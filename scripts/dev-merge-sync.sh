@@ -17,6 +17,31 @@
 # living uncommitted under scripts/ does not block itself.
 set -euo pipefail
 
+# The GATING jobs of .github/workflows/ci.yml, by check name. Every one must
+# report a real `pass` before we merge.
+#
+# Waiting on the checks does NOT establish that, which is the whole reason this
+# list exists: every job in ci.yml carries `if: draft == false`, so on a draft
+# PR they all skip — and `gh pr checks --watch --fail-fast` reports each one as
+# `skipping` and exits 0, which is indistinguishable from green. This script
+# would then merge code CI has never compiled. (GitHub's own required-status
+# checks would not save us either: a skipped check counts as satisfied — and
+# this repo can't have them anyway, since rulesets/branch protection need Pro on
+# a private repo.)
+#
+# Deliberately not required: "detect changes" (a path-filter helper for the
+# other jobs), "tmux render tests (non-gating)" (named non-gating; flaky under
+# load, and conditional), and the two iOS jobs — they are `if: false`, so
+# NOTHING under app/ios is covered (see /CLAUDE.md). Re-enable them there and
+# they belong in this list.
+REQUIRED_CHECKS=(
+  "rustfmt"
+  "clippy"
+  "cargo test"
+  "ts-rs bindings sync"
+  "frontend (typecheck + build + test)"
+)
+
 BASE="master"
 ASSUME_YES=0
 TITLE=""
@@ -62,8 +87,30 @@ else
 fi
 [ -n "$PR" ] || die "could not resolve a PR number"
 
+# A draft runs no CI at all, so there would be nothing to verify below. Marking
+# it ready is the owner's call, not this script's (/CLAUDE.md) — and it is also
+# what fires `ready_for_review` and lets CI through.
+[ "$(gh pr view "$PR" --json isDraft -q .isDraft)" = "false" ] ||
+  die "PR #$PR is a draft: CI does not run on drafts. The owner marks it ready ('gh pr ready $PR'), then re-run this."
+
 echo "==> waiting for checks on PR #$PR ..."
 gh pr checks "$PR" --watch --fail-fast || die "checks failed/cancelled on PR #$PR — not merging"
+
+# Trust the results, not the wait: see REQUIRED_CHECKS above for why exiting 0
+# proves nothing on its own.
+echo "==> verifying the gating checks reported a real pass ..."
+CHECKS="$(gh pr checks "$PR" --json name,bucket --jq '.[] | "\(.bucket)\t\(.name)"')" ||
+  die "could not read the checks for PR #$PR"
+for name in "${REQUIRED_CHECKS[@]}"; do
+  buckets="$(printf '%s\n' "$CHECKS" | awk -F'\t' -v n="$name" '$2 == n { print $1 }')"
+  if [ -z "$buckets" ]; then
+    die "required check '$name' never reported on PR #$PR — CI has not seen this code (renamed in ci.yml?). Not merging."
+  fi
+  if printf '%s\n' "$buckets" | grep -qxv 'pass'; then
+    die "required check '$name' is '$(printf '%s' "$buckets" | tr '\n' ',')', not a pass. Not merging."
+  fi
+  echo "    pass  $name"
+done
 
 if [ "$ASSUME_YES" -ne 1 ]; then
   printf "==> merge PR #%s into %s and fast-forward %s? [y/N] " "$PR" "$BASE" "$DEV"

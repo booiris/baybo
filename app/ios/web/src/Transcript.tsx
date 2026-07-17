@@ -79,14 +79,16 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
 }
 
 /// Map a REST `ChatWorkStep` (the `work` transcript row's step — snake_case
-/// `tool_label` / `tool_status` / `tool_summary`, no `call_id`) onto a rendered
-/// WorkStep. A reconstructed step's tool call is already closed, so `status`
-/// falls back to "ok" when the persisted result didn't carry one.
+/// `tool_label` / `tool_status` / `tool_summary`) onto a rendered WorkStep. A
+/// reconstructed step's tool call is already closed, so `status` falls back to
+/// "ok" when the persisted result didn't carry one.
 export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
   if (s.kind === "tool") {
     return {
       kind: "tool",
-      callId: "",
+      // "" only for a row the gateway persisted before it sent `call_id`;
+      // `workStepKey` falls back to content-keying for those.
+      callId: s.call_id ?? "",
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "ok",
       summary: s.tool_summary || undefined,
@@ -248,10 +250,29 @@ export function rowOrdinal(id: string): number | null {
 }
 
 /// Identity of a work step for dedup when folding two representations of the
-/// same turn's block: a tool step is keyed by its call id (stable across the
-/// live vs reconstructed shapes); text steps by kind + text.
+/// same turn's block. Text steps key by kind + text.
+///
+/// A tool step keys by its call id, which both shapes now carry.
+///
+/// A row persisted before the gateway sent `call_id` on the REST shape has
+/// none, and keying those `tool:` collapsed EVERY reconstructed call in the
+/// block to one identity: folding two reconstructed halves of a turn kept the
+/// first tool step and silently deleted the rest (a real 88-row turn lost 32 of
+/// its steps to it on every restore), while folding a live block with its own
+/// reconstruction double-rendered every call.
+///
+/// So an id-less step keys by what it DID. Distinct calls differ in their label
+/// (the command/URL), and near-always in their summary/status too; two calls
+/// identical in all three are indistinguishable here and still collapse. This
+/// never mixes with the id form (`tool!` vs `tool:`) — an id-less step and an
+/// id-carrying one for the SAME call don't dedup, which is why the gateway
+/// sends the id rather than this being the answer.
 export function workStepKey(s: WorkStep): string {
-  return s.kind === "tool" ? `tool:${s.callId}` : `${s.kind}:${s.text}`;
+  if (s.kind !== "tool") return `${s.kind}:${s.text}`;
+  if (s.callId) return `tool:${s.callId}`;
+  // A NUL separator, so a field containing the separator cannot forge
+  // another field's boundary ("a b" + "c" vs "a" + "b c").
+  return ["tool!", s.label, s.status, s.summary ?? ""].join("\u0000");
 }
 
 /// Concatenate two work blocks' steps WITHOUT duplicating shared ones — so
@@ -283,6 +304,63 @@ export function freezeActiveWork(rows: Row[]): Row[] {
   );
 }
 
+/// Apply `mutate` to the tail work block, opening one if the turn doesn't have
+/// an open block yet (the web chat's ensureWork). The pure core of
+/// `withOpenWork`.
+///
+/// A work frame belongs to the tail work block whenever the tail IS one — even
+/// if it was just FROZEN. A restored live block stays `active` and a re-entry's
+/// continuation extends it (keeping its real startedAt); but a block can also be
+/// frozen MID-STREAM by a `turn_state{inactive}` that raced ahead of a straggler
+/// frame — on cancel the gateway emits an unguarded `tool_completed` through the
+/// SAME ordered channel the turn-end projector rides, so `[tool_started] →
+/// turn_state{inactive} → tool_completed` reaches the client with the block
+/// already closed. Folding into the frozen tail rather than forking is the
+/// invariant that keeps ONE turn to ONE card: this never appends a work row
+/// adjacent to another (the `[work][work]` re-entry split). The straggler even
+/// resolves its own still-"running" tool step in place. The block keeps its
+/// frozen `active:false`, so a cancelled turn reads "Worked", not a stuck
+/// "Working".
+///
+/// The tail is found by scanning back over a trailing NOTICE run, not by taking
+/// `rows[len-1]`: a terminal notice landing once the block is frozen keeps its
+/// OWN row (it may be durable — see `foldTerminalNoticeIn`), and a plain
+/// adjacency check would then fork the turn's continuation into a second card
+/// ([work][notice][work]). The block folded back into keeps its frozen
+/// `active:false` and its `elapsedMs` — `mutate` only appends steps — so a
+/// straggler never re-opens or re-times a settled card.
+export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[] {
+  let i = rows.length - 1;
+  while (i >= 0 && rows[i].role === "notice") i--;
+  const target = i >= 0 ? rows[i] : undefined;
+  if (target && target.role === "work") {
+    const next = [...rows];
+    next[i] = mutate(target);
+    return next;
+  }
+  // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
+  // still-`active` block anywhere in the thread first, so a stale open block
+  // can't linger as a second live "Working" card beside this one.
+  const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
+  return [...freezeActiveWork(rows), mutate(fresh)];
+}
+
+/// A terminal notice that lands mid-turn folds INTO the open work block as a
+/// leveled step, so it doesn't sever the block into two cards (the tail must
+/// stay a work row for `openWorkIn` to keep extending it). Only an ACTIVE block
+/// folds: those mid-turn notices are live-only (never persisted), so the folded
+/// step can't duplicate a durable row. A notice with no active block — between
+/// turns, or a persisted `/stop`/`/compact` outcome anchored after the turn —
+/// keeps its own centered `role:"notice"` row (its durable shape). The pure core
+/// of `foldTerminalNotice`.
+export function foldTerminalNoticeIn(rows: Row[], level: string, text: string): Row[] {
+  const last = rows[rows.length - 1];
+  if (last && last.role === "work" && last.active) {
+    return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
+  }
+  return [...rows, { id: uid(), role: "notice", content: text }];
+}
+
 /// Fuse a client work block (`base` — live/restored: freshest streamed steps +
 /// active state) with the server's reconstruction of the SAME turn (`recon` —
 /// authoritative persisted steps + server-anchored timing). One block, not two:
@@ -300,6 +378,69 @@ export function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
     // server's number regardless of who closes the block first.
     elapsedMs: recon.elapsedMs ?? base.elapsedMs,
   };
+}
+
+/// Join two halves of ONE turn that a PAGE BOUNDARY cut in two.
+///
+/// A turn longer than a sync page reconstructs as two blocks, because each page
+/// is folded on its own: the older page holds the turn's user row, so its half
+/// times from the real turn start and is closed by that page's trailing flush;
+/// the newer page has no user row, so its half opens at its first intermediate
+/// row and is closed by the answer. Neither half's duration is the turn's.
+///
+/// Span the pair: start at the FIRST half's start (the true turn start), end at
+/// the SECOND half's end (`startedAt + elapsedMs`). A restored half has no
+/// `startedAt` (stripped), so fall back to a half's own duration — an
+/// undercount, but the mirror only holds a split written before this joined at
+/// the seam.
+export function joinWorkHalves(first: WorkRow, second: WorkRow): WorkRow {
+  const secondEnd =
+    second.startedAt !== undefined && second.elapsedMs !== undefined
+      ? second.startedAt + second.elapsedMs
+      : undefined;
+  const spanned =
+    first.startedAt !== undefined && secondEnd !== undefined
+      ? Math.max(0, secondEnd - first.startedAt)
+      : undefined;
+  return {
+    ...first,
+    steps: mergeWorkSteps(first.steps, second.steps),
+    // A half still live keeps the card live; anchored to the turn's true start,
+    // so the ticker reads the whole turn rather than restarting at the seam.
+    active: first.active || second.active,
+    startedAt: first.startedAt,
+    elapsedMs: spanned ?? first.elapsedMs ?? second.elapsedMs,
+  };
+}
+
+/// Fold two ADJACENT work rows — always one turn, since a healthy turn has a
+/// message row between its block and the next. Which fold depends on what the
+/// two rows ARE: two server reconstructions with DIFFERENT `w<ordinal>` ids are
+/// sequential halves of one turn (a page boundary cut it), so span them;
+/// anything else — a live block beside its own reconstruction, or the same row
+/// re-delivered — is two representations of ONE span, so reconcile them.
+export function foldWork(prev: WorkRow, next: WorkRow): WorkRow {
+  const prevOrd = rowOrdinal(prev.id);
+  const nextOrd = rowOrdinal(next.id);
+  return prevOrd !== null && nextOrd !== null && prevOrd !== nextOrd
+    ? joinWorkHalves(prev, next)
+    : reconcileWork(prev, next);
+}
+
+/// Collapse every adjacent work pair in an assembled row list. Idempotent — a
+/// healthy list has no adjacency — so it is safe to run at each seam where rows
+/// are joined (a prepended history page, a rebuilt sync page).
+export function foldAdjacentWork(rows: Row[]): Row[] {
+  const out: Row[] = [];
+  for (const r of rows) {
+    const prev = out[out.length - 1];
+    if (r.role === "work" && prev && prev.role === "work") {
+      out[out.length - 1] = foldWork(prev, r);
+      continue;
+    }
+    out.push(r);
+  }
+  return out;
 }
 
 /// Index in `rows` of the work block belonging to the SAME turn as a work row
@@ -338,6 +479,37 @@ export function clearAwaitingApproval(step: WorkStep): WorkStep {
     : step;
 }
 
+/// Does the mirror hold a work block whose turn can no longer be timed here?
+///
+/// An ACTIVE block legitimately has no duration — it is still running. A CLOSED
+/// one always got its `elapsedMs` from `closeWork` (`now − startedAt`) or from
+/// the server via `reconcileWork`, so a closed block with none is a mirror we
+/// broke: either it closed after a restore had already stripped its `startedAt`
+/// (the anchor is gone, and the local clock knows `now`, not when the turn
+/// ended), or a legacy adjacency heal dropped the number outright. The duration
+/// is unrecoverable locally — but the gateway still has it
+/// (`work_started_at`/`work_ended_at`), and re-timing needs the row re-delivered
+/// for `reconcileWork` to fuse. A difference sync never re-delivers a row below
+/// the cursor, and `hasMoreOlder: false` can leave no history page to page in
+/// either, so the block would read "worked for a moment" forever. A BASELINE
+/// sync is the only way back — hence `cursor: null` on such a restore.
+///
+/// Self-limiting, and never a loop: the baseline REPLACE rebuilds the newest
+/// page from the gateway with true timing and re-persists healed, so the next
+/// open takes the normal difference path. A block too old for that page is
+/// dropped from the thread by the REPLACE (and pages back in timed), so it stops
+/// matching too. Worst case is one baseline pull per open.
+export function hasUntimedWork(rows: Row[] | undefined): boolean {
+  return (rows ?? []).some(
+    (r) =>
+      r.role === "work" &&
+      !r.active &&
+      r.elapsedMs === undefined &&
+      Array.isArray(r.steps) &&
+      r.steps.length > 0,
+  );
+}
+
 export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
   for (let r of rows ?? []) {
@@ -357,12 +529,23 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
       // healthy turn always has a message between its block and the next, so
       // adjacency alone marks the tear, whether or not either half already
       // closed. Fold the whole run into one card, staying "working" if any piece
-      // was still live (a turn with no final reply must not read as "worked");
-      // the split's real duration was lost, so it stays untimed. Since the
-      // `withOpenWork` fold-into-frozen-tail invariant now prevents minting a
-      // fresh adjacency split, this only ever folds a LEGACY on-disk mirror
-      // written by a pre-fix build (it re-persists as one row, so it fires once
-      // per such session) — kept as defense-in-depth.
+      // was still live (a turn with no final reply must not read as "worked").
+      // Since the `openWorkIn` fold-into-frozen-tail invariant now prevents
+      // minting a fresh adjacency split, this only ever folds a LEGACY on-disk
+      // mirror written by a pre-fix build (it re-persists as one row, so it
+      // fires once per such session) — kept as defense-in-depth.
+      //
+      // KEEP the duration. `prev` anchors the turn, so its `elapsedMs` is the
+      // best number available: when the tear stranded a fragment beside a
+      // SERVER-reconstructed block (`w<ordinal>`, timed from
+      // work_started_at/work_ended_at) it is the whole turn's true span, and
+      // when two live halves tore apart it undercounts — still far better than
+      // dropping it, which reads as "worked for a moment" on a five-minute turn
+      // and is UNRECOVERABLE: the fold re-persists as one row, and a cursor
+      // already past the block means no sync or history page ever re-delivers
+      // it for `reconcileWork` to re-time. `startedAt` still goes, like every
+      // other restore path — a restored anchor would have a live ticker count
+      // all the app-closed hours.
       const prev = out[out.length - 1];
       if (prev && prev.role === "work") {
         out[out.length - 1] = {
@@ -370,7 +553,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
           steps: mergeWorkSteps(prev.steps, r.steps),
           active: prev.active || r.active,
           startedAt: undefined,
-          elapsedMs: undefined,
+          elapsedMs: prev.elapsedMs ?? r.elapsedMs,
         };
       } else {
         // Heal a DIFFERENT persisted split: a durable progress block that a
@@ -1492,11 +1675,20 @@ export function Transcript({
         .filter((n): n is number => n !== null),
     ),
   );
+  // Evaluated once, at mount. A mirror holding a block we can no longer time
+  // drops its cursor below, so the mount's sync REBUILDS rather than differences
+  // — the gateway's copy is the only one that still knows the duration. This
+  // does NOT delay the first paint: `messages` seeds from the mirror in its own
+  // initializer and the paint path never reads the cursor, so the thread renders
+  // on the first commit as always; the rebuilt page swaps in when it lands,
+  // reusing every row's DOM (a block keeps its `w<ordinal>` key across the
+  // REPLACE, so it re-times in place rather than remounting).
+  const [restoredUntimedWork] = useState(() => hasUntimedWork(restored?.messages));
   // The sync cursor + its rebase-dirty flag (see transcript/cursor.ts, which
   // owns the advance rule). `cursor: null` = no baseline yet — the next sync
   // omits `since_ordinal` and REPLACEs on the newest page.
   const cursorRef = useRef<CursorState>({
-    cursor: restored?.lastOrdinal ?? null,
+    cursor: restoredUntimedWork ? null : (restored?.lastOrdinal ?? null),
     rebaseDirty: false,
   });
   // Started-at epoch-ms of turns this client has already seen END — the
@@ -1728,21 +1920,8 @@ export function Transcript({
     prependAnchor.current = null;
   }, [messages]);
 
-  // A terminal notice that lands mid-turn folds INTO the open work block as a
-  // leveled step, so it doesn't sever the block into two cards (the tail must
-  // stay a work row for `withOpenWork` to keep extending it). Only an active
-  // block folds: those mid-turn notices are live-only (never persisted), so the
-  // folded step can't duplicate a durable row. A notice with no active block —
-  // between turns, or a persisted `/stop`/`/compact` outcome anchored after the
-  // turn — keeps its own centered `role:"notice"` row (its durable shape).
   const foldTerminalNotice = useCallback((level: string, text: string) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      if (last && last.role === "work" && last.active) {
-        return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
-      }
-      return [...rows, { id: uid(), role: "notice", content: text }];
-    });
+    setMessages((rows) => foldTerminalNoticeIn(rows, level, text));
   }, []);
 
   const appendNotice = useCallback((text: string) => {
@@ -1834,33 +2013,8 @@ export function Transcript({
 
   // ---- work block (the turn's thinking / tool process) ---------------------
 
-  // Apply `mutate` to the tail work block, opening one if the turn doesn't
-  // have an open block yet (the web chat's ensureWork).
   const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      // A work frame belongs to the tail work block whenever the tail IS one —
-      // even if it was just FROZEN. A restored live block stays `active` and a
-      // re-entry's continuation extends it (keeping its real startedAt); but a
-      // block can also be frozen MID-STREAM by a `turn_state{inactive}` that
-      // raced ahead of a straggler frame — on cancel the gateway emits an
-      // unguarded `tool_completed` through the SAME ordered channel the turn-end
-      // projector rides, so `[tool_started] → turn_state{inactive} → tool_completed`
-      // reaches the client with the block already closed. Folding into the frozen
-      // tail rather than forking is the invariant that keeps ONE turn to ONE card:
-      // withOpenWork never appends a work row adjacent to another (the
-      // `[work][work]` re-entry split). The straggler even resolves its own
-      // still-"running" tool step in place. The block keeps its frozen
-      // `active:false`, so a cancelled turn reads "Worked", not a stuck "Working".
-      if (last && last.role === "work") {
-        return [...rows.slice(0, -1), mutate(last)];
-      }
-      // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
-      // still-`active` block anywhere in the thread first, so a stale open block
-      // can't linger as a second live "Working" card beside this one.
-      const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
-      return [...freezeActiveWork(rows), mutate(fresh)];
-    });
+    setMessages((rows) => openWorkIn(rows, mutate));
   }, []);
 
   const pushWorkStep = useCallback(
@@ -2067,7 +2221,10 @@ export function Transcript({
     setMessages((m) => {
       const seen = new Set(m.map((x) => x.id));
       const fresh = older.filter((x) => !seen.has(x.id));
-      return [...fresh, ...m];
+      // Fold at the seam: a turn longer than a page has a work block on BOTH
+      // sides of it (each page folds its own half), and they meet here with no
+      // message row between — one turn must stay one card.
+      return foldAdjacentWork([...fresh, ...m]);
     });
     // Only advance the cursor on a non-empty page; an empty page leaves it put.
     if (newOldest !== null) oldestOrdinal.current = newOldest;
@@ -2163,7 +2320,10 @@ export function Transcript({
         }
       }
       if (replace) {
-        const pageIds = new Set(pageRows.map((r) => r.id));
+        // A page can hold BOTH halves of a turn it is wide enough to span, or
+        // one half beside a turn it cut — fold before anything else reads them.
+        const folded = foldAdjacentWork(pageRows);
+        const pageIds = new Set(folded.map((r) => r.id));
         setMessages((prev) => {
           // Keep the in-flight turn's open work block and any optimistic user
           // sends still awaiting their durable row (echoed-but-unpersisted, or
@@ -2180,7 +2340,7 @@ export function Transcript({
           // active, adopt the server id + server-anchored timing, union the steps
           // — instead of rendering both (duplicate/overlapping cards) or dropping
           // either (losing steps or the correct duration).
-          let rows = pageRows;
+          let rows = folded;
           let carried = openWork;
           if (openWork.length > 0) {
             const tail = rows[rows.length - 1];
@@ -2243,7 +2403,7 @@ export function Transcript({
             // its own work block is still appended.
             const tail = next[next.length - 1];
             if (row.role === "work" && tail && tail.role === "work") {
-              next[next.length - 1] = reconcileWork(tail, row);
+              next[next.length - 1] = foldWork(tail, row);
               continue;
             }
             // A re-delivered `work` row whose turn ALREADY ended on screen: its
