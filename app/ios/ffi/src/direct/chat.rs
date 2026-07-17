@@ -52,9 +52,10 @@ impl ChatTransport for super::DirectSessions {
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
-            // Direct user messages carry the device id + `channel_type=device`,
+            // Direct user messages carry the device id + `channel_type=owner`,
             // matching the relay content leg while still using the admin-bearer
-            // direct transport.
+            // direct transport. Web and mobile share the one `owner` channel;
+            // which of them is talking is an auth concern, not a channel one.
             let device_id = http.device_id().to_owned();
             let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
                 user_message_frame(session_id, &device_id, text, msg_id, attachments)
