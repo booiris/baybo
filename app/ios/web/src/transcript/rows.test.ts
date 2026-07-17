@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
+  foldTerminalNoticeIn,
   freezeActiveWork,
   isStopAckNotice,
   isStopCommand,
   mergeWorkSteps,
+  openWorkIn,
   reconcileWork,
   restStepToWork,
   restoreImageDims,
@@ -296,6 +298,62 @@ describe("freezeActiveWork", () => {
   it("prefers a duration already reconciled from the server over the wall clock", () => {
     const rows: Row[] = [work({ id: "w1", steps: [tool()], active: true, startedAt: 1, elapsedMs: 250 })];
     expect((freezeActiveWork(rows)[0] as WorkRow).elapsedMs).toBe(250);
+  });
+});
+
+describe("openWorkIn / foldTerminalNoticeIn — one turn, one card", () => {
+  const steps = (rows: Row[]) => rows.filter((r): r is WorkRow => r.role === "work");
+
+  it("folds a straggler into a FROZEN tail — the invariant against the [work][work] split", () => {
+    // `turn_state{inactive}` races ahead of a cancel's unguarded
+    // `tool_completed`, so the block is already closed when the frame lands.
+    let rows: Row[] = openWorkIn([], (w) => ({ ...w, steps: [tool({ callId: "c1" })] }));
+    rows = freezeActiveWork(rows);
+    rows = openWorkIn(rows, (w) => ({ ...w, steps: [...w.steps, tool({ callId: "c2" })] }));
+
+    expect(steps(rows)).toHaveLength(1);
+    expect(steps(rows)[0].steps).toHaveLength(2);
+  });
+
+  it("folds a terminal notice INTO an active block rather than severing it", () => {
+    let rows: Row[] = openWorkIn([], (w) => ({ ...w, steps: [tool({ callId: "c1" })] }));
+    rows = foldTerminalNoticeIn(rows, "warn", "degraded");
+    rows = openWorkIn(rows, (w) => ({ ...w, steps: [...w.steps, tool({ callId: "c2" })] }));
+
+    expect(steps(rows)).toHaveLength(1);
+    expect(steps(rows)[0].steps).toMatchObject([{ kind: "tool" }, { kind: "notice", text: "degraded" }, { kind: "tool" }]);
+  });
+
+  it("keeps ONE card when a terminal notice lands on a FROZEN block mid-turn", () => {
+    // The straggler sequence of the first case, with a terminal notice (a
+    // server rejection, the empty-user-reply warn) in between. The notice sees
+    // `active:false` so it keeps its own row — correct, it may be durable — but
+    // that row breaks the ADJACENCY `openWorkIn`'s fold-into-frozen-tail
+    // invariant rests on, so the straggler forks a SECOND card.
+    // Wanted: [work][notice] with the straggler folded back into the one block.
+    let rows: Row[] = openWorkIn([], (w) => ({ ...w, steps: [tool({ callId: "c1" })] }));
+    rows = freezeActiveWork(rows);
+    rows = foldTerminalNoticeIn(rows, "warn", "degraded");
+    rows = openWorkIn(rows, (w) => ({ ...w, steps: [...w.steps, tool({ callId: "c2" })] }));
+
+    expect(rows.filter((r) => r.role === "notice")).toHaveLength(1);
+    expect(steps(rows)).toHaveLength(1);
+    expect(steps(rows)[0].steps).toHaveLength(2);
+  });
+
+  it("stops the back-scan at the turn's answer — a LATER turn still gets its own card", () => {
+    // The back-scan crosses notices only. A finished turn is separated from the
+    // next by its answer bubble (or, for a turn that produced none, the next
+    // turn's user row), so a notice sitting between turns can't make a new
+    // turn's first frame fold back into the previous turn's card.
+    let rows: Row[] = openWorkIn([], (w) => ({ ...w, steps: [tool({ callId: "c1" })] }));
+    rows = freezeActiveWork(rows);
+    rows = [...rows, { id: "m1", role: "assistant", content: "done" }];
+    rows = foldTerminalNoticeIn(rows, "info", "compacted");
+    rows = openWorkIn(rows, (w) => ({ ...w, steps: [tool({ callId: "c2" })] }));
+
+    expect(rows.map((r) => r.role)).toEqual(["work", "assistant", "notice", "work"]);
+    expect(steps(rows)[0].steps).toHaveLength(1);
   });
 });
 

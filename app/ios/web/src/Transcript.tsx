@@ -283,6 +283,63 @@ export function freezeActiveWork(rows: Row[]): Row[] {
   );
 }
 
+/// Apply `mutate` to the tail work block, opening one if the turn doesn't have
+/// an open block yet (the web chat's ensureWork). The pure core of
+/// `withOpenWork`.
+///
+/// A work frame belongs to the tail work block whenever the tail IS one — even
+/// if it was just FROZEN. A restored live block stays `active` and a re-entry's
+/// continuation extends it (keeping its real startedAt); but a block can also be
+/// frozen MID-STREAM by a `turn_state{inactive}` that raced ahead of a straggler
+/// frame — on cancel the gateway emits an unguarded `tool_completed` through the
+/// SAME ordered channel the turn-end projector rides, so `[tool_started] →
+/// turn_state{inactive} → tool_completed` reaches the client with the block
+/// already closed. Folding into the frozen tail rather than forking is the
+/// invariant that keeps ONE turn to ONE card: this never appends a work row
+/// adjacent to another (the `[work][work]` re-entry split). The straggler even
+/// resolves its own still-"running" tool step in place. The block keeps its
+/// frozen `active:false`, so a cancelled turn reads "Worked", not a stuck
+/// "Working".
+///
+/// The tail is found by scanning back over a trailing NOTICE run, not by taking
+/// `rows[len-1]`: a terminal notice landing once the block is frozen keeps its
+/// OWN row (it may be durable — see `foldTerminalNoticeIn`), and a plain
+/// adjacency check would then fork the turn's continuation into a second card
+/// ([work][notice][work]). The block folded back into keeps its frozen
+/// `active:false` and its `elapsedMs` — `mutate` only appends steps — so a
+/// straggler never re-opens or re-times a settled card.
+export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[] {
+  let i = rows.length - 1;
+  while (i >= 0 && rows[i].role === "notice") i--;
+  const target = i >= 0 ? rows[i] : undefined;
+  if (target && target.role === "work") {
+    const next = [...rows];
+    next[i] = mutate(target);
+    return next;
+  }
+  // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
+  // still-`active` block anywhere in the thread first, so a stale open block
+  // can't linger as a second live "Working" card beside this one.
+  const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
+  return [...freezeActiveWork(rows), mutate(fresh)];
+}
+
+/// A terminal notice that lands mid-turn folds INTO the open work block as a
+/// leveled step, so it doesn't sever the block into two cards (the tail must
+/// stay a work row for `openWorkIn` to keep extending it). Only an ACTIVE block
+/// folds: those mid-turn notices are live-only (never persisted), so the folded
+/// step can't duplicate a durable row. A notice with no active block — between
+/// turns, or a persisted `/stop`/`/compact` outcome anchored after the turn —
+/// keeps its own centered `role:"notice"` row (its durable shape). The pure core
+/// of `foldTerminalNotice`.
+export function foldTerminalNoticeIn(rows: Row[], level: string, text: string): Row[] {
+  const last = rows[rows.length - 1];
+  if (last && last.role === "work" && last.active) {
+    return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
+  }
+  return [...rows, { id: uid(), role: "notice", content: text }];
+}
+
 /// Fuse a client work block (`base` — live/restored: freshest streamed steps +
 /// active state) with the server's reconstruction of the SAME turn (`recon` —
 /// authoritative persisted steps + server-anchored timing). One block, not two:
@@ -1728,21 +1785,8 @@ export function Transcript({
     prependAnchor.current = null;
   }, [messages]);
 
-  // A terminal notice that lands mid-turn folds INTO the open work block as a
-  // leveled step, so it doesn't sever the block into two cards (the tail must
-  // stay a work row for `withOpenWork` to keep extending it). Only an active
-  // block folds: those mid-turn notices are live-only (never persisted), so the
-  // folded step can't duplicate a durable row. A notice with no active block —
-  // between turns, or a persisted `/stop`/`/compact` outcome anchored after the
-  // turn — keeps its own centered `role:"notice"` row (its durable shape).
   const foldTerminalNotice = useCallback((level: string, text: string) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      if (last && last.role === "work" && last.active) {
-        return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
-      }
-      return [...rows, { id: uid(), role: "notice", content: text }];
-    });
+    setMessages((rows) => foldTerminalNoticeIn(rows, level, text));
   }, []);
 
   const appendNotice = useCallback((text: string) => {
@@ -1834,33 +1878,8 @@ export function Transcript({
 
   // ---- work block (the turn's thinking / tool process) ---------------------
 
-  // Apply `mutate` to the tail work block, opening one if the turn doesn't
-  // have an open block yet (the web chat's ensureWork).
   const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
-    setMessages((rows) => {
-      const last = rows[rows.length - 1];
-      // A work frame belongs to the tail work block whenever the tail IS one —
-      // even if it was just FROZEN. A restored live block stays `active` and a
-      // re-entry's continuation extends it (keeping its real startedAt); but a
-      // block can also be frozen MID-STREAM by a `turn_state{inactive}` that
-      // raced ahead of a straggler frame — on cancel the gateway emits an
-      // unguarded `tool_completed` through the SAME ordered channel the turn-end
-      // projector rides, so `[tool_started] → turn_state{inactive} → tool_completed`
-      // reaches the client with the block already closed. Folding into the frozen
-      // tail rather than forking is the invariant that keeps ONE turn to ONE card:
-      // withOpenWork never appends a work row adjacent to another (the
-      // `[work][work]` re-entry split). The straggler even resolves its own
-      // still-"running" tool step in place. The block keeps its frozen
-      // `active:false`, so a cancelled turn reads "Worked", not a stuck "Working".
-      if (last && last.role === "work") {
-        return [...rows.slice(0, -1), mutate(last)];
-      }
-      // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
-      // still-`active` block anywhere in the thread first, so a stale open block
-      // can't linger as a second live "Working" card beside this one.
-      const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
-      return [...freezeActiveWork(rows), mutate(fresh)];
-    });
+    setMessages((rows) => openWorkIn(rows, mutate));
   }, []);
 
   const pushWorkStep = useCallback(
