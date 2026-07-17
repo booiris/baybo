@@ -379,6 +379,69 @@ export function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
   };
 }
 
+/// Join two halves of ONE turn that a PAGE BOUNDARY cut in two.
+///
+/// A turn longer than a sync page reconstructs as two blocks, because each page
+/// is folded on its own: the older page holds the turn's user row, so its half
+/// times from the real turn start and is closed by that page's trailing flush;
+/// the newer page has no user row, so its half opens at its first intermediate
+/// row and is closed by the answer. Neither half's duration is the turn's.
+///
+/// Span the pair: start at the FIRST half's start (the true turn start), end at
+/// the SECOND half's end (`startedAt + elapsedMs`). A restored half has no
+/// `startedAt` (stripped), so fall back to a half's own duration — an
+/// undercount, but the mirror only holds a split written before this joined at
+/// the seam.
+export function joinWorkHalves(first: WorkRow, second: WorkRow): WorkRow {
+  const secondEnd =
+    second.startedAt !== undefined && second.elapsedMs !== undefined
+      ? second.startedAt + second.elapsedMs
+      : undefined;
+  const spanned =
+    first.startedAt !== undefined && secondEnd !== undefined
+      ? Math.max(0, secondEnd - first.startedAt)
+      : undefined;
+  return {
+    ...first,
+    steps: mergeWorkSteps(first.steps, second.steps),
+    // A half still live keeps the card live; anchored to the turn's true start,
+    // so the ticker reads the whole turn rather than restarting at the seam.
+    active: first.active || second.active,
+    startedAt: first.startedAt,
+    elapsedMs: spanned ?? first.elapsedMs ?? second.elapsedMs,
+  };
+}
+
+/// Fold two ADJACENT work rows — always one turn, since a healthy turn has a
+/// message row between its block and the next. Which fold depends on what the
+/// two rows ARE: two server reconstructions with DIFFERENT `w<ordinal>` ids are
+/// sequential halves of one turn (a page boundary cut it), so span them;
+/// anything else — a live block beside its own reconstruction, or the same row
+/// re-delivered — is two representations of ONE span, so reconcile them.
+export function foldWork(prev: WorkRow, next: WorkRow): WorkRow {
+  const prevOrd = rowOrdinal(prev.id);
+  const nextOrd = rowOrdinal(next.id);
+  return prevOrd !== null && nextOrd !== null && prevOrd !== nextOrd
+    ? joinWorkHalves(prev, next)
+    : reconcileWork(prev, next);
+}
+
+/// Collapse every adjacent work pair in an assembled row list. Idempotent — a
+/// healthy list has no adjacency — so it is safe to run at each seam where rows
+/// are joined (a prepended history page, a rebuilt sync page).
+export function foldAdjacentWork(rows: Row[]): Row[] {
+  const out: Row[] = [];
+  for (const r of rows) {
+    const prev = out[out.length - 1];
+    if (r.role === "work" && prev && prev.role === "work") {
+      out[out.length - 1] = foldWork(prev, r);
+      continue;
+    }
+    out.push(r);
+  }
+  return out;
+}
+
 /// Index in `rows` of the work block belonging to the SAME turn as a work row
 /// of durable ordinal `ord` that has ended up ABOVE the turn's answer bubble.
 /// Scan back over the trailing answer/notice run; accept the preceding work
@@ -2157,7 +2220,10 @@ export function Transcript({
     setMessages((m) => {
       const seen = new Set(m.map((x) => x.id));
       const fresh = older.filter((x) => !seen.has(x.id));
-      return [...fresh, ...m];
+      // Fold at the seam: a turn longer than a page has a work block on BOTH
+      // sides of it (each page folds its own half), and they meet here with no
+      // message row between — one turn must stay one card.
+      return foldAdjacentWork([...fresh, ...m]);
     });
     // Only advance the cursor on a non-empty page; an empty page leaves it put.
     if (newOldest !== null) oldestOrdinal.current = newOldest;
@@ -2253,7 +2319,10 @@ export function Transcript({
         }
       }
       if (replace) {
-        const pageIds = new Set(pageRows.map((r) => r.id));
+        // A page can hold BOTH halves of a turn it is wide enough to span, or
+        // one half beside a turn it cut — fold before anything else reads them.
+        const folded = foldAdjacentWork(pageRows);
+        const pageIds = new Set(folded.map((r) => r.id));
         setMessages((prev) => {
           // Keep the in-flight turn's open work block and any optimistic user
           // sends still awaiting their durable row (echoed-but-unpersisted, or
@@ -2270,7 +2339,7 @@ export function Transcript({
           // active, adopt the server id + server-anchored timing, union the steps
           // — instead of rendering both (duplicate/overlapping cards) or dropping
           // either (losing steps or the correct duration).
-          let rows = pageRows;
+          let rows = folded;
           let carried = openWork;
           if (openWork.length > 0) {
             const tail = rows[rows.length - 1];
@@ -2333,7 +2402,7 @@ export function Transcript({
             // its own work block is still appended.
             const tail = next[next.length - 1];
             if (row.role === "work" && tail && tail.role === "work") {
-              next[next.length - 1] = reconcileWork(tail, row);
+              next[next.length - 1] = foldWork(tail, row);
               continue;
             }
             // A re-delivered `work` row whose turn ALREADY ended on screen: its

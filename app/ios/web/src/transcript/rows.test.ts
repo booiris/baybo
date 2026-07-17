@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
+  foldAdjacentWork,
   foldTerminalNoticeIn,
   freezeActiveWork,
   hasUntimedWork,
@@ -435,6 +436,75 @@ describe("openWorkIn / foldTerminalNoticeIn — one turn, one card", () => {
 
     expect(rows.map((r) => r.role)).toEqual(["work", "assistant", "notice", "work"]);
     expect(steps(rows)[0].steps).toHaveLength(1);
+  });
+});
+
+describe("foldAdjacentWork — a turn cut by a page boundary is still one turn", () => {
+  // The real numbers off a device mirror: a 91-row session whose turn ran rows
+  // 3..90. The baseline sync page is the newest 50 rows (42..91), which carries
+  // no user row, so its half opened at row 43 and was closed by the answer at
+  // row 91; the history page (rows 1..41) held the user row, so its half timed
+  // from the real turn start and was closed by that page's trailing flush at
+  // row 41. Prepending the older page puts them side by side.
+  const TURN_START = 1784173283804; // row 2 — the user's prompt
+  const FIRST_END = 1784173863833; // row 41 — the older page's last row
+  const SECOND_START = 1784173872143; // row 43
+  const TURN_END = 1784174854449; // row 91 — the answer
+  const first = (): WorkRow =>
+    work({ id: "w3", steps: [tool({ callId: "", label: "Fetch(a)" })], startedAt: TURN_START, elapsedMs: FIRST_END - TURN_START });
+  const second = (): WorkRow =>
+    work({ id: "w43", steps: [tool({ callId: "", label: "Fetch(b)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START });
+
+  it("spans the whole turn — neither half's own duration is the turn's", () => {
+    const [row] = foldAdjacentWork([first(), second()]) as [WorkRow];
+    expect(row.startedAt).toBe(TURN_START);
+    expect(row.elapsedMs).toBe(TURN_END - TURN_START); // 26m11s, not the halves' 9m40s / 16m22s
+  });
+
+  it("keeps one card, the earlier id, and every step from both halves", () => {
+    const out = foldAdjacentWork([first(), second()]) as WorkRow[];
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("w3");
+    expect(out[0].steps).toHaveLength(2);
+  });
+
+  it("stays live when the newer half is still running, anchored at the turn's start", () => {
+    const live = { ...second(), active: true, elapsedMs: undefined };
+    const [row] = foldAdjacentWork([first(), live]) as [WorkRow];
+    expect(row).toMatchObject({ active: true, startedAt: TURN_START });
+  });
+
+  it("leaves a healthy thread alone — a turn's block is separated by its answer", () => {
+    const rows: Row[] = [first(), { id: "m91", role: "assistant", content: "done" }, second()];
+    expect(foldAdjacentWork(rows)).toHaveLength(3);
+  });
+
+  it("is idempotent, so it is safe to run at every seam", () => {
+    const once = foldAdjacentWork([first(), second()]);
+    expect(foldAdjacentWork(once)).toEqual(once);
+  });
+
+  it("collapses a run of three halves (a turn spanning three pages)", () => {
+    const third = work({ id: "w80", steps: [tool({ callId: "", label: "Fetch(c)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START });
+    const out = foldAdjacentWork([first(), second(), third]) as WorkRow[];
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: "w3", startedAt: TURN_START, elapsedMs: TURN_END - TURN_START });
+  });
+
+  // The other fold: a live block beside its OWN reconstruction is one span in
+  // two representations, so the server's timing replaces the client's guess —
+  // it must NOT be spanned as if the two were sequential.
+  it("reconciles a live block with its own reconstruction rather than spanning it", () => {
+    const live = work({ id: "u7-abc", steps: [tool({ callId: "c1" })], active: true, startedAt: 999 });
+    const recon = work({ id: "w43", steps: [tool({ callId: "", label: "Fetch(b)" })], startedAt: SECOND_START, elapsedMs: 4_000 });
+    const [row] = foldAdjacentWork([live, recon]) as [WorkRow];
+    expect(row).toMatchObject({ id: "u7-abc", active: true, startedAt: SECOND_START, elapsedMs: 4_000 });
+  });
+
+  it("reconciles the same block re-delivered (one id, one span)", () => {
+    const [row] = foldAdjacentWork([first(), first()]) as [WorkRow];
+    expect(row).toMatchObject({ id: "w3", startedAt: TURN_START, elapsedMs: FIRST_END - TURN_START });
+    expect(row.steps).toHaveLength(1);
   });
 });
 
