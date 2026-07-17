@@ -70,8 +70,8 @@ pub enum AuthedClient {
         channel_type: Option<String>,
     },
     /// Admin-side web chat tab. Authenticated by the admin bearer on the
-    /// admin listener, then constrained by the Register handshake to
-    /// `ChannelType::HTTP`.
+    /// admin listener, then constrained by the Register handshake to the
+    /// shared `ChannelType::OWNER` chat channel.
     Web,
     /// A paired, operator-approved companion device. On the channel
     /// listener this is resolved by its persisted `auth_token` against the
@@ -81,8 +81,9 @@ pub enum AuthedClient {
     /// either the admin bearer or the matching approved device token when
     /// [`DEVICE_ID_HEADER`] is present, then selects the same downstream
     /// identity for direct device and relay API-tunnel requests. It registers on
-    /// `/v1/channel-ws` only as [`ChannelType::DEVICE`] and `/v1/blobs` uploads
-    /// are stamped with the device id for diagnostics.
+    /// `/v1/channel-ws` as the shared `ChannelType::OWNER` chat channel (the
+    /// same one the web dashboard uses; the web-vs-device split is auth only)
+    /// and `/v1/blobs` uploads are stamped with the device id for diagnostics.
     Device {
         device_id: String,
     },

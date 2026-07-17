@@ -247,9 +247,9 @@ mod tests {
             user: User {
                 id: "u".into(),
                 name: None,
-                channel: ChannelType::http(),
+                channel: ChannelType::owner(),
             },
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
             state: SessionState::default(),

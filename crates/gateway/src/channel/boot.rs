@@ -36,7 +36,7 @@ pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// process per view = `Subscribed`), not from operator preference.
 fn kind_for(channel_type: &ChannelType) -> ChannelKind {
     match channel_type.as_str() {
-        ChannelType::HTTP | ChannelType::TUI | ChannelType::DEVICE => ChannelKind::Subscribed,
+        ChannelType::OWNER | ChannelType::TUI => ChannelKind::Subscribed,
         ChannelType::TELEGRAM | ChannelType::DISCORD | ChannelType::WEIXIN => {
             ChannelKind::Multiplexed
         }
@@ -68,35 +68,32 @@ pub fn install_channels(
     if config.weixin.as_ref().is_some_and(|c| c.enabled) {
         install_channel(registry, ChannelType::weixin())?;
     }
-    // HTTP is the embedded web dashboard / chat channel and is always
-    // installed — it has no operator-facing knobs. The SessionPulse
-    // hookup that fires `Frame::SessionActivity` lives inside
-    // [`install_channel`] so the lazy-install fallback in
-    // [`super::adapter::Sidecar::build`] can never miss it either.
-    install_channel(registry, ChannelType::http())?;
-    // The mobile companion device channel is `Subscribed` like `http`: paired
-    // devices register as `device` and self-pull threads via `Frame::Subscribe`. Always
-    // installed — the device-auth gate (an approved `auth_token`) is what
-    // actually admits a connection, so the waiting channel costs nothing.
-    install_channel(registry, ChannelType::device())?;
+    // The single owner chat channel serves both the web dashboard and the
+    // mobile app (both register as `owner`; see `docs/modules/channels.md`),
+    // so a web tab and a phone on the same session share one subscriptions map
+    // + in-flight buffer. Always installed — it has no operator-facing knobs,
+    // and the device-auth gate (an approved `auth_token`) is what admits a
+    // device connection.
+    install_channel(registry, ChannelType::owner())?;
     Ok(())
 }
 
-/// Install one channel with its approval gate. For the `http` (web) and
-/// `device` (mobile) chat surfaces the [`SessionPulse`] observer is attached
-/// too: a `UserEcho` or a *completed* agent emission (terminal
-/// `Message`/`Notice`) then emits a throttled `Frame::SessionActivity` so
-/// clients not subscribed to the affected session still get the unread signal.
-/// TUI is `Subscribed` as well but is deliberately excluded — it ignores
-/// `SessionActivity`, and its post-`Subscribe` handshake expects
-/// `HistorySnapshot` as the very next frame, which a broadcast pulse could race.
+/// Install one channel with its approval gate. For the shared `owner` chat
+/// channel (the merged web + mobile fan-out domain) the [`SessionPulse`]
+/// observer is attached too: a `UserEcho` or a *completed* agent emission
+/// (terminal `Message`/`Notice`) then emits a throttled
+/// `Frame::SessionActivity` so clients not subscribed to the affected session
+/// still get the unread signal. TUI is `Subscribed` as well but is
+/// deliberately excluded — it ignores `SessionActivity`, and its
+/// post-`Subscribe` handshake expects `HistorySnapshot` as the very next
+/// frame, which a broadcast pulse could race.
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
     let channel = build_channel(channel_type.clone(), kind);
-    let wants_pulse = channel_type == ChannelType::http() || channel_type == ChannelType::device();
+    let wants_pulse = channel_type == ChannelType::owner();
     registry.install(channel)?;
     if wants_pulse
         && let Some(chan) = registry.get(&channel_type)
@@ -177,9 +174,9 @@ mod tests {
 
     #[test]
     fn kind_for_known_types() {
-        assert!(kind_for(&ChannelType::http()).is_subscribed());
+        assert!(kind_for(&ChannelType::owner()).is_subscribed());
         assert!(kind_for(&ChannelType::tui()).is_subscribed());
-        assert!(kind_for(&ChannelType::device()).is_subscribed());
+        assert!(kind_for(&ChannelType::owner()).is_subscribed());
         assert!(kind_for(&ChannelType::telegram()).is_multiplexed());
         assert!(kind_for(&ChannelType::weixin()).is_multiplexed());
         assert!(kind_for(&ChannelType::discord()).is_multiplexed());
@@ -187,7 +184,7 @@ mod tests {
 
     #[test]
     fn build_channel_attaches_approval_gate() {
-        let ch = build_channel(ChannelType::http(), ChannelKind::Subscribed);
+        let ch = build_channel(ChannelType::owner(), ChannelKind::Subscribed);
         assert!(ch.approval_gate().is_some());
     }
 }

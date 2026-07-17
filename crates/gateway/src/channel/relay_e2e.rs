@@ -182,8 +182,9 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
         .create(&device_row("device-dev", device.public().to_vec()))
         .await
         .expect("seed approved device row");
-    crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
-        .expect("install device channel");
+    // Device connections pool into the shared `owner` channel.
+    crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::owner())
+        .expect("install owner channel");
     let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
         .await
         .expect("gateway static key");
@@ -251,7 +252,7 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
         content: "over real relay".into(),
         session_id: "sess-e2e".into(),
         user_id: "user-1".into(),
-        channel_type: ChannelType::device(),
+        channel_type: ChannelType::owner(),
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: "m1".into(),

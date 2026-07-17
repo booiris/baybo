@@ -15,10 +15,11 @@ use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
 /// Channel type strings that subprocess sidecars may not claim — they
 /// would shadow an in-process adapter. `"tui"` is enforced separately
-/// (only the vault-token TUI auth path may claim it). `"device"` joins `"http"`
-/// here: only the device-auth path ([`AuthedClient::Device`]) may claim it,
-/// just as only [`AuthedClient::Web`] may claim `"http"`.
-const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP, ChannelType::DEVICE];
+/// (only the vault-token TUI auth path may claim it). `"owner"` is reserved
+/// so a subprocess sidecar can't register onto the owner's own chat pool —
+/// only the web ([`AuthedClient::Web`]) and device ([`AuthedClient::Device`])
+/// auth paths may claim it.
+const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::OWNER];
 
 /// Outcome of a successful Register handshake. Only the channel type
 /// is reported; subscriptions are negotiated post-handshake.
@@ -66,22 +67,24 @@ pub(crate) fn validate_register(
                 "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
             ));
         }
+        // Web and device both register onto the single shared `owner` chat
+        // pool (their surface identity comes from the auth path — the admin
+        // bearer vs the approved device token — not the channel claim). The
+        // claim is pinned to `owner` so a leaked web/device token still can't
+        // be redirected onto another channel's session stream (tui/telegram).
         AuthedClient::Web => {
-            if normalized != ChannelType::HTTP {
+            if normalized != ChannelType::OWNER {
                 return Err(format!(
                     "web chat must register as channel_type '{}', got '{normalized}'",
-                    ChannelType::HTTP,
+                    ChannelType::OWNER,
                 ));
             }
         }
-        // A paired, approved device registers as the device channel only —
-        // fixed like web auth's `http`, so a leaked device token can't be
-        // redirected onto another channel's session stream.
         AuthedClient::Device { device_id, .. } => {
-            if normalized != ChannelType::DEVICE {
+            if normalized != ChannelType::OWNER {
                 return Err(format!(
                     "device token must register as channel_type '{}', got '{normalized}'",
-                    ChannelType::DEVICE,
+                    ChannelType::OWNER,
                 ));
             }
             let _ = device_id;
@@ -231,11 +234,11 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let handle = tokens.mint(ClientIdentity {
             pid: 1,
-            label: "http".into(),
-            bound_channel_type: Some("http".into()),
+            label: "owner".into(),
+            bound_channel_type: Some("owner".into()),
         });
-        let frame = register(handle.token(), "http");
-        let authed = subprocess(1, "http");
+        let frame = register(handle.token(), "owner");
+        let authed = subprocess(1, "owner");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"));
     }
@@ -308,14 +311,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_device_auth_claiming_device_channel() {
+    fn accepts_device_auth_claiming_owner_channel() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("", ChannelType::DEVICE);
+        let frame = register("", ChannelType::OWNER);
         let authed = AuthedClient::Device {
             device_id: "d1".into(),
         };
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
-        assert_eq!(outcome.channel_type.as_str(), ChannelType::DEVICE);
+        assert_eq!(outcome.channel_type.as_str(), ChannelType::OWNER);
     }
 
     #[test]
@@ -330,30 +333,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_subprocess_claiming_device() {
-        // `device` is reserved like `http`: a sidecar can't impersonate a device.
+    fn rejects_subprocess_claiming_owner() {
+        // `owner` is reserved: a sidecar can't register onto the owner's own
+        // chat pool, even with a token bound to it.
         let tokens = ChannelTokenTable::new();
         let handle = tokens.mint(ClientIdentity {
             pid: 5,
-            label: "sidecar-device".into(),
-            bound_channel_type: Some("device".into()),
+            label: "sidecar-owner".into(),
+            bound_channel_type: Some("owner".into()),
         });
-        let frame = register(handle.token(), "device");
-        let authed = subprocess(5, "sidecar-device");
+        let frame = register(handle.token(), "owner");
+        let authed = subprocess(5, "sidecar-owner");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]
-    fn accepts_web_auth_claiming_http_channel() {
+    fn accepts_web_auth_claiming_owner_channel() {
         // The admin listener turns a valid admin bearer into AuthedClient::Web.
-        // That identity is the *only* path allowed to claim the
-        // otherwise-reserved "http" channel type.
+        // Web and device auth are the *only* paths allowed to claim the
+        // otherwise-reserved "owner" chat channel.
         let tokens = ChannelTokenTable::new();
-        let frame = register("", ChannelType::HTTP);
+        let frame = register("", ChannelType::OWNER);
         let authed = AuthedClient::Web;
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
-        assert_eq!(outcome.channel_type.as_str(), ChannelType::HTTP);
+        assert_eq!(outcome.channel_type.as_str(), ChannelType::OWNER);
     }
 
     #[test]
@@ -372,19 +376,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_subprocess_claiming_http_even_with_matching_bound_type() {
+    fn rejects_subprocess_claiming_owner_even_with_matching_bound_type() {
         // Reserved-channel-types is a hard floor: even a sidecar
-        // whose token was minted with bound_channel_type=Some("http")
-        // can't claim it. Only AuthedClient::Web is allowed past the
-        // RESERVED gate.
+        // whose token was minted with bound_channel_type=Some("owner")
+        // can't claim it. Only the web/device auth paths are allowed past
+        // the RESERVED gate.
         let tokens = ChannelTokenTable::new();
         let handle = tokens.mint(ClientIdentity {
             pid: 99,
-            label: "sidecar-http".into(),
-            bound_channel_type: Some("http".into()),
+            label: "sidecar-owner".into(),
+            bound_channel_type: Some("owner".into()),
         });
-        let frame = register(handle.token(), "http");
-        let authed = subprocess(99, "sidecar-http");
+        let frame = register(handle.token(), "owner");
+        let authed = subprocess(99, "sidecar-owner");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"), "got: {err}");
     }
