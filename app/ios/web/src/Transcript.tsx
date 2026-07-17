@@ -395,6 +395,37 @@ export function clearAwaitingApproval(step: WorkStep): WorkStep {
     : step;
 }
 
+/// Does the mirror hold a work block whose turn can no longer be timed here?
+///
+/// An ACTIVE block legitimately has no duration — it is still running. A CLOSED
+/// one always got its `elapsedMs` from `closeWork` (`now − startedAt`) or from
+/// the server via `reconcileWork`, so a closed block with none is a mirror we
+/// broke: either it closed after a restore had already stripped its `startedAt`
+/// (the anchor is gone, and the local clock knows `now`, not when the turn
+/// ended), or a legacy adjacency heal dropped the number outright. The duration
+/// is unrecoverable locally — but the gateway still has it
+/// (`work_started_at`/`work_ended_at`), and re-timing needs the row re-delivered
+/// for `reconcileWork` to fuse. A difference sync never re-delivers a row below
+/// the cursor, and `hasMoreOlder: false` can leave no history page to page in
+/// either, so the block would read "worked for a moment" forever. A BASELINE
+/// sync is the only way back — hence `cursor: null` on such a restore.
+///
+/// Self-limiting, and never a loop: the baseline REPLACE rebuilds the newest
+/// page from the gateway with true timing and re-persists healed, so the next
+/// open takes the normal difference path. A block too old for that page is
+/// dropped from the thread by the REPLACE (and pages back in timed), so it stops
+/// matching too. Worst case is one baseline pull per open.
+export function hasUntimedWork(rows: Row[] | undefined): boolean {
+  return (rows ?? []).some(
+    (r) =>
+      r.role === "work" &&
+      !r.active &&
+      r.elapsedMs === undefined &&
+      Array.isArray(r.steps) &&
+      r.steps.length > 0,
+  );
+}
+
 export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
   for (let r of rows ?? []) {
@@ -1560,11 +1591,20 @@ export function Transcript({
         .filter((n): n is number => n !== null),
     ),
   );
+  // Evaluated once, at mount. A mirror holding a block we can no longer time
+  // drops its cursor below, so the mount's sync REBUILDS rather than differences
+  // — the gateway's copy is the only one that still knows the duration. This
+  // does NOT delay the first paint: `messages` seeds from the mirror in its own
+  // initializer and the paint path never reads the cursor, so the thread renders
+  // on the first commit as always; the rebuilt page swaps in when it lands,
+  // reusing every row's DOM (a block keeps its `w<ordinal>` key across the
+  // REPLACE, so it re-times in place rather than remounting).
+  const [restoredUntimedWork] = useState(() => hasUntimedWork(restored?.messages));
   // The sync cursor + its rebase-dirty flag (see transcript/cursor.ts, which
   // owns the advance rule). `cursor: null` = no baseline yet — the next sync
   // omits `since_ordinal` and REPLACEs on the newest page.
   const cursorRef = useRef<CursorState>({
-    cursor: restored?.lastOrdinal ?? null,
+    cursor: restoredUntimedWork ? null : (restored?.lastOrdinal ?? null),
     rebaseDirty: false,
   });
   // Started-at epoch-ms of turns this client has already seen END — the

@@ -3,6 +3,7 @@ import {
   clearAwaitingApproval,
   foldTerminalNoticeIn,
   freezeActiveWork,
+  hasUntimedWork,
   isStopAckNotice,
   isStopCommand,
   mergeWorkSteps,
@@ -309,6 +310,40 @@ describe("freezeActiveWork", () => {
   it("prefers a duration already reconciled from the server over the wall clock", () => {
     const rows: Row[] = [work({ id: "w1", steps: [tool()], active: true, startedAt: 1, elapsedMs: 250 })];
     expect((freezeActiveWork(rows)[0] as WorkRow).elapsedMs).toBe(250);
+  });
+});
+
+describe("hasUntimedWork — the mirror we broke, and can only rebuild from the gateway", () => {
+  it("flags a CLOSED block with no duration — the number is gone and only the gateway has it", () => {
+    expect(hasUntimedWork([work({ id: "w3", steps: [{ kind: "status", text: "reading" }] })])).toBe(true);
+  });
+
+  it("ignores an ACTIVE block — it is still running, so having no duration is correct", () => {
+    const rows: Row[] = [work({ id: "w3", steps: [tool()], active: true, startedAt: 1 })];
+    expect(hasUntimedWork(rows)).toBe(false);
+  });
+
+  it("ignores a timed block — the overwhelming majority, which must keep differencing", () => {
+    const rows: Row[] = [work({ id: "w3", steps: [tool()], elapsedMs: 4_000 })];
+    expect(hasUntimedWork(rows)).toBe(false);
+  });
+
+  it("ignores an empty block — sanitizeRestoredRows drops it, so it never renders untimed", () => {
+    expect(hasUntimedWork([work({ id: "w3" })])).toBe(false);
+  });
+
+  it("tolerates an absent mirror, and on-disk garbage (the mirror is JSON, not a trusted type)", () => {
+    expect(hasUntimedWork(undefined)).toBe(false);
+    expect(hasUntimedWork([{ id: "w3", role: "work", active: false } as unknown as Row])).toBe(false);
+  });
+
+  it("finds a broken block anywhere in the thread, not just at the tail", () => {
+    const rows: Row[] = [
+      work({ id: "w3", steps: [{ kind: "status", text: "reading" }] }),
+      { id: "m91", role: "assistant", content: "done" },
+      work({ id: "w95", steps: [tool()], elapsedMs: 4_000 }),
+    ];
+    expect(hasUntimedWork(rows)).toBe(true);
   });
 });
 
