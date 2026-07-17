@@ -220,7 +220,12 @@ async fn listing_cron_can_be_filtered_to_one_channel() {
         )
         .await;
     }
-    let bin = get(&router, "/v1/cron?deleted=true&channel=owner", StatusCode::OK).await;
+    let bin = get(
+        &router,
+        "/v1/cron?deleted=true&channel=owner",
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(channels_of(&bin), vec!["owner".to_string()], "{bin:?}");
     // …and the live list is empty for that channel now, not merely unfiltered.
     let live = get(&router, "/v1/cron?channel=owner", StatusCode::OK).await;

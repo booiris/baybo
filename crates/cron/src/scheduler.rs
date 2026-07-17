@@ -2709,4 +2709,44 @@ mod tests {
             Some("sess-creator"),
         );
     }
+
+    /// **Days of the week are Quartz-numbered here — 1=Sunday — NOT Unix's
+    /// 0=Sunday/1=Monday.** So `* * * * 1-5` means Sunday..Thursday, and is not
+    /// the "weekdays" the author of that expression almost certainly meant.
+    ///
+    /// Nothing in our own code declares this: it is the `cron` crate's
+    /// convention, inherited silently, and exactly the sort of thing a minor
+    /// bump can change. It has a reader now — the iOS scheduled-jobs list says
+    /// each expression in words — and a flipped convention would fail nowhere
+    /// and simply start telling every user the wrong day. Hence a test over a
+    /// third-party behaviour, deliberately.
+    #[test]
+    fn days_of_week_are_quartz_numbered_from_sunday() {
+        use chrono::Datelike;
+
+        let weekday_of = |expr: &str| {
+            cron::Schedule::from_str(expr)
+                .expect("parse")
+                .upcoming(Utc)
+                .next()
+                .expect("a next fire")
+                .weekday()
+        };
+        assert_eq!(
+            weekday_of("0 0 12 * * 1"),
+            chrono::Weekday::Sun,
+            "1 is Sunday"
+        );
+        assert_eq!(weekday_of("0 0 12 * * 2"), chrono::Weekday::Mon);
+        assert_eq!(
+            weekday_of("0 0 12 * * 7"),
+            chrono::Weekday::Sat,
+            "7 is Saturday"
+        );
+        // The names agree with the numbers, not with Unix.
+        assert_eq!(weekday_of("0 0 12 * * FRI"), weekday_of("0 0 12 * * 6"));
+        // Unix's Sunday is not merely a different day here — it does not parse,
+        // so a habit-written `0` fails loudly rather than firing on Saturday.
+        assert!(cron::Schedule::from_str("0 0 12 * * 0").is_err());
+    }
 }

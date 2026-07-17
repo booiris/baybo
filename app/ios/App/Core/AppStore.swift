@@ -109,6 +109,9 @@ final class AppStore: ObservableObject {
     @Published var confirmDeleteSession: String?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
+    /// Job id → name, learned from the scheduled-jobs list. See
+    /// `rememberCronJobTitles`.
+    @Published private(set) var cronJobTitles: [String: String] = [:]
     /// Transient archive/delete failure line, rendered by the list headers the
     /// way compose failures are. Cleared when the next mutation starts.
     @Published var sessionNotice: String?
@@ -587,9 +590,31 @@ final class AppStore: ObservableObject {
     /// user already left).
     func loadCronJobs() async throws -> [CronJobSummary] {
         #if DEBUG
-            if demoHomeMode { return Self.demoCronJobs() }
+            if demoHomeMode {
+                let demo = Self.demoCronJobs()
+                rememberCronJobTitles(demo)
+                return demo
+            }
         #endif
-        return try await Baybo.client.chatListCronJobs()
+        let jobs = try await Baybo.client.chatListCronJobs()
+        rememberCronJobTitles(jobs)
+        return jobs
+    }
+
+    /// A job's name, kept so `CronGroupScreen` can title itself for a job whose
+    /// fires cannot: a group is a view over its fires, so a job that has never
+    /// fired has no members to read a title from, and the screen would otherwise
+    /// head a specific job's page with the generic "Scheduled task".
+    ///
+    /// A cache with no staleness problem, because it cannot be consulted while
+    /// wrong: a fire-less group is reachable ONLY from the jobs list — the chat
+    /// list's group row exists only where fires do — so the one path that needs
+    /// this always fills it moments earlier. Once fires exist they carry the
+    /// live title themselves and win.
+    private func rememberCronJobTitles(_ jobs: [CronJobSummary]) {
+        for job in jobs where !job.title.isEmpty {
+            cronJobTitles[job.id] = job.title
+        }
     }
 
     #if DEBUG

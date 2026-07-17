@@ -40,13 +40,39 @@ final class CronJobsUITests: BayboUITestCase {
             app.staticTexts[Self.namelessJob].exists,
             "a titleless job must fall back to its prompt, not render blank")
 
-        // Its schedule, with the timezone — `0 9 * * *` means nothing without it.
+        // The schedule reads as a sentence, with the timezone — `0 9 * * *` is
+        // punctuation to most people, and means nothing without whose 9am.
+        // Matched around the time rather than through it: the formatter puts a
+        // NARROW NO-BREAK SPACE before AM, so an exact label match would need an
+        // invisible character pasted into this file.
         XCTAssertTrue(
-            app.staticTexts["0 9 * * * · Asia/Shanghai"].exists,
-            "the row does not show the schedule and its timezone")
+            app.staticTexts.matching(
+                NSPredicate(
+                    format: "label BEGINSWITH %@ AND label ENDSWITH %@",
+                    "Daily at", "· Asia/Shanghai")
+            ).firstMatch.exists,
+            "the row does not say the schedule in words with its timezone")
 
         XCTAssertTrue(app.staticTexts["Paused"].exists, "a disabled job must read as paused")
         XCTAssertTrue(app.staticTexts["Done"].exists, "a spent one-shot must read as done")
+    }
+
+    /// A job that has never fired has no cron group to open — the group is a view
+    /// over fires that do not exist. It must still say so in its own name rather
+    /// than showing a blank page under a generic title: the jobs list is the only
+    /// way to reach this state, and it just learned the name.
+    func testAJobWithNoRunsOpensANamedEmptyHistory() throws {
+        let app = openCronJobs()
+        let job = app.staticTexts[Self.pausedJob]
+        XCTAssertTrue(job.waitForExistence(timeout: 5))
+        job.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["No execution records yet"].waitForExistence(timeout: 3),
+            "a fire-less job's history does not say it is empty")
+        XCTAssertTrue(
+            app.staticTexts[Self.pausedJob].exists,
+            "the empty history is headed by the generic fallback, not the job's name")
     }
 
     /// The list is the only place a job appears as a SCHEDULE; tapping it crosses

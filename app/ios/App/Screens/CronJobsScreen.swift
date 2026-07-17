@@ -208,7 +208,10 @@ struct CronJobRowView: View {
     static func scheduleLabel(_ job: CronJobSummary, locale: String) -> String {
         switch job.schedule {
         case .recurring(let expr):
-            "\(expr) · \(job.timezone)"
+            // Words where we can manage them, the raw expression where we
+            // cannot — `CronExpression` never guesses (and note its day-of-week
+            // trap: `1-5` is Sunday..Thursday here, and it says so).
+            "\(CronExpression.humanize(expr, lproj: locale)) · \(job.timezone)"
         case .once(let time):
             "\(absolute(time, locale: locale, zone: job.timezone) ?? time) · \(job.timezone)"
         }

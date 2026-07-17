@@ -38,10 +38,21 @@ struct CronJobRowTests {
         #expect(CronJobRowView.headline(job(title: "")) == "Summarize the news")
     }
 
-    @Test func aRecurringJobShowsItsExpressionAndZone() {
+    /// The row says the schedule in words and keeps the zone beside it —
+    /// `CronExpression` owns the sentence (and its own tests); this pins that the
+    /// row actually asks it, rather than printing the raw cron.
+    @Test func aRecurringJobShowsItsScheduleInWordsWithTheZone() {
         #expect(
-            CronJobRowView.scheduleLabel(job(), locale: "en_US")
-                == "0 9 * * * · Asia/Shanghai")
+            Self.plain(CronJobRowView.scheduleLabel(job(), locale: "en"))
+                == "Daily at 9:00 AM · Asia/Shanghai")
+    }
+
+    /// An expression the humanizer will not describe still has to render — as
+    /// itself, never as a guess.
+    @Test func anUndescribableExpressionFallsBackToTheRawCron() {
+        #expect(
+            CronJobRowView.scheduleLabel(job(schedule: .recurring(expr: "0 9 * 3 *")), locale: "en")
+                == "0 9 * 3 * · Asia/Shanghai")
     }
 
     /// **The one-shot's instant renders in the JOB's zone, not the device's.**
@@ -55,9 +66,9 @@ struct CronJobRowTests {
     @Test func aOneShotRendersInItsOwnZoneNotTheDevices() {
         let instant = "2026-07-20T10:00:00Z"
         let utc = CronJobRowView.scheduleLabel(
-            job(schedule: .once(time: instant), timezone: "UTC"), locale: "en_US")
+            job(schedule: .once(time: instant), timezone: "UTC"), locale: "en")
         let shanghai = CronJobRowView.scheduleLabel(
-            job(schedule: .once(time: instant), timezone: "Asia/Shanghai"), locale: "en_US")
+            job(schedule: .once(time: instant), timezone: "Asia/Shanghai"), locale: "en")
 
         #expect(Self.plain(utc).contains("10:00 AM"), "got \(utc)")
         #expect(utc.hasSuffix("· UTC"))
@@ -80,7 +91,7 @@ struct CronJobRowTests {
     @Test func anUnknownZoneFallsBackToTheRawInstant() {
         let label = CronJobRowView.scheduleLabel(
             job(schedule: .once(time: "2026-07-20T10:00:00Z"), timezone: "Mars/Olympus"),
-            locale: "en_US")
+            locale: "en")
         #expect(label == "2026-07-20T10:00:00Z · Mars/Olympus")
     }
 
@@ -96,28 +107,28 @@ struct CronJobRowTests {
     /// list the label is the ONLY thing saying they will not run — an empty
     /// column would render them identical to a live job.
     @Test func aJobWithNothingComingSaysWhyRatherThanShowingATime() {
-        #expect(!CronJobRowView.nextLabel(job(status: .disabled), locale: "en_US").isEmpty)
-        #expect(!CronJobRowView.nextLabel(job(status: .executed), locale: "en_US").isEmpty)
+        #expect(!CronJobRowView.nextLabel(job(status: .disabled), locale: "en").isEmpty)
+        #expect(!CronJobRowView.nextLabel(job(status: .executed), locale: "en").isEmpty)
         #expect(
-            CronJobRowView.nextLabel(job(status: .disabled), locale: "en_US")
-                != CronJobRowView.nextLabel(job(status: .executed), locale: "en_US"),
+            CronJobRowView.nextLabel(job(status: .disabled), locale: "en")
+                != CronJobRowView.nextLabel(job(status: .executed), locale: "en"),
             "paused and done must not read the same")
     }
 
     /// An enabled job with no next trigger (a gateway that omitted it) renders
     /// nothing rather than a wrong or stale time.
     @Test func anEnabledJobWithoutATriggerShowsNothing() {
-        #expect(CronJobRowView.nextLabel(job(status: .enabled), locale: "en_US").isEmpty)
+        #expect(CronJobRowView.nextLabel(job(status: .enabled), locale: "en").isEmpty)
         #expect(
             CronJobRowView.nextLabel(
-                job(status: .enabled, nextTriggerAt: "not a timestamp"), locale: "en_US"
+                job(status: .enabled, nextTriggerAt: "not a timestamp"), locale: "en"
             ).isEmpty)
     }
 
     @Test func anEnabledJobCountsDownToItsNextRun() {
         let soon = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3 * 3600))
         let label = CronJobRowView.nextLabel(
-            job(status: .enabled, nextTriggerAt: soon), locale: "en_US")
+            job(status: .enabled, nextTriggerAt: soon), locale: "en")
         #expect(!label.isEmpty)
         #expect(label.contains("2") || label.contains("3"), "got \(label)")
     }

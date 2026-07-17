@@ -7,7 +7,7 @@ import SwiftUI
 /// toggle re-renders live.
 @MainActor
 final class Lang: ObservableObject {
-    struct Language {
+    struct Language: Sendable {
         let code: String
         let short: String
         let label: String
@@ -16,7 +16,10 @@ final class Lang: ObservableObject {
     }
 
     /// Mirrors the web `SUPPORTED_LANGUAGES` (order defines the cycle).
-    static let supported: [Language] = [
+    ///
+    /// `nonisolated`: an immutable table of the languages that exist, which
+    /// `catalog(lproj:)` must read off the main actor.
+    nonisolated static let supported: [Language] = [
         Language(code: "en", short: "EN", label: "English", lproj: "en"),
         Language(code: "zh", short: "中", label: "简体中文", lproj: "zh-Hans"),
     ]
@@ -64,7 +67,23 @@ final class Lang: ObservableObject {
         String(format: t(key), arg)
     }
 
-    private static func bundle(for language: Language) -> Bundle {
+    /// The catalog for an EXPLICIT language, rather than the app's current one.
+    ///
+    /// For pure formatters that are told which language to speak (they already
+    /// take one, to drive `Locale`-based date/list formatting) — so the sentence
+    /// template and the OS-formatted parts inside it cannot end up in different
+    /// languages, which is what "每Sun 9:00 AM" was. It also makes such a
+    /// formatter testable: `t` reads the ambient setting, which on a test host is
+    /// the MACHINE's language — English on a CI runner, whatever the developer
+    /// has locally.
+    /// `nonisolated`: resolving a catalog reads the app bundle and nothing this
+    /// class owns, so a pure formatter can be told a language without also having
+    /// to be on the main actor.
+    nonisolated static func catalog(lproj: String) -> Bundle {
+        bundle(for: supported.first { $0.lproj == lproj } ?? supported[0])
+    }
+
+    nonisolated private static func bundle(for language: Language) -> Bundle {
         Bundle.main.path(forResource: language.lproj, ofType: "lproj")
             .flatMap(Bundle.init(path:)) ?? .main
     }
