@@ -722,10 +722,13 @@ final class AppStore: ObservableObject {
     }
 
     #if DEBUG
-        /// `-baybo-open-home`'s cron job fixture: the three states the row draws
-        /// differently — a live recurring job, a paused one, and a spent one-shot
-        /// with no title (the prompt fallback) — so the screen is screenshot- and
+        /// `-baybo-open-home`'s cron job fixture: a live job, a paused one, and a
+        /// titleless one (the prompt fallback) — so the screen is screenshot- and
         /// XCUITest-verifiable with no gateway.
+        ///
+        /// All recurring, because the list is: a one-shot is dropped in
+        /// `list_cron_jobs` and could never reach a real screen, so seeding one
+        /// would be a fixture for a state production cannot produce.
         ///
         /// The live one is keyed to the seeded cron GROUP (`demo-job`), so tapping
         /// it opens that job's two demo fires: the list → job → its history path
@@ -738,7 +741,7 @@ final class AppStore: ObservableObject {
                     id: "demo-job",
                     title: "Morning brief",
                     prompt: "Summarize overnight CI and the open PRs",
-                    schedule: .recurring(expr: "0 9 * * *"),
+                    expr: "0 9 * * *",
                     timezone: "Asia/Shanghai",
                     status: .enabled,
                     nextTriggerAt: iso.string(from: now.addingTimeInterval(3 * 3600)),
@@ -747,20 +750,20 @@ final class AppStore: ObservableObject {
                     id: "demo-job-paused",
                     title: "Weekly digest",
                     prompt: "Round up the week",
-                    schedule: .recurring(expr: "0 18 * * FRI"),
+                    expr: "0 18 * * FRI",
                     timezone: "UTC",
                     status: .disabled,
                     nextTriggerAt: nil,
                     lastTriggeredAt: nil),
                 CronJobSummary(
-                    id: "demo-job-once",
+                    id: "demo-job-nameless",
                     title: "",
                     prompt: "Remind me to renew the TLS certificate",
-                    schedule: .once(time: "2026-07-20T10:00:00Z"),
+                    expr: "*/30 * * * *",
                     timezone: "UTC",
-                    status: .executed,
-                    nextTriggerAt: nil,
-                    lastTriggeredAt: "2026-07-20T10:00:00Z"),
+                    status: .enabled,
+                    nextTriggerAt: iso.string(from: now.addingTimeInterval(12 * 60)),
+                    lastTriggeredAt: nil),
             ]
         }
     #endif

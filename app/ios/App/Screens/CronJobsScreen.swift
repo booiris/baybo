@@ -113,21 +113,16 @@ struct CronJobsScreen: View {
                 // Not a full swipe: delete is destructive, and pause is a state
                 // flip on a thing that runs unattended — both want the tap.
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    // A spent one-shot is offered neither verb: there is nothing
-                    // to pause, and resuming it is a 400 server-side (its
-                    // schedule has no future left). Only delete applies.
-                    if job.status != .executed {
-                        let paused = job.status == .disabled
-                        Button {
-                            Haptics.tap()
-                            appStore.requestCronPaused(job.id, paused: !paused)
-                        } label: {
-                            Label(
-                                lang.t(paused ? "cronJobs.resume" : "cronJobs.pause"),
-                                systemImage: paused ? "play.circle" : "pause.circle")
-                        }
-                        .tint(Theme.inkSoft)
+                    let paused = job.status == .disabled
+                    Button {
+                        Haptics.tap()
+                        appStore.requestCronPaused(job.id, paused: !paused)
+                    } label: {
+                        Label(
+                            lang.t(paused ? "cronJobs.resume" : "cronJobs.pause"),
+                            systemImage: paused ? "play.circle" : "pause.circle")
                     }
+                    .tint(Theme.inkSoft)
                     Button(role: .destructive) {
                         appStore.promptDeleteCronJob(
                             job.id, name: CronJobRowView.headline(job))
@@ -184,7 +179,7 @@ extension CronJobSummary {
             id: id,
             title: title,
             prompt: prompt,
-            schedule: schedule,
+            expr: expr,
             timezone: timezone,
             status: status,
             nextTriggerAt: nextTriggerAt,
@@ -255,22 +250,11 @@ struct CronJobRowView: View {
     /// `0 9 * * *` says nothing without whose 9am, and a phone that travels is
     /// exactly where that bites.
     ///
-    /// A one-shot is rendered **in the job's own zone**, the same zone the label
-    /// names — the recurring case shows the job's 9am, so the one-shot shows the
-    /// job's clock too, and the two rows mean the same thing by the same rule.
-    /// Rendering the instant in the DEVICE's zone under the job's label is the
-    /// bug this exists to prevent: `10:00Z` came out "6:00 PM · UTC" on a
-    /// Shanghai phone, a stated time that was never true anywhere.
+    /// Words where we can manage them, the raw expression where we cannot —
+    /// `CronExpression` never guesses (and note its day-of-week trap: `1-5` is
+    /// Sunday..Thursday here, and it says so).
     static func scheduleLabel(_ job: CronJobSummary, locale: String) -> String {
-        switch job.schedule {
-        case .recurring(let expr):
-            // Words where we can manage them, the raw expression where we
-            // cannot — `CronExpression` never guesses (and note its day-of-week
-            // trap: `1-5` is Sunday..Thursday here, and it says so).
-            "\(CronExpression.humanize(expr, lproj: locale)) · \(job.timezone)"
-        case .once(let time):
-            "\(absolute(time, locale: locale, zone: job.timezone) ?? time) · \(job.timezone)"
-        }
+        "\(CronExpression.humanize(job.expr, lproj: locale)) · \(job.timezone)"
     }
 
     /// The right column: what happens NEXT, which is only a time when a time is
@@ -293,20 +277,6 @@ struct CronJobRowView: View {
             // making the reader do date arithmetic against today.
             return formatter.localizedString(for: date, relativeTo: Date())
         }
-    }
-
-    /// `nil` — so the caller shows the raw RFC 3339 — when the instant or the
-    /// zone will not parse. A `Z`-suffixed string is at least unambiguous; a
-    /// wall-clock rendered against the wrong zone is not.
-    private static func absolute(_ rfc3339: String, locale: String, zone: String) -> String? {
-        guard let date = Self.parse(rfc3339), let timeZone = TimeZone(identifier: zone) else {
-            return nil
-        }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: locale)
-        formatter.timeZone = timeZone
-        formatter.setLocalizedDateFormatFromTemplate("yMdjm")
-        return formatter.string(from: date)
     }
 
     /// The gateway stamps RFC 3339 with fractional seconds on some fields and

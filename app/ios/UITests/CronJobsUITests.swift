@@ -9,6 +9,10 @@ import XCTest
 /// that the screen resolves its rows out of the async load (a `nil`-vs-`[]`
 /// mix-up would show "no scheduled jobs" forever), that the prompt fallback
 /// reaches a titleless row, and that a tap crosses into the cron group.
+///
+/// Every fixture job is RECURRING, because the list is: a one-shot is dropped in
+/// `list_cron_jobs` and cannot reach this screen, so seeding one would fixture a
+/// state production does not produce.
 final class CronJobsUITests: BayboUITestCase {
     private static let liveJob = "Morning brief"
     private static let pausedJob = "Weekly digest"
@@ -26,9 +30,9 @@ final class CronJobsUITests: BayboUITestCase {
         return app
     }
 
-    /// Every live job, whatever shape: recurring and one-shot, enabled and not.
-    /// The status labels are the only thing separating a job that will run from
-    /// one that never will again, in a list that offers no way to ask.
+    /// Every live recurring job, running or paused. "Paused" is the only thing
+    /// separating a job that will fire from one that will not, so a row that
+    /// dropped it would read as live.
     func testMenuOpensTheJobListShowingEveryLiveJobAndItsState() throws {
         let app = openCronJobs()
 
@@ -54,7 +58,6 @@ final class CronJobsUITests: BayboUITestCase {
             "the row does not say the schedule in words with its timezone")
 
         XCTAssertTrue(app.staticTexts["Paused"].exists, "a disabled job must read as paused")
-        XCTAssertTrue(app.staticTexts["Done"].exists, "a spent one-shot must read as done")
     }
 
     /// Pause and resume are one toggle, so the swipe must offer the verb the row
@@ -87,20 +90,6 @@ final class CronJobsUITests: BayboUITestCase {
         XCTAssertTrue(
             app.staticTexts.matching(identifier: "Paused").count == 1,
             "resuming did not clear the row's paused label")
-    }
-
-    /// A one-shot that has already run can only be deleted: there is nothing to
-    /// pause, and resuming it is a 400 server-side (no future left in its
-    /// schedule), so the row must not offer a verb that cannot work.
-    func testASpentOneShotOffersOnlyDelete() throws {
-        let app = openCronJobs()
-        let spent = app.staticTexts[Self.namelessJob]
-        XCTAssertTrue(spent.waitForExistence(timeout: 5))
-        spent.swipeLeft()
-
-        XCTAssertTrue(app.buttons["Delete"].waitForExistence(timeout: 3))
-        XCTAssertFalse(app.buttons["Pause"].exists, "nothing to pause on a job that has run")
-        XCTAssertFalse(app.buttons["Resume"].exists, "resuming a spent one-shot cannot work")
     }
 
     /// Delete names the job and states the blast radius that is the MIRROR of the

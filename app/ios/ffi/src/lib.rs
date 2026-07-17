@@ -30,8 +30,8 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, CronScheduleSpec, FrameSink,
-    MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
+    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, FrameSink, MessageLookup,
+    PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};

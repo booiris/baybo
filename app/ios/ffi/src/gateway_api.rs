@@ -5,7 +5,7 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ChatSessionSummary, CronJobStatus, CronJobSummary, CronScheduleSpec};
+use crate::api::{ChatSessionSummary, CronJobStatus, CronJobSummary};
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_CRON: &str = "/v1/cron";
@@ -138,8 +138,13 @@ struct WireCronJob {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireCronSchedule {
-    Cron { expr: String },
-    At { time: String },
+    Cron {
+        expr: String,
+    },
+    /// A one-shot. Its `time` is deliberately not captured: the variant exists to
+    /// be RECOGNISED so `list_cron_jobs` can drop the row, and a field nothing
+    /// reads is a field that goes stale. Serde ignores the rest of the object.
+    At,
 }
 
 #[derive(Deserialize)]
@@ -279,18 +284,23 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
-/// The owner's LIVE scheduled jobs, newest-first as the gateway ordered them
-/// (`GET /v1/cron?channel=owner`).
+/// The owner's LIVE, RECURRING scheduled jobs, in the order the gateway returned
+/// them (`GET /v1/cron?channel=owner`).
 ///
-/// Two filters, both server-side, both deliberate:
+/// Three filters. Two are the server's, one is ours:
 ///
-/// - **live only** — the default. The recycle bin is a desktop affordance (it
-///   needs restore, which this read-only list does not offer), so a phone that
-///   listed deleted jobs could only tease them.
+/// - **live only** — the request's default. The recycle bin is a desktop
+///   affordance (it needs restore, which this list does not offer), so a phone
+///   that listed deleted jobs could only tease them.
 /// - **`channel=owner`** — the one channel whose fires this app can open. The
 ///   route is otherwise an unfiltered operator view spanning every channel, and
 ///   a `telegram` job's prompt has no business crossing to a phone that can
 ///   neither show its history nor act on it.
+/// - **recurring only** — dropped HERE rather than asked of the gateway, because
+///   unlike the other two it protects nothing and hides nothing: it is this
+///   list's identity. A one-shot (`{"kind":"at"}`) is a reminder — it fires once
+///   and is over — while this list is what runs on a repeat, and every verb it
+///   offers (pause, resume) is meaningless on a moment that has passed.
 pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
     client: &C,
 ) -> Result<Vec<CronJobSummary>, String> {
@@ -301,22 +311,24 @@ pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
     Ok(list
         .items
         .into_iter()
-        .map(|job| CronJobSummary {
-            id: job.id,
-            title: job.title,
-            prompt: job.prompt,
-            schedule: match job.schedule {
-                WireCronSchedule::Cron { expr } => CronScheduleSpec::Recurring { expr },
-                WireCronSchedule::At { time } => CronScheduleSpec::Once { time },
-            },
-            timezone: job.timezone,
-            status: match job.status {
-                WireCronStatus::Enabled => CronJobStatus::Enabled,
-                WireCronStatus::Disabled => CronJobStatus::Disabled,
-                WireCronStatus::Executed => CronJobStatus::Executed,
-            },
-            next_trigger_at: job.next_trigger_at,
-            last_triggered_at: job.last_triggered_at,
+        .filter_map(|job| {
+            let WireCronSchedule::Cron { expr } = job.schedule else {
+                return None;
+            };
+            Some(CronJobSummary {
+                id: job.id,
+                title: job.title,
+                prompt: job.prompt,
+                expr,
+                timezone: job.timezone,
+                status: match job.status {
+                    WireCronStatus::Enabled => CronJobStatus::Enabled,
+                    WireCronStatus::Disabled => CronJobStatus::Disabled,
+                    WireCronStatus::Executed => CronJobStatus::Executed,
+                },
+                next_trigger_at: job.next_trigger_at,
+                last_triggered_at: job.last_triggered_at,
+            })
         })
         .collect())
 }
@@ -1070,20 +1082,27 @@ mod tests {
     }
 
     /// Both schedule kinds ride the same list — the user asked for every live
-    /// job, so a one-shot `at` job must not be dropped or mangled into an expr.
+    /// Every recurring job survives with its fields intact, and a one-shot is
+    /// dropped whole — never mangled into an expression, never counted.
     #[tokio::test]
-    async fn list_cron_jobs_maps_both_schedule_kinds_and_every_status() {
+    async fn list_cron_jobs_carries_recurring_jobs_and_drops_one_shots() {
         let client = RecordingClient::new(
             r#"{"items":[
                 {"id":"j1","title":"Morning brief","prompt":"Summarize","schedule":{"kind":"cron","expr":"0 9 * * *"},"timezone":"Asia/Shanghai","status":"enabled","next_trigger_at":"2026-07-18T01:00:00Z","last_triggered_at":"2026-07-17T01:00:00Z"},
-                {"id":"j2","title":"","prompt":"One shot","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
-                {"id":"j3","title":"Paused","prompt":"p","schedule":{"kind":"cron","expr":"@daily"},"timezone":"UTC","status":"disabled"}
+                {"id":"j2","title":"A reminder","prompt":"One shot","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
+                {"id":"j3","title":"","prompt":"p","schedule":{"kind":"cron","expr":"0 18 * * FRI"},"timezone":"UTC","status":"disabled"}
             ]}"#,
         );
         let jobs = list_cron_jobs(&client).await.expect("list");
 
-        assert_eq!(jobs.len(), 3);
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["j1", "j3"],
+            "a one-shot is a reminder, not a schedule this list manages",
+        );
+
         assert_eq!(jobs[0].title, "Morning brief");
+        assert_eq!(jobs[0].expr, "0 9 * * *");
         assert_eq!(jobs[0].timezone, "Asia/Shanghai");
         assert_eq!(jobs[0].status, CronJobStatus::Enabled);
         assert_eq!(
@@ -1094,22 +1113,29 @@ mod tests {
             jobs[0].last_triggered_at.as_deref(),
             Some("2026-07-17T01:00:00Z")
         );
-        assert!(
-            matches!(&jobs[0].schedule, CronScheduleSpec::Recurring { expr } if expr == "0 9 * * *"),
-        );
 
         // A legacy row: no title, and the list falls back to the prompt — so the
         // empty string must survive rather than becoming a `None` nobody checks.
         assert_eq!(jobs[1].title, "");
-        assert_eq!(jobs[1].prompt, "One shot");
-        assert_eq!(jobs[1].status, CronJobStatus::Executed);
-        assert!(
-            matches!(&jobs[1].schedule, CronScheduleSpec::Once { time } if time == "2026-07-20T10:00:00Z"),
-        );
-        // A one-shot that ran, and a paused job, both have nothing coming.
+        assert_eq!(jobs[1].prompt, "p");
+        // Paused: it keeps its expression and has nothing coming.
+        assert_eq!(jobs[1].expr, "0 18 * * FRI");
+        assert_eq!(jobs[1].status, CronJobStatus::Disabled);
         assert_eq!(jobs[1].next_trigger_at, None);
-        assert_eq!(jobs[2].status, CronJobStatus::Disabled);
-        assert_eq!(jobs[2].next_trigger_at, None);
+    }
+
+    /// A list of nothing but one-shots is EMPTY — not a decode error, and not a
+    /// list of holes. `[]` is what the screen renders "no scheduled jobs" from.
+    #[tokio::test]
+    async fn a_list_of_only_one_shots_comes_back_empty() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"j1","title":"Renew the cert","prompt":"x","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
+                {"id":"j2","title":"Call mum","prompt":"y","schedule":{"kind":"at","time":"2026-08-01T10:00:00Z"},"timezone":"UTC","status":"enabled"}
+            ]}"#,
+        );
+        let jobs = list_cron_jobs(&client).await.expect("list");
+        assert!(jobs.is_empty(), "got {jobs:?}");
     }
 
     #[tokio::test]
