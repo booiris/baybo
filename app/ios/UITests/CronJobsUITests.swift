@@ -57,6 +57,84 @@ final class CronJobsUITests: BayboUITestCase {
         XCTAssertTrue(app.staticTexts["Done"].exists, "a spent one-shot must read as done")
     }
 
+    /// Pause and resume are one toggle, so the swipe must offer the verb the row
+    /// is NOT already in — the demo's mutations resolve locally, so what is under
+    /// test is the flip reaching the row and the swipe re-reading it.
+    func testPauseAndResumeFlipTheRow() throws {
+        let app = openCronJobs()
+        let live = app.staticTexts[Self.liveJob]
+        XCTAssertTrue(live.waitForExistence(timeout: 5))
+        // COUNTED, not merely present: the fixture already contains one paused
+        // job, so "is there a Paused label" is true before this test does
+        // anything and would pass a resume that did nothing.
+        let pausedLabels = app.staticTexts.matching(identifier: "Paused")
+        XCTAssertEqual(pausedLabels.count, 1, "the fixture's own paused job")
+
+        live.swipeLeft()
+        let pause = app.buttons["Pause"]
+        XCTAssertTrue(pause.waitForExistence(timeout: 3), "a live job offers no Pause")
+        pause.tap()
+        XCTAssertTrue(
+            app.staticTexts.matching(identifier: "Paused").count == 2,
+            "pausing did not mark the row paused")
+
+        // Now paused, the same swipe must offer the other verb.
+        live.swipeLeft()
+        let resume = app.buttons["Resume"]
+        XCTAssertTrue(resume.waitForExistence(timeout: 3), "a paused job offers no Resume")
+        XCTAssertFalse(app.buttons["Pause"].exists, "a paused job must not offer Pause too")
+        resume.tap()
+        XCTAssertTrue(
+            app.staticTexts.matching(identifier: "Paused").count == 1,
+            "resuming did not clear the row's paused label")
+    }
+
+    /// A one-shot that has already run can only be deleted: there is nothing to
+    /// pause, and resuming it is a 400 server-side (no future left in its
+    /// schedule), so the row must not offer a verb that cannot work.
+    func testASpentOneShotOffersOnlyDelete() throws {
+        let app = openCronJobs()
+        let spent = app.staticTexts[Self.namelessJob]
+        XCTAssertTrue(spent.waitForExistence(timeout: 5))
+        spent.swipeLeft()
+
+        XCTAssertTrue(app.buttons["Delete"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["Pause"].exists, "nothing to pause on a job that has run")
+        XCTAssertFalse(app.buttons["Resume"].exists, "resuming a spent one-shot cannot work")
+    }
+
+    /// Delete names the job and states the blast radius that is the MIRROR of the
+    /// group delete's: the schedule stops, the history stays.
+    func testDeleteConfirmsByNameThenRemovesTheJob() throws {
+        let app = openCronJobs()
+        let doomed = app.staticTexts[Self.pausedJob]
+        XCTAssertTrue(doomed.waitForExistence(timeout: 5))
+        doomed.swipeLeft()
+
+        let delete = app.buttons["Delete"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3), "the job swipe revealed no Delete")
+        delete.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["Delete this scheduled job?"].waitForExistence(timeout: 3),
+            "the job delete confirm did not present")
+        XCTAssertTrue(
+            app.staticTexts.matching(
+                NSPredicate(format: "label CONTAINS %@", "“\(Self.pausedJob)”")
+            ).firstMatch.exists,
+            "the confirm does not name the job it will stop")
+        XCTAssertTrue(
+            app.staticTexts.matching(
+                NSPredicate(format: "label CONTAINS[c] %@", "records it has already produced are kept")
+            ).firstMatch.exists,
+            "the confirm does not say the execution records survive")
+
+        try dialogCommit(app, "Delete").tap()
+        XCTAssertTrue(
+            doomed.waitForNonExistence(timeout: 3), "the confirmed delete kept the job listed")
+        XCTAssertTrue(app.staticTexts[Self.liveJob].exists, "it took an unrelated job with it")
+    }
+
     /// A job that has never fired has no cron group to open — the group is a view
     /// over fires that do not exist. It must still say so in its own name rather
     /// than showing a blank page under a generic title: the jobs list is the only

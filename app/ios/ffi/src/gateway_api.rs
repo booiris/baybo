@@ -321,6 +321,41 @@ pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
+/// Pause or resume a scheduled job (`POST /v1/cron/{id}/pause|resume`).
+///
+/// Paused, the job keeps its schedule and loses its next trigger; resumed, the
+/// gateway recomputes that trigger **from now** and does not backfill the slots
+/// it slept through. Resuming a one-shot whose moment has passed is a 400 — its
+/// schedule has no future left — which is why the phone offers neither verb on a
+/// job that has already run.
+pub(crate) async fn set_cron_paused<C: GatewayJsonClient + Sync>(
+    client: &C,
+    job_id: String,
+    paused: bool,
+) -> Result<(), String> {
+    validate_path_segment(&job_id, "job_id")?;
+    let action = if paused { "pause" } else { "resume" };
+    let path = format!("{PATH_CRON}/{job_id}/{action}");
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// Delete a scheduled job (`DELETE /v1/cron/{id}`) — a SOFT delete: the row goes
+/// to the recycle bin (`deleted_at`), stops firing, and is restorable from the
+/// web dashboard.
+///
+/// Its execution records are NOT touched. They are ordinary sessions and outlive
+/// the job that made them, so the chat list keeps showing that history under the
+/// title each fire snapshotted. (Deleting the *group* is the opposite gesture:
+/// see `chat_hide_many` — it clears the records and leaves the job running.)
+pub(crate) async fn delete_cron_job<C: GatewayJsonClient + Sync>(
+    client: &C,
+    job_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&job_id, "job_id")?;
+    let path = format!("{PATH_CRON}/{job_id}");
+    client.delete_empty(&path).await
+}
+
 pub(crate) async fn set_archived<C: GatewayJsonClient + Sync>(
     client: &C,
     session_id: String,
@@ -1107,6 +1142,63 @@ mod tests {
                 body: r#"{"session_ids":["s1","s2"]}"#.to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn pausing_and_resuming_a_cron_job_post_their_own_verbs() {
+        let client = RecordingClient::empty();
+        set_cron_paused(&client, "j1".to_string(), true)
+            .await
+            .expect("pause");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/cron/j1/pause".to_string(),
+                body: String::new(),
+            }
+        );
+
+        let client = RecordingClient::empty();
+        set_cron_paused(&client, "j1".to_string(), false)
+            .await
+            .expect("resume");
+        assert_eq!(client.only_call().path, "/v1/cron/j1/resume");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_cron_job_deletes_the_job_path_not_a_session() {
+        let client = RecordingClient::empty();
+        delete_cron_job(&client, "j1".to_string())
+            .await
+            .expect("delete");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "DELETE",
+                path: "/v1/cron/j1".to_string(),
+                body: String::new(),
+            }
+        );
+    }
+
+    /// A job id reaches the gateway as a PATH segment, so it gets the same
+    /// traversal guard `set_cron_pinned` has — nothing about these verbs makes
+    /// the id trustworthier.
+    #[tokio::test]
+    async fn cron_mutations_reject_a_path_traversing_job_id() {
+        let client = RecordingClient::empty();
+        assert!(
+            set_cron_paused(&client, "../../v1/chat/sessions".to_string(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            delete_cron_job(&client, "../../v1/chat/sessions".to_string())
+                .await
+                .is_err()
+        );
+        assert!(client.calls.lock().is_empty());
     }
 
     /// The confirm dialog snapshots the visible members, so an empty snapshot is

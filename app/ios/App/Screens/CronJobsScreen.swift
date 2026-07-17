@@ -23,21 +23,21 @@ struct CronJobsScreen: View {
     @ObservedObject private var lang = Lang.shared
     @Environment(\.dismiss) private var dismiss
 
-    /// Nil while the first load is in flight — distinct from `[]`, which is the
-    /// proven-empty answer. Only the latter may claim "no scheduled jobs".
-    @State private var jobs: [CronJobSummary]?
-    @State private var failure: String?
+    /// Whether the FIRST load failed. A later refresh that fails keeps the rows
+    /// it has and says so on the notice line instead — a pull-to-refresh with no
+    /// signal must not empty the list it just showed.
+    @State private var failed = false
 
     var body: some View {
         ZStack(alignment: .top) {
             Group {
-                if let jobs {
+                if let jobs = appStore.cronJobs {
                     if jobs.isEmpty {
                         message(lang.t("cronJobs.empty"))
                     } else {
                         jobList(jobs)
                     }
-                } else if failure != nil {
+                } else if failed {
                     message(lang.t("cronJobs.failed"))
                 } else {
                     ProgressView().tint(Theme.inkSoft)
@@ -80,6 +80,14 @@ struct CronJobsScreen: View {
             }
             .padding(.horizontal, 24)
             .frame(height: ChatHeaderView.barHeight)
+
+            if let notice = appStore.cronJobNotice {
+                Text(verbatim: notice)
+                    .font(Theme.mono(12))
+                    .foregroundStyle(Theme.err)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
         }
         .frame(maxWidth: .infinity)
         .background(alignment: .top) { veil }
@@ -102,6 +110,32 @@ struct CronJobsScreen: View {
                 .listRowBackground(Theme.paper)
                 .listRowSeparatorTint(Theme.line)
                 .listRowInsets(EdgeInsets(top: 0, leading: 24, bottom: 0, trailing: 24))
+                // Not a full swipe: delete is destructive, and pause is a state
+                // flip on a thing that runs unattended — both want the tap.
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    // A spent one-shot is offered neither verb: there is nothing
+                    // to pause, and resuming it is a 400 server-side (its
+                    // schedule has no future left). Only delete applies.
+                    if job.status != .executed {
+                        let paused = job.status == .disabled
+                        Button {
+                            Haptics.tap()
+                            appStore.requestCronPaused(job.id, paused: !paused)
+                        } label: {
+                            Label(
+                                lang.t(paused ? "cronJobs.resume" : "cronJobs.pause"),
+                                systemImage: paused ? "play.circle" : "pause.circle")
+                        }
+                        .tint(Theme.inkSoft)
+                    }
+                    Button(role: .destructive) {
+                        appStore.promptDeleteCronJob(
+                            job.id, name: CronJobRowView.headline(job))
+                    } label: {
+                        Label(lang.t("list.delete"), systemImage: "trash")
+                    }
+                    .tint(Theme.err)
+                }
             }
         }
         .listStyle(.plain)
@@ -124,15 +158,37 @@ struct CronJobsScreen: View {
         .frame(maxWidth: .infinity)
     }
 
-    /// A reload keeps the rows it already has on screen: a pull-to-refresh that
-    /// failed should say so without also emptying the list it just showed.
+    /// A failed reload keeps the rows it already has: a pull-to-refresh with no
+    /// signal must not empty the list it just showed. Only a first load with
+    /// nothing to fall back on gets the failure page.
     private func load() async {
         do {
-            jobs = try await appStore.loadCronJobs()
-            failure = nil
+            try await appStore.loadCronJobs()
+            failed = false
+            appStore.cronJobNotice = nil
         } catch {
-            failure = bayboErrorText(error)
+            if appStore.cronJobs == nil {
+                failed = true
+            } else {
+                appStore.cronJobNotice = lang.t("cronJobs.failed")
+            }
         }
+    }
+}
+
+extension CronJobSummary {
+    /// A copy with a new run state. UniFFI records are immutable (`let` fields),
+    /// so an optimistic flip mints one rather than mutating in place.
+    func with(status: CronJobStatus, nextTriggerAt: String?) -> CronJobSummary {
+        CronJobSummary(
+            id: id,
+            title: title,
+            prompt: prompt,
+            schedule: schedule,
+            timezone: timezone,
+            status: status,
+            nextTriggerAt: nextTriggerAt,
+            lastTriggeredAt: lastTriggeredAt)
     }
 }
 

@@ -218,6 +218,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatHideSession(sessionId: String) async throws { throw Self.unsupported }
     func chatHideMany(sessionIds: [String]) async throws { throw Self.unsupported }
     func chatListCronJobs() async throws -> [CronJobSummary] { throw Self.unsupported }
+    func chatSetCronPaused(jobId: String, paused: Bool) async throws { throw Self.unsupported }
+    func chatDeleteCronJob(jobId: String) async throws { throw Self.unsupported }
     func chatListSessions() async throws -> [ChatSessionSummary] { throw Self.unsupported }
     func chatSetArchived(sessionId: String, archived: Bool) async throws { throw Self.unsupported }
     func chatSetPinned(sessionId: String, pinned: Bool) async throws { throw Self.unsupported }

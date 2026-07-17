@@ -350,6 +350,46 @@ impl BayboClient {
         .await
     }
 
+    /// Pause or resume a scheduled job, from the cron job list.
+    ///
+    /// Resuming recomputes the next trigger from NOW — a job paused over a
+    /// weekend does not fire five times on Monday. Resuming a one-shot that has
+    /// already run fails: there is no future left in its schedule.
+    pub async fn chat_set_cron_paused(
+        self: Arc<Self>,
+        job_id: String,
+        paused: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_cron_paused(&client, job_id, paused).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_cron_paused(&relay::GatewayApi, job_id, paused).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Delete a scheduled job — soft, into the gateway's recycle bin, restorable
+    /// from the web dashboard. The job stops firing; the conversations it already
+    /// produced are ordinary sessions and stay exactly where they are.
+    pub async fn chat_delete_cron_job(self: Arc<Self>, job_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::delete_cron_job(&client, job_id).await
+                }
+                ActiveLeg::Relay => gateway_api::delete_cron_job(&relay::GatewayApi, job_id).await,
+            }
+        })
+        .await
+    }
+
     /// Soft-hide every named session in one round-trip (`POST
     /// /v1/chat/sessions/hide`) — same guarantee as `chat_hide_session`, once per
     /// id: the gateway sets `hidden` and every row survives.

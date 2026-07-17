@@ -88,6 +88,27 @@ struct RootView: View {
                 .zIndex(1)
             }
 
+            // Deleting the JOB is the mirror of deleting its group, so the body
+            // states the opposite blast radius: the schedule stops, the history
+            // stays. It names the job, because the list is the only place these
+            // are told apart and this dialog covers it.
+            if let pending = store.confirmDeleteCronJob {
+                ConfirmDialog(
+                    titleKey: "cronJobs.deleteConfirmTitle",
+                    bodyKey: "cronJobs.deleteConfirmBody",
+                    bodyArg: pending.name,
+                    destructiveKey: "list.delete",
+                    onCancel: dismissDeleteCronJobConfirm,
+                    onConfirm: {
+                        dismissDeleteCronJobConfirm()
+                        withAnimation {
+                            store.requestDeleteCronJob(pending.jobId)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
+
             // A cron group's delete clears its execution records — never the job
             // — so the body says so, and counts them: the group is a view over
             // its fires, and "delete" hiding N conversations is exactly the kind
@@ -123,6 +144,12 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissDeleteCronJobConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmDeleteCronJob = nil
         }
     }
 

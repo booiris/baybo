@@ -49,6 +49,14 @@ final class AppStore: ObservableObject {
         case cronJobs
     }
 
+    /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
+    /// so the dialog can say WHICH job it is about to stop — the list is the only
+    /// place these are told apart, and the dialog covers it.
+    struct PendingCronJobDelete: Equatable {
+        let jobId: String
+        let name: String
+    }
+
     /// A cron group's delete, waiting on the confirm dialog.
     ///
     /// The members are **snapshotted when the dialog opens**, and the confirm
@@ -112,6 +120,24 @@ final class AppStore: ObservableObject {
     /// Job id → name, learned from the scheduled-jobs list. See
     /// `rememberCronJobTitles`.
     @Published private(set) var cronJobTitles: [String: String] = [:]
+    /// The scheduled job a swipe-delete is asking to confirm.
+    @Published var confirmDeleteCronJob: PendingCronJobDelete?
+    /// The scheduled-jobs list `CronJobsScreen` renders.
+    ///
+    /// Held here rather than in the screen's `@State` for the reason the chat
+    /// list's rows are in `SessionIndex`: the delete confirm mounts at the app
+    /// root (it must dim the whole shell), so the rows it removes have to be
+    /// reachable from outside the screen. `nil` = never loaded; `[]` = proven
+    /// empty — only the latter may say "no scheduled jobs".
+    ///
+    /// In memory only. It is re-fetched on every appear, so what survives here is
+    /// one screen's worth of rows to paint while that lands — not a cache that
+    /// can outlive the app and disagree with the gateway about what is scheduled.
+    @Published private(set) var cronJobs: [CronJobSummary]?
+    /// A cron mutation that failed, rendered by the jobs screen. Its own line, not
+    /// `sessionNotice`: that belongs to the chat list's mutations, and would
+    /// surface this on a screen the user already left.
+    @Published var cronJobNotice: String?
     /// Transient archive/delete failure line, rendered by the list headers the
     /// way compose failures are. Cleared when the next mutation starts.
     @Published var sessionNotice: String?
@@ -588,17 +614,95 @@ final class AppStore: ObservableObject {
     /// so this neither caches nor writes a `sessionNotice` (which belongs to the
     /// chat list's own mutations and would surface a cron error on a screen the
     /// user already left).
+    @discardableResult
     func loadCronJobs() async throws -> [CronJobSummary] {
         #if DEBUG
             if demoHomeMode {
                 let demo = Self.demoCronJobs()
                 rememberCronJobTitles(demo)
+                cronJobs = demo
                 return demo
             }
         #endif
         let jobs = try await Baybo.client.chatListCronJobs()
         rememberCronJobTitles(jobs)
+        cronJobs = jobs
         return jobs
+    }
+
+    /// Pause or resume a job: flip the row now, send, and take the list back from
+    /// the gateway on success.
+    ///
+    /// That refetch is not belt-and-braces. Resuming recomputes the next trigger
+    /// **server-side** (from now — a job paused over a weekend must not fire five
+    /// times on Monday), and only the scheduler can say when that is. The
+    /// optimistic row therefore carries no next trigger at all until the refetch
+    /// lands, rather than a stale one it has no way to recompute.
+    func requestCronPaused(_ jobId: String, paused: Bool) {
+        cronJobNotice = nil
+        let rollback = cronJobs
+        applyCronPause(jobId, paused: paused)
+        #if DEBUG
+            if demoHomeMode { return }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatSetCronPaused(jobId: jobId, paused: paused)
+                // Already applied; a failure to REFETCH leaves the optimistic row
+                // standing (it is right about the status) and the next appear
+                // reconciles the trigger.
+                try? await loadCronJobs()
+            } catch {
+                cronJobs = rollback
+                cronJobNotice = Lang.shared.t(
+                    paused ? "cronJobs.pauseFailed" : "cronJobs.resumeFailed")
+            }
+        }
+    }
+
+    /// Raise the delete confirm for a swiped job.
+    func promptDeleteCronJob(_ jobId: String, name: String) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmDeleteCronJob = PendingCronJobDelete(jobId: jobId, name: name)
+        }
+    }
+
+    /// Delete a scheduled job, after the confirm: drop the row and send.
+    ///
+    /// The job stops firing and goes to the gateway's recycle bin. Its execution
+    /// records are untouched — they are ordinary conversations, and the chat list
+    /// keeps showing them under the title each fire snapshotted. (The mirror
+    /// gesture, deleting the GROUP, clears those records and leaves the job
+    /// running: `requestDeleteGroup`.)
+    func requestDeleteCronJob(_ jobId: String) {
+        cronJobNotice = nil
+        let rollback = cronJobs
+        cronJobs?.removeAll { $0.id == jobId }
+        #if DEBUG
+            if demoHomeMode { return }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatDeleteCronJob(jobId: jobId)
+            } catch {
+                cronJobs = rollback
+                cronJobNotice = Lang.shared.t("cronJobs.deleteFailed")
+            }
+        }
+    }
+
+    /// Both directions drop the next trigger: pausing because the gateway does,
+    /// and resuming because the new one is the scheduler's to compute.
+    ///
+    /// So a paused row reads "Paused" at once, while a resumed one shows an empty
+    /// meta column for the round trip it takes the refetch to land. That blank is
+    /// deliberate: the honest answer to "when does this next run" is not yet
+    /// known here, and the alternatives are inventing a time or showing the stale
+    /// one the job had before it was ever paused.
+    private func applyCronPause(_ jobId: String, paused: Bool) {
+        guard let index = cronJobs?.firstIndex(where: { $0.id == jobId }) else { return }
+        cronJobs?[index] = cronJobs![index].with(
+            status: paused ? .disabled : .enabled, nextTriggerAt: nil)
     }
 
     /// A job's name, kept so `CronGroupScreen` can title itself for a job whose
