@@ -63,7 +63,7 @@ fn lineage_kind_str(s: &Session) -> Option<&'static str> {
 /// one place. `User`/`Cron` sources are always `Role::User` (their constructor
 /// sets the role), so for those the stored role is redundant and the source
 /// wins; an `Agent` source dispatches on the role.
-fn rehydrate_message(
+pub(super) fn rehydrate_message(
     role: &str,
     content: Vec<baybo_model::ContentBlock>,
     source: &str,
@@ -580,6 +580,7 @@ impl SessionStore for SqliteSessionStore {
         let now_us = super::time::to_us(chrono::Utc::now());
         let source = message.source().as_str().to_string();
         let platform_msg_id = message.platform_msg_id().to_string();
+        let indexed = message.clone();
         // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1 … RETURNING` keeps
         // ordinals contiguous without an explicit sequence and hands
         // back the assigned value in one round trip. The actor model
@@ -587,7 +588,11 @@ impl SessionStore for SqliteSessionStore {
         // append race to defend against here.
         self.pool
             .interact("sessions.append_session_message", move |conn| {
-                let ordinal: i64 = conn
+                // The FTS mirror must be atomic with the row: a crash between
+                // the two leaves the message permanently unsearchable, and
+                // nothing downstream can detect the gap.
+                let tx = conn.transaction()?;
+                let ordinal: i64 = tx
                     .query_row(
                         "INSERT INTO session_messages \
                      (session_id, ordinal, role, content, created_at, source, platform_msg_id) \
@@ -601,6 +606,8 @@ impl SessionStore for SqliteSessionStore {
                     .ok_or_else(|| {
                         anyhow::anyhow!("INSERT … RETURNING returned no rows for session_messages")
                     })?;
+                super::search::index_row(&tx, &sid, ordinal, &indexed)?;
+                tx.commit()?;
                 Ok(ordinal)
             })
             .await
@@ -626,9 +633,11 @@ impl SessionStore for SqliteSessionStore {
         let source_event_id = source_event_id.to_string();
         let source = message.source().as_str().to_string();
         let platform_msg_id = message.platform_msg_id().to_string();
+        let indexed = message.clone();
         self.pool
             .interact("sessions.append_session_message_idempotent", move |conn| {
-                let inserted: Option<i64> = conn
+                let tx = conn.transaction()?;
+                let inserted: Option<i64> = tx
                     .query_row(
                         "INSERT INTO session_messages \
                          (session_id, ordinal, role, content, created_at, source, \
@@ -651,10 +660,15 @@ impl SessionStore for SqliteSessionStore {
                     .optional()?;
 
                 if let Some(ordinal) = inserted {
+                    super::search::index_row(&tx, &session_id, ordinal, &indexed)?;
+                    tx.commit()?;
                     return Ok(SessionMessageAppendOutcome::Inserted { ordinal });
                 }
 
-                let ordinal: i64 = conn
+                // `Existing` means the row — and therefore its index entry — was
+                // written by the first delivery of this source event. Indexing
+                // here would duplicate it.
+                let ordinal: i64 = tx
                     .query_row(
                         "SELECT ordinal FROM session_messages \
                          WHERE session_id = ?1 AND source_event_id = ?2",
@@ -667,6 +681,7 @@ impl SessionStore for SqliteSessionStore {
                             "idempotent session_message insert returned no row and no existing key"
                         )
                     })?;
+                tx.commit()?;
                 Ok(SessionMessageAppendOutcome::Existing { ordinal })
             })
             .await
@@ -784,18 +799,30 @@ impl SessionStore for SqliteSessionStore {
         let session_param = session_id.as_str().to_string();
         // Serialize the message contents up front: a failure here is a
         // `StorageError::Storage`, which the pool's `anyhow` closure can't
-        // build.
-        let mut prepared: Vec<(String, String, String, String)> =
-            Vec::with_capacity(new_active.len());
+        // build. `segmented` rides along for the same reason the row does —
+        // deriving it inside the closure would mean carrying `ChatMessage` in.
+        struct PreparedRow {
+            role: String,
+            content: String,
+            source: String,
+            platform_msg_id: String,
+            /// `None` for a row a chat surface never renders — the reseeded
+            /// system prompt that compaction writes is exactly that.
+            segmented: Option<String>,
+        }
+        let mut prepared: Vec<PreparedRow> = Vec::with_capacity(new_active.len());
         for msg in new_active {
             let content = serde_json::to_string(&msg.content)
                 .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
-            prepared.push((
-                msg.role.as_str().to_string(),
+            prepared.push(PreparedRow {
+                role: msg.role.as_str().to_string(),
                 content,
-                msg.source().as_str().to_string(),
-                msg.platform_msg_id().to_string(),
-            ));
+                source: msg.source().as_str().to_string(),
+                platform_msg_id: msg.platform_msg_id().to_string(),
+                segmented: super::search::indexable_text(msg)
+                    .as_deref()
+                    .map(super::search::segment),
+            });
         }
 
         self.pool
@@ -833,7 +860,8 @@ impl SessionStore for SqliteSessionStore {
                     );
                     let mut params: Vec<rusqlite::types::Value> =
                         Vec::with_capacity(chunk.len() * COLS_PER_ROW);
-                    for (i, (role, content, source, platform_msg_id)) in chunk.iter().enumerate() {
+                    let mut fts: Vec<(i64, &str)> = Vec::new();
+                    for (i, row) in chunk.iter().enumerate() {
                         if i > 0 {
                             sql.push_str(", ");
                         }
@@ -851,15 +879,25 @@ impl SessionStore for SqliteSessionStore {
                         let ordinal = next_ordinal + (chunk_idx * ROWS_PER_BATCH) as i64 + i as i64;
                         params.push(rusqlite::types::Value::Text(session_param.clone()));
                         params.push(rusqlite::types::Value::Integer(ordinal));
-                        params.push(rusqlite::types::Value::Text(role.clone()));
-                        params.push(rusqlite::types::Value::Text(content.clone()));
+                        params.push(rusqlite::types::Value::Text(row.role.clone()));
+                        params.push(rusqlite::types::Value::Text(row.content.clone()));
                         params.push(rusqlite::types::Value::Integer(now_us));
-                        params.push(rusqlite::types::Value::Text(source.clone()));
-                        params.push(rusqlite::types::Value::Text(platform_msg_id.clone()));
+                        params.push(rusqlite::types::Value::Text(row.source.clone()));
+                        params.push(rusqlite::types::Value::Text(row.platform_msg_id.clone()));
+                        if let Some(segmented) = row.segmented.as_deref() {
+                            fts.push((ordinal, segmented));
+                        }
                     }
                     tx.execute(&sql, rusqlite::params_from_iter(params))?;
+                    for (ordinal, segmented) in fts {
+                        super::search::index_segmented(&tx, &session_param, ordinal, segmented)?;
+                    }
                 }
 
+                // The `superseded_by` UPDATE above deliberately leaves
+                // `message_fts` alone: pre-compaction originals stay indexed, or
+                // search would go blind exactly where a session got long enough
+                // to be worth searching. See `docs/search.md`.
                 tx.commit()?;
                 Ok(())
             })

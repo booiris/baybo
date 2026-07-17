@@ -9,8 +9,8 @@ pub mod test_support;
 // import them from `baybo_store` directly, not via this adapter.
 use baybo_store::{
     AgentProfileStore, BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore,
-    CostStore, CronStore, DeviceStore, JobStore, SecretStore, SessionFolderStore, SessionStore,
-    SessionSummaryStore, SkillRiskStore, TaskStore, TraceStore,
+    CostStore, CronStore, DeviceStore, JobStore, MessageSearchStore, SecretStore,
+    SessionFolderStore, SessionStore, SessionSummaryStore, SkillRiskStore, TaskStore, TraceStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -23,6 +23,7 @@ use baybo_store::{
 #[derive(Clone)]
 pub struct Store {
     pub session: std::sync::Arc<dyn SessionStore>,
+    pub message_search: std::sync::Arc<dyn MessageSearchStore>,
     pub session_summary: std::sync::Arc<dyn SessionSummaryStore>,
     pub session_folder: std::sync::Arc<dyn SessionFolderStore>,
     pub task: std::sync::Arc<dyn TaskStore>,
@@ -67,6 +68,9 @@ impl Store {
         let agent_profile = sqlite::SqliteAgentProfileStore::open(pool.clone()).await?;
         Ok(Self {
             session: std::sync::Arc::new(sqlite::SqliteSessionStore::new(pool.clone())),
+            message_search: std::sync::Arc::new(sqlite::SqliteMessageSearchStore::new(
+                pool.clone(),
+            )),
             session_summary: std::sync::Arc::new(sqlite::SqliteSessionSummaryStore::new(
                 pool.clone(),
             )),

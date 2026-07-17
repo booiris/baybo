@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod device;
 mod job;
+mod search;
 mod secret;
 mod session;
 mod session_folder;
@@ -25,6 +26,7 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use device::SqliteDeviceStore;
 pub use job::SqliteJobStore;
+pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
 pub use session_folder::SqliteSessionFolderStore;
@@ -337,6 +339,18 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
                     ON session_messages(session_id, ordinal)
                     WHERE superseded_by IS NULL;
+
+                -- Identity of the pipeline that produced `message_fts`, so a
+                -- changed segmenter rebuilds instead of leaving half the index
+                -- speaking a different alphabet than the queries. `message_fts`
+                -- itself is NOT created here: it is dropped and recreated by
+                -- `search::rebuild_if_stale` off this fingerprint, because
+                -- `CREATE ... IF NOT EXISTS` cannot migrate a column onto a table
+                -- that already exists. See `docs/search.md`.
+                CREATE TABLE IF NOT EXISTS search_meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
 
                 -- Out-of-band events shown in the chat transcript but NOT part
                 -- of the LLM conversation: a user's control-command echo
@@ -762,6 +776,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
             WHERE json_extract(data, '$.channel') IN ('http', 'device');",
     )
     .map_err(|e| anyhow::anyhow!("owner-channel collapse migration failed: {e}"))?;
+
+    search::rebuild_if_stale(conn)
+        .map_err(|e| anyhow::anyhow!("search index rebuild failed: {e}"))?;
 
     Ok(())
 }

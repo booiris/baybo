@@ -448,6 +448,27 @@ impl ChatMessage {
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
     }
+
+    /// `true` when this row's prose belongs in the full-text index: everything
+    /// a human authored or an agent said, across every session — a subagent's
+    /// own run and a cron fire's are as searchable as a chat. Scope is the
+    /// caller's job, off `message_fts.channel`; see `docs/search.md`.
+    ///
+    /// What stays out is text nobody composed as a turn: the system prompt and
+    /// skill reminders and `<system-reminder>` blocks
+    /// ([`MessageSource::Agent`] on a non-assistant role), recalled memories
+    /// ([`MessageSource::RecalledMemory`], whose text the memory backend already
+    /// owns, so indexing it stores the same prose twice), and tool output
+    /// (`Role::Tool`, which cannot be ranked beside prose — a tool row runs five
+    /// orders of magnitude longer than a typed question and `bm25` weights
+    /// columns, not rows).
+    ///
+    /// Neither field decides this alone: [`MessageSource::Agent`] covers both
+    /// assistant output (a real turn) and the system prompt (not one), and
+    /// `Role::User` covers both a typed prompt and an injected reminder.
+    pub fn is_searchable(&self) -> bool {
+        self.from_user() || self.role == Role::Assistant || self.source == MessageSource::Cron
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
