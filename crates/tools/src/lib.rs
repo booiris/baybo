@@ -595,6 +595,13 @@ pub trait RunningChild: Send {
     async fn wait(&mut self) -> i32;
     /// Request termination (best-effort). The escort calls this on cancel.
     fn start_kill(&mut self);
+    /// The host process-group id (== leader pid) for an unsandboxed child in
+    /// its own group, so the runtime can persist it for crash-safe boot reaping.
+    /// `None` for children with no host group to reap directly (sandboxed
+    /// docker/bwrap children, reaped by their backend's own teardown).
+    fn process_group_id(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// [`RunningChild`] over a plain [`tokio::process::Child`] — the
