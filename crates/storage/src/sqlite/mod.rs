@@ -45,6 +45,22 @@ use deadpool_sqlite::{Config, Runtime};
 /// exist, so a bigger pool buys read parallelism and nothing else.
 const POOL_SIZE: usize = 8;
 
+/// Size the WAL is truncated back to whenever a reset finds it larger.
+///
+/// Sqlite never shrinks a WAL on its own: a checkpoint *resets* it and the next
+/// writer overwrites from frame 1, leaving the file at its all-time high-water
+/// mark forever. Sqlite's default of no limit therefore prices the file at the
+/// largest burst it has ever seen, however brief and however long ago.
+///
+/// This bounds only what a reset truncates *back to*, never how far a
+/// transaction may grow the file — an oversized write still succeeds and
+/// collapses at the next reset. Sitting an order of magnitude above the ~4 MiB
+/// that the default 1000-page `wal_autocheckpoint` resets at is deliberate: the
+/// limit is here to collapse a pathological high-water mark, not to police
+/// ordinary traffic, which never comes near it and so never pays
+/// truncate-and-regrow churn.
+const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 /// A second writer waits for the current one rather than failing. Concurrent
 /// writers are routine here — the agent loop and the trace sink write while the
 /// gateway serves reads — and sqlite's default of 0 would turn that normal
@@ -109,13 +125,16 @@ impl SqlitePool {
             // every connection the pool ever creates — including ones opened
             // lazily under load, or replaced after a recycle. `journal_mode` is
             // persisted in the file header and only needs saying once, but
-            // `synchronous` and `busy_timeout` are per-handle and would
-            // otherwise silently revert to sqlite's defaults on a fresh handle.
+            // `synchronous`, `busy_timeout` and `journal_size_limit` are
+            // per-handle and would otherwise silently revert to sqlite's
+            // defaults on a fresh handle. The limit has to reach every
+            // connection because any of them may be the one that resets the WAL.
             .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {
                 Box::pin(async move {
                     conn.interact(|conn| {
                         conn.busy_timeout(BUSY_TIMEOUT)?;
                         conn.pragma_update(None, "journal_mode", "WAL")?;
+                        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
                         conn.pragma_update(None, "synchronous", "NORMAL")
                     })
                     .await
@@ -802,12 +821,13 @@ mod tests {
         // Ask enough connections to cover the pool: a hook that fires only for
         // the first one would pass a single-connection check.
         for _ in 0..POOL_SIZE * 2 {
-            let (journal_mode, busy_timeout, synchronous) = pool
+            let (journal_mode, busy_timeout, synchronous, journal_size_limit) = pool
                 .interact("test.pragmas", |conn| {
                     Ok((
                         conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
                         conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))?,
                         conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
+                        conn.query_row("PRAGMA journal_size_limit", [], |r| r.get::<_, i64>(0))?,
                     ))
                 })
                 .await
@@ -815,6 +835,7 @@ mod tests {
             assert_eq!(journal_mode, "wal");
             assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
             assert_eq!(synchronous, 1, "NORMAL");
+            assert_eq!(journal_size_limit, WAL_SIZE_LIMIT);
         }
     }
 
