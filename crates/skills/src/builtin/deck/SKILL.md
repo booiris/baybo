@@ -1,7 +1,7 @@
 ---
 name: deck
-version: 0.2.0
-description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /deck <request>; never auto-selected. Covers the bundle contract, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
+version: 0.3.0
+description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /deck <request>; never auto-selected. Covers the bundle contract, per-size adaptation and the optional maximized layout, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
 command: deck
 user-invocable: true
 disable-model-invocation: true
@@ -40,7 +40,19 @@ the card appears on the user's deck already showing data.
   openapi.json
   service.js     backend — runs on the gateway host (use ctx.fetch / ctx.exec)
   card.html      frontend — runs on the phone in a sandboxed iframe, NO network
+  src/           OPTIONAL — pre-build sources kept with the bundle (not run)
 ```
+
+**`src/` and `bun build` (optional).** `card.html` must be a single
+self-contained file, but for a complex card you may author it as TypeScript /
+multiple modules under `src/` and build the one `card.html` with `bun build`
+on the host (it's installed), e.g.
+`bun build src/card.ts --outfile card.html` (no `--minify` — keep it
+readable/diffable). Put the sources under `src/` and they ride along with the
+bundle: the gateway never runs or reads them, but `DeckCardGet` hands them
+back so a later edit works from the real inputs, not the built output. Caps:
+≤32 files, ≤256 KB each, ≤2 MB total; no symlinks. Most cards need no `src/`
+— write `card.html` directly.
 
 ### manifest.json
 
@@ -48,12 +60,25 @@ the card appears on the user's deck already showing data.
 {
   "title": "Claude quota",
   "size": "wide",
+  "sizes": ["wide", "large"],
+  "maximize": true,
   "refresh": { "op": "refresh", "min_emit_interval_secs": 300 }
 }
 ```
 
-- `size`: `small` (1×1) | `wide` (2×1) | `large` (2×2). Title and size
-  are install-time defaults; the user's layout owns them afterwards.
+- `size`: `small` (1×1) | `wide` (2×1) | `large` (2×2). The install-time
+  default; the user's layout owns it afterwards. Must be a member of `sizes`.
+- `sizes` (optional): every grid size your `card.html` actually adapts to.
+  The user's ⤢ resize cycle is confined to this set, so **only list a size
+  you have laid out** — a size you declare but don't handle renders clipped.
+  Omit it for a single-size card (equivalent to `["<size>"]`); the ⤢ control
+  hides. Pick sizes that suit the data: one hero number fits `small`; a hero
+  plus a few rows wants `wide`; two rows of that or a small chart wants
+  `large`.
+- `maximize` (optional, default false): declare `true` only if you provide a
+  full-screen `"max"` layout (see below). It adds a ⛶ button in the tile's
+  **top-right** — so if you set it, keep the top-right ~34×34pt of every
+  layout clear of important content.
 - `refresh.op` must exist in `openapi.json`; the gate calls it once with
   `refresh.params` (optional object).
 - `min_emit_interval_secs`: your emit floor. The gateway accepts at most
@@ -131,7 +156,29 @@ images only). The shell injects a `deck` global before your code runs:
   cached one) and again on every live push. Render from here.
 - `await deck.call(op, params)` — invoke one of your ops on demand
   (user taps, drill-downs). Same validation as any call.
-- `deck.size` — current size class string.
+- `deck.size` — current render size: `"small"` | `"wide"` | `"large"` |
+  `"max"` (while maximized).
+- `deck.onSizeChange(fn)` — called with the current size immediately and
+  again whenever it changes (resize, or maximize/restore). This is how you
+  adapt: show more rows at `large`, the full view at `max`, less at `small`.
+
+### Adapting to size — one document, `deck.onSizeChange`
+
+Your card is **one** `card.html`. Don't guess a size at load; drive layout
+off `deck.onSizeChange`. The idiomatic pattern is to reflect the size onto a
+root attribute and let CSS do the rest, so a resize never reloads the card:
+
+```js
+deck.onSizeChange((s) => { document.documentElement.dataset.size = s; });
+```
+```css
+.detail { display: none; }              /* hidden at small/wide */
+[data-size="large"] .detail,
+[data-size="max"] .detail { display: block; }
+[data-size="small"] .hero { font-size: 20px; }
+```
+
+Only declare a `sizes` entry you've actually laid out this way.
 
 ### Card design — a base stylesheet is injected, use it
 
@@ -168,7 +215,28 @@ Hard rules:
   `small` ≈ 178×148, `wide` ≈ 368×148, `large` ≈ 368×310. `.card` +
   `.foot` compose against that; 1 hero + 2–3 secondary metrics fit a
   `wide`, a `large` holds two rows of that. If it doesn't fit, show
-  less — a clipped half-line reads as a bug.
+  less — a clipped half-line reads as a bug. Each size you list in `sizes`
+  is a layout you own — test that it fills its tile without clipping.
+
+### Maximizing (optional) — the `"max"` size
+
+Set `"maximize": true` only if you build a full-screen layout for
+`deck.size === "max"`. The shell then shows a ⛶ button in the top-right; a
+tap expands the card to fill the screen (the card never reloads — same
+document, `deck.size` flips to `"max"`), and a ✕ in the same corner
+restores it. The maximized layout **may scroll** (it's the whole screen, not
+a tile) and is where a card earns its detail: a full history, a chart, a
+table. Two rules:
+
+- **Keep the top-right clear** — the ✕ lives there (~34×34pt below the
+  status bar); don't put a tappable control or key number under it.
+- **Keep the bottom clear** — the tab bar floats over the bottom of the
+  maximized card. End your content with
+  `padding-bottom: calc(env(safe-area-inset-bottom) + 64px)` so nothing
+  important hides behind it.
+
+If you don't provide a `"max"` layout, leave `maximize` out — a ⛶ that
+expands to the same tile layout stretched full-screen looks broken.
 
 Self-contained: no frameworks, everything inline, and render something
 sensible for `{error: "..."}` snapshots (a muted line, not a red wall).
@@ -249,12 +317,15 @@ card from scratch to change it** — you would lose whatever it already did.
 Instead, edit its real source:
 
 1. `DeckCardList()` — lists every live card (`card_id`, `title`, `size`,
-   …). Match the user's description ("the quota card") to a `title` to
-   get its `card_id`. If it's ambiguous, ask which one.
-2. `DeckCardGet(card_id)` — returns that card's current four files
-   verbatim. Write them into a fresh scratch directory.
-3. Make the surgical change the user asked for (edit one file; leave the
-   rest byte-for-byte).
+   `sizes`, `maximize`, …). Match the user's description ("the quota card")
+   to a `title` to get its `card_id`. If it's ambiguous, ask which one.
+2. `DeckCardGet(card_id)` — returns that card's current source verbatim: the
+   four bundle files plus any `src/` pre-build files (keyed by their `src/…`
+   path). Write them all into a fresh scratch directory. If the card has a
+   `src/`, edit the source and re-run `bun build` to regenerate `card.html`;
+   otherwise edit `card.html` directly.
+3. Make the surgical change the user asked for (edit the relevant file; leave
+   the rest byte-for-byte).
 4. `DeckCardUpdate(card_id, path)` — same dry-run gate as create; on
    success the service restarts on the new code. The user's title, size,
    and layout are owned by the card after install, so the manifest's

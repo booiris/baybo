@@ -71,6 +71,8 @@ fn card_summary(card: &CardView) -> Value {
         "card_id": card.id,
         "title": card.title,
         "size": card.size.as_str(),
+        "sizes": card.sizes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "maximize": card.maximize,
         "position": card.position,
         "spec_hash": card.spec_hash,
     })
@@ -91,7 +93,7 @@ impl Tool for DeckCardListTool {
     }
 
     fn description(&self) -> String {
-        "List the user's live deck cards (card_id, title, size, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating.".to_string()
+        "List the user's live deck cards (card_id, title, size, sizes, maximize, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -108,6 +110,8 @@ impl Tool for DeckCardListTool {
                     "card_id": c.id,
                     "title": c.title,
                     "size": c.size.as_str(),
+                    "sizes": c.sizes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    "maximize": c.maximize,
                     "enabled": c.enabled,
                     "spec_hash": c.spec_hash,
                 })
@@ -133,7 +137,7 @@ impl Tool for DeckCardGetTool {
     }
 
     fn description(&self) -> String {
-        "Return a live card's current four source files verbatim, so you can edit from the real source before DeckCardUpdate (rather than re-authoring blind). See the /deck skill.".to_string()
+        "Return a live card's current source verbatim (the four bundle files plus any src/ pre-build sources), so you can edit from the real source before DeckCardUpdate (rather than re-authoring blind). See the /deck skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -161,14 +165,22 @@ impl Tool for DeckCardGetTool {
             .bundle_files(&params.card_id)
             .await
             .map_err(map_err)?;
+        let mut all = json!({
+            "manifest.json": files.manifest_json,
+            "openapi.json": files.openapi_json,
+            "service.js": files.service_js,
+            "card.html": files.card_html,
+        });
+        // Fold any src/ pre-build sources into the same map, keyed by their
+        // bundle-relative path (`src/…`), so the agent sees the real inputs.
+        if let Some(obj) = all.as_object_mut() {
+            for (rel, contents) in files.src {
+                obj.insert(rel, Value::String(contents));
+            }
+        }
         Ok(ToolOutput::Json(json!({
             "card_id": params.card_id,
-            "files": {
-                "manifest.json": files.manifest_json,
-                "openapi.json": files.openapi_json,
-                "service.js": files.service_js,
-                "card.html": files.card_html,
-            }
+            "files": all,
         })))
     }
 }

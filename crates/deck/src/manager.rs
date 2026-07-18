@@ -21,8 +21,8 @@ use baybo_security::SecretVault;
 use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 
 use crate::bundle::{
-    self, CARD_FILE, DeckBundle, MANIFEST_FILE, OPENAPI_FILE, SDK_VERSION, SERVICE_FILE,
-    load_bundle,
+    self, CARD_FILE, DeckBundle, MANIFEST_FILE, MAX_SOURCE_BYTES, MAX_SRC_FILES,
+    MAX_SRC_TOTAL_BYTES, OPENAPI_FILE, SDK_VERSION, SERVICE_FILE, SRC_DIR, load_bundle,
 };
 use crate::error::{DeckError, Result};
 use crate::host::{DeckHost, InternalReads};
@@ -63,6 +63,11 @@ pub struct CardView {
     pub title: String,
     pub position: i64,
     pub size: DeckSize,
+    /// The grid sizes the card implements (always contains `size`); a
+    /// single-entry list is a card that never adapted.
+    pub sizes: Vec<DeckSize>,
+    /// Whether the card declares a maximized layout.
+    pub maximize: bool,
     pub enabled: bool,
     pub quarantined_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -82,6 +87,8 @@ impl From<DeckCardRow> for CardView {
             title: r.title,
             position: r.position,
             size: r.size,
+            sizes: r.sizes,
+            maximize: r.maximize,
             enabled: r.enabled,
             quarantined_at: r.quarantined_at,
             deleted_at: r.deleted_at,
@@ -99,14 +106,18 @@ pub struct DeckView {
     pub snapshots: Vec<DeckSnapshotRow>,
 }
 
-/// A live card's four source files, verbatim from its installed bundle —
-/// the seed for editing a card across chats (`DeckCardGet`).
+/// A live card's source, verbatim from its installed bundle — the seed for
+/// editing a card across chats (`DeckCardGet`). The four required files plus
+/// any `src/` pre-build sources kept alongside them (relative path →
+/// contents, e.g. `src/card.tsx`), so an agent editing a `bun build`-authored
+/// card gets the real inputs, not just the built `card.html`.
 #[derive(Debug, Clone)]
 pub struct BundleFiles {
     pub manifest_json: String,
     pub openapi_json: String,
     pub service_js: String,
     pub card_html: String,
+    pub src: std::collections::BTreeMap<String, String>,
 }
 
 /// Required dependencies, named at the call site (see the repo's
@@ -290,6 +301,7 @@ impl DeckManager {
             openapi_json: read(OPENAPI_FILE)?,
             service_js: read(SERVICE_FILE)?,
             card_html: read(CARD_FILE)?,
+            src: read_src_tree(&dir.join(SRC_DIR)),
         })
     }
 
@@ -346,6 +358,8 @@ impl DeckManager {
             title: installed.manifest.title.clone(),
             position,
             size: installed.manifest.size,
+            sizes: installed.sizes.clone(),
+            maximize: installed.maximize,
             enabled: true,
             quarantined_at: None,
             deleted_at: None,
@@ -402,8 +416,19 @@ impl DeckManager {
         let installed = load_bundle(&dest)?;
         let detail = format!("{} -> {}", row.spec_hash, installed.spec_hash);
         provenance("update", card_id, &detail);
+        // The row keeps the user's size UNLESS the new code dropped it — the
+        // capability set (sizes/maximize) is a property of the code, so it is
+        // always refreshed, and an orphaned size clamps to the new default.
+        let size = clamp_size(row.size, &installed.sizes, installed.manifest.size);
         self.store
-            .set_installed(card_id, &row.title, &installed.spec_hash)
+            .set_installed(
+                card_id,
+                &row.title,
+                &installed.spec_hash,
+                size,
+                &installed.sizes,
+                installed.maximize,
+            )
             .await?;
         self.commit_bundle(card_id, &row.title, "update", &detail)
             .await;
@@ -423,7 +448,29 @@ impl DeckManager {
     }
 
     pub async fn set_layout(&self, entries: &[DeckLayoutEntry]) -> Result<()> {
-        self.store.set_layout(entries).await?;
+        // Enforce the `size ∈ sizes` invariant on the write path too: the
+        // gateway only checks that a size token parses, not that the card
+        // implements it, so a non-conforming client could otherwise persist a
+        // size `card.html` doesn't lay out. An off-set entry keeps the card's
+        // current (valid) size instead; an unknown id passes through (the
+        // store ignores it).
+        let rows = self.store.list_live().await?;
+        let by_id: HashMap<&str, &DeckCardRow> = rows.iter().map(|r| (r.id.as_str(), r)).collect();
+        let clamped: Vec<DeckLayoutEntry> = entries
+            .iter()
+            .map(|e| {
+                let size = match by_id.get(e.id.as_str()) {
+                    Some(row) if !row.sizes.contains(&e.size) => row.size,
+                    _ => e.size,
+                };
+                DeckLayoutEntry {
+                    id: e.id.clone(),
+                    position: e.position,
+                    size,
+                }
+            })
+            .collect();
+        self.store.set_layout(&clamped).await?;
         self.events.deck_changed();
         Ok(())
     }
@@ -575,9 +622,18 @@ impl DeckManager {
                             tracing::warn!(card = %row.id, "deck: sdk stamp failed: {e}");
                         }
                         if let Ok(restamped) = load_bundle(&dir) {
+                            let size =
+                                clamp_size(row.size, &restamped.sizes, restamped.manifest.size);
                             let _ = self
                                 .store
-                                .set_installed(&row.id, &row.title, &restamped.spec_hash)
+                                .set_installed(
+                                    &row.id,
+                                    &row.title,
+                                    &restamped.spec_hash,
+                                    size,
+                                    &restamped.sizes,
+                                    restamped.maximize,
+                                )
                                 .await;
                         }
                         provenance("sdk-regate", &row.id, "passed");
@@ -674,10 +730,12 @@ impl DeckManager {
         self.deck_root.join(".staging").join(name)
     }
 
-    /// Copy the four bundle files from `staged_dir` into a staging dir
-    /// under the deck root (same filesystem), stamp the SDK version into
-    /// the manifest, then atomically rename into `dest` — SkillInstall's
-    /// staging discipline.
+    /// Copy the bundle from `staged_dir` into a staging dir under the deck
+    /// root (same filesystem), stamp the SDK version into the manifest, then
+    /// atomically rename into `dest` — SkillInstall's staging discipline.
+    /// The four required files are copied verbatim; an optional `src/`
+    /// subtree (the card's pre-build sources) rides along under caps so a
+    /// `DeckCardGet` can hand the real inputs back for a cross-chat edit.
     fn materialize(&self, staged_dir: &Path, card_id: &str, dest: &Path) -> Result<()> {
         let staging = self.staging_path(card_id);
         if staging.exists() {
@@ -687,6 +745,7 @@ impl DeckManager {
         for name in [MANIFEST_FILE, OPENAPI_FILE, SERVICE_FILE, CARD_FILE] {
             std::fs::copy(staged_dir.join(name), staging.join(name))?;
         }
+        copy_src_tree(&staged_dir.join(SRC_DIR), &staging.join(SRC_DIR))?;
         self.stamp_sdk(&staging)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -774,5 +833,209 @@ impl DeckManager {
             ));
         }
         Ok(snapshot)
+    }
+}
+
+/// The size correction to apply on an update/boot re-gate: `None` keeps the
+/// user's current size (the new code still implements it — and, crucially,
+/// leaves the size column alone so a concurrent layout resize survives);
+/// `Some(default)` re-clamps to the new manifest default (guaranteed a member
+/// of `sizes` by [`crate::bundle::load_bundle`]) when the new code dropped the
+/// size the user was on.
+fn clamp_size(current: DeckSize, sizes: &[DeckSize], default: DeckSize) -> Option<DeckSize> {
+    if sizes.contains(&current) {
+        None
+    } else {
+        Some(default)
+    }
+}
+
+/// Best-effort read of a card's `src/` subtree into `relative-path → contents`
+/// (keys prefixed `src/…`), for `DeckCardGet`. Non-UTF-8 files and anything
+/// past the caps are skipped rather than failing the read — the required four
+/// files are the contract; `src/` is a convenience. Symlinks are ignored (a
+/// bundle's `src/` is plain agent-written text).
+fn read_src_tree(src_dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut total: u64 = 0;
+    let mut stack = vec![src_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= MAX_SRC_FILES {
+                return out;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if meta.len() > MAX_SOURCE_BYTES as u64 || total + meta.len() > MAX_SRC_TOTAL_BYTES {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Key relative to the bundle root (`src/...`), forward slashes.
+            let rel = path
+                .strip_prefix(src_dir.parent().unwrap_or(src_dir))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            total += meta.len();
+            out.insert(rel, text);
+        }
+    }
+    out
+}
+
+/// Copy an optional `src/` subtree into the staging bundle under caps. A
+/// missing source dir is a no-op (most cards have no `src/`). Symlinks are
+/// refused (an agent must not smuggle `/etc/passwd` into the deck root via a
+/// symlinked `src/` entry); the file/byte caps bound the copy so a stray
+/// `node_modules` can't bloat the deck root.
+fn copy_src_tree(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    let mut count: usize = 0;
+    let mut total: u64 = 0;
+    let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
+    while let Some((src, dst)) = stack.pop() {
+        std::fs::create_dir_all(&dst)?;
+        for entry in std::fs::read_dir(&src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let meta = std::fs::symlink_metadata(&src_path)?;
+            if meta.file_type().is_symlink() {
+                return Err(DeckError::InvalidBundle(format!(
+                    "src/ may not contain symlinks: {}",
+                    src_path.display()
+                )));
+            }
+            let name = entry.file_name();
+            let dst_path = dst.join(&name);
+            if meta.is_dir() {
+                stack.push((src_path, dst_path));
+                continue;
+            }
+            count += 1;
+            if count > MAX_SRC_FILES {
+                return Err(DeckError::InvalidBundle(format!(
+                    "src/ exceeds {MAX_SRC_FILES} files"
+                )));
+            }
+            if meta.len() > MAX_SOURCE_BYTES as u64 {
+                return Err(DeckError::InvalidBundle(format!(
+                    "src/ file {} exceeds {MAX_SOURCE_BYTES} bytes",
+                    src_path.display()
+                )));
+            }
+            total += meta.len();
+            if total > MAX_SRC_TOTAL_BYTES {
+                return Err(DeckError::InvalidBundle(format!(
+                    "src/ subtree exceeds {MAX_SRC_TOTAL_BYTES} bytes"
+                )));
+            }
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_size_keeps_current_when_still_offered() {
+        // `None` = leave the size column alone (don't clobber a concurrent resize).
+        assert_eq!(
+            clamp_size(
+                DeckSize::Small,
+                &[DeckSize::Small, DeckSize::Wide],
+                DeckSize::Wide
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn clamp_size_falls_to_default_when_dropped() {
+        // The user was on `small`, but the new code only offers wide/large.
+        assert_eq!(
+            clamp_size(
+                DeckSize::Small,
+                &[DeckSize::Wide, DeckSize::Large],
+                DeckSize::Large
+            ),
+            Some(DeckSize::Large),
+        );
+    }
+
+    #[test]
+    fn src_tree_round_trips_through_copy_and_read() {
+        let from = tempfile::tempdir().unwrap();
+        let src = from.path().join(SRC_DIR);
+        std::fs::create_dir_all(src.join("sizes")).unwrap();
+        std::fs::write(src.join("card.tsx"), "export const x = 1;").unwrap();
+        std::fs::write(src.join("sizes/max.tsx"), "export const max = 2;").unwrap();
+
+        let to = tempfile::tempdir().unwrap();
+        let dst = to.path().join(SRC_DIR);
+        copy_src_tree(&src, &dst).unwrap();
+
+        // Keys are bundle-relative with forward slashes.
+        let read = read_src_tree(&dst);
+        assert_eq!(
+            read.get("src/card.tsx").map(String::as_str),
+            Some("export const x = 1;")
+        );
+        assert_eq!(
+            read.get("src/sizes/max.tsx").map(String::as_str),
+            Some("export const max = 2;")
+        );
+        assert_eq!(read.len(), 2);
+    }
+
+    #[test]
+    fn copy_src_tree_is_a_noop_without_a_src_dir() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let dst = to.path().join(SRC_DIR);
+        copy_src_tree(&from.path().join(SRC_DIR), &dst).unwrap();
+        assert!(!dst.exists(), "no src/ → nothing copied");
+    }
+
+    #[test]
+    fn copy_src_tree_refuses_a_symlink() {
+        let from = tempfile::tempdir().unwrap();
+        let src = from.path().join(SRC_DIR);
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("leak.tsx")).unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let err = copy_src_tree(&src, &to.path().join(SRC_DIR)).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn copy_src_tree_enforces_the_file_cap() {
+        let from = tempfile::tempdir().unwrap();
+        let src = from.path().join(SRC_DIR);
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..=MAX_SRC_FILES {
+            std::fs::write(src.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let to = tempfile::tempdir().unwrap();
+        let err = copy_src_tree(&src, &to.path().join(SRC_DIR)).unwrap_err();
+        assert!(err.to_string().contains("files"), "{err}");
     }
 }

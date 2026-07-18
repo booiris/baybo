@@ -17,6 +17,8 @@ function card(id: string, position: number, size: DeckCard["size"] = "wide"): De
     title: id,
     position,
     size,
+    sizes: [size],
+    maximize: false,
     enabled: true,
     quarantined: false,
     specHash: "h",
@@ -89,10 +91,38 @@ describe("layout math", () => {
     ]);
   });
 
-  it("cycles sizes small → wide → large → small", () => {
-    expect(cycleSize("small")).toBe("wide");
-    expect(cycleSize("wide")).toBe("large");
-    expect(cycleSize("large")).toBe("small");
+  it("cycles within the card's declared size set, in canonical order", () => {
+    const all: DeckCard["size"][] = ["small", "wide", "large"];
+    expect(cycleSize("small", all)).toBe("wide");
+    expect(cycleSize("wide", all)).toBe("large");
+    expect(cycleSize("large", all)).toBe("small");
+
+    // A two-size card skips the size it doesn't implement.
+    expect(cycleSize("wide", ["wide", "large"])).toBe("large");
+    expect(cycleSize("large", ["wide", "large"])).toBe("wide");
+
+    // A single-size card has nothing to cycle to.
+    expect(cycleSize("large", ["large"])).toBe("large");
+  });
+});
+
+describe("normalizeCard", () => {
+  it("defaults sizes to [size] and maximize to false for a legacy card", () => {
+    const c = replaceState([card("a", 0)], []).cards[0];
+    expect(c.sizes).toEqual(["wide"]);
+    expect(c.maximize).toBe(false);
+  });
+
+  it("keeps a declared set in canonical order and guarantees size ∈ sizes", () => {
+    const raw = {
+      ...card("a", 0, "small"),
+      sizes: ["large", "wide"] as DeckCard["size"][],
+      maximize: true,
+    };
+    const c = replaceState([raw], []).cards[0];
+    // `small` (the current size) is folded in; order is canonical.
+    expect(c.sizes).toEqual(["small", "wide", "large"]);
+    expect(c.maximize).toBe(true);
   });
 });
 

@@ -184,6 +184,10 @@ struct WireDeckCard {
     title: String,
     position: i64,
     size: String,
+    #[serde(default)]
+    sizes: Vec<String>,
+    #[serde(default)]
+    maximize: bool,
     enabled: bool,
     quarantined: bool,
     #[serde(default)]
@@ -197,11 +201,21 @@ struct WireDeckCard {
 
 impl WireDeckCard {
     fn into_info(self) -> DeckCardInfo {
+        // A pre-field gateway (or a card that never declared sizes) omits the
+        // set — fall back to `[size]` so the client always has a non-empty
+        // list that contains the current size.
+        let sizes = if self.sizes.is_empty() {
+            vec![self.size.clone()]
+        } else {
+            self.sizes
+        };
         DeckCardInfo {
             card_id: self.card_id,
             title: self.title,
             position: self.position,
             size: self.size,
+            sizes,
+            maximize: self.maximize,
             enabled: self.enabled,
             quarantined: self.quarantined,
             deleted_at_ms: self.deleted_at_ms,

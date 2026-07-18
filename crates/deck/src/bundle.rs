@@ -26,6 +26,18 @@ pub const CARD_FILE: &str = "card.html";
 pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// Byte cap on `manifest.json`.
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+
+/// Optional `src/` subdirectory carried verbatim with the bundle: the card's
+/// pre-build sources (e.g. TypeScript compiled to `card.html` with `bun
+/// build` on the host). It is inert data — the gateway never reads or
+/// executes it; it exists so `DeckCardGet` can hand the real sources back for
+/// a cross-chat edit. These caps bound the copy so a stray `node_modules`
+/// can't bloat the deck root.
+pub const SRC_DIR: &str = "src";
+/// Max files under `src/`.
+pub const MAX_SRC_FILES: usize = 32;
+/// Byte cap on the whole `src/` subtree.
+pub const MAX_SRC_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
 /// Floor on a card's declared emit interval; the emit clamp enforces
 /// `max(declared, floor)`.
 pub const MIN_EMIT_INTERVAL_FLOOR_SECS: u64 = 10;
@@ -56,9 +68,22 @@ pub struct RefreshSpec {
 pub struct DeckManifest {
     /// Install-time default; `deck_cards.title` is authoritative after.
     pub title: String,
-    /// Install-time default; layout writes own it after.
+    /// The card's default tile size — also the clamp target when an update
+    /// drops the size the user was on. Layout writes own it after install;
+    /// must be a member of `sizes`.
     #[serde(with = "size_str")]
     pub size: DeckSize,
+    /// The grid sizes the card's `card.html` implements. Absent means the
+    /// card adapts to nothing — resolved to `[size]` (a legacy single-size
+    /// card) in [`load_bundle`]. Kept as raw strings here so a bad token
+    /// fails admission with a clear message rather than a serde error, and
+    /// so the SDK-stamp round-trip is a passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<String>>,
+    /// Whether the card declares a full-screen maximized layout (the ⛶
+    /// affordance and a `deck.size === "max"` render path).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maximize: bool,
     pub refresh: RefreshSpec,
     /// Which preamble version installed this card. Stamped by the
     /// installer (agent-provided values are overwritten); informational
@@ -89,6 +114,12 @@ pub struct DeckBundle {
     pub spec: CardSpec,
     pub card_html: String,
     pub spec_hash: String,
+    /// The manifest's `sizes` resolved and validated (never empty; contains
+    /// `manifest.size`). A legacy manifest with no `sizes` resolves to
+    /// `[manifest.size]`.
+    pub sizes: Vec<DeckSize>,
+    /// The manifest's `maximize` flag.
+    pub maximize: bool,
 }
 
 impl DeckBundle {
@@ -133,6 +164,8 @@ pub fn load_bundle(dir: &Path) -> Result<DeckBundle> {
         ));
     }
 
+    let (sizes, maximize) = resolve_sizes(&manifest)?;
+
     let spec_bytes = read_capped(dir, OPENAPI_FILE, crate::spec::MAX_SPEC_BYTES)?;
     let spec = CardSpec::parse(&spec_bytes)?;
     if !spec.has_op(&manifest.refresh.op) {
@@ -165,7 +198,49 @@ pub fn load_bundle(dir: &Path) -> Result<DeckBundle> {
         spec,
         card_html,
         spec_hash,
+        sizes,
+        maximize,
     })
+}
+
+/// Resolve + validate the manifest's declared size set. Absent → the honest
+/// legacy default `[size]`. Present → parse every token (a bad one fails
+/// admission with a clear message), reject empty, dedup preserving order,
+/// and require `manifest.size` to be a member (the default size must be one
+/// the card can actually render).
+fn resolve_sizes(manifest: &DeckManifest) -> Result<(Vec<DeckSize>, bool)> {
+    let sizes = match &manifest.sizes {
+        None => vec![manifest.size],
+        Some(raw) => {
+            if raw.is_empty() {
+                return Err(DeckError::InvalidBundle(
+                    "manifest `sizes` is present but empty — omit it for a single-size card, \
+                     or list the sizes card.html implements"
+                        .into(),
+                ));
+            }
+            let mut out: Vec<DeckSize> = Vec::with_capacity(raw.len());
+            for token in raw {
+                let size = DeckSize::parse(token).ok_or_else(|| {
+                    DeckError::InvalidBundle(format!(
+                        "manifest `sizes` entry `{token}` must be small|wide|large"
+                    ))
+                })?;
+                if !out.contains(&size) {
+                    out.push(size);
+                }
+            }
+            if !out.contains(&manifest.size) {
+                return Err(DeckError::InvalidBundle(format!(
+                    "manifest `size` ({}) must be one of `sizes` ({})",
+                    manifest.size.as_str(),
+                    DeckSize::join(&out)
+                )));
+            }
+            out
+        }
+    };
+    Ok((sizes, manifest.maximize))
 }
 
 #[cfg(test)]
@@ -263,6 +338,72 @@ mod tests {
         .unwrap();
         std::fs::remove_file(tmp.path().join(CARD_FILE)).unwrap();
         assert!(load_bundle(tmp.path()).is_err());
+    }
+
+    fn write_manifest(dir: &Path, manifest: serde_json::Value) {
+        std::fs::write(dir.join(MANIFEST_FILE), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn absent_sizes_resolves_to_single_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_fixtures::write_bundle(tmp.path(), "t", "export const ops = {};");
+        let b = load_bundle(tmp.path()).unwrap();
+        assert_eq!(b.sizes, vec![DeckSize::Wide], "legacy card → [size]");
+        assert!(!b.maximize);
+    }
+
+    #[test]
+    fn declared_sizes_and_maximize_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_fixtures::write_bundle(tmp.path(), "t", "export const ops = {};");
+        write_manifest(
+            tmp.path(),
+            serde_json::json!({
+                "title": "t", "size": "large",
+                "sizes": ["wide", "large", "wide"], "maximize": true,
+                "refresh": {"op": "refresh", "min_emit_interval_secs": 60}
+            }),
+        );
+        let b = load_bundle(tmp.path()).unwrap();
+        assert_eq!(b.sizes, vec![DeckSize::Wide, DeckSize::Large], "deduped");
+        assert!(b.maximize);
+    }
+
+    #[test]
+    fn rejects_bad_size_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_fixtures::write_bundle(tmp.path(), "t", "export const ops = {};");
+
+        // Unknown token.
+        write_manifest(
+            tmp.path(),
+            serde_json::json!({
+                "title": "t", "size": "wide", "sizes": ["wide", "huge"],
+                "refresh": {"op": "refresh", "min_emit_interval_secs": 60}
+            }),
+        );
+        assert!(load_bundle(tmp.path()).is_err(), "bad size token");
+
+        // Default size not in the set.
+        write_manifest(
+            tmp.path(),
+            serde_json::json!({
+                "title": "t", "size": "small", "sizes": ["wide", "large"],
+                "refresh": {"op": "refresh", "min_emit_interval_secs": 60}
+            }),
+        );
+        assert!(load_bundle(tmp.path()).is_err(), "size not in sizes");
+
+        // Present but empty.
+        write_manifest(
+            tmp.path(),
+            serde_json::json!({
+                "title": "t", "size": "wide", "sizes": [],
+                "refresh": {"op": "refresh", "min_emit_interval_secs": 60}
+            }),
+        );
+        assert!(load_bundle(tmp.path()).is_err(), "empty sizes");
     }
 
     #[test]

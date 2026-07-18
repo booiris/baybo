@@ -10,9 +10,21 @@
   let latest;
   let hasData = false;
   const dataCbs = [];
+  const sizeCbs = [];
   const queuedCalls = [];
   const pending = new Map();
   let nextId = 1;
+
+  function notifySize() {
+    for (const cb of sizeCbs) {
+      try {
+        cb(size);
+      } catch (err) {
+        if (port)
+          port.postMessage({ type: "log", level: "error", message: String(err) });
+      }
+    }
+  }
 
   function flushQueued() {
     while (queuedCalls.length > 0) {
@@ -39,7 +51,10 @@
       if (msg.ok) p.resolve(msg.value);
       else p.reject(new Error(msg.error || "call failed"));
     } else if (msg.type === "size") {
-      size = msg.size;
+      if (msg.size && msg.size !== size) {
+        size = msg.size;
+        notifySize();
+      }
     }
   }
 
@@ -61,6 +76,18 @@
         } catch {
           /* card callback error — nothing to do */
         }
+      }
+    },
+    /// Register a size-change callback. Fires immediately with the current
+    /// size, then on every change — including `"max"` while maximized — so a
+    /// card can drive one render path off `deck.size`. `size` is one of
+    /// "small" | "wide" | "large" | "max".
+    onSizeChange: function (cb) {
+      sizeCbs.push(cb);
+      try {
+        cb(size);
+      } catch {
+        /* card callback error — nothing to do */
       }
     },
     call: function (op, params) {

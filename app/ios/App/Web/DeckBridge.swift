@@ -61,6 +61,10 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             }
         case "editMode":
             store?.editMode = body["active"] as? Bool ?? false
+        case "maximize":
+            // The shell entered/left a card's full-screen layout; native
+            // hides the wordmark header while it's up.
+            store?.setMaximized(body["active"] as? Bool ?? false)
         case "quickSetup":
             // Empty-board CTA: open a fresh chat and auto-send a `/deck …`
             // request.

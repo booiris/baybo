@@ -27,8 +27,39 @@ private struct DeckContent: View {
             // header's paper veil instead of hitting a hard edge.
             DeckWebView(host: host)
                 .ignoresSafeArea()
-            HomeHeaderView()
-                .overlay(alignment: .leading) {
+            header
+                // A maximized card owns the whole surface: fade the wordmark
+                // header out and stop it hit-testing (the tab bar stays, per
+                // the deck maximize design). The shell drives the card's own
+                // expand animation; this rides the same beat.
+                .opacity(deck.maximized ? 0 : 1)
+                .allowsHitTesting(!deck.maximized)
+                .animation(.easeInOut(duration: 0.24), value: deck.maximized)
+        }
+        .onChange(of: lang.code) { _, code in
+            host.bridge.setLanguage(code)
+        }
+        .alert(
+            Text(verbatim: lang.t("deck.deleteTitle")),
+            isPresented: Binding(
+                get: { deck.pendingDelete != nil },
+                set: { if !$0 { deck.pendingDelete = nil } }
+            )
+        ) {
+            Button(lang.t("deck.deleteConfirm"), role: .destructive) {
+                deck.confirmPendingDelete()
+            }
+            Button(lang.t("deck.cancel"), role: .cancel) {
+                deck.pendingDelete = nil
+            }
+        } message: {
+            Text(verbatim: lang.t("deck.deleteBody"))
+        }
+    }
+
+    private var header: some View {
+        HomeHeaderView()
+            .overlay(alignment: .leading) {
                     // The Chats header's ☰ grammar: one glass circle, menu
                     // entries for the section's secondary surfaces. Deck has
                     // one — the recycle bin.
@@ -66,25 +97,5 @@ private struct DeckContent: View {
                     .glassEffect(.regular.interactive(), in: .capsule)
                     .padding(.trailing, 20)
                 }
-        }
-        .onChange(of: lang.code) { _, code in
-            host.bridge.setLanguage(code)
-        }
-        .alert(
-            Text(verbatim: lang.t("deck.deleteTitle")),
-            isPresented: Binding(
-                get: { deck.pendingDelete != nil },
-                set: { if !$0 { deck.pendingDelete = nil } }
-            )
-        ) {
-            Button(lang.t("deck.deleteConfirm"), role: .destructive) {
-                deck.confirmPendingDelete()
-            }
-            Button(lang.t("deck.cancel"), role: .cancel) {
-                deck.pendingDelete = nil
-            }
-        } message: {
-            Text(verbatim: lang.t("deck.deleteBody"))
-        }
     }
 }

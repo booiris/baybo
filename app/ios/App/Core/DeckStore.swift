@@ -14,6 +14,14 @@ final class DeckStore: ObservableObject {
         let title: String
         var position: Int64
         var size: String
+        /// The grid sizes the card implements; the shell's ⤢ cycle stays in
+        /// this set and a single entry hides the control. Optional so a
+        /// pre-field mirror still decodes — normalized to `[size]` on the web
+        /// side when absent/empty.
+        let sizes: [String]?
+        /// Whether the card declares a maximized layout (the ⛶ affordance).
+        /// Optional for the same pre-field-mirror reason (defaults false).
+        let maximize: Bool?
         let enabled: Bool
         let quarantined: Bool
         let specHash: String
@@ -58,6 +66,10 @@ final class DeckStore: ObservableObject {
 
     /// Mirrored from the shell's edit mode so the native header can show Done.
     @Published var editMode = false
+    /// A card is maximized full-screen in the shell (driven by the ⛶ tap the
+    /// shell reports over the bridge). Native hides the wordmark header while
+    /// set so the maximized card owns the whole surface; the tab bar stays.
+    @Published var maximized = false
     /// A delete waiting on the native confirm (destructive actions confirm
     /// natively; the shell only reports intent).
     @Published var pendingDelete: String?
@@ -101,6 +113,12 @@ final class DeckStore: ObservableObject {
     // MARK: bridge lifecycle
 
     func bridgeBecameReady() {
+        // A fresh shell (first boot, or a rebind that rebuilt the webview) has
+        // no maximized card and never sends the corrective postMaximize(false),
+        // so a `maximized` left true from a prior binding would strand the
+        // header hidden forever. Maximize is transient view state — not
+        // restored through InitPayload — so reset it to match the new shell.
+        maximized = false
         bridge?.deliverInit(
             InitPayload(
                 cards: state.cards,
@@ -115,6 +133,13 @@ final class DeckStore: ObservableObject {
     func setEditMode(_ active: Bool) {
         editMode = active
         bridge?.setEditMode(active)
+    }
+
+    /// The shell entered/left a card's maximized layout. Purely reflective —
+    /// the shell owns the animation and card state; native only hides the
+    /// header so the maximized card is unobstructed.
+    func setMaximized(_ active: Bool) {
+        maximized = active
     }
 
     /// Set (or clear, with nil) the in-flight card-setup session and reflect
@@ -358,6 +383,8 @@ final class DeckStore: ObservableObject {
             title: info.title,
             position: info.position,
             size: info.size,
+            sizes: info.sizes,
+            maximize: info.maximize,
             enabled: info.enabled,
             quarantined: info.quarantined,
             specHash: info.specHash,

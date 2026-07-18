@@ -27,13 +27,15 @@ impl SqliteDeckCardStore {
     }
 }
 
-/// Raw column tuple: (id, title, position, size, enabled, quarantined_at µs,
-/// deleted_at µs, spec_hash, last_seq, created_at µs).
+/// Raw column tuple: (id, title, position, size, sizes, maximize, enabled,
+/// quarantined_at µs, deleted_at µs, spec_hash, last_seq, created_at µs).
 type RawCard = (
     String,
     String,
     i64,
     String,
+    String,
+    bool,
     bool,
     Option<i64>,
     Option<i64>,
@@ -42,8 +44,8 @@ type RawCard = (
     i64,
 );
 
-const CARD_COLUMNS: &str = "id, title, position, size, enabled, quarantined_at, \
-     deleted_at, spec_hash, last_seq, created_at";
+const CARD_COLUMNS: &str = "id, title, position, size, sizes, maximize, enabled, \
+     quarantined_at, deleted_at, spec_hash, last_seq, created_at";
 
 fn card_from_raw(raw: RawCard) -> Result<DeckCardRow> {
     let (
@@ -51,6 +53,8 @@ fn card_from_raw(raw: RawCard) -> Result<DeckCardRow> {
         title,
         position,
         size,
+        sizes,
+        maximize,
         enabled,
         quarantined_us,
         deleted_us,
@@ -60,6 +64,9 @@ fn card_from_raw(raw: RawCard) -> Result<DeckCardRow> {
     ) = raw;
     let size = DeckSize::parse(&size)
         .ok_or_else(|| StorageError::Storage(format!("deck_cards.size unknown: {size}")))?;
+    // A blank column (legacy row) means the card declared no set — it is a
+    // single-size, never-adapted card, so [size] is the honest fallback.
+    let sizes = DeckSize::parse_list(&sizes).unwrap_or_else(|| vec![size]);
     let ts = |us: i64, col: &str| {
         super::time::from_us(us)
             .ok_or_else(|| StorageError::Storage(format!("deck_cards.{col} out of range: {us}")))
@@ -69,6 +76,8 @@ fn card_from_raw(raw: RawCard) -> Result<DeckCardRow> {
         title,
         position,
         size,
+        sizes,
+        maximize,
         enabled,
         quarantined_at: quarantined_us
             .map(|us| ts(us, "quarantined_at"))
@@ -92,6 +101,8 @@ fn read_raw_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCard> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -121,17 +132,20 @@ impl DeckCardStore for SqliteDeckCardStore {
         let quarantined = r.quarantined_at.map(super::time::to_us);
         let deleted = r.deleted_at.map(super::time::to_us);
         let created = super::time::to_us(r.created_at);
+        let sizes = DeckSize::join(&r.sizes);
         self.pool
             .interact("deck_cards.create", move |conn| {
                 conn.execute(
-                    "INSERT INTO deck_cards (id, title, position, size, enabled, \
-                     quarantined_at, deleted_at, spec_hash, last_seq, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO deck_cards (id, title, position, size, sizes, maximize, \
+                     enabled, quarantined_at, deleted_at, spec_hash, last_seq, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         r.id,
                         r.title,
                         r.position,
                         r.size.as_str(),
+                        sizes,
+                        r.maximize,
                         r.enabled,
                         quarantined,
                         deleted,
@@ -261,16 +275,28 @@ impl DeckCardStore for SqliteDeckCardStore {
         Ok(affected > 0)
     }
 
-    async fn set_installed(&self, id: &str, title: &str, spec_hash: &str) -> Result<bool> {
+    async fn set_installed(
+        &self,
+        id: &str,
+        title: &str,
+        spec_hash: &str,
+        size: Option<DeckSize>,
+        sizes: &[DeckSize],
+        maximize: bool,
+    ) -> Result<bool> {
         let id = id.to_string();
         let title = title.to_string();
         let spec_hash = spec_hash.to_string();
+        // NULL leaves the existing size in place (COALESCE); a value re-clamps.
+        let size = size.map(|s| s.as_str());
+        let sizes = DeckSize::join(sizes);
         let affected = self
             .pool
             .interact("deck_cards.set_installed", move |conn| {
                 Ok(conn.execute(
-                    "UPDATE deck_cards SET title = ?2, spec_hash = ?3 WHERE id = ?1",
-                    rusqlite::params![id, title, spec_hash],
+                    "UPDATE deck_cards SET title = ?2, spec_hash = ?3, \
+                     size = COALESCE(?4, size), sizes = ?5, maximize = ?6 WHERE id = ?1",
+                    rusqlite::params![id, title, spec_hash, size, sizes, maximize],
                 )?)
             })
             .await?;
@@ -423,6 +449,8 @@ mod tests {
             title: format!("card {id}"),
             position: pos,
             size: DeckSize::Wide,
+            sizes: vec![DeckSize::Wide, DeckSize::Large],
+            maximize: false,
             enabled: true,
             quarantined_at: None,
             deleted_at: None,
@@ -449,8 +477,36 @@ mod tests {
 
         let a = store.get("a").await.unwrap().unwrap();
         assert_eq!(a.size, DeckSize::Wide);
+        assert_eq!(a.sizes, vec![DeckSize::Wide, DeckSize::Large]);
+        assert!(!a.maximize);
         assert!(a.enabled);
         assert!(store.get("ghost").await.unwrap().is_none());
+    }
+
+    /// A row written before the `sizes` column existed carries the ALTER
+    /// default (empty string); the reader must fall back to `[size]` — a
+    /// single-size, never-adapted legacy card — not error or empty-list.
+    #[tokio::test]
+    async fn legacy_row_without_sizes_falls_back_to_single_size() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteDeckCardStore::new(pool.clone());
+        // Insert bypassing `create` to leave `sizes` at the column default.
+        let now_us = super::super::time::to_us(chrono::Utc::now());
+        pool.interact("test.legacy_insert", move |conn| {
+            conn.execute(
+                "INSERT INTO deck_cards (id, title, position, size, spec_hash, created_at) \
+                 VALUES ('legacy', 't', 0, 'large', 'h', ?1)",
+                rusqlite::params![now_us],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let row = store.get("legacy").await.unwrap().unwrap();
+        assert_eq!(row.size, DeckSize::Large);
+        assert_eq!(row.sizes, vec![DeckSize::Large], "empty column → [size]");
+        assert!(!row.maximize, "maximize defaults false");
     }
 
     #[tokio::test]
@@ -502,10 +558,46 @@ mod tests {
         );
         assert!(store.set_quarantined("a", None).await.unwrap());
 
-        assert!(store.set_installed("a", "renamed", "hash1").await.unwrap());
+        assert!(
+            store
+                .set_installed(
+                    "a",
+                    "renamed",
+                    "hash1",
+                    Some(DeckSize::Small),
+                    &[DeckSize::Small],
+                    true,
+                )
+                .await
+                .unwrap()
+        );
         let a = store.get("a").await.unwrap().unwrap();
         assert_eq!(a.title, "renamed");
         assert_eq!(a.spec_hash, "hash1");
+        // A Some(size) re-clamps and refreshes the capability set.
+        assert_eq!(a.size, DeckSize::Small);
+        assert_eq!(a.sizes, vec![DeckSize::Small]);
+        assert!(a.maximize);
+
+        // A None size leaves the size column untouched (a concurrent layout
+        // resize is not clobbered) while still refreshing title/hash/sizes.
+        assert!(
+            store
+                .set_installed(
+                    "a",
+                    "again",
+                    "hash2",
+                    None,
+                    &[DeckSize::Small, DeckSize::Wide],
+                    false,
+                )
+                .await
+                .unwrap()
+        );
+        let a = store.get("a").await.unwrap().unwrap();
+        assert_eq!(a.size, DeckSize::Small, "size untouched by None");
+        assert_eq!(a.sizes, vec![DeckSize::Small, DeckSize::Wide]);
+        assert!(!a.maximize);
 
         assert!(!store.set_enabled("ghost", true).await.unwrap());
     }

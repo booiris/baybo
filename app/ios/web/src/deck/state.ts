@@ -5,16 +5,46 @@
 
 export type DeckSize = "small" | "wide" | "large";
 
+/// The runtime size a card is currently rendered at. A grid `DeckSize`, or
+/// `"max"` while the card is maximized full-screen — the value pushed to the
+/// card over its port and reported by `deck.size` / `deck.onSizeChange`.
+export type RenderSize = DeckSize | "max";
+
+/// Canonical size order (small < wide < large) so the ⤢ cycle is stable
+/// regardless of the order the card declared its `sizes` in.
+const SIZE_ORDER: DeckSize[] = ["small", "wide", "large"];
+
+function isDeckSize(s: unknown): s is DeckSize {
+  return s === "small" || s === "wide" || s === "large";
+}
+
 export type DeckCard = {
   cardId: string;
   title: string;
   position: number;
   size: DeckSize;
+  /// The grid sizes the card implements (canonical order, always contains
+  /// `size`, never empty). Normalized from the payload by `normalizeCard`.
+  sizes: DeckSize[];
+  /// Whether the card declares a maximized layout (the ⛶ affordance).
+  maximize: boolean;
   enabled: boolean;
   quarantined: boolean;
   specHash: string;
   lastSeq: number;
 };
+
+/// Fill `sizes` / `maximize` for a card coming off the bridge: a pre-field
+/// mirror or a legacy card omits them, so default `sizes` to `[size]` (a
+/// single-size, never-adapted card) and `maximize` to false. Also drops any
+/// bogus size token and guarantees `size ∈ sizes`.
+export function normalizeCard(raw: DeckCard): DeckCard {
+  const declared = Array.isArray(raw.sizes) ? raw.sizes.filter(isDeckSize) : [];
+  const set = new Set<DeckSize>(declared.length > 0 ? declared : [raw.size]);
+  set.add(raw.size);
+  const sizes = SIZE_ORDER.filter((s) => set.has(s));
+  return { ...raw, sizes, maximize: raw.maximize === true };
+}
 
 export type DeckSnapshot = {
   cardId: string;
@@ -48,7 +78,7 @@ export function replaceState(
   for (const s of snapshots) {
     snaps[s.cardId] = { seq: s.seq, payload: s.payload, error: s.error ?? null };
   }
-  return { cards: [...cards].sort(byPosition), snaps };
+  return { cards: cards.map(normalizeCard).sort(byPosition), snaps };
 }
 
 function byPosition(a: DeckCard, b: DeckCard): number {
@@ -115,10 +145,15 @@ export function layoutEntries(cards: DeckCard[]): LayoutEntry[] {
   return cards.map((c, i) => ({ cardId: c.cardId, position: i, size: c.size }));
 }
 
-const SIZE_CYCLE: DeckSize[] = ["small", "wide", "large"];
-
-export function cycleSize(size: DeckSize): DeckSize {
-  return SIZE_CYCLE[(SIZE_CYCLE.indexOf(size) + 1) % SIZE_CYCLE.length];
+/// Next size in the card's own implemented set (canonical order, wrapping).
+/// A single-size card has nothing to cycle to — the caller hides the control,
+/// but this stays a no-op for safety. An off-set current value starts the
+/// cycle at the set's first size.
+export function cycleSize(size: DeckSize, sizes: DeckSize[]): DeckSize {
+  const ordered = SIZE_ORDER.filter((s) => sizes.includes(s));
+  if (ordered.length <= 1) return ordered[0] ?? size;
+  const i = ordered.indexOf(size);
+  return ordered[(i + 1) % ordered.length] ?? ordered[0];
 }
 
 /// The card iframe's CSP: no network of any kind, inline script/style +

@@ -214,6 +214,43 @@ body {
   display: flex;
 }
 
+/* A card that implements only one size has nothing to resize to — hide the
+   ⤢ even in edit mode (more specific than the show rule above). */
+.deck-grid.editing .deck-card.single-size .deck-size-btn {
+  display: none;
+}
+
+/* ⛶ maximize / ✕ close — one button, top-right, outside edit mode. Shown on
+   a maximize-capable tile; while a card is maximized only that tile keeps it
+   (as the ✕). Sits where a card's heading never does (top-left), honoring
+   the SKILL's "leave the top-right clear" rule. */
+.deck-max-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--deck-line);
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--deck-ink);
+  font-size: 14px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+}
+.deck-grid:not(.editing) .deck-card.can-maximize .deck-max-btn {
+  display: flex;
+}
+.deck-grid.has-max .deck-card:not(.maximized) .deck-max-btn {
+  display: none;
+}
+.deck-max-btn:active {
+  opacity: 0.7;
+}
+
 @keyframes deck-wiggle {
   0% { transform: rotate(-0.4deg); }
   50% { transform: rotate(0.4deg); }
@@ -255,6 +292,32 @@ body {
   border: 1px dashed var(--deck-line);
   border-radius: 16px;
   background: rgba(28, 27, 25, 0.03);
+}
+
+/* Maximized card: lifted out of flow and filling the viewport (inline
+   left/top/width/height drive the rect). Full-bleed, so no border or radius;
+   the placeholder holds its grid slot for the collapse. The tab bar floats
+   over the bottom (per the maximize design) — the card's own max layout keeps
+   content clear of it. */
+.deck-card.maximized {
+  position: fixed;
+  z-index: 20;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: var(--deck-paper);
+}
+.deck-card.deck-max-animate {
+  transition:
+    left 260ms cubic-bezier(0.2, 0, 0, 1),
+    top 260ms cubic-bezier(0.2, 0, 0, 1),
+    width 260ms cubic-bezier(0.2, 0, 0, 1),
+    height 260ms cubic-bezier(0.2, 0, 0, 1);
+}
+/* Clear the status-bar / notch when maximized. */
+.deck-card.maximized .deck-max-btn {
+  top: calc(env(safe-area-inset-top) + 10px);
+  right: calc(env(safe-area-inset-right) + 14px);
 }
 
 /* Cards must never receive pointer events while editing — the drag owns

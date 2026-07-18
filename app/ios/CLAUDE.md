@@ -212,9 +212,16 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   actions confirm NATIVELY (the shell only reports intent). Bridge
   (`App/Web/DeckBridge.swift` ⇄ `web/src/deck/bridge.ts`): native→web
   `init/deckState/cardData/bundle/callResult/setEditMode/setLanguage`;
-  web→native `ready/refetch/requestBundle/call/layout/cardAction/editMode/quickSetup/log`
+  web→native `ready/refetch/requestBundle/call/layout/cardAction/editMode/quickSetup/maximize/log`
   (`quickSetup` is the empty-board CTA: native opens a fresh chat and
-  auto-sends a `/deck` request, via `AppStore.startCardDraft`).
+  auto-sends a `/deck` request, via `AppStore.startCardDraft`; `maximize`
+  reports a card entered/left its full-screen layout so `DeckScreen` fades the
+  wordmark header out — the tab bar stays — while `DeckStore.maximized` is set).
+  Card size is per-card adaptive: the manifest declares `sizes` (the grid
+  sizes it implements; the ⤢ cycle stays in that set) and `maximize` (a
+  full-screen `deck.size === "max"` layout via a ⛶ button); both ride the
+  `DeckCardInfo`/`DeckStore.Card` model and the shell drives the expand with
+  the drag engine's fixed-tile trick (zero iframe reload).
 - **Chat list data**: `SessionIndex` (Application Support/baybo/sessions.json)
   is the device-local registry backing the list on BOTH legs. Both direct and
   relay merge `chat_list_sessions()` over it on appear/foreground/pull: direct

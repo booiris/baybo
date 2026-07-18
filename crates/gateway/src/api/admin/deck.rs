@@ -58,6 +58,13 @@ pub struct DeckCardDto {
     pub position: i64,
     /// `small` (1×1) | `wide` (2×1) | `large` (2×2).
     pub size: String,
+    /// The grid sizes the card implements; the client's ⤢ resize cycle stays
+    /// inside this set and a single entry hides the control. Always contains
+    /// `size`.
+    pub sizes: Vec<String>,
+    /// Whether the card declares a maximized (full-screen) layout — the ⛶
+    /// affordance in the top-right.
+    pub maximize: bool,
     pub enabled: bool,
     pub quarantined: bool,
     /// Unix millis; present only in the recycle listing.
@@ -79,6 +86,8 @@ impl From<CardView> for DeckCardDto {
             title: c.title,
             position: c.position,
             size: c.size.as_str().to_string(),
+            sizes: c.sizes.iter().map(|s| s.as_str().to_string()).collect(),
+            maximize: c.maximize,
             enabled: c.enabled,
             quarantined: c.quarantined_at.is_some(),
             deleted_at_ms: c.deleted_at.map(|t| t.timestamp_millis()),

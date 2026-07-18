@@ -112,6 +112,13 @@ export function postEditMode(active: boolean): void {
   post({ type: "editMode", active });
 }
 
+/// A card entered/left its full-screen maximized layout. Native reflects it
+/// by fading the wordmark header out (the tab bar stays); the shell owns the
+/// tile's own expand/collapse animation.
+export function postMaximize(active: boolean): void {
+  post({ type: "maximize", active });
+}
+
 /// Empty-board "Quick setup": ask native to open a fresh chat on the Chats
 /// tab and auto-send `prompt` (a `/deck …` request) so the user lands in the
 /// conversation already working.

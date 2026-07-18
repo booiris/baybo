@@ -12,12 +12,20 @@ struct DeckStoreTests {
         return DeckStore(clientProvider: { fake })
     }
 
-    private func card(_ id: String, position: Int64, size: String = "wide") -> DeckCardInfo {
+    private func card(
+        _ id: String,
+        position: Int64,
+        size: String = "wide",
+        sizes: [String] = ["wide"],
+        maximize: Bool = false
+    ) -> DeckCardInfo {
         DeckCardInfo(
             cardId: id,
             title: id,
             position: position,
             size: size,
+            sizes: sizes,
+            maximize: maximize,
             enabled: true,
             quarantined: false,
             deletedAtMs: nil,

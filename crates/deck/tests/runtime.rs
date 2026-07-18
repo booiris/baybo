@@ -14,6 +14,7 @@ use serde_json::json;
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_storage::sqlite::{SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
+use baybo_store::{DeckLayoutEntry, DeckSize};
 
 #[derive(Default)]
 struct RecordingEvents {
@@ -251,6 +252,66 @@ export const ops = {
     let view = h.manager.deck_view().await.unwrap();
     assert!(view.snapshots[0].payload.contains("99"));
     assert_eq!(git_log_count(h.manager.deck_root(), &card.id), 2);
+
+    h.manager.shutdown().await;
+}
+
+/// A layout write may only persist a size the card implements. The gateway
+/// checks the token parses, not membership, so the manager clamps an off-set
+/// size back to the card's current (valid) size — the `size ∈ sizes`
+/// invariant holds on the write path, not just install/update/boot.
+#[tokio::test]
+async fn set_layout_clamps_size_to_the_cards_implemented_set() {
+    let Some(h) = harness_or_skip("set_layout_clamps_size_to_the_cards_implemented_set").await
+    else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    // A card that implements only wide + large.
+    std::fs::write(
+        staged.path().join("manifest.json"),
+        json!({
+            "title": "Quota", "size": "wide", "sizes": ["wide", "large"],
+            "refresh": {"op": "refresh", "min_emit_interval_secs": 60}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap();
+    assert_eq!(card.size, DeckSize::Wide);
+
+    // small is not implemented → clamped to the current valid size.
+    h.manager
+        .set_layout(&[DeckLayoutEntry {
+            id: card.id.clone(),
+            position: 0,
+            size: DeckSize::Small,
+        }])
+        .await
+        .unwrap();
+    let off_set = h.manager.deck_view().await.unwrap();
+    assert_eq!(
+        off_set.cards.iter().find(|c| c.id == card.id).unwrap().size,
+        DeckSize::Wide,
+        "off-set size clamped to current"
+    );
+
+    // large IS implemented → honored.
+    h.manager
+        .set_layout(&[DeckLayoutEntry {
+            id: card.id.clone(),
+            position: 0,
+            size: DeckSize::Large,
+        }])
+        .await
+        .unwrap();
+    let in_set = h.manager.deck_view().await.unwrap();
+    assert_eq!(
+        in_set.cards.iter().find(|c| c.id == card.id).unwrap().size,
+        DeckSize::Large,
+        "in-set size honored"
+    );
 
     h.manager.shutdown().await;
 }

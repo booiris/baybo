@@ -751,6 +751,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     title          TEXT    NOT NULL,
                     position       INTEGER NOT NULL,
                     size           TEXT    NOT NULL,
+                    -- Comma-separated grid sizes the card implements; the ⤢
+                    -- cycle stays inside this set. Empty on a row migrated
+                    -- before the column existed → the reader falls back to
+                    -- [size] (a legacy single-size card).
+                    sizes          TEXT    NOT NULL DEFAULT '',
+                    -- Whether the card declares a maximized layout (⛶).
+                    maximize       INTEGER NOT NULL DEFAULT 0,
                     enabled        INTEGER NOT NULL DEFAULT 1,
                     quarantined_at INTEGER,
                     deleted_at     INTEGER,
@@ -797,6 +804,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
         "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN channel TEXT",
+        "ALTER TABLE deck_cards ADD COLUMN sizes TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {

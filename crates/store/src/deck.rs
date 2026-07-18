@@ -43,6 +43,25 @@ impl DeckSize {
             _ => None,
         }
     }
+
+    /// Join a size list to the comma-separated form the `deck_cards.sizes`
+    /// column stores.
+    pub fn join(sizes: &[DeckSize]) -> String {
+        sizes
+            .iter()
+            .map(DeckSize::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Parse the `deck_cards.sizes` column back to a list, dropping unknown
+    /// tokens. An empty/blank column (a row migrated before the column
+    /// existed) yields `None` so the caller can fall back to `[size]` — the
+    /// honest "single-size, never adapted" default for a legacy card.
+    pub fn parse_list(s: &str) -> Option<Vec<DeckSize>> {
+        let parsed: Vec<DeckSize> = s.split(',').filter_map(DeckSize::parse).collect();
+        (!parsed.is_empty()).then_some(parsed)
+    }
 }
 
 /// One row of `deck_cards`.
@@ -53,7 +72,17 @@ pub struct DeckCardRow {
     pub title: String,
     /// Manual order on the deck, ascending.
     pub position: i64,
+    /// The user's current tile size (authoritative post-install); always a
+    /// member of `sizes`.
     pub size: DeckSize,
+    /// The grid sizes the card's `card.html` actually implements — the ⤢
+    /// resize cycle is confined to these, and a single-entry list hides the
+    /// resize control. Refreshed from the manifest on every install/update;
+    /// a legacy card (installed before the field) reads back as `[size]`.
+    pub sizes: Vec<DeckSize>,
+    /// Whether the card declares a full-screen maximized layout (the ⛶
+    /// affordance). Refreshed from the manifest on install/update.
+    pub maximize: bool,
     pub enabled: bool,
     /// Set when the runtime auto-disabled the card (crash/timeout window).
     pub quarantined_at: Option<DateTime<Utc>>,
@@ -117,9 +146,22 @@ pub trait DeckCardStore: Send + Sync {
     /// Stamp or clear `quarantined_at`. Returns `Ok(false)` if no row matched.
     async fn set_quarantined(&self, id: &str, at: Option<DateTime<Utc>>) -> Result<bool>;
 
-    /// Update title + spec hash after a bundle update. Returns `Ok(false)`
-    /// if no row matched.
-    async fn set_installed(&self, id: &str, title: &str, spec_hash: &str) -> Result<bool>;
+    /// Apply the post-install authoritative fields after an install-gate
+    /// pass (update / boot re-gate): title + spec hash, plus the manifest's
+    /// capability set (`sizes` / `maximize`) refreshed from the new code.
+    /// `size` is `Some` **only** when the caller must re-clamp — the user's
+    /// current size is no longer in the new `sizes`; `None` leaves the size
+    /// column untouched so a concurrent layout resize is not clobbered.
+    /// Returns `Ok(false)` if no row matched.
+    async fn set_installed(
+        &self,
+        id: &str,
+        title: &str,
+        spec_hash: &str,
+        size: Option<DeckSize>,
+        sizes: &[DeckSize],
+        maximize: bool,
+    ) -> Result<bool>;
 
     /// Stamp (`Some` = soft delete) or clear (`None` = restore)
     /// `deleted_at`. Returns `Ok(false)` if no row matched.

@@ -40,6 +40,7 @@ type Tile = {
   overlay: HTMLElement;
   sizeBtn: HTMLButtonElement;
   removeBtn: HTMLButtonElement;
+  maxBtn: HTMLButtonElement;
 };
 
 export class DeckShell {
@@ -53,6 +54,18 @@ export class DeckShell {
   private editMode = false;
   private setupInflight = false;
   private lang: "en" | "zh" = "en";
+  // Maximize state (the full-screen card). `maximizedCardId` is the card
+  // currently expanded; `maxPlaceholder` holds its grid slot so the tile
+  // flows back to the same spot on restore. Like the drag engine, the tile
+  // lifts to `position: fixed` and animates via transform/rect — never a DOM
+  // move — so its iframe keeps painting live content, zero reload.
+  private maximizedCardId: string | null = null;
+  private maxPlaceholder: HTMLElement | null = null;
+  // True while a maximize/restore geometry transition is in flight. A
+  // maximize/restore is inert until it clears, so a re-tap during the ~260ms
+  // animation can't start a second operation whose stale settle would tear the
+  // first one down (leaving a card wedged with a ✕ on a grid-size tile).
+  private maxAnimating = false;
   // Live drag state (the iOS-home-screen engine below).
   private dragCardId: string | null = null;
   private dragEl: HTMLElement | null = null;
@@ -92,6 +105,10 @@ export class DeckShell {
 
   setEditMode(active: boolean): void {
     if (this.editMode === active) return;
+    // Editing and maximizing are mutually exclusive surfaces — collapse a
+    // maximized card before entering edit mode (native hides the edit pill
+    // while maximized, so this only fires on a programmatic init edge).
+    if (active && this.maximizedCardId !== null) this.clearMaximizeState();
     this.editMode = active;
     if (!active && this.dragCardId !== null) this.endDrag();
     this.grid.classList.toggle("editing", active);
@@ -125,8 +142,11 @@ export class DeckShell {
       const channel = new MessageChannel();
       tile.port = channel.port1;
       channel.port1.onmessage = (e) => this.onCardMessage(cardId, e.data);
+      // A card whose iframe finishes loading while it is already maximized
+      // must init at "max", not its grid size.
+      const initSize = cardId === this.maximizedCardId ? "max" : tile.card.size;
       frame.contentWindow?.postMessage(
-        { type: "deck_init", size: tile.card.size },
+        { type: "deck_init", size: initSize },
         "*",
         [channel.port2],
       );
@@ -207,6 +227,16 @@ export class DeckShell {
   }
 
   private reconcileTiles(): void {
+    // If the maximized card vanished (deleted elsewhere) or its code changed
+    // out from under the fixed tile, collapse back to the grid first so the
+    // teardown/removal below is a normal flow tile again.
+    if (this.maximizedCardId !== null) {
+      const still = this.state.cards.find((c) => c.cardId === this.maximizedCardId);
+      const tile = this.tiles.get(this.maximizedCardId);
+      if (!still || (tile && still.specHash !== tile.card.specHash)) {
+        this.clearMaximizeState();
+      }
+    }
     const seen = new Set<string>();
     for (const card of this.state.cards) {
       seen.add(card.cardId);
@@ -217,8 +247,17 @@ export class DeckShell {
         this.grid.append(tile.el);
       }
       const specChanged = tile.card.specHash !== card.specHash;
+      const isMax = card.cardId === this.maximizedCardId;
       tile.card = card;
-      tile.el.dataset.size = card.size;
+      // A maximize-capable card shows the ⛶; a single-size card hides ⤢.
+      tile.el.classList.toggle("can-maximize", card.maximize);
+      tile.el.classList.toggle("single-size", card.sizes.length <= 1);
+      // The maximized tile keeps data-size="max" and its "max" render size;
+      // don't reset either from the grid size while it's expanded. But keep
+      // its placeholder's span in sync with a remote resize, so the restore
+      // animation targets the correct grid slot instead of the stale span.
+      if (!isMax) tile.el.dataset.size = card.size;
+      else if (this.maxPlaceholder) this.maxPlaceholder.dataset.size = card.size;
       if (specChanged && tile.frame) {
         // New code: tear the old iframe down and refetch the bundle.
         tile.port?.close();
@@ -231,7 +270,7 @@ export class DeckShell {
         tile.bundleRequested = true;
         bridge.postRequestBundle(card.cardId);
       }
-      tile.port?.postMessage({ type: "size", size: card.size });
+      if (!isMax) tile.port?.postMessage({ type: "size", size: card.size });
       this.renderOverlay(tile);
     }
     for (const [cardId, tile] of this.tiles) {
@@ -248,6 +287,11 @@ export class DeckShell {
     // ever reboots a card.
     let i = 0;
     for (const card of this.state.cards) {
+      if (card.cardId === this.maximizedCardId) {
+        // The fixed tile is out of flow; its placeholder holds the slot.
+        this.maxPlaceholder?.style.setProperty("order", String(i++));
+        continue;
+      }
       const el = this.tiles.get(card.cardId)?.el;
       if (el) el.style.order = String(i++);
     }
@@ -278,7 +322,9 @@ export class DeckShell {
     sizeBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!this.editMode) return;
-      const next = cycleSize(this.tiles.get(card.cardId)?.card.size ?? card.size);
+      const cur = this.tiles.get(card.cardId)?.card ?? card;
+      const next = cycleSize(cur.size, cur.sizes);
+      if (next === cur.size) return;
       this.state = { ...this.state, cards: setCardSize(this.state.cards, card.cardId, next) };
       this.reconcileTiles();
       bridge.postLayout(layoutEntries(this.state.cards));
@@ -293,9 +339,32 @@ export class DeckShell {
       bridge.postCardAction(card.cardId, "delete");
     });
 
-    el.append(header, body, overlay, sizeBtn, removeBtn);
+    // ⛶ (maximize) / ✕ (close) — one button, glyph + action swap with state.
+    // Visibility is CSS: shown on a maximize-capable tile when not editing
+    // and (for non-maximized tiles) when nothing else is maximized.
+    const maxBtn = document.createElement("button");
+    maxBtn.className = "deck-max-btn";
+    maxBtn.textContent = "⛶";
+    maxBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (this.editMode) return;
+      if (this.maximizedCardId === card.cardId) this.restoreCard();
+      else this.maximizeCard(card.cardId);
+    });
+
+    el.append(header, body, overlay, sizeBtn, removeBtn, maxBtn);
     this.wireDrag(el, card.cardId);
-    return { card, el, frame: null, port: null, bundleRequested: false, overlay, sizeBtn, removeBtn };
+    return {
+      card,
+      el,
+      frame: null,
+      port: null,
+      bundleRequested: false,
+      overlay,
+      sizeBtn,
+      removeBtn,
+      maxBtn,
+    };
   }
 
   private renderOverlay(tile: Tile): void {
@@ -345,7 +414,8 @@ export class DeckShell {
     el.addEventListener("pointerdown", (down) => {
       if (!this.editMode || this.dragCardId !== null) return;
       const target = down.target as HTMLElement;
-      if (target.closest(".deck-size-btn, .deck-remove-btn, .deck-face-btn")) return;
+      if (target.closest(".deck-size-btn, .deck-remove-btn, .deck-face-btn, .deck-max-btn"))
+        return;
       const startX = down.clientX;
       const startY = down.clientY;
       // Capture the pointer: beginDrag flips the tile to position:fixed
@@ -543,5 +613,135 @@ export class DeckShell {
         );
       }
     }
+  }
+
+  // ---- maximize engine -----------------------------------------------
+  //
+  // Same insight as the drag engine: an <iframe> reloads only when its node
+  // MOVES in the DOM, so the tile lifts to `position: fixed` and animates by
+  // rect — the live card never reboots. A placeholder holds the grid slot so
+  // the tile flows back to exactly where it was. Native fades the wordmark
+  // header out (bridge.postMaximize); the tab bar stays.
+
+  private maximizeCard(cardId: string): void {
+    if (
+      this.editMode ||
+      this.dragCardId !== null ||
+      this.maximizedCardId !== null ||
+      this.maxAnimating
+    )
+      return;
+    const tile = this.tiles.get(cardId);
+    if (!tile || !tile.card.maximize) return;
+    const el = tile.el;
+    const rect = el.getBoundingClientRect();
+    this.maxAnimating = true;
+
+    const ph = document.createElement("div");
+    ph.className = "deck-drop-slot";
+    ph.dataset.size = el.dataset.size ?? "wide";
+    ph.style.order = el.style.order;
+    this.maxPlaceholder = ph;
+    this.grid.append(ph);
+
+    this.maximizedCardId = cardId;
+    this.grid.classList.add("has-max");
+    el.classList.add("maximized");
+    tile.maxBtn.textContent = "✕";
+
+    // Lift out of flow at the exact on-screen rect, commit that starting
+    // frame, then transition to fill the viewport.
+    el.style.left = `${rect.left}px`;
+    el.style.top = `${rect.top}px`;
+    el.style.width = `${rect.width}px`;
+    el.style.height = `${rect.height}px`;
+    void el.offsetWidth;
+    el.classList.add("deck-max-animate");
+    el.style.left = "0px";
+    el.style.top = "0px";
+    el.style.width = "100vw";
+    el.style.height = "100dvh";
+
+    tile.port?.postMessage({ type: "size", size: "max" });
+    bridge.postMaximize(true);
+    // Drop the transition once expanded so a later viewport change (rotation,
+    // keyboard) resizes instantly rather than animating.
+    this.afterTransition(el, () => {
+      el.classList.remove("deck-max-animate");
+      this.maxAnimating = false;
+    });
+  }
+
+  private restoreCard(): void {
+    const cardId = this.maximizedCardId;
+    if (cardId === null || this.maxAnimating) return;
+    const tile = this.tiles.get(cardId);
+    const ph = this.maxPlaceholder;
+    if (!tile || !ph) {
+      this.clearMaximizeState();
+      return;
+    }
+    this.maxAnimating = true;
+    const el = tile.el;
+    const target = ph.getBoundingClientRect();
+    el.classList.add("deck-max-animate");
+    el.style.left = `${target.left}px`;
+    el.style.top = `${target.top}px`;
+    el.style.width = `${target.width}px`;
+    el.style.height = `${target.height}px`;
+
+    // State (card size, glyph, native header) flips now; only the geometry
+    // animates.
+    tile.port?.postMessage({ type: "size", size: tile.card.size });
+    tile.maxBtn.textContent = "⛶";
+    bridge.postMaximize(false);
+    this.maximizedCardId = null;
+
+    this.afterTransition(el, () => {
+      el.classList.remove("maximized", "deck-max-animate");
+      el.style.cssText = "";
+      ph.remove();
+      this.maxPlaceholder = null;
+      this.grid.classList.remove("has-max");
+      this.maxAnimating = false;
+      // cssText wipe cleared `order`/`data-size` — reconcile re-applies them.
+      this.reconcileTiles();
+    });
+  }
+
+  /// Hard, non-animated collapse — used when the maximized card is deleted or
+  /// updated out from under the fixed tile (reconcileTiles), or edit mode is
+  /// forced on. Leaves the grid consistent; the caller's reconcile re-lays.
+  private clearMaximizeState(): void {
+    const cardId = this.maximizedCardId;
+    if (cardId === null) return;
+    this.maximizedCardId = null;
+    const tile = this.tiles.get(cardId);
+    if (tile) {
+      tile.el.classList.remove("maximized", "deck-max-animate");
+      tile.el.style.cssText = "";
+      tile.maxBtn.textContent = "⛶";
+      tile.port?.postMessage({ type: "size", size: tile.card.size });
+    }
+    this.maxPlaceholder?.remove();
+    this.maxPlaceholder = null;
+    this.grid.classList.remove("has-max");
+    this.maxAnimating = false;
+    bridge.postMaximize(false);
+  }
+
+  /// Run `fn` once on the element's next transitionend, with a timer backstop
+  /// — a swallowed transitionend (display churn, zero-distance) must never
+  /// wedge the tile mid-animation.
+  private afterTransition(el: HTMLElement, fn: () => void): void {
+    let done = false;
+    const run = () => {
+      if (done) return;
+      done = true;
+      el.removeEventListener("transitionend", run);
+      fn();
+    };
+    el.addEventListener("transitionend", run);
+    setTimeout(run, 360);
   }
 }

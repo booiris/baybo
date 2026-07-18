@@ -239,6 +239,13 @@ pub struct DeckCardInfo {
     pub position: i64,
     /// Size class: `"small"` (1×1), `"wide"` (2×1), or `"large"` (2×2).
     pub size: String,
+    /// The grid sizes the card's `card.html` implements — the ⤢ resize cycle
+    /// stays inside this set, and a single entry hides the resize control.
+    /// Always contains `size`.
+    pub sizes: Vec<String>,
+    /// Whether the card declares a maximized (full-screen) layout — the ⛶
+    /// affordance the shell renders in the tile's top-right.
+    pub maximize: bool,
     pub enabled: bool,
     /// Auto-disabled by the gateway supervisor (crash/timeout budget blown);
     /// the card renders an error face with a Re-enable action.
