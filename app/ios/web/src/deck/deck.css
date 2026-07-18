@@ -152,7 +152,7 @@ body {
 }
 
 /* Primary CTA on the empty board: one solid ink pill (monochrome, so
-   still on-language) that opens a prefilled /card draft. */
+   still on-language) that opens a prefilled /deck draft. */
 .deck-empty-cta {
   border: 1px solid var(--deck-ink);
   border-radius: 999px;

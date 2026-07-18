@@ -723,24 +723,24 @@ mod tests {
         let reg = SkillRegistry::new();
         let n = reg.register_builtins();
         assert!(n > 0, "expected compiled-in builtins");
-        assert!(reg.get("deck-card").is_some());
+        assert!(reg.get("deck").is_some());
         reg.load_dir(&dir);
 
         // The SkillInstall path: reload after a workspace change. Builtins
         // must survive (this exact call used to drop them all).
         reg.reload();
-        assert!(reg.get("deck-card").is_some(), "builtin lost on reload");
+        assert!(reg.get("deck").is_some(), "builtin lost on reload");
 
         // A same-named workspace skill still overrides its builtin.
-        let sub = dir.join("deck-card");
+        let sub = dir.join("deck");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(
             sub.join("SKILL.md"),
-            "---\nname: deck-card\ndescription: patched\n---\nbody\n",
+            "---\nname: deck\ndescription: patched\n---\nbody\n",
         )
         .unwrap();
         reg.reload();
-        assert_eq!(reg.get("deck-card").unwrap().description, "patched");
+        assert_eq!(reg.get("deck").unwrap().description, "patched");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

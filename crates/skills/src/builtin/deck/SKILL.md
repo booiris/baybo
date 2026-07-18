@@ -1,8 +1,8 @@
 ---
-name: deck-card
+name: deck
 version: 0.2.0
-description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /card <request>; never auto-selected. Covers the bundle contract, the service/card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
-command: card
+description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /deck <request>; never auto-selected. Covers the bundle contract, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
+command: deck
 user-invocable: true
 disable-model-invocation: true
 channels:
@@ -20,7 +20,7 @@ allowed-tools:
 
 # Authoring a deck card
 
-The user invoked `/card` — the text after the command is their request.
+The user invoked `/deck` — the text after the command is their request.
 Build the card they asked for. If the request is empty, ask what the
 card should show before writing anything.
 

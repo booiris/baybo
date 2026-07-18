@@ -33,10 +33,10 @@ export const en = {
       durHM: "{{h}}h {{m}}m",
     },
     deck: {
-      empty: "No cards yet — type /card in a chat to make one.",
+      empty: "No cards yet — type /deck in a chat to make one.",
       quickSetup: "Create a card",
       createCardInflight: "Creating · view",
-      quickSetupPrompt: "/card Make a card that monitors baybo's token usage",
+      quickSetupPrompt: "/deck Make a card that monitors baybo's token usage",
       quarantined: "This card was stopped after repeated failures.",
       disabled: "Paused",
       reenable: "Re-enable",

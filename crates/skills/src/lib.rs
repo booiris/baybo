@@ -49,7 +49,7 @@ pub struct SkillDefinition {
     /// Channels whose sessions may see or invoke this skill (listing,
     /// slash expansion, and the `Skill` tool all enforce it). Empty =
     /// every channel, the norm. Set via the `channels:` frontmatter key
-    /// (e.g. `channels: [owner]` for the owner-surface-only deck-card).
+    /// (e.g. `channels: [owner]` for the owner-surface-only deck skill).
     #[serde(default)]
     pub channels: Vec<baybo_model::ChannelType>,
     /// Autocomplete hint for the slash command (e.g., `[issue-number]`).

@@ -82,7 +82,7 @@ export class DeckShell {
     for (const tile of this.tiles.values()) this.renderOverlay(tile);
   }
 
-  /// A `/card` creation from the empty-board CTA is running (no card yet):
+  /// A `/deck` creation from the empty-board CTA is running (no card yet):
   /// the CTA shows a spinner and a re-tap returns to that chat (native
   /// routes it; the shell just reflects the state).
   setSetupInflight(active: boolean): void {

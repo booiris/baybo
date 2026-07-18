@@ -62,7 +62,7 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
         case "editMode":
             store?.editMode = body["active"] as? Bool ?? false
         case "quickSetup":
-            // Empty-board CTA: open a fresh chat and auto-send a `/card …`
+            // Empty-board CTA: open a fresh chat and auto-send a `/deck …`
             // request.
             if let prompt = body["prompt"] as? String {
                 AppStore.shared?.startCardDraft(prompt: prompt)

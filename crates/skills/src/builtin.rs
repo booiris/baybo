@@ -18,7 +18,7 @@ use crate::SkillDefinition;
 use crate::loader::parse_skill_md;
 
 const BAYBO_CLI_SKILL_MD: &str = include_str!("builtin/baybo-cli/SKILL.md");
-const DECK_CARD_SKILL_MD: &str = include_str!("builtin/deck-card/SKILL.md");
+const DECK_SKILL_MD: &str = include_str!("builtin/deck/SKILL.md");
 
 /// Template token in built-in SKILL.md bodies that gets substituted
 /// with the absolute path of the running `baybo` binary at register
@@ -32,10 +32,7 @@ const BAYBO_BIN_TOKEN: &str = "{{BAYBO_BIN}}";
 /// [`crate::SkillRegistry::register`] is keyed by `name`.
 pub(crate) fn all() -> Vec<SkillDefinition> {
     let bin = resolve_baybo_bin();
-    let raw = [
-        ("baybo-cli", BAYBO_CLI_SKILL_MD),
-        ("deck-card", DECK_CARD_SKILL_MD),
-    ];
+    let raw = [("baybo-cli", BAYBO_CLI_SKILL_MD), ("deck", DECK_SKILL_MD)];
     raw.into_iter()
         .filter_map(|(name, md)| parse(name, md, &bin))
         .collect()

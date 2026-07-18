@@ -358,10 +358,10 @@ mod tests {
 
     #[test]
     fn command_override_replaces_the_name_derived_command() {
-        let src = "---\nname: deck-card\ncommand: card\n---\n";
-        let skill = parse_skill_md(src, "deck-card").unwrap();
-        assert_eq!(skill.command.as_deref(), Some("card"));
-        assert_eq!(skill.name, "deck-card");
+        let src = "---\nname: deck\ncommand: deck-cmd\n---\n";
+        let skill = parse_skill_md(src, "deck").unwrap();
+        assert_eq!(skill.command.as_deref(), Some("deck-cmd"));
+        assert_eq!(skill.name, "deck");
     }
 
     #[test]

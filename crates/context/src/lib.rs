@@ -3111,8 +3111,8 @@ mod tests {
     #[tokio::test]
     async fn slash_expands_a_skill_hidden_from_the_model() {
         let registry = Arc::new(SkillRegistry::new());
-        let mut skill = mk_skill("deck-card", "CARD_BODY");
-        skill.command = Some("card".into());
+        let mut skill = mk_skill("deck", "CARD_BODY");
+        skill.command = Some("deck".into());
         skill.agent_invocable = false;
         registry.register(skill);
         let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
@@ -3123,7 +3123,7 @@ mod tests {
         );
 
         ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
-            "/card quota monitor".into(),
+            "/deck quota monitor".into(),
         )]))
         .await;
         ctx.expand_slash_command().await;
@@ -3140,8 +3140,8 @@ mod tests {
     async fn channel_restricted_skill_is_inert_off_channel() {
         let mk_registry = || {
             let registry = Arc::new(SkillRegistry::new());
-            let mut skill = mk_skill("deck-card", "CARD_BODY");
-            skill.command = Some("card".into());
+            let mut skill = mk_skill("deck", "CARD_BODY");
+            skill.command = Some("deck".into());
             skill.channels = vec![baybo_model::ChannelType::owner()];
             registry.register(skill);
             registry
@@ -3150,7 +3150,7 @@ mod tests {
         let mut on_owner = make_ctx_with_registry(mk_registry(), 5, 100_000, 0.75);
         assert_eq!(on_owner.invocable_skill_summaries().len(), 1);
         on_owner
-            .append(&ChatMessage::user(vec![ContentBlock::Text("/card".into())]))
+            .append(&ChatMessage::user(vec![ContentBlock::Text("/deck".into())]))
             .await;
         on_owner.expand_slash_command().await;
         assert_eq!(on_owner.message_count(), 2, "owner session expands");
@@ -3162,7 +3162,7 @@ mod tests {
             "hidden from a telegram session's listing"
         );
         on_telegram
-            .append(&ChatMessage::user(vec![ContentBlock::Text("/card".into())]))
+            .append(&ChatMessage::user(vec![ContentBlock::Text("/deck".into())]))
             .await;
         on_telegram.expand_slash_command().await;
         assert_eq!(
