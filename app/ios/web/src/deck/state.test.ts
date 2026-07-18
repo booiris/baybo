@@ -29,7 +29,7 @@ describe("replaceState", () => {
     const prev = replaceState([card("a", 0)], [
       { cardId: "a", seq: 9, payload: `{"n":9}` },
     ]);
-    expect(prev.snaps.a.seq).toBe(9);
+    expect(prev.snaps.a?.seq).toBe(9);
 
     // A DeckChanged refetch replaces snapshot + seq even if LOWER — the
     // refetch is the authority (the sentinel/cursor bug class).
@@ -38,7 +38,7 @@ describe("replaceState", () => {
       [{ cardId: "a", seq: 3, payload: `{"n":3}` }],
     );
     expect(next.cards.map((c) => c.cardId)).toEqual(["b", "a"]);
-    expect(next.snaps.a.seq).toBe(3);
+    expect(next.snaps.a?.seq).toBe(3);
   });
 });
 
@@ -52,7 +52,7 @@ describe("applyCardData", () => {
     expect(applyCardData(base, "a", 4, "{}").changed).toBe(false);
     const up = applyCardData(base, "a", 6, `{"n":6}`);
     expect(up.changed).toBe(true);
-    expect(up.state.snaps.a.seq).toBe(6);
+    expect(up.state.snaps.a?.seq).toBe(6);
   });
 
   it("accepts a first push for a card with no cached snapshot", () => {

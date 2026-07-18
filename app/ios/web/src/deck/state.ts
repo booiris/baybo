@@ -31,7 +31,9 @@ export type SnapshotCell = {
 
 export type DeckState = {
   cards: DeckCard[];
-  snaps: Record<string, SnapshotCell>;
+  /// `| undefined` is the honest index type: a card can have no cached
+  /// snapshot yet, and lookups must handle the miss.
+  snaps: Record<string, SnapshotCell | undefined>;
 };
 
 export const EMPTY_STATE: DeckState = { cards: [], snaps: {} };
@@ -50,7 +52,8 @@ export function replaceState(
 }
 
 function byPosition(a: DeckCard, b: DeckCard): number {
-  return a.position - b.position || a.cardId.localeCompare(b.cardId);
+  const byPos = a.position - b.position;
+  return byPos !== 0 ? byPos : a.cardId.localeCompare(b.cardId);
 }
 
 /// Live push rule: accept iff seq is strictly greater than the cached
@@ -66,7 +69,7 @@ export function applyCardData(
     return { state, changed: false };
   }
   const cached = state.snaps[cardId];
-  if (cached && seq <= cached.seq) {
+  if (cached !== undefined && seq <= cached.seq) {
     return { state, changed: false };
   }
   return {
@@ -154,7 +157,7 @@ export function buildSrcdoc(
 /// Invalid JSON (should be impossible — the gateway stores JSON text)
 /// degrades to null rather than wedging the card.
 export function parsePayload(cell: SnapshotCell): unknown {
-  if (cell.error) return { error: cell.error };
+  if (cell.error !== null && cell.error !== "") return { error: cell.error };
   try {
     return JSON.parse(cell.payload) as unknown;
   } catch {

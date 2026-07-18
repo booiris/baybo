@@ -25,7 +25,8 @@ import {
 
 // Locale DATA only — the i18next runtime lives in the React transcript entry
 // and must not be dragged into this vanilla chunk for four strings.
-const STRINGS: Record<string, Record<string, string>> = {
+// `Partial` because `t()` looks keys up dynamically — a miss is real.
+const STRINGS: Record<"en" | "zh", Partial<Record<string, string>>> = {
   en: en.translation.deck,
   zh: zh.translation.deck,
 };
@@ -50,7 +51,7 @@ export class DeckShell {
   private pendingCalls = new Map<string, { cardId: string; localId: number }>();
   private nextCallSerial = 1;
   private editMode = false;
-  private lang = "en";
+  private lang: "en" | "zh" = "en";
   // Live drag state (the iOS-home-screen engine below).
   private dragCardId: string | null = null;
   private dragEl: HTMLElement | null = null;
@@ -71,8 +72,7 @@ export class DeckShell {
   }
 
   private t(key: string): string {
-    const table = STRINGS[this.lang] ?? STRINGS.en;
-    return table[key] ?? STRINGS.en[key] ?? key;
+    return STRINGS[this.lang][key] ?? STRINGS.en[key] ?? key;
   }
 
   setLanguage(lang: string): void {
@@ -84,7 +84,7 @@ export class DeckShell {
   setEditMode(active: boolean): void {
     if (this.editMode === active) return;
     this.editMode = active;
-    if (!active && this.dragCardId) this.endDrag();
+    if (!active && this.dragCardId !== null) this.endDrag();
     this.grid.classList.toggle("editing", active);
     bridge.postEditMode(active);
     for (const tile of this.tiles.values()) this.renderOverlay(tile);
@@ -166,7 +166,7 @@ export class DeckShell {
   private pushSnapshot(cardId: string): void {
     const tile = this.tiles.get(cardId);
     const cell = this.state.snaps[cardId];
-    if (!tile || !tile.port || !cell) return;
+    if (!tile || !tile.port || cell === undefined) return;
     tile.port.postMessage({ type: "data", payload: parsePayload(cell) });
   }
 
@@ -312,7 +312,7 @@ export class DeckShell {
       { passive: false },
     );
     el.addEventListener("pointerdown", (down) => {
-      if (!this.editMode || this.dragCardId) return;
+      if (!this.editMode || this.dragCardId !== null) return;
       const target = down.target as HTMLElement;
       if (target.closest(".deck-size-btn, .deck-remove-btn, .deck-face-btn")) return;
       const startX = down.clientX;
@@ -337,7 +337,7 @@ export class DeckShell {
           this.beginDrag(el, cardId, startX, startY);
         }
         this.lastPoint = { x: ev.clientX, y: ev.clientY };
-        if (!this.dragRaf) {
+        if (this.dragRaf === 0) {
           this.dragRaf = requestAnimationFrame(() => {
             this.dragRaf = 0;
             this.dragFrame();
@@ -385,7 +385,7 @@ export class DeckShell {
 
   private dragFrame(): void {
     const el = this.dragEl;
-    if (!el || !this.dragCardId) return;
+    if (!el || this.dragCardId === null) return;
     const dx = this.lastPoint.x - this.dragOrigin.x;
     const dy = this.lastPoint.y - this.dragOrigin.y;
     el.style.transform = `translate(${dx}px, ${dy}px) scale(1.04)`;
@@ -400,10 +400,10 @@ export class DeckShell {
     const el = this.dragEl;
     const ph = this.placeholder;
     const cardId = this.dragCardId;
-    if (!el || !ph || !cardId) return;
+    if (!el || !ph || cardId === null) return;
     // The last pointer movement may still be waiting on rAF — resolve
     // the final slot from the actual drop point, not the last frame.
-    if (this.dragRaf) {
+    if (this.dragRaf !== 0) {
       cancelAnimationFrame(this.dragRaf);
       this.dragRaf = 0;
     }
