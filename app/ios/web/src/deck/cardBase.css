@@ -1,0 +1,100 @@
+/* Deck card base — injected into every card's srcdoc AHEAD of the
+   agent-written fragment, so the app's design language ships once
+   instead of being re-authored per card. Everything is overridable:
+   the card's own <style> comes later in the cascade, and the palette
+   is custom properties. Keep this additive-only — installed cards
+   assume it. */
+
+:root {
+  --ink: #1c1b19;
+  --muted: rgba(28, 27, 25, 0.55);
+  --line: rgba(28, 27, 25, 0.14);
+  --ok: #2e7d4f;
+  --bad: #b43c28;
+}
+
+html,
+body {
+  margin: 0;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+body {
+  height: 100vh;
+  overflow: hidden;
+  font: 13px -apple-system, "SF Pro Text", sans-serif;
+  color: var(--ink);
+  -webkit-text-size-adjust: none;
+}
+
+/* Column filling the tile; .foot pins to the bottom via margin-top. */
+.card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 10px 12px;
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hero {
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.divider {
+  border-top: 1px solid var(--line);
+  margin: 6px 0;
+}
+
+.foot {
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+.dot.bad {
+  background: var(--bad);
+}
+
+.bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  background: var(--ink);
+}

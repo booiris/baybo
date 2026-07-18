@@ -6,6 +6,7 @@
 
 import Sortable from "sortablejs";
 import sdkSource from "./sdkCard.js?raw";
+import cardBaseCss from "./cardBase.css?raw";
 import * as bridge from "./bridge";
 import { en } from "../locales/en";
 import { zh } from "../locales/zh";
@@ -80,9 +81,11 @@ export class DeckShell {
       fallbackClass: "deck-drag-fallback",
       fallbackTolerance: 4,
       ghostClass: "deck-drag-ghost",
-      delay: 100,
+      // Forgiving hold-then-drag: a finger wobbles a few px during the
+      // start delay; a real flick still cancels into a scroll.
+      delay: 150,
       delayOnTouchOnly: true,
-      touchStartThreshold: 3,
+      touchStartThreshold: 6,
       onEnd: (evt) => {
         if (evt.oldIndex === evt.newIndex) return;
         const ids = [...this.grid.children].map(
@@ -136,7 +139,7 @@ export class DeckShell {
     const frame = document.createElement("iframe");
     frame.className = "deck-card-frame";
     frame.setAttribute("sandbox", "allow-scripts");
-    frame.srcdoc = buildSrcdoc(cardHtml, sdkSource);
+    frame.srcdoc = buildSrcdoc(cardHtml, sdkSource, cardBaseCss);
     frame.addEventListener("load", () => {
       const channel = new MessageChannel();
       tile.port = channel.port1;
@@ -181,11 +184,16 @@ export class DeckShell {
       const globalId = `${cardId}#${this.nextCallSerial++}`;
       this.pendingCalls.set(globalId, { cardId, localId: m.id });
       bridge.postCall(globalId, cardId, m.op, m.params ?? {});
+    } else if (m.type === "edit_hold") {
+      // The SDK's in-iframe long-press detector (gestures inside the
+      // iframe never bubble to this document). Worst a hostile card can
+      // do with it is open edit mode — no data crosses.
+      this.setEditMode(true);
     } else if (m.type === "log") {
       bridge.log(m.level === "error" ? "error" : "info", `[card ${cardId}] ${m.message ?? ""}`);
     }
     // Anything else from a card is ignored: port identity is the card's
-    // only capability, and the surface is exactly call + log.
+    // only capability, and the surface is exactly call + edit_hold + log.
   }
 
   private pushSnapshot(cardId: string): void {

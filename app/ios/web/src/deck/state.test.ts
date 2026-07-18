@@ -97,14 +97,18 @@ describe("layout math", () => {
 });
 
 describe("srcdoc composition", () => {
-  it("puts CSP first and the SDK before the card fragment", () => {
-    const doc = buildSrcdoc("<div id=card></div>", "/*sdk*/");
+  it("orders CSP, then base style, then SDK, then the card fragment", () => {
+    const doc = buildSrcdoc("<div id=card></div>", "/*sdk*/", "/*base*/");
     expect(doc).toContain(CARD_CSP);
     const cspAt = doc.indexOf("Content-Security-Policy");
+    const baseAt = doc.indexOf("/*base*/");
     const sdkAt = doc.indexOf("/*sdk*/");
     const cardAt = doc.indexOf("<div id=card>");
     expect(cspAt).toBeGreaterThan(-1);
-    expect(sdkAt).toBeGreaterThan(cspAt);
+    // Base style precedes the fragment so a card's own <style> wins the
+    // cascade — that ordering IS the override contract.
+    expect(baseAt).toBeGreaterThan(cspAt);
+    expect(sdkAt).toBeGreaterThan(baseAt);
     expect(cardAt).toBeGreaterThan(sdkAt);
     // No network is reachable under this CSP even though sandbox alone
     // would allow a fire-and-forget fetch.

@@ -131,8 +131,45 @@ images only). The shell injects a `deck` global before your code runs:
   (user taps, drill-downs). Same validation as any call.
 - `deck.size` — current size class string.
 
-Keep it self-contained and theme-light: system font stack, no
-frameworks, everything inline.
+### Card design — a base stylesheet is injected, use it
+
+The app is **soft monochrome line minimalism**: near-black ink on
+paper-white, thin hairlines, generous whitespace, zero decoration. To
+keep every card in that language, the shell injects a **base
+stylesheet before your fragment** — body font/color defaults plus:
+
+- Tokens: `--ink` `--muted` `--line` `--ok` `--bad`.
+- Classes: `.card` (flex column filling the tile, padded),
+  `.label` (small muted caption row), `.hero` (the one big number),
+  `.row` (space-between line), `.divider`, `.foot` (bottom-pinned muted
+  footer), `.dot` / `.dot.bad` (status dot), `.bar > i` (thin progress,
+  set the `i` width in %).
+
+**Prefer the classes; write only layout CSS of your own.** Everything
+is overridable — your `<style>` comes after the base in the cascade,
+and the palette is custom properties — but overriding the look is the
+exception, not the norm.
+
+Hard rules:
+
+- **No gradients, no box-shadows, no emoji, no icon fonts.** Flat
+  paper. Color is for STATUS only (`--ok`/`--bad` dots or a bar fill) —
+  never colored backgrounds, pills, or per-metric accents.
+- **Don't draw your own card surface** — no outer border, radius, or
+  page background. The shell's tile IS the surface; separate regions
+  with `.divider` or whitespace, not nested boxes.
+- **One small heading, yours** (a `.label` is usually right). The shell
+  shows the manifest title only while the user edits the layout — in
+  normal view your fragment owns the heading. Never a big banner.
+- **Design to the declared size — tiles clip, they never scroll.** The
+  iframe viewport is exactly the tile interior (iPhone-class, pt):
+  `small` ≈ 178×148, `wide` ≈ 368×148, `large` ≈ 368×310. `.card` +
+  `.foot` compose against that; 1 hero + 2–3 secondary metrics fit a
+  `wide`, a `large` holds two rows of that. If it doesn't fit, show
+  less — a clipped half-line reads as a bug.
+
+Self-contained: no frameworks, everything inline, and render something
+sensible for `{error: "..."}` snapshots (a muted line, not a red wall).
 
 ## Worked example 1 — API watcher (fetch-shaped)
 
@@ -173,16 +210,24 @@ export function start(ctx) {
 ```
 
 ```html
-<!-- card.html -->
+<!-- card.html — the injected base does the design; the card is just
+     structure: label + hero + bottom-pinned footer. The one custom
+     rule shows the override path. -->
 <style>
-  .card { font: 13px -apple-system, sans-serif; padding: 8px; }
-  .big  { font-size: 22px; font-weight: 600; }
+  .hero { margin-top: 6px; }
 </style>
-<div class="card"><div class="big" id="v">…</div><div id="d"></div></div>
+<div class="card">
+  <div class="label"><span class="dot" id="dot"></span>负载</div>
+  <div class="hero" id="v">–</div>
+  <div class="foot" id="d"></div>
+</div>
 <script>
   deck.onData((s) => {
-    document.getElementById("v").textContent = s.error ?? s.load ?? "";
-    document.getElementById("d").textContent = s.at ? new Date(s.at).toLocaleTimeString() : "";
+    const bad = !!s.error;
+    document.getElementById("dot").className = "dot" + (bad ? " bad" : "");
+    document.getElementById("v").textContent = s.error ?? s.load ?? "–";
+    document.getElementById("d").textContent =
+      s.at ? new Date(s.at).toLocaleTimeString() + " 更新" : "";
   });
 </script>
 ```

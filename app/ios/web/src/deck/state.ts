@@ -127,11 +127,22 @@ export const CARD_CSP =
 /// Compose a card's srcdoc: CSP first, then the card-side SDK (so the
 /// `deck` global exists before any card inline script runs), then the
 /// agent-written fragment.
-export function buildSrcdoc(cardHtml: string, sdkSource: string): string {
+export function buildSrcdoc(
+  cardHtml: string,
+  sdkSource: string,
+  baseCss: string,
+): string {
+  // `baseCss` (cardBase.css) is the injected design language: widget
+  // behavior (no text selection / touch callout — WebKit would otherwise
+  // claim a long-press for the selection UI before the SDK's edit-hold
+  // detector sees it; no scrolling) plus the app's tokens and utility
+  // classes. Injected BEFORE the fragment so the card's own <style>
+  // overrides it in the cascade.
   return (
     `<!doctype html><html><head>` +
     `<meta http-equiv="Content-Security-Policy" content="${CARD_CSP}">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">` +
+    `<style>${baseCss}</style>` +
     `</head><body>` +
     `<script>${sdkSource}</script>` +
     cardHtml +
