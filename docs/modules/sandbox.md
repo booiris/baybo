@@ -69,8 +69,8 @@ The three backends have nothing meaningful in common at the syscall
 level — bwrap namespaces vs. SBPL rules vs. dockerd-managed cgroups —
 so the trait surface is small: `run(spec) ->
 Result<SandboxOutput, SandboxError>`, `spawn_detached(spec) -> Box<dyn
-DetachedChild>` (backs the Bash timeout → background path and deck's resident
-card services; the caller owns wait/timeout/kill, and the Docker impl must
+DetachedChild>` (backs the Bash timeout → background path; the caller owns
+wait/timeout/kill, and the Docker impl must
 `docker rm -f` the container on kill), `warm()`, `default_resource_limits()`, and `backend()` for
 diagnostics. There is no shared "policy" type beyond `SandboxSpec` itself.
 
@@ -79,14 +79,8 @@ diagnostics. There is no shared "policy" type beyond `SandboxSpec` itself.
 `SandboxAdapter::spawn_command_detached` (`baybo-agent`) bridges the two.
 All three backends override `spawn_detached`; the default impl returns
 `SandboxError::InvalidSpec`, on which the tool falls back to the blocking
-`run` (kill-on-timeout). For a resident stdio-RPC child (a deck card
-service), `StdinSource::Piped` keeps stdin open for the child's whole
-lifetime and `DetachedChild::take_stdin` (default `None`) hands out the
-write half once. bwrap and sandbox-exec support it; Docker refuses
-`Piped` on both `run` and `spawn_detached` with `InvalidSpec` (it would
-need `docker run -i` plus attach plumbing), and every backend's blocking
-`run` refuses it — an open pipe nobody writes would park the child until
-timeout.
+`run` (kill-on-timeout). (Deck card services do **not** use this crate —
+they run on the host, unsandboxed; see [`deck.md`](deck.md).)
 
 #### Docker fallback specifics
 
@@ -466,7 +460,7 @@ backend binary is absent.
 | `tools`      | Defines `ExecSandbox` trait + `SandboxedOutput` and adds `sandbox` / `workspace_root` to `ToolContext`. `BashTool` opts in to routing.   |
 | `agent`      | Builds `SandboxAdapter` per call; passes the runner and any sandbox-bypass reason into `ToolExecutor::new`. |
 | `security`   | Hosts the decision-layer primitives (the SSRF floor `is_blocked_ip` consumed by WebFetch's `validate_url_with` in `baybo-tools` and by deck's host-mediated `ctx.fetch`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
-| `deck`       | `DeckManager` resolves its own `current_platform_runner()`; resident card services ride `spawn_detached` with `StdinSource::Piped` (stdio-RPC, `NetworkPolicy::None`), and card `ctx.exec` uses blocking `run`. bwrap / sandbox-exec only — Docker cannot pipe stdin. |
+| `deck`       | Does **not** use this crate. Resident card services and card `ctx.exec` run directly on the host (unsandboxed — trusted-author model); `deck` only shares `baybo-security`'s SSRF floor for its host-mediated `ctx.fetch`. See [`deck.md`](deck.md). |
 | `bootstrap`  | `crates/baybo/src/sandbox_boot.rs` calls `current_platform_runner()` at startup; `runtime.rs` threads the result into `ToolExecutor`.                 |
 
 ## Deferred (post-v1)

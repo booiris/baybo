@@ -1,13 +1,21 @@
-//! One resident card service: a sandboxed bun child speaking NDJSON over
-//! stdio, plus the parent-side pumps that police its emits and serve its
-//! host RPCs (fetch / exec).
+//! One resident card service: a bun child speaking NDJSON over stdio,
+//! plus the parent-side pumps that police its emits and serve its host
+//! RPCs (fetch / exec).
 //!
-//! The child has no sockets ([`NetworkPolicy::None`]) — every effect is a
-//! stdio round-trip into the Rust parent. Per-call timeouts fail the
-//! *call*, never the process; process death is the supervisor's concern.
+//! The child runs directly on the host (no sandbox — the card author is
+//! the operator's own trusted agent, the same one trusted to run `Bash`;
+//! see the trust model in `docs/modules/deck.md`), inheriting the host
+//! environment so `bun` resolves off the login `PATH` exactly like the
+//! channel sidecars. Effects still funnel through the parent by
+//! convention — `ctx.fetch` is a host-mediated stdio round-trip so the
+//! secret-placeholder reveal + audit keep working — but that is now a
+//! convenience of the SDK, not an enforced boundary. Per-call timeouts
+//! fail the *call*, never the process; process death is the supervisor's
+//! concern.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -16,13 +24,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-
-use baybo_sandbox::SandboxRunner;
-use baybo_sandbox::spec::{
-    EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec, StdinSource,
-    default_sensitive_denylist,
-};
 
 use crate::error::{DeckError, Result};
 
@@ -203,12 +206,11 @@ pub(crate) struct SpawnConfig {
     pub emit_interval: Duration,
 }
 
-/// Spawn + init one card service inside the sandbox. Waits for the
-/// child's `ready` (module imported, `ops` export present) before
-/// returning, so a boot failure surfaces here — with the child's stderr
-/// folded into the error — instead of as a dead handle.
+/// Spawn + init one card service on the host. Waits for the child's
+/// `ready` (module imported, `ops` export present) before returning, so a
+/// boot failure surfaces here — with the child's stderr folded into the
+/// error — instead of as a dead handle.
 pub(crate) async fn spawn_service(
-    runner: &Arc<dyn SandboxRunner>,
     cfg: SpawnConfig,
     host: Arc<dyn HostServices>,
     emit_sink: Arc<dyn EmitSink>,
@@ -219,44 +221,33 @@ pub(crate) async fn spawn_service(
     std::fs::write(&preamble_path, PREAMBLE_JS)?;
     let service_js = cfg.bundle_dir.join(crate::bundle::SERVICE_FILE);
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let spec = SandboxSpec {
-        program: bun_binary(),
-        args: vec![
-            preamble_path.to_string_lossy().into_owned(),
-            service_js.to_string_lossy().into_owned(),
-        ],
-        cwd: Some(cfg.bundle_dir.clone()),
-        workspace_root: cfg.scratch_dir.clone(),
-        readable_paths: vec![cfg.bundle_dir.clone()],
-        writable_paths: Vec::new(),
-        allowed_hosts: Default::default(),
-        network_policy: NetworkPolicy::None,
-        env: EnvPolicy::Baseline,
-        stdin: StdinSource::Piped,
-        // Ignored by spawn_detached; the supervisor owns lifetime.
-        timeout: Duration::from_secs(3600),
-        resource_limits: runner.default_resource_limits(),
-        // Permissive keeps FHS roots readable so bun + its dylibs
-        // resolve; the sensitive denylist masks credential vaults. The
-        // bundle rides `readable_paths`; the only RW surface is the
-        // per-card scratch dir.
-        filesystem_policy: FilesystemPolicy::Permissive {
-            extra_root: cfg.scratch_dir.clone(),
-            denied_paths: default_sensitive_denylist(home.as_deref(), None),
-        },
-    };
-
-    let mut child = runner.spawn_detached(spec).await?;
-    let stdin = child.take_stdin().ok_or_else(|| {
-        DeckError::ServiceUnavailable(
-            "sandbox backend cannot pipe stdin (deck services need bwrap or sandbox-exec)".into(),
-        )
+    // Runs directly on the host, inheriting the environment so `bun`
+    // resolves off the login `PATH` (same as the channel sidecars) and a
+    // card can reach host state and CLIs. `TMPDIR` etc. are inherited.
+    let mut cmd = Command::new(bun_binary());
+    cmd.arg(&preamble_path)
+        .arg(&service_js)
+        .current_dir(&cfg.bundle_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| {
+        DeckError::ServiceUnavailable(format!(
+            "failed to launch `{}` ({e}); is bun installed and on PATH? \
+             (override with {DECK_BUN_ENV})",
+            bun_binary().display()
+        ))
     })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| DeckError::Internal("child stdin unavailable".into()))?;
     let stdout = child
-        .take_stdout()
+        .stdout
+        .take()
         .ok_or_else(|| DeckError::Internal("child stdout unavailable".into()))?;
-    let stderr = child.take_stderr();
+    let stderr = child.stderr.take();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
     let mut stdin = stdin;
@@ -430,13 +421,14 @@ pub(crate) async fn spawn_service(
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     tokio::spawn(async move {
-        let code = tokio::select! {
-            code = child.wait() => code,
+        let status = tokio::select! {
+            status = child.wait() => status,
             _ = kill_rx.recv() => {
-                child.start_kill();
+                let _ = child.start_kill();
                 child.wait().await
             }
         };
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
         let _ = exit_tx.send(code);
     });
 

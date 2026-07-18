@@ -176,12 +176,6 @@ pub enum StdinSource {
     Null,
     Inherit,
     Bytes(Vec<u8>),
-    /// Keep stdin open as a pipe the caller writes for the child's whole
-    /// lifetime (a resident stdio-RPC child, e.g. a deck card service).
-    /// Only meaningful with [`crate::SandboxRunner::spawn_detached`] — the
-    /// blocking `run` path refuses it, since an open pipe nobody writes
-    /// would park the child until timeout.
-    Piped,
 }
 
 #[derive(Debug)]

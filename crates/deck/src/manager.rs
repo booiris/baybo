@@ -17,7 +17,6 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use baybo_sandbox::SandboxRunner;
 use baybo_security::SecretVault;
 use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 
@@ -169,42 +168,14 @@ pub struct DeckManager {
     events: Arc<dyn DeckEvents>,
     deck_root: PathBuf,
     scratch_root: PathBuf,
-    /// `None` when no usable sandbox backend exists on this host — the
-    /// deck degrades to read-only CRUD (rows + cached snapshots serve;
-    /// installs and service calls refuse with a clear error).
-    runner: Option<Arc<dyn SandboxRunner>>,
-    host: Option<Arc<DeckHost>>,
-    supervisor: Option<Arc<DeckSupervisor>>,
+    host: Arc<DeckHost>,
+    supervisor: Arc<DeckSupervisor>,
     /// Compiled admission contracts keyed by (card_id → (spec_hash, spec)).
     spec_cache: Mutex<HashMap<String, (String, Arc<CardSpec>)>>,
 }
 
 impl DeckManager {
     pub fn from_config(config: DeckManagerConfig) -> Arc<Self> {
-        let runner = match baybo_sandbox::current_platform_runner() {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(
-                    "deck: no usable sandbox backend ({e}); card services are unavailable"
-                );
-                None
-            }
-        };
-        Self::build(config, runner)
-    }
-
-    /// Test-only constructor with an injected runner, so the full
-    /// spawn/stdio/gate pipeline is exercisable on hosts whose OS
-    /// backend is unusable (the OS-isolation layer has its own smokes).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn from_config_with_runner(
-        config: DeckManagerConfig,
-        runner: Option<Arc<dyn SandboxRunner>>,
-    ) -> Arc<Self> {
-        Self::build(config, runner)
-    }
-
-    fn build(config: DeckManagerConfig, runner: Option<Arc<dyn SandboxRunner>>) -> Arc<Self> {
         let DeckManagerConfig {
             store,
             vault,
@@ -213,37 +184,28 @@ impl DeckManager {
             scratch_root,
             internal,
         } = config;
-        let host = runner.as_ref().map(|r| {
-            Arc::new(DeckHost::new(
-                vault.clone(),
-                r.clone(),
-                internal,
-                scratch_root.clone(),
-            ))
-        });
-        let supervisor = match (&runner, &host) {
-            (Some(runner), Some(host)) => Some(Arc::new(DeckSupervisor::new(
-                runner.clone(),
-                host.clone(),
-                Arc::new(ManagerEmitSink {
-                    store: store.clone(),
-                    events: events.clone(),
-                }),
-                Arc::new(ManagerQuarantine {
-                    store: store.clone(),
-                    events: events.clone(),
-                }),
-                scratch_root.clone(),
-            ))),
-            _ => None,
-        };
+        // Card services run on the host (no sandbox), so the runtime is
+        // always available — a missing `bun` surfaces as a spawn error at
+        // install/boot, not a silent CRUD-only degradation.
+        let host = Arc::new(DeckHost::new(vault, internal, scratch_root.clone()));
+        let supervisor = Arc::new(DeckSupervisor::new(
+            host.clone(),
+            Arc::new(ManagerEmitSink {
+                store: store.clone(),
+                events: events.clone(),
+            }),
+            Arc::new(ManagerQuarantine {
+                store: store.clone(),
+                events: events.clone(),
+            }),
+            scratch_root.clone(),
+        ));
 
         Arc::new(Self {
             store,
             events,
             deck_root,
             scratch_root,
-            runner,
             host,
             supervisor,
             spec_cache: Mutex::new(HashMap::new()),
@@ -254,13 +216,8 @@ impl DeckManager {
         &self.deck_root
     }
 
-    fn supervisor(&self) -> Result<&Arc<DeckSupervisor>> {
-        self.supervisor.as_ref().ok_or_else(|| {
-            DeckError::ServiceUnavailable(
-                "no usable sandbox backend on this host (deck services need bwrap or sandbox-exec)"
-                    .into(),
-            )
-        })
+    fn supervisor(&self) -> &Arc<DeckSupervisor> {
+        &self.supervisor
     }
 
     fn bundle_dir(&self, card_id: &str) -> PathBuf {
@@ -320,7 +277,7 @@ impl DeckManager {
         }
         let spec = self.spec_for(card_id).await?;
         spec.validate_call(op, &params)?;
-        self.supervisor()?.call(card_id, op, params).await
+        self.supervisor().call(card_id, op, params).await
     }
 
     // ---- lifecycle ----------------------------------------------------
@@ -389,9 +346,7 @@ impl DeckManager {
         let bundle = load_bundle(staged_dir)?;
         let first = self.dry_run(&bundle).await?;
 
-        if let Some(sup) = &self.supervisor {
-            sup.stop(card_id).await;
-        }
+        self.supervisor().stop(card_id).await;
         let dest = self.bundle_dir(card_id);
         let backup = self.staging_path(&format!("{card_id}.old"));
         if backup.exists() {
@@ -473,9 +428,7 @@ impl DeckManager {
     pub async fn disable(&self, card_id: &str) -> Result<()> {
         self.live_row(card_id).await?;
         self.store.set_enabled(card_id, false).await?;
-        if let Some(sup) = &self.supervisor {
-            sup.stop(card_id).await;
-        }
+        self.supervisor().stop(card_id).await;
         self.events.deck_changed();
         Ok(())
     }
@@ -484,9 +437,7 @@ impl DeckManager {
     /// bundle files kept.
     pub async fn soft_delete(&self, card_id: &str) -> Result<()> {
         self.live_row(card_id).await?;
-        if let Some(sup) = &self.supervisor {
-            sup.stop(card_id).await;
-        }
+        self.supervisor().stop(card_id).await;
         self.store.set_deleted(card_id, Some(Utc::now())).await?;
         provenance("delete", card_id, "soft");
         self.events.deck_changed();
@@ -604,9 +555,7 @@ impl DeckManager {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(sup) = &self.supervisor {
-            sup.stop_all().await;
-        }
+        self.supervisor().stop_all().await;
     }
 
     // ---- internals ----------------------------------------------------
@@ -699,7 +648,7 @@ impl DeckManager {
     }
 
     async fn start_service(&self, card_id: &str, bundle: &DeckBundle) -> Result<()> {
-        let sup = self.supervisor()?;
+        let sup = self.supervisor();
         sup.start(
             card_id,
             self.bundle_dir(card_id),
@@ -709,26 +658,12 @@ impl DeckManager {
         Ok(())
     }
 
-    /// The dry-run gate's execution half: boot the service in the real
-    /// sandbox against the bundle's own directory, invoke the refresh op
-    /// once, and check the returned snapshot. Kills the throwaway
-    /// process before returning. Emits during the dry run are discarded.
+    /// The dry-run gate's execution half: boot the service on the host
+    /// against the bundle's own directory, invoke the refresh op once,
+    /// and check the returned snapshot. Kills the throwaway process
+    /// before returning. Emits during the dry run are discarded.
     async fn dry_run(&self, bundle: &DeckBundle) -> Result<Value> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| {
-                DeckError::ServiceUnavailable(
-                    "no usable sandbox backend on this host (deck services need bwrap or sandbox-exec)"
-                        .into(),
-                )
-            })?
-            .clone();
-        let host = self
-            .host
-            .as_ref()
-            .ok_or_else(|| DeckError::Internal("host services missing".into()))?
-            .clone();
+        let host = self.host.clone();
 
         struct DiscardEmits;
         #[async_trait]
@@ -744,7 +679,6 @@ impl DeckManager {
 
         let gate_id = format!("gate-{}", uuid::Uuid::new_v4());
         let running = spawn_service(
-            &runner,
             crate::service::SpawnConfig {
                 card_id: gate_id.clone(),
                 bundle_dir: bundle.dir.clone(),

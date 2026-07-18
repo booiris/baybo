@@ -1,8 +1,8 @@
-//! End-to-end deck runtime smoke: real sandbox backend + real bun.
+//! End-to-end deck runtime smoke: real bun running on the host.
 //!
-//! Self-skips when the platform sandbox backend is missing or unusable
-//! (e.g. nested sandbox-exec) or bun is not installed — the same
-//! self-skip discipline as the sandbox/docker smokes.
+//! Card services run directly on the host (no sandbox), so this only
+//! needs `bun` on `PATH` (or `BAYBO_BUN_BIN`); it self-skips when bun is
+//! not installed.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,67 +11,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::json;
 
-use async_trait::async_trait;
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
-use baybo_sandbox::spec::{Backend, SandboxOutput, SandboxSpec, StdinSource};
-use baybo_sandbox::{DetachedChild, SandboxError, SandboxRunner, TokioDetachedChild};
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_storage::sqlite::{SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
-
-/// Plain-tokio runner: same process semantics, no OS isolation. Lets the
-/// full spawn/stdio/gate pipeline run on hosts whose OS backend is
-/// broken (this Mac's sandbox-exec smoke fails environmentally); the
-/// isolation layer itself is covered by the sandbox crate's smokes.
-struct PlainRunner;
-
-#[async_trait]
-impl SandboxRunner for PlainRunner {
-    async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
-        let started = std::time::Instant::now();
-        let mut cmd = tokio::process::Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .current_dir(spec.cwd.as_deref().unwrap_or(&spec.workspace_root))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let child = cmd.spawn().map_err(SandboxError::Io)?;
-        let out = tokio::time::timeout(spec.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| SandboxError::Timeout(spec.timeout))?
-            .map_err(SandboxError::Io)?;
-        Ok(SandboxOutput {
-            exit_code: out.status.code().unwrap_or(-1),
-            stdout: out.stdout,
-            stderr: out.stderr,
-            elapsed: started.elapsed(),
-            timed_out: false,
-        })
-    }
-
-    async fn spawn_detached(
-        &self,
-        spec: SandboxSpec,
-    ) -> Result<Box<dyn DetachedChild>, SandboxError> {
-        let mut cmd = tokio::process::Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .current_dir(spec.cwd.as_deref().unwrap_or(&spec.workspace_root))
-            .stdin(match spec.stdin {
-                StdinSource::Piped => std::process::Stdio::piped(),
-                _ => std::process::Stdio::null(),
-            })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        Ok(Box::new(TokioDetachedChild(
-            cmd.spawn().map_err(SandboxError::Io)?,
-        )))
-    }
-
-    fn backend(&self) -> Backend {
-        Backend::SandboxExec
-    }
-}
 
 #[derive(Default)]
 struct RecordingEvents {
@@ -86,32 +28,6 @@ impl DeckEvents for RecordingEvents {
     fn deck_changed(&self) {
         *self.changed.lock() += 1;
     }
-}
-
-async fn sandbox_usable() -> bool {
-    let Ok(runner) = baybo_sandbox::current_platform_runner() else {
-        return false;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let spec = baybo_sandbox::spec::SandboxSpec {
-        program: "/usr/bin/true".into(),
-        args: vec![],
-        cwd: Some(tmp.path().to_path_buf()),
-        workspace_root: tmp.path().to_path_buf(),
-        readable_paths: vec![],
-        writable_paths: vec![],
-        allowed_hosts: Default::default(),
-        network_policy: baybo_sandbox::spec::NetworkPolicy::None,
-        env: baybo_sandbox::spec::EnvPolicy::Baseline,
-        stdin: baybo_sandbox::spec::StdinSource::Null,
-        timeout: Duration::from_secs(5),
-        resource_limits: runner.default_resource_limits(),
-        filesystem_policy: baybo_sandbox::spec::FilesystemPolicy::Permissive {
-            extra_root: tmp.path().to_path_buf(),
-            denied_paths: vec![],
-        },
-    };
-    matches!(runner.run(spec).await, Ok(out) if out.exit_code == 0)
 }
 
 fn bun_usable() -> bool {
@@ -133,14 +49,6 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
         eprintln!("skipping {test}: bun not installed");
         return None;
     }
-    // Prefer the real OS backend; fall back to the plain runner where it
-    // is environmentally broken so the pipeline still gets exercised.
-    let runner: Arc<dyn SandboxRunner> = if sandbox_usable().await {
-        baybo_sandbox::current_platform_runner().expect("probe passed")
-    } else {
-        eprintln!("{test}: OS sandbox backend unusable here; using plain runner");
-        Arc::new(PlainRunner)
-    };
     let root = tempfile::tempdir().unwrap();
     let pool = SqlitePool::open_in_memory().await.unwrap();
     let store = Arc::new(SqliteDeckCardStore::new(pool.clone()));
@@ -149,17 +57,14 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
         Arc::new(SqliteSecretStore::new(pool)),
     ));
     let events = Arc::new(RecordingEvents::default());
-    let manager = DeckManager::from_config_with_runner(
-        DeckManagerConfig {
-            store,
-            vault,
-            events: events.clone(),
-            deck_root: root.path().join("deck"),
-            scratch_root: root.path().join("scratch"),
-            internal: None,
-        },
-        Some(runner),
-    );
+    let manager = DeckManager::from_config(DeckManagerConfig {
+        store,
+        vault,
+        events: events.clone(),
+        deck_root: root.path().join("deck"),
+        scratch_root: root.path().join("scratch"),
+        internal: None,
+    });
     Some(Harness {
         manager,
         events,

@@ -1,22 +1,23 @@
-//! Parent-side capability RPCs served to the sandboxed child: the
+//! Parent-side capability RPCs the child calls over stdio: the
 //! host-mediated `ctx.fetch` (SSRF floor + placeholder reveal + audit
-//! log) and the sandboxed `ctx.exec`. The child never holds a raw secret
-//! and cannot open a socket — everything effectful funnels through here.
+//! log) and `ctx.exec`. `ctx.fetch` keeps a raw secret from ever
+//! entering the child — the card carries only the `[{REDACTED_SECRET_…}]`
+//! placeholder and the parent reveals it at egress. Routing effects
+//! through here is an SDK convenience (and the reveal's enforcement
+//! point), not a sandbox: the child runs on the host and could open its
+//! own socket, consistent with the trusted-author model.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::process::Command;
 
-use baybo_sandbox::SandboxRunner;
-use baybo_sandbox::spec::{
-    EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec, StdinSource,
-    default_sensitive_denylist,
-};
 use baybo_security::{PlaceholderMinter, SecretVault};
 
 use crate::service::{HostExecResponse, HostFetchRequest, HostFetchResponse, HostServices};
@@ -48,7 +49,6 @@ pub trait InternalReads: Send + Sync + 'static {
 
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
-    runner: Arc<dyn SandboxRunner>,
     internal: Option<Arc<dyn InternalReads>>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
@@ -57,13 +57,11 @@ pub(crate) struct DeckHost {
 impl DeckHost {
     pub fn new(
         vault: Arc<SecretVault>,
-        runner: Arc<dyn SandboxRunner>,
         internal: Option<Arc<dyn InternalReads>>,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             vault,
-            runner,
             internal,
             scratch_root,
         }
@@ -256,35 +254,28 @@ impl HostServices for DeckHost {
         if let Err(e) = std::fs::create_dir_all(&scratch) {
             return Err(format!("scratch dir: {e}"));
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let spec = SandboxSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), cmd],
-            cwd: Some(scratch.clone()),
-            workspace_root: scratch.clone(),
-            readable_paths: Vec::new(),
-            writable_paths: Vec::new(),
-            allowed_hosts: Default::default(),
-            network_policy: NetworkPolicy::None,
-            env: EnvPolicy::Baseline,
-            stdin: StdinSource::Null,
-            timeout: EXEC_TIMEOUT,
-            resource_limits: self.runner.default_resource_limits(),
-            // Same visibility model as the Bash tool (FHS + $HOME
-            // readable so installed binaries work), but with deck's own
-            // no-network policy on top and the credential denylist.
-            filesystem_policy: FilesystemPolicy::Permissive {
-                extra_root: home.clone().unwrap_or_else(|| scratch.clone()),
-                denied_paths: default_sensitive_denylist(home.as_deref(), None),
-            },
+        // Runs on the host with the inherited environment (so installed
+        // CLIs and credential dirs resolve), in a per-card scratch cwd.
+        // The 10s wall clock + output caps are the only bounds; a
+        // misbehaving card is caught by the strike/quarantine budget, not
+        // an OS jail (trusted-author model — see `docs/modules/deck.md`).
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&scratch)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().map_err(|e| format!("exec: {e}"))?;
+        let out = match tokio::time::timeout(EXEC_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(format!("exec: {e}")),
+            Err(_) => return Err(format!("exec: timed out after {EXEC_TIMEOUT:?}")),
         };
-        let out = self
-            .runner
-            .run(spec)
-            .await
-            .map_err(|e| format!("exec: {e}"))?;
         Ok(HostExecResponse {
-            code: out.exit_code,
+            code: out.status.code().unwrap_or(-1),
             stdout: truncate_output(&out.stdout),
             stderr: truncate_output(&out.stderr),
         })

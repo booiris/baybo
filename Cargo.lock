@@ -601,9 +601,7 @@ name = "baybo-deck"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "baybo-deck",
  "baybo-model",
- "baybo-sandbox",
  "baybo-security",
  "baybo-storage",
  "baybo-store",

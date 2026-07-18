@@ -84,12 +84,6 @@ pub trait DetachedChild: Send {
     fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
     /// Take the child's stderr reader (once).
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
-    /// Take the child's stdin writer (once); `Some` only when the spec was
-    /// spawned with [`spec::StdinSource::Piped`] and the backend supports
-    /// it (bwrap / sandbox-exec do; Docker does not today). Default `None`.
-    fn take_stdin(&mut self) -> Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>> {
-        None
-    }
     /// Wait for the child to exit; returns its exit code (or -1).
     async fn wait(&mut self) -> i32;
     /// Terminate the child (best-effort) — used by `/stop` / `JobStop`.
@@ -108,12 +102,6 @@ impl DetachedChild for TokioDetachedChild {
             .stdout
             .take()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
-    }
-    fn take_stdin(&mut self) -> Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>> {
-        self.0
-            .stdin
-            .take()
-            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>)
     }
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.0

@@ -17,8 +17,6 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use baybo_sandbox::SandboxRunner;
-
 use crate::error::{DeckError, Result};
 use crate::service::{
     EmitSink, HostServices, RunningService, ServiceHandle, SpawnConfig, StrikeRecorder,
@@ -44,7 +42,6 @@ struct ServiceEntry {
 }
 
 pub(crate) struct DeckSupervisor {
-    runner: Arc<dyn SandboxRunner>,
     host: Arc<dyn HostServices>,
     emit_sink: Arc<dyn EmitSink>,
     quarantine: Arc<dyn QuarantineSink>,
@@ -55,14 +52,12 @@ pub(crate) struct DeckSupervisor {
 
 impl DeckSupervisor {
     pub fn new(
-        runner: Arc<dyn SandboxRunner>,
         host: Arc<dyn HostServices>,
         emit_sink: Arc<dyn EmitSink>,
         quarantine: Arc<dyn QuarantineSink>,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
-            runner,
             host,
             emit_sink,
             quarantine,
@@ -86,7 +81,6 @@ impl DeckSupervisor {
             },
         );
 
-        let runner = self.runner.clone();
         let host = self.host.clone();
         let emit_sink = self.emit_sink.clone();
         let quarantine = self.quarantine.clone();
@@ -107,14 +101,8 @@ impl DeckSupervisor {
                     emit_interval,
                 };
                 let started = Instant::now();
-                let spawn = spawn_service(
-                    &runner,
-                    cfg,
-                    host.clone(),
-                    emit_sink.clone(),
-                    strikes.clone(),
-                )
-                .await;
+                let spawn =
+                    spawn_service(cfg, host.clone(), emit_sink.clone(), strikes.clone()).await;
                 let crashed = match spawn {
                     Ok(RunningService {
                         handle,

@@ -25,7 +25,7 @@ card should show before writing anything.
 A deck card is a self-contained bundle of exactly four plain files. You
 write them in a scratch directory with your normal file tools, then
 install with `DeckCardCreate(path)`. Install runs a **dry-run gate**:
-your `service.js` is booted for real in the sandbox and the refresh op
+your `service.js` is booted for real on the host and the refresh op
 is invoked once — failures (including the service's stderr) come back in
 the tool result so you can fix and retry in the same turn. On success
 the card appears on the user's deck already showing data.
@@ -36,7 +36,7 @@ the card appears on the user's deck already showing data.
 <staging-dir>/
   manifest.json
   openapi.json
-  service.js     backend — runs on the gateway, sandboxed, NO network of its own
+  service.js     backend — runs on the gateway host (use ctx.fetch / ctx.exec)
   card.html      frontend — runs on the phone in a sandboxed iframe, NO network
 ```
 
@@ -99,14 +99,17 @@ snapshot JSON (not null).**
 `ctx` surface (universal — no declaration or configuration):
 
 - `await ctx.fetch(url, {method, headers, body})` →
-  `{status, headers, body, json()}`. Host-mediated: this process has no
-  sockets. Loopback/LAN addresses are blocked (SSRF floor). To use a
-  vault secret, put its `[{REDACTED_SECRET_…}]` placeholder in a header
-  or the URL — it is revealed only at egress in the Rust parent; never
-  ask for or embed a raw secret. Redirects are not followed.
-- `await ctx.exec(cmd)` → `{code, stdout, stderr}`. Runs in the OS
-  sandbox with **no network**, 10s cap, 256KB output cap. Use for host
-  state: `df -k`, `uptime`, `ps`, `git -C <dir> log`, etc.
+  `{status, headers, body, json()}`. Host-mediated (the Rust parent makes
+  the request): **always use this for HTTP** — it is the only path that
+  reveals vault secrets. Put a secret's `[{REDACTED_SECRET_…}]`
+  placeholder in a header or the URL and it is substituted only at egress
+  in the parent; never ask for or embed a raw secret. Loopback/LAN
+  addresses are blocked (SSRF floor); redirects are not followed.
+- `await ctx.exec(cmd)` → `{code, stdout, stderr}`. Runs `/bin/sh -c` on
+  the host with the inherited environment (installed CLIs and credential
+  dirs resolve, network available), 10s cap, 256KB output cap. Use for
+  host state and CLIs: `df -k`, `uptime`, `ps`, `git -C <dir> log`,
+  `codex …`, etc.
 - `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed).
 - `ctx.log(msg)` — diagnostic logging (console.log also routes here).
 

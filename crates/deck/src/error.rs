@@ -34,9 +34,6 @@ pub enum DeckError {
     #[error("storage: {0}")]
     Storage(#[from] baybo_store::StorageError),
 
-    #[error("sandbox: {0}")]
-    Sandbox(#[from] baybo_sandbox::SandboxError),
-
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
