@@ -13,6 +13,7 @@ pub mod bundle;
 pub mod error;
 pub mod host;
 pub mod manager;
+mod repo;
 pub mod service;
 pub mod spec;
 pub mod supervisor;
@@ -21,4 +22,6 @@ pub mod tools;
 pub use bundle::{DeckManifest, RefreshSpec, SDK_VERSION};
 pub use error::{DeckError, Result};
 pub use host::InternalReads;
-pub use manager::{CardView, DeckEvents, DeckManager, DeckManagerConfig, DeckView, NoopDeckEvents};
+pub use manager::{
+    BundleFiles, CardView, DeckEvents, DeckManager, DeckManagerConfig, DeckView, NoopDeckEvents,
+};

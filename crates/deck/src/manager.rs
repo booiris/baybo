@@ -99,6 +99,16 @@ pub struct DeckView {
     pub snapshots: Vec<DeckSnapshotRow>,
 }
 
+/// A live card's four source files, verbatim from its installed bundle —
+/// the seed for editing a card across chats (`DeckCardGet`).
+#[derive(Debug, Clone)]
+pub struct BundleFiles {
+    pub manifest_json: String,
+    pub openapi_json: String,
+    pub service_js: String,
+    pub card_html: String,
+}
+
 /// Required dependencies, named at the call site (see the repo's
 /// `from_config` convention).
 pub struct DeckManagerConfig {
@@ -172,6 +182,9 @@ pub struct DeckManager {
     supervisor: Arc<DeckSupervisor>,
     /// Compiled admission contracts keyed by (card_id → (spec_hash, spec)).
     spec_cache: Mutex<HashMap<String, (String, Arc<CardSpec>)>>,
+    /// Serializes the bundle git commits (`deck_root` version history) so
+    /// two concurrent mutations can't collide on `.git/index.lock`.
+    git_lock: tokio::sync::Mutex<()>,
 }
 
 impl DeckManager {
@@ -209,6 +222,7 @@ impl DeckManager {
             host,
             supervisor,
             spec_cache: Mutex::new(HashMap::new()),
+            git_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -260,6 +274,23 @@ impl DeckManager {
         Ok(std::fs::read_to_string(
             self.bundle_dir(card_id).join(CARD_FILE),
         )?)
+    }
+
+    /// The four source files of a live card, read from its installed
+    /// bundle. This is what lets the agent edit a card it didn't create —
+    /// in a brand-new chat it has no memory of the bundle and its file
+    /// tools can't reach the deck root, so the current source has to come
+    /// back through a tool result to seed the next `update`.
+    pub async fn bundle_files(&self, card_id: &str) -> Result<BundleFiles> {
+        self.live_row(card_id).await?;
+        let dir = self.bundle_dir(card_id);
+        let read = |name: &str| -> Result<String> { Ok(std::fs::read_to_string(dir.join(name))?) };
+        Ok(BundleFiles {
+            manifest_json: read(MANIFEST_FILE)?,
+            openapi_json: read(OPENAPI_FILE)?,
+            service_js: read(SERVICE_FILE)?,
+            card_html: read(CARD_FILE)?,
+        })
     }
 
     pub async fn openapi_json(&self, card_id: &str) -> Result<Value> {
@@ -324,6 +355,13 @@ impl DeckManager {
         };
         self.store.create(&row).await?;
         provenance("install", &card_id, &installed.spec_hash);
+        self.commit_bundle(
+            &card_id,
+            &installed.manifest.title,
+            "install",
+            &installed.spec_hash,
+        )
+        .await;
 
         let text = first.to_string();
         let seq = self
@@ -362,14 +400,13 @@ impl DeckManager {
         self.spec_cache.lock().remove(card_id);
 
         let installed = load_bundle(&dest)?;
-        provenance(
-            "update",
-            card_id,
-            &format!("{} -> {}", row.spec_hash, installed.spec_hash),
-        );
+        let detail = format!("{} -> {}", row.spec_hash, installed.spec_hash);
+        provenance("update", card_id, &detail);
         self.store
             .set_installed(card_id, &row.title, &installed.spec_hash)
             .await?;
+        self.commit_bundle(card_id, &row.title, "update", &detail)
+            .await;
 
         let text = first.to_string();
         let seq = self
@@ -499,6 +536,8 @@ impl DeckManager {
         }
         self.spec_cache.lock().remove(card_id);
         provenance("purge", card_id, "hard");
+        self.commit_bundle(card_id, &row.title, "purge", "hard")
+            .await;
         self.events.deck_changed();
         Ok(())
     }
@@ -560,6 +599,26 @@ impl DeckManager {
     }
 
     // ---- internals ----------------------------------------------------
+
+    /// Best-effort: record this bundle-file mutation as a commit in the
+    /// deck root's git history. A git failure (no `git`, detached HEAD,
+    /// lock contention) is logged and swallowed — version history is a
+    /// convenience for the operator, never a correctness dependency of the
+    /// deck operation, matching the tracing-based provenance model.
+    async fn commit_bundle(&self, card_id: &str, title: &str, event: &str, detail: &str) {
+        let _guard = self.git_lock.lock().await;
+        match crate::repo::commit_card(&self.deck_root, card_id, title, event, detail).await {
+            Ok(Some(sha)) => tracing::debug!(
+                target: "deck::provenance",
+                card = %card_id, event = %event, %sha, "deck bundle committed"
+            ),
+            Ok(None) => {}
+            Err(reason) => tracing::warn!(
+                target: "deck::provenance",
+                card = %card_id, event = %event, "deck git commit skipped: {reason}"
+            ),
+        }
+    }
 
     async fn quarantine_with_reason(&self, card_id: &str, reason: &str) {
         let sink = ManagerQuarantine {

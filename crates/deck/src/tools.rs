@@ -17,28 +17,48 @@ use serde_json::{Value, json};
 
 use crate::manager::{CardView, DeckManager};
 
-/// Build the deck tools with manifests, ready for a `ToolRegistry`.
-/// `Trusted` with `ReadFile` — they read the agent's staged bundle from
-/// disk; everything else they do runs through the manager's own gates.
-/// Owner-channel-only: the deck is the owner's surface, so sessions on
-/// any other channel (telegram, tui, subagent, …) neither see these
+/// Build the deck tools with manifests, ready for a `ToolRegistry`. All
+/// `Trusted`; the authoring pair (`Create`/`Update`) carries `ReadFile`
+/// because it reads the agent's staged bundle from disk, while the
+/// discovery pair (`List`/`Get`) reads through the manager and needs no
+/// filesystem capability. Everything else runs through the manager's own
+/// gates. Owner-channel-only: the deck is the owner's surface, so sessions
+/// on any other channel (telegram, tui, subagent, …) neither see these
 /// tools in their LLM list nor may execute them.
 pub fn agent_tools(manager: Arc<DeckManager>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-    let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(DeckCardCreateTool {
-            manager: manager.clone(),
-        }),
-        Arc::new(DeckCardUpdateTool { manager }),
+    let entries: Vec<(Arc<dyn Tool>, Vec<baybo_tools::ToolCapability>)> = vec![
+        (
+            Arc::new(DeckCardListTool {
+                manager: manager.clone(),
+            }),
+            vec![],
+        ),
+        (
+            Arc::new(DeckCardGetTool {
+                manager: manager.clone(),
+            }),
+            vec![],
+        ),
+        (
+            Arc::new(DeckCardCreateTool {
+                manager: manager.clone(),
+            }),
+            vec![baybo_tools::ToolCapability::ReadFile],
+        ),
+        (
+            Arc::new(DeckCardUpdateTool { manager }),
+            vec![baybo_tools::ToolCapability::ReadFile],
+        ),
     ];
-    tools
+    entries
         .into_iter()
-        .map(|tool| {
+        .map(|(tool, capabilities)| {
             let manifest = ToolManifest {
                 name: tool.name().to_string(),
                 description: tool.description(),
                 trust_level: baybo_model::TrustLevel::Trusted,
                 parameters_schema: tool.parameters_schema(),
-                capabilities: vec![baybo_tools::ToolCapability::ReadFile],
+                capabilities,
                 channels: vec![baybo_model::ChannelType::owner()],
             };
             (tool, manifest)
@@ -60,6 +80,99 @@ fn map_err(e: crate::error::DeckError) -> ToolError {
     ToolError::Execution(e.to_string())
 }
 
+pub struct DeckCardListTool {
+    manager: Arc<DeckManager>,
+}
+
+#[async_trait]
+impl Tool for DeckCardListTool {
+    fn name(&self) -> &str {
+        "DeckCardList"
+    }
+
+    fn description(&self) -> String {
+        "List the user's live deck cards (card_id, title, size, enabled, spec_hash) — use it to resolve the user's description to a card_id before updating.".to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        let view = self.manager.deck_view().await.map_err(map_err)?;
+        let cards: Vec<Value> = view
+            .cards
+            .iter()
+            .map(|c| {
+                json!({
+                    "card_id": c.id,
+                    "title": c.title,
+                    "size": c.size.as_str(),
+                    "enabled": c.enabled,
+                    "spec_hash": c.spec_hash,
+                })
+            })
+            .collect();
+        Ok(ToolOutput::Json(json!({ "cards": cards })))
+    }
+}
+
+pub struct DeckCardGetTool {
+    manager: Arc<DeckManager>,
+}
+
+#[derive(Deserialize)]
+struct GetParams {
+    card_id: String,
+}
+
+#[async_trait]
+impl Tool for DeckCardGetTool {
+    fn name(&self) -> &str {
+        "DeckCardGet"
+    }
+
+    fn description(&self) -> String {
+        "Return a live card's current four source files verbatim, so you can edit from the real source before DeckCardUpdate (rather than re-authoring blind). See the /card skill.".to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "card_id": {"type": "string", "description": "The card's uuid (from DeckCardList)"}
+            },
+            "required": ["card_id"]
+        })
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("card_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        let params: GetParams =
+            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let files = self
+            .manager
+            .bundle_files(&params.card_id)
+            .await
+            .map_err(map_err)?;
+        Ok(ToolOutput::Json(json!({
+            "card_id": params.card_id,
+            "files": {
+                "manifest.json": files.manifest_json,
+                "openapi.json": files.openapi_json,
+                "service.js": files.service_js,
+                "card.html": files.card_html,
+            }
+        })))
+    }
+}
+
 pub struct DeckCardCreateTool {
     manager: Arc<DeckManager>,
 }
@@ -77,16 +190,7 @@ impl Tool for DeckCardCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Install a new deck card from a staged bundle directory.
-
-The directory must contain exactly these four files (author them with your normal file tools first — the /card skill expansion in this conversation carries the contract and templates):
-- manifest.json  {"title", "size": "small|wide|large", "refresh": {"op", "params"?, "min_emit_interval_secs"}}
-- openapi.json   the card's op contract (paths./<op>.get|post with typed parameters)
-- service.js     backend: `export const ops = {...}` + optional `export function start(ctx)`
-- card.html      frontend, rendered in a sandboxed iframe on the phone
-
-Install runs the dry-run gate: static validation, a real sandboxed boot, one invocation of the refresh op, and a checked first snapshot — all before the card goes live. Failures are returned here (including the service's stderr) so you can fix the bundle and retry. On success the card appears on the user's deck already populated."#
-            .to_string()
+        "Install a new deck card from a staged bundle directory (absolute path). Runs the dry-run gate and returns any failure (including the service's stderr) so you can fix and retry. The /card skill carries the bundle contract and templates.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -141,10 +245,7 @@ impl Tool for DeckCardUpdateTool {
     }
 
     fn description(&self) -> String {
-        r#"Replace an existing deck card's bundle with a staged directory (same four files as DeckCardCreate).
-
-Runs the same dry-run gate before anything goes live; on success the card's service restarts on the new code. The card's title, size, and position are owned by the row after install — the new manifest's values do NOT overwrite the user's layout."#
-            .to_string()
+        "Replace an existing card's bundle (card_id + staged directory of the same four files). Runs the same dry-run gate and restarts the service; the user's title/size/layout are preserved. See the /card skill.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {

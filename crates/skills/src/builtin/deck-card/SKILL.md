@@ -12,6 +12,8 @@ allowed-tools:
   - Edit
   - Read
   - Bash
+  - DeckCardList
+  - DeckCardGet
   - DeckCardCreate
   - DeckCardUpdate
 ---
@@ -232,15 +234,35 @@ export function start(ctx) {
 </script>
 ```
 
-## Install flow
+## Install flow (new card)
 
 1. Write the four files into a scratch directory.
 2. `DeckCardCreate(path: "<absolute staging dir>")`.
 3. If the gate fails, read the error (it includes your service's
    stderr), edit the files, and call `DeckCardCreate` again.
-4. To change an existing card: stage the new bundle and call
-   `DeckCardUpdate(card_id, path)`. The user's title/size/layout are
-   preserved; only your code and contract change.
+
+## Updating an existing card
+
+The user's cards persist across conversations, so this works even in a
+brand-new chat where you have no memory of the card. **Do not re-write a
+card from scratch to change it** — you would lose whatever it already did.
+Instead, edit its real source:
+
+1. `DeckCardList()` — lists every live card (`card_id`, `title`, `size`,
+   …). Match the user's description ("the quota card") to a `title` to
+   get its `card_id`. If it's ambiguous, ask which one.
+2. `DeckCardGet(card_id)` — returns that card's current four files
+   verbatim. Write them into a fresh scratch directory.
+3. Make the surgical change the user asked for (edit one file; leave the
+   rest byte-for-byte).
+4. `DeckCardUpdate(card_id, path)` — same dry-run gate as create; on
+   success the service restarts on the new code. The user's title, size,
+   and layout are owned by the card after install, so the manifest's
+   values do **not** overwrite them.
+
+Every install/update/purge is auto-committed to a git repo under the deck
+root, so the operator can diff and roll back a card by hand — you don't
+manage that, but it's why editing from the real source matters.
 
 Tell the user the card is on their Deck once the install succeeds. Do
 not fabricate data sources: if the user's request needs an API you can't

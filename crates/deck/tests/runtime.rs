@@ -72,6 +72,18 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
     })
 }
 
+/// Count commits in the deck root's git history touching `pathspec`.
+fn git_log_count(deck_root: &Path, pathspec: &str) -> usize {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(deck_root)
+        .args(["log", "--oneline", "--", pathspec])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git log failed");
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
 fn stage_bundle(dir: &Path, service_js: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
@@ -129,6 +141,9 @@ async fn install_call_lifecycle() {
     assert!(!h.events.card_data.lock().is_empty());
     assert!(*h.events.changed.lock() >= 1);
 
+    // Install auto-committed the bundle into the deck root's git history.
+    assert_eq!(git_log_count(h.manager.deck_root(), &card.id), 1);
+
     // Validated on-demand op call reaches the resident service.
     let sum = h
         .manager
@@ -179,6 +194,63 @@ async fn install_call_lifecycle() {
     h.manager.purge(&card.id).await.unwrap();
     assert!(h.manager.recycle_view().await.unwrap().is_empty());
     assert!(!h.manager.deck_root().join(&card.id).exists());
+    // Purge removed the files but git history survives (install + purge),
+    // so a purged card's code stays recoverable.
+    assert_eq!(git_log_count(h.manager.deck_root(), &card.id), 2);
+
+    h.manager.shutdown().await;
+}
+
+/// The cross-chat update path: a card installed with no in-context memory
+/// of its bundle is discoverable (`deck_view`), its source is retrievable
+/// (`bundle_files`, what `DeckCardGet` returns), and an edit built from
+/// that source updates it — with git recording both revisions.
+#[tokio::test]
+async fn update_from_persisted_bundle_round_trips() {
+    let Some(h) = harness_or_skip("update_from_persisted_bundle_round_trips").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), GOOD_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap();
+
+    // Discovery: a fresh chat resolves title -> card_id via the list.
+    let listed = h.manager.deck_view().await.unwrap();
+    let found = listed.cards.iter().find(|c| c.title == "Quota").unwrap();
+    assert_eq!(found.id, card.id);
+
+    // Fetch the real source (DeckCardGet) — all four files come back.
+    let files = h.manager.bundle_files(&card.id).await.unwrap();
+    assert!(files.service_js.contains("sum: a + b"));
+    assert!(files.manifest_json.contains("Quota"));
+    assert!(files.card_html.contains("<div"));
+    assert!(files.openapi_json.contains("refresh"));
+
+    // Edit from that source: re-stage the fetched files, change only the
+    // service, and update.
+    let edit = tempfile::tempdir().unwrap();
+    std::fs::write(edit.path().join("manifest.json"), &files.manifest_json).unwrap();
+    std::fs::write(edit.path().join("openapi.json"), &files.openapi_json).unwrap();
+    std::fs::write(edit.path().join("card.html"), &files.card_html).unwrap();
+    std::fs::write(
+        edit.path().join("service.js"),
+        r#"
+export const ops = {
+  refresh: async () => ({ ok: true, n: 99 }),
+  add: async ({ a, b }) => ({ sum: a + b }),
+};
+"#,
+    )
+    .unwrap();
+    let updated = h.manager.update(&card.id, edit.path()).await.unwrap();
+    assert_eq!(updated.id, card.id, "same card, in place");
+    assert_ne!(updated.spec_hash, card.spec_hash, "new code, new hash");
+
+    // The new snapshot reflects the edit, and git holds both revisions —
+    // the old source is still recoverable.
+    let view = h.manager.deck_view().await.unwrap();
+    assert!(view.snapshots[0].payload.contains("99"));
+    assert_eq!(git_log_count(h.manager.deck_root(), &card.id), 2);
 
     h.manager.shutdown().await;
 }
