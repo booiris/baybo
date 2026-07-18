@@ -444,10 +444,18 @@ impl DeckManager {
         Ok(())
     }
 
-    /// Restore from the recycle bin — a transition into the running
-    /// fleet, so it re-passes the gate; a failed gate leaves the card in
-    /// the bin with the error returned to the caller. Counts against the
-    /// card cap like an install.
+    /// Restore from the recycle bin. NO dry-run gate, deliberately: the
+    /// bundle is byte-identical to when the user deleted it (delete
+    /// doesn't touch files) and the user is present and watching — if
+    /// the service can't boot (e.g. the SDK moved while it sat in the
+    /// bin), the supervisor's crash→quarantine machinery surfaces a
+    /// visible error face within seconds, and the Re-enable path IS
+    /// gated (`enable` is the re-admission verdict). The gate stays
+    /// where new code enters (install/update) and where drift is silent
+    /// (the post-upgrade boot re-gate). The card lands with its last
+    /// pre-delete snapshot (soft delete keeps them); the resident
+    /// service's first tick refreshes it. Counts against the card cap
+    /// like an install.
     pub async fn restore(&self, card_id: &str) -> Result<CardView> {
         let row = self
             .store
@@ -462,16 +470,9 @@ impl DeckManager {
             return Err(DeckError::DeckFull(MAX_CARDS));
         }
         let bundle = load_bundle(&self.bundle_dir(card_id))?;
-        let first = self.dry_run(&bundle).await?;
         self.store.set_deleted(card_id, None).await?;
         self.store.set_quarantined(card_id, None).await?;
         provenance("restore", card_id, &bundle.spec_hash);
-        let text = first.to_string();
-        let seq = self
-            .store
-            .record_snapshot(card_id, &text, None, Utc::now())
-            .await?;
-        self.events.card_data(card_id, seq, &text);
         if row.enabled {
             self.start_service(card_id, &bundle).await?;
         }
