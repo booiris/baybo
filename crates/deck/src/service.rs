@@ -54,7 +54,8 @@ pub(crate) fn bun_binary() -> PathBuf {
 }
 
 /// Host-side capability RPCs served to the child. Implemented by the
-/// manager (fetch with SSRF floor + placeholder reveal; sandboxed exec).
+/// manager (fetch with SSRF floor + placeholder reveal; host exec with
+/// wall-clock and output caps).
 #[async_trait]
 pub(crate) trait HostServices: Send + Sync + 'static {
     async fn fetch(

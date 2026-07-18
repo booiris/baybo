@@ -8,8 +8,10 @@
 // ctx surface (universal, undeclared — see docs/modules/deck.md):
 //   ctx.fetch(url, {method, headers, body}) -> {status, headers, body, json()}
 //     host-mediated: SSRF floor + [{REDACTED_SECRET_…}] reveal happen in
-//     the Rust parent; this process has no sockets at all.
-//   ctx.exec(cmd) -> {code, stdout, stderr}   sandboxed, no network
+//     the Rust parent. The child itself is trusted host code and can perform
+//     direct I/O, but secrets remain parent-only.
+//   ctx.exec(cmd) -> {code, stdout, stderr}
+//     host /bin/sh -c, inherited environment, 10s wall clock + output caps
 //   ctx.emit(payload)                          policed + seq'd by the parent
 //   ctx.log(msg)
 //

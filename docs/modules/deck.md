@@ -1,7 +1,5 @@
 # deck — agent-authored live cards
 
-**Status: implemented (2026-07-18), uncommitted on `feat/ios-swiftui`.** This document was written as the design (2026-07-17) and the implementation followed it; where a decision reversed during design, the rejected alternative is kept with the reason — the same convention as [`cron-groups.md`](../cron-groups.md). Verified: root workspace clippy zero-warnings + nextest green (modulo the documented environmental set), `baybo-deck` end-to-end runtime tests against real bun (install gate → resident service → validated ops → emit policing → lifecycle), 11 `/v1/deck` routes in the regenerated OpenAPI snapshot, ffi workspace 152 tests, ios web vitest 204 + sentinel pins, Swift `BayboTests` 168 on the simulator.
-
 **Implementation deviations** (each deliberate, none load-bearing on the security model):
 
 - **Card services run on the host, not under `crates/sandbox`** (post-implementation reversal, 2026-07-18). The sandbox jail broke bun binary resolution (bwrap's scrubbed `PATH`) and walled services off from what real cards need (a Codex-quota card's `~/.codex` creds + network; a machine-status card's host CLIs); since the sandbox was never a security boundary against the trusted author, it was removed rather than perforated. `service.js` and `ctx.exec` now spawn directly like the channel sidecars. The `StdinSource::Piped` + `DetachedChild::take_stdin` additions to `baybo-sandbox` were reverted with it. Full rationale in "The service runtime" below.
@@ -11,6 +9,8 @@
 - **The install-time rendered preview screenshot** (browser-sidecar best-effort, authoring step 4) is not implemented; install is the plain dry-run gate.
 - **iOS surfaces**: the FFI exposes fetch/recycle/bundle/call/layout/enable/disable/delete/restore but not purge or the per-card `openapi.json` (REST-only, desktop affordances). The recycle bin has a native screen (`DeckRecycleScreen`, pushed from the Deck header's ☰ menu — the Chats-☰ grammar; rows restore via `deck_restore` and the board refetches on the `DeckChanged` echo); purge stays REST-only. The native delete confirm is a system alert rather than the hand-rolled `ConfirmDialog`.
 - **Relay-leg op replay is governed per op by the card's own contract**: every op's mandatory `x-baybo-retryable` declaration (compiled at install, served as `retryable_ops` on the deck view) picks the phone's `ReplayPolicy` — a declared-safe op may replay a silent pooled leg, anything else fails up to the card (arbitrary agent-written service code is not safely at-least-once). The absolute-state deck writes stay on the convergent retry path unconditionally.
+
+**Post-design additions (`5ad915c5`, later than the original build).** Two capabilities beyond the 2026-07-17 design landed after the fact: (1) **automatic git version history** for card bundles — `workspace/deck/` is a git repo and install/update/purge auto-commit (see "Version history is automatic" under *The card bundle*); (2) **cross-chat update discovery tools** — `DeckCardList` + `DeckCardGet`, so the agent can update a card in a fresh conversation with no memory of its uuid and no filesystem reach into the deck root (see *Authoring pipeline*). The same commit trimmed all four `DeckCard*` tool descriptions to one-liners — the bundle contract lives in the `/card` skill, not in the always-on tool schemas that ride every cached owner-channel prompt (~326 tokens for the four tools, down from ~621).
 
 ## Overview
 
@@ -190,13 +190,13 @@ The tab label has `Localizable.xcstrings` keys (en `Deck` + the zh-Hans kanban t
 
 Card authoring is **explicit-invocation-only and owner-channel-only**: the
 builtin `deck-card` skill is slash-only (`command: card` +
-`disable-model-invocation: true`) and `channels: [owner]`, and the
-`DeckCardCreate`/`DeckCardUpdate` manifests carry `channels: [owner]` — so
-the model never volunteers a card, a telegram/tui/subagent session neither
-sees the skill nor the tools (they're filtered from its LLM tool list and
-refused by the executor), and a card is only ever authored when the owner
-types `/card <request>` in chat (web or iOS; it's a plain chat message, no
-client plumbing).
+`disable-model-invocation: true`) and `channels: [owner]`, and all four
+`DeckCard*` tool manifests (`List`/`Get`/`Create`/`Update`) carry
+`channels: [owner]` — so the model never volunteers a card, a
+telegram/tui/subagent session neither sees the skill nor the tools (they're
+filtered from its LLM tool list and refused by the executor), and a card is
+only ever authored when the owner types `/card <request>` in chat (web or
+iOS; it's a plain chat message, no client plumbing).
 
 When the user types `/card`:
 
@@ -208,6 +208,8 @@ When the user types `/card`:
 Updates re-run the same gate; `DeckCardUpdate(card_id, path)` replaces the bundle and restarts the service.
 
 **Cross-chat updates need discovery, not memory.** A card persists across conversations, but a *new* chat has no memory of its uuid and the agent's file tools are sandboxed to `workspace/work/` — they can't reach `workspace/deck/<uuid>/` to read the installed source. So the authoring skill carries two read-only discovery tools alongside the authoring pair: **`DeckCardList`** (every live card's `card_id`/`title`/`size`/`enabled`/`spec_hash`, so the agent resolves "the quota card" → a uuid) and **`DeckCardGet(card_id)`** (the card's current four files returned *inline* in the tool result, so the agent edits from the real source rather than re-authoring blind — the sandbox-reach problem is why the source comes back through the tool result, not a path). The update flow is then: `DeckCardList` → `DeckCardGet` → write the four files to a fresh scratch dir → surgical edit → `DeckCardUpdate`. All four deck tools are `Trusted` + `channels: [owner]`; the authoring pair holds `ReadFile` (they read the agent's staged dir), the discovery pair holds no filesystem capability (they read through the manager). Without these, updating in a new chat would force a full re-write from the user's description, silently dropping whatever the card already did.
+
+The four tool **descriptions are deliberately terse** — one line each, pointing at the `/card` skill. The full bundle contract (the four-file shapes, the `ctx`/`deck` SDK, worked examples) lives only in the skill, which is injected on `/card` and nowhere else; the tool *schemas*, by contrast, ride every owner-channel prompt in the cached prefix whether or not the turn touches the deck. Keeping the contract out of the always-on descriptions holds the four tools to ~326 tokens (from ~621 before the trim) with no prompt-cache disruption — the model still sees the whole contract exactly when it authors, via the skill.
 
 ## Deferred and open items
 
