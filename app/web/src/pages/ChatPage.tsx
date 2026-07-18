@@ -11,6 +11,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { uuid } from '../uuid';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -1694,7 +1695,7 @@ export function ChatPage() {
       if (!wsRef.current || statusRef.current.state !== 'connected') return false;
       // Same UUID is the WS frame's dedup key AND the optimistic row's
       // reconciliation key (the inbound echo replaces this row in place).
-      const clientMsgId = crypto.randomUUID();
+      const clientMsgId = uuid();
       stoppedSessionsRef.current.delete(targetSessionId);
       setViews((prev) => {
         const view = prev[targetSessionId] ?? EMPTY_VIEW;
@@ -1775,7 +1776,7 @@ export function ChatPage() {
       if (!wsRef.current || statusRef.current.state !== 'connected') return false;
       const prepared = items
         .map((it) => ({
-          clientMsgId: crypto.randomUUID(),
+          clientMsgId: uuid(),
           text: it.text.trim(),
           attachments: it.attachments,
         }))
@@ -1865,7 +1866,7 @@ export function ChatPage() {
       // any buffered answer first, keep the partial reply as its own bubble
       // below the collapsed block, and mark the session stopped so a delta
       // that raced in just after is dropped rather than spilling a bubble.
-      const clientMsgId = crypto.randomUUID();
+      const clientMsgId = uuid();
       flushPacerKeepStreaming(sessionId);
       stoppedSessionsRef.current.add(sessionId);
       streamingAnswerRef.current.delete(sessionId);
@@ -1956,7 +1957,7 @@ export function ChatPage() {
       } else if (action === 'direct') {
         sendText(composer, wire);
       } else {
-        queue.enqueue({ id: crypto.randomUUID(), text: trimmed, attachments: wire });
+        queue.enqueue({ id: uuid(), text: trimmed, attachments: wire });
       }
       setComposer('');
       attachments.forEach((a) => {
@@ -2084,7 +2085,7 @@ export function ChatPage() {
 
   const uploadAttachment = useCallback(
     async (file: File) => {
-      const localId = crypto.randomUUID();
+      const localId = uuid();
       const mime = file.type || 'application/octet-stream';
       // Instant composer thumbnail for images, straight from the local file
       // (no upload round-trip needed to preview it).
