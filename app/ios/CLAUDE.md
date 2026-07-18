@@ -48,7 +48,8 @@ cargo nextest run --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Transcript bundle (own pnpm workspace — the root `frontend` job never sees it)
-(cd web && pnpm test)     # vitest: reducers, sync cursor, bridge isolation
+(cd web && pnpm lint)     # eslint: wiring-bug gate (suppression baseline)
+(cd web && pnpm test)     # vitest: reducers, sync cursor, bridge isolation, WorkBlock render
 (cd web && pnpm build)    # tsc --noEmit -> enforces web/src/wireSentinel.ts
 
 # Swift. Build once, then run either bundle against the built products.
@@ -68,10 +69,17 @@ xcodebuild test-without-building -project Baybo.xcodeproj -scheme Baybo \
   four routing invariants, the `invalid_token` untyped-string chain, and
   `since_ordinal` serializing as an **explicit null** (add `skip_serializing_if`
   and a baseline REPLACE quietly becomes an APPEND).
-- **`web/`** — vitest + jsdom over the pure reducers, NOT the DOM. Mounting
+- **`web/`** — vitest + jsdom, mostly over the pure reducers. Mounting
   `<Transcript>` was tried and rejected: jsdom reports `scrollHeight` as 0, so
-  every follow/pin/jump branch degenerates. The simulator demo flags cover what a
-  reducer test cannot.
+  every follow/pin/jump branch degenerates — the transcript is tested through its
+  extracted reducers, and the simulator demo flags cover what a reducer test
+  cannot. A **small presentational component with no scrollHeight/follow/pin
+  dependency is fine to render**, though: `WorkBlock.test.tsx` mounts
+  `WorkBlockView` (React Testing Library) for its active/closed/toggle wiring —
+  do NOT extend this to `<Transcript>`. `pnpm lint` (eslint, mirroring app/web —
+  strict-boolean-expressions / no-unnecessary-condition / react-hooks, with a
+  suppression baseline for the existing backlog) gates the wiring-bug class over
+  `src`.
 - **`Tests/` (`BayboTests`)** — Swift Testing (`@Test`/`#expect`), a
   **host-application** bundle (hostless would relink the Rust staticlib and make
   `Lang.t` return bare keys). `ChatStore` takes an injected `any

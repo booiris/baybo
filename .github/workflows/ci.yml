@@ -227,6 +227,12 @@ jobs:
           cache-dependency-path: app/ios/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: app/ios/web
+      # eslint gates the wiring-bug class tsc + the pure-reducer suite can't see
+      # (strict-boolean-expressions, no-unnecessary-condition, react-hooks); the
+      # existing backlog is tracked in app/ios/web/eslint-suppressions.json, so
+      # only NEW violations fail. Mirrors the root frontend job's lint step.
+      - run: pnpm lint
+        working-directory: app/ios/web
       # vitest over the transcript reducers — the sync cursor, the work-block
       # folds, and the cross-session bridge isolation.
       - run: pnpm test
