@@ -1,0 +1,25 @@
+{
+  "src/Markdown.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/Transcript.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 15
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 51
+    }
+  },
+  "src/WorkBlock.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 3
+    }
+  },
+  "src/bridge.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    }
+  }
+}
