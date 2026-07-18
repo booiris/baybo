@@ -2,14 +2,16 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
 // Vitest keeps its own config so the production `vite.config.ts` (dev
-// proxy + build output) stays free of test concerns. The React plugin is
-// here only so a test can import a component module for its JSX without a
-// transform error — the suites themselves exercise pure reducers and
-// never render, so `jsdom` is just a safe import sandbox.
+// proxy + build output) stays free of test concerns. Most suites exercise
+// pure reducers and never render — for those `jsdom` is just a safe import
+// sandbox. The React Testing Library suites (queueStore / QueuePanel) do
+// render into that jsdom; `setup.ts` wires their jest-dom matchers and
+// per-test unmount.
 export default defineConfig({
   plugins: [react()],
   test: {
     environment: 'jsdom',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    setupFiles: ['./src/test/setup.ts'],
   },
 });

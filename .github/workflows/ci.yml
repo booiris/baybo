@@ -170,6 +170,11 @@ jobs:
       # test. pnpm builds in dependency order; this also builds the web
       # dashboard (gen:api + tsc -b + vite build).
       - run: pnpm -r --if-present run build
+      # eslint gates app/web on the wiring-bug class tsc + the vitest reducers
+      # can't see (strict-boolean-expressions, no-unnecessary-condition,
+      # react-hooks); the existing backlog is tracked in
+      # app/web/eslint-suppressions.json, so only NEW violations fail here.
+      - run: pnpm --filter baybo-web lint
       # tsc --noEmit across the channel SDK + channel/tool sidecars
       - run: pnpm -r --if-present run check
       # node --test suites (channel SDK, channel + browser sidecars)

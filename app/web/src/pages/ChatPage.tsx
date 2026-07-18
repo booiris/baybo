@@ -345,6 +345,73 @@ export function caretOnSlashToken(text: string, caret: number): boolean {
   return caret <= prefixEnd;
 }
 
+/** A queued send carries real content — a non-blank message or an attachment.
+ *  Blank items can only arise from an out-of-band localStorage write (the
+ *  composer/edit paths refuse them); they're dropped before a batch is sized or
+ *  a deferred flush runs so they can't wedge the queue or skew the threshold. */
+export function hasSendableContent(item: QueuedItem): boolean {
+  return item.text.trim().length > 0 || item.attachments.length > 0;
+}
+
+/** Whether a deferred flush goes out as ONE coalesced batch frame rather than
+ *  individual sends: 2+ real messages with no slash command among them (a slash
+ *  command is a coalescing barrier). Blanks are filtered before the count is
+ *  taken, so one real message beside junk still sends individually. */
+export function canBatchDeferred(items: readonly QueuedItem[]): boolean {
+  const sendable = items.filter(hasSendableContent);
+  return sendable.length >= 2 && sendable.every((i) => !isSlashText(i.text));
+}
+
+export type QueueFrameAction =
+  | 'fire' // dispatch the single top parked item
+  | 'fire-deferred' // dispatch every sendable deferred item (batched or one-by-one)
+  | 'restore-deferred' // move still-pending deferred items back to the parked queue
+  | 'pause-cancelled'
+  | 'pause-error'
+  | 'none';
+
+/** Session state a queue decision reads, snapshot at the frame boundary. */
+export interface QueueFrameCtx {
+  /** The session was /stop'd; its salvaged partial reply must not drain the queue. */
+  stopped: boolean;
+  /** A live turn armed this session (turn token set) — false for a sync
+   *  redelivery replayed on reload, which must never auto-fire. */
+  armed: boolean;
+  /** This turn already dispatched from the queue (fired === token). */
+  alreadyFired: boolean;
+  /** The queue is paused after a cancelled/errored reply. */
+  paused: boolean;
+  hasItems: boolean;
+  hasDeferred: boolean;
+}
+
+/** Pure decision for what an inbound frame does to a session's send queue,
+ *  extracted from `drainQueueOnFrame` so the auto-fire / restore / pause rules
+ *  are unit-testable independent of the side effects (the send calls, the store
+ *  mutations, the fired-this-turn bookkeeping) the caller still owns. Auto-fire
+ *  keys on a real turn completion; a reload redelivery (unarmed) never fires. */
+export function classifyQueueFrame(frame: Frame, ctx: QueueFrameCtx): QueueFrameAction {
+  if (frame.kind === 'message' && frame.role !== 'user') {
+    if (ctx.stopped || !ctx.armed || ctx.alreadyFired || ctx.paused) return 'none';
+    if (ctx.hasDeferred) return 'fire-deferred';
+    if (ctx.hasItems) return 'fire';
+    return 'none';
+  }
+  if (frame.kind === 'turn_state' && !frame.active) {
+    // The one turn-end signal that ALWAYS fires. If the message branch didn't
+    // already dispatch this turn, still-pending deferred items can't ride this
+    // completion — move them back to the parked queue rather than strand them.
+    if (!ctx.alreadyFired && ctx.hasDeferred && !ctx.paused) return 'restore-deferred';
+    return 'none';
+  }
+  if (frame.kind === 'notice' && frame.transient !== true) {
+    if (!ctx.hasItems && !ctx.hasDeferred) return 'none';
+    if (isStopCancellationNotice(frame.text)) return 'pause-cancelled';
+    if (frame.level === 'error') return 'pause-error';
+  }
+  return 'none';
+}
+
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
@@ -1925,62 +1992,45 @@ export function ChatPage() {
   // pipeline so it stops draining until the user resumes via the banner.
   const drainQueueOnFrame = useCallback(
     (frame: Frame) => {
+      // Only these three carry a session_id the queue reacts to; anything else
+      // is inert. The decision is pure (`classifyQueueFrame`); this callback
+      // owns the side effects — the send calls, the store mutations, and the
+      // fired-this-turn bookkeeping that keeps a live completion single-fire.
+      if (frame.kind !== 'message' && frame.kind !== 'turn_state' && frame.kind !== 'notice') {
+        return;
+      }
       const store = queueStoreRef.current;
-      if (frame.kind === 'message' && frame.role !== 'user') {
-        const sid = frame.session_id;
-        // A just-/stop'd session salvages its partial reply as an assistant
-        // message — that is NOT a normal completion and must never drain the
-        // queue. Cleared when a new turn starts or a non-stop message is sent.
-        if (stoppedSessionsRef.current.has(sid)) return;
-        const token = turnTokenRef.current.get(sid);
-        // Fire only when a live turn armed this session (token set) — skips
-        // sync redeliveries applied on reload — and not already fired this turn.
-        if (token !== undefined && firedForTurnRef.current.get(sid) !== token) {
-          const snap = store.queue(sid);
-          if (snap.pauseReason !== null) return;
-          // Deferred ("waiting in the thread") messages — the ones the operator
-          // clicked send on mid-final-reply — ALL go out together as soon as the
-          // reply completes, so the agent answers them as one merged turn.
-          // Parked items stay one-per-completion. Sharing the parked-queue token
-          // gate keeps this single-fire-per-live-completion.
-          if (snap.deferred.length > 0) {
-            // Drop any content-less junk (can only arise from an out-of-band
-            // localStorage write — the composer/edit paths refuse blank items)
-            // so it can't wedge the queue or skew the batch threshold/removal.
-            const sendable = snap.deferred.filter(
-              (i) => i.text.trim().length > 0 || i.attachments.length > 0,
-            );
-            for (const item of snap.deferred) {
-              if (!sendable.includes(item)) store.removeDeferred(sid, item.id);
-            }
-            if (sendable.length === 0) return;
-            firedForTurnRef.current.set(sid, token);
-            // 2+ plain messages go as ONE batch frame so the server coalesces
-            // them deterministically (no per-message intake race). A slash
-            // command is a coalescing barrier — those, and the lone-item case,
-            // fall back to individual sends.
-            const canBatch = sendable.length >= 2 && sendable.every((i) => !isSlashText(i.text));
-            if (canBatch) {
-              if (sendBatchToSession(sid, sendable)) {
-                for (const item of sendable) store.removeDeferred(sid, item.id);
-              } else {
-                firedForTurnRef.current.delete(sid);
-              }
-              return;
-            }
-            for (const item of sendable) {
-              if (sendToSession(sid, item.text, item.attachments)) {
-                store.removeDeferred(sid, item.id);
-              } else {
-                // Disconnected — stop here and leave the rest deferred to retry.
-                firedForTurnRef.current.delete(sid);
-                break;
-              }
-            }
-            return;
-          }
+      const sid = frame.session_id;
+      const token = turnTokenRef.current.get(sid);
+      const snap = store.queue(sid);
+      const action = classifyQueueFrame(frame, {
+        stopped: stoppedSessionsRef.current.has(sid),
+        armed: token !== undefined,
+        alreadyFired: token !== undefined && firedForTurnRef.current.get(sid) === token,
+        paused: snap.pauseReason !== null,
+        hasItems: snap.items.length > 0,
+        hasDeferred: snap.deferred.length > 0,
+      });
+      switch (action) {
+        case 'none':
+          return;
+        case 'restore-deferred':
+          store.restoreDeferred(sid);
+          return;
+        case 'pause-cancelled':
+          // The reply a deferred message was waiting on was cancelled — move it
+          // back to the parked queue and pause so it isn't auto-sent; the
+          // banner's "Send remaining" is the explicit resume.
+          store.restoreDeferred(sid);
+          store.setPause(sid, 'cancelled');
+          return;
+        case 'pause-error':
+          store.restoreDeferred(sid);
+          store.setPause(sid, 'error');
+          return;
+        case 'fire': {
           const top = snap.items[0];
-          if (!top) return;
+          if (!top || token === undefined) return;
           firedForTurnRef.current.set(sid, token);
           if (sendToSession(sid, top.text, top.attachments)) {
             store.removeItem(sid, top.id);
@@ -1988,45 +2038,40 @@ export function ChatPage() {
             // Disconnected — leave it queued and allow a later retry.
             firedForTurnRef.current.delete(sid);
           }
+          return;
         }
-        return;
-      }
-      if (frame.kind === 'turn_state' && !frame.active) {
-        const sid = frame.session_id;
-        const token = turnTokenRef.current.get(sid);
-        // `turn_state{active:false}` is the one turn-end signal that ALWAYS
-        // fires; the assistant `message` does not (a blank/tool-only final
-        // emits none, an errored/cancelled turn emits none, a reload/Reset
-        // never re-delivers the prior completion). So if the message branch did
-        // NOT already dispatch a deferred item this turn (firedForTurn === token
-        // means it did, and the rest keep waiting for the turn that dispatch
-        // started), the still-pending deferred items can't ride this completion.
-        // Move them back to the parked queue — visible/editable and drained on
-        // the next completion — rather than leaving them stranded as a
-        // read-only thread bubble. Restoring (not sending) here also means a
-        // turn that ended via /stop or error can't auto-fire a deferred item
-        // ahead of the pause-setting notice.
-        if (token === undefined || firedForTurnRef.current.get(sid) !== token) {
-          const snap = store.queue(sid);
-          if (snap.deferred.length > 0 && snap.pauseReason === null) {
-            store.restoreDeferred(sid);
+        case 'fire-deferred': {
+          if (token === undefined) return;
+          // Deferred ("waiting in the thread") messages ALL go out together as
+          // soon as the reply completes, so the agent answers them as one
+          // merged turn. Drop content-less junk first (an out-of-band
+          // localStorage write — the composer/edit paths refuse blank items).
+          const sendable = snap.deferred.filter(hasSendableContent);
+          for (const item of snap.deferred) {
+            if (!sendable.includes(item)) store.removeDeferred(sid, item.id);
           }
-        }
-        return;
-      }
-      if (frame.kind === 'notice' && !frame.transient) {
-        const sid = frame.session_id;
-        const q = store.queue(sid);
-        if (q.items.length === 0 && q.deferred.length === 0) return;
-        // The reply a deferred message was waiting on was cancelled/failed —
-        // move it back to the parked queue and pause so it isn't auto-sent; the
-        // banner's "Send remaining" is the explicit resume.
-        if (isStopCancellationNotice(frame.text)) {
-          store.restoreDeferred(sid);
-          store.setPause(sid, 'cancelled');
-        } else if (frame.level === 'error') {
-          store.restoreDeferred(sid);
-          store.setPause(sid, 'error');
+          if (sendable.length === 0) return;
+          firedForTurnRef.current.set(sid, token);
+          // 2+ plain messages go as ONE batch frame so the server coalesces
+          // them deterministically (no per-message intake race).
+          if (canBatchDeferred(sendable)) {
+            if (sendBatchToSession(sid, sendable)) {
+              for (const item of sendable) store.removeDeferred(sid, item.id);
+            } else {
+              firedForTurnRef.current.delete(sid);
+            }
+            return;
+          }
+          for (const item of sendable) {
+            if (sendToSession(sid, item.text, item.attachments)) {
+              store.removeDeferred(sid, item.id);
+            } else {
+              // Disconnected — stop here and leave the rest deferred to retry.
+              firedForTurnRef.current.delete(sid);
+              break;
+            }
+          }
+          return;
         }
       }
     },
