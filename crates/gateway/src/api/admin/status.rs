@@ -23,18 +23,18 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     )
 )]
 async fn status(State(state): State<AdminState>) -> Result<axum::Json<StatusResponse>> {
+    // Both figures are SQL COUNTs — the probe never materialises the
+    // session or job rows it is counting.
     let sessions = state
         .session_manager
-        .list()
+        .session_count()
         .await
-        .map_err(|e| crate::GatewayError::Session(e.to_string()))?
-        .len();
+        .map_err(|e| crate::GatewayError::Session(e.to_string()))?;
     let jobs_in_flight = state
         .job_lifecycle
-        .list(Some(baybo_job::JobStatusKind::InProgress))
+        .count_by_status(baybo_job::JobStatusKind::InProgress)
         .await
-        .map_err(|e: baybo_job::JobError| crate::GatewayError::Job(e.to_string()))?
-        .len();
+        .map_err(|e: baybo_job::JobError| crate::GatewayError::Job(e.to_string()))?;
     Ok(axum::Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         bind_address: state.bind_display.clone(),

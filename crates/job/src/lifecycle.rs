@@ -312,6 +312,42 @@ impl JobLifecycle {
         Ok(jobs)
     }
 
+    /// Per-session job aggregates (count + latest status kind) in one
+    /// grouped store query — list surfaces use this instead of a
+    /// `list_by_session` fan-out across every session.
+    pub async fn session_job_stats(&self) -> Result<Vec<baybo_store::SessionJobStats>> {
+        Ok(self.store.session_job_stats().await?)
+    }
+
+    /// Number of jobs in the given status — a SQL COUNT, no rows
+    /// materialised.
+    pub async fn count_by_status(&self, status: JobStatusKind) -> Result<usize> {
+        Ok(self
+            .store
+            .count_by_status_kind(status.as_snake_case())
+            .await?)
+    }
+
+    /// One page of jobs (newest `created_at` first) plus the total
+    /// matching count — paging lives in SQL, so a page never
+    /// materialises the whole table.
+    pub async fn list_page(
+        &self,
+        status: Option<JobStatusKind>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Job>, usize)> {
+        let (rows, total) = self
+            .store
+            .list_page(status.map(|k| k.as_snake_case()), limit, offset)
+            .await?;
+        let jobs = rows
+            .into_iter()
+            .map(Job::from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((jobs, total))
+    }
+
     /// Non-terminal jobs for one session, status-filtered at the store rather
     /// than loaded whole and retained. Used by `/stop` to find the in-flight
     /// turn + background children without a full-history load on a long-lived

@@ -48,7 +48,22 @@ pub trait TraceStore: Send + Sync {
     async fn save_span(&self, span: &SpanRow) -> Result<()>;
     async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>>;
     async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<SpanRow>>;
+    /// Every span under a job's steps in one query, ordered by
+    /// `started_at`. Tree assemblers (job trace, replay) use this
+    /// instead of a `list_spans_by_step` round-trip per step.
+    async fn list_spans_by_job(&self, job_id: &JobId) -> Result<Vec<SpanRow>>;
+    /// Count a job's `(steps, spans)` without materialising any `data`
+    /// blobs. List/status surfaces need only the numbers — span blobs
+    /// can run to hundreds of KB each, so counting via the list
+    /// methods is prohibitively expensive.
+    async fn trace_counts_by_job(&self, job_id: &JobId) -> Result<(usize, usize)>;
 
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()>;
     async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>>;
+    /// Events for many spans in one query. Each span's events arrive in
+    /// `seq` order; ordering ACROSS spans is unspecified (consumers
+    /// group by `span_id`). Tree assemblers use this instead of a
+    /// `list_span_events` round-trip per span (most spans have no
+    /// events at all).
+    async fn list_span_events_for_spans(&self, span_ids: &[SpanId]) -> Result<Vec<SpanEventRow>>;
 }

@@ -4936,7 +4936,14 @@ export interface operations {
     };
     get_trace: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description When set, `session_messages` carries only rows with a greater
+                 *     ordinal; the client already holds the prefix and re-validates it
+                 *     via the response's `supersede_watermark`.
+                 */
+                since_ordinal?: number;
+            };
             header?: never;
             path: {
                 /** @description Session id whose trace overview to fetch */
@@ -4946,7 +4953,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace overview: session_messages log + job summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;

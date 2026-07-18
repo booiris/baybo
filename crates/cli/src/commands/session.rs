@@ -30,21 +30,15 @@ fn sessions(ctx: &CommandContext) -> Result<&baybo_agent::SessionManager> {
     })
 }
 
-/// Trace replay is optional on `show` — argv-light boots that lack
-/// `QueryApi` still surface metadata + message count gracefully.
+/// Trace counts are optional on `show` — argv-light boots that lack
+/// `QueryApi` still surface metadata + message count gracefully. SQL
+/// counts only; the full trace tree is never materialised for a tally.
 async fn try_replay_counts(
     ctx: &CommandContext,
     session_id: &SessionId,
 ) -> Option<(usize, usize, usize)> {
     let api: &QueryApi = ctx.query_api.as_deref()?;
-    let replay = api.replay(session_id, None).await.ok()?;
-    let mut steps = 0;
-    let mut spans = 0;
-    for j in &replay.jobs {
-        steps += j.steps.len();
-        spans += j.steps.iter().map(|s| s.spans.len()).sum::<usize>();
-    }
-    Some((replay.jobs.len(), steps, spans))
+    api.trace_counts(session_id).await.ok()
 }
 
 async fn list(ctx: &CommandContext) -> Result<CommandOutput> {

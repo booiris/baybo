@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_model::{
@@ -18,6 +19,26 @@ type Result<T> = std::result::Result<T, SessionError>;
 /// an agentic turn persists many invisible tool rows per visible reply, so the
 /// count scans up to `cap * this` rows to reach `cap` visible replies.
 const UNREAD_SCAN_MULTIPLIER: usize = 10;
+
+/// A row that renders as an unread chat bubble: a final assistant
+/// reply. Intermediate agentic iterations (assistant rows carrying
+/// tool calls) don't count as separate unread bubbles.
+fn is_visible_reply(msg: &ChatMessage) -> bool {
+    msg.role == Role::Assistant && !msg.has_tool_use()
+}
+
+/// Chat-list sidebar aggregates for a set of sessions, produced by
+/// [`SessionManager::chat_list_scan`] from grouped store reads.
+#[derive(Debug, Default)]
+pub struct ChatListScan {
+    /// Newest human-authored message per session (first-line preview).
+    pub last_user: HashMap<SessionId, (DateTime<Utc>, ChatMessage)>,
+    /// Last N active rows per session, ascending (second-line preview
+    /// scan window).
+    pub tails: HashMap<SessionId, Vec<(i64, DateTime<Utc>, ChatMessage)>>,
+    /// Unread visible-reply count per session, capped.
+    pub unread_counts: HashMap<SessionId, usize>,
+}
 
 /// Map a store row into the domain summary.
 fn folder_row_to_summary(row: SessionFolderRow) -> FolderSummary {
@@ -389,20 +410,61 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// The freshest human-authored message (source `user` /
-    /// `user_interjection`), paired with its persisted `created_at`, or
-    /// `None`. A single indexed lookup — powers the chat sidebar preview
-    /// without walking the tail, so a prompt buried under a long tool loop
-    /// is still found. No existence pre-check: an unknown session and one
-    /// with no user turn both yield `None` (both render no preview).
-    pub async fn last_user_message(
+    /// Everything the chat-list sidebar needs for a set of sessions in
+    /// three grouped store reads (first-line previews, second-line tail
+    /// scans, unread counts) instead of a per-session round-trip
+    /// fan-out. Sessions absent from a map have no matching rows.
+    pub async fn chat_list_scan(
         &self,
-        session_id: &SessionId,
-    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>> {
-        self.store
-            .load_last_user_message(session_id)
-            .await
-            .map_err(SessionError::from)
+        session_ids: &[SessionId],
+        tail_limit: usize,
+        unread_cap: usize,
+    ) -> Result<ChatListScan> {
+        let last_user = self
+            .store
+            .last_user_messages(session_ids)
+            .await?
+            .into_iter()
+            .map(|(id, created_at, msg)| (id, (created_at, msg)))
+            .collect();
+        let mut tails: HashMap<SessionId, Vec<(i64, DateTime<Utc>, ChatMessage)>> = HashMap::new();
+        for (id, ordinal, created_at, msg) in
+            self.store.active_tails(session_ids, tail_limit).await?
+        {
+            tails
+                .entry(id)
+                .or_default()
+                .push((ordinal, created_at, msg));
+        }
+        let mut unread_counts: HashMap<SessionId, usize> = HashMap::new();
+        if unread_cap > 0 {
+            let scan_bound = unread_cap.saturating_mul(UNREAD_SCAN_MULTIPLIER);
+            for (id, msg) in self.store.unread_scan(session_ids, scan_bound).await? {
+                if is_visible_reply(&msg) {
+                    let count = unread_counts.entry(id).or_default();
+                    *count = (*count + 1).min(unread_cap);
+                }
+            }
+        }
+        Ok(ChatListScan {
+            last_user,
+            tails,
+            unread_counts,
+        })
+    }
+
+    /// `title` per session (flat column, one grouped query). Sessions
+    /// unknown to the store yield no entry.
+    pub async fn session_titles(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<HashMap<SessionId, Option<String>>> {
+        Ok(self
+            .store
+            .session_titles(session_ids)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// Append a single message to the session's transcript log.
@@ -468,6 +530,22 @@ impl SessionManager {
     pub async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
         self.store
             .list_control_events(session_id)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Control events whose `after_ordinal` anchor falls in
+    /// `[lower, upper]`, seq-ordered — history pages interleave only
+    /// the events anchored inside the page instead of loading the
+    /// whole event log to keep a slice.
+    pub async fn list_control_events_in_range(
+        &self,
+        session_id: &SessionId,
+        lower: i64,
+        upper: i64,
+    ) -> Result<Vec<ControlEvent>> {
+        self.store
+            .list_control_events_in_range(session_id, lower, upper)
             .await
             .map_err(SessionError::from)
     }
@@ -658,15 +736,14 @@ impl SessionManager {
         if cap == 0 {
             return Ok(0);
         }
-        let read_cursor = self.store.read_cursor(session_id).await?.unwrap_or(-1);
         let scan_bound = cap.saturating_mul(UNREAD_SCAN_MULTIPLIER);
         let rows = self
             .store
-            .load_active_session_messages_since(session_id, read_cursor, scan_bound)
+            .unread_scan(std::slice::from_ref(session_id), scan_bound)
             .await?;
         let count = rows
             .into_iter()
-            .filter(|(_, _, msg)| msg.role == Role::Assistant && !msg.has_tool_use())
+            .filter(|(_, msg)| is_visible_reply(msg))
             .count();
         Ok(count.min(cap))
     }
@@ -847,19 +924,38 @@ impl SessionManager {
     }
 
     pub async fn touch(&self, session_id: &SessionId) -> Result<()> {
-        let session = self.store.get(session_id).await?;
-        match session {
-            Some(mut session) => {
-                session.last_active = Utc::now();
-                self.store.save(&session).await?;
-                debug!(session_id = %session_id, "touched session");
-                Ok(())
-            }
-            None => {
-                warn!(session_id = %session_id, "attempted to touch non-existent session");
-                Err(SessionError::NotFound(format!("session {session_id}")))
-            }
+        // Targeted write (column + embedded blob field in one
+        // statement) — the per-message hot path never pays a full
+        // `get` + decode + re-serialize + `save` pair just to bump a
+        // timestamp.
+        let updated = self.store.touch_last_active(session_id, Utc::now()).await?;
+        if !updated {
+            warn!(session_id = %session_id, "attempted to touch non-existent session");
+            return Err(SessionError::NotFound(format!("session {session_id}")));
         }
+        debug!(session_id = %session_id, "touched session");
+        Ok(())
+    }
+
+    /// Total stored sessions — the status probe needs the number, not
+    /// the rows.
+    pub async fn session_count(&self) -> Result<usize> {
+        Ok(self.store.count_sessions().await?)
+    }
+
+    /// Channel tag per session (flat column, one grouped query).
+    /// Sessions unknown to the store yield no entry. Powers batch
+    /// scope checks.
+    pub async fn session_channels(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<HashMap<SessionId, String>> {
+        Ok(self
+            .store
+            .session_channels(session_ids)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// List candidate idle sessions: every "normal" session whose

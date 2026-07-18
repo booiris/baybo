@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use baybo_model::{JobId, SessionId};
 use baybo_store::job::Result;
-use baybo_store::{JobRow, JobStore, JobTransitionRow};
+use baybo_store::{JobRow, JobStore, JobTransitionRow, SessionJobStats};
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 /// In-memory `JobStore` for tests. Keyed by `row.id`. `record_transition`
@@ -106,6 +107,60 @@ impl JobStore for MemoryJobStore {
 
     async fn list_all(&self) -> Result<Vec<JobRow>> {
         Ok(self.jobs.lock().values().cloned().collect())
+    }
+
+    async fn list_page(
+        &self,
+        status_kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<JobRow>, usize)> {
+        let mut rows: Vec<JobRow> = self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| status_kind.is_none_or(|k| j.status_kind == k))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+        let total = rows.len();
+        let page = rows.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn count_by_status_kind(&self, status_kind: &str) -> Result<usize> {
+        Ok(self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| j.status_kind == status_kind)
+            .count())
+    }
+
+    async fn session_job_stats(&self) -> Result<Vec<SessionJobStats>> {
+        let mut by_session: HashMap<SessionId, (usize, DateTime<Utc>, String)> = HashMap::new();
+        for j in self.jobs.lock().values() {
+            let entry = by_session.entry(j.session_id.clone()).or_insert((
+                0,
+                j.created_at,
+                j.status_kind.clone(),
+            ));
+            entry.0 += 1;
+            if j.created_at >= entry.1 {
+                entry.1 = j.created_at;
+                entry.2 = j.status_kind.clone();
+            }
+        }
+        Ok(by_session
+            .into_iter()
+            .map(
+                |(session_id, (job_count, _, latest_status_kind))| SessionJobStats {
+                    session_id,
+                    job_count,
+                    latest_status_kind,
+                },
+            )
+            .collect())
     }
 
     async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()> {

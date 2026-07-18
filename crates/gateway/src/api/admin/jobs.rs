@@ -86,20 +86,32 @@ async fn list_jobs(
         None => 0,
     };
 
-    let mut jobs = match params.session {
+    let (page_jobs, total) = match params.session {
+        // Session-scoped lists stay a per-session load (bounded by that
+        // session's job count) with in-memory paging.
         Some(sid) => {
             let sid = baybo_model::SessionId::from(sid);
-            state.job_lifecycle.list_by_session(&sid, status).await
+            let mut jobs = state
+                .job_lifecycle
+                .list_by_session(&sid, status)
+                .await
+                .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
+            let total = jobs.len();
+            if offset >= total {
+                return Ok(Json(ListResponse::new(Vec::new())));
+            }
+            let page: Vec<_> = jobs.drain(offset..).take(limit).collect();
+            (page, total)
         }
-        None => state.job_lifecycle.list(status).await,
-    }
-    .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
-
-    let total = jobs.len();
-    if offset >= total {
-        return Ok(Json(ListResponse::new(Vec::new())));
-    }
-    let page: Vec<_> = jobs.drain(offset..).take(limit).map(Job::from).collect();
+        // The unscoped list pages in SQL — a page never materialises
+        // the whole jobs table.
+        None => state
+            .job_lifecycle
+            .list_page(status, limit, offset)
+            .await
+            .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?,
+    };
+    let page: Vec<_> = page_jobs.into_iter().map(Job::from).collect();
     let next_cursor = if offset + page.len() < total {
         Some((offset + page.len()).to_string())
     } else {

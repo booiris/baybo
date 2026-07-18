@@ -140,11 +140,6 @@ pub trait SessionStore: Send + Sync {
     /// targeted UPDATE leaves the JSON `data` blob alone.
     async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool>;
 
-    /// The session's chat-list read cursor, or `None` when nothing has been
-    /// read yet (or the row is missing). Backs the list endpoint's
-    /// `unread_count` derivation.
-    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>>;
-
     /// Set or clear the session's auto-generated title. Implementations
     /// must update only the flat `title` column so stale `save` calls cannot
     /// clobber it.
@@ -237,6 +232,16 @@ pub trait SessionStore: Send + Sync {
 
     /// All control events for a session, oldest-first by `seq`.
     async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>>;
+    /// Control events whose `after_ordinal` anchor falls in
+    /// `[lower, upper]`, seq-ordered — the page-scoped variant of
+    /// [`Self::list_control_events`] so a history page never loads a
+    /// session's whole event log to keep a slice.
+    async fn list_control_events_in_range(
+        &self,
+        session_id: &SessionId,
+        lower: i64,
+        upper: i64,
+    ) -> Result<Vec<ControlEvent>>;
 
     /// Apply a `/compact`-style compression: mark every currently-
     /// active row as superseded by the first newly-inserted row, then
@@ -283,6 +288,87 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredMessage>>;
+
+    /// Incremental variant of
+    /// [`Self::load_session_messages_with_supersede`]: only rows with
+    /// `ordinal > after_ordinal`, superseded markers included. Pollers
+    /// that already hold a prefix use this instead of re-reading the
+    /// whole transcript; they must also watch
+    /// [`Self::supersede_watermark`] to learn when the prefix's own
+    /// markers went stale.
+    async fn load_session_messages_with_supersede_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+    ) -> Result<Vec<StoredMessage>>;
+
+    /// Highest `superseded_by` marker across the session (`None` while
+    /// nothing is superseded). It only ever advances, and only when a
+    /// compaction rewrites history — incremental transcript readers
+    /// compare it against the value they last saw to detect that
+    /// already-fetched rows gained markers and a full reload is due.
+    async fn supersede_watermark(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
+    /// `created_at` of every session created in `[from, to)`, in no
+    /// particular order. A flat-column projection for creation-rate
+    /// analytics — no session blobs are decoded.
+    async fn session_created_times(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<DateTime<Utc>>>;
+
+    /// Newest human-authored active row (`source` `user` /
+    /// `user_interjection`) for each requested session, one grouped
+    /// query. Sessions without such a row yield no entry. Powers the
+    /// chat list's first-line previews without a per-session fan-out.
+    async fn last_user_messages(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, DateTime<Utc>, ChatMessage)>>;
+
+    /// Last `limit` active rows of each requested session, ascending
+    /// within each session, one grouped query. The batched sibling of
+    /// [`Self::load_active_session_messages_tail`] for list surfaces.
+    async fn active_tails(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, i64, DateTime<Utc>, ChatMessage)>>;
+
+    /// Up to `limit` active rows per requested session strictly above
+    /// that session's chat-list `read_cursor` (unset cursor reads as
+    /// -1), ascending, one grouped query joined against the cursor in
+    /// SQL. Powers the unread badge without a per-session
+    /// cursor-read + scan pair.
+    async fn unread_scan(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, ChatMessage)>>;
+
+    /// `title` of each requested session (flat column, no blob
+    /// decode). Sessions without a row yield no entry.
+    async fn session_titles(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, Option<String>)>>;
+
+    /// Channel tag of each requested session (flat column, no blob
+    /// decode). Sessions without a row yield no entry. Powers batch
+    /// scope checks without a per-id session load.
+    async fn session_channels(&self, session_ids: &[SessionId])
+    -> Result<Vec<(SessionId, String)>>;
+
+    /// Bump `last_active` to `now` in one targeted write (column +
+    /// embedded blob field together, atomically) — the per-message
+    /// hot-path alternative to a full `get` + `save` round-trip pair.
+    /// Returns `false` when the session id is unknown.
+    async fn touch_last_active(&self, session_id: &SessionId, now: DateTime<Utc>) -> Result<bool>;
+
+    /// Total number of stored sessions. Status surfaces need the
+    /// number, not the rows.
+    async fn count_sessions(&self) -> Result<usize>;
 
     /// 0-indexed position of the row with `ordinal == ordinal` within
     /// the session's active sequence (rows where `superseded_by IS
@@ -360,15 +446,4 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         platform_msg_id: &str,
     ) -> Result<Option<i64>>;
-
-    /// The freshest **human-authored** active message — source `user` or
-    /// `user_interjection` (i.e. [`ChatMessage::from_user`]) — paired with
-    /// its persisted `created_at`, or `None` when the session has no such
-    /// turn. A single indexed `ORDER BY ordinal DESC LIMIT 1` lookup;
-    /// powers the chat sidebar preview so a prompt buried under a long
-    /// tool loop is found without walking the tail.
-    async fn load_last_user_message(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>>;
 }
