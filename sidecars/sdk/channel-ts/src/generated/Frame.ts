@@ -52,4 +52,13 @@ description?: string | null, } | { "kind": "approval_resolved", call_id: string,
  * Frame-level serde discriminator — a same-named variant
  * field would collide on the wire.
  */
-source: ActivityKind, at: string, } | { "kind": "ping" } | { "kind": "pong" };
+source: ActivityKind, at: string, } | { "kind": "deck_card_data", card_id: string, 
+/**
+ * Persisted per-card monotonic counter (`deck_cards.last_seq`)
+ * assigned by the gateway at emit-accept time — never derived
+ * from the prunable snapshot table, so it cannot regress
+ * across a gateway restart. `u32` for the same reason as
+ * [`WireAttachment::size`]: avoids the TS-side `BigInt`
+ * round-trip the default msgpack encoder rejects.
+ */
+seq: number, payload: string, } | { "kind": "deck_changed" } | { "kind": "ping" } | { "kind": "pong" };

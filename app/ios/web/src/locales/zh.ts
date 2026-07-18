@@ -31,6 +31,12 @@ export const zh: typeof en = {
       durH: "{{h}} 小时",
       durHM: "{{h}} 小时 {{m}} 分",
     },
+    deck: {
+      empty: "还没有卡片 — 在聊天里输入 /card 创建一张。",
+      quarantined: "此卡片因反复失败已被停用。",
+      disabled: "已暂停",
+      reenable: "重新启用",
+    },
   },
 };
 

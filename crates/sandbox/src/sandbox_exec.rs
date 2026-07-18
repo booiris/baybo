@@ -106,7 +106,7 @@ impl SandboxExecRunner {
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
-            StdinSource::Bytes(_) => Stdio::piped(),
+            StdinSource::Bytes(_) | StdinSource::Piped => Stdio::piped(),
         });
         cmd
     }
@@ -155,6 +155,11 @@ pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
 impl SandboxRunner for SandboxExecRunner {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
         validate_spec(&spec)?;
+        if matches!(spec.stdin, StdinSource::Piped) {
+            return Err(SandboxError::InvalidSpec(
+                "StdinSource::Piped requires spawn_detached".into(),
+            ));
+        }
         let workspace_symlink_mount = spec
             .cwd
             .as_deref()
@@ -233,6 +238,12 @@ impl crate::DetachedChild for SandboxExecDetachedChild {
             .stdout
             .take()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    fn take_stdin(&mut self) -> Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>> {
+        self.child
+            .stdin
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>)
     }
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child

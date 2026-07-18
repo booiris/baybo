@@ -626,6 +626,7 @@ pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
+        channels: Vec::new(),
     };
     (Arc::new(tool), manifest)
 }

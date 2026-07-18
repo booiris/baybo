@@ -38,7 +38,11 @@ type MirroredKind =
   | "approval_requested"
   | "approval_resolved"
   | "gap"
-  | "notice";
+  | "notice"
+  // Deck frames — no deck UI here; the native deck shell consumes them. Pinned
+  // anyway so a wire-side rename/retype of the deck contract fails this build.
+  | "deck_card_data"
+  | "deck_changed";
 
 // A renamed/removed wire variant first collapses `Extract` to `never` — which
 // extends anything — so existence is asserted separately (non-distributive).

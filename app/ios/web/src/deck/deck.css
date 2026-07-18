@@ -1,0 +1,174 @@
+/* Deck shell — monochrome soft line minimalism (the app's system). */
+
+:root {
+  --deck-ink: #1c1b19;
+  --deck-paper: #ffffff;
+  --deck-line: rgba(28, 27, 25, 0.14);
+  --deck-muted: rgba(28, 27, 25, 0.55);
+  --deck-gap: 12px;
+  --deck-row-h: 150px;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--deck-paper);
+  color: var(--deck-ink);
+  font-family: -apple-system, "SF Pro Text", sans-serif;
+  -webkit-text-size-adjust: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.deck-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: var(--deck-row-h);
+  grid-auto-flow: dense;
+  gap: var(--deck-gap);
+  padding: calc(env(safe-area-inset-top) + 8px) 16px
+    calc(env(safe-area-inset-bottom) + 24px);
+}
+
+.deck-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--deck-line);
+  border-radius: 16px;
+  background: var(--deck-paper);
+  overflow: hidden;
+}
+
+.deck-card[data-size="small"] {
+  grid-column: span 1;
+  grid-row: span 1;
+}
+.deck-card[data-size="wide"] {
+  grid-column: span 2;
+  grid-row: span 1;
+}
+.deck-card[data-size="large"] {
+  grid-column: span 2;
+  grid-row: span 2;
+}
+
+.deck-card.faulted {
+  border-color: rgba(180, 60, 40, 0.5);
+}
+
+.deck-card-header {
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--deck-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: none;
+}
+
+.deck-card-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.deck-card-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+
+.deck-card-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  color: var(--deck-muted);
+}
+
+.deck-face-btn {
+  border: 1px solid var(--deck-ink);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--deck-ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 16px;
+}
+
+.deck-empty {
+  padding: 40vh 32px 0;
+  text-align: center;
+  font-size: 14px;
+  color: var(--deck-muted);
+}
+
+/* Edit mode: wiggle + controls. */
+.deck-size-btn,
+.deck-remove-btn {
+  position: absolute;
+  top: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--deck-line);
+  background: var(--deck-paper);
+  color: var(--deck-ink);
+  font-size: 13px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+.deck-size-btn {
+  right: 38px;
+}
+.deck-remove-btn {
+  right: 6px;
+}
+
+.deck-grid.editing .deck-size-btn,
+.deck-grid.editing .deck-remove-btn {
+  display: flex;
+}
+
+@keyframes deck-wiggle {
+  0% { transform: rotate(-0.4deg); }
+  50% { transform: rotate(0.4deg); }
+  100% { transform: rotate(-0.4deg); }
+}
+
+.deck-grid.editing .deck-card {
+  animation: deck-wiggle 0.3s ease-in-out infinite;
+}
+
+/* SortableJS drag pair: the in-grid original becomes the dimmed slot
+   indicator (ghost) while the fallback clone rides the finger. */
+.deck-grid.editing .deck-card.deck-drag-ghost {
+  animation: none;
+  opacity: 0.25;
+  box-shadow: none;
+}
+
+.deck-card.deck-drag-fallback {
+  animation: none;
+  opacity: 0.95;
+  z-index: 10;
+  box-shadow: 0 12px 32px rgba(28, 27, 25, 0.28);
+}
+
+/* Cards must never receive pointer events while editing — the drag owns
+   the surface, and a wiggling iframe eating the gesture would stall it. */
+.deck-grid.editing .deck-card-frame {
+  pointer-events: none;
+}

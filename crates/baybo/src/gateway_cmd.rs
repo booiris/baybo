@@ -474,6 +474,19 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         tracing::info!("push: dispatcher started (subscribed to job lifecycle bus)");
     }
 
+    // Deck services: boot starts every enabled card (with the
+    // post-upgrade re-gate) and the shutdown edge stops the resident
+    // processes.
+    {
+        let deck = Arc::clone(&graph.deck_manager);
+        let deck_shutdown = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            deck.boot().await;
+            deck_shutdown.wait().await;
+            deck.shutdown().await;
+        }));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -496,6 +509,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         stores: graph.stores.clone(),
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
+        deck_manager: Arc::clone(&graph.deck_manager),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to

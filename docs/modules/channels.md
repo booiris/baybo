@@ -144,7 +144,9 @@ fans output to connections:
 Operations that only make sense on a `Subscribed` channel —
 `subscribe` / `unsubscribe` / `echo_inbound` /
 `broadcast_session_patch` / `broadcast_session_activity` /
-`broadcast_folders_changed` / `set_dispatch_observer` — live on
+`broadcast_folders_changed` / `broadcast_list_stale` /
+`broadcast_deck_card_data` / `broadcast_deck_changed` /
+`set_dispatch_observer` — live on
 [`SubscribedView<'_>`], a cheap borrow obtained from
 `Channel::as_subscribed()`. Multiplexed channels
 return `None` from that call, so a caller holding only a `&Channel`
@@ -177,10 +179,13 @@ Plus one Subscribed-exclusive method on the view:
 | `SubscribedView::echo_inbound(msg)`   | Echo a user message back to all tabs subscribed to its `session_id` so multi-tab views render through one path |
 
 `SubscribedView` additionally exposes `broadcast_session_patch` /
-`broadcast_session_activity` / `broadcast_folders_changed` for
-sidebar-level frames that target all attached connections regardless of
-subscription (sidebar freshness doesn't need per-session keying — every
-tab maintains its full list).
+`broadcast_session_activity` / `broadcast_folders_changed` /
+`broadcast_list_stale` for sidebar-level frames, plus
+`broadcast_deck_card_data` / `broadcast_deck_changed` for deck pushes
+([`deck.md`](./deck.md)); all of them target every attached connection
+regardless of subscription (sidebar freshness doesn't need per-session
+keying — every tab maintains its full list — and the deck tab has no
+session to subscribe to).
 
 All of these funnel into the same internal `dispatch_event` /
 `broadcast_frame` machinery: non-blocking, drops the frame for any

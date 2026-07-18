@@ -158,9 +158,11 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 
 - **Navigation**: the home shell (`AppStore.Route.home`) is `HomeTabView`, a
   NATIVE iOS 26 `TabView(selection: $homeTab)` (Liquid Glass tab bar) with four
-  sections (Agents · Projects · Chats · Settings, `AppStore.HomeTab`). Only `chats`
-  (`ChatListScreen`) and `settings` (`SettingsScreen` — language, version, log
-  out) have real screens; `agents`/`projects` are `PlaceholderScreen`. An OUTER
+  sections (Deck · Projects · Chats · Settings, `AppStore.HomeTab`). `deck`
+  (`DeckScreen` — the board of agent-authored live cards, see the Deck bullet
+  below and `docs/modules/deck.md`), `chats` (`ChatListScreen`) and `settings`
+  (`SettingsScreen` — language, version, log out) have real screens;
+  `projects` is `PlaceholderScreen`. An OUTER
   `NavigationStack(path: $chatPath)` in `RootView` WRAPS the whole TabView;
   opening a session pushes `ChatScreen` over the ENTIRE shell (tab bar
   included), so the bar reveals together with the pop transition. (Do NOT move
@@ -184,6 +186,25 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   fluid pop can't inherit a fast flick's velocity and overshoot the revealed
   list (the "list slides right then rubber-bands" glitch; stock Settings
   does the same, it just hides it better).
+- **Deck** (`docs/modules/deck.md` — the design doc is the source of truth):
+  the Deck tab renders the app's SECOND webview (`DeckHost`, kept warm like
+  `TranscriptHost`, torn down with the binding), loading `deck.html` — a
+  second Vite entry in the SAME `web/` dist the transcript uses, so it rides
+  the existing `App/Resources/transcript/` copy + scheme handler with no extra
+  build step. The shell (`web/src/deck/`) draws the 2-column size-class grid
+  and hosts each card in an `<iframe sandbox="allow-scripts" srcdoc>` (opaque
+  origin + injected CSP: no network) with a per-card `MessagePort` as the
+  card's identity. `DeckStore` (`App/Core/DeckStore.swift`) is the engine:
+  REST refetch over the active leg (`deckFetch`), a `deck.json` mirror for
+  instant offline paint, live pushes via the connection-global `DeckSink`
+  (`DeckEventsRelay` — the `SessionActivityHandler` idiom; `Frame::DeckCardData`
+  is accepted iff its seq beats the cached one, `Frame::DeckChanged` triggers a
+  refetch), optimistic layout writes with baseline rollback, and op calls
+  (`deckCall`) correlated back to the card that asked. Destructive card
+  actions confirm NATIVELY (the shell only reports intent). Bridge
+  (`App/Web/DeckBridge.swift` ⇄ `web/src/deck/bridge.ts`): native→web
+  `init/deckState/cardData/bundle/callResult/setEditMode/setLanguage`;
+  web→native `ready/refetch/requestBundle/call/layout/cardAction/editMode/log`.
 - **Chat list data**: `SessionIndex` (Application Support/baybo/sessions.json)
   is the device-local registry backing the list on BOTH legs. Both direct and
   relay merge `chat_list_sessions()` over it on appear/foreground/pull: direct

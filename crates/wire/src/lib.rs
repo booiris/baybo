@@ -851,6 +851,33 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         at: DateTime<Utc>,
     },
+    /// Server → client: a deck card's service emitted a fresh snapshot.
+    /// Broadcast to every connection on the owner channel regardless of
+    /// subscription (the [`Frame::SessionActivity`] pattern) — the deck
+    /// tab has no session to subscribe to, so a session-scoped frame
+    /// could never reach it. Clients accept the push iff `seq` is
+    /// greater than their cached seq for the card; on a
+    /// [`Frame::DeckChanged`]-triggered refetch they replace cached
+    /// snapshot + seq unconditionally. `payload` is the card's own JSON
+    /// text, opaque to the gateway beyond rate/size policing. Clients
+    /// without deck UI (web today, sidecars, TUI) ignore this frame.
+    DeckCardData {
+        card_id: String,
+        /// Persisted per-card monotonic counter (`deck_cards.last_seq`)
+        /// assigned by the gateway at emit-accept time — never derived
+        /// from the prunable snapshot table, so it cannot regress
+        /// across a gateway restart. `u32` for the same reason as
+        /// [`WireAttachment::size`]: avoids the TS-side `BigInt`
+        /// round-trip the default msgpack encoder rejects.
+        seq: u32,
+        payload: String,
+    },
+    /// Server → client: deck structure changed — install, update,
+    /// delete, restore, enable, disable, quarantine, layout. Carries no
+    /// payload; clients respond by refetching `GET /v1/deck` (the
+    /// refetch also replaces cached snapshots + seqs). Clients without
+    /// deck UI ignore this frame.
+    DeckChanged,
     /// Liveness probe (either direction). The receiver MUST reply with
     /// [`Frame::Pong`].
     ///
@@ -904,6 +931,8 @@ impl Frame {
             | Frame::BotStatus { .. }
             | Frame::SlashManifest { .. }
             | Frame::FoldersChanged { .. }
+            | Frame::DeckCardData { .. }
+            | Frame::DeckChanged
             | Frame::Ping
             | Frame::Pong => None,
         }

@@ -18,11 +18,13 @@
     "react-dom": "^19.0.0",
     "react-i18next": "^17.0.8",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "sortablejs": "^1.15.7"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/sortablejs": "^1.15.9",
     "@vitejs/plugin-react": "^4.3.0",
     "jsdom": "^29.1.1",
     "typescript": "^5.7.0",

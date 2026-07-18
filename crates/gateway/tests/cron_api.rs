@@ -537,6 +537,7 @@ fn build_admin_state(
         blob_store: tg.deps.stores.blob.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
+        deck_manager: Arc::clone(&tg.deps.deck_manager),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     }
 }

@@ -174,6 +174,11 @@ export type WireFrame =
   // is absent for unattributable loss; native additionally refetches the
   // session list for that case.)
   | { kind: "gap"; session_id?: string }
+  // Deck frames — no deck UI here; the native deck shell consumes them. They
+  // fall through the router's `default` like any unrendered kind; modeled only
+  // so wireSentinel.ts pins their shape against the generated contract.
+  | { kind: "deck_card_data"; card_id: string; seq: number; payload: string }
+  | { kind: "deck_changed" }
   // Synthesized NATIVE-side (not a wire frame): one backward history page,
   // rows verbatim `ChatTranscriptItem`s (unfiltered, keyed by row id).
   | {

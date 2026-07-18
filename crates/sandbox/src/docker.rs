@@ -243,6 +243,11 @@ impl SandboxRunner for DockerRunner {
     }
 
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        if matches!(spec.stdin, StdinSource::Piped) {
+            return Err(SandboxError::InvalidSpec(
+                "StdinSource::Piped is not supported by the docker backend".into(),
+            ));
+        }
         if !spec.allowed_hosts.is_empty() {
             // Docker has no in-tree per-host enforcement. The proper
             // kernel-level filter is scoped in
@@ -271,8 +276,11 @@ impl SandboxRunner for DockerRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // `Piped` is refused up front on this backend (docker would need
+        // `docker run -i` plus attach plumbing); the arm exists only for
+        // match exhaustiveness.
         cmd.stdin(match spec.stdin {
-            StdinSource::Null => Stdio::null(),
+            StdinSource::Null | StdinSource::Piped => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
             StdinSource::Bytes(_) => Stdio::piped(),
         });
@@ -336,6 +344,11 @@ impl SandboxRunner for DockerRunner {
         &self,
         spec: SandboxSpec,
     ) -> Result<Box<dyn crate::DetachedChild>, SandboxError> {
+        if matches!(spec.stdin, StdinSource::Piped) {
+            return Err(SandboxError::InvalidSpec(
+                "StdinSource::Piped is not supported by the docker backend".into(),
+            ));
+        }
         if !spec.allowed_hosts.is_empty() {
             tracing::warn!(
                 hosts = ?spec.allowed_hosts,
@@ -358,8 +371,11 @@ impl SandboxRunner for DockerRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // `Piped` is refused up front on this backend (docker would need
+        // `docker run -i` plus attach plumbing); the arm exists only for
+        // match exhaustiveness.
         cmd.stdin(match spec.stdin {
-            StdinSource::Null => Stdio::null(),
+            StdinSource::Null | StdinSource::Piped => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
             StdinSource::Bytes(_) => Stdio::piped(),
         });

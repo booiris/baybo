@@ -50,6 +50,7 @@ pub fn build(
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
+        channels: Vec::new(),
     };
     (tool, manifest)
 }
@@ -169,6 +170,12 @@ impl Tool for SkillTool {
         if matches!(skill.trust_level, TrustLevel::Untrusted) {
             return Err(ToolError::NotFound(format!(
                 "skill '{}' is untrusted and cannot be invoked",
+                p.skill
+            )));
+        }
+        if !skill.channels.is_empty() && !skill.channels.contains(&ctx.user.channel) {
+            return Err(ToolError::NotFound(format!(
+                "skill '{}' is not available on this channel",
                 p.skill
             )));
         }
@@ -484,6 +491,7 @@ pub fn build_install_tool(
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
+        channels: Vec::new(),
     };
     (tool, manifest)
 }
@@ -663,6 +671,7 @@ pub fn build_uninstall_tool(
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
+        channels: Vec::new(),
     };
     (tool, manifest)
 }
@@ -841,6 +850,7 @@ mod tests {
             description: "test".into(),
             command: Some(name.into()),
             agent_invocable: true,
+            channels: vec![],
             argument_hint: None,
             prompt_template: "# Body\n".into(),
             allowed_tools: vec![],
@@ -908,6 +918,35 @@ mod tests {
         assert_eq!(lf["templates"], json!(["templates/cfg.yaml"]));
         assert_eq!(lf["scripts"], json!(["scripts/s.sh"]));
         assert_eq!(lf["other"], json!(["misc.txt"]));
+    }
+
+    /// A `channels:`-restricted skill refuses the `Skill` tool from a
+    /// session on any other channel (the ctx fixture runs on `tui`),
+    /// and loads normally when the restriction admits the channel.
+    #[tokio::test]
+    async fn channel_restricted_skill_refuses_other_channels() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill(dir.path(), "demo");
+        skill.channels = vec![baybo_model::ChannelType::owner()];
+        registry.register(skill);
+        let tool = SkillTool {
+            registry: Arc::clone(&registry),
+            risk_check: Arc::new(AlwaysPass),
+        };
+
+        let err = tool
+            .execute(json!({"skill": "demo"}), &mk_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)), "got {err:?}");
+
+        let mut owner_ctx = mk_ctx();
+        owner_ctx.user.channel = ChannelType::owner();
+        tool.execute(json!({"skill": "demo"}), &owner_ctx)
+            .await
+            .expect("owner channel loads the skill");
     }
 
     /// The slash route must surface the same sub-file affordance the LLM

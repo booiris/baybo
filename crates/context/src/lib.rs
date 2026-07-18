@@ -160,6 +160,11 @@ pub struct ContextManager {
     pub(crate) budget: TokenBudget,
     calibration: Arc<TokenCalibration>,
     pub(crate) skill_registry: Arc<SkillRegistry>,
+    /// Channel of the session this manager serves. Gates which skills
+    /// are advertised to the model and which `/command`s expand here —
+    /// a skill whose `channels:` frontmatter excludes this channel is
+    /// invisible to the session.
+    pub(crate) channel: baybo_model::ChannelType,
     /// Owned conversation transcript — the sole source of truth.
     pub(crate) messages: Vec<ChatMessage>,
     /// Per-message token count, kept in lockstep with `messages`.
@@ -256,6 +261,9 @@ pub struct ContextManagerConfig {
     pub compression_threshold: f64,
     pub calibration: Arc<TokenCalibration>,
     pub skill_registry: Arc<SkillRegistry>,
+    /// Channel of the session (from the session row). Skills restricted
+    /// via `channels:` frontmatter are filtered against it.
+    pub channel: baybo_model::ChannelType,
     pub session_id: SessionId,
     pub sessions: Arc<SessionManager>,
     /// For a subagent session: `(profile registry, profile name)` — context
@@ -280,6 +288,7 @@ impl ContextManager {
             budget: TokenBudget::new(0, config.compression_threshold),
             calibration: config.calibration,
             skill_registry: config.skill_registry,
+            channel: config.channel,
             messages: Vec::new(),
             per_message_tokens: Vec::new(),
             called_skills: Vec::new(),
@@ -488,11 +497,13 @@ impl ContextManager {
         }
     }
 
-    /// Skills the agent may invoke: the registry's summaries filtered to
-    /// agent-invocable, non-untrusted entries (registry order). Empty when the
-    /// registry is empty. The seed reminder advertises exactly this set; the
-    /// agent loop reuses it for the per-turn slash-command candidate list, so
-    /// the advertised set and the slash-invocable set can't drift.
+    /// Skills the agent may invoke here: the registry's summaries filtered to
+    /// agent-invocable, non-untrusted entries whose `channels:` restriction
+    /// (if any) admits this session's channel. Empty when the registry is
+    /// empty. The seed reminder and the post-compaction trailer advertise
+    /// exactly this set; slash candidates are a *different* set
+    /// ([`Self::slash_skill_summaries`]) so a slash-only skill stays
+    /// user-invocable without being advertised.
     pub fn invocable_skill_summaries(&self) -> Vec<SkillSummary> {
         if self.skill_registry.is_empty() {
             return Vec::new();
@@ -501,7 +512,31 @@ impl ContextManager {
             .all_summaries_sorted()
             .into_iter()
             .filter(|s| {
-                s.agent_invocable && !matches!(s.trust_level, baybo_model::TrustLevel::Untrusted)
+                s.agent_invocable
+                    && !matches!(s.trust_level, baybo_model::TrustLevel::Untrusted)
+                    && s.allows_channel(&self.channel)
+            })
+            .collect()
+    }
+
+    /// Skills a user `/command` may expand here: anything carrying a
+    /// command, minus untrusted entries and skills whose `channels:`
+    /// restriction excludes this session's channel. Deliberately
+    /// independent of `agent_invocable`: a slash-only skill
+    /// (`disable-model-invocation: true` + `user-invocable: true`) is
+    /// hidden from the model's listing yet must keep expanding on the
+    /// user's explicit command (docs/modules/skills.md).
+    fn slash_skill_summaries(&self) -> Vec<SkillSummary> {
+        if self.skill_registry.is_empty() {
+            return Vec::new();
+        }
+        self.skill_registry
+            .all_summaries_sorted()
+            .into_iter()
+            .filter(|s| {
+                s.command.is_some()
+                    && !matches!(s.trust_level, baybo_model::TrustLevel::Untrusted)
+                    && s.allows_channel(&self.channel)
             })
             .collect()
     }
@@ -546,7 +581,7 @@ impl ContextManager {
             .filter(|m| m.source() == baybo_model::MessageSource::User)
             .map(|m| baybo_llm::multimodal::extract_text(&m.content))?;
         let (skill_name, _args) =
-            detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
+            detect_slash_invocation(&user_text, &self.slash_skill_summaries())?;
         let skill = self.skill_registry.get(&skill_name)?;
         let body = render_skill_for_slash(&skill, self.session_id.as_str());
         Some((
@@ -967,6 +1002,7 @@ impl ContextManager {
             self.skill_registry.as_ref(),
             self.tokenizer.as_ref(),
             &self.called_skills,
+            &self.invocable_skill_summaries(),
         );
 
         let before_tokens = self.budget.current();
@@ -2008,19 +2044,29 @@ pub(crate) fn insert_skill_trailer(
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
+    // The session's advertisable set (`invocable_skill_summaries`) — NOT
+    // the raw registry listing, which would re-broadcast skills the seed
+    // reminder deliberately hid (non-agent-invocable, untrusted, or
+    // restricted to another channel). The detail payload below stays
+    // keyed on `called_skills` unfiltered: a skill actually invoked in
+    // this session must keep its definition re-broadcast.
+    advertised: &[SkillSummary],
 ) {
     let mut insert_at = 0;
     while insert_at < messages.len() && messages[insert_at].role == Role::System {
         insert_at += 1;
     }
-    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
-    messages.insert(
-        insert_at,
-        ChatMessage::agent_context(vec![ContentBlock::Text(reminder)]),
-    );
+    if !advertised.is_empty() {
+        let reminder = render_skill_reminder(advertised);
+        messages.insert(
+            insert_at,
+            ChatMessage::agent_context(vec![ContentBlock::Text(reminder)]),
+        );
+        insert_at += 1;
+    }
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
         messages.insert(
-            insert_at + 1,
+            insert_at,
             ChatMessage::agent_context(vec![ContentBlock::Text(detail)]),
         );
     }
@@ -2037,11 +2083,15 @@ pub(crate) fn estimate_skill_trailer_tokens(
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
+    advertised: &[SkillSummary],
 ) -> usize {
-    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
-    let mut total = tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
-        reminder,
-    )]));
+    let mut total = 0;
+    if !advertised.is_empty() {
+        let reminder = render_skill_reminder(advertised);
+        total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
+            reminder,
+        )]));
+    }
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
         total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
             detail,
@@ -2153,6 +2203,7 @@ mod tests {
             compression_threshold: threshold,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
             session_id: test_session_id(),
             sessions,
             subagent_profile: None,
@@ -2366,13 +2417,13 @@ mod tests {
         ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
         // `err_chat` makes the LLM-summary stage fail, so the
-        // compressor falls through to truncate, then `ContextManager`
-        // appends the skill trailer (system + 2 tail + trailer).
+        // compressor falls through to truncate. The test registry is
+        // empty, so no trailer reminder is inserted.
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
-        // system + 2 most recent non-system + trailer reminder.
-        assert_eq!(ctx.messages().len(), 4);
+        // system + 2 most recent non-system.
+        assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
@@ -2414,8 +2465,9 @@ mod tests {
         let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
 
         assert!(matches!(outcome, CompressionOutcome::Compressed));
-        // system + reminder + keep_recent=2 most recent non-system.
-        assert_eq!(ctx.messages().len(), 4);
+        // system + keep_recent=2 most recent non-system (empty test
+        // registry → no trailer reminder).
+        assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
@@ -2446,6 +2498,7 @@ mod tests {
             compression_threshold: 0.75,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -2508,6 +2561,7 @@ mod tests {
             compression_threshold: 0.75,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
@@ -2847,6 +2901,7 @@ mod tests {
             description: format!("desc for {name}"),
             command: None,
             agent_invocable: true,
+            channels: vec![],
             argument_hint: None,
             prompt_template: body.into(),
             allowed_tools: vec![],
@@ -2962,6 +3017,7 @@ mod tests {
             compression_threshold: threshold,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: registry,
+            channel: baybo_model::ChannelType::owner(),
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
@@ -3044,6 +3100,116 @@ mod tests {
         .await;
         ctx.expand_slash_command().await;
         assert_eq!(ctx.message_count(), 2, "unknown command appends nothing");
+    }
+
+    /// A slash-only skill (`disable-model-invocation: true` +
+    /// `user-invocable: true`) must stay expandable on the user's
+    /// explicit `/command` while being hidden from the model's
+    /// advertised listing. The candidate sets are deliberately
+    /// different — this combination used to be dead because slash
+    /// detection reused `invocable_skill_summaries`.
+    #[tokio::test]
+    async fn slash_expands_a_skill_hidden_from_the_model() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("deck-card", "CARD_BODY");
+        skill.command = Some("card".into());
+        skill.agent_invocable = false;
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+
+        assert!(
+            ctx.invocable_skill_summaries().is_empty(),
+            "not advertised to the model"
+        );
+
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/card quota monitor".into(),
+        )]))
+        .await;
+        ctx.expand_slash_command().await;
+        let last = ctx.messages().last().unwrap();
+        match last.content.first() {
+            Some(ContentBlock::Text(t)) => assert!(t.contains("CARD_BODY")),
+            other => panic!("expected injected body, got {other:?}"),
+        }
+    }
+
+    /// A `channels:`-restricted skill is invisible on other channels:
+    /// not listed, and its `/command` falls through as plain text.
+    #[tokio::test]
+    async fn channel_restricted_skill_is_inert_off_channel() {
+        let mk_registry = || {
+            let registry = Arc::new(SkillRegistry::new());
+            let mut skill = mk_skill("deck-card", "CARD_BODY");
+            skill.command = Some("card".into());
+            skill.channels = vec![baybo_model::ChannelType::owner()];
+            registry.register(skill);
+            registry
+        };
+
+        let mut on_owner = make_ctx_with_registry(mk_registry(), 5, 100_000, 0.75);
+        assert_eq!(on_owner.invocable_skill_summaries().len(), 1);
+        on_owner
+            .append(&ChatMessage::user(vec![ContentBlock::Text("/card".into())]))
+            .await;
+        on_owner.expand_slash_command().await;
+        assert_eq!(on_owner.message_count(), 2, "owner session expands");
+
+        let mut on_telegram = make_ctx_with_registry(mk_registry(), 5, 100_000, 0.75);
+        on_telegram.channel = baybo_model::ChannelType::telegram();
+        assert!(
+            on_telegram.invocable_skill_summaries().is_empty(),
+            "hidden from a telegram session's listing"
+        );
+        on_telegram
+            .append(&ChatMessage::user(vec![ContentBlock::Text("/card".into())]))
+            .await;
+        on_telegram.expand_slash_command().await;
+        assert_eq!(
+            on_telegram.message_count(),
+            1,
+            "telegram session must not expand an owner-only skill"
+        );
+    }
+
+    /// The trailer's reminder block advertises the caller-supplied
+    /// (seed-filtered) set — not the raw registry — and is skipped
+    /// entirely when that set is empty; the called-skill detail block
+    /// stays keyed on `called_skills` regardless.
+    #[test]
+    fn skill_trailer_respects_the_advertised_set() {
+        let registry = registry_with(&[("visible", "V_BODY"), ("hidden", "H_BODY")]);
+        let advertised: Vec<SkillSummary> = registry
+            .all_summaries_sorted()
+            .into_iter()
+            .filter(|s| s.name == "visible")
+            .collect();
+
+        let mut messages = vec![make_msg(Role::System, "sys")];
+        insert_skill_trailer(
+            &mut messages,
+            &registry,
+            &SimpleTokenizer,
+            &["hidden".to_string()],
+            &advertised,
+        );
+        let texts: Vec<&str> = messages
+            .iter()
+            .map(|m| match m.content.first() {
+                Some(ContentBlock::Text(t)) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(texts[1].contains("- visible"));
+        assert!(
+            !texts[1].contains("- hidden"),
+            "reminder leaks hidden skill"
+        );
+        assert!(texts[2].contains("H_BODY"), "called skill keeps its detail");
+
+        let mut bare = vec![make_msg(Role::System, "sys")];
+        insert_skill_trailer(&mut bare, &registry, &SimpleTokenizer, &[], &[]);
+        assert_eq!(bare.len(), 1, "empty advertised set inserts no reminder");
     }
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the

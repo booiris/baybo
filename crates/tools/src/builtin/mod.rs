@@ -122,6 +122,7 @@ pub(crate) fn trusted<T: Tool + 'static>(
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities,
+        channels: Vec::new(),
     };
     (Arc::new(tool), manifest)
 }

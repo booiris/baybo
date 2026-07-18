@@ -166,6 +166,9 @@ pub struct ManagerGraph {
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
     pub secret_vault: Arc<SecretVault>,
+    /// Deck card manager (`/v1/deck/*` + the DeckCard* tools). Boot and
+    /// shutdown are the gateway entrypoint's responsibility.
+    pub deck_manager: Arc<baybo_deck::DeckManager>,
     /// Cloneable bundle of every sqlite-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -533,6 +536,26 @@ pub async fn build_managers(
         tool_registry.register(uninstall_tool, uninstall_manifest);
     }
 
+    // --- Deck manager (docs/modules/deck.md) — built here so its tools
+    // register while `tool_registry` still has a single Arc owner. Push
+    // hooks ride the owner channel; boot (service start + post-upgrade
+    // re-gates) and shutdown are driven by the gateway entrypoint. The
+    // `baybo://` internal read registry is an open item — `None` until
+    // its read surface is designed.
+    let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
+        store: stores.deck.clone(),
+        vault: Arc::clone(&secret_vault),
+        events: Arc::new(baybo_gateway::deck_events::GatewayDeckEvents::new(
+            Arc::clone(&channels_registry),
+        )),
+        deck_root: workspace_paths.deck_dir(),
+        scratch_root: workspace_paths.state_dir().join("deck-scratch"),
+        internal: None,
+    });
+    for (tool, manifest) in baybo_deck::tools::agent_tools(Arc::clone(&deck_manager)) {
+        tool_registry.register(tool, manifest);
+    }
+
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the
     // session's workspace handle); the gateway only does scan + sanitize.
@@ -716,6 +739,7 @@ pub async fn build_managers(
         workspace,
         channels_registry,
         secret_vault,
+        deck_manager,
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
@@ -853,6 +877,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         compression_threshold,
                         calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
+                        channel: session.channel.clone(),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
                         subagent_profile: session

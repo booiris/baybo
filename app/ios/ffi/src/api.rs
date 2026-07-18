@@ -228,6 +228,66 @@ pub enum CronJobStatus {
     Executed,
 }
 
+/// One deck card row, mirroring the gateway's `DeckCardDto` (`GET /v1/deck`
+/// and `GET /v1/deck/recycle`). Flat primitives + unix-millis timestamps, the
+/// [`ChatSessionSummary`] pattern.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeckCardInfo {
+    pub card_id: String,
+    pub title: String,
+    /// Ordered slot in the deck's 2-column flow layout.
+    pub position: i64,
+    /// Size class: `"small"` (1×1), `"wide"` (2×1), or `"large"` (2×2).
+    pub size: String,
+    pub enabled: bool,
+    /// Auto-disabled by the gateway supervisor (crash/timeout budget blown);
+    /// the card renders an error face with a Re-enable action.
+    pub quarantined: bool,
+    /// Unix millis; populated only on recycle-bin rows.
+    pub deleted_at_ms: Option<i64>,
+    pub spec_hash: String,
+    /// The card's persisted push counter — the seed for the client's seq
+    /// cursor (accept a [`DeckSink::on_card_data`] push iff its seq is
+    /// greater than the cached one).
+    pub last_seq: i64,
+    pub created_at_ms: i64,
+    /// Ops whose mandatory `x-baybo-retryable` declaration is `true`. The
+    /// caller passes the per-op verdict into [`deck_call`]'s `retryable` so
+    /// the relay leg knows whether a silent-death call may be replayed.
+    pub retryable_ops: Vec<String>,
+}
+
+/// Latest stored snapshot for one card — the deck's instant paint source.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeckSnapshotInfo {
+    pub card_id: String,
+    /// Gateway-assigned monotonic emit counter for the card.
+    pub seq: i64,
+    /// The card's own JSON text, opaque to this layer; empty when `error` is
+    /// present.
+    pub payload: String,
+    pub fetched_at_ms: i64,
+    pub error: Option<String>,
+}
+
+/// `GET /v1/deck`: live cards (ordered by position) plus the latest snapshot
+/// per card. A [`DeckSink::on_deck_changed`] nudge means refetch this whole
+/// view and replace cached snapshots + seqs unconditionally.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeckView {
+    pub cards: Vec<DeckCardInfo>,
+    pub snapshots: Vec<DeckSnapshotInfo>,
+}
+
+/// One entry of the full ordered layout write (`PUT /v1/deck/layout`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeckLayoutEntryInput {
+    pub card_id: String,
+    pub position: i64,
+    /// `"small"` | `"wide"` | `"large"` — the gateway rejects anything else.
+    pub size: String,
+}
+
 /// Result of the per-send durability point lookup
 /// (`GET /v1/chat/sessions/{id}/messages?platform_msg_id=…`), consumed by the
 /// native outbox: `found: false` is a provable absence (the key was never
@@ -363,6 +423,28 @@ pub trait SessionListSink: Send + Sync {
     /// missed row matters. See `docs/sync-protocol.md` ("refetch the session
     /// list") and `docs/cron-groups.md` (a cron fire is the row this loses).
     fn on_list_stale(&self);
+}
+
+/// Where the connection-global deck frames land — the [`SessionListSink`]
+/// pattern. `Frame::DeckCardData` / `Frame::DeckChanged` are session-less
+/// broadcasts (the deck tab has no session to subscribe), so the transport
+/// routes them here and NEVER to a per-session [`FrameSink`]. One sink per
+/// client, registered via [`crate::BayboClient::set_deck_sink`]; both legs
+/// share it. Calls arrive on the core's tokio workers, so the Swift impl must
+/// be thread-safe (hop to the main actor before touching UI).
+///
+/// The Swift implementor must NOT be named `DeckSinkImpl` — UniFFI generates a
+/// class of exactly that name for every `with_foreign` trait, and a same-named
+/// class collides (cf. `SessionActivityHandler` in `App/Core/SessionIndex.swift`).
+#[uniffi::export(with_foreign)]
+pub trait DeckSink: Send + Sync {
+    /// A card's service emitted a fresh snapshot. Accept iff `seq` beats the
+    /// cached seq for `card_id`; `payload` is the card's own JSON text.
+    fn on_card_data(&self, card_id: String, seq: u32, payload: String);
+    /// Deck structure changed (install, update, delete, restore, enable,
+    /// disable, quarantine, layout). No payload — refetch
+    /// [`crate::BayboClient::deck_fetch`].
+    fn on_deck_changed(&self);
 }
 
 /// Gateway-side cancellation of an in-flight pairing (the operator declined or

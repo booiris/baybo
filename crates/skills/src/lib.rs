@@ -39,11 +39,19 @@ pub struct SkillDefinition {
     pub version: String,
     pub description: String,
     /// Slash-command name (no leading `/`) that invokes this skill.
-    /// `None` when the SKILL.md sets `user-invocable: false`.
+    /// The skill name by default, overridden by the `command:`
+    /// frontmatter key. `None` when the SKILL.md sets
+    /// `user-invocable: false`.
     pub command: Option<String>,
     /// Whether the model may auto-select this skill from its description.
     /// `false` when the SKILL.md sets `disable-model-invocation: true`.
     pub agent_invocable: bool,
+    /// Channels whose sessions may see or invoke this skill (listing,
+    /// slash expansion, and the `Skill` tool all enforce it). Empty =
+    /// every channel, the norm. Set via the `channels:` frontmatter key
+    /// (e.g. `channels: [owner]` for the owner-surface-only deck-card).
+    #[serde(default)]
+    pub channels: Vec<baybo_model::ChannelType>,
     /// Autocomplete hint for the slash command (e.g., `[issue-number]`).
     pub argument_hint: Option<String>,
     pub prompt_template: String,

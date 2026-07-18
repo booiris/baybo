@@ -5,10 +5,14 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ChatSessionSummary, CronJobStatus, CronJobSummary};
+use crate::api::{
+    ChatSessionSummary, CronJobStatus, CronJobSummary, DeckCardInfo, DeckLayoutEntryInput,
+    DeckSnapshotInfo, DeckView,
+};
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_CRON: &str = "/v1/cron";
+const PATH_DECK: &str = "/v1/deck";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
 /// Content-type for every JSON-bodied request, shared by both legs.
@@ -46,6 +50,22 @@ pub(crate) trait GatewayJsonClient {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a;
+
+    /// POST `body` verbatim (content-type JSON) and return the raw response
+    /// body bytes UNPARSED — the deck's per-card op surface, whose response
+    /// shape belongs to the card, not this client. `retryable` is the op's
+    /// MANDATORY `x-baybo-retryable` declaration, compiled from the card's
+    /// spec at install and served on the deck view: the relay impl replays a
+    /// silent pooled leg only when it is true. An undeclared-false op runs
+    /// agent-written service code with unrestricted semantics, where the
+    /// client-keyed convergence argument in `relay::api::should_retry` does
+    /// not hold.
+    fn post_raw<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+        retryable: bool,
+    ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'a;
 }
 
 pub(crate) trait GatewayBlobClient {
@@ -153,6 +173,89 @@ enum WireCronStatus {
     Enabled,
     Disabled,
     Executed,
+}
+
+/// The gateway's `DeckCardDto` (`GET /v1/deck`, `GET /v1/deck/recycle`,
+/// `POST /v1/deck/cards/{id}/restore`). `deleted_at_ms` is skipped server-side
+/// on live rows, hence the default.
+#[derive(Deserialize)]
+struct WireDeckCard {
+    card_id: String,
+    title: String,
+    position: i64,
+    size: String,
+    enabled: bool,
+    quarantined: bool,
+    #[serde(default)]
+    deleted_at_ms: Option<i64>,
+    spec_hash: String,
+    last_seq: i64,
+    created_at_ms: i64,
+    #[serde(default)]
+    retryable_ops: Vec<String>,
+}
+
+impl WireDeckCard {
+    fn into_info(self) -> DeckCardInfo {
+        DeckCardInfo {
+            card_id: self.card_id,
+            title: self.title,
+            position: self.position,
+            size: self.size,
+            enabled: self.enabled,
+            quarantined: self.quarantined,
+            deleted_at_ms: self.deleted_at_ms,
+            spec_hash: self.spec_hash,
+            last_seq: self.last_seq,
+            created_at_ms: self.created_at_ms,
+            retryable_ops: self.retryable_ops,
+        }
+    }
+}
+
+/// The gateway's `DeckSnapshotDto`. `error` is skipped server-side on a clean
+/// snapshot, hence the default.
+#[derive(Deserialize)]
+struct WireDeckSnapshot {
+    card_id: String,
+    seq: i64,
+    payload: String,
+    fetched_at_ms: i64,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl WireDeckSnapshot {
+    fn into_info(self) -> DeckSnapshotInfo {
+        DeckSnapshotInfo {
+            card_id: self.card_id,
+            seq: self.seq,
+            payload: self.payload,
+            fetched_at_ms: self.fetched_at_ms,
+            error: self.error,
+        }
+    }
+}
+
+/// The gateway's `DeckResponse` (`GET /v1/deck`).
+#[derive(Deserialize)]
+struct WireDeckResponse {
+    cards: Vec<WireDeckCard>,
+    snapshots: Vec<WireDeckSnapshot>,
+}
+
+/// The gateway's `DeckBundleDto` (`GET /v1/deck/cards/{id}/bundle`).
+#[derive(Deserialize)]
+struct WireDeckBundle {
+    card_html: String,
+}
+
+/// One `PUT /v1/deck/layout` entry — the gateway's `DeckLayoutEntryDto`.
+#[derive(Serialize)]
+struct WireDeckLayoutEntry<'a> {
+    card_id: &'a str,
+    position: i64,
+    size: &'a str,
 }
 
 #[derive(Serialize)]
@@ -331,6 +434,126 @@ pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
             })
         })
         .collect())
+}
+
+/// The deck view: live cards ordered by position + latest snapshot per card
+/// (`GET /v1/deck`). The instant-paint pull behind the deck tab's open and
+/// every `DeckChanged` refetch.
+pub(crate) async fn fetch_deck<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<DeckView, String> {
+    let response: WireDeckResponse = client.get_json(PATH_DECK).await?;
+    Ok(DeckView {
+        cards: response
+            .cards
+            .into_iter()
+            .map(WireDeckCard::into_info)
+            .collect(),
+        snapshots: response
+            .snapshots
+            .into_iter()
+            .map(WireDeckSnapshot::into_info)
+            .collect(),
+    })
+}
+
+/// The deck's recycle bin — soft-deleted cards, most recent first
+/// (`GET /v1/deck/recycle`).
+pub(crate) async fn fetch_deck_recycle<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<Vec<DeckCardInfo>, String> {
+    let cards: Vec<WireDeckCard> = client.get_json(&format!("{PATH_DECK}/recycle")).await?;
+    Ok(cards.into_iter().map(WireDeckCard::into_info).collect())
+}
+
+/// A card's frontend (`GET /v1/deck/cards/{id}/bundle` → `card_html`). The
+/// deck shell holds no gateway URL or token in either mode, so the HTML
+/// reaches it over this call like all other data.
+pub(crate) async fn fetch_deck_bundle<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+) -> Result<String, String> {
+    validate_path_segment(&card_id, "card_id")?;
+    let bundle: WireDeckBundle = client
+        .get_json(&format!("{PATH_DECK}/cards/{card_id}/bundle"))
+        .await?;
+    Ok(bundle.card_html)
+}
+
+/// A user-initiated card op (`POST /v1/deck/services/{id}/{op}`): `params_json`
+/// goes up verbatim as the JSON body, and the op's JSON result comes back
+/// verbatim — the response shape is the card's own contract, never parsed
+/// here. Rides [`GatewayJsonClient::post_raw`], the one no-replay route.
+pub(crate) async fn call_deck_op<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+    op: String,
+    params_json: String,
+    retryable: bool,
+) -> Result<String, String> {
+    validate_path_segment(&card_id, "card_id")?;
+    validate_path_segment(&op, "op")?;
+    let path = format!("{PATH_DECK}/services/{card_id}/{op}");
+    let body = client
+        .post_raw(&path, params_json.into_bytes(), retryable)
+        .await?;
+    String::from_utf8(body).map_err(|e| format!("decode op response: {e}"))
+}
+
+/// Full ordered layout write (`PUT /v1/deck/layout`) — an absolute snapshot of
+/// every card's position + size, so a replay converges.
+pub(crate) async fn set_deck_layout<C: GatewayJsonClient + Sync>(
+    client: &C,
+    entries: Vec<DeckLayoutEntryInput>,
+) -> Result<(), String> {
+    let wire: Vec<WireDeckLayoutEntry<'_>> = entries
+        .iter()
+        .map(|e| WireDeckLayoutEntry {
+            card_id: &e.card_id,
+            position: e.position,
+            size: &e.size,
+        })
+        .collect();
+    let body = serde_json::to_vec(&wire).map_err(|e| format!("encode deck layout: {e}"))?;
+    client.put_empty(&format!("{PATH_DECK}/layout"), body).await
+}
+
+/// Run-state toggle (`POST /v1/deck/cards/{id}/enable|disable`). Enabling
+/// re-runs the dry-run gate; a failed gate leaves the card quarantined and the
+/// error rides back here.
+pub(crate) async fn set_deck_enabled<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    validate_path_segment(&card_id, "card_id")?;
+    let action = if enabled { "enable" } else { "disable" };
+    let path = format!("{PATH_DECK}/cards/{card_id}/{action}");
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// Soft-delete a card into the recycle bin (`DELETE /v1/deck/cards/{id}`) —
+/// the service stops, the bundle files stay, restore undoes it.
+pub(crate) async fn delete_deck_card<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&card_id, "card_id")?;
+    let path = format!("{PATH_DECK}/cards/{card_id}");
+    client.delete_empty(&path).await
+}
+
+/// Restore a card from the recycle bin (`POST /v1/deck/cards/{id}/restore`).
+/// The gateway re-runs the dry-run gate first; a failed gate leaves the card
+/// in the bin with the error returned here. Success returns the live row.
+pub(crate) async fn restore_deck_card<C: GatewayJsonClient + Sync>(
+    client: &C,
+    card_id: String,
+) -> Result<DeckCardInfo, String> {
+    validate_path_segment(&card_id, "card_id")?;
+    let path = format!("{PATH_DECK}/cards/{card_id}/restore");
+    let card: WireDeckCard = client.post_json(&path, Vec::new()).await?;
+    Ok(card.into_info())
 }
 
 /// Pause or resume a scheduled job (`POST /v1/cron/{id}/pause|resume`).
@@ -722,6 +945,18 @@ mod tests {
             async move {
                 self.record("DELETE", path, b"");
                 Ok(())
+            }
+        }
+
+        fn post_raw<'a>(
+            &'a self,
+            path: &'a str,
+            body: Vec<u8>,
+            _retryable: bool,
+        ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'a {
+            async move {
+                self.record("POST", path, &body);
+                Ok(self.canned.clone().into_bytes())
             }
         }
     }
@@ -1234,6 +1469,221 @@ mod tests {
     async fn hide_many_with_no_ids_is_a_no_op() {
         let client = RecordingClient::empty();
         hide_many(&client, Vec::new()).await.expect("no-op");
+        assert!(client.calls.lock().is_empty());
+    }
+
+    /// The gateway's `DeckResponse` shape, verbatim — including the fields the
+    /// server SKIPS on live/clean rows (`deleted_at_ms`, `error`), which must
+    /// come back as `None` rather than failing the decode.
+    const DECK_RESPONSE: &str = r#"{
+        "cards":[
+            {"card_id":"c1","title":"Claude quota","position":0,"size":"wide","enabled":true,"quarantined":false,"spec_hash":"h1","last_seq":41,"created_at_ms":1752000000000},
+            {"card_id":"c2","title":"Machine status","position":1,"size":"small","enabled":false,"quarantined":true,"spec_hash":"h2","last_seq":7,"created_at_ms":1752100000000}
+        ],
+        "snapshots":[
+            {"card_id":"c1","seq":41,"payload":"{\"used\":0.4}","fetched_at_ms":1752200000000},
+            {"card_id":"c2","seq":7,"payload":"","fetched_at_ms":1752200100000,"error":"call timed out"}
+        ]
+    }"#;
+
+    #[tokio::test]
+    async fn fetch_deck_parses_the_gateway_deck_response() {
+        let client = RecordingClient::new(DECK_RESPONSE);
+        let view = fetch_deck(&client).await.expect("deck");
+
+        assert_eq!(client.only_call().path, PATH_DECK);
+        assert_eq!(view.cards.len(), 2);
+        let card = &view.cards[0];
+        assert_eq!(card.card_id, "c1");
+        assert_eq!(card.title, "Claude quota");
+        assert_eq!(card.position, 0);
+        assert_eq!(card.size, "wide");
+        assert!(card.enabled);
+        assert!(!card.quarantined);
+        assert_eq!(card.deleted_at_ms, None);
+        assert_eq!(card.spec_hash, "h1");
+        assert_eq!(card.last_seq, 41);
+        assert_eq!(card.created_at_ms, 1_752_000_000_000);
+        assert!(view.cards[1].quarantined);
+        assert!(!view.cards[1].enabled);
+
+        assert_eq!(view.snapshots.len(), 2);
+        let clean = &view.snapshots[0];
+        assert_eq!(clean.card_id, "c1");
+        assert_eq!(clean.seq, 41);
+        assert_eq!(clean.payload, r#"{"used":0.4}"#);
+        assert_eq!(clean.fetched_at_ms, 1_752_200_000_000);
+        assert_eq!(clean.error, None);
+        let failed = &view.snapshots[1];
+        assert_eq!(failed.payload, "");
+        assert_eq!(failed.error.as_deref(), Some("call timed out"));
+    }
+
+    /// A recycle row is the same DTO with `deleted_at_ms` populated.
+    #[tokio::test]
+    async fn fetch_deck_recycle_parses_deleted_rows_off_the_recycle_path() {
+        let client = RecordingClient::new(
+            r#"[{"card_id":"c9","title":"Old card","position":3,"size":"large","enabled":false,"quarantined":false,"deleted_at_ms":1752300000000,"spec_hash":"h9","last_seq":2,"created_at_ms":1751000000000}]"#,
+        );
+        let cards = fetch_deck_recycle(&client).await.expect("recycle");
+
+        assert_eq!(client.only_call().path, "/v1/deck/recycle");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].card_id, "c9");
+        assert_eq!(cards[0].deleted_at_ms, Some(1_752_300_000_000));
+    }
+
+    #[tokio::test]
+    async fn fetch_deck_bundle_returns_the_card_html() {
+        let client = RecordingClient::new(r#"{"card_html":"<main>quota</main>"}"#);
+        let html = fetch_deck_bundle(&client, "c1".to_string())
+            .await
+            .expect("bundle");
+
+        assert_eq!(html, "<main>quota</main>");
+        assert_eq!(client.only_call().path, "/v1/deck/cards/c1/bundle");
+    }
+
+    /// The op call is a pass-through in BOTH directions: the params text goes
+    /// up as the body byte-for-byte, and the response comes back byte-for-byte
+    /// — never parsed and re-serialized, which would reorder the card's keys.
+    #[tokio::test]
+    async fn call_deck_op_passes_params_and_response_through_verbatim() {
+        let canned = r#"{"zulu":1,"alpha":2}"#;
+        let client = RecordingClient::new(canned);
+        let result = call_deck_op(
+            &client,
+            "c1".to_string(),
+            "quota".to_string(),
+            r#"{"provider":"anthropic"}"#.to_string(),
+            true,
+        )
+        .await
+        .expect("op");
+
+        assert_eq!(result, canned);
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/deck/services/c1/quota".to_string(),
+                body: r#"{"provider":"anthropic"}"#.to_string(),
+            }
+        );
+    }
+
+    /// The card id AND the op are both path segments the card's author never
+    /// controls but the caller's JS might — same traversal guard as every
+    /// other path-borne id.
+    #[tokio::test]
+    async fn call_deck_op_rejects_a_path_escaping_card_id_or_op() {
+        for (card_id, op) in [("../cards/c1", "quota"), ("c1", "quota?x=1"), ("", "op")] {
+            let client = RecordingClient::empty();
+            assert!(
+                call_deck_op(
+                    &client,
+                    card_id.to_string(),
+                    op.to_string(),
+                    "{}".to_string(),
+                    false
+                )
+                .await
+                .is_err(),
+                "{card_id}/{op} must be rejected"
+            );
+            assert!(client.calls.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn set_deck_layout_puts_the_full_ordered_layout() {
+        let client = RecordingClient::empty();
+        set_deck_layout(
+            &client,
+            vec![
+                DeckLayoutEntryInput {
+                    card_id: "c2".to_string(),
+                    position: 0,
+                    size: "large".to_string(),
+                },
+                DeckLayoutEntryInput {
+                    card_id: "c1".to_string(),
+                    position: 1,
+                    size: "small".to_string(),
+                },
+            ],
+        )
+        .await
+        .expect("layout");
+
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "PUT",
+                path: "/v1/deck/layout".to_string(),
+                body: r#"[{"card_id":"c2","position":0,"size":"large"},{"card_id":"c1","position":1,"size":"small"}]"#.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_deck_enabled_posts_its_own_verb_per_direction() {
+        let client = RecordingClient::empty();
+        set_deck_enabled(&client, "c1".to_string(), true)
+            .await
+            .expect("enable");
+        assert_eq!(client.only_call().path, "/v1/deck/cards/c1/enable");
+
+        let client = RecordingClient::empty();
+        set_deck_enabled(&client, "c1".to_string(), false)
+            .await
+            .expect("disable");
+        assert_eq!(client.only_call().path, "/v1/deck/cards/c1/disable");
+    }
+
+    #[tokio::test]
+    async fn delete_deck_card_deletes_the_card_path() {
+        let client = RecordingClient::empty();
+        delete_deck_card(&client, "c1".to_string())
+            .await
+            .expect("delete");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "DELETE",
+                path: "/v1/deck/cards/c1".to_string(),
+                body: String::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_deck_card_posts_restore_and_parses_the_returned_row() {
+        let client = RecordingClient::new(
+            r#"{"card_id":"c9","title":"Old card","position":3,"size":"wide","enabled":true,"quarantined":false,"spec_hash":"h9","last_seq":2,"created_at_ms":1751000000000}"#,
+        );
+        let card = restore_deck_card(&client, "c9".to_string())
+            .await
+            .expect("restore");
+
+        assert_eq!(client.only_call().path, "/v1/deck/cards/c9/restore");
+        assert_eq!(card.card_id, "c9");
+        assert!(card.enabled);
+        assert_eq!(card.deleted_at_ms, None, "a restored row has left the bin");
+    }
+
+    /// Every deck mutation keyed by card id gets the same traversal guard.
+    #[tokio::test]
+    async fn deck_mutations_reject_a_path_traversing_card_id() {
+        let client = RecordingClient::empty();
+        assert!(
+            set_deck_enabled(&client, "../x".to_string(), true)
+                .await
+                .is_err()
+        );
+        assert!(delete_deck_card(&client, "a/b".to_string()).await.is_err());
+        assert!(restore_deck_card(&client, "a#b".to_string()).await.is_err());
+        assert!(fetch_deck_bundle(&client, "a?b".to_string()).await.is_err());
         assert!(client.calls.lock().is_empty());
     }
 

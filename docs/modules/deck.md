@@ -1,0 +1,215 @@
+# deck — agent-authored live cards
+
+**Status: implemented (2026-07-18), uncommitted on `feat/ios-swiftui`.** This document was written as the design (2026-07-17) and the implementation followed it; where a decision reversed during design, the rejected alternative is kept with the reason — the same convention as [`cron-groups.md`](../cron-groups.md). Verified: root workspace clippy zero-warnings + nextest green (modulo the documented environmental set), `baybo-deck` end-to-end runtime tests against real bun (install gate → resident service → validated ops → emit policing → lifecycle), 11 `/v1/deck` routes in the regenerated OpenAPI snapshot, ffi workspace 152 tests, ios web vitest 204 + sentinel pins, Swift `BayboTests` 168 on the simulator.
+
+**Implementation deviations** (each deliberate, none load-bearing on the security model):
+
+- **The deck shell ships in the transcript dist**, as a second Vite entry (`deck.html`) served at `baybo-transcript://localhost/deck.html` — not a separate `App/Resources/deck` copy step. One dist, two entries; `build-app.sh` and `project.yml` are unchanged, and no CI path-filter change is needed (the shell lives under the already-filtered `app/ios/web`; `crates/deck` is not an ffi dependency).
+- **Provenance events are structured tracing** (target `deck::provenance`: install / update with hash before→after / delete / restore / purge / quarantine / sdk-regate), not `TraceStore` spans — deck lifecycle has no session to hang a trace tree on; store-backed spans are deferred with that design question.
+- **`baybo://` internal reads**: the `InternalReads` trait exists in `baybo-deck` and the fetch path dispatches the scheme, but the gateway wires `None` — the curated read registry is still the open item it was at design time.
+- **The install-time rendered preview screenshot** (browser-sidecar best-effort, authoring step 4) is not implemented; install is the plain dry-run gate.
+- **iOS surfaces**: the FFI exposes fetch/recycle/bundle/call/layout/enable/disable/delete/restore but not purge or the per-card `openapi.json` (REST-only, desktop affordances); the iOS recycle-bin screen is deferred (the FFI method for it exists). The native delete confirm is a system alert rather than the hand-rolled `ConfirmDialog`.
+- **Relay-leg op replay is governed per op by the card's own contract**: every op's mandatory `x-baybo-retryable` declaration (compiled at install, served as `retryable_ops` on the deck view) picks the phone's `ReplayPolicy` — a declared-safe op may replay a silent pooled leg, anything else fails up to the card (arbitrary agent-written service code is not safely at-least-once). The absolute-state deck writes stay on the convergent retry path unconditionally.
+
+## Overview
+
+Deck is a dashboard tab of **live cards, each authored end-to-end by the agent on user request**. The user says "make me a card that watches my Claude quota" (or "a machine-status board") in chat; the agent writes a small self-contained bundle — a backend (`service.js`) that runs supervised on the gateway host and a frontend (`card.html`) that renders in a sandboxed iframe on the phone — and installs it with one tool call. Cards are not limited to any genre: anything the agent can express with the universal service context (external HTTP, sandboxed commands, gateway-internal reads) is a valid card.
+
+Deck replaces the **Pulse** tab, which is nothing but a renamed placeholder: commit `195c9c30` relabelled the `HomeTab.agents` slot to "Pulse" (en and zh-Hans) and its icon to `waveform.path.ecg`, still rendering `PlaceholderScreen`. There is no data source, storage, FFI surface, or test to migrate. The similarly named `SessionPulse` (`crates/gateway/src/channel/session_pulse.rs`) is the unrelated, load-bearing unread-badge broadcaster and is untouched.
+
+Naming: **Deck** (en; the zh-Hans tab label is the owner-chosen kanban-board term, recorded in `Localizable.xcstrings`), icon `rectangle.stack`. The name is load-bearing across every layer: `crates/deck` (`baybo-deck`), `/v1/deck/*`, `Frame::DeckCardData`, `DeckSink`, `DeckScreen`/`DeckStore` (Swift), the `deck` global (card JS).
+
+## The card bundle
+
+A card is a directory of plain files at `workspace/deck/<uuid>/`:
+
+```
+workspace/deck/<uuid>/
+  manifest.json    title + size class (install-time defaults), refresh declaration, sdk stamp
+  openapi.json     the card's op contract (see "admission contract")
+  service.js       agent-written backend; runs sandboxed on the gateway
+  card.html        agent-written frontend; runs in a sandboxed iframe on the phone
+```
+
+Plain files were chosen over blob-store versioning and over inline sqlite columns for one reason: **the agent iterates on cards with its ordinary `Read`/`Edit`/`Write` tools**, and the operator can read, hand-edit, diff, and git the bundle. Install follows `SkillInstall`'s staging discipline — validate → stage under the destination root → atomic rename (`SkillInstall` stages inside the skills dir deliberately, so the rename stays same-filesystem-atomic) — then adds the deck-specific tail `SkillInstall` doesn't have: insert the DB row, start the service.
+
+Manifest semantics, to kill a dual-source-of-truth trap: the manifest's `title` and size class are **install-time defaults only** — after install the `deck_cards` row is authoritative, user layout edits rewrite the row, and `DeckCardUpdate` preserves the row's values instead of clobbering them from a stale manifest. The refresh declaration is `{op, min_emit_interval_secs}`: the op the dry-run gate invokes, and the floor the emit clamp enforces (an event-driven card declares its floor honestly without promising a cadence). The sdk stamp records which preamble version installed the card — the boot re-gate's trigger: a stamp differing from the current preamble sends the card back through the dry-run gate, and a pass restamps it.
+
+`service.js` and `card.html` are the two halves of one card and never talk to each other directly. The backend produces JSON (it knows *how to ask Anthropic for quota*, or *how to read the host's load average*); the frontend turns JSON into pixels (it knows *how to draw a quota ring*). The only paths between them are validated ops and pushed snapshots, both crossing the gateway.
+
+## The service runtime
+
+### Process model
+
+Every enabled card's service is an **always-resident supervised bun process**, started at gateway boot and restarted with the `SidecarSupervisor` backoff curve (500ms–30s). Resident-forever was chosen over lazy-start/idle-reap and over spawn-per-request: the design's data plane is push (services tick on their own schedule and emit), so a process with no live timer has nothing to do, and the card count cap bounds the fleet.
+
+The process runs inside `crates/sandbox` (bwrap / sandbox-exec / docker fallback) with:
+
+- **`NetworkPolicy::None`** — no sockets at all. All I/O is stdio RPC to the Rust parent.
+- Read-only bundle mount + a scratch tmp dir; memory and pids ceilings.
+- **Per-call timeout (10s): the call fails, the process survives.**
+- Stdout/snapshot size caps (256 KB): an oversize op result fails the call; an oversize emit is rejected and logged (only quarantine records an error face).
+- A **card count cap** (24) refused at install.
+
+### Quarantine
+
+Restart backoff alone lets a crash-looping card burn CPU forever at the 30s floor, silently. So the supervisor keeps per-card failure counters: **5 crashes or 10 call timeouts inside a 10-minute sliding window auto-disable the card** — service stopped, `quarantined_at` stamped, the card renders an error face on the phone with a Re-enable action. A bad card degrades itself, never the gateway. (A per-card egress budget was considered and declined; timeout + quarantine is the accepted containment.)
+
+### The SDK: runtime-injected, both sides
+
+Agent-generated plumbing is the most likely failure mode, so **card code contains none**. The gateway never runs `service.js` directly; it spawns a **preamble** bundled in the gateway binary which owns the stdio JSON-RPC framing (`init` / `call{id,op,params}` / `result` / `emit` / capability RPCs), builds `ctx`, imports `service.js`, and dispatches into its exports. A service is pure logic:
+
+```js
+export const ops = {
+  quota: async ({ provider }, ctx) =>
+    parse(await ctx.fetch(URLS[provider], { headers: { "x-api-key": "[{REDACTED_SECRET_…}]" } })),
+}
+export function start(ctx) {
+  setInterval(async () => ctx.emit(await ops.quota({ provider: "anthropic" }, ctx)), 300_000)
+}
+```
+
+Card-side, the deck shell inlines its own `sdkCard.js` into each iframe's `srcdoc` ahead of `card.html`; card code sees only the `deck` global (`deck.onData(cb)`, `deck.call(op, params)`, `deck.size`) and never the MessagePort handshake.
+
+The two SDK halves ship in different artifacts on different release trains (gateway binary vs iOS app bundle) — safe, because neither half speaks to the other: the only cross-artifact contract is the card's own `openapi.json` ops and its snapshot JSON. The accepted trade of injected-latest (vs vendoring a pinned SDK copy into each bundle): `spec_hash` covers the agent-written half only, and a gateway upgrade swaps the preamble under every installed card. Two disciplines blunt it: the `ctx`/`deck` API is **additive-only**, and after a gateway upgrade the supervisor **re-runs each card's dry-run** before enabling it, quarantining incompatibilities visibly instead of letting them fail on a timer at 3 a.m. If pin-exactness is ever wanted, the escape hatch is mechanical, not architectural: vendor the current preamble into the bundle at install and point the spawn at it.
+
+### The universal `ctx` — no capability configuration
+
+This section reversed twice during design; the history matters. The first design gated every capability behind an operator allowlist in `baybo.json` (`deck.allowed_hosts`, `deck.allowed_secrets`, …); the second reduced that to declare-equals-granted from the manifest. The final decision goes further: **no capability declaration exists at all.** Every service receives the same `ctx`:
+
+- **`ctx.fetch(url, opts)`** — external HTTP, executed by the Rust parent. The parent applies the SSRF floor — the shared primitive is `baybo_security::is_blocked_ip` (loopback / RFC1918 / link-local / CGNAT / ULA and friends); the URL-validation + safe-resolution pair wrapping it is reimplemented over `is_blocked_ip` in deck's `host.rs` — vet the URL, resolve the host, drop blocked addresses, pin the connection to the vetted ones (`web_fetch.rs`'s own pair stays private to that tool) — then reveals `[{REDACTED_SECRET_…}]` placeholders (note the asymmetric `[{ }]` delimiters: `{{ }}` was explicitly rejected in `placeholder.rs` because every mainstream template engine parses it) from the `SecretVault` into headers at egress, performs TLS, and returns the body. The child never holds a raw secret and cannot open a socket even if it tries. Any vault placeholder reveals on demand.
+- **`ctx.exec(cmd)`** — a command through the same `crates/sandbox` machinery the Bash tool uses, but under deck's own spec: `NetworkPolicy::None`, 10s cap, stdout size-capped. (The Bash tool itself runs `NetworkPolicy::All` — no-network is a deck choice, not an inherited property.) This is what makes "any card the user can describe" true: `docker ps`, `df`, `git log`, `smartctl`, `nvidia-smi` — anything on the host.
+- **`ctx.emit(json)`** — a snapshot push (see data plane).
+- Gateway-internal reads (token spend, cron health, session stats) ride a **`baybo://` pseudo-scheme on `ctx.fetch`**, resolved in-process against a curated read-only registry — necessary because the SSRF floor rightly blocks loopback HTTP, and deliberately narrow: no general `/v1` proxy, so LLM keys and config writes stay dark. The registry's exact read surface is an open item.
+
+**Trust model, stated honestly.** The sandbox, timeouts, and quarantine are *reliability* machinery, not a security boundary against the card author — the author is the operator's own agent, the same one trusted to run `Bash` on this host. What makes deck different from chat-driven `Bash` is that services run **unattended, forever**, with no per-call approval gate and no human watching call #4,000; and the author is *steerable* (the agent reads untrusted content, and a prompt-injected card revision is a standing channel rather than a one-shot command). The final design accepts that residual risk explicitly — a prompt-injected card edit can self-grant secret egress with no gate. What still stands: secrets exist only parent-side and reach requests only by placeholder reveal; **every secret-bearing egress is audit-logged with card id + host**; and on the tool path (`DeckCardCreate`/`DeckCardUpdate`) the dry-run gate means new code executes once under the agent's eyes — with its output in the transcript — before it runs unattended. The non-tool dry-runs (post-upgrade boot re-runs, REST-triggered restore/enable) run the same gate with no transcript; their failures surface as trace events plus the quarantine face, nowhere else. (The design's advisory install pre-screen via the skills risk assessor did not land — nothing scans a bundle for exfil shapes.)
+
+### Tick ownership and emit policing
+
+The **service owns its own clock** (a `setInterval` in `start(ctx)`, per the manifest's declared cadence) — chosen over a gateway-driven ticker for cadence flexibility (irregular schedules, event-driven updates, provider-429 backoff). The forced consequence: the gateway cannot withhold a tick, so it polices **ingestion** instead. `emit` is clamped to a per-card minimum accepted interval — the manifest's declared `min_emit_interval_secs`, floored by a gateway-wide named const (10s) — with excess emits coalesced to latest; `seq` is assigned by the gateway; snapshot size is capped; and emit floods count toward quarantine. Pause and quarantine are implemented by **stopping the process** — untrusted code is never trusted to rate-limit itself.
+
+## The admission contract: per-card OpenAPI
+
+Each service publishes its op surface as its own `openapi.json`, and the spec is **load-bearing, not documentation**: at install the gateway parses it into compiled per-op validators, and every call that **crosses the gateway** — user-initiated ops and every dry-run invocation (install, update, re-admission) — is validated *before* anything reaches agent-written code (op exists, params match, unknown fields rejected, body size capped). The document wrapper stays a hand-checked narrow subset (op-name grammar, `get`/`post` only, mandatory `x-baybo-retryable`) but the parameter check itself is **standard JSON Schema compiled by the `jsonschema` crate** — each declared parameter's `schema` is taken verbatim into a per-op `{type: object, properties, required, additionalProperties: false}` validator, so scalars, enums, and typed `array`/`object` params with nested constraints all validate. Two hard edges: `$ref`/`$dynamicRef` are rejected at admission, and the crate is built `default-features = false` — its default remote resolvers (HTTP + file) are compiled out, so an agent-written schema can never make spec compilation touch the network or filesystem. Every op also carries a **mandatory `x-baybo-retryable` boolean** — the author's declaration that replaying the op is harmless (pure read/recompute) or not (side effects); install refuses a spec that omits it, so replay-safety is always a decision, never a default. The `true` set rides the deck view (`retryable_ops` per card) to clients, whose transports use it as the per-op replay verdict. Off-schema requests die at the gateway. Be precise about the boundary: the self-timer's own op invocations are plain in-process function calls inside the service and never cross the gateway, and runtime `emit` payloads are policed for rate and size only — the snapshot is vetted (non-null JSON, size-capped) at gate time, not per tick. The spec is also served (`GET /v1/deck/services/{uuid}/openapi.json`) so the agent writing `card.html` and future tooling can introspect a card.
+
+Per-card ops can **never** merge into the main `docs/openapi.json` — that document is snapshot-tested byte-for-byte (`openapi_spec_sync.rs`) and describes the static surface. The deck's own management routes join it normally (`UPDATE_OPENAPI=1` regen); the per-card ops are a deliberately separate dynamic surface addressed by UUID.
+
+Op semantics are **unrestricted within the sandbox** — no read/mutate taxonomy. The card's power surface is exactly `ctx`, and the SSRF floor keeps the gateway's own REST unreachable from `ctx.fetch`, so "card mutates the gateway" is dead by default without an effect system.
+
+## Data plane
+
+Card JS has **zero network access** — no fetch, no XHR, no WebSocket, enforced by CSP and the iframe sandbox (below). This was forced, not chosen: in relay mode the gateway has no reachable URL at all (the phone reaches it only through the Noise tunnel inside the FFI), so a card that literally `fetch()`ed a gateway endpoint could never work for relay users, and no scoped-token story exists for the direct leg (the phone's stored direct-mode credential *is* the admin token). Everything crosses the native bridge.
+
+**Push is the primary plane.** A service tick flows:
+
+```
+service ctx.emit → gateway: policed, seq-stamped, stored in deck_snapshots
+  → Frame::DeckCardData { card_id, seq, payload } broadcast on the owner channel
+  → iOS FFI dispatch_inbound_frame (new arm, BEFORE per-session routing)
+  → DeckSink (connection-global, the SessionListSink pattern)
+  → Swift DeckStore → bridge → shell → iframe postMessage → deck.onData
+```
+
+The connection-global sink is mandatory, not optional: today any unrecognized session-less frame is fanned to per-session chat `FrameSink`s only, so a user parked on the Deck tab with no chat subscribed would receive nothing.
+
+Broadcast scope: the owner channel is shared — the web dashboard registers on it too (the `SessionPulse` precedent) — so deck frames land on `app/web` WS connections whose deck parity is deferred; the web client must ignore them (its `wireSentinel` update is exactly this obligation). The TUI is not an owner-channel client and never sees them. One interaction to note: a slow owner-channel consumer whose queue fills gets nudged with `Frame::Gap{session_id: None}` (full resync), so a card emitting at its clamp floor adds pressure on clients that cannot even render it — acceptable at deck's emit floors, but worth remembering before lowering the floor const. `Frame::DeckChanged` (no payload) signals structural change — install, update, delete, restore, purge, enable, disable, quarantine, layout — and clients respond by refetching `GET /v1/deck`.
+
+**Pull covers open and taps.** `GET /v1/deck` returns cards + layout + latest snapshots + seqs (instant paint from cache). `seq` is a **persisted per-card monotonic counter on the `deck_cards` row** — never derived from the prunable snapshot table, so it cannot regress across a gateway restart (the sentinel/cursor bug class `docs/sync-protocol.md` exists to kill). Client rule: accept a push iff `push.seq >` the cached seq; a `DeckChanged`-triggered refetch replaces cached snapshot + seq unconditionally. User-initiated card interaction (`deck.call`) travels shell → bridge → FFI → `POST /v1/deck/services/{uuid}/{op}` → spec validation → stdio `call` → JSON back. Same validated surface as the scheduled path.
+
+### REST surface
+
+All under `require_admin_token` on the admin router; the relay API tunnel admits any `/v1/*` path, so the whole surface works over both legs with zero extra transport work.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/deck` | cards + layout + latest snapshots + seqs |
+| `PUT /v1/deck/layout` | full ordered layout write `[{uuid, position, size}]` |
+| `GET /v1/deck/recycle` | soft-deleted cards, most recent first |
+| `POST /v1/deck/cards/{uuid}/enable` / `disable` | run-state toggle (disable stops the process) |
+| `DELETE /v1/deck/cards/{uuid}` | soft delete (below) |
+| `POST /v1/deck/cards/{uuid}/restore` | recycle-bin restore |
+| `POST /v1/deck/cards/{uuid}/purge` | hard delete out of the bin (row, snapshots, bundle files) |
+| `GET /v1/deck/cards/{uuid}/bundle` | `card.html` (reaches the shell via `deck_fetch_bundle`, below) |
+| `GET /v1/deck/services/{uuid}/openapi.json` | the card's op contract |
+| `POST /v1/deck/services/{uuid}/{op}` | validated on-demand op call |
+
+### Wire and contract obligations
+
+Two new frames (`DeckCardData`, `DeckChanged`) mean: ts-rs regen (`scripts/check-ts-bindings.sh`), updates to both hand-written `wireSentinel.ts` mirrors (`app/ios/web`, `app/web`), a new UniFFI callback interface (`DeckSink { on_card_data, on_deck_changed }`) + Swift bindings regen (`build-core.sh`). Both legs skip undecodable inbound frames — `DirectCodec` (`direct/chat.rs`) and the relay `ContentSession::open` (`core/content.rs`, which explicitly mirrors the direct codec's forward-compat posture) — so older clients tolerate the new frames; deck makes that skip behavior load-bearing on both legs.
+
+New `BayboClient` FFI methods, each routed over the active leg like every `chat_*` call: `deck_fetch`, `deck_fetch_recycle`, `deck_fetch_bundle(uuid)` (the shell holds no gateway URL or token in either mode — `card.html` reaches it over the bridge like all other data), `deck_call(uuid, op, params_json)`, `deck_set_layout`, `deck_set_enabled`, `deck_delete`, `deck_restore`, `set_deck_sink`.
+
+## Storage
+
+Follows the `SessionFolderStore` recipe: `DeckCardStore` trait + row DTOs in `crates/store`, sqlite impl in `crates/storage/src/sqlite/deck.rs`, tables in `init_db`'s CREATE batch (new tables need no migration entry), a new `Arc<dyn DeckCardStore>` field on the `Store` DI bundle. (`DeckCardStore`, not `DeckStore` — the Swift client-side observable is already named `DeckStore`, and one grep should never conflate the persistence port with the UI store.)
+
+- **`deck_cards`** — `id` (uuid PK), `title`, `position`, `size` (`small` 1×1 / `wide` 2×1 / `large` 2×2), `enabled`, `quarantined_at`, `deleted_at`, `spec_hash`, `last_seq` (the per-card monotonic push counter), `created_at`.
+- **`deck_snapshots`** — `card_id`, `seq`, `payload`, `fetched_at`, `error` (latest row per card is the paint source; ephemeral render state, not transcript). Retention is **prune-on-insert in the sqlite impl** — a plain `DELETE` keeping a named-const latest-N per card, as `storage.md` sanctions; the janitor's charter ("no storage compaction") stays untouched and no background sweeper is involved.
+
+**Deletion is a soft-delete recycle bin, mirroring `cron_jobs`** (the one precedent for "user-authored, painful to recreate"): delete stamps `deleted_at`, stops and deregisters the service, hides the card, and keeps `workspace/deck/<uuid>/` intact; listings apply the live-only predicate in SQL. Restore clears the stamp **after re-running the dry-run gate**, and that is one instance of the single re-admission rule: **every transition into the running fleet — restore, enable (including from quarantine), and the post-upgrade boot re-run — passes the dry-run gate first.** A failed restore leaves the card in the bin with the error returned to the caller; a failed enable leaves it quarantined with a refreshed error face; restore counts against the card cap like an install. Purging from the bin is the hard delete that removes files.
+
+**Job/Trace boundary (explicit deviation).** The repo constraint says background execution enters Job and Trace. Deck services are streaming residents, not discrete work items: modelling every 5-minute tick as a Job would flood both stores with noise. The decision: **card provenance and lifecycle transitions** are recorded as trace events — install, update (`spec_hash` before → after), delete, restore, purge, start, stop, crash, quarantine — satisfying the "hot reload and tool updates leave provenance records in Trace" constraint; individual ticks and op calls are not Jobs. Ops appear in the audit log when they egress with secrets.
+
+**Governance boundary (second explicit deviation).** The repo constraint says tool/skill extensions carry source, version, hash, trust level, and capability declarations. A deck card carries `spec_hash` and an implicit source (the operator's own agent wrote it) — no version field, no trust tier, and capability declarations deliberately abolished by the trust decision above; `ExtensionManifest`/`TrustLevel` in `crates/model` go unused here. This is a knowing deviation, accepted with the trust model. If deck cards ever gain third-party provenance (sharing, import), the governance vocabulary must be adopted before that feature ships.
+
+## iOS client
+
+### Tab and navigation
+
+`HomeTab.agents` is renamed to `.deck` outright — label Deck (en + zh-Hans), icon `rectangle.stack` — including the `-baybo-home-tab` debug-arg literal and the `-baybo-demo-tabs` cycle order (the "agents" placeholder was never real, so no compat shim). `PlaceholderScreen` survives for the Projects tab. `app/ios/CLAUDE.md`'s navigation prose changes accordingly.
+
+### Render host: one deck webview, per-card iframes
+
+The deck is the app's **second** WKWebView (`DeckHost`, mirroring `TranscriptHost`: own scheme-handler instance serving the deck shell bundle, prewarmed once a binding reaches home, kept warm until logout/rebind). The shell — trusted code, a second Vite entry in the existing `app/ios/web` workspace (no shared-package seam; web parity is explicitly deferred, and a future `app/web` deck page is an extraction refactor) — renders the grid and hosts one iframe per card:
+
+- `<iframe sandbox="allow-scripts" srcdoc="…">` — **no `allow-same-origin`**, so each card gets a unique opaque origin: no storage, no cookies, no parent DOM, no access to the shell's native bridge.
+- The shell injects a **CSP meta** into every `srcdoc` (`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:`) because the sandbox attribute alone does **not** block network — an opaque-origin frame can still fire-and-forget a cross-origin POST. CSP closes that.
+- **Card identity is a per-card `MessagePort`**, minted by the shell and transferred into the iframe once at init. With `srcdoc` sandboxing, every card's `postMessage` arrives with `event.origin === "null"` — identity by claimed uuid would let card A read card B's data. Port identity is bound shell-side — each port's message handler closes over its card's uuid, which the card can neither see nor forge; closing the port mutes a removed card instantly.
+
+This keeps the app's web-content process count at 2 (transcript + deck) regardless of card count, at the cost of web-implemented drag gestures. Those gestures are **SortableJS** (edit-mode-gated, `forceFallback` so the finger-following clone behaves identically in WKWebView; the settled DOM order maps back to state via `reorderTo`) — the long-press that *enters* edit mode stays a small hand-rolled hold-timer, and the hand-rolled drop-index arithmetic it replaced is gone.
+
+One WebKit runtime behavior needs a day-one simulator probe before the shell design is final: CSP-meta + `srcdoc` semantics inside a custom-scheme-hosted page (`baybo-transcript://`) are not answerable from this repo's code.
+
+### Layout: ordered flow + size classes
+
+"Free-form" resolved to **order + size**, not x/y placement: each card holds a `position` index and a size class (Small 1×1, Wide 2×1, Large 2×2) on a 2-column grid that reflows automatically — the iOS home-screen-widget idiom, robust across widths, and drag-reorder in a flow is tractable on touch where free-canvas collision/compaction is not.
+
+Layout lives **server-side** (`deck_cards.position`/`size`) with the `SessionIndex` mutation idiom, deck-shaped: drag applies locally at once, `PUT /v1/deck/layout`; on failure it rolls back to the server-acked **baseline** (never the negation) and refetches — the write is one absolute layout, so no pending-mutation epochs or merge guards are needed. A small local mirror (`Application Support/baybo/deck.json`) gives instant offline paint.
+
+### Install UX
+
+Creation is live: `DeckChanged` fires only after the dry-run gate has stored the first snapshot, so the card arrives on the deck **already populated** — the refetch it triggers carries the snapshot, and any loading face lasts only the iframe-boot instant — typically before the agent's chat reply lands. The reply says so in words — the skill has the agent tell the user the card is on their Deck; there is no deep link (the tab is one tap away). No modal and no per-card phone confirmation, consistent with the trust model.
+
+### Client build, localization, CI
+
+The tab label has `Localizable.xcstrings` keys (en `Deck` + the zh-Hans kanban term), plus the deck-native strings (`deck.editDone`, the delete-confirm set); the shell carries its own tiny en/zh string table fed by a `setLanguage` bridge call (deliberately not the transcript's i18next — the shell is dependency-free vanilla TS). Packaging: the shell is a second entry in the SAME dist, so `build-app.sh`'s existing `web/dist → App/Resources/transcript/` copy ships it with no new step and `project.yml` is untouched. CI: no filter changes — the shell lives under the already-filtered `app/ios/web`, and `crates/deck` is not an ffi dependency (the iOS jobs are currently disabled anyway, so the tiers run by hand and the PR body says so).
+
+## Authoring pipeline
+
+Card authoring is **explicit-invocation-only and owner-channel-only**: the
+builtin `deck-card` skill is slash-only (`command: card` +
+`disable-model-invocation: true`) and `channels: [owner]`, and the
+`DeckCardCreate`/`DeckCardUpdate` manifests carry `channels: [owner]` — so
+the model never volunteers a card, a telegram/tui/subagent session neither
+sees the skill nor the tools (they're filtered from its LLM tool list and
+refused by the executor), and a card is only ever authored when the owner
+types `/card <request>` in chat (web or iOS; it's a plain chat message, no
+client plumbing).
+
+When the user types `/card`:
+
+1. **Skill.** The slash expansion injects the builtin `deck-card` skill: the bundle contract, the `ctx`/`deck` SDK surface, and worked examples deliberately spanning genres (an API-fetch quota card *and* a fetch-free machine-status card via `ctx.exec`) so the skill doesn't anchor generation to one shape.
+2. **Staging.** The agent scaffolds and edits the four files in a scratch dir with its ordinary `Write`/`Edit` tools — the same loop it uses for all code.
+3. **`DeckCardCreate(path)` — install is a dry-run gate.** The tool: (a) static-validates (manifest + spec parse, size caps, refresh op declared with on-schema params); (b) boots the service in the real sandbox — a missing `ops` export dies here; (c) invokes the refresh op once; (d) rejects a null or oversize snapshot — all **before** the row enables or `DeckChanged` fires. Failures (stderr, bad JSON, timeout) return in the tool result so the agent iterates in the same turn; success stores the first snapshot, so the user's first sight of the card is populated, not a spinner.
+4. **Preview (best-effort).** When the browser sidecar is present, the tool renders `card.html` with the first snapshot and attaches a screenshot to the chat reply; absent a browser it degrades to the plain dry-run silently.
+
+Updates re-run the same gate; `DeckCardUpdate` edits in place and restarts the service.
+
+## Deferred and open items
+
+- **Web parity** (`app/web` `/deck` page) — deferred; requires extracting the shell from `app/ios/web`.
+- **`baybo://` internal read registry** — which curated reads exist (llm usage, analytics, cron, jobs, sessions) and their shapes.
+- **WebKit probe** — CSP-meta + `srcdoc` behavior inside a custom-scheme page (simulator, day one).
+- **Quota data sources** — the motivating card's weakest link: Anthropic usage/cost needs an org admin key; Claude-Max and Codex usage endpoints are unofficial. Expect iteration against unofficial APIs; the architecture is indifferent.
+- **Egress budgets** — considered, declined; revisit only if a real card burns real quota.
+- **Vendored SDK pinning** — documented escape hatch, not scheduled.

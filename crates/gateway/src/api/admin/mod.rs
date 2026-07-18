@@ -8,6 +8,7 @@ pub mod channels;
 pub mod chat;
 pub mod config;
 pub mod cron;
+pub mod deck;
 pub mod jobs;
 pub mod llm;
 pub mod logs;
@@ -79,6 +80,7 @@ pub(crate) fn validate_llm_pin(
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
         (name = "agents", description = "User-managed agent profiles (chat personas)"),
+        (name = "deck", description = "Agent-authored live cards (docs/modules/deck.md)"),
     )
 )]
 pub struct AdminApiDoc;
@@ -104,7 +106,8 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(push::routes())
         .merge(llm::routes())
         .merge(logs::routes())
-        .merge(agents::routes());
+        .merge(agents::routes())
+        .merge(deck::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())
         .nest("/v1", v1)
         .split_for_parts();

@@ -2600,6 +2600,458 @@
         }
       }
     },
+    "/v1/deck": {
+      "get": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "get_deck",
+        "responses": {
+          "200": {
+            "description": "Cards + layout + latest snapshots + seqs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeckResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}": {
+      "delete": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "delete_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Soft-deleted into the recycle bin"
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}/bundle": {
+      "get": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "get_bundle",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The card's frontend",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeckBundleDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}/disable": {
+      "post": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "disable_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Service stopped"
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}/enable": {
+      "post": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "enable_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Card re-passed the dry-run gate and its service started"
+          },
+          "400": {
+            "description": "Gate failed; card left quarantined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}/purge": {
+      "post": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "purge_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Row, snapshots, and bundle files removed"
+          },
+          "400": {
+            "description": "Card is not in the recycle bin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/cards/{card_id}/restore": {
+      "post": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "restore_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Card re-passed the gate and left the bin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeckCardDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Gate failed; card stays in the bin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/layout": {
+      "put": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "put_layout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DeckLayoutEntryDto"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Layout applied"
+          },
+          "400": {
+            "description": "Bad entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/recycle": {
+      "get": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "get_recycle",
+        "responses": {
+          "200": {
+            "description": "Soft-deleted cards, most recent first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeckCardDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/services/{card_id}/openapi.json": {
+      "get": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "get_service_openapi",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The card's op contract (its own OpenAPI document)"
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deck/services/{card_id}/{op}": {
+      "post": {
+        "tags": [
+          "deck"
+        ],
+        "operationId": "call_service_op",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "description": "Card uuid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "op",
+            "in": "path",
+            "description": "Op name declared in the card's openapi.json",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The op's JSON result"
+          },
+          "400": {
+            "description": "Off-schema call (rejected before reaching card code)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown card",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/jobs": {
       "get": {
         "tags": [
@@ -4974,6 +5426,158 @@
           "executed"
         ]
       },
+      "DeckBundleDto": {
+        "type": "object",
+        "required": [
+          "card_html"
+        ],
+        "properties": {
+          "card_html": {
+            "type": "string",
+            "description": "The card's frontend, rendered by the deck shell in a sandboxed\niframe. Reaches clients via their transport (never a direct URL)."
+          }
+        }
+      },
+      "DeckCardDto": {
+        "type": "object",
+        "required": [
+          "card_id",
+          "title",
+          "position",
+          "size",
+          "enabled",
+          "quarantined",
+          "spec_hash",
+          "last_seq",
+          "created_at_ms",
+          "retryable_ops"
+        ],
+        "properties": {
+          "card_id": {
+            "type": "string"
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "deleted_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix millis; present only in the recycle listing."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The card's persisted push counter — the client's seq cursor seed."
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "quarantined": {
+            "type": "boolean"
+          },
+          "retryable_ops": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ops the card declared replay-safe (`x-baybo-retryable: true`); the\nphone's relay transport replays a silent-death call only for these."
+          },
+          "size": {
+            "type": "string",
+            "description": "`small` (1×1) | `wide` (2×1) | `large` (2×2)."
+          },
+          "spec_hash": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "DeckLayoutEntryDto": {
+        "type": "object",
+        "required": [
+          "card_id",
+          "position",
+          "size"
+        ],
+        "properties": {
+          "card_id": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size": {
+            "type": "string",
+            "description": "`small` | `wide` | `large`."
+          }
+        }
+      },
+      "DeckResponse": {
+        "type": "object",
+        "required": [
+          "cards",
+          "snapshots"
+        ],
+        "properties": {
+          "cards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeckCardDto"
+            },
+            "description": "Live cards ordered by position."
+          },
+          "snapshots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeckSnapshotDto"
+            },
+            "description": "Latest snapshot per card (the paint source)."
+          }
+        }
+      },
+      "DeckSnapshotDto": {
+        "type": "object",
+        "required": [
+          "card_id",
+          "seq",
+          "payload",
+          "fetched_at_ms"
+        ],
+        "properties": {
+          "card_id": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fetched_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "payload": {
+            "type": "string",
+            "description": "The card's own JSON text; empty when `error` is present."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "description": "Uniform error envelope for every non-2xx admin response.\n\n`GatewayError::into_response` already emits `{\"error\": \"...\"}`; this\ntype just pins the shape in the spec so clients can discriminate on\nit rather than on status codes alone.",
@@ -6317,6 +6921,10 @@
     {
       "name": "agents",
       "description": "User-managed agent profiles (chat personas)"
+    },
+    {
+      "name": "deck",
+      "description": "Agent-authored live cards (docs/modules/deck.md)"
     }
   ]
 }

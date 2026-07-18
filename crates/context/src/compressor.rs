@@ -403,6 +403,7 @@ impl ContextManager {
             self.skill_registry.as_ref(),
             self.tokenizer.as_ref(),
             &called,
+            &self.invocable_skill_summaries(),
         );
         let recent_slice_tokens: usize = recent_slice
             .iter()

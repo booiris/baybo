@@ -78,6 +78,7 @@ impl ProbeTool {
             trust_level: TrustLevel::Trusted,
             parameters_schema: json!({ "type": "object", "additionalProperties": true }),
             capabilities: vec![],
+            channels: Vec::new(),
         }
     }
 }

@@ -1470,9 +1470,13 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
+        // Channel-filtered: a tool whose manifest restricts `channels`
+        // (e.g. the owner-only deck tools) is invisible to sessions on
+        // other channels. The channel is session-stable, so the list
+        // stays byte-identical across calls and prompt caching holds.
         let tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
-            .tool_definitions()
+            .tool_definitions_for_channel(&session.channel)
             .into_iter()
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,

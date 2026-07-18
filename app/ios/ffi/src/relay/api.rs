@@ -127,6 +127,34 @@ impl GatewayJsonClient for GatewayApi {
             Ok(())
         }
     }
+
+    fn post_raw<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+        retryable: bool,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'a {
+        async move {
+            // A deck op runs agent-written card code — not the client-keyed,
+            // replay-convergent surface `should_retry` reasons about — so a
+            // silent pooled leg is replayed only when the op's mandatory
+            // `x-baybo-retryable` declaration says replay is harmless;
+            // otherwise the caller sees the failure and decides.
+            let policy = if retryable {
+                ReplayPolicy::Converges
+            } else {
+                ReplayPolicy::Never
+            };
+            request_with_policy(
+                "POST",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
+                Some(body),
+                policy,
+            )
+            .await
+        }
+    }
 }
 
 /// What one request/response did to the leg it ran on.
@@ -246,12 +274,32 @@ async fn run_exchange<F: TunnelFrames>(
     Ok((response_body, head.reuse))
 }
 
+/// Whether a request that died in pooled-leg silence may be replayed.
+/// `Converges` is this surface's default bargain (see [`should_retry`]);
+/// `Never` is for the routes WITHOUT the client-keyed convergence property —
+/// today the deck's per-card op calls ([`GatewayJsonClient::post_raw`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayPolicy {
+    Converges,
+    Never,
+}
+
 /// One gateway call: on a warm leg if the pool has one, on a fresh leg otherwise.
 async fn request(
     method: &str,
     path: &str,
     headers: Vec<TunnelHeader>,
     body: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    request_with_policy(method, path, headers, body, ReplayPolicy::Converges).await
+}
+
+async fn request_with_policy(
+    method: &str,
+    path: &str,
+    headers: Vec<TunnelHeader>,
+    body: Option<Vec<u8>>,
+    replay: ReplayPolicy,
 ) -> Result<Vec<u8>, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let key = BindingKey::from(&record);
@@ -271,7 +319,7 @@ async fn request(
         // gateway reclaimed it, the relay flapped, a NAT dropped the flow. That is
         // the ONE failure worth retrying, and only when the route can survive being
         // run twice.
-        let retry = should_retry(&outcome, leg.was_pooled);
+        let retry = replay == ReplayPolicy::Converges && should_retry(&outcome, leg.was_pooled);
         settle(leg, parkable(outcome.reuse, &outcome.result)).await;
         if !retry {
             return outcome.result.map_err(String::from);
@@ -347,7 +395,9 @@ fn parkable(reuse: Option<TunnelReuse>, result: &Result<Vec<u8>, LegError>) -> O
 /// `GatewayBlobClient` on a one-shot blob leg, never `GatewayJsonClient` — and
 /// that structural separation is what keeps it safe. **A new route without the
 /// client-keyed property must not be added to `GatewayJsonClient` without
-/// revisiting this.**
+/// revisiting this.** The one revisit so far: `post_raw` (the deck's per-card
+/// op calls, which run agent-written code) opts out wholesale via
+/// [`ReplayPolicy::Never`] — this rule never even runs for it.
 fn should_retry(outcome: &Exchange, was_pooled: bool) -> bool {
     outcome.result.is_err()
         // A leg WE just dialed that fails means the network is down. Retrying there

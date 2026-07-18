@@ -67,6 +67,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         trust_level: baybo_model::TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
+        channels: Vec::new(),
     };
     (tool, manifest)
 }

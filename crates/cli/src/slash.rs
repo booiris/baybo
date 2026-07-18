@@ -370,6 +370,7 @@ mod tests {
                 None
             },
             agent_invocable: true,
+            channels: vec![],
             argument_hint: None,
             prompt_template: "body".into(),
             allowed_tools: vec![],

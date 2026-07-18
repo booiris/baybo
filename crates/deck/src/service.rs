@@ -1,0 +1,571 @@
+//! One resident card service: a sandboxed bun child speaking NDJSON over
+//! stdio, plus the parent-side pumps that police its emits and serve its
+//! host RPCs (fetch / exec).
+//!
+//! The child has no sockets ([`NetworkPolicy::None`]) — every effect is a
+//! stdio round-trip into the Rust parent. Per-call timeouts fail the
+//! *call*, never the process; process death is the supervisor's concern.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
+
+use baybo_sandbox::SandboxRunner;
+use baybo_sandbox::spec::{
+    EnvPolicy, FilesystemPolicy, NetworkPolicy, SandboxSpec, StdinSource,
+    default_sensitive_denylist,
+};
+
+use crate::error::{DeckError, Result};
+
+/// Per-op-call wall clock: the call fails, the process survives.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bun cold start + module import budget before the spawn counts as a crash.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Byte cap on an accepted emit payload / op result (the snapshot cap).
+pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+/// Emits arriving faster than the clamp are coalesced; more than this many
+/// coalesced inside one window is an emit flood (a quarantine strike).
+pub const EMIT_FLOOD_MAX: u64 = 100;
+
+/// Override for the `bun` binary used to run card services. Shares the
+/// channel-sidecar override name (`sidecar::supervisor::BUN_BINARY_ENV`)
+/// deliberately — "the bun that runs embedded JS" is one operator concept.
+pub const DECK_BUN_ENV: &str = "BAYBO_BUN_BIN";
+
+const PREAMBLE_JS: &str = include_str!("sdk/preamble.js");
+const PREAMBLE_FILE: &str = "preamble.js";
+
+pub(crate) fn bun_binary() -> PathBuf {
+    std::env::var_os(DECK_BUN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("bun"))
+}
+
+/// Host-side capability RPCs served to the child. Implemented by the
+/// manager (fetch with SSRF floor + placeholder reveal; sandboxed exec).
+#[async_trait]
+pub(crate) trait HostServices: Send + Sync + 'static {
+    async fn fetch(
+        &self,
+        card_id: &str,
+        req: HostFetchRequest,
+    ) -> std::result::Result<HostFetchResponse, String>;
+    async fn exec(
+        &self,
+        card_id: &str,
+        cmd: String,
+    ) -> std::result::Result<HostExecResponse, String>;
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct HostFetchRequest {
+    pub url: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct HostFetchResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct HostExecResponse {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Where accepted emits go (the manager: size check → snapshot row →
+/// broadcast). Returning `Err` marks the emit invalid (a strike).
+#[async_trait]
+pub(crate) trait EmitSink: Send + Sync + 'static {
+    async fn emit(&self, card_id: &str, payload: Value) -> std::result::Result<(), String>;
+}
+
+/// Strike recorder the supervisor consults for quarantine decisions.
+#[derive(Default)]
+pub(crate) struct StrikeRecorder {
+    crashes: Mutex<Vec<Instant>>,
+    timeouts: Mutex<Vec<Instant>>,
+}
+
+pub const QUARANTINE_WINDOW: Duration = Duration::from_secs(600);
+pub const QUARANTINE_CRASHES: usize = 5;
+pub const QUARANTINE_TIMEOUTS: usize = 10;
+
+impl StrikeRecorder {
+    fn push_and_count(list: &Mutex<Vec<Instant>>) -> usize {
+        let mut list = list.lock();
+        let now = Instant::now();
+        list.push(now);
+        list.retain(|t| now.duration_since(*t) <= QUARANTINE_WINDOW);
+        list.len()
+    }
+
+    /// Record a crash; true if the crash budget is exhausted.
+    pub fn record_crash(&self) -> bool {
+        Self::push_and_count(&self.crashes) >= QUARANTINE_CRASHES
+    }
+
+    /// Record a call timeout / emit flood; true if the budget is exhausted.
+    pub fn record_timeout(&self) -> bool {
+        Self::push_and_count(&self.timeouts) >= QUARANTINE_TIMEOUTS
+    }
+}
+
+enum CallReply {
+    Ok(Value),
+    Failed(String),
+}
+
+/// Cheap-clone handle for issuing op calls against the running child.
+#[derive(Clone)]
+pub(crate) struct ServiceHandle {
+    card_id: String,
+    writer: mpsc::Sender<String>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<CallReply>>>>,
+    next_call_id: Arc<AtomicU64>,
+    strikes: Arc<StrikeRecorder>,
+}
+
+impl ServiceHandle {
+    /// Invoke one op with [`CALL_TIMEOUT`]. A timeout fails the call and
+    /// records a strike; the process itself survives.
+    pub async fn call(&self, op: &str, params: Value) -> Result<Value> {
+        let id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(id, tx);
+        let line = serde_json::json!({"type": "call", "id": id, "op": op, "params": params});
+        if self.writer.send(format!("{line}\n")).await.is_err() {
+            self.pending.lock().remove(&id);
+            return Err(DeckError::ServiceUnavailable(
+                "service process is not running".into(),
+            ));
+        }
+        match tokio::time::timeout(CALL_TIMEOUT, rx).await {
+            Ok(Ok(CallReply::Ok(v))) => {
+                let size = serde_json::to_vec(&v).map(|b| b.len()).unwrap_or(0);
+                if size > SNAPSHOT_MAX_BYTES {
+                    return Err(DeckError::OpRejected(format!(
+                        "op result exceeds {SNAPSHOT_MAX_BYTES} bytes"
+                    )));
+                }
+                Ok(v)
+            }
+            Ok(Ok(CallReply::Failed(e))) => Err(DeckError::ServiceUnavailable(format!(
+                "op `{op}` failed: {e}"
+            ))),
+            Ok(Err(_)) => Err(DeckError::ServiceUnavailable(
+                "service process exited mid-call".into(),
+            )),
+            Err(_) => {
+                self.pending.lock().remove(&id);
+                if self.strikes.record_timeout() {
+                    tracing::warn!(card = %self.card_id, "deck: call-timeout budget exhausted");
+                }
+                Err(DeckError::ServiceUnavailable(format!(
+                    "op `{op}` timed out after {CALL_TIMEOUT:?}"
+                )))
+            }
+        }
+    }
+}
+
+/// A spawned, initialized child. `exited` resolves when the process dies;
+/// dropping/using `kill` tears it down.
+pub(crate) struct RunningService {
+    pub handle: ServiceHandle,
+    pub exited: oneshot::Receiver<i32>,
+    pub kill: mpsc::Sender<()>,
+}
+
+pub(crate) struct SpawnConfig {
+    pub card_id: String,
+    pub bundle_dir: PathBuf,
+    pub scratch_dir: PathBuf,
+    /// Effective emit clamp (manifest floor already applied).
+    pub emit_interval: Duration,
+}
+
+/// Spawn + init one card service inside the sandbox. Waits for the
+/// child's `ready` (module imported, `ops` export present) before
+/// returning, so a boot failure surfaces here — with the child's stderr
+/// folded into the error — instead of as a dead handle.
+pub(crate) async fn spawn_service(
+    runner: &Arc<dyn SandboxRunner>,
+    cfg: SpawnConfig,
+    host: Arc<dyn HostServices>,
+    emit_sink: Arc<dyn EmitSink>,
+    strikes: Arc<StrikeRecorder>,
+) -> Result<RunningService> {
+    std::fs::create_dir_all(&cfg.scratch_dir)?;
+    let preamble_path = cfg.scratch_dir.join(PREAMBLE_FILE);
+    std::fs::write(&preamble_path, PREAMBLE_JS)?;
+    let service_js = cfg.bundle_dir.join(crate::bundle::SERVICE_FILE);
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let spec = SandboxSpec {
+        program: bun_binary(),
+        args: vec![
+            preamble_path.to_string_lossy().into_owned(),
+            service_js.to_string_lossy().into_owned(),
+        ],
+        cwd: Some(cfg.bundle_dir.clone()),
+        workspace_root: cfg.scratch_dir.clone(),
+        readable_paths: vec![cfg.bundle_dir.clone()],
+        writable_paths: Vec::new(),
+        allowed_hosts: Default::default(),
+        network_policy: NetworkPolicy::None,
+        env: EnvPolicy::Baseline,
+        stdin: StdinSource::Piped,
+        // Ignored by spawn_detached; the supervisor owns lifetime.
+        timeout: Duration::from_secs(3600),
+        resource_limits: runner.default_resource_limits(),
+        // Permissive keeps FHS roots readable so bun + its dylibs
+        // resolve; the sensitive denylist masks credential vaults. The
+        // bundle rides `readable_paths`; the only RW surface is the
+        // per-card scratch dir.
+        filesystem_policy: FilesystemPolicy::Permissive {
+            extra_root: cfg.scratch_dir.clone(),
+            denied_paths: default_sensitive_denylist(home.as_deref(), None),
+        },
+    };
+
+    let mut child = runner.spawn_detached(spec).await?;
+    let stdin = child.take_stdin().ok_or_else(|| {
+        DeckError::ServiceUnavailable(
+            "sandbox backend cannot pipe stdin (deck services need bwrap or sandbox-exec)".into(),
+        )
+    })?;
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| DeckError::Internal("child stdout unavailable".into()))?;
+    let stderr = child.take_stderr();
+
+    let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+    let mut stdin = stdin;
+    tokio::spawn(async move {
+        while let Some(line) = writer_rx.recv().await {
+            if stdin.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            if stdin.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Capture a stderr tail for crash diagnostics.
+    let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = stderr {
+        let tail = stderr_tail.clone();
+        let card = cfg.card_id.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(card = %card, "deck service stderr: {line}");
+                let mut t = tail.lock();
+                t.push_str(&line);
+                t.push('\n');
+                let len = t.len();
+                if len > 4096 {
+                    let cut = len - 4096;
+                    t.drain(..cut);
+                }
+            }
+        });
+    }
+
+    let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<CallReply>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (ready_tx, ready_rx) = oneshot::channel::<std::result::Result<(), String>>();
+    let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+
+    let handle = ServiceHandle {
+        card_id: cfg.card_id.clone(),
+        writer: writer_tx.clone(),
+        pending: pending.clone(),
+        next_call_id: Arc::new(AtomicU64::new(1)),
+        strikes: strikes.clone(),
+    };
+
+    // Reader pump: dispatch child → parent messages.
+    {
+        let card_id = cfg.card_id.clone();
+        let pending = pending.clone();
+        let writer = writer_tx.clone();
+        let ready_tx = ready_tx.clone();
+        let emit = EmitPolicy::new(
+            cfg.card_id.clone(),
+            cfg.emit_interval,
+            emit_sink,
+            strikes.clone(),
+        );
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    tracing::debug!(card = %card_id, "deck service emitted non-JSON line");
+                    continue;
+                };
+                match msg.get("type").and_then(Value::as_str) {
+                    Some("ready") => {
+                        if let Some(tx) = ready_tx.lock().take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                    }
+                    Some("fatal") => {
+                        let err = msg
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("fatal")
+                            .to_string();
+                        if let Some(tx) = ready_tx.lock().take() {
+                            let _ = tx.send(Err(err));
+                        }
+                    }
+                    Some("result") => {
+                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let Some(tx) = pending.lock().remove(&id) else {
+                            continue;
+                        };
+                        let ok = msg.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let reply = if ok {
+                            CallReply::Ok(msg.get("value").cloned().unwrap_or(Value::Null))
+                        } else {
+                            CallReply::Failed(
+                                msg.get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("op failed")
+                                    .to_string(),
+                            )
+                        };
+                        let _ = tx.send(reply);
+                    }
+                    Some("emit") => {
+                        emit.on_emit(msg.get("payload").cloned().unwrap_or(Value::Null))
+                            .await;
+                    }
+                    Some("fetch") => {
+                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let req = serde_json::from_value::<HostFetchRequest>(msg.clone());
+                        let host = host.clone();
+                        let writer = writer.clone();
+                        let card = card_id.clone();
+                        tokio::spawn(async move {
+                            let outcome = match req {
+                                Ok(req) => host
+                                    .fetch(&card, req)
+                                    .await
+                                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                                Err(e) => Err(format!("malformed fetch request: {e}")),
+                            };
+                            let _ = writer.send(host_result_line(id, outcome)).await;
+                        });
+                    }
+                    Some("exec") => {
+                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let cmd = msg
+                            .get("cmd")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let host = host.clone();
+                        let writer = writer.clone();
+                        let card = card_id.clone();
+                        tokio::spawn(async move {
+                            let outcome = host
+                                .exec(&card, cmd)
+                                .await
+                                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null));
+                            let _ = writer.send(host_result_line(id, outcome)).await;
+                        });
+                    }
+                    Some("log") => {
+                        let level = msg.get("level").and_then(Value::as_str).unwrap_or("info");
+                        let text = msg.get("msg").and_then(Value::as_str).unwrap_or_default();
+                        if level == "error" || level == "warn" {
+                            tracing::warn!(card = %card_id, "deck service: {text}");
+                        } else {
+                            tracing::debug!(card = %card_id, "deck service: {text}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Stream closed: fail every pending call.
+            for (_, tx) in pending.lock().drain() {
+                let _ = tx.send(CallReply::Failed("service process exited".into()));
+            }
+        });
+    }
+
+    // Init + wait ready.
+    let init = serde_json::json!({"type": "init"});
+    let _ = writer_tx.send(format!("{init}\n")).await;
+
+    // Waiter task owns the child: kill signal or natural death.
+    let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+    let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+    tokio::spawn(async move {
+        let code = tokio::select! {
+            code = child.wait() => code,
+            _ = kill_rx.recv() => {
+                child.start_kill();
+                child.wait().await
+            }
+        };
+        let _ = exit_tx.send(code);
+    });
+
+    match tokio::time::timeout(READY_TIMEOUT, ready_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(err))) => {
+            let _ = kill_tx.send(()).await;
+            let tail = stderr_tail.lock().clone();
+            return Err(DeckError::DryRun(format!(
+                "service failed to boot: {err}{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nstderr:\n{tail}")
+                }
+            )));
+        }
+        Ok(Err(_)) | Err(_) => {
+            let _ = kill_tx.send(()).await;
+            let tail = stderr_tail.lock().clone();
+            return Err(DeckError::DryRun(format!(
+                "service did not become ready within {READY_TIMEOUT:?}{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nstderr:\n{tail}")
+                }
+            )));
+        }
+    }
+
+    Ok(RunningService {
+        handle,
+        exited: exit_rx,
+        kill: kill_tx,
+    })
+}
+
+fn host_result_line(id: u64, outcome: std::result::Result<Value, String>) -> String {
+    let msg = match outcome {
+        Ok(value) => {
+            serde_json::json!({"type": "host_result", "id": id, "ok": true, "value": value})
+        }
+        Err(error) => {
+            serde_json::json!({"type": "host_result", "id": id, "ok": false, "error": error})
+        }
+    };
+    format!("{msg}\n")
+}
+
+/// Emit ingestion policing: the service owns its clock, so the gateway
+/// polices acceptance — at most one accepted emit per clamp window,
+/// excess coalesced to latest and flushed when the window reopens.
+/// Floods count toward quarantine.
+struct EmitPolicy {
+    card_id: String,
+    interval: Duration,
+    sink: Arc<dyn EmitSink>,
+    strikes: Arc<StrikeRecorder>,
+    state: Arc<tokio::sync::Mutex<EmitState>>,
+}
+
+#[derive(Default)]
+struct EmitState {
+    last_accepted: Option<Instant>,
+    pending_latest: Option<Value>,
+    coalesced_in_window: u64,
+    flush_scheduled: bool,
+}
+
+impl EmitPolicy {
+    fn new(
+        card_id: String,
+        interval: Duration,
+        sink: Arc<dyn EmitSink>,
+        strikes: Arc<StrikeRecorder>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            card_id,
+            interval,
+            sink,
+            strikes,
+            state: Arc::new(tokio::sync::Mutex::new(EmitState::default())),
+        })
+    }
+
+    async fn accept(&self, payload: Value) {
+        if let Err(e) = self.sink.emit(&self.card_id, payload).await {
+            tracing::warn!(card = %self.card_id, "deck: emit rejected: {e}");
+        }
+    }
+
+    async fn on_emit(self: &Arc<Self>, payload: Value) {
+        let mut st = self.state.lock().await;
+        let now = Instant::now();
+        let open = st
+            .last_accepted
+            .is_none_or(|t| now.duration_since(t) >= self.interval);
+        if open && !st.flush_scheduled {
+            st.last_accepted = Some(now);
+            st.coalesced_in_window = 0;
+            drop(st);
+            self.accept(payload).await;
+            return;
+        }
+        st.pending_latest = Some(payload);
+        st.coalesced_in_window += 1;
+        if st.coalesced_in_window == EMIT_FLOOD_MAX && self.strikes.record_timeout() {
+            tracing::warn!(card = %self.card_id, "deck: emit flood; strike budget exhausted");
+        }
+        if !st.flush_scheduled {
+            st.flush_scheduled = true;
+            let this = self.clone();
+            let wait = st
+                .last_accepted
+                .map(|t| self.interval.saturating_sub(now.duration_since(t)))
+                .unwrap_or(self.interval);
+            drop(st);
+            tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                let mut st = this.state.lock().await;
+                st.flush_scheduled = false;
+                if let Some(latest) = st.pending_latest.take() {
+                    st.last_accepted = Some(Instant::now());
+                    st.coalesced_in_window = 0;
+                    drop(st);
+                    this.accept(latest).await;
+                }
+            });
+        }
+    }
+}

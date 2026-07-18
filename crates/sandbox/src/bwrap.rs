@@ -168,7 +168,7 @@ impl BwrapRunner {
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
-            StdinSource::Bytes(_) => Stdio::piped(),
+            StdinSource::Bytes(_) | StdinSource::Piped => Stdio::piped(),
         });
         cmd
     }
@@ -194,6 +194,11 @@ impl BwrapRunner {
 #[async_trait]
 impl SandboxRunner for BwrapRunner {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        if matches!(spec.stdin, StdinSource::Piped) {
+            return Err(SandboxError::InvalidSpec(
+                "StdinSource::Piped requires spawn_detached".into(),
+            ));
+        }
         if !spec.allowed_hosts.is_empty() {
             tracing::warn!(
                 hosts = ?spec.allowed_hosts,

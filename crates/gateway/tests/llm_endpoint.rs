@@ -86,6 +86,7 @@ async fn router_with_reloader(
         blob_store: tg.deps.stores.blob.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
+        deck_manager: Arc::clone(&tg.deps.deck_manager),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
@@ -417,6 +418,7 @@ async fn get_usage_aggregates_by_model() {
         blob_store: tg.deps.stores.blob.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
+        deck_manager: Arc::clone(&tg.deps.deck_manager),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();

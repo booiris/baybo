@@ -20,7 +20,7 @@ One directory per skill, a `SKILL.md` entrypoint with YAML frontmatter plus a Ma
 
 At startup the registry first calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans `<workspace.path>/skills/<skill-name>/SKILL.md` and overlays any workspace skill of the same name on top. Built-ins are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an operator can patch shipped behaviour by dropping a same-named directory under the workspace.
 
-The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags).
+The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags). The second is `deck-card` — the inverse shape: slash-only (`command: card` + `disable-model-invocation: true`, so the model never auto-selects it; the user types `/card <request>`) and owner-channel-only (`channels: [owner]`) — carrying the deck card bundle contract, the `ctx`/`deck` SDK surface, and worked examples for authoring a card before `DeckCardCreate`/`DeckCardUpdate`; see [`deck.md`](deck.md#authoring-pipeline).
 
 ```
 <workspace>/skills/
@@ -50,12 +50,14 @@ All fields are optional. When omitted, `name` falls back to the directory name.
 
 | Field                      | Type                      | Default    | Effect |
 |----------------------------|---------------------------|------------|--------|
-| `name`                     | scalar                    | dir name   | Skill identifier; also drives the `/<name>` slash command. |
+| `name`                     | scalar                    | dir name   | Skill identifier; also the default `/<name>` slash command. |
 | `description`              | scalar                    | `""`       | Used by the model for auto-selection. |
 | `when_to_use`              | scalar                    | `None`     | Appended to `description` in the skill listing. |
 | `allowed-tools`            | list or space-sep string  | `[]`       | Tool allow-list while the skill is active. |
+| `command`                  | scalar                    | `name`     | Slash-command override (`command: card` → `/card`). Same grammar as names; rejected with `user-invocable: false`. |
 | `disable-model-invocation` | bool                      | `false`    | `true` clears `agent_invocable` — only the slash command remains. |
 | `user-invocable`           | bool                      | `true`     | `false` clears `command` — only agent decision remains. |
+| `channels`                 | list or space-sep string  | `[]`       | Channel restriction (empty = all). Off-channel sessions get no listing, no slash expansion, and a `Skill`-tool refusal — e.g. `channels: [owner]` on `deck-card`. |
 | `argument-hint`            | scalar                    | `None`     | Autocomplete hint (e.g. `[issue-number]`). |
 | `version`                  | scalar                    | `"0.0.0"`  | Recorded in trace provenance. Must match `[a-zA-Z0-9._\-+~]{1,32}` — whitespace, quotes, and angle brackets are rejected so a hostile manifest can't break out of the `<skill version="…">` attribute. |
 
@@ -73,10 +75,10 @@ The Markdown body becomes `prompt_template`; it reaches the model as the `Skill`
 
 Every skill exposes two independent entry points; both default on:
 
-- `command: Option<String>` — explicit `/name` slash command (set from frontmatter `name` unless `user-invocable: false`)
+- `command: Option<String>` — explicit `/name` slash command (frontmatter `name`, or the `command:` override, unless `user-invocable: false`)
 - `agent_invocable: bool` — the model may auto-select based on `description` (unless `disable-model-invocation: true`)
 
-A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invocation: true`; a `legacy-system-context` reference that isn't actionable as a command sets `user-invocable: false`. A regex-based pattern trigger is **not** modelled — use `description` plus model decision instead.
+A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invocation: true`; a `legacy-system-context` reference that isn't actionable as a command sets `user-invocable: false`. The slash-only combination is real and load-bearing — the builtin `deck-card` is `command: card` + `disable-model-invocation: true`, so a card is only ever authored when the user explicitly types `/card` — which is why the slash-candidate set in `baybo-context` (`slash_skill_summaries`: `command.is_some() && !Untrusted && channel-admitted`) is deliberately independent of the model-advertised set (`invocable_skill_summaries`, which also requires `agent_invocable`). A regex-based pattern trigger is **not** modelled — use `description` plus model decision instead.
 
 The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `ContextManager::expand_slash_command` matches the leading `/<cmd>` against the invocable skill set and injects the skill body. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#slash-completion) for the full wiring.
 
@@ -92,7 +94,8 @@ Skills are no longer auto-injected at user-turn start. Instead the
 agent loop seeds a session-start **system reminder** (an agent-context
 row appended by `ContextManager::ensure_seeded`, re-broadcast after
 each compaction via the skill trailer) listing every agent-invocable,
-non-`Untrusted` skill (name, description, optional
+non-`Untrusted` skill whose `channels:` restriction (if any) admits the
+session's channel (name, description, optional
 `argument-hint`); the LLM pulls one in by calling the `Skill` tool
 (see [`tools.md`](./tools.md#skill-tool)). The list comes from
 `SkillRegistry::all_summaries_sorted()` — a lightweight projection
@@ -100,14 +103,20 @@ non-`Untrusted` skill (name, description, optional
 Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
 / `requirements` per turn would burn allocator pressure proportional
 to skill count × body size; the projection avoids that. Filtered to
-`agent_invocable && trust_level != Untrusted`, sorted by name for
-stable across-turn ordering. When the registry is empty,
+`agent_invocable && trust_level != Untrusted && allows_channel`, sorted
+by name for stable across-turn ordering. When the registry is empty,
 `SkillRegistry::is_empty()` short-circuits before the projection
-runs at all.
+runs at all. The trailer's reminder block advertises this same
+filtered set (and is skipped when it is empty); the per-called-skill
+`<skill>` detail blocks stay keyed on `called_skills` unfiltered, so a
+skill actually invoked in the session keeps its definition across
+compaction regardless of flags.
 
 Slash invocations are expanded before the first LLM call by
 `ContextManager::expand_slash_command`: when the trailing user message
-is `/<cmd> [args]` matching an invocable skill, the skill's body
+is `/<cmd> [args]` matching a slash-invocable skill
+(`slash_skill_summaries` — commanded, non-untrusted,
+channel-admitted; independent of `agent_invocable`), the skill's body
 (`render_skill_for_slash`, `{{session_id}}` substituted, plus a
 linked-files inventory hint when the skill ships sub-files) is
 appended as a hidden agent-context row. Unlike an LLM-issued `Skill`
@@ -197,7 +206,11 @@ The crate ships two governance-gated lifecycle tools (built by `build_install_to
 - On failure, keep the old version rather than emptying the registry
 
 `SkillRegistry` offers `reload()` — re-scans every directory previously
-passed to `load_dir` and rebuilds the skill set from disk. The TUI
+passed to `load_dir` and rebuilds the skill set from disk. Builtins are
+replayed first (from the definitions captured by `register_builtins`),
+then the dir scans run on top so a same-named workspace skill still
+overrides its builtin — without the replay, the first
+`SkillInstall`-triggered reload silently dropped every builtin. The TUI
 Skills dashboard wires this into its refresh action (`r` key), so an
 operator editing `<workspace>/skills/<name>/SKILL.md` can press refresh
 to pick up the change without restarting Baybo. Individual broken

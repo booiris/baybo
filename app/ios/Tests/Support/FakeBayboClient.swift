@@ -226,6 +226,50 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
 
+    // MARK: deck
+
+    /// Scripted deck responses + recorded mutations, so `DeckStore`'s
+    /// refresh / layout / action paths are testable with no gateway.
+    var deckView: DeckView = DeckView(cards: [], snapshots: [])
+    private(set) var deckLayoutPuts: [[DeckLayoutEntryInput]] = []
+    private(set) var deckEnableCalls: [(String, Bool)] = []
+    private(set) var deckDeletes: [String] = []
+    var deckLayoutError: Error?
+
+    func deckFetch() async throws -> DeckView {
+        lock.withLock { deckView }
+    }
+
+    func deckFetchRecycle() async throws -> [DeckCardInfo] { throw Self.unsupported }
+
+    func deckFetchBundle(cardId: String) async throws -> String { throw Self.unsupported }
+
+    func deckCall(cardId: String, op: String, paramsJson: String, retryable: Bool) async throws
+        -> String
+    {
+        throw Self.unsupported
+    }
+
+    func deckSetLayout(entries: [DeckLayoutEntryInput]) async throws {
+        let failure = lock.withLock { () -> Error? in
+            deckLayoutPuts.append(entries)
+            return deckLayoutError
+        }
+        if let failure { throw failure }
+    }
+
+    func deckSetEnabled(cardId: String, enabled: Bool) async throws {
+        lock.withLock { deckEnableCalls.append((cardId, enabled)) }
+    }
+
+    func deckDelete(cardId: String) async throws {
+        lock.withLock { deckDeletes.append(cardId) }
+    }
+
+    func deckRestore(cardId: String) async throws -> DeckCardInfo { throw Self.unsupported }
+
+    func setDeckSink(sink: DeckSink) {}
+
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
         throw Self.unsupported
     }

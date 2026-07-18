@@ -480,6 +480,7 @@ impl AgentTestHarnessBuilder {
             compression_threshold,
             calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
+            channel: session.channel.clone(),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),

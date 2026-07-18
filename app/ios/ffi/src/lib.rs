@@ -17,6 +17,7 @@ mod blob_helper;
 mod core;
 mod direct;
 mod gateway_api;
+mod gateway_client;
 mod keychain;
 mod logging;
 mod qr;
@@ -30,11 +31,13 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, FrameSink, MessageLookup,
+    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo,
+    DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink, MessageLookup,
     PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
+use gateway_client::ActiveGatewayClient;
 
 uniffi::setup_scaffolding!();
 
@@ -60,6 +63,20 @@ pub struct BayboClient {
     direct: direct::DirectSessions,
     pairing: relay::PairingSessions,
     apns: Arc<ApnsState>,
+}
+
+impl BayboClient {
+    /// Resolve the active leg's REST client ONCE — the dispatch seam every
+    /// `gateway_api` helper rides (see [`gateway_client::ActiveGatewayClient`]). Call sites
+    /// that used to re-state the direct/relay `match` per method bind this
+    /// and pass it straight through. NOT in the exported impl block below:
+    /// uniffi would try to lower the return type over the FFI.
+    fn gateway_client(&self) -> Result<ActiveGatewayClient, String> {
+        Ok(match active_leg()? {
+            ActiveLeg::Direct => ActiveGatewayClient::Direct(self.direct.http_client()?),
+            ActiveLeg::Relay => ActiveGatewayClient::Relay(relay::GatewayApi),
+        })
+    }
 }
 
 #[uniffi::export]
@@ -116,6 +133,18 @@ impl BayboClient {
     pub fn set_session_list_sink(&self, sink: Arc<dyn SessionListSink>) {
         transport::set_list_sink(&self.relay, Some(sink.clone()));
         transport::set_list_sink(&self.direct, Some(sink));
+    }
+
+    /// Install the deck's connection-global sink: `Frame::DeckCardData` /
+    /// `Frame::DeckChanged` are session-less broadcasts (the `SessionActivity`
+    /// pattern — the deck tab has no session to subscribe), so the transport
+    /// routes them here instead of any per-session frame sink. Set once at
+    /// launch; both legs share it (only one is live at a time). With no sink
+    /// installed the frames drop silently — [`Self::deck_fetch`] repaints from
+    /// the stored snapshots on the tab's first open.
+    pub fn set_deck_sink(&self, sink: Arc<dyn DeckSink>) {
+        transport::set_deck_sink(&self.relay, Some(sink.clone()));
+        transport::set_deck_sink(&self.direct, Some(sink));
     }
 
     /// The device id of a persisted relay pairing, if any — so a relaunch shows
@@ -225,14 +254,9 @@ impl BayboClient {
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             let requested = session_id.clone();
-            let created = match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::create_session(&client, &session_id).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::create_session(&relay::GatewayApi, &session_id).await
-                }
+            let created = {
+                let client = self.gateway_client()?;
+                gateway_api::create_session(&client, &session_id).await
             }?;
             if created != requested {
                 return Err(format!(
@@ -253,15 +277,8 @@ impl BayboClient {
         archived: bool,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::set_archived(&client, session_id, archived).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::set_archived(&relay::GatewayApi, session_id, archived).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::set_archived(&client, session_id, archived).await
         })
         .await
     }
@@ -275,15 +292,8 @@ impl BayboClient {
         pinned: bool,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::set_pinned(&client, session_id, pinned).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::set_pinned(&relay::GatewayApi, session_id, pinned).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::set_pinned(&client, session_id, pinned).await
         })
         .await
     }
@@ -302,15 +312,8 @@ impl BayboClient {
         pinned: bool,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::set_cron_pinned(&client, job_id, pinned).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::set_cron_pinned(&relay::GatewayApi, job_id, pinned).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::set_cron_pinned(&client, job_id, pinned).await
         })
         .await
     }
@@ -321,13 +324,8 @@ impl BayboClient {
     /// Noise-protected API tunnel.
     pub async fn chat_hide_session(self: Arc<Self>, session_id: String) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::hide_session(&client, session_id).await
-                }
-                ActiveLeg::Relay => gateway_api::hide_session(&relay::GatewayApi, session_id).await,
-            }
+            let client = self.gateway_client()?;
+            gateway_api::hide_session(&client, session_id).await
         })
         .await
     }
@@ -339,13 +337,8 @@ impl BayboClient {
     /// only and owner-scoped — see `gateway_api::list_cron_jobs`.
     pub async fn chat_list_cron_jobs(self: Arc<Self>) -> Result<Vec<CronJobSummary>, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::list_cron_jobs(&client).await
-                }
-                ActiveLeg::Relay => gateway_api::list_cron_jobs(&relay::GatewayApi).await,
-            }
+            let client = self.gateway_client()?;
+            gateway_api::list_cron_jobs(&client).await
         })
         .await
     }
@@ -361,15 +354,8 @@ impl BayboClient {
         paused: bool,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::set_cron_paused(&client, job_id, paused).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::set_cron_paused(&relay::GatewayApi, job_id, paused).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::set_cron_paused(&client, job_id, paused).await
         })
         .await
     }
@@ -379,13 +365,8 @@ impl BayboClient {
     /// produced are ordinary sessions and stay exactly where they are.
     pub async fn chat_delete_cron_job(self: Arc<Self>, job_id: String) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::delete_cron_job(&client, job_id).await
-                }
-                ActiveLeg::Relay => gateway_api::delete_cron_job(&relay::GatewayApi, job_id).await,
-            }
+            let client = self.gateway_client()?;
+            gateway_api::delete_cron_job(&client, job_id).await
         })
         .await
     }
@@ -402,13 +383,8 @@ impl BayboClient {
         session_ids: Vec<String>,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::hide_many(&client, session_ids).await
-                }
-                ActiveLeg::Relay => gateway_api::hide_many(&relay::GatewayApi, session_ids).await,
-            }
+            let client = self.gateway_client()?;
+            gateway_api::hide_many(&client, session_ids).await
         })
         .await
     }
@@ -421,13 +397,122 @@ impl BayboClient {
         self: Arc<Self>,
     ) -> Result<Vec<ChatSessionSummary>, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::list_sessions(&client).await
-                }
-                ActiveLeg::Relay => gateway_api::list_sessions(&relay::GatewayApi).await,
-            }
+            let client = self.gateway_client()?;
+            gateway_api::list_sessions(&client).await
+        })
+        .await
+    }
+
+    /// The deck view for the active binding (`GET /v1/deck`): live cards
+    /// ordered by position + the latest snapshot per card — the instant-paint
+    /// pull behind the Deck tab's open and every [`DeckSink::on_deck_changed`]
+    /// refetch (which replaces cached snapshots and seqs unconditionally).
+    /// Direct reaches it over REST, relay through the Noise-protected API
+    /// tunnel.
+    pub async fn deck_fetch(self: Arc<Self>) -> Result<DeckView, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_deck(&client).await
+        })
+        .await
+    }
+
+    /// The deck's recycle bin (`GET /v1/deck/recycle`): soft-deleted cards,
+    /// most recent first, each restorable via [`Self::deck_restore`].
+    pub async fn deck_fetch_recycle(self: Arc<Self>) -> Result<Vec<DeckCardInfo>, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_deck_recycle(&client).await
+        })
+        .await
+    }
+
+    /// A card's frontend HTML (`GET /v1/deck/cards/{id}/bundle`), for the deck
+    /// shell to render in a sandboxed iframe. The shell holds no gateway URL
+    /// or token in either mode — the bundle crosses the active leg like all
+    /// other data.
+    pub async fn deck_fetch_bundle(self: Arc<Self>, card_id: String) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_deck_bundle(&client, card_id).await
+        })
+        .await
+    }
+
+    /// A user-initiated card op (`POST /v1/deck/services/{id}/{op}`):
+    /// `params_json` goes up verbatim as the JSON body and the op's JSON
+    /// result returns verbatim — the shapes are the card's own contract,
+    /// validated by the gateway against the card's `openapi.json` before any
+    /// card code runs. Never replayed on a flaky leg: the op runs
+    /// agent-written service code whose side effects this client cannot
+    /// reason about.
+    pub async fn deck_call(
+        self: Arc<Self>,
+        card_id: String,
+        op: String,
+        params_json: String,
+        retryable: bool,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::call_deck_op(&client, card_id, op, params_json, retryable).await
+        })
+        .await
+    }
+
+    /// Write the full ordered layout (`PUT /v1/deck/layout`) — every card's
+    /// position + size in one absolute snapshot, the deck's drag-reorder
+    /// commit (optimistic client-side, rolled back to the server baseline on
+    /// failure, like the chat list's pin/archive machinery).
+    pub async fn deck_set_layout(
+        self: Arc<Self>,
+        entries: Vec<DeckLayoutEntryInput>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_deck_layout(&client, entries).await
+        })
+        .await
+    }
+
+    /// Enable or disable a card (`POST /v1/deck/cards/{id}/enable|disable`).
+    /// Enabling re-runs the gateway's dry-run gate — the one path out of
+    /// quarantine — and a failed gate leaves the card quarantined with the
+    /// error surfaced here; disabling stops the card's service outright.
+    pub async fn deck_set_enabled(
+        self: Arc<Self>,
+        card_id: String,
+        enabled: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_deck_enabled(&client, card_id, enabled).await
+        })
+        .await
+    }
+
+    /// Soft-delete a card into the recycle bin (`DELETE /v1/deck/cards/{id}`):
+    /// the service stops, the bundle files stay, and [`Self::deck_restore`]
+    /// undoes it. Purging is a desktop affordance; the phone offers only the
+    /// recoverable delete.
+    pub async fn deck_delete(self: Arc<Self>, card_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::delete_deck_card(&client, card_id).await
+        })
+        .await
+    }
+
+    /// Restore a card from the recycle bin (`POST /v1/deck/cards/{id}/restore`).
+    /// The gateway re-runs the dry-run gate first; failure leaves the card in
+    /// the bin with the error surfaced here. Success returns the live row.
+    pub async fn deck_restore(
+        self: Arc<Self>,
+        card_id: String,
+    ) -> Result<DeckCardInfo, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::restore_deck_card(&client, card_id).await
         })
         .await
     }
@@ -615,22 +700,8 @@ impl BayboClient {
         limit: Option<u32>,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Relay => {
-                    gateway_api::fetch_history_page(
-                        &relay::GatewayApi,
-                        session_id,
-                        before_ordinal,
-                        limit,
-                    )
-                    .await
-                }
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::fetch_history_page(&client, session_id, before_ordinal, limit)
-                        .await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::fetch_history_page(&client, session_id, before_ordinal, limit).await
         })
         .await
     }
@@ -646,16 +717,8 @@ impl BayboClient {
         limit: u32,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Relay => {
-                    gateway_api::fetch_sync(&relay::GatewayApi, session_id, since_ordinal, limit)
-                        .await
-                }
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::fetch_sync(&client, session_id, since_ordinal, limit).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::fetch_sync(&client, session_id, since_ordinal, limit).await
         })
         .await
     }
@@ -670,16 +733,9 @@ impl BayboClient {
         platform_msg_id: String,
     ) -> Result<MessageLookup, BayboError> {
         runtime::run(async move {
-            let response = match active_leg()? {
-                ActiveLeg::Relay => {
-                    gateway_api::lookup_message(&relay::GatewayApi, session_id, &platform_msg_id)
-                        .await
-                }
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::lookup_message(&client, session_id, &platform_msg_id).await
-                }
-            }?;
+            let client = self.gateway_client()?;
+            let response =
+                gateway_api::lookup_message(&client, session_id, &platform_msg_id).await?;
             Ok(MessageLookup {
                 found: response.found,
                 ordinal: response.ordinal,
@@ -697,15 +753,8 @@ impl BayboClient {
         ordinal: i64,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Relay => {
-                    gateway_api::mark_read(&relay::GatewayApi, session_id, ordinal).await
-                }
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::mark_read(&client, session_id, ordinal).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::mark_read(&client, session_id, ordinal).await
         })
         .await
     }
@@ -724,15 +773,8 @@ impl BayboClient {
         session_ids: Vec<String>,
     ) -> Result<(), BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Relay => {
-                    gateway_api::mark_many_read(&relay::GatewayApi, session_ids).await
-                }
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::mark_many_read(&client, session_ids).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::mark_many_read(&client, session_ids).await
         })
         .await
     }
@@ -778,15 +820,8 @@ impl BayboClient {
         mime_type: String,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
-                ActiveLeg::Direct => {
-                    let client = self.direct.http_client()?;
-                    gateway_api::upload_bytes(&client, bytes, mime_type).await
-                }
-                ActiveLeg::Relay => {
-                    gateway_api::upload_bytes(&relay::GatewayApi, bytes, mime_type).await
-                }
-            }
+            let client = self.gateway_client()?;
+            gateway_api::upload_bytes(&client, bytes, mime_type).await
         })
         .await
     }

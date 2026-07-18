@@ -29,6 +29,7 @@ pub struct SkillSummary {
     pub description: String,
     pub argument_hint: Option<String>,
     pub agent_invocable: bool,
+    pub channels: Vec<baybo_model::ChannelType>,
     pub trust_level: baybo_model::TrustLevel,
 }
 
@@ -40,8 +41,17 @@ impl From<&SkillDefinition> for SkillSummary {
             description: skill.description.clone(),
             argument_hint: skill.argument_hint.clone(),
             agent_invocable: skill.agent_invocable,
+            channels: skill.channels.clone(),
             trust_level: skill.trust_level.clone(),
         }
+    }
+}
+
+impl SkillSummary {
+    /// Whether a session on `channel` may see or invoke this skill.
+    /// An empty `channels` list means no restriction.
+    pub fn allows_channel(&self, channel: &baybo_model::ChannelType) -> bool {
+        self.channels.is_empty() || self.channels.contains(channel)
     }
 }
 
@@ -60,6 +70,11 @@ pub struct SkillRegistry {
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
+    /// Skills registered via `register_builtins`, kept so `reload` can
+    /// replay them. Without this, the first `SkillInstall`-triggered
+    /// reload silently dropped every builtin (the map is cleared and
+    /// only `load_dirs` are rescanned).
+    builtins: RwLock<Vec<SkillDefinition>>,
 }
 
 impl Default for SkillRegistry {
@@ -73,6 +88,7 @@ impl SkillRegistry {
         Self {
             skills: DashMap::new(),
             load_dirs: RwLock::new(Vec::new()),
+            builtins: RwLock::new(Vec::new()),
         }
     }
 
@@ -92,11 +108,12 @@ impl SkillRegistry {
     /// name override the built-in — operators can always patch the
     /// shipped behaviour locally.
     pub fn register_builtins(&self) -> usize {
-        let mut loaded = 0;
-        for skill in crate::builtin::all() {
-            self.register(skill);
-            loaded += 1;
+        let builtins = crate::builtin::all();
+        for skill in &builtins {
+            self.register(skill.clone());
         }
+        let loaded = builtins.len();
+        *self.builtins.write() = builtins;
         loaded
     }
 
@@ -160,11 +177,17 @@ impl SkillRegistry {
     /// out, edits take effect, and new subdirectories appear. Returns the
     /// number of skills in the registry after the reload.
     ///
-    /// Skills registered programmatically (not via `load_dir`) are cleared
-    /// as well — reload is "authoritative disk state wins."
+    /// Builtins survive: they are replayed first, then the dir scans run
+    /// on top so a same-named workspace skill still overrides its builtin.
+    /// Other programmatically registered skills (not via `load_dir` or
+    /// `register_builtins`) are cleared — for those, reload is
+    /// "authoritative disk state wins."
     pub fn reload(&self) -> usize {
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
         self.skills.clear();
+        for skill in self.builtins.read().iter() {
+            self.register(skill.clone());
+        }
         for dir in &dirs {
             self.scan_dir(dir);
         }
@@ -431,6 +454,7 @@ mod tests {
             description: description.into(),
             command: Some(name.into()),
             agent_invocable: true,
+            channels: vec![],
             argument_hint: None,
             prompt_template: "be helpful".into(),
             allowed_tools: vec![],
@@ -685,5 +709,39 @@ mod tests {
         // No dirs were tracked, so reload clears everything and scans nothing.
         assert_eq!(reg.reload(), 0);
         assert!(reg.get("in-memory").is_none());
+    }
+
+    #[test]
+    fn reload_keeps_builtins_and_workspace_overrides_still_win() {
+        let dir = std::env::temp_dir().join(format!(
+            "baybo-skills-reload-builtin-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let reg = SkillRegistry::new();
+        let n = reg.register_builtins();
+        assert!(n > 0, "expected compiled-in builtins");
+        assert!(reg.get("deck-card").is_some());
+        reg.load_dir(&dir);
+
+        // The SkillInstall path: reload after a workspace change. Builtins
+        // must survive (this exact call used to drop them all).
+        reg.reload();
+        assert!(reg.get("deck-card").is_some(), "builtin lost on reload");
+
+        // A same-named workspace skill still overrides its builtin.
+        let sub = dir.join("deck-card");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("SKILL.md"),
+            "---\nname: deck-card\ndescription: patched\n---\nbody\n",
+        )
+        .unwrap();
+        reg.reload();
+        assert_eq!(reg.get("deck-card").unwrap().description, "patched");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
