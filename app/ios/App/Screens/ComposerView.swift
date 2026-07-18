@@ -146,6 +146,17 @@ struct ComposerView: View {
             pickerItem = nil
             stage(item)
         }
+        .onAppear {
+            // One-shot for the Deck "Quick setup": seed the /card request and
+            // send it immediately, so the user lands in the conversation
+            // already working. Clear `initialDraft` FIRST so a re-appear can't
+            // double-send.
+            if let seed = store.initialDraft, text.isEmpty {
+                store.initialDraft = nil
+                text = seed
+                send()
+            }
+        }
         #if DEBUG
             // `-baybo-demo-keyboard`: raise then drop the keyboard without a
             // tap, so the keyboard-tracking transcript slide is recordable

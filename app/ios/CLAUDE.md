@@ -212,7 +212,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   actions confirm NATIVELY (the shell only reports intent). Bridge
   (`App/Web/DeckBridge.swift` ⇄ `web/src/deck/bridge.ts`): native→web
   `init/deckState/cardData/bundle/callResult/setEditMode/setLanguage`;
-  web→native `ready/refetch/requestBundle/call/layout/cardAction/editMode/log`.
+  web→native `ready/refetch/requestBundle/call/layout/cardAction/editMode/quickSetup/log`
+  (`quickSetup` is the empty-board CTA: native opens a fresh chat and
+  auto-sends a `/card` request, via `AppStore.startCardDraft`).
 - **Chat list data**: `SessionIndex` (Application Support/baybo/sessions.json)
   is the device-local registry backing the list on BOTH legs. Both direct and
   relay merge `chat_list_sessions()` over it on appear/foreground/pull: direct

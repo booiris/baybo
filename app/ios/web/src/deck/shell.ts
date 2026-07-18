@@ -51,6 +51,7 @@ export class DeckShell {
   private pendingCalls = new Map<string, { cardId: string; localId: number }>();
   private nextCallSerial = 1;
   private editMode = false;
+  private setupInflight = false;
   private lang: "en" | "zh" = "en";
   // Live drag state (the iOS-home-screen engine below).
   private dragCardId: string | null = null;
@@ -79,6 +80,14 @@ export class DeckShell {
     this.lang = lang.startsWith("zh") ? "zh" : "en";
     this.renderEmpty();
     for (const tile of this.tiles.values()) this.renderOverlay(tile);
+  }
+
+  /// A `/card` creation from the empty-board CTA is running (no card yet):
+  /// the CTA shows a spinner and a re-tap returns to that chat (native
+  /// routes it; the shell just reflects the state).
+  setSetupInflight(active: boolean): void {
+    this.setupInflight = active;
+    this.renderEmpty();
   }
 
   setEditMode(active: boolean): void {
@@ -171,8 +180,30 @@ export class DeckShell {
   }
 
   private renderEmpty(): void {
-    this.emptyEl.textContent = this.t("empty");
-    this.emptyEl.style.display = this.state.cards.length === 0 ? "" : "none";
+    const empty = this.state.cards.length === 0;
+    this.emptyEl.style.display = empty ? "" : "none";
+    if (!empty) return;
+    // Rebuilt each call (also on setLanguage), so the copy + CTA follow
+    // the active locale.
+    this.emptyEl.replaceChildren();
+    const msg = document.createElement("div");
+    msg.textContent = this.t("empty");
+    const cta = document.createElement("button");
+    cta.className = "deck-empty-cta";
+    // Same CTA either way — native decides new-vs-return from its own
+    // setup-session state; the shell only shows which mode it's in.
+    if (this.setupInflight) {
+      cta.classList.add("inflight");
+      const spin = document.createElement("span");
+      spin.className = "deck-cta-spin";
+      cta.append(spin, document.createTextNode(this.t("createCardInflight")));
+    } else {
+      cta.textContent = this.t("quickSetup");
+    }
+    cta.addEventListener("click", () =>
+      bridge.postQuickSetup(this.t("quickSetupPrompt")),
+    );
+    this.emptyEl.append(msg, cta);
   }
 
   private reconcileTiles(): void {

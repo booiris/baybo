@@ -77,6 +77,11 @@ final class ChatStore: ObservableObject {
     /// draft's sync request is simply skipped native-side until the session
     /// exists.
     let listed: Bool
+    /// One-shot composer seed for a fresh draft (the Deck "Quick setup"): on
+    /// appear `ComposerView` copies it into the field and sends it, then
+    /// clears this; nil for every normal open. Not `@Published` — it is read
+    /// once at mount, never observed.
+    var initialDraft: String?
     @Published private(set) var connState: ConnState
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?

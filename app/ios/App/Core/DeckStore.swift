@@ -42,6 +42,7 @@ final class DeckStore: ObservableObject {
         let snapshots: [Snapshot]
         let lang: String
         let editMode: Bool
+        let setupInflight: Bool
     }
 
     /// One soft-deleted card in the recycle bin. Not persisted — the bin is
@@ -64,6 +65,11 @@ final class DeckStore: ObservableObject {
     @Published private(set) var recycle: [RecycledCard] = []
 
     private(set) var state = StatePayload(cards: [], snapshots: [])
+    /// The chat session of an in-flight empty-board `/card` creation (set by
+    /// `AppStore.startCardDraft`, cleared when a card actually lands). While
+    /// set, the empty-board CTA shows an in-flight state and a re-tap returns
+    /// to this chat instead of starting a new one.
+    private(set) var setupSessionId: String?
     weak var bridge: DeckBridge?
 
     /// Lazily resolved so constructing the store (an `AppStore` stored
@@ -100,7 +106,8 @@ final class DeckStore: ObservableObject {
                 cards: state.cards,
                 snapshots: state.snapshots,
                 lang: Lang.shared.code,
-                editMode: editMode
+                editMode: editMode,
+                setupInflight: setupSessionId != nil
             ))
         requestRefresh()
     }
@@ -108,6 +115,15 @@ final class DeckStore: ObservableObject {
     func setEditMode(_ active: Bool) {
         editMode = active
         bridge?.setEditMode(active)
+    }
+
+    /// Set (or clear, with nil) the in-flight card-setup session and reflect
+    /// it on the empty-board CTA. Called by `AppStore.startCardDraft` on
+    /// start; cleared here once a card lands (`refreshNow`).
+    func setSetupSession(_ id: String?) {
+        guard setupSessionId != id else { return }
+        setupSessionId = id
+        bridge?.setSetupInflight(id != nil)
     }
 
     // MARK: refresh + live pushes
@@ -128,6 +144,11 @@ final class DeckStore: ObservableObject {
             state = StatePayload(cards: cards, snapshots: snapshots)
             persist()
             bridge?.deliverState(state)
+            // A card landed → the empty-board setup finished; drop the
+            // in-flight session so the CTA returns to its normal state.
+            if !cards.isEmpty {
+                setSetupSession(nil)
+            }
         } catch {
             NSLog("deck: refresh failed: %@", String(describing: error))
         }

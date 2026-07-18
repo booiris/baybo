@@ -830,6 +830,24 @@ final class AppStore: ObservableObject {
         return nil
     }
 
+    /// The Deck empty-board CTA. First tap: open a fresh chat on the Chats
+    /// tab and auto-send a `/card …` request (seed the store BEFORE
+    /// activating so `ComposerView` sends it on appear), tracking the session
+    /// as the in-flight setup. A re-tap while it's still running (no card
+    /// yet) returns to THAT chat instead of spawning a duplicate — the
+    /// tracked session clears once a card lands (`DeckStore.refreshNow`).
+    func startCardDraft(prompt: String) {
+        if let existing = deckStore.setupSessionId {
+            Task { await activateSession(existing, ensureListed: false) }
+            return
+        }
+        let sessionId = prewarmedDraftId ?? newChatSessionId()
+        prewarmedDraftId = nil
+        chatStore(for: sessionId).initialDraft = prompt
+        deckStore.setSetupSession(sessionId)
+        Task { await activateSession(sessionId, ensureListed: false) }
+    }
+
     private func prewarmTranscriptHost() {
         guard route == .home, transcriptHost == nil else { return }
         let sessionId = newChatSessionId()

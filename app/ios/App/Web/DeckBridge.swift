@@ -61,6 +61,12 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             }
         case "editMode":
             store?.editMode = body["active"] as? Bool ?? false
+        case "quickSetup":
+            // Empty-board CTA: open a fresh chat and auto-send a `/card …`
+            // request.
+            if let prompt = body["prompt"] as? String {
+                AppStore.shared?.startCardDraft(prompt: prompt)
+            }
         case "log":
             let level = body["level"] as? String ?? "info"
             let text = body["message"] as? String ?? ""
@@ -133,6 +139,10 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
 
     func setEditMode(_ active: Bool) {
         eval("setEditMode", active ? "true" : "false")
+    }
+
+    func setSetupInflight(_ active: Bool) {
+        eval("setSetupInflight", active ? "true" : "false")
     }
 
     func setLanguage(_ code: String) {

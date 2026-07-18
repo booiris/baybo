@@ -13,6 +13,10 @@ export type DeckStatePayload = {
 export type DeckInitPayload = DeckStatePayload & {
   lang: string;
   editMode?: boolean;
+  /// A `/card` creation started from the empty-board CTA is still running
+  /// (no card yet): the CTA shows an in-flight state and a re-tap returns
+  /// to that chat rather than starting a new one.
+  setupInflight?: boolean;
 };
 
 export type CardDataPayload = { cardId: string; seq: number; payload: string };
@@ -32,6 +36,7 @@ export type DeckShellGlobal = {
   callResult(payload: CallResultPayload): void;
   setEditMode(active: boolean): void;
   setLanguage(lang: string): void;
+  setSetupInflight(active: boolean): void;
 };
 
 export type CardAction = "enable" | "disable" | "delete";
@@ -105,4 +110,11 @@ export function postCardAction(cardId: string, action: CardAction): void {
 
 export function postEditMode(active: boolean): void {
   post({ type: "editMode", active });
+}
+
+/// Empty-board "Quick setup": ask native to open a fresh chat on the Chats
+/// tab and auto-send `prompt` (a `/card …` request) so the user lands in the
+/// conversation already working.
+export function postQuickSetup(prompt: string): void {
+  post({ type: "quickSetup", prompt });
 }
