@@ -95,4 +95,50 @@ describe('applySyncMerge (difference append + dedup)', () => {
     const page = [transcriptItemToRow(SID, msg(3, 'assistant', 'a'))];
     expect(applySyncMerge(prev, page)).toHaveLength(1);
   });
+
+  it('reconciles a live /stop-ack notice with its durable twin by content (no double)', () => {
+    // The `/stop` ack is persisted AFTER its emit, so the live frame carried no
+    // `durable_id` and the row was minted with a client `notice-…` key. Its
+    // synced `n<seq>` twin must adopt that row, not append a second card.
+    const ack = 'Stopped.\n- Cancelled the in-progress reply.';
+    const prev: TranscriptRow[] = [
+      { key: `notice-${SID}-0-1700`, role: 'system', text: '', notice: { level: 'info', text: ack } },
+    ];
+    const synced = transcriptItemToRow(SID, {
+      id: 'n4',
+      kind: 'notice',
+      role: '',
+      text: ack,
+      has_attachments: false,
+      notice_level: 'info',
+      created_at: new Date(0).toISOString(),
+    } as ApiItem);
+    const out = applySyncMerge(prev, [synced]);
+    expect(out).toHaveLength(1); // reconciled, not doubled
+    expect(out[0].key).toBe(`row-${SID}-n4`); // adopted the durable key
+    // A second sync now dedups by key.
+    expect(applySyncMerge(out, [synced])).toBe(out);
+  });
+
+  it('reconciles a durable /compact command echo with the optimistic bubble by platform_msg_id', () => {
+    // The Command control event now carries the send's platform_msg_id, so its
+    // synced user row reconciles with the optimistic `/compact` bubble instead
+    // of appending a second command bubble.
+    const prev: TranscriptRow[] = [
+      { key: 'pending-c', role: 'user', text: '/compact', pending: true, clientMsgId: 'c' },
+    ];
+    const synced = transcriptItemToRow(SID, {
+      id: 'n2',
+      kind: 'message',
+      role: 'user',
+      text: '/compact',
+      has_attachments: false,
+      platform_msg_id: 'c',
+      created_at: new Date(0).toISOString(),
+    } as ApiItem);
+    const out = applySyncMerge(prev, [synced]);
+    const commands = out.filter((r) => r.text === '/compact');
+    expect(commands).toHaveLength(1); // reconciled, not doubled
+    expect(commands[0].pending).toBeFalsy();
+  });
 });

@@ -83,4 +83,21 @@ pub struct ControlEvent {
     /// When the event occurred (e.g. the instant the user hit `/stop`), shown in
     /// the UI.
     pub created_at: DateTime<Utc>,
+    /// The originating send's `platform_msg_id` for a user-authored `Command`
+    /// echo (`/stop`, `/compact`) — empty for the notice kinds. The chat view
+    /// surfaces it as the row's `platform_msg_id` so a client's optimistic
+    /// command bubble reconciles with this durable echo instead of a difference
+    /// sync doubling it. Empty (the historical default) for rows predating the
+    /// column and for every non-command event.
+    #[serde(default)]
+    pub platform_msg_id: String,
+}
+
+/// The stable transcript row id of a persisted control event (`n<seq>`), as
+/// the sync/backfill DTOs key it. The SINGLE source of the format: the gateway
+/// reconstruction and the live `Frame::Notice::durable_id` must produce the
+/// same string, because clients dedup a live-minted notice row against its
+/// later-synced twin by exactly this id.
+pub fn control_event_row_id(seq: i64) -> String {
+    format!("n{seq}")
 }

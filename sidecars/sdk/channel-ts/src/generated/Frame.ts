@@ -30,7 +30,37 @@ as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pe
  * Omitted on the wire when `false` (the default), so existing
  * terminal notices are byte-identical.
  */
-transient?: boolean, } | { "kind": "task_list", session_id: string, user_id?: string, tasks: Array<TaskView>, } | { "kind": "turn_state", session_id: string, user_id?: string, active: boolean, 
+transient?: boolean, 
+/**
+ * `Some(true)` only for a tool-authored aside emitted while the turn
+ * keeps running (`SessionNotifier`): work-block clients may fold it
+ * into the open turn card as a leveled step. `Some(false)` for
+ * terminal or durable notices — turn failures, `/stop` acks,
+ * `/compact` confirmations — which must stay a visible standalone
+ * row. The emitter declares this because the client cannot infer it:
+ * a terminal notice races ahead of `turn_state{inactive}`, so "the
+ * turn looks live" proves nothing.
+ *
+ * Deliberately a TRI-STATE, not a defaulted bool: the gateway always
+ * sets `Some`, so `None` means the frame crossed a peer that
+ * predates the field — clients then fall back to the legacy
+ * fold-if-active heuristic. A defaulted `bool` cannot survive a
+ * re-encode hop (the iOS FFI decodes into this shared struct and
+ * re-encodes for its webview): absence would be manufactured into
+ * `false` and the fallback could never fire. `skip_serializing_if`
+ * keeps `None` absent across exactly that hop.
+ */
+mid_turn?: boolean | null, 
+/**
+ * The persisted control event's stable transcript row id (`n<seq>`)
+ * when this notice was recorded durably BEFORE being emitted (the
+ * blank-reply fallback, the `/compact` confirmation). Clients key
+ * their live-minted notice row by it so the row the next sync
+ * redelivers dedups by id instead of rendering the same text twice.
+ * Absent for live-only notices and for ones persisted only after
+ * the emit (the `/stop` acks, which clients pull via sync instead).
+ */
+durable_id?: string | null, } | { "kind": "task_list", session_id: string, user_id?: string, tasks: Array<TaskView>, } | { "kind": "turn_state", session_id: string, user_id?: string, active: boolean, 
 /**
  * `Some` iff `active`.
  */

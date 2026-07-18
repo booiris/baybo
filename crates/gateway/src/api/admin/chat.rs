@@ -3021,13 +3021,16 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
         None => (TranscriptItemKind::Message, "user".to_owned()),
     };
     ChatTranscriptItem {
-        id: format!("n{}", ev.seq),
+        id: baybo_model::control_event_row_id(ev.seq),
         ordinal: None,
         kind,
         role,
         text: ev.text,
         has_attachments: false,
-        platform_msg_id: String::new(),
+        // A `Command` echo carries the send's id so a client's optimistic
+        // command bubble reconciles with this durable row instead of a
+        // difference sync doubling it; notices carry none.
+        platform_msg_id: ev.platform_msg_id,
         attachments: Vec::new(),
         created_at: ev.created_at,
         steps: Vec::new(),
@@ -3174,7 +3177,31 @@ mod tests {
             kind,
             text: body.to_owned(),
             created_at: ts(secs),
+            platform_msg_id: String::new(),
         }
+    }
+
+    #[test]
+    fn control_event_item_emits_the_command_platform_msg_id() {
+        // A `/compact` echo reconstructs as a user MESSAGE row carrying the
+        // send's `platform_msg_id`, so a client's optimistic command bubble
+        // reconciles with it instead of a difference sync doubling the bubble.
+        let mut cmd = ctl(1, 4, baybo_model::ControlEventKind::Command, "/compact", 5);
+        cmd.platform_msg_id = "pm-7".to_owned();
+        let item = control_event_item(cmd);
+        assert_eq!(item.id, "n1");
+        assert_eq!(item.role, "user");
+        assert_eq!(item.platform_msg_id, "pm-7");
+
+        // A notice reconstructs with no msg id (it is not a user send).
+        let notice = ctl(
+            2,
+            4,
+            baybo_model::ControlEventKind::NoticeInfo,
+            "Stopped",
+            5,
+        );
+        assert_eq!(control_event_item(notice).platform_msg_id, "");
     }
 
     #[test]

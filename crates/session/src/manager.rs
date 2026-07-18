@@ -519,9 +519,17 @@ impl SessionManager {
         kind: ControlEventKind,
         text: &str,
         created_at: DateTime<Utc>,
+        platform_msg_id: &str,
     ) -> Result<i64> {
         self.store
-            .append_control_event(session_id, after_ordinal, kind, text, created_at)
+            .append_control_event(
+                session_id,
+                after_ordinal,
+                kind,
+                text,
+                created_at,
+                platform_msg_id,
+            )
             .await
             .map_err(SessionError::from)
     }

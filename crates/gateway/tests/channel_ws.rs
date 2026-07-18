@@ -606,6 +606,8 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         event: AgentEvent::Notice {
             level: baybo_channels::NoticeLevel::Info,
             text: "for some other tab".into(),
+            mid_turn: false,
+            durable_id: None,
         },
     });
 

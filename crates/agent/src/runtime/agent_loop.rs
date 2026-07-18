@@ -309,7 +309,14 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
             session_id: self.session_id.clone(),
             user_id: self.user_id.clone(),
             channel: self.channel.clone(),
-            event: AgentEvent::Notice { level, text },
+            // The one mid_turn=true source: every SessionNotifier emission is
+            // by construction an aside from inside a running tool call.
+            event: AgentEvent::Notice {
+                level,
+                text,
+                mid_turn: true,
+                durable_id: None,
+            },
         });
     }
 }
@@ -2605,6 +2612,7 @@ impl AgentLoop {
                 ControlEventKind::Progress,
                 text,
                 chrono::Utc::now(),
+                "",
             )
             .await
         {
@@ -3067,7 +3075,13 @@ mod notifier_bridge_tests {
         let out = rx.try_recv().expect("notice should be queued");
         match out {
             AgentOutput {
-                event: AgentEvent::Notice { level, text },
+                event:
+                    AgentEvent::Notice {
+                        level,
+                        text,
+                        mid_turn,
+                        durable_id,
+                    },
                 session_id,
                 user_id,
                 ..
@@ -3076,6 +3090,8 @@ mod notifier_bridge_tests {
                 assert_eq!(text, "summary: detail");
                 assert_eq!(session_id, "s");
                 assert_eq!(user_id, "u");
+                assert!(mid_turn, "SessionNotifier asides must be mid_turn");
+                assert!(durable_id.is_none(), "asides are live-only");
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -3087,7 +3103,7 @@ mod notifier_bridge_tests {
         n.emit(ToolsNoticeLevel::Error, "blocked", "rationale");
         match rx.try_recv().unwrap() {
             AgentOutput {
-                event: AgentEvent::Notice { level, text },
+                event: AgentEvent::Notice { level, text, .. },
                 ..
             } => {
                 assert_eq!(level, baybo_channels::NoticeLevel::Error);

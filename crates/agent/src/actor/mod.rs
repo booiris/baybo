@@ -537,6 +537,8 @@ impl AgentActor {
                 event: AgentEvent::Notice {
                     level: NoticeLevel::Error,
                     text: format!("The turn failed before producing a reply: {e}"),
+                    mid_turn: false,
+                    durable_id: None,
                 },
             };
             self.send_response(notice, "user_turn_failed").await;
@@ -934,7 +936,7 @@ impl AgentActor {
         let content = incoming.message.content;
         if is_compact_command(&content) {
             return self
-                .handle_compact(slash_command_text(&content), sent_at)
+                .handle_compact(slash_command_text(&content), sent_at, platform_msg_id)
                 .await;
         }
         // Background results are not folded into slash turns. Their own
@@ -1138,16 +1140,22 @@ impl AgentActor {
                 "user turn produced an empty reply; surfacing fallback notice"
             );
             // Record the fallback as an out-of-band control event so a reload
-            // doesn't show a bare user turn with no reply.
-            if let Some(after) = self.current_after_ordinal().await {
-                self.persist_control_event(
-                    after,
-                    ControlEventKind::NoticeWarn,
-                    EMPTY_USER_REPLY_NOTICE,
-                    chrono::Utc::now(),
-                )
-                .await;
-            }
+            // doesn't show a bare user turn with no reply; the live notice
+            // carries the durable row id so clients dedup against the synced
+            // twin.
+            let durable_id = match self.current_after_ordinal().await {
+                Some(after) => {
+                    self.persist_control_event(
+                        after,
+                        ControlEventKind::NoticeWarn,
+                        EMPTY_USER_REPLY_NOTICE,
+                        chrono::Utc::now(),
+                        "",
+                    )
+                    .await
+                }
+                None => None,
+            };
             let notice = AgentOutput {
                 session_id: self.durable.session.id.clone(),
                 user_id: self.durable.session.user.id.clone(),
@@ -1155,6 +1163,8 @@ impl AgentActor {
                 event: AgentEvent::Notice {
                     level: NoticeLevel::Warn,
                     text: EMPTY_USER_REPLY_NOTICE.to_string(),
+                    mid_turn: false,
+                    durable_id,
                 },
             };
             self.send_response(notice, "user_empty_fallback").await;
@@ -1172,6 +1182,7 @@ impl AgentActor {
         &mut self,
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
+        platform_msg_id: String,
     ) -> anyhow::Result<()> {
         // `compact_now` mints its own maintenance job and returns a control
         // notice; it does not emit a chat reply from the actor itself.
@@ -1189,17 +1200,30 @@ impl AgentActor {
         // Record the `/compact` echo + its confirmation as out-of-band control
         // events (off the LLM transcript) so a reload shows them, anchored after
         // the (post-compaction) last row.
-        if let Some(after) = self.current_after_ordinal().await {
-            self.persist_control_event(after, ControlEventKind::Command, &command_text, sent_at)
+        let durable_id = match self.current_after_ordinal().await {
+            Some(after) => {
+                // The Command echo carries the send's id so a client's
+                // optimistic `/compact` bubble reconciles with it; the notice
+                // is server-authored, so it has none.
+                self.persist_control_event(
+                    after,
+                    ControlEventKind::Command,
+                    &command_text,
+                    sent_at,
+                    &platform_msg_id,
+                )
                 .await;
-            self.persist_control_event(
-                after,
-                ControlEventKind::NoticeInfo,
-                &text,
-                chrono::Utc::now(),
-            )
-            .await;
-        }
+                self.persist_control_event(
+                    after,
+                    ControlEventKind::NoticeInfo,
+                    &text,
+                    chrono::Utc::now(),
+                    "",
+                )
+                .await
+            }
+            None => None,
+        };
         let notice = AgentOutput {
             session_id: self.durable.session.id.clone(),
             user_id: self.durable.session.user.id.clone(),
@@ -1207,6 +1231,8 @@ impl AgentActor {
             event: AgentEvent::Notice {
                 level: NoticeLevel::Info,
                 text,
+                mid_turn: false,
+                durable_id,
             },
         };
         self.send_response(notice, "compact").await;
@@ -1255,26 +1281,41 @@ impl AgentActor {
 
     /// Append an out-of-band control event (slash-command echo / notice) to the
     /// session's control-event log — separate from the LLM transcript, surfaced
-    /// only on the chat view. Best-effort: a write failure just means it won't
-    /// reappear on reload.
+    /// only on the chat view. Returns the event's stable transcript row id
+    /// (`n<seq>`) so a live notice emitted for the same event can carry it
+    /// (`AgentEvent::Notice::durable_id`) and clients dedup against the row the
+    /// next sync redelivers. Best-effort: `None` on a write failure just means
+    /// it won't reappear on reload (and the live notice dedups nothing).
     async fn persist_control_event(
         &self,
         after_ordinal: i64,
         kind: ControlEventKind,
         text: &str,
         at: chrono::DateTime<chrono::Utc>,
-    ) {
-        if let Err(e) = self
+        platform_msg_id: &str,
+    ) -> Option<String> {
+        match self
             .volatile
             .session_manager
-            .append_control_event(&self.durable.session.id, after_ordinal, kind, text, at)
+            .append_control_event(
+                &self.durable.session.id,
+                after_ordinal,
+                kind,
+                text,
+                at,
+                platform_msg_id,
+            )
             .await
         {
-            warn!(
-                session_id = %self.durable.session.id,
-                error = %e,
-                "failed to persist control event"
-            );
+            Ok(seq) => Some(baybo_model::control_event_row_id(seq)),
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %e,
+                    "failed to persist control event"
+                );
+                None
+            }
         }
     }
 

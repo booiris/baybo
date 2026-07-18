@@ -324,7 +324,7 @@ export function freezeActiveWork(rows: Row[]): Row[] {
 ///
 /// The tail is found by scanning back over a trailing NOTICE run, not by taking
 /// `rows[len-1]`: a terminal notice landing once the block is frozen keeps its
-/// OWN row (it may be durable — see `foldTerminalNoticeIn`), and a plain
+/// OWN row (it may be durable — see `severTerminalNoticeIn`), and a plain
 /// adjacency check would then fork the turn's continuation into a second card
 /// ([work][notice][work]). The block folded back into keeps its frozen
 /// `active:false` and its `elapsedMs` — `mutate` only appends steps — so a
@@ -345,20 +345,41 @@ export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[
   return [...freezeActiveWork(rows), mutate(fresh)];
 }
 
-/// A terminal notice that lands mid-turn folds INTO the open work block as a
-/// leveled step, so it doesn't sever the block into two cards (the tail must
-/// stay a work row for `openWorkIn` to keep extending it). Only an ACTIVE block
-/// folds: those mid-turn notices are live-only (never persisted), so the folded
-/// step can't duplicate a durable row. A notice with no active block — between
-/// turns, or a persisted `/stop`/`/compact` outcome anchored after the turn —
-/// keeps its own centered `role:"notice"` row (its durable shape). The pure core
-/// of `foldTerminalNotice`.
-export function foldTerminalNoticeIn(rows: Row[], level: string, text: string): Row[] {
+/// A tool-authored mid-turn aside (the wire's `mid_turn` flag — the SERVER
+/// declares fold-eligibility, the client never infers it from timing) folds
+/// INTO the open work block as a leveled step, so it doesn't sever the block
+/// into two cards (the tail must stay a work row for `openWorkIn` to keep
+/// extending it). Only an ACTIVE block folds: these asides are live-only
+/// (never persisted), so the folded step can't duplicate a durable row. With
+/// no active block the aside keeps its own centered `role:"notice"` row. The
+/// pure core of `foldMidTurnNotice`.
+export function foldMidTurnNoticeIn(rows: Row[], level: string, text: string): Row[] {
   const last = rows[rows.length - 1];
   if (last && last.role === "work" && last.active) {
     return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
   }
   return [...rows, { id: uid(), role: "notice", content: text }];
+}
+
+/// A terminal or durable notice (`mid_turn`-less: the turn-failed / crash /
+/// blank-reply notices, `/compact` confirmations) severs: freeze any active
+/// block so it can't linger "working" behind the card, and keep the notice its
+/// own centered row. Folding it instead would bury the turn's only output
+/// inside the collapsing card — these notices beat the projector's
+/// `turn_state{inactive}`, so an active-looking block proves nothing.
+/// `durableId` is the persisted twin's `n<seq>` row id: the minted row adopts
+/// it so the row the next sync redelivers dedups by id instead of rendering
+/// the same text twice (a uid-keyed copy would be invisible to that dedup —
+/// the exact doubling the stop-ack path avoids by never minting). The pure
+/// core of `severTerminalNotice`.
+export function severTerminalNoticeIn(rows: Row[], text: string, durableId: string | null): Row[] {
+  const frozen = freezeActiveWork(rows);
+  if (durableId !== null && durableId !== "") {
+    // The durable row may already be on screen (a sync raced the live frame).
+    if (rows.some((r) => r.id === durableId)) return frozen;
+    return [...frozen, { id: durableId, role: "notice", content: text }];
+  }
+  return [...frozen, { id: uid(), role: "notice", content: text }];
 }
 
 /// Fuse a client work block (`base` — live/restored: freshest streamed steps +
@@ -1920,8 +1941,12 @@ export function Transcript({
     prependAnchor.current = null;
   }, [messages]);
 
-  const foldTerminalNotice = useCallback((level: string, text: string) => {
-    setMessages((rows) => foldTerminalNoticeIn(rows, level, text));
+  const foldMidTurnNotice = useCallback((level: string, text: string) => {
+    setMessages((rows) => foldMidTurnNoticeIn(rows, level, text));
+  }, []);
+
+  const severTerminalNotice = useCallback((text: string, durableId: string | null) => {
+    setMessages((rows) => severTerminalNoticeIn(rows, text, durableId));
   }, []);
 
   const appendNotice = useCallback((text: string) => {
@@ -2636,12 +2661,21 @@ export function Transcript({
           setAwaitingReply(false);
           setMessages((rows) => freezeActiveWork(rows));
           runSync();
-        } else {
-          // A terminal notice (a server rejection, a degraded-mode banner) means
-          // no turn is starting — end the optimistic window so the stop button
-          // can't strand.
+        } else if (frame.mid_turn ?? true) {
+          // A tool-authored aside — the server's fold-eligibility declaration.
+          // Fold into the open block; the turn keeps running. An ABSENT flag
+          // means an older gateway that predates it (the new gateway always
+          // serializes `mid_turn`): fall back to this legacy fold-if-active
+          // heuristic rather than severing, which would freeze the live block
+          // on every tool aside and drop the stop affordance mid-turn.
           setAwaitingReply(false);
-          foldTerminalNotice(frame.level, frame.text);
+          foldMidTurnNotice(frame.level, frame.text);
+        } else {
+          // A terminal notice (a turn failure, a server rejection) means no
+          // reply is coming — end the optimistic window so the stop button
+          // can't strand, freeze the block, and keep the notice a visible row.
+          setAwaitingReply(false);
+          severTerminalNotice(frame.text, frame.durable_id ?? null);
         }
         break;
       case "sync_page":

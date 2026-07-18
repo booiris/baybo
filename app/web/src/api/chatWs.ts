@@ -225,6 +225,19 @@ export type Frame =
        *  observer), which must fold into the open work block rather than
        *  end the turn. Absent/false for a terminal notice. */
       transient?: boolean;
+      /** `true` only for a tool-authored aside emitted while the turn keeps
+       *  running (`SessionNotifier`) — the fold-eligible class. `false` for
+       *  terminal or durable notices (turn failures, `/stop` acks,
+       *  `/compact` confirmations), which must stay a committed row. The
+       *  server declares this; the client cannot infer it from timing.
+       *  Absent only when the frame crossed a peer that predates the field
+       *  (tri-state on the wire). */
+      mid_turn?: boolean | null;
+      /** The persisted control event's stable row id (`n<seq>`) when this
+       *  notice was recorded durably before the emit (blank-reply fallback,
+       *  `/compact` confirmation). The live-minted row is keyed by it so the
+       *  row the next sync redelivers dedups instead of doubling. */
+      durable_id?: string | null;
     }
   | {
       kind: 'approval_requested';

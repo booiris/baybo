@@ -50,7 +50,7 @@
       "count": 45
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 120
+      "count": 119
     }
   },
   "src/pages/CronPage.tsx": {
@@ -160,7 +160,7 @@
   },
   "src/pages/turnSync.test.ts": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 11
+      "count": 9
     },
     "@typescript-eslint/strict-boolean-expressions": {
       "count": 1

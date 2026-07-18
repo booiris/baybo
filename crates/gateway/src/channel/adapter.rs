@@ -474,7 +474,12 @@ async fn agent_output_to_frame(
                 ordinal: response.ordinal,
             })
         }
-        AgentEvent::Notice { level, text } => {
+        AgentEvent::Notice {
+            level,
+            text,
+            mid_turn,
+            durable_id,
+        } => {
             let level = match level {
                 NoticeLevel::Info => "info",
                 NoticeLevel::Warn => "warn",
@@ -486,6 +491,8 @@ async fn agent_output_to_frame(
                 level: level.to_owned(),
                 text,
                 transient: false,
+                mid_turn: Some(mid_turn),
+                durable_id,
             }
         }
         // Transient progress narration (the observer) rides the same
@@ -499,6 +506,8 @@ async fn agent_output_to_frame(
             level: "info".to_owned(),
             text,
             transient: true,
+            mid_turn: Some(false),
+            durable_id: None,
         },
         AgentEvent::TaskList(tasks) => Frame::TaskList {
             session_id,
@@ -724,16 +733,86 @@ mod tests {
             event: AgentEvent::Notice {
                 level: NoticeLevel::Warn,
                 text: "heads up".to_owned(),
+                mid_turn: false,
+                durable_id: None,
             },
         };
         let blobs = MemoryBlobStore::new();
         let frame = super::agent_output_to_frame(out, &ChannelType::owner(), &blobs).await;
         match frame {
             Frame::Notice {
-                level, transient, ..
+                level,
+                transient,
+                mid_turn,
+                ..
             } => {
                 assert_eq!(level, "warn");
                 assert!(!transient, "a terminal notice must not be transient");
+                assert_eq!(
+                    mid_turn,
+                    Some(false),
+                    "a terminal notice must not read mid_turn"
+                );
+            }
+            other => panic!("expected a notice frame, got {other:?}"),
+        }
+    }
+
+    /// A tool-authored aside (`SessionNotifier`) carries `mid_turn: true`
+    /// through to the wire — the flag work-block clients key the fold on.
+    #[tokio::test]
+    async fn mid_turn_notice_flag_passes_through() {
+        let out = AgentOutput {
+            session_id: "s1".into(),
+            user_id: "u1".to_owned(),
+            channel: ChannelType::owner(),
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: "sandbox downgraded".to_owned(),
+                mid_turn: true,
+                durable_id: None,
+            },
+        };
+        let blobs = MemoryBlobStore::new();
+        let frame = super::agent_output_to_frame(out, &ChannelType::owner(), &blobs).await;
+        match frame {
+            Frame::Notice {
+                transient,
+                mid_turn,
+                ..
+            } => {
+                assert_eq!(
+                    mid_turn,
+                    Some(true),
+                    "the tool-aside flag must reach the wire"
+                );
+                assert!(!transient, "mid_turn is orthogonal to transient");
+            }
+            other => panic!("expected a notice frame, got {other:?}"),
+        }
+    }
+
+    /// A durably-persisted notice's row id (`n<seq>`) rides the frame so
+    /// clients can key their live-minted row by it and dedup against the
+    /// twin the next sync redelivers.
+    #[tokio::test]
+    async fn durable_notice_row_id_passes_through() {
+        let out = AgentOutput {
+            session_id: "s1".into(),
+            user_id: "u1".to_owned(),
+            channel: ChannelType::owner(),
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "Context compacted.".to_owned(),
+                mid_turn: false,
+                durable_id: Some("n7".to_owned()),
+            },
+        };
+        let blobs = MemoryBlobStore::new();
+        let frame = super::agent_output_to_frame(out, &ChannelType::owner(), &blobs).await;
+        match frame {
+            Frame::Notice { durable_id, .. } => {
+                assert_eq!(durable_id.as_deref(), Some("n7"));
             }
             other => panic!("expected a notice frame, got {other:?}"),
         }

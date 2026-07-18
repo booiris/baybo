@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 
 import {
   workBlockDisplay,
+  formatDuration,
   formatWorkedLabel,
+  foldNoticeIntoActiveWork,
   closeActiveWork,
   settleActiveWork,
   finalizeTrailingAnswer,
@@ -51,19 +53,161 @@ describe('workBlockDisplay — spinner first, expand on the first step', () => {
   });
 });
 
+describe('formatDuration — humanized by magnitude, mirrors the iOS transcript', () => {
+  it.each([
+    ['seconds under a minute', 5_000, '5s'],
+    ['the last second before the minute boundary', 59_000, '59s'],
+    ['exactly one minute crosses into the m form', 60_000, '1m'],
+    ['minutes and seconds', 90_000, '1m 30s'],
+    ['a whole minute drops the seconds', 120_000, '2m'],
+    ['hours and minutes', 5_400_000, '1h 30m'],
+    ['a whole hour drops the minutes', 3_600_000, '1h'],
+    ['a 60-minute rounding carry rolls the hour', 7_170_000, '2h'],
+  ])('%s', (_why, ms, expected) => {
+    expect(formatDuration(ms)).toBe(expected);
+  });
+});
+
 describe('formatWorkedLabel — never "0s", "Cancelled" for /stop', () => {
   it('renders just "Worked" for a sub-second turn', () => {
     expect(formatWorkedLabel(0)).toBe('Worked');
+    expect(formatWorkedLabel(500)).toBe('Worked');
   });
 
-  it('renders the whole-second duration once it reaches 1s', () => {
-    expect(formatWorkedLabel(1)).toBe('Worked 1s');
-    expect(formatWorkedLabel(42)).toBe('Worked 42s');
+  it('renders the humanized duration once it reaches 1s', () => {
+    expect(formatWorkedLabel(1_000)).toBe('Worked 1s');
+    expect(formatWorkedLabel(42_000)).toBe('Worked 42s');
+    expect(formatWorkedLabel(90_000)).toBe('Worked 1m 30s');
   });
 
   it('labels a cancelled turn distinctly, still never "0s"', () => {
     expect(formatWorkedLabel(0, true)).toBe('Cancelled');
-    expect(formatWorkedLabel(7, true)).toBe('Cancelled · Worked 7s');
+    expect(formatWorkedLabel(7_000, true)).toBe('Cancelled · Worked 7s');
+  });
+});
+
+describe('foldNoticeIntoActiveWork — mid-turn notices stay inside the card', () => {
+  const step: WorkStep = { key: 's', kind: 'tool', tool: 'edit_file', toolStatus: 'ok' };
+  const activeBlock = (): TranscriptRow => ({
+    key: 'w',
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [step],
+    workActive: true,
+    workStartedAt: 1000,
+  });
+
+  it('folds a leveled notice step into the active tail block, leaving the turn running', () => {
+    const out = foldNoticeIntoActiveWork([activeBlock()], 'warn', 'degraded mode');
+    expect(out).toHaveLength(1);
+    expect(out?.[0].workActive).toBe(true);
+    expect(out?.[0].steps).toHaveLength(2);
+    expect(out?.[0].steps?.[1]).toMatchObject({
+      kind: 'notice',
+      noticeLevel: 'warn',
+      text: 'degraded mode',
+    });
+  });
+
+  it('declines a frozen tail — the notice keeps its committed row', () => {
+    const frozen: TranscriptRow = { ...activeBlock(), workActive: false, workEndedAt: 1500 };
+    expect(foldNoticeIntoActiveWork([frozen], 'error', 'x')).toBeNull();
+  });
+
+  it('folds a trailing streaming bubble to prose AHEAD of the notice step', () => {
+    // The web keeps the streamed reply as a transcript row below the block
+    // (iOS holds it out-of-band). The bubble must fold away, not be reached
+    // over: the notice's pacer flush deletes the pacer, and the next delta's
+    // recreated pacer would adopt a left-behind bubble as its write target and
+    // wholesale-replace — erase — the pre-notice text.
+    const bubble: TranscriptRow = { key: 'a', role: 'assistant', text: 'partial', streaming: true };
+    const out = foldNoticeIntoActiveWork([activeBlock(), bubble], 'warn', 'degraded');
+    expect(out).toHaveLength(1); // bubble folded away
+    expect(out?.[0].workActive).toBe(true);
+    expect(out?.[0].steps).toMatchObject([
+      { kind: 'tool' },
+      { kind: 'prose', text: 'partial' },
+      { kind: 'notice', noticeLevel: 'warn', text: 'degraded' },
+    ]);
+  });
+
+  it('drops a blank streaming bubble without minting an empty prose step', () => {
+    const blank: TranscriptRow = { key: 'a', role: 'assistant', text: '   ', streaming: true };
+    const out = foldNoticeIntoActiveWork([activeBlock(), blank], 'info', 'x');
+    expect(out).toHaveLength(1);
+    expect(out?.[0].steps).toMatchObject([{ kind: 'tool' }, { kind: 'notice', text: 'x' }]);
+  });
+
+  it('declines when the streaming bubble sits over a frozen block', () => {
+    const frozen: TranscriptRow = { ...activeBlock(), workActive: false, workEndedAt: 1500 };
+    const bubble: TranscriptRow = { key: 'a', role: 'assistant', text: 'partial', streaming: true };
+    expect(foldNoticeIntoActiveWork([frozen, bubble], 'info', 'x')).toBeNull();
+  });
+
+  it('declines a FINALIZED trailing answer (final-reply phase done — not mid-stream)', () => {
+    const done: TranscriptRow = { key: 'a', role: 'assistant', text: 'answer' };
+    expect(foldNoticeIntoActiveWork([activeBlock(), done], 'info', 'x')).toBeNull();
+  });
+
+  it('declines an EMPTY active block — the eagerly-opened working affordance', () => {
+    // `applyTurnState` opens a step-less block on `turn_state{active}` before
+    // any work lands (iOS opens none until a real work frame). A notice on it
+    // is the turn's ONLY output — the turn-failed / blank-reply notice racing
+    // ahead of `turn_state{inactive}` — and must stay a visible card instead
+    // of being buried inside a bare "Worked Xs ›" stub.
+    const empty: TranscriptRow = { ...activeBlock(), steps: [] };
+    expect(foldNoticeIntoActiveWork([empty], 'error', 'The turn failed')).toBeNull();
+  });
+
+  it('declines an empty transcript', () => {
+    expect(foldNoticeIntoActiveWork([], 'info', 'x')).toBeNull();
+  });
+});
+
+
+describe('straggler frames fold back across trailing notice rows (one turn, one card)', () => {
+  const closedWork = (): TranscriptRow => ({
+    key: 'w',
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [{ key: 's', kind: 'tool', tool: 'edit_file', toolStatus: 'ok' }],
+    workActive: false,
+    workStartedAt: 1000,
+    workEndedAt: 1500,
+  });
+  const noticeRow = (): TranscriptRow => ({
+    key: 'n',
+    role: 'system',
+    text: '',
+    notice: { level: 'warn', text: 'stopped' },
+  });
+
+  it('a tool completing after the freeze folds into the block, not a second card', () => {
+    const out = applyToolCompletedStep([closedWork(), noticeRow()], 'c9', 'ok', 'late result', undefined, false);
+    expect(out).toHaveLength(2); // no third row forked
+    expect(out[0].kind).toBe('work');
+    expect(out[0].steps).toHaveLength(2);
+    expect(out[0].steps?.[1]).toMatchObject({ kind: 'tool', toolSummary: 'late result' });
+    expect(out[0].workActive).toBe(false); // stays frozen — never re-opened
+    expect(out[0].workEndedAt).toBe(1500); // never re-timed
+    expect(out[1].notice?.text).toBe('stopped'); // the notice keeps its row
+  });
+
+  it('a late tool START also folds back (still one card)', () => {
+    const out = pushToolStartedStep([closedWork(), noticeRow()], 'c9', 'Bash', 'ls', false);
+    expect(out).toHaveLength(2);
+    expect(out[0].steps).toHaveLength(2);
+    expect(out[0].workActive).toBe(false);
+  });
+
+  it('the scan stops at a non-notice row — a later turn still gets its own card', () => {
+    const rows: TranscriptRow[] = [closedWork(), { key: 'a', role: 'assistant', text: 'done' }];
+    const out = applyToolCompletedStep(rows, 'c9', 'ok', 'late', undefined, false);
+    expect(out).toHaveLength(3);
+    expect(out[0].steps).toHaveLength(1); // the finished turn is untouched
+    expect(out[2].kind).toBe('work'); // fresh block appended at the tail
   });
 });
 

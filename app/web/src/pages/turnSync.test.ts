@@ -1,12 +1,15 @@
 import { describe, it, expect } from 'vitest';
 
 import {
+  applySyncMerge,
   applyTurnState,
   routeInboundFrame,
+  transcriptItemToRow,
   type SessionView,
   type TranscriptRow,
   type WorkStep,
 } from './ChatPage';
+import type { components } from '../api/schema';
 import type { Frame } from '../api/chatWs';
 
 // These suites pin the server-authoritative TurnState contract on the
@@ -109,6 +112,37 @@ describe('applyTurnState — turn-state reconciliation', () => {
     const next = applyTurnState(prev, false, null);
     expect(next[0].workActive).toBe(false);
     expect(typeof next[0].workEndedAt).toBe('number');
+  });
+
+  it('finds the matching block across its trailing answer/notice run (no duplicate below)', () => {
+    // The turn's partial answer bubble and a committed notice row land BELOW
+    // the block, so the block is not the literal tail; the reconciliation must
+    // still reach it rather than opening a second card after them.
+    const closed = workRow({ startedAt: 1000, active: false, endedAt: 1500, steps: [toolStep('x')] });
+    const answer: TranscriptRow = { key: 'a', role: 'assistant', text: 'partial' };
+    const notice: TranscriptRow = {
+      key: 'n',
+      role: 'system',
+      text: '',
+      notice: { level: 'warn', text: 'degraded' },
+    };
+    const next = applyTurnState([closed, answer, notice], true, 1000);
+    expect(next).toHaveLength(3);
+    expect(next[0].workActive).toBe(true);
+    expect(next[0].workEndedAt).toBeUndefined();
+    expect(next[1]).toBe(answer);
+    expect(next[2]).toBe(notice);
+  });
+
+  it('a user row is the barrier — an earlier turn is never reconciled through it', () => {
+    const closed = workRow({ startedAt: 1000, active: false, endedAt: 1500, steps: [toolStep('x')] });
+    const user: TranscriptRow = { key: 'u', role: 'user', text: 'next prompt' };
+    const next = applyTurnState([closed, user], true, 2000);
+    expect(next).toHaveLength(3);
+    expect(next[0]).toBe(closed); // untouched
+    expect(next[2].kind).toBe('work');
+    expect(next[2].workActive).toBe(true);
+    expect(next[2].workStartedAt).toBe(2000);
   });
 });
 
@@ -295,14 +329,176 @@ describe('multi-tab turn sync via routeInboundFrame', () => {
     expect(work?.workCancelled).toBe(true);
   });
 
-  it('a non-cancelling notice leaves the block as plain "Worked"', () => {
+  it('a mid_turn notice folds into the ACTIVE block; the turn keeps running', () => {
+    // Committing the notice as its own row would sever the block — no longer
+    // the transcript tail — so the turn's next work frame would fork a second
+    // "Worked" card. It folds in as a leveled step instead (the iOS model).
+    // Fold-eligibility is the SERVER's `mid_turn` declaration (tool asides),
+    // never inferred from timing.
     const tab = makeTab();
     tab.feed(turnStart);
     tab.feed(toolStarted);
+    tab.feed({ kind: 'notice', session_id: SID, level: 'warn', text: 'degraded mode', mid_turn: true });
+    const work = tab.views()[SID].transcript.find((r) => r.kind === 'work');
+    expect(work?.workActive).toBe(true); // not severed — the turn is still going
+    const foldedSteps = work?.steps ?? [];
+    expect(foldedSteps[foldedSteps.length - 1]).toMatchObject({
+      kind: 'notice',
+      noticeLevel: 'warn',
+      text: 'degraded mode',
+    });
+    expect(tab.views()[SID].transcript.some((r) => r.notice !== undefined)).toBe(false);
+
+    // More work after the notice lands in the SAME card…
+    tab.feed({ kind: 'tool_started', session_id: SID, call_id: 'c2', tool: 'edit_file', label: 'y' });
+    expect(tab.views()[SID].transcript.filter((r) => r.kind === 'work')).toHaveLength(1);
+
+    // …and the turn's own end closes it to a plain "Worked" (never "Cancelled").
+    tab.feed(turnEnd);
+    const closed = tab.views()[SID].transcript.find((r) => r.kind === 'work');
+    expect(closed?.workActive).toBe(false);
+    expect(closed?.workCancelled).toBeFalsy();
+  });
+
+  it('a notice with no active block keeps its committed row (between turns)', () => {
+    const tab = makeTab();
     tab.feed({ kind: 'notice', session_id: SID, level: 'info', text: 'Context compacted.' });
-    const work = (tab.views()[SID]?.transcript ?? []).find((r) => r.kind === 'work');
-    expect(work?.workActive).toBe(false);
+    const rows = tab.views()[SID].transcript;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].notice?.text).toBe('Context compacted.');
+    expect(tab.turn()?.active).toBe(false);
+  });
+
+  it('a turn-failure notice on the EMPTY eagerly-opened block stays a visible card', () => {
+    // The actor emits the "turn failed before producing a reply" error notice
+    // BEFORE the projector's turn_state{inactive}, so it lands while the
+    // step-less working affordance is still active. Folding it there would
+    // bury the turn's only output inside a bare "Worked Xs ›" stub.
+    const tab = makeTab();
+    tab.feed(turnStart); // opens the empty active block
+    tab.feed({
+      kind: 'notice',
+      session_id: SID,
+      level: 'error',
+      text: 'The turn failed before producing a reply: boom',
+    });
+    const rows = tab.views()[SID].transcript;
+    expect(rows.some((r) => r.kind === 'work')).toBe(false); // empty block dropped
+    expect(rows[rows.length - 1].notice?.level).toBe('error'); // failure visible
+    tab.feed(turnEnd);
+    expect(tab.views()[SID].transcript.some((r) => r.kind === 'work')).toBe(false);
+  });
+
+  it('a mid-stream mid_turn notice folds into the block (bubble → prose, no sever, no fork)', () => {
+    const tab = makeTab();
+    tab.feed(turnStart);
+    tab.feed(toolStarted);
+    tab.feed({ kind: 'answer_delta', session_id: SID, text: 'partial ' });
+    tab.feed({ kind: 'notice', session_id: SID, level: 'warn', text: 'degraded mode', mid_turn: true });
+    const rows = tab.views()[SID].transcript;
+    expect(rows.filter((r) => r.kind === 'work')).toHaveLength(1);
+    expect(rows.some((r) => r.notice !== undefined)).toBe(false); // folded, not committed
+    const work = rows.find((r) => r.kind === 'work');
+    expect(work?.workActive).toBe(true); // block not frozen mid-stream
+    // The streamed text is preserved as a prose step AHEAD of the notice, and
+    // the bubble row is gone — left at the tail it would become the recreated
+    // pacer's write target and the next delta would erase the pre-notice text.
+    const steps = work?.steps ?? [];
+    expect(steps[steps.length - 2]).toMatchObject({ kind: 'prose', text: 'partial ' });
+    expect(steps[steps.length - 1]).toMatchObject({ kind: 'notice', text: 'degraded mode' });
+    expect(rows[rows.length - 1].kind).toBe('work'); // bubble folded away
+
+    // A post-notice delta opens a FRESH bubble with only its own text…
+    tab.feed({ kind: 'answer_delta', session_id: SID, text: 'part B' });
+    const rows2 = tab.views()[SID].transcript;
+    expect(rows2[rows2.length - 1]).toMatchObject({ role: 'assistant', streaming: true, text: 'part B' });
+
+    // …and the turn's continuation still lands in the SAME card.
+    tab.feed({ kind: 'tool_started', session_id: SID, call_id: 'c2', tool: 'edit_file', label: 'y' });
+    expect(tab.views()[SID].transcript.filter((r) => r.kind === 'work')).toHaveLength(1);
+  });
+
+  it('a no-op /stop ack severs even against a still-active block (persisted ack stays visible)', () => {
+    // An observer tab can receive "Nothing in progress to stop." while its
+    // block is still active (the router's ack is unordered w.r.t. the turn-end
+    // frames). The ack is a persisted control event and carries no `mid_turn`,
+    // so it severs — burying it inside the collapsed card would hide it live
+    // and double it against the durable row.
+    const tab = makeTab();
+    tab.feed(turnStart);
+    tab.feed(toolStarted);
+    tab.feed({ kind: 'notice', session_id: SID, level: 'info', text: 'Nothing in progress to stop.' });
+    const rows = tab.views()[SID].transcript;
+    expect(rows[rows.length - 1].notice?.text).toBe('Nothing in progress to stop.');
+    const work = rows.find((r) => r.kind === 'work');
+    expect(work?.workActive).toBe(false); // severed + closed, never "Cancelled"
     expect(work?.workCancelled).toBeFalsy();
+  });
+
+  it('a durably-persisted notice keys its live row by the n<seq> id, so the synced twin dedups', () => {
+    const tab = makeTab();
+    tab.feed({
+      kind: 'notice',
+      session_id: SID,
+      level: 'info',
+      text: 'Context compacted.',
+      durable_id: 'n7',
+    });
+    const rows = tab.views()[SID].transcript;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].key).toBe(`row-${SID}-n7`); // transcriptRowKey(sid, 'n7')
+    // The next difference sync redelivers the same control event — the stable
+    // key makes applySyncMerge's dedup skip it instead of doubling the card.
+    const synced = transcriptItemToRow(SID, {
+      id: 'n7',
+      kind: 'notice',
+      role: '',
+      text: 'Context compacted.',
+      has_attachments: false,
+      notice_level: 'info',
+      created_at: '2026-06-14T12:00:05Z',
+    } as components['schemas']['ChatTranscriptItem']);
+    expect(applySyncMerge(rows, [synced])).toBe(rows); // unchanged — deduped
+  });
+
+  it('skips the durable-keyed mint when the row is already on screen (sync raced ahead)', () => {
+    // Persist precedes emit, and a gap/reconnect sync is unordered w.r.t. the
+    // WS frame — the synced twin can land first. The live frame must not
+    // append a second card under the same key.
+    const tab = makeTab();
+    const noticeFrame: Frame = {
+      kind: 'notice',
+      session_id: SID,
+      level: 'info',
+      text: 'Context compacted.',
+      durable_id: 'n7',
+    };
+    tab.feed(noticeFrame);
+    tab.feed(noticeFrame);
+    expect(tab.views()[SID].transcript).toHaveLength(1);
+  });
+
+  it('a terminal failure notice on a STEPPED active block still severs into a visible card', () => {
+    // The turn-failed / blank-reply notices carry no `mid_turn`, and they beat
+    // the projector's turn_state{inactive}. With work already on the block the
+    // old shape-based fold buried them inside the collapsing card; the wire
+    // flag keeps them a committed row.
+    const tab = makeTab();
+    tab.feed(turnStart);
+    tab.feed(toolStarted);
+    tab.feed({
+      kind: 'notice',
+      session_id: SID,
+      level: 'error',
+      text: 'The turn failed before producing a reply: boom',
+    });
+    const rows = tab.views()[SID].transcript;
+    expect(rows[rows.length - 1].notice?.level).toBe('error'); // failure visible
+    const work = rows.find((r) => r.kind === 'work');
+    expect(work?.workActive).toBe(false); // block collapsed above the card
+    expect(work?.steps?.some((s) => s.kind === 'notice')).toBeFalsy(); // not folded
+    tab.feed(turnEnd);
+    expect(tab.views()[SID].transcript[rows.length - 1].notice?.level).toBe('error');
   });
 
   it('keeps attachments when an ordinal final message replaces a streaming bubble', () => {

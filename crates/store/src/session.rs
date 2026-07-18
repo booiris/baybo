@@ -220,7 +220,9 @@ pub trait SessionStore: Send + Sync {
     /// `seq` and returns it. `after_ordinal` is the `session_messages.ordinal`
     /// the event follows (`-1` if none yet), used to interleave it into the chat
     /// view; `created_at` is the event's own time (e.g. when the user hit
-    /// `/stop`), shown in the UI.
+    /// `/stop`), shown in the UI. `platform_msg_id` is the originating send's id
+    /// for a user-authored `Command` echo (empty for notices) so a client's
+    /// optimistic command bubble reconciles with the durable echo.
     async fn append_control_event(
         &self,
         session_id: &SessionId,
@@ -228,6 +230,7 @@ pub trait SessionStore: Send + Sync {
         kind: ControlEventKind,
         text: &str,
         created_at: DateTime<Utc>,
+        platform_msg_id: &str,
     ) -> Result<i64>;
 
     /// All control events for a session, oldest-first by `seq`.

@@ -700,21 +700,30 @@ impl SessionStore for SqliteSessionStore {
         kind: ControlEventKind,
         text: &str,
         created_at: DateTime<Utc>,
+        platform_msg_id: &str,
     ) -> Result<i64> {
         let sid = session_id.as_str().to_string();
         let kind = kind.as_str().to_string();
         let text = text.to_string();
+        let platform_msg_id = platform_msg_id.to_string();
         let created_us = super::time::to_us(created_at);
         self.pool
             .interact("sessions.append_control_event", move |conn| {
                 let seq: i64 = conn
                     .query_row(
                         "INSERT INTO session_control_events \
-                     (session_id, seq, after_ordinal, kind, text, created_at) \
-                     SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5 \
+                     (session_id, seq, after_ordinal, kind, text, created_at, platform_msg_id) \
+                     SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5, ?6 \
                      FROM session_control_events WHERE session_id = ?1 \
                      RETURNING seq",
-                        rusqlite::params![sid, after_ordinal, kind, text, created_us],
+                        rusqlite::params![
+                            sid,
+                            after_ordinal,
+                            kind,
+                            text,
+                            created_us,
+                            platform_msg_id
+                        ],
                         |row| row.get(0),
                     )
                     .optional()?
@@ -1466,7 +1475,8 @@ impl SqliteSessionStore {
             .pool
             .interact("sessions.list_control_events", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
+                    "SELECT seq, after_ordinal, kind, text, created_at, platform_msg_id \
+                     FROM session_control_events \
                      WHERE session_id = ?1 AND after_ordinal >= ?2 AND after_ordinal <= ?3 \
                      ORDER BY seq",
                 )?;
@@ -1478,6 +1488,7 @@ impl SqliteSessionStore {
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1486,7 +1497,7 @@ impl SqliteSessionStore {
             .await?;
 
         let mut out = Vec::new();
-        for (seq, after_ordinal, kind_str, text, created_us) in rows {
+        for (seq, after_ordinal, kind_str, text, created_us, platform_msg_id) in rows {
             let kind = kind_str
                 .parse::<ControlEventKind>()
                 .map_err(StorageError::Storage)?;
@@ -1501,6 +1512,7 @@ impl SqliteSessionStore {
                 kind,
                 text,
                 created_at,
+                platform_msg_id,
             });
         }
         Ok(out)
@@ -1637,17 +1649,18 @@ mod tests {
         // survives the µs-granular column round-trip exactly.
         let at = DateTime::from_timestamp_micros(1_700_000_000_123_456).expect("valid timestamp");
 
-        // `seq` is assigned monotonically from 0, per session.
+        // `seq` is assigned monotonically from 0, per session. The Command echo
+        // carries the send's `platform_msg_id`; notices carry none.
         let s0 = store
-            .append_control_event(&s.id, -1, ControlEventKind::Command, "/stop", at)
+            .append_control_event(&s.id, -1, ControlEventKind::Command, "/stop", at, "pm-42")
             .await
             .unwrap();
         let s1 = store
-            .append_control_event(&s.id, 7, ControlEventKind::NoticeInfo, "Stopped", at)
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeInfo, "Stopped", at, "")
             .await
             .unwrap();
         let s2 = store
-            .append_control_event(&s.id, 7, ControlEventKind::NoticeError, "boom", at)
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeError, "boom", at, "")
             .await
             .unwrap();
         assert_eq!((s0, s1, s2), (0, 1, 2));
@@ -1656,14 +1669,17 @@ mod tests {
         assert_eq!(events.len(), 3);
 
         // Ordered by seq; kind strings parse back to the typed enum; anchors,
-        // text and the microsecond timestamp all preserved.
+        // text, the microsecond timestamp and the command's platform_msg_id all
+        // preserved.
         assert_eq!(events[0].seq, 0);
         assert_eq!(events[0].after_ordinal, -1);
         assert_eq!(events[0].kind, ControlEventKind::Command);
         assert_eq!(events[0].text, "/stop");
         assert_eq!(events[0].created_at, at);
+        assert_eq!(events[0].platform_msg_id, "pm-42");
         assert_eq!(events[1].kind, ControlEventKind::NoticeInfo);
         assert_eq!(events[1].after_ordinal, 7);
+        assert_eq!(events[1].platform_msg_id, "", "a notice carries no msg id");
         assert_eq!(events[2].kind, ControlEventKind::NoticeError);
         assert_eq!(events[2].text, "boom");
 
@@ -1671,7 +1687,7 @@ mod tests {
         let other = make_root_session("ctl-2");
         store.save(&other).await.unwrap();
         let o0 = store
-            .append_control_event(&other.id, 0, ControlEventKind::NoticeWarn, "warn", at)
+            .append_control_event(&other.id, 0, ControlEventKind::NoticeWarn, "warn", at, "")
             .await
             .unwrap();
         assert_eq!(o0, 0, "seq is per-session, not global");
