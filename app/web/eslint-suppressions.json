@@ -1,0 +1,174 @@
+{
+  "src/App.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/api/auth.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/components/IconRail.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/components/LoginScreen.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/components/trace/MessageList.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/components/trace/SanitizeChip.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    }
+  },
+  "src/pages/AgentsPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 5
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 15
+    }
+  },
+  "src/pages/AnalyticsPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 3
+    }
+  },
+  "src/pages/ChatPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 45
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 120
+    }
+  },
+  "src/pages/CronPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 3
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 18
+    }
+  },
+  "src/pages/JobsPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/pages/LlmPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 12
+    }
+  },
+  "src/pages/LogsPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 4
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 3
+    }
+  },
+  "src/pages/TraceSessionPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 4
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 28
+    }
+  },
+  "src/pages/TracesPage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 6
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 5
+    }
+  },
+  "src/pages/chat/AttachmentImage.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  },
+  "src/pages/chat/FolderContextMenu.tsx": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/pages/chat/SearchPanel.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 4
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/pages/chat/SessionSidebar.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 6
+    }
+  },
+  "src/pages/chat/inputHistory.ts": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/pages/chat/outboxStore.ts": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/pages/chat/queueStore.tsx": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 5
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 15
+    }
+  },
+  "src/pages/chat/sessionBuckets.ts": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 3
+    }
+  },
+  "src/pages/cronActions.test.ts": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/pages/turnSync.test.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 11
+    },
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 1
+    }
+  },
+  "src/types/trace.ts": {
+    "@typescript-eslint/strict-boolean-expressions": {
+      "count": 2
+    }
+  }
+}

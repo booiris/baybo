@@ -17,10 +17,12 @@ type TraceSessionSummary = components['schemas']['TraceSessionSummary'];
  * Only works in development mode.
  */
 export function useMockMode() {
-  if (!import.meta.env.DEV) return false;
+  // The hook must run unconditionally (rules of hooks) — every caller is a page
+  // under the root <HashRouter>, so useSearchParams is always in context. The
+  // DEV guard then discards the result in production.
   const [searchParams] = useSearchParams();
-  const isMock = searchParams.get('mock') === 'true' || searchParams.get('mock') === '1';
-  return isMock;
+  if (!import.meta.env.DEV) return false;
+  return searchParams.get('mock') === 'true' || searchParams.get('mock') === '1';
 }
 
 // --- Logs Mock Data ---

@@ -8,6 +8,7 @@
 // caller is interested in.
 
 import { decode, encode } from '@msgpack/msgpack';
+import { uuid } from '../uuid';
 
 // Wire frame shape pulled straight from the Rust ts-rs generation.
 // We re-declare a lightweight version here because the shipped
@@ -341,7 +342,7 @@ export class ChatWs {
    *  the WS dropped between send and echo, double-click on the button,
    *  …) the gateway's `InboundDedup` rejects the retry inside its
    *  recency window instead of producing a second agent turn for the
-   *  same user message. A fresh `crypto.randomUUID()` is generated
+   *  same user message. A fresh `uuid()` is generated
    *  per call when the caller doesn't supply one. */
   sendMessage(input: {
     sessionId: string;
@@ -351,7 +352,7 @@ export class ChatWs {
     attachments?: WireAttachment[];
     clientMsgId?: string;
   }): void {
-    const msgId = input.clientMsgId ?? crypto.randomUUID();
+    const msgId = input.clientMsgId ?? uuid();
     this.sendFrame({
       kind: 'message',
       content: input.content,
