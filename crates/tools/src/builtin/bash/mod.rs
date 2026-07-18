@@ -35,6 +35,7 @@
 //! and `free` runs directly with no Bash approval. Environment variables and
 //! `cd` changes do NOT persist across invocations.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -43,6 +44,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::{WorkspacePaths, absolutise};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -970,6 +972,123 @@ fn prune_outputs_before(dir: &Path, cutoff: std::time::SystemTime) -> usize {
         }
     }
     pruned
+}
+
+/// One persisted detached-command process group. Written at detach and cleared
+/// by the escort on completion, so a boot after a hard kill (SIGKILL / OOM /
+/// crash) — which runs neither the `ProcessGroupKiller` destructors nor the
+/// force-exit reap — can still find and SIGKILL groups this process orphaned.
+/// `command` is the fingerprint that guards against pid-group recycling: a
+/// recorded pgid is only killed if a live member still runs it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedDetachedGroup {
+    pgid: i32,
+    command: String,
+}
+
+/// Subdir of the background-output dir holding the detached-group ledger, one
+/// `<handle>.json` per live group. Kept out of the output-file dir itself so
+/// `prune_background_outputs` (non-recursive, files only) never touches it.
+pub fn detached_group_dir(background_output_dir: &Path) -> PathBuf {
+    background_output_dir.join("groups")
+}
+
+/// Record a detached unsandboxed command's process group so a future boot can
+/// reap it if this process dies without unwinding. Best-effort; a write
+/// failure just forgoes the crash-safety net for this one job.
+pub fn record_detached_group(dir: &Path, handle_id: &str, pgid: i32, command: &str) {
+    let record = PersistedDetachedGroup {
+        pgid,
+        command: command.to_string(),
+    };
+    if let Ok(json) = serde_json::to_vec(&record)
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let _ = std::fs::write(dir.join(format!("{handle_id}.json")), json);
+    }
+}
+
+/// Drop a detached group's ledger entry once its escort has reaped the group.
+pub fn clear_detached_group(dir: &Path, handle_id: &str) {
+    let _ = std::fs::remove_file(dir.join(format!("{handle_id}.json")));
+}
+
+/// Boot: SIGKILL every persisted detached group that is provably still ours,
+/// then clear the ledger. A recorded pgid is killed only when a live member of
+/// that group still runs the recorded command — so a pgid recycled to an
+/// unrelated group (or a group that already exited) is left alone. Returns the
+/// number of groups killed.
+pub fn reap_persisted_detached_groups(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut killed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(rec) = serde_json::from_slice::<PersistedDetachedGroup>(&bytes)
+            && group_has_member_running(rec.pgid, &rec.command)
+        {
+            // SAFETY: a negative pid signals the whole group; verified ours by
+            // the live-member-runs-the-command check above.
+            unsafe { libc::kill(-rec.pgid, libc::SIGKILL) };
+            killed += 1;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    killed
+}
+
+/// True iff some live process in group `pgid` still has `command` in its
+/// cmdline — the ownership check that makes [`reap_persisted_detached_groups`]
+/// safe against pid-group recycling.
+fn group_has_member_running(pgid: i32, command: &str) -> bool {
+    let needle = normalize_ws(command);
+    if needle.is_empty() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if proc_stat_field(&stat, 5).and_then(|f| f.parse::<i32>().ok()) != Some(pgid) {
+            continue;
+        }
+        if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            let cmdline = normalize_ws(&String::from_utf8_lossy(&raw).replace('\0', " "));
+            if cmdline.contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whitespace-normalized (single-spaced, trimmed) copy for substring matching.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Field `n` (1-based, per proc(5)) of a `/proc/<pid>/stat` line. Handles a
+/// `comm` (field 2) containing spaces/parens by anchoring on the final ')':
+/// fields 3+ follow it. Only fields ≥ 3 are supported (all this module needs).
+fn proc_stat_field(stat: &str, n: usize) -> Option<&str> {
+    debug_assert!(n >= 3, "fields 1-2 (pid, comm) are not parsed here");
+    let after_comm = stat.get(stat.rfind(')')? + 1..)?.trim_start();
+    after_comm.split_whitespace().nth(n - 3)
 }
 
 enum DetachedOutcome {
@@ -1914,22 +2033,62 @@ impl BashTool {
     }
 }
 
+/// Process-global set of unsandboxed process-group leader pids (== pgid,
+/// since these children spawn with `process_group(0)`). Every armed
+/// [`ProcessGroupKiller`] registers its group and deregisters when it reaps
+/// the group or the child exits cleanly, so the set always equals the groups
+/// we still owe a kill.
+///
+/// Its one consumer is [`reap_tracked_process_groups`]: the force-exit path
+/// (`force_exit_watchdog`) `process::exit`s without unwinding, so the
+/// `ProcessGroupKiller` destructors that normally reap detached command trees
+/// never run. Reaping the set there turns "orphan to init and leak until the
+/// next reboot" back into "killed on the way out".
+static TRACKED_PROCESS_GROUPS: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
+
+fn register_process_group(pgid: i32) {
+    TRACKED_PROCESS_GROUPS.lock().insert(pgid);
+}
+
+fn unregister_process_group(pgid: i32) {
+    TRACKED_PROCESS_GROUPS.lock().remove(&pgid);
+}
+
+/// SIGKILL every still-tracked unsandboxed process group. The shutdown
+/// backstop for `force_exit_watchdog`, which `process::exit`s past the
+/// [`ProcessGroupKiller`] destructors that would otherwise reap detached
+/// `Bash` command trees. Draining the set makes it idempotent.
+pub fn reap_tracked_process_groups() {
+    let groups = std::mem::take(&mut *TRACKED_PROCESS_GROUPS.lock());
+    for pgid in groups {
+        // SAFETY: a negative pid signals the whole group; each leader was a
+        // child we spawned with `process_group(0)`.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+}
+
 /// SIGKILLs an entire process group on drop unless disarmed. Paired with
 /// `Command::process_group(0)` below so a timed-out or cancelled `sh -c "…"`
 /// reaps its descendants: tokio's `kill_on_drop`/`start_kill` only signal the
 /// direct child, leaving anything it forked (and their children) orphaned and,
-/// in the worst case, spinning at 100% CPU.
+/// in the worst case, spinning at 100% CPU. Its lifetime is mirrored in
+/// [`TRACKED_PROCESS_GROUPS`] so a destructor-less exit can still reap it.
 struct ProcessGroupKiller(Option<i32>);
 
 impl ProcessGroupKiller {
     /// `child_pid` is the group leader — we spawn with `process_group(0)`, so
     /// its pgid equals its pid. `None` if the child's id is already gone.
     fn arm(child_pid: Option<u32>) -> Self {
-        Self(child_pid.map(|p| p as i32))
+        let pgid = child_pid.map(|p| p as i32);
+        if let Some(pgid) = pgid {
+            register_process_group(pgid);
+        }
+        Self(pgid)
     }
 
     fn kill_group(&self) {
         if let Some(pgid) = self.0 {
+            unregister_process_group(pgid);
             // SAFETY: a negative pid signals the whole group; the leader is our
             // own child, so this only reaps the command's own process tree.
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
@@ -1937,8 +2096,11 @@ impl ProcessGroupKiller {
     }
 
     /// The child finished on its own (or we already reaped the group), so the
-    /// pgid may be recycled — don't signal it on drop.
+    /// pgid may be recycled — deregister it and don't signal it on drop.
     fn disarm(&mut self) {
+        if let Some(pgid) = self.0 {
+            unregister_process_group(pgid);
+        }
         self.0 = None;
     }
 }
@@ -1985,6 +2147,10 @@ impl RunningChild for ProcessGroupRunningChild {
     fn start_kill(&mut self) {
         self.group.kill_group();
         let _ = self.child.start_kill();
+    }
+
+    fn process_group_id(&self) -> Option<i32> {
+        self.group.0
     }
 }
 
@@ -2199,6 +2365,167 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// The registry that `reap_tracked_process_groups` drains must track
+    /// exactly the armed-but-unreaped groups: `arm` adds, `disarm` (clean
+    /// exit) removes, and the `Drop` guard removes. A stale entry would make
+    /// the force-exit reap SIGKILL a recycled pgid; a missing entry would let
+    /// a detached tree leak past a destructor-less exit. Uses a synthetic
+    /// out-of-`pid_max` leader id so the `Drop`'s group-kill is a harmless
+    /// `ESRCH` and can't collide with a real process or another test's group.
+    #[test]
+    fn process_group_registry_tracks_armed_groups() {
+        let synthetic = i32::MAX;
+        assert!(!TRACKED_PROCESS_GROUPS.lock().contains(&synthetic));
+
+        let mut guard = ProcessGroupKiller::arm(Some(synthetic as u32));
+        assert!(
+            TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
+            "arm must register the group"
+        );
+        guard.disarm();
+        assert!(
+            !TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
+            "disarm must deregister the group"
+        );
+
+        // Re-arm and drop without disarming: the `Drop` guard must also
+        // deregister (its kill is a harmless ESRCH on the synthetic pgid).
+        drop(ProcessGroupKiller::arm(Some(synthetic as u32)));
+        assert!(
+            !TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
+            "the Drop guard must deregister the group"
+        );
+    }
+
+    #[test]
+    fn proc_stat_field_reads_real_and_tricky_comm() {
+        // Real: field 5 (pgrp) of our own stat matches getpgrp().
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("read self stat");
+        let pgrp: i32 = proc_stat_field(&stat, 5)
+            .and_then(|f| f.parse().ok())
+            .expect("pgrp parses");
+        assert_eq!(pgrp, unsafe { libc::getpgrp() });
+
+        // Synthetic: a comm with embedded spaces and parens must not shift the
+        // post-comm fields (the parser anchors on the final ')').
+        let weird = "1234 (weird ) name) R 1 4321 4321 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 999";
+        assert_eq!(proc_stat_field(weird, 3), Some("R"), "state");
+        assert_eq!(proc_stat_field(weird, 4), Some("1"), "ppid");
+        assert_eq!(proc_stat_field(weird, 5), Some("4321"), "pgrp");
+    }
+
+    fn unique_tag(kind: &str) -> String {
+        format!(
+            "baybo-{kind}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    /// Boot reap: a persisted group whose live members still run the recorded
+    /// command is SIGKILLed and its ledger entry removed. Leaks the child guard
+    /// (`mem::forget`) so only the on-disk ledger — the sole survivor of a hard
+    /// kill — drives the reap.
+    #[tokio::test]
+    async fn reap_persisted_detached_groups_kills_recorded_group() {
+        let tag = unique_tag("bootreap");
+        let pidfile = std::env::temp_dir().join(format!("{tag}.pid"));
+        let ledger = std::env::temp_dir().join(format!("{tag}.d"));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let child =
+            spawn_unsandboxed_detached("sh", &["-c".to_string(), script.clone()], None, &[])
+                .expect("detached spawn ok");
+        let pgid = child
+            .process_group_id()
+            .expect("unsandboxed child has a pgid");
+        std::mem::forget(child);
+
+        record_detached_group(&ledger, "bg-1", pgid, &script);
+
+        let gpid: i32 = {
+            let mut found = None;
+            for _ in 0..40 {
+                if let Ok(s) = std::fs::read_to_string(&pidfile)
+                    && let Ok(p) = s.trim().parse::<i32>()
+                {
+                    found = Some(p);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            found.expect("grandchild wrote its pid")
+        };
+        let _ = std::fs::remove_file(&pidfile);
+
+        let killed = reap_persisted_detached_groups(&ledger);
+        assert_eq!(killed, 1, "the recorded group should be reaped");
+
+        let reaped = wait_until_pid_gone(gpid).await;
+        if !reaped {
+            unsafe { libc::kill(gpid, libc::SIGKILL) };
+        }
+        assert!(reaped, "grandchild {gpid} survived boot reap");
+        assert!(
+            !ledger.join("bg-1.json").exists(),
+            "the ledger entry must be cleared after reaping"
+        );
+        let _ = std::fs::remove_dir_all(&ledger);
+    }
+
+    /// Pid-recycling guard: a persisted pgid whose live members do NOT run the
+    /// recorded command is left untouched — the group is not ours. Proves the
+    /// fingerprint check that keeps boot reaping safe.
+    #[tokio::test]
+    async fn reap_persisted_detached_groups_spares_mismatched_command() {
+        let tag = unique_tag("bootspare");
+        let pidfile = std::env::temp_dir().join(format!("{tag}.pid"));
+        let ledger = std::env::temp_dir().join(format!("{tag}.d"));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let child =
+            spawn_unsandboxed_detached("sh", &["-c".to_string(), script.clone()], None, &[])
+                .expect("detached spawn ok");
+        let pgid = child
+            .process_group_id()
+            .expect("unsandboxed child has a pgid");
+        std::mem::forget(child);
+
+        let gpid: i32 = {
+            let mut found = None;
+            for _ in 0..40 {
+                if let Ok(s) = std::fs::read_to_string(&pidfile)
+                    && let Ok(p) = s.trim().parse::<i32>()
+                {
+                    found = Some(p);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            found.expect("grandchild wrote its pid")
+        };
+        let _ = std::fs::remove_file(&pidfile);
+
+        // Record the real pgid but a command no live member runs (simulating a
+        // recycled pgid). The reap must refuse to touch it.
+        record_detached_group(&ledger, "bg-1", pgid, "sleep 999 --unrelated-marker");
+        let killed = reap_persisted_detached_groups(&ledger);
+        assert_eq!(killed, 0, "a mismatched-command group must be spared");
+        assert!(
+            unsafe { libc::kill(gpid, 0) == 0 },
+            "grandchild {gpid} must still be alive after a spared reap"
+        );
+
+        // Clean up the group ourselves (the reap intentionally didn't).
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&ledger);
     }
 
     #[test]

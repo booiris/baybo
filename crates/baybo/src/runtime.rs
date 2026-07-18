@@ -594,14 +594,29 @@ pub async fn build_managers(
             workspace_paths.clone(),
         )));
 
-    // Prune stale detached-command output files left under logs/background/
-    // (the agent reads them shortly after the completion notification, so a
-    // week's retention is generous). Off the boot path — blocking fs.
+    let bg_output_dir = baybo_tools::builtin::bash::background_output_dir(&workspace_paths);
+    let bg_groups_dir = baybo_tools::builtin::bash::detached_group_dir(&bg_output_dir);
+
+    // Reap detached command groups this host orphaned across a hard kill
+    // (SIGKILL / OOM / crash) — those run neither the `ProcessGroupKiller`
+    // destructors nor the force-exit reap, so the on-disk ledger is the only
+    // record left. Verified against pid-group recycling before any SIGKILL.
+    // Also prune stale detached-command output files (the agent reads them
+    // shortly after the completion notification, so a week's retention is
+    // generous). Off the boot path — blocking fs + a /proc scan.
     {
-        let dir = baybo_tools::builtin::bash::background_output_dir(&workspace_paths);
+        let output_dir = bg_output_dir.clone();
+        let groups_dir = bg_groups_dir.clone();
         tokio::task::spawn_blocking(move || {
+            let reaped = baybo_tools::builtin::bash::reap_persisted_detached_groups(&groups_dir);
+            if reaped > 0 {
+                info!(
+                    reaped,
+                    "reaped orphaned background command groups from a prior run"
+                );
+            }
             let pruned = baybo_tools::builtin::bash::prune_background_outputs(
-                &dir,
+                &output_dir,
                 std::time::Duration::from_secs(7 * 24 * 60 * 60),
             );
             if pruned > 0 {
@@ -614,9 +629,10 @@ pub async fn build_managers(
     // routes completion notifications via the supervisor, which is built
     // further down, so it holds it behind a `OnceLock` set right after.
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
-    let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(Arc::clone(
-        &bg_supervisor_slot,
-    )));
+    let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
+        Arc::clone(&bg_supervisor_slot),
+        bg_groups_dir,
+    ));
     let background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>> = Some(bg_manager.clone());
     let background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>> = Some(bg_manager);
 
@@ -1019,6 +1035,11 @@ pub fn force_exit_watchdog(budget: std::time::Duration) {
             "baybo: graceful shutdown exceeded {}s, force-exiting",
             budget.as_secs()
         );
+        // `process::exit` runs no destructors, so the `ProcessGroupKiller`
+        // guards that reap detached `Bash` command trees never fire. Reap
+        // them explicitly or they orphan to init and leak until the next
+        // reboot.
+        baybo_tools::builtin::bash::reap_tracked_process_groups();
         std::process::exit(0);
     });
 }
