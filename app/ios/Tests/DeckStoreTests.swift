@@ -125,6 +125,44 @@ struct DeckStoreTests {
         DeckStore.removeMirror()
     }
 
+    @Test func recycleFetchesAndRestorePutsTheCardBack() async {
+        let fake = FakeBayboClient()
+        fake.deckRecycleList = [card("gone", position: 0)]
+        fake.deckView = DeckView(cards: [], snapshots: [])
+        let store = makeStore(fake)
+
+        await store.fetchRecycleNow()
+        #expect(store.recycle.map(\.cardId) == ["gone"])
+
+        store.restore(cardId: "gone")
+        // OPTIMISTIC: the row leaves at the tap, before the (slow —
+        // dry-run-gated) restore call returns.
+        #expect(store.recycle.isEmpty, "row leaves the bin at the tap")
+        await store.actionTask?.value
+        #expect(fake.deckRestores == ["gone"])
+        #expect(store.recycle.isEmpty)
+        DeckStore.removeMirror()
+    }
+
+    @Test func restoreFailureRollsTheRowBackIntoTheBin() async {
+        let fake = FakeBayboClient()
+        fake.deckRecycleList = [card("gone", position: 0)]
+        fake.deckView = DeckView(cards: [], snapshots: [])
+        let store = makeStore(fake)
+        await store.fetchRecycleNow()
+
+        // The fake throws for a card absent from its recycle list — the
+        // gateway's dry-run gate refusing the restore looks the same.
+        fake.deckRecycleList = []
+        store.restore(cardId: "gone")
+        #expect(store.recycle.isEmpty, "optimistic removal still happens")
+        await store.actionTask?.value
+        #expect(
+            store.recycle.map(\.cardId) == ["gone"],
+            "failed restore rolls the row back")
+        DeckStore.removeMirror()
+    }
+
     @Test func enableActionCallsTheFfiAndRefreshes() async {
         let fake = FakeBayboClient()
         fake.deckView = DeckView(cards: [card("a", position: 0)], snapshots: [])

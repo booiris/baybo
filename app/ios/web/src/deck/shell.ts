@@ -4,7 +4,6 @@
 // init — ports are held in a shell-side map the card can neither see nor
 // forge; closing the port mutes a removed card instantly.
 
-import Sortable from "sortablejs";
 import sdkSource from "./sdkCard.js?raw";
 import cardBaseCss from "./cardBase.css?raw";
 import * as bridge from "./bridge";
@@ -31,9 +30,6 @@ const STRINGS: Record<string, Record<string, string>> = {
   zh: zh.translation.deck,
 };
 
-/// Long-press threshold entering edit mode (matches the iOS wiggle idiom).
-const EDIT_HOLD_MS = 450;
-
 type Tile = {
   card: DeckCard;
   el: HTMLElement;
@@ -55,7 +51,14 @@ export class DeckShell {
   private nextCallSerial = 1;
   private editMode = false;
   private lang = "en";
-  private sortable: Sortable;
+  // Live drag state (the iOS-home-screen engine below).
+  private dragCardId: string | null = null;
+  private dragEl: HTMLElement | null = null;
+  private placeholder: HTMLElement | null = null;
+  private placeholderIndex = 0;
+  private dragOrigin = { x: 0, y: 0, left: 0, top: 0 };
+  private lastPoint = { x: 0, y: 0 };
+  private dragRaf = 0;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -64,37 +67,6 @@ export class DeckShell {
     this.emptyEl = document.createElement("div");
     this.emptyEl.className = "deck-empty";
     this.root.append(this.grid, this.emptyEl);
-    // SortableJS owns the drag while editing: the fallback clone follows
-    // the finger, displaced neighbors FLIP into place, and the settled
-    // DOM order becomes the state. forceFallback because WKWebView's
-    // native HTML5 DnD is unreliable and the fallback styles identically
-    // on every surface. The touch delay lets a quick flick still scroll
-    // the board in edit mode.
-    this.sortable = Sortable.create(this.grid, {
-      disabled: true,
-      animation: 250,
-      easing: "cubic-bezier(0.2, 0, 0, 1)",
-      draggable: ".deck-card",
-      filter: ".deck-size-btn, .deck-remove-btn",
-      preventOnFilter: false,
-      forceFallback: true,
-      fallbackClass: "deck-drag-fallback",
-      fallbackTolerance: 4,
-      ghostClass: "deck-drag-ghost",
-      // Forgiving hold-then-drag: a finger wobbles a few px during the
-      // start delay; a real flick still cancels into a scroll.
-      delay: 150,
-      delayOnTouchOnly: true,
-      touchStartThreshold: 6,
-      onEnd: (evt) => {
-        if (evt.oldIndex === evt.newIndex) return;
-        const ids = [...this.grid.children].map(
-          (el) => (el as HTMLElement).dataset.cardId ?? "",
-        );
-        this.state = { ...this.state, cards: reorderTo(this.state.cards, ids) };
-        bridge.postLayout(layoutEntries(this.state.cards));
-      },
-    });
     this.renderEmpty();
   }
 
@@ -112,8 +84,8 @@ export class DeckShell {
   setEditMode(active: boolean): void {
     if (this.editMode === active) return;
     this.editMode = active;
+    if (!active && this.dragCardId) this.endDrag();
     this.grid.classList.toggle("editing", active);
-    this.sortable.option("disabled", !active);
     bridge.postEditMode(active);
     for (const tile of this.tiles.values()) this.renderOverlay(tile);
   }
@@ -184,16 +156,11 @@ export class DeckShell {
       const globalId = `${cardId}#${this.nextCallSerial++}`;
       this.pendingCalls.set(globalId, { cardId, localId: m.id });
       bridge.postCall(globalId, cardId, m.op, m.params ?? {});
-    } else if (m.type === "edit_hold") {
-      // The SDK's in-iframe long-press detector (gestures inside the
-      // iframe never bubble to this document). Worst a hostile card can
-      // do with it is open edit mode — no data crosses.
-      this.setEditMode(true);
     } else if (m.type === "log") {
       bridge.log(m.level === "error" ? "error" : "info", `[card ${cardId}] ${m.message ?? ""}`);
     }
     // Anything else from a card is ignored: port identity is the card's
-    // only capability, and the surface is exactly call + edit_hold + log.
+    // only capability, and the surface is exactly call + log.
   }
 
   private pushSnapshot(cardId: string): void {
@@ -216,6 +183,7 @@ export class DeckShell {
       if (!tile) {
         tile = this.createTile(card);
         this.tiles.set(card.cardId, tile);
+        this.grid.append(tile.el);
       }
       const specChanged = tile.card.specHash !== card.specHash;
       tile.card = card;
@@ -234,7 +202,6 @@ export class DeckShell {
       }
       tile.port?.postMessage({ type: "size", size: card.size });
       this.renderOverlay(tile);
-      this.grid.append(tile.el); // append order == flow order
     }
     for (const [cardId, tile] of this.tiles) {
       if (!seen.has(cardId)) {
@@ -242,6 +209,16 @@ export class DeckShell {
         tile.el.remove();
         this.tiles.delete(cardId);
       }
+    }
+    // Placement is CSS `order`, NEVER a DOM move: relocating an <iframe>
+    // in the tree reloads its document (the historical "whole page
+    // flashes" bug). Tiles are appended once at creation and stay put;
+    // reorders are pure style, so no reconcile — and no drag settle —
+    // ever reboots a card.
+    let i = 0;
+    for (const card of this.state.cards) {
+      const el = this.tiles.get(card.cardId)?.el;
+      if (el) el.style.order = String(i++);
     }
   }
 
@@ -286,7 +263,7 @@ export class DeckShell {
     });
 
     el.append(header, body, overlay, sizeBtn, removeBtn);
-    this.wireGestures(el);
+    this.wireDrag(el, card.cardId);
     return { card, el, frame: null, port: null, bundleRequested: false, overlay, sizeBtn, removeBtn };
   }
 
@@ -310,38 +287,230 @@ export class DeckShell {
     overlay.append(line, btn);
   }
 
-  /// Long-press enters edit mode; the drag itself belongs to SortableJS
-  /// (enabled in `setEditMode`), so this only arms the hold-to-edit
-  /// timer and cancels it when the touch turns into a scroll.
-  private wireGestures(el: HTMLElement): void {
-    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  // ---- drag engine ---------------------------------------------------
+  //
+  // iOS-home-screen mechanics, built around one constraint: an <iframe>
+  // reloads whenever its node MOVES in the DOM, but transform and CSS
+  // `order` never touch the tree. So the REAL tile follows the finger
+  // (fixed + translate — its document keeps painting live), a plain-div
+  // placeholder holds the target slot via `order`, neighbors FLIP-slide,
+  // and the drop is pure style. Zero reloads at any point. In edit mode
+  // the drag arms on the first few px of movement — no hold delay,
+  // matching the wiggle-mode feel.
 
+  private wireDrag(el: HTMLElement, cardId: string): void {
+    // The one thing that reliably stops WKWebView's native UIScrollView
+    // pan from claiming the touch (it fires pointercancel ~2 moves in,
+    // killing the drag — `touch-action: none` alone did NOT hold once
+    // beginDrag's position:fixed flip triggered gesture re-arbitration).
+    // touchMOVE only, so taps still synthesize clicks for the buttons.
+    el.addEventListener(
+      "touchmove",
+      (e) => {
+        if (this.editMode) e.preventDefault();
+      },
+      { passive: false },
+    );
     el.addEventListener("pointerdown", (down) => {
-      if (this.editMode) return;
-      holdTimer = setTimeout(() => this.setEditMode(true), EDIT_HOLD_MS);
-      const clearHold = () => {
-        if (holdTimer) {
-          clearTimeout(holdTimer);
-          holdTimer = null;
-        }
-      };
+      if (!this.editMode || this.dragCardId) return;
+      const target = down.target as HTMLElement;
+      if (target.closest(".deck-size-btn, .deck-remove-btn, .deck-face-btn")) return;
+      const startX = down.clientX;
+      const startY = down.clientY;
+      // Capture the pointer: beginDrag flips the tile to position:fixed
+      // mid-gesture, and without capture WebKit re-hit-tests and drops
+      // the move stream right there (observed: drags died ~16px in).
+      try {
+        el.setPointerCapture(down.pointerId);
+      } catch {
+        // Capture is best-effort; an already-released pointer just
+        // degrades to the uncaptured behavior.
+      }
+      let started = false;
       const move = (ev: PointerEvent) => {
-        if (
-          Math.abs(ev.clientX - down.clientX) > 8 ||
-          Math.abs(ev.clientY - down.clientY) > 8
-        ) {
-          clearHold();
+        if (ev.pointerId !== down.pointerId) return;
+        if (!started) {
+          if (Math.abs(ev.clientX - startX) < 4 && Math.abs(ev.clientY - startY) < 4) {
+            return;
+          }
+          started = true;
+          this.beginDrag(el, cardId, startX, startY);
+        }
+        this.lastPoint = { x: ev.clientX, y: ev.clientY };
+        if (!this.dragRaf) {
+          this.dragRaf = requestAnimationFrame(() => {
+            this.dragRaf = 0;
+            this.dragFrame();
+          });
         }
       };
       const up = () => {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         window.removeEventListener("pointercancel", up);
-        clearHold();
+        if (started) this.endDrag();
       };
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
       window.addEventListener("pointercancel", up);
     });
+  }
+
+  private beginDrag(el: HTMLElement, cardId: string, grabX: number, grabY: number): void {
+    const rect = el.getBoundingClientRect();
+    this.dragCardId = cardId;
+    this.dragEl = el;
+    this.dragOrigin = { x: grabX, y: grabY, left: rect.left, top: rect.top };
+    this.lastPoint = { x: grabX, y: grabY };
+    this.placeholderIndex = this.state.cards.findIndex((c) => c.cardId === cardId);
+
+    const ph = document.createElement("div");
+    ph.className = "deck-drop-slot";
+    ph.dataset.size = el.dataset.size ?? "wide";
+    this.placeholder = ph;
+
+    this.flipTiles(() => {
+      this.grid.append(ph);
+      // Lift the tile out of flow at its exact on-screen rect; from here
+      // it is positioned by transform alone.
+      el.classList.add("deck-dragging-live");
+      el.style.left = `${rect.left}px`;
+      el.style.top = `${rect.top}px`;
+      el.style.width = `${rect.width}px`;
+      el.style.height = `${rect.height}px`;
+      this.applyPlaceholderOrder();
+    });
+    this.grid.classList.add("has-drag");
+  }
+
+  private dragFrame(): void {
+    const el = this.dragEl;
+    if (!el || !this.dragCardId) return;
+    const dx = this.lastPoint.x - this.dragOrigin.x;
+    const dy = this.lastPoint.y - this.dragOrigin.y;
+    el.style.transform = `translate(${dx}px, ${dy}px) scale(1.04)`;
+    const target = this.dropIndexAt(this.lastPoint.x, this.lastPoint.y);
+    if (target !== this.placeholderIndex) {
+      this.placeholderIndex = target;
+      this.flipTiles(() => this.applyPlaceholderOrder());
+    }
+  }
+
+  private endDrag(): void {
+    const el = this.dragEl;
+    const ph = this.placeholder;
+    const cardId = this.dragCardId;
+    if (!el || !ph || !cardId) return;
+    // The last pointer movement may still be waiting on rAF — resolve
+    // the final slot from the actual drop point, not the last frame.
+    if (this.dragRaf) {
+      cancelAnimationFrame(this.dragRaf);
+      this.dragRaf = 0;
+    }
+    const finalTarget = this.dropIndexAt(this.lastPoint.x, this.lastPoint.y);
+    if (finalTarget !== this.placeholderIndex) {
+      this.placeholderIndex = finalTarget;
+      this.flipTiles(() => this.applyPlaceholderOrder());
+    }
+    this.dragCardId = null;
+
+    // Ease the lifted tile onto the slot, then settle to pure style: the
+    // tile rejoins the flow via `order` — no DOM move, no reload.
+    const phRect = ph.getBoundingClientRect();
+    const dx = phRect.left - this.dragOrigin.left;
+    const dy = phRect.top - this.dragOrigin.top;
+    el.style.transition = "transform 180ms cubic-bezier(0.2, 0, 0, 1)";
+    el.style.transform = `translate(${dx}px, ${dy}px)`;
+
+    const others = this.state.cards
+      .filter((c) => c.cardId !== cardId)
+      .map((c) => c.cardId);
+    others.splice(this.placeholderIndex, 0, cardId);
+
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      el.removeEventListener("transitionend", settle);
+      el.classList.remove("deck-dragging-live");
+      el.style.cssText = "";
+      ph.remove();
+      this.placeholder = null;
+      this.dragEl = null;
+      this.grid.classList.remove("has-drag");
+      const next = reorderTo(this.state.cards, others);
+      const changed = next.some(
+        (c, i) => c.cardId !== this.state.cards[i]?.cardId,
+      );
+      this.state = { ...this.state, cards: next };
+      this.reconcileTiles();
+      if (changed) bridge.postLayout(layoutEntries(this.state.cards));
+    };
+    el.addEventListener("transitionend", settle);
+    // Transitionend can be swallowed (display churn, zero-distance move);
+    // the timer is the backstop so a drop can never wedge mid-settle.
+    setTimeout(settle, 240);
+  }
+
+  /// Others keep their relative order (0,1,2,… skipping the dragged
+  /// tile); indices at/after the slot shift +1 and the placeholder takes
+  /// the slot value, so CSS grid renders the insertion preview.
+  private applyPlaceholderOrder(): void {
+    let i = 0;
+    for (const card of this.state.cards) {
+      if (card.cardId === this.dragCardId) continue;
+      const el = this.tiles.get(card.cardId)?.el;
+      if (!el) continue;
+      el.style.order = String(i >= this.placeholderIndex ? i + 1 : i);
+      i += 1;
+    }
+    this.placeholder?.style.setProperty("order", String(this.placeholderIndex));
+  }
+
+  /// Insertion index for the pointer, judged against the LIVE rects of
+  /// the other tiles (they move as the placeholder does). Axis-aware:
+  /// a full-width tile swaps on the VERTICAL midline (dragging past its
+  /// center is enough — no deep dragging), while a narrow (half-width)
+  /// tile keeps the left/right test for side-by-side pairs.
+  private dropIndexAt(x: number, y: number): number {
+    const gridWidth = this.grid.clientWidth;
+    let index = 0;
+    for (const card of this.state.cards) {
+      if (card.cardId === this.dragCardId) continue;
+      const el = this.tiles.get(card.cardId)?.el;
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      const narrow = r.width < gridWidth * 0.6;
+      const after = narrow
+        ? y > r.bottom || (y >= r.top && x > r.left + r.width / 2)
+        : y > r.top + r.height / 2;
+      if (after) index += 1;
+    }
+    return index;
+  }
+
+  /// FLIP everything except the lifted tile across `mutate`: capture
+  /// rects, mutate, animate the delta back to zero. WAAPI so the wiggle
+  /// keyframes (paused during a drag via `.has-drag`) can't fight the
+  /// slide on the `transform` channel.
+  private flipTiles(mutate: () => void): void {
+    const before: Array<{ el: HTMLElement; left: number; top: number }> = [];
+    for (const tile of this.tiles.values()) {
+      if (tile.el === this.dragEl) continue;
+      const r = tile.el.getBoundingClientRect();
+      before.push({ el: tile.el, left: r.left, top: r.top });
+    }
+    mutate();
+    for (const { el, left, top } of before) {
+      const n = el.getBoundingClientRect();
+      const dx = left - n.left;
+      const dy = top - n.top;
+      if (dx !== 0 || dy !== 0) {
+        el.animate(
+          [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
+          { duration: 220, easing: "cubic-bezier(0.2, 0, 0, 1)" },
+        );
+      }
+    }
   }
 }

@@ -231,16 +231,20 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// Scripted deck responses + recorded mutations, so `DeckStore`'s
     /// refresh / layout / action paths are testable with no gateway.
     var deckView: DeckView = DeckView(cards: [], snapshots: [])
+    var deckRecycleList: [DeckCardInfo] = []
     private(set) var deckLayoutPuts: [[DeckLayoutEntryInput]] = []
     private(set) var deckEnableCalls: [(String, Bool)] = []
     private(set) var deckDeletes: [String] = []
+    private(set) var deckRestores: [String] = []
     var deckLayoutError: Error?
 
     func deckFetch() async throws -> DeckView {
         lock.withLock { deckView }
     }
 
-    func deckFetchRecycle() async throws -> [DeckCardInfo] { throw Self.unsupported }
+    func deckFetchRecycle() async throws -> [DeckCardInfo] {
+        lock.withLock { deckRecycleList }
+    }
 
     func deckFetchBundle(cardId: String) async throws -> String { throw Self.unsupported }
 
@@ -266,7 +270,16 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         lock.withLock { deckDeletes.append(cardId) }
     }
 
-    func deckRestore(cardId: String) async throws -> DeckCardInfo { throw Self.unsupported }
+    func deckRestore(cardId: String) async throws -> DeckCardInfo {
+        try lock.withLock {
+            deckRestores.append(cardId)
+            guard let info = deckRecycleList.first(where: { $0.cardId == cardId }) else {
+                throw Self.unsupported
+            }
+            deckRecycleList.removeAll { $0.cardId == cardId }
+            return info
+        }
+    }
 
     func setDeckSink(sink: DeckSink) {}
 

@@ -44,11 +44,24 @@ final class DeckStore: ObservableObject {
         let editMode: Bool
     }
 
+    /// One soft-deleted card in the recycle bin. Not persisted — the bin is
+    /// fetched fresh on entry (it changes from any client, and staleness here
+    /// costs nothing).
+    struct RecycledCard: Equatable, Identifiable {
+        let cardId: String
+        let title: String
+        let size: String
+        let deletedAtMs: Int64?
+        var id: String { cardId }
+    }
+
     /// Mirrored from the shell's edit mode so the native header can show Done.
     @Published var editMode = false
     /// A delete waiting on the native confirm (destructive actions confirm
     /// natively; the shell only reports intent).
     @Published var pendingDelete: String?
+    /// The recycle bin, most recently deleted first (server order).
+    @Published private(set) var recycle: [RecycledCard] = []
 
     private(set) var state = StatePayload(cards: [], snapshots: [])
     weak var bridge: DeckBridge?
@@ -257,6 +270,48 @@ final class DeckStore: ObservableObject {
                 try await self.client.deckDelete(cardId: cardId)
             } catch {
                 NSLog("deck: delete failed: %@", String(describing: error))
+            }
+            await self.refreshNow()
+            self.actionTask = nil
+        }
+    }
+
+    // MARK: recycle bin
+
+    func fetchRecycleNow() async {
+        do {
+            recycle = try await client.deckFetchRecycle().map {
+                RecycledCard(
+                    cardId: $0.cardId,
+                    title: $0.title,
+                    size: $0.size,
+                    deletedAtMs: $0.deletedAtMs
+                )
+            }
+        } catch {
+            NSLog("deck: recycle fetch failed: %@", String(describing: error))
+        }
+    }
+
+    /// Restore one card out of the bin. OPTIMISTIC: the row leaves the
+    /// list at the tap — the gateway's restore is slow by design (it
+    /// re-runs the dry-run admission gate: boot the service, invoke the
+    /// refresh op once, vet the snapshot — a deleted card is never
+    /// resurrected unvetted), and waiting on it left the row sitting
+    /// there for seconds. On failure the row comes back (the mutation
+    /// idiom: roll back to the baseline, never the negation).
+    func restore(cardId: String) {
+        guard let index = recycle.firstIndex(where: { $0.cardId == cardId }) else { return }
+        let removed = recycle.remove(at: index)
+        actionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.client.deckRestore(cardId: cardId)
+            } catch {
+                NSLog("deck: restore failed: %@", String(describing: error))
+                if !self.recycle.contains(where: { $0.cardId == cardId }) {
+                    self.recycle.insert(removed, at: min(index, self.recycle.count))
+                }
             }
             await self.refreshNow()
             self.actionTask = nil

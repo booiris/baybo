@@ -48,6 +48,9 @@ final class AppStore: ObservableObject {
         /// sibling of `archived`: same ☰ menu, same push, no argument (the list
         /// fetches itself).
         case cronJobs
+        /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
+        /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
+        case deckRecycle
     }
 
     /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
@@ -600,6 +603,13 @@ final class AppStore: ObservableObject {
     func openCronJobs() {
         guard !chatPath.contains(.cronJobs) else { return }
         chatPath.append(.cronJobs)
+    }
+
+    /// The Deck header's ☰ menu entry: push the card recycle bin. Guarded like
+    /// `openArchived`.
+    func openDeckRecycle() {
+        guard !chatPath.contains(.deckRecycle) else { return }
+        chatPath.append(.deckRecycle)
     }
 
     /// Tapping a cron group row: push that job's fires. Guarded like `openArchived`.

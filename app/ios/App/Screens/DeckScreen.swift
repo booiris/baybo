@@ -14,30 +14,57 @@ struct DeckScreen: View {
 }
 
 private struct DeckContent: View {
+    @EnvironmentObject private var appStore: AppStore
     @ObservedObject var deck: DeckStore
     let host: DeckHost
     @ObservedObject private var lang = Lang.shared
 
     var body: some View {
         ZStack(alignment: .top) {
+            // Full-bleed like the chat list: the grid's own top padding
+            // (deck.css, env(safe-area-inset-top) + header height) sets
+            // the resting offset, and scrolled content ghosts under the
+            // header's paper veil instead of hitting a hard edge.
             DeckWebView(host: host)
-                .ignoresSafeArea(edges: .bottom)
-                .padding(.top, 52)
+                .ignoresSafeArea()
             HomeHeaderView()
-                .overlay(alignment: .trailing) {
-                    if deck.editMode {
+                .overlay(alignment: .leading) {
+                    // The Chats header's ☰ grammar: one glass circle, menu
+                    // entries for the section's secondary surfaces. Deck has
+                    // one — the recycle bin.
+                    Menu {
                         Button {
-                            deck.setEditMode(false)
+                            appStore.openDeckRecycle()
                         } label: {
-                            Text(verbatim: lang.t("deck.editDone"))
-                                .font(Theme.mono(13))
-                                .foregroundStyle(Theme.ink)
-                                .padding(.horizontal, 14)
-                                .frame(height: 34)
+                            Label(
+                                lang.t("deck.menuRecycle"),
+                                systemImage: "arrow.uturn.backward")
                         }
-                        .glassEffect(.regular.interactive(), in: .capsule)
-                        .padding(.trailing, 20)
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(Theme.ink)
+                            .frame(width: 45, height: 45)
                     }
+                    .glassEffect(.regular.interactive(), in: .circle)
+                    .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
+                    .padding(.leading, 20)
+                }
+                .overlay(alignment: .trailing) {
+                    // The header pill is the ONLY way in and out of edit
+                    // mode (reorder/resize/remove) — no long-press entry;
+                    // holds inside a card belong to the card.
+                    Button {
+                        deck.setEditMode(!deck.editMode)
+                    } label: {
+                        Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit"))
+                            .font(Theme.mono(13))
+                            .foregroundStyle(Theme.ink)
+                            .padding(.horizontal, 14)
+                            .frame(height: 34)
+                    }
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .padding(.trailing, 20)
                 }
         }
         .onChange(of: lang.code) { _, code in

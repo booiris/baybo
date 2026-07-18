@@ -52,57 +52,6 @@
     }
   });
 
-  // Long-press → edit mode. Gestures inside the iframe never bubble to
-  // the shell document, so the SDK detects the hold and reports it over
-  // the port (the injected base style suppresses text selection so
-  // WebKit doesn't claim the press for the selection UI first). 450ms
-  // mirrors the shell's EDIT_HOLD_MS.
-  (function () {
-    let timer = null;
-    let sx = 0;
-    let sy = 0;
-    function cancel() {
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
-    window.addEventListener(
-      "pointerdown",
-      function (e) {
-        sx = e.clientX;
-        sy = e.clientY;
-        cancel();
-        timer = setTimeout(function () {
-          timer = null;
-          if (port) port.postMessage({ type: "edit_hold" });
-        }, 450);
-      },
-      true,
-    );
-    window.addEventListener(
-      "pointermove",
-      function (e) {
-        if (
-          timer !== null &&
-          (Math.abs(e.clientX - sx) > 8 || Math.abs(e.clientY - sy) > 8)
-        ) {
-          cancel();
-        }
-      },
-      true,
-    );
-    window.addEventListener("pointerup", cancel, true);
-    window.addEventListener("pointercancel", cancel, true);
-    window.addEventListener(
-      "contextmenu",
-      function (e) {
-        e.preventDefault();
-      },
-      true,
-    );
-  })();
-
   window.deck = {
     onData: function (cb) {
       dataCbs.push(cb);

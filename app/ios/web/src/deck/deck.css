@@ -19,13 +19,28 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* The shell is a widget surface, not a document: without this, a
+   long-press anywhere the SHELL owns starts WebKit text selection —
+   the loupe magnifier, and the <iframe> element itself getting
+   selected as an atomic node (blue box around the whole card). The
+   card INTERIORS are covered separately by cardBase.css; this covers
+   the parent document. */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
 .deck-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   grid-auto-rows: var(--deck-row-h);
   grid-auto-flow: dense;
   gap: var(--deck-gap);
-  padding: calc(env(safe-area-inset-top) + 8px) 16px
+  /* The webview is full-bleed under the native header (46pt bar + 8
+     breathing); this padding is the resting offset, and scrolling runs
+     the cards under the header's paper veil like the chat list. */
+  padding: calc(env(safe-area-inset-top) + 54px) 16px
     calc(env(safe-area-inset-bottom) + 24px);
 }
 
@@ -39,15 +54,18 @@ body {
   overflow: hidden;
 }
 
-.deck-card[data-size="small"] {
+.deck-card[data-size="small"],
+.deck-drop-slot[data-size="small"] {
   grid-column: span 1;
   grid-row: span 1;
 }
-.deck-card[data-size="wide"] {
+.deck-card[data-size="wide"],
+.deck-drop-slot[data-size="wide"] {
   grid-column: span 2;
   grid-row: span 1;
 }
-.deck-card[data-size="large"] {
+.deck-card[data-size="large"],
+.deck-drop-slot[data-size="large"] {
   grid-column: span 2;
   grid-row: span 2;
 }
@@ -168,19 +186,37 @@ body {
   animation: deck-wiggle 0.3s ease-in-out infinite;
 }
 
-/* SortableJS drag pair: the in-grid original becomes the dimmed slot
-   indicator (ghost) while the fallback clone rides the finger. */
-.deck-grid.editing .deck-card.deck-drag-ghost {
-  animation: none;
-  opacity: 0.25;
-  box-shadow: none;
+/* The live drag (iOS-home-screen mechanics; see shell.ts drag engine).
+   The REAL tile lifts out of flow and follows the finger — fixed +
+   transform, never a DOM move, so its iframe keeps painting live
+   content the whole way. The placeholder is the drop slot the grid
+   reflows around. Wiggle pauses during a drag so the FLIP slides own
+   the transform channel. Drags must win over scrolling on tiles while
+   editing (the wiggle-mode contract), hence touch-action. */
+.deck-grid.editing .deck-card {
+  touch-action: none;
 }
 
-.deck-card.deck-drag-fallback {
+.deck-grid.has-drag .deck-card {
   animation: none;
-  opacity: 0.95;
+}
+
+/* No pointer-events:none here: the lifted tile is the pointer-capture
+   target, and it must stay event-eligible for the move stream. Nothing
+   hit-tests under the finger anyway — dropIndexAt works on rects. */
+.deck-card.deck-dragging-live {
+  position: fixed;
   z-index: 10;
-  box-shadow: 0 12px 32px rgba(28, 27, 25, 0.28);
+  margin: 0;
+  animation: none;
+  box-shadow: 0 12px 32px rgba(28, 27, 25, 0.22);
+  will-change: transform;
+}
+
+.deck-drop-slot {
+  border: 1px dashed var(--deck-line);
+  border-radius: 16px;
+  background: rgba(28, 27, 25, 0.03);
 }
 
 /* Cards must never receive pointer events while editing — the drag owns
