@@ -228,6 +228,7 @@ impl SessionStore for SqliteSessionStore {
         let id = session.id.as_str().to_string();
         let root_id = session.root_session_id.as_str().to_string();
         let trigger_kind = trigger_kind.to_string();
+        let channel = session.channel.as_str().to_string();
         let created_us = super::time::to_us(session.created_at);
         let last_active_us = super::time::to_us(session.last_active);
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
@@ -244,8 +245,8 @@ impl SessionStore for SqliteSessionStore {
                     "INSERT INTO sessions \
                      (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
                       parent_span_id, lineage_kind, created_at, last_active, \
-                      hidden, pinned, archived, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                      hidden, pinned, archived, channel, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13) \
                      ON CONFLICT(id) DO UPDATE SET \
                        root_session_id = excluded.root_session_id, \
                        trigger_kind = excluded.trigger_kind, \
@@ -270,6 +271,7 @@ impl SessionStore for SqliteSessionStore {
                         pinned_flag,
                         archived_flag,
                         data,
+                        channel,
                     ],
                 )?;
                 Ok(())
@@ -405,22 +407,6 @@ impl SessionStore for SqliteSessionStore {
         Ok(affected > 0)
     }
 
-    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
-        let sid = session_id.as_str().to_string();
-        self.pool
-            .interact("sessions.read_cursor", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT read_cursor FROM sessions WHERE id = ?1",
-                        rusqlite::params![sid],
-                        |row| row.get::<_, Option<i64>>(0),
-                    )
-                    .optional()?
-                    .flatten())
-            })
-            .await
-    }
-
     async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
         let sid = session_id.as_str().to_string();
         let value: Option<String> = title.map(|t| t.to_string());
@@ -507,21 +493,17 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_by_channel(&self, channel: &baybo_model::ChannelType) -> Result<Vec<Session>> {
-        // Push the channel filter into SQL via `json_extract` — the
-        // sessions table doesn't carry `channel` as a flat column
-        // (it rides inside the JSON `data` blob), so a real index
-        // isn't available without a schema migration. This is still
-        // a full table scan, but non-matching rows never ship their
-        // `data` blob out of sqlite or pay the serde decode
-        // in userland, which is the cost we actually care about for
-        // a long-running gateway with thousands of bot sessions.
+        // The flat `channel` column (backfilled by `init_db`, written on
+        // every save) makes this an `idx_sessions_channel_active` range
+        // scan — non-matching rows never ship their `data` blob out of
+        // sqlite or pay the serde decode.
         let channel = channel.as_str().to_string();
         let rows = self
             .pool
             .interact("sessions.list_by_channel", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
-                     WHERE json_extract(data, '$.channel') = ?1 \
+                     WHERE channel = ?1 \
                      ORDER BY last_active DESC",
                 )?;
                 let rows = stmt
@@ -747,48 +729,17 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
-        let sid = session_id.as_str().to_string();
-        let rows = self
-            .pool
-            .interact("sessions.list_control_events", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
-                     WHERE session_id = ?1 ORDER BY seq",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await?;
+        self.list_control_events_impl(session_id, None).await
+    }
 
-        let mut out = Vec::new();
-        for (seq, after_ordinal, kind_str, text, created_us) in rows {
-            let kind = kind_str
-                .parse::<ControlEventKind>()
-                .map_err(StorageError::Storage)?;
-            let created_at = super::time::from_us(created_us).ok_or_else(|| {
-                StorageError::Storage(format!(
-                    "session_control_events.created_at out of range: {created_us}"
-                ))
-            })?;
-            out.push(ControlEvent {
-                seq,
-                after_ordinal,
-                kind,
-                text,
-                created_at,
-            });
-        }
-        Ok(out)
+    async fn list_control_events_in_range(
+        &self,
+        session_id: &SessionId,
+        lower: i64,
+        upper: i64,
+    ) -> Result<Vec<ControlEvent>> {
+        self.list_control_events_impl(session_id, Some((lower, upper)))
+            .await
     }
 
     async fn apply_session_compaction(
@@ -1181,57 +1132,384 @@ impl SessionStore for SqliteSessionStore {
             .await
     }
 
-    async fn load_last_user_message(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<(DateTime<Utc>, baybo_model::ChatMessage)>> {
-        let sid = session_id.as_str().to_string();
-        // Newest human-authored row (source `user` / `user_interjection`,
-        // i.e. `from_user`). The partial active index makes `ORDER BY
-        // ordinal DESC LIMIT 1` a single back-of-index probe regardless of
-        // how many tool/agent rows the turn appended after the prompt.
-        let row = self
-            .pool
-            .interact("sessions.load_last_user_message", move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT created_at, role, content, source, platform_msg_id FROM session_messages \
-                         WHERE session_id = ?1 AND superseded_by IS NULL \
-                           AND source IN ('user', 'user_interjection') \
-                         ORDER BY ordinal DESC \
-                         LIMIT 1",
-                        rusqlite::params![sid],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, String>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?)
-            })
-            .await?;
-
-        let Some((created_us, role, content_json, source_str, platform_msg_id)) = row else {
-            return Ok(None);
-        };
-        let created_at = super::time::from_us(created_us).ok_or_else(|| {
-            StorageError::Storage(format!(
-                "session_messages.created_at out of range: {created_us}"
-            ))
-        })?;
-        Ok(Some((
-            created_at,
-            decode_message_row((role, content_json, source_str, platform_msg_id))?,
-        )))
-    }
-
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
+    ) -> Result<Vec<StoredMessage>> {
+        self.load_messages_with_supersede_impl(session_id, None)
+            .await
+    }
+
+    async fn load_session_messages_with_supersede_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.load_messages_with_supersede_impl(session_id, Some(after_ordinal))
+            .await
+    }
+
+    async fn supersede_watermark(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.supersede_watermark", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT MAX(superseded_by) FROM session_messages WHERE session_id = ?1",
+                    rusqlite::params![sid],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .await
+    }
+
+    async fn session_created_times(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<DateTime<Utc>>> {
+        let from_us = super::time::to_us(from);
+        let to_us = super::time::to_us(to);
+        let raw = self
+            .pool
+            .interact("sessions.session_created_times", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT created_at FROM sessions WHERE created_at >= ?1 AND created_at < ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![from_us, to_us], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|us| {
+                super::time::from_us(us).ok_or_else(|| {
+                    StorageError::Internal(anyhow::anyhow!(
+                        "sessions.created_at out of range: {us}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    async fn last_user_messages(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, DateTime<Utc>, ChatMessage)>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The human-authored `source` tags, i.e. `ChatMessage::from_user`.
+        // Must stay in lockstep with `MessageSource::{User, UserInterjection}`
+        // wire strings in `baybo-model` — `decode_message_row` round-trips
+        // through the same tags, so a drift shows up in this file's tests.
+        const HUMAN_SOURCES_SQL: &str = "'user', 'user_interjection'";
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        let raw = self
+            .pool
+            .interact("sessions.last_user_messages", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, created_at, role, content, source, platform_msg_id FROM ( \
+                         SELECT session_id, created_at, role, content, source, platform_msg_id, \
+                                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
+                         FROM session_messages \
+                         WHERE session_id IN ({placeholders}) AND superseded_by IS NULL \
+                           AND source IN ({HUMAN_SOURCES_SQL}) \
+                     ) WHERE rn = 1"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(sid, created_us, role, content, source, pmi)| {
+                let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                    StorageError::Storage(format!(
+                        "session_messages.created_at out of range: {created_us}"
+                    ))
+                })?;
+                Ok((
+                    SessionId::from(sid),
+                    created_at,
+                    decode_message_row((role, content, source, pmi))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn active_tails(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, i64, DateTime<Utc>, ChatMessage)>> {
+        if session_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        let limit = limit as i64;
+        let raw = self
+            .pool
+            .interact("sessions.active_tails", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id FROM ( \
+                         SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id, \
+                                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
+                         FROM session_messages \
+                         WHERE session_id IN ({placeholders}) AND superseded_by IS NULL \
+                     ) WHERE rn <= ? ORDER BY session_id, ordinal"
+                ))?;
+                let params: Vec<rusqlite::types::Value> = keys
+                    .iter()
+                    .map(|k| rusqlite::types::Value::from(k.clone()))
+                    .chain(std::iter::once(rusqlite::types::Value::from(limit)))
+                    .collect();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(sid, ordinal, created_us, role, content, source, pmi)| {
+                let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                    StorageError::Storage(format!(
+                        "session_messages.created_at out of range: {created_us}"
+                    ))
+                })?;
+                Ok((
+                    SessionId::from(sid),
+                    ordinal,
+                    created_at,
+                    decode_message_row((role, content, source, pmi))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn unread_scan(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, ChatMessage)>> {
+        if session_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        let limit = limit as i64;
+        let raw = self
+            .pool
+            .interact("sessions.unread_scan", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, role, content, source, platform_msg_id FROM ( \
+                         SELECT sm.session_id, sm.role, sm.content, sm.source, sm.platform_msg_id, \
+                                ROW_NUMBER() OVER (PARTITION BY sm.session_id ORDER BY sm.ordinal) rn \
+                         FROM session_messages sm JOIN sessions s ON s.id = sm.session_id \
+                         WHERE sm.session_id IN ({placeholders}) AND sm.superseded_by IS NULL \
+                           AND sm.ordinal > COALESCE(s.read_cursor, -1) \
+                     ) WHERE rn <= ? ORDER BY session_id"
+                ))?;
+                let params: Vec<rusqlite::types::Value> = keys
+                    .iter()
+                    .map(|k| rusqlite::types::Value::from(k.clone()))
+                    .chain(std::iter::once(rusqlite::types::Value::from(limit)))
+                    .collect();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(sid, role, content, source, pmi)| {
+                Ok((
+                    SessionId::from(sid),
+                    decode_message_row((role, content, source, pmi))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn session_titles(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, Option<String>)>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        self.pool
+            .interact("sessions.session_titles", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, title FROM sessions WHERE id IN ({placeholders})"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                        Ok((
+                            SessionId::from(row.get::<_, String>(0)?),
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn session_channels(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, String)>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = session_ids.iter().map(|s| s.as_str().to_string()).collect();
+        self.pool
+            .interact("sessions.session_channels", move |conn| {
+                let placeholders = super::in_placeholders(keys.len());
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, channel FROM sessions \
+                     WHERE id IN ({placeholders}) AND channel IS NOT NULL"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                        Ok((
+                            SessionId::from(row.get::<_, String>(0)?),
+                            row.get::<_, String>(1)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn touch_last_active(&self, session_id: &SessionId, now: DateTime<Utc>) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        let now_us = super::time::to_us(now);
+        // The blob's embedded copy is patched in the same statement so
+        // read paths that decode `data` (get / list_*) stay coherent
+        // without selecting the column separately. The bound TEXT value
+        // lands as a JSON string — the same shape serde writes.
+        let now_json = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let affected = self
+            .pool
+            .interact("sessions.touch_last_active", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions \
+                     SET last_active = ?2, data = json_set(data, '$.last_active', ?3) \
+                     WHERE id = ?1",
+                    rusqlite::params![sid, now_us, now_json],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn count_sessions(&self) -> Result<usize> {
+        self.pool
+            .interact("sessions.count_sessions", move |conn| {
+                let n: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+                Ok(n as usize)
+            })
+            .await
+    }
+}
+
+impl SqliteSessionStore {
+    async fn list_control_events_impl(
+        &self,
+        session_id: &SessionId,
+        anchor_range: Option<(i64, i64)>,
+    ) -> Result<Vec<ControlEvent>> {
+        let sid = session_id.as_str().to_string();
+        // `i64::MIN..=i64::MAX` bounds make the unfiltered case the
+        // same statement — the `(session_id, seq)` PK confines both to
+        // one session partition.
+        let (lower, upper) = anchor_range.unwrap_or((i64::MIN, i64::MAX));
+        let rows = self
+            .pool
+            .interact("sessions.list_control_events", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
+                     WHERE session_id = ?1 AND after_ordinal >= ?2 AND after_ordinal <= ?3 \
+                     ORDER BY seq",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid, lower, upper], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let mut out = Vec::new();
+        for (seq, after_ordinal, kind_str, text, created_us) in rows {
+            let kind = kind_str
+                .parse::<ControlEventKind>()
+                .map_err(StorageError::Storage)?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_control_events.created_at out of range: {created_us}"
+                ))
+            })?;
+            out.push(ControlEvent {
+                seq,
+                after_ordinal,
+                kind,
+                text,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn load_messages_with_supersede_impl(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: Option<i64>,
     ) -> Result<Vec<StoredMessage>> {
         let sid = session_id.as_str().to_string();
         let rows = self
@@ -1240,10 +1518,10 @@ impl SessionStore for SqliteSessionStore {
                 let mut stmt = conn.prepare(
                     "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id \
                      FROM session_messages \
-                     WHERE session_id = ?1 ORDER BY ordinal",
+                     WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![sid], |row| {
+                    .query_map(rusqlite::params![sid, after_ordinal.unwrap_or(i64::MIN)], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, Option<i64>>(1)?,
@@ -1528,6 +1806,46 @@ mod tests {
         let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].hidden, "hidden flag must reflect the column");
+    }
+
+    #[tokio::test]
+    async fn touch_last_active_keeps_column_and_blob_coherent() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+        let s = make_root_session("touch-me");
+        store.save(&s).await.unwrap();
+
+        let later = s.last_active + chrono::Duration::hours(3);
+        assert!(store.touch_last_active(&s.id, later).await.unwrap());
+        assert!(
+            !store
+                .touch_last_active(&SessionId::from("missing"), later)
+                .await
+                .unwrap()
+        );
+
+        // The blob must still decode, and both the decoded field and the
+        // flat ordering column must carry the new timestamp — a stale
+        // blob would resurface the old time on the next `get` + `save`.
+        // Compared at µs precision: the schema-wide timestamp invariant
+        // (`sqlite::time`) truncates sub-microsecond digits.
+        let later_us = super::super::time::from_us(super::super::time::to_us(later)).unwrap();
+        let loaded = store.get(&s.id).await.unwrap().unwrap();
+        assert_eq!(loaded.last_active, later_us);
+        let column_us = pool
+            .interact("test.read_last_active", {
+                let sid = s.id.as_str().to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT last_active FROM sessions WHERE id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(column_us, super::super::time::to_us(later));
     }
 
     #[tokio::test]
@@ -2242,20 +2560,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_last_user_message_finds_freshest_human_turn_past_tool_churn() {
+    async fn chat_list_batch_queries_group_per_session() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let a = make_root_session("batch-a");
+        store.save(&a).await.unwrap();
+        store.set_title(&a.id, Some("A")).await.unwrap();
+        let b = make_root_session("batch-b");
+        store.save(&b).await.unwrap();
+
+        // Session A: user prompt, assistant reply, newer user prompt.
+        for msg in [
+            baybo_model::ChatMessage::user(text("first prompt")),
+            baybo_model::ChatMessage::assistant(text("reply")),
+            baybo_model::ChatMessage::user(text("second prompt")),
+        ] {
+            store.append_session_message(&a.id, &msg).await.unwrap();
+        }
+        // Session B: only an agent-injected row — no user preview.
+        store
+            .append_session_message(
+                &b.id,
+                &baybo_model::ChatMessage::agent_context(text("frame")),
+            )
+            .await
+            .unwrap();
+
+        let ids = [a.id.clone(), b.id.clone()];
+
+        let last_users = store.last_user_messages(&ids).await.unwrap();
+        assert_eq!(last_users.len(), 1, "B has no human-authored row");
+        assert_eq!(last_users[0].0, a.id);
+
+        let tails = store.active_tails(&ids, 2).await.unwrap();
+        let a_tail: Vec<i64> = tails
+            .iter()
+            .filter(|(sid, ..)| sid == &a.id)
+            .map(|(_, ordinal, ..)| *ordinal)
+            .collect();
+        assert_eq!(a_tail, vec![1, 2], "last 2 rows, ascending");
+        assert_eq!(tails.iter().filter(|(sid, ..)| sid == &b.id).count(), 1);
+
+        // Unread: A's cursor sits before the assistant reply, B has no cursor.
+        store.set_read_cursor(&a.id, 0).await.unwrap();
+        let unread = store.unread_scan(&ids, 10).await.unwrap();
+        let a_unread: Vec<_> = unread.iter().filter(|(sid, _)| sid == &a.id).collect();
+        assert_eq!(
+            a_unread.len(),
+            2,
+            "reply + second prompt sit above the cursor"
+        );
+
+        let titles = store.session_titles(&ids).await.unwrap();
+        let title_map: std::collections::HashMap<_, _> = titles.into_iter().collect();
+        assert_eq!(title_map[&a.id], Some("A".into()));
+        assert_eq!(title_map[&b.id], None);
+    }
+
+    #[tokio::test]
+    async fn last_user_messages_finds_freshest_human_turn_past_tool_churn() {
         let pool = SqlitePool::open_in_memory().await.unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("preview-me");
         store.save(&session).await.unwrap();
         let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
 
-        // No user turn yet -> None.
+        // No user turn yet -> no entry for the session.
         assert!(
             store
-                .load_last_user_message(&session.id)
+                .last_user_messages(std::slice::from_ref(&session.id))
                 .await
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
 
         store
@@ -2291,11 +2669,11 @@ mod tests {
                 .unwrap();
         }
 
-        let (_, msg) = store
-            .load_last_user_message(&session.id)
+        let rows = store
+            .last_user_messages(std::slice::from_ref(&session.id))
             .await
-            .unwrap()
-            .expect("a user turn");
+            .unwrap();
+        let (_, _, msg) = rows.first().expect("a user turn");
         assert!(msg.from_user());
         assert_eq!(
             msg.content,
@@ -2305,7 +2683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_last_user_message_counts_interjections_not_agent_user_rows() {
+    async fn last_user_messages_counts_interjections_not_agent_user_rows() {
         let pool = SqlitePool::open_in_memory().await.unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("interjection-me");
@@ -2335,11 +2713,11 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, msg) = store
-            .load_last_user_message(&session.id)
+        let rows = store
+            .last_user_messages(std::slice::from_ref(&session.id))
             .await
-            .unwrap()
-            .expect("a user turn");
+            .unwrap();
+        let (_, _, msg) = rows.first().expect("a user turn");
         assert_eq!(
             msg.content,
             text("interjected"),

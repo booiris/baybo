@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_model::{ChatMessage, ContentBlock, MessageSource, Role, SessionId, ThinkingContent};
-use baybo_tools::{VirtualReadAccess, VirtualReadResolver};
+use baybo_tools::{VirtualReadAccess, VirtualReadResolver, VirtualReadWindow};
 use baybo_workspace::WorkspacePaths;
 use baybo_workspace::paths::SESSION_LOG_EXTENSION;
 use tracing::warn;
@@ -63,6 +63,7 @@ impl VirtualReadResolver for SessionTranscriptReader {
         &self,
         path: &Path,
         access: &VirtualReadAccess<'_>,
+        window: &VirtualReadWindow,
     ) -> Option<Result<String, String>> {
         if !self.is_transcript_path(path) {
             return None;
@@ -83,7 +84,22 @@ impl VirtualReadResolver for SessionTranscriptReader {
         }
         Some(
             match self.transcript.full_transcript(access.session_id).await {
-                Ok(messages) => Ok(render_transcript(&messages)),
+                // Render only up to the window's last line — a paged read
+                // of a long transcript stops materialising text at the
+                // page boundary instead of rendering the whole log per
+                // page — then number + slice with the shared paginator so
+                // line numbers match a real file read. The end line comes
+                // from the paginator itself so its offset/limit defaulting
+                // has a single source of truth.
+                Ok(messages) => {
+                    let end_line = baybo_tools::paginate_end_line(window.offset, window.limit);
+                    let rendered = render_transcript(&messages, end_line);
+                    Ok(baybo_tools::paginate_numbered(
+                        &rendered,
+                        window.offset,
+                        window.limit,
+                    ))
+                }
                 Err(e) => Err(format!("failed to load session transcript: {e}")),
             },
         )
@@ -99,11 +115,16 @@ const MAX_RENDER_BYTES: usize = 16 * 1024 * 1024;
 /// Flatten a transcript into readable, line-oriented text for the
 /// post-compaction recovery read. Each message gets an ordinal/provenance
 /// header and its blocks expanded verbatim (text, tool calls + args, tool
-/// results, thinking) so the model can recover exact pre-compaction detail;
-/// `ReadTool` paginates the returned text by line, like any file read.
-fn render_transcript(messages: &[ChatMessage]) -> String {
+/// results, thinking) so the model can recover exact pre-compaction detail.
+/// Rendering stops once `max_lines` lines exist — the caller paginates by
+/// line, so text past the requested window would be thrown away anyway.
+fn render_transcript(messages: &[ChatMessage], max_lines: usize) -> String {
     let mut out = String::new();
+    let mut lines = 0usize;
     for (i, msg) in messages.iter().enumerate() {
+        if lines >= max_lines {
+            break;
+        }
         if out.len() >= MAX_RENDER_BYTES {
             out.push_str(&format!(
                 "… [transcript truncated at {} MiB]\n",
@@ -111,6 +132,7 @@ fn render_transcript(messages: &[ChatMessage]) -> String {
             ));
             break;
         }
+        let rendered_before = out.len();
         // Label by role, except for synthesized/framed rows: recalled-memory,
         // cron, and mid-turn-interjection rows ride the wire as `Role::User`
         // wrapped in a steering envelope, so labelling them by role alone would
@@ -172,6 +194,9 @@ fn render_transcript(messages: &[ChatMessage]) -> String {
             }
         }
         out.push('\n');
+        // Whole messages render atomically (simpler than clipping inside a
+        // block); the line count only gates whether the NEXT message starts.
+        lines += out[rendered_before..].matches('\n').count();
     }
     out
 }
@@ -240,7 +265,7 @@ mod tests {
                 meta: None,
             }]),
         ];
-        let out = render_transcript(&messages);
+        let out = render_transcript(&messages, usize::MAX);
         assert!(out.contains("[0] user"));
         assert!(out.contains("hello"));
         assert!(out.contains("<thinking>"));
@@ -263,7 +288,7 @@ mod tests {
             ChatMessage::recalled_memory(vec![ContentBlock::Text("recalled note".into())]),
             ChatMessage::user_interjection(vec![ContentBlock::Text("steer left".into())]),
         ];
-        let out = render_transcript(&messages);
+        let out = render_transcript(&messages, usize::MAX);
         assert!(out.contains("[0] user"));
         assert!(out.contains("[1] recalled_memory"));
         assert!(out.contains("[2] user_interjection"));
@@ -285,7 +310,10 @@ mod tests {
             session_id: &sid,
             user: &u,
         };
-        let Some(Ok(text)) = reader.resolve(&own_path(&sid), &access).await else {
+        let Some(Ok(text)) = reader
+            .resolve(&own_path(&sid), &access, &VirtualReadWindow::default())
+            .await
+        else {
             panic!("expected Some(Ok)");
         };
         assert!(text.contains("recovered detail"));
@@ -303,7 +331,10 @@ mod tests {
             session_id: &caller,
             user: &u,
         };
-        let Some(Err(reason)) = reader.resolve(&own_path(&other), &access).await else {
+        let Some(Err(reason)) = reader
+            .resolve(&own_path(&other), &access, &VirtualReadWindow::default())
+            .await
+        else {
             panic!("cross-session read must be denied");
         };
         assert!(reason.contains("own transcript"));
@@ -319,7 +350,12 @@ mod tests {
             user: &u,
         };
         let elsewhere = std::path::Path::new("/tmp/baybo-vread-test/work/foo.txt");
-        assert!(reader.resolve(elsewhere, &access).await.is_none());
+        assert!(
+            reader
+                .resolve(elsewhere, &access, &VirtualReadWindow::default())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -331,7 +367,10 @@ mod tests {
             session_id: &sid,
             user: &u,
         };
-        let Some(Err(reason)) = reader.resolve(&own_path(&sid), &access).await else {
+        let Some(Err(reason)) = reader
+            .resolve(&own_path(&sid), &access, &VirtualReadWindow::default())
+            .await
+        else {
             panic!("expected Some(Err)");
         };
         assert!(reason.contains("failed to load"));
@@ -397,7 +436,10 @@ mod tests {
             session_id: &sid,
             user: &u,
         };
-        let Some(Ok(text)) = reader.resolve(&own_path(&sid), &access).await else {
+        let Some(Ok(text)) = reader
+            .resolve(&own_path(&sid), &access, &VirtualReadWindow::default())
+            .await
+        else {
             panic!("expected Some(Ok)");
         };
         assert!(

@@ -30,9 +30,10 @@ pub use approval::{
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::read::READ_TOOL_NAME;
+pub use builtin::read::{paginate_end_line, paginate_numbered};
 pub use error::ToolError;
 pub use read_tracker::ReadTracker;
-pub use virtual_read::{VirtualReadAccess, VirtualReadResolver};
+pub use virtual_read::{VirtualReadAccess, VirtualReadResolver, VirtualReadWindow};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 

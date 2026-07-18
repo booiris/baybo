@@ -869,6 +869,7 @@ dependencies = [
  "baybo-store",
  "baybo-trace",
  "chrono",
+ "futures",
  "parking_lot",
  "serde",
  "serde_json",

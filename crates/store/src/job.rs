@@ -42,6 +42,19 @@ pub struct JobTransitionRow {
     pub data: String,
 }
 
+/// Per-session job aggregates for list surfaces: how many jobs a
+/// session has and the `status_kind` of its newest job (by
+/// `created_at`). One grouped query replaces a `list_by_session`
+/// fan-out across every session.
+#[derive(Debug, Clone)]
+pub struct SessionJobStats {
+    pub session_id: SessionId,
+    pub job_count: usize,
+    /// `JobStatusKind` of the latest job, rendered as its snake_case
+    /// wire string (same encoding as [`JobRow::status_kind`]).
+    pub latest_status_kind: String,
+}
+
 /// Persistence backend for jobs and their transition audit log. Trades
 /// in [`JobRow`] / [`JobTransitionRow`] rather than the rich `baybo-job`
 /// types so the contract stays in this leaf crate.
@@ -62,6 +75,22 @@ pub trait JobStore: Send + Sync {
     async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<JobRow>>;
     /// Return every stored job. Ordering unspecified — callers sort.
     async fn list_all(&self) -> Result<Vec<JobRow>>;
+    /// One page of jobs, newest `created_at` first, optionally
+    /// filtered by the snake_case `JobStatusKind` wire string, plus
+    /// the total matching count. Ordering + paging live in SQL so a
+    /// page never materialises the full table.
+    async fn list_page(
+        &self,
+        status_kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<JobRow>, usize)>;
+    /// Job aggregates grouped by session — one [`SessionJobStats`] per
+    /// session that has at least one job. Ordering unspecified.
+    async fn session_job_stats(&self) -> Result<Vec<SessionJobStats>>;
+    /// Number of jobs with the given snake_case `JobStatusKind` wire
+    /// string. Status surfaces need the number, not the rows.
+    async fn count_by_status_kind(&self, status_kind: &str) -> Result<usize>;
     /// Jobs whose status is non-terminal (`pending` / `in_progress` /
     /// `stuck`). Used by admin queries surfacing jobs needing attention.
     async fn list_recoverable(&self) -> Result<Vec<JobRow>>;

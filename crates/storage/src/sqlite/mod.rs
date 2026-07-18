@@ -204,6 +204,13 @@ impl SqlitePool {
     }
 }
 
+/// `?,?,...,?` for an `IN (...)` list of `n` bound values. Callers
+/// chunk large lists (see `IN_CHUNK` sites) to stay under sqlite's
+/// bound-variable limit.
+pub(crate) fn in_placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
+}
+
 /// Create all required tables if they do not already exist.
 ///
 /// Timestamp columns (`created_at`, `started_at` on `jobs`, etc.) are Unix
@@ -483,6 +490,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     timestamp                       INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cost_user_id ON cost_records(user_id);
+                CREATE INDEX IF NOT EXISTS idx_cost_user_ts ON cost_records(user_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
                 CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
@@ -502,6 +510,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     ON jobs(session_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status
                     ON jobs(status_kind);
+                CREATE INDEX IF NOT EXISTS idx_jobs_created
+                    ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jobs_parent
                     ON jobs(parent_job_id);
 
@@ -528,6 +538,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 );
                 CREATE INDEX IF NOT EXISTS idx_steps_job
                     ON steps(job_id, started_at);
+                -- Serves the boot recovery sweep: only genuinely open
+                -- rows are read instead of json_extract-scanning every
+                -- step/span blob.
+                CREATE INDEX IF NOT EXISTS idx_steps_open
+                    ON steps(id) WHERE ended_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS spans (
                     id         TEXT PRIMARY KEY,
@@ -538,6 +553,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 );
                 CREATE INDEX IF NOT EXISTS idx_spans_step
                     ON spans(step_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_spans_open_step
+                    ON spans(step_id) WHERE ended_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS span_events (
                     span_id         TEXT    NOT NULL,
@@ -779,6 +796,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
         "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
         "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN channel TEXT",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {
@@ -807,7 +825,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              ON cron_jobs(deleted_at) WHERE deleted_at IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event
              ON session_messages(session_id, source_event_id)
-             WHERE source_event_id IS NOT NULL;",
+             WHERE source_event_id IS NOT NULL;
+         -- Serves the chat-list base query (channel scope + newest-first).
+         CREATE INDEX IF NOT EXISTS idx_sessions_channel_active
+             ON sessions(channel, last_active DESC);",
     )
     .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
 
@@ -829,6 +850,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
             WHERE json_extract(data, '$.channel') IN ('http', 'device');",
     )
     .map_err(|e| anyhow::anyhow!("owner-channel collapse migration failed: {e}"))?;
+
+    // Backfill the flat `channel` column from the blob for rows written
+    // before the column existed. Runs AFTER the owner-collapse pass so a
+    // collapsed tag lands, not the retired one. Idempotent: after one
+    // pass no row has a NULL channel (new writes set it directly).
+    conn.execute(
+        "UPDATE sessions SET channel = json_extract(data, '$.channel') WHERE channel IS NULL",
+        [],
+    )
+    .map_err(|e| anyhow::anyhow!("channel column backfill failed: {e}"))?;
 
     search::rebuild_if_stale(conn)
         .map_err(|e| anyhow::anyhow!("search index rebuild failed: {e}"))?;

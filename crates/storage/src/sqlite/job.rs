@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use super::SqlitePool;
 use baybo_model::{JobId, SessionId};
 use baybo_store::job::Result;
-use baybo_store::{JobRow, JobStore, JobTransitionRow, StorageError};
+use baybo_store::{JobRow, JobStore, JobTransitionRow, SessionJobStats, StorageError};
 
 pub struct SqliteJobStore {
     pool: SqlitePool,
@@ -204,6 +204,101 @@ impl JobStore for SqliteJobStore {
             vec![],
         )
         .await
+    }
+
+    async fn list_page(
+        &self,
+        status_kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<JobRow>, usize)> {
+        let status_kind = status_kind.map(str::to_string);
+        let limit = limit as i64;
+        let offset = offset as i64;
+        self.pool
+            .interact("jobs.list_page", move |conn| {
+                let (filter, params): (&str, Vec<Value>) = match &status_kind {
+                    Some(k) => ("WHERE status_kind = ?1", vec![Value::from(k.clone())]),
+                    None => ("", vec![]),
+                };
+                let total: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM jobs {filter}"),
+                    rusqlite::params_from_iter(params.iter()),
+                    |row| row.get(0),
+                )?;
+                let mut page_params = params;
+                page_params.push(Value::from(limit));
+                page_params.push(Value::from(offset));
+                let (limit_ref, offset_ref) = if status_kind.is_some() {
+                    ("?2", "?3")
+                } else {
+                    ("?1", "?2")
+                };
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SELECT_COLS} FROM jobs {filter} \
+                     ORDER BY created_at DESC, id DESC LIMIT {limit_ref} OFFSET {offset_ref}"
+                ))?;
+                let raws = stmt
+                    .query_map(rusqlite::params_from_iter(page_params), raw_job_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let rows = raws
+                    .into_iter()
+                    .map(job_row_from)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok((rows, total as usize))
+            })
+            .await
+    }
+
+    async fn count_by_status_kind(&self, status_kind: &str) -> Result<usize> {
+        let status_kind = status_kind.to_string();
+        self.pool
+            .interact("jobs.count_by_status_kind", move |conn| {
+                let n: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE status_kind = ?1",
+                    rusqlite::params![status_kind],
+                    |row| row.get(0),
+                )?;
+                Ok(n as usize)
+            })
+            .await
+    }
+
+    async fn session_job_stats(&self) -> Result<Vec<SessionJobStats>> {
+        self.pool
+            .interact("jobs.session_job_stats", move |conn| {
+                // The correlated subquery resolves the newest job's
+                // status_kind per group via idx_jobs_session
+                // (session_id, created_at) — an index seek per session,
+                // no data-blob reads.
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, COUNT(*), \
+                            (SELECT j2.status_kind FROM jobs j2 \
+                              WHERE j2.session_id = jobs.session_id \
+                              ORDER BY j2.created_at DESC, j2.id DESC LIMIT 1) \
+                     FROM jobs GROUP BY session_id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows
+                    .into_iter()
+                    .map(
+                        |(session_id, job_count, latest_status_kind)| SessionJobStats {
+                            session_id: SessionId::from(session_id),
+                            job_count: job_count as usize,
+                            latest_status_kind,
+                        },
+                    )
+                    .collect())
+            })
+            .await
     }
 
     async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()> {
@@ -406,6 +501,61 @@ mod tests {
             assert_eq!(j.session_id, sess_a);
             assert_ne!(j.status_kind, "completed");
         }
+    }
+
+    #[tokio::test]
+    async fn session_job_stats_groups_and_picks_latest_status() {
+        use std::collections::HashMap;
+
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteJobStore::new(pool);
+        let sess_a = SessionId::from("sess-a");
+        let sess_b = SessionId::from("sess-b");
+        let base = chrono::Utc::now();
+        let mk = |s: &SessionId| {
+            Job::new(
+                s.clone(),
+                TriggerKind::User,
+                JobInput::UserChat {
+                    content: vec![ContentBlock::Text("hi".into())],
+                },
+                None,
+            )
+        };
+
+        // sess-a: completed job (older) + pending job (newest) — the
+        // stats must report the newest job's status, not any other.
+        let mut a_done = mk(&sess_a);
+        a_done.created_at = base;
+        a_done.start().unwrap();
+        a_done
+            .complete(baybo_job::JobOutput::Message {
+                content: vec![ContentBlock::Text("ok".into())],
+                ordinal: None,
+            })
+            .unwrap();
+        create(&store, &a_done).await;
+        let mut a_pending = mk(&sess_a);
+        a_pending.created_at = base + chrono::Duration::seconds(1);
+        create(&store, &a_pending).await;
+
+        let mut b_running = mk(&sess_b);
+        b_running.created_at = base;
+        b_running.start().unwrap();
+        create(&store, &b_running).await;
+
+        let stats: HashMap<_, _> = store
+            .session_job_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.session_id.clone(), s))
+            .collect();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[&sess_a].job_count, 2);
+        assert_eq!(stats[&sess_a].latest_status_kind, "pending");
+        assert_eq!(stats[&sess_b].job_count, 1);
+        assert_eq!(stats[&sess_b].latest_status_kind, "in_progress");
     }
 
     #[tokio::test]

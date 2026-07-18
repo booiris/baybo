@@ -95,6 +95,48 @@ impl TraceStore for MemoryTraceStore {
             .collect())
     }
 
+    async fn list_spans_by_job(&self, job_id: &JobId) -> Result<Vec<SpanRow>> {
+        let step_ids: std::collections::HashSet<StepId> = self
+            .steps
+            .lock()
+            .values()
+            .filter_map(|r| Step::from_row(r.clone()).ok())
+            .filter(|s| &s.job_id == job_id)
+            .map(|s| s.id)
+            .collect();
+        let mut spans: Vec<(chrono::DateTime<chrono::Utc>, SpanRow)> = self
+            .spans
+            .lock()
+            .values()
+            .filter_map(|r| {
+                Span::from_row(r.clone())
+                    .ok()
+                    .filter(|s| step_ids.contains(&s.step_id))
+                    .map(|s| (s.started_at, r.clone()))
+            })
+            .collect();
+        spans.sort_by_key(|(started_at, _)| *started_at);
+        Ok(spans.into_iter().map(|(_, r)| r).collect())
+    }
+
+    async fn trace_counts_by_job(&self, job_id: &JobId) -> Result<(usize, usize)> {
+        let step_ids: std::collections::HashSet<StepId> = self
+            .steps
+            .lock()
+            .values()
+            .filter_map(|r| Step::from_row(r.clone()).ok())
+            .filter(|s| &s.job_id == job_id)
+            .map(|s| s.id)
+            .collect();
+        let spans = self
+            .spans
+            .lock()
+            .values()
+            .filter(|r| Span::from_row((*r).clone()).is_ok_and(|s| step_ids.contains(&s.step_id)))
+            .count();
+        Ok((step_ids.len(), spans))
+    }
+
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
         self.span_events
             .lock()
@@ -111,5 +153,16 @@ impl TraceStore for MemoryTraceStore {
             .get(span_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn list_span_events_for_spans(&self, span_ids: &[SpanId]) -> Result<Vec<SpanEventRow>> {
+        let events = self.span_events.lock();
+        let mut out = Vec::new();
+        for id in span_ids {
+            if let Some(evs) = events.get(id) {
+                out.extend(evs.iter().cloned());
+            }
+        }
+        Ok(out)
     }
 }

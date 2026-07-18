@@ -6,7 +6,7 @@ use super::time;
 use baybo_model::{CallReason, CostRecord, CostSummary, TimeRange};
 use baybo_model::{JobId, MicroUsd, SessionId, SpanId};
 use baybo_store::StorageError;
-use baybo_store::cost::{CostStore, Result as CostResult};
+use baybo_store::cost::{CostGroupBucket, CostGroupKey, CostStore, Result as CostResult};
 
 pub struct SqliteCostStore {
     pool: SqlitePool,
@@ -81,6 +81,87 @@ impl CostStore for SqliteCostStore {
             })
             .await?;
         raws.into_iter().map(raw_to_cost_record).collect()
+    }
+
+    async fn query_user_summary(&self, user_id: &str, range: TimeRange) -> CostResult<CostSummary> {
+        let user_id = user_id.to_string();
+        let from = time::to_us(range.from);
+        let to = time::to_us(range.to);
+        let summary = self
+            .pool
+            .interact("cost.query_user_summary", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
+                                COALESCE(SUM(output_tokens), 0), \
+                                COALESCE(SUM(cached_input_tokens), 0), \
+                                COALESCE(SUM(cache_creation_input_tokens), 0), \
+                                COUNT(*) \
+                         FROM cost_records \
+                         WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+                        rusqlite::params![user_id, from, to],
+                        summary_from_aggregate_row,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        summary.ok_or_else(|| StorageError::Storage("expected aggregate row".to_string()))
+    }
+
+    async fn query_range_grouped(
+        &self,
+        range: TimeRange,
+        key: CostGroupKey,
+    ) -> CostResult<Vec<CostGroupBucket>> {
+        let from = time::to_us(range.from);
+        let to = time::to_us(range.to);
+        // `timestamp` is Unix µs; strftime wants seconds.
+        let key_expr = match key {
+            CostGroupKey::Day => "strftime('%Y-%m-%d', timestamp / 1000000, 'unixepoch')",
+            CostGroupKey::Model => "model",
+            CostGroupKey::Reason => "COALESCE(reason, '')",
+        };
+        self.pool
+            .interact("cost.query_range_grouped", move |conn| {
+                // Aggregates first, key last, so the shared
+                // `summary_from_aggregate_row` decode (columns 0-5) is reused
+                // instead of a third hand-indexed copy.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT COALESCE(SUM(cost_usd), 0), \
+                            COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                            COALESCE(SUM(cached_input_tokens), 0), \
+                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), {key_expr} \
+                     FROM cost_records WHERE timestamp >= ?1 AND timestamp < ?2 \
+                     GROUP BY 7"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![from, to], bucket_from_aggregate_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn query_session_by_job(
+        &self,
+        session_id: &SessionId,
+    ) -> CostResult<Vec<CostGroupBucket>> {
+        let session_id = session_id.as_str().to_string();
+        self.pool
+            .interact("cost.query_session_by_job", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT COALESCE(SUM(cost_usd), 0), \
+                            COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                            COALESCE(SUM(cached_input_tokens), 0), \
+                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), job_id \
+                     FROM cost_records WHERE session_id = ?1 GROUP BY job_id",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![session_id], bucket_from_aggregate_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
     }
 
     async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary> {
@@ -172,6 +253,15 @@ impl CostStore for SqliteCostStore {
             .await?;
         summary.ok_or_else(|| StorageError::Storage("expected aggregate row".to_string()))
     }
+}
+
+/// Decode `<summary aggregates>, key` — the shared 6-column aggregate
+/// SELECT list with the group key appended as column 6.
+fn bucket_from_aggregate_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostGroupBucket> {
+    Ok(CostGroupBucket {
+        summary: summary_from_aggregate_row(row)?,
+        key: row.get::<_, String>(6)?,
+    })
 }
 
 fn summary_from_aggregate_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostSummary> {
@@ -313,6 +403,86 @@ mod tests {
         let summary = store.query_global(wide_range()).await.unwrap();
         assert_eq!(summary.record_count, 2);
         assert_eq!(summary.total_cost_usd, usd(0.30));
+    }
+
+    #[tokio::test]
+    async fn query_user_summary_aggregates_in_sql() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCostStore::new(pool);
+        store.record(&test_record("u1", usd(0.10))).await.unwrap();
+        store.record(&test_record("u1", usd(0.20))).await.unwrap();
+        store.record(&test_record("u2", usd(0.40))).await.unwrap();
+        let summary = store.query_user_summary("u1", wide_range()).await.unwrap();
+        assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.total_cost_usd, usd(0.30));
+        assert_eq!(summary.total_input_tokens, 200);
+    }
+
+    #[tokio::test]
+    async fn query_range_grouped_by_day_model_and_reason() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCostStore::new(pool);
+        let mut a = test_record("u1", usd(0.10));
+        a.model = "m-a".into();
+        a.reason = CallReason::Chat;
+        let mut b = test_record("u1", usd(0.20));
+        b.model = "m-b".into();
+        b.reason = CallReason::Tool("WebFetch".into());
+        store.record(&a).await.unwrap();
+        store.record(&b).await.unwrap();
+
+        let days = store
+            .query_range_grouped(wide_range(), CostGroupKey::Day)
+            .await
+            .unwrap();
+        assert_eq!(days.len(), 1, "both records fall on today (UTC)");
+        assert_eq!(days[0].key, Utc::now().format("%Y-%m-%d").to_string());
+        assert_eq!(days[0].summary.record_count, 2);
+        assert_eq!(days[0].summary.total_cost_usd, usd(0.30));
+
+        let mut models = store
+            .query_range_grouped(wide_range(), CostGroupKey::Model)
+            .await
+            .unwrap();
+        models.sort_by(|x, y| x.key.cmp(&y.key));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].key, "m-a");
+        assert_eq!(models[0].summary.record_count, 1);
+
+        let reasons = store
+            .query_range_grouped(wide_range(), CostGroupKey::Reason)
+            .await
+            .unwrap();
+        let keys: Vec<_> = reasons.iter().map(|b| b.key.as_str()).collect();
+        assert!(keys.contains(&"chat") && keys.contains(&"tool:WebFetch"));
+    }
+
+    #[tokio::test]
+    async fn query_session_by_job_groups_per_job() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCostStore::new(pool);
+        let job_a = JobId::new();
+        let job_b = JobId::new();
+        for (job, cost) in [(job_a, 0.10), (job_a, 0.20), (job_b, 0.40)] {
+            let mut rec = test_record("u1", usd(cost));
+            rec.job_id = job;
+            store.record(&rec).await.unwrap();
+        }
+        let buckets = store
+            .query_session_by_job(&SessionId::from("sess-1"))
+            .await
+            .unwrap();
+        assert_eq!(buckets.len(), 2);
+        let a = buckets.iter().find(|b| b.key == job_a.to_string()).unwrap();
+        assert_eq!(a.summary.record_count, 2);
+        assert_eq!(a.summary.total_cost_usd, usd(0.30));
+        assert!(
+            store
+                .query_session_by_job(&SessionId::from("other"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

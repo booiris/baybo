@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use crate::error::CostError;
 use baybo_model::{CostRecord, CostSummary, TimeRange};
-use baybo_store::cost::{CostStore, Result as CostResult};
+use baybo_store::cost::{CostGroupBucket, CostGroupKey, CostStore, Result as CostResult};
 
 const fn assert_send<T: Send>() {}
 const _: () = assert_send::<CostError>();
@@ -47,6 +47,19 @@ fn in_range(record: &CostRecord, range: &TimeRange) -> bool {
     record.timestamp >= range.from && record.timestamp < range.to
 }
 
+fn fold<'a>(records: impl Iterator<Item = &'a CostRecord>) -> CostSummary {
+    let mut summary = CostSummary::default();
+    for r in records {
+        summary.total_cost_usd += r.cost_usd;
+        summary.total_input_tokens += r.input_tokens;
+        summary.total_output_tokens += r.output_tokens;
+        summary.total_cached_input_tokens += r.cached_input_tokens;
+        summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
+        summary.record_count += 1;
+    }
+    summary
+}
+
 #[async_trait]
 impl CostStore for MemoryCostStore {
     async fn record(&self, record: &CostRecord) -> CostResult<()> {
@@ -64,17 +77,61 @@ impl CostStore for MemoryCostStore {
             .collect())
     }
 
+    async fn query_user_summary(&self, user_id: &str, range: TimeRange) -> CostResult<CostSummary> {
+        Ok(fold(
+            self.records
+                .lock()
+                .iter()
+                .filter(|r| r.user_id == user_id && in_range(r, &range)),
+        ))
+    }
+
     async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self.records.lock().iter().filter(|r| in_range(r, &range)) {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
+        Ok(fold(
+            self.records.lock().iter().filter(|r| in_range(r, &range)),
+        ))
+    }
+
+    async fn query_range_grouped(
+        &self,
+        range: TimeRange,
+        key: CostGroupKey,
+    ) -> CostResult<Vec<CostGroupBucket>> {
+        let records = self.records.lock();
+        let mut by_key: std::collections::BTreeMap<String, Vec<&CostRecord>> = Default::default();
+        for r in records.iter().filter(|r| in_range(r, &range)) {
+            let k = match key {
+                CostGroupKey::Day => r.timestamp.date_naive().format("%Y-%m-%d").to_string(),
+                CostGroupKey::Model => r.model.clone(),
+                CostGroupKey::Reason => r.reason.to_token().into_owned(),
+            };
+            by_key.entry(k).or_default().push(r);
         }
-        Ok(summary)
+        Ok(by_key
+            .into_iter()
+            .map(|(key, rs)| CostGroupBucket {
+                key,
+                summary: fold(rs.into_iter()),
+            })
+            .collect())
+    }
+
+    async fn query_session_by_job(
+        &self,
+        session_id: &SessionId,
+    ) -> CostResult<Vec<CostGroupBucket>> {
+        let records = self.records.lock();
+        let mut by_job: std::collections::BTreeMap<String, Vec<&CostRecord>> = Default::default();
+        for r in records.iter().filter(|r| &r.session_id == session_id) {
+            by_job.entry(r.job_id.to_string()).or_default().push(r);
+        }
+        Ok(by_job
+            .into_iter()
+            .map(|(key, rs)| CostGroupBucket {
+                key,
+                summary: fold(rs.into_iter()),
+            })
+            .collect())
     }
 
     async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
@@ -90,33 +147,17 @@ impl CostStore for MemoryCostStore {
     }
 
     async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| &r.session_id == session_id)
-        {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
+        Ok(fold(
+            self.records
+                .lock()
+                .iter()
+                .filter(|r| &r.session_id == session_id),
+        ))
     }
 
     async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self.records.lock().iter().filter(|r| &r.job_id == job_id) {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
+        Ok(fold(
+            self.records.lock().iter().filter(|r| &r.job_id == job_id),
+        ))
     }
 }
