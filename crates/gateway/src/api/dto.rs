@@ -918,6 +918,16 @@ pub struct TracesListQuery {
     pub offset: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TraceOverviewQuery {
+    /// When set, `session_messages` carries only rows with a greater
+    /// ordinal; the client already holds the prefix and re-validates it
+    /// via the response's `supersede_watermark`.
+    #[serde(default)]
+    pub since_ordinal: Option<i64>,
+}
+
 /// One row of the trace browser list view. Mirrors
 /// [`baybo_query::SessionSummary`] for the wire.
 #[derive(Debug, Clone, Serialize, ToSchema)]

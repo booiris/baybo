@@ -355,8 +355,15 @@ pub struct TraceJobSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceOverview {
     pub session_id: SessionId,
+    /// Full transcript on an unconditional load; only rows with
+    /// `ordinal > since_ordinal` on an incremental one.
     pub session_messages: Vec<SessionMessageRow>,
     pub jobs: Vec<TraceJobSummary>,
+    /// Highest `superseded_by` marker in the session. Incremental
+    /// pollers compare it to the value they last saw: a change means a
+    /// compaction re-marked rows they already hold, so the cached
+    /// prefix is stale and a full reload is required.
+    pub supersede_watermark: Option<i64>,
 }
 
 /// Full step/span tree for a single job, served by
@@ -481,20 +488,101 @@ impl QueryApi {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         // Span events are stored separately; fold them in so callers
         // get a fully self-contained `StepDetail`.
-        for span in &mut spans {
-            if span.events.is_empty() {
-                let evs: Vec<SpanEvent> = self
-                    .trace
-                    .list_span_events(&span.id)
-                    .await
-                    .map_err(TraceError::from)?
-                    .into_iter()
-                    .map(SpanEvent::from_row)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.attach_span_events(&mut spans).await?;
+        Ok(StepDetail { step, spans })
+    }
+
+    /// Fill `events` on every span that has none inline, with one
+    /// batched store query. Events are stored in their own table, so
+    /// spans arrive with an empty `events` vec; fetching them per span
+    /// is an O(spans) round-trip fan-out.
+    async fn attach_span_events(&self, spans: &mut [Span]) -> Result<()> {
+        let need: Vec<baybo_model::SpanId> = spans
+            .iter()
+            .filter(|s| s.events.is_empty())
+            .map(|s| s.id)
+            .collect();
+        if need.is_empty() {
+            return Ok(());
+        }
+        let mut events_by_span: HashMap<baybo_model::SpanId, Vec<SpanEvent>> = HashMap::new();
+        for row in self
+            .trace
+            .list_span_events_for_spans(&need)
+            .await
+            .map_err(TraceError::from)?
+        {
+            let span_id = row.span_id;
+            events_by_span
+                .entry(span_id)
+                .or_default()
+                .push(SpanEvent::from_row(row)?);
+        }
+        for span in spans.iter_mut() {
+            if span.events.is_empty()
+                && let Some(evs) = events_by_span.remove(&span.id)
+            {
                 span.events = evs;
             }
         }
-        Ok(StepDetail { step, spans })
+        Ok(())
+    }
+
+    /// Assemble one job's ordered `steps → spans (+ events)` tree from
+    /// three batched store queries, regardless of tree size. The
+    /// per-step / per-span round-trip fan-out this replaces cost
+    /// O(steps + spans) pool checkouts per call.
+    async fn load_step_tree_for_job(&self, job_id: &JobId) -> Result<Vec<ReplayStep>> {
+        let mut steps = self
+            .trace
+            .list_steps_by_job(job_id)
+            .await
+            .map_err(TraceError::from)?
+            .into_iter()
+            .map(Step::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        steps.sort_by_key(|s| s.started_at);
+
+        let mut spans = self
+            .trace
+            .list_spans_by_job(job_id)
+            .await
+            .map_err(TraceError::from)?
+            .into_iter()
+            .map(Span::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.attach_span_events(&mut spans).await?;
+
+        let mut spans_by_step: HashMap<StepId, Vec<Span>> = HashMap::new();
+        for span in spans {
+            spans_by_step.entry(span.step_id).or_default().push(span);
+        }
+        Ok(steps
+            .into_iter()
+            .map(|step| {
+                let spans = spans_by_step.remove(&step.id).unwrap_or_default();
+                ReplayStep { step, spans }
+            })
+            .collect())
+    }
+
+    /// Per-session trace tally `(jobs, steps, spans)` for status
+    /// surfaces — SQL counts per job, no step/span blob is ever
+    /// materialised.
+    pub async fn trace_counts(&self, session_id: &SessionId) -> Result<(usize, usize, usize)> {
+        let jobs = self.jobs.list_by_session(session_id, None).await?;
+        let mut steps = 0usize;
+        let mut spans = 0usize;
+        for job in &jobs {
+            let (s, sp) = self
+                .trace
+                .trace_counts_by_job(&job.id)
+                .await
+                .map_err(TraceError::from)?;
+            steps += s;
+            spans += sp;
+        }
+        Ok((jobs.len(), steps, spans))
     }
 
     // ── 5. find_recoverable_jobs ───────────────────────────────
@@ -573,22 +661,10 @@ impl QueryApi {
             CostScope::TimeRange(range) => {
                 Ok(costs.query_global(range).await.map_err(CostError::from)?)
             }
-            CostScope::User { user_id, range } => {
-                let records = costs
-                    .query_user(&user_id, range)
-                    .await
-                    .map_err(CostError::from)?;
-                let mut summary = CostSummary::default();
-                for r in records {
-                    summary.total_cost_usd += r.cost_usd;
-                    summary.total_input_tokens += r.input_tokens;
-                    summary.total_output_tokens += r.output_tokens;
-                    summary.total_cached_input_tokens += r.cached_input_tokens;
-                    summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-                    summary.record_count += 1;
-                }
-                Ok(summary)
-            }
+            CostScope::User { user_id, range } => Ok(costs
+                .query_user_summary(&user_id, range)
+                .await
+                .map_err(CostError::from)?),
             CostScope::Session(sid) => {
                 Ok(costs.query_session(&sid).await.map_err(CostError::from)?)
             }
@@ -603,11 +679,11 @@ impl QueryApi {
     /// **latest** job's status kind. Sessions with zero jobs are
     /// dropped (a session with no trace is invisible to the browser).
     ///
-    /// Cardinality: this iterates every live session and loads its
-    /// jobs/steps/spans to compute aggregates. Acceptable for the
-    /// admin surface (low request rate, modest session counts) and
-    /// avoids new storage methods. If session counts grow, the
-    /// natural follow-up is a denormalised per-session counter table.
+    /// Cardinality: everything pre-pagination comes from the session
+    /// scan plus one grouped job-stats query; the aggregates that need
+    /// further store reads (full latest job, span counts, token
+    /// totals) are computed for the returned page only. Request cost
+    /// scales with page size, not total history.
     pub async fn list_session_summaries(
         &self,
         filter: SessionSummaryFilter,
@@ -618,8 +694,6 @@ impl QueryApi {
         // trigger/lineage class.
         let mut sessions = self.sessions.list_all().await.map_err(SessionError::from)?;
 
-        // Cheap filters first so we don't pay per-session aggregate
-        // costs for rows about to be dropped.
         if let Some(prefix) = filter.session_id_prefix.as_deref() {
             let needle = prefix.to_ascii_lowercase();
             sessions.retain(|s| s.id.as_str().to_ascii_lowercase().contains(&needle));
@@ -634,86 +708,90 @@ impl QueryApi {
             sessions.retain(|s| derive_session_kind(s) == want_kind);
         }
 
-        // Now compute aggregates + apply latest-status filter +
-        // drop sessions with no jobs.
-        let mut summaries: Vec<SessionSummary> = Vec::new();
-        for session in &sessions {
-            let mut jobs = self.jobs.list_by_session(&session.id, None).await?;
-            if jobs.is_empty() {
-                continue;
-            }
-            // `list_by_session` returns newest-first, so the head is
-            // the latest job by `created_at`.
-            jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            let latest = jobs.first();
-            if let Some(want) = filter.status_kind
-                && latest.is_none_or(|j| j.status.kind() != want)
-            {
-                continue;
-            }
+        let job_stats: HashMap<SessionId, baybo_store::SessionJobStats> = self
+            .jobs
+            .session_job_stats()
+            .await?
+            .into_iter()
+            .map(|s| (s.session_id.clone(), s))
+            .collect();
 
-            let mut span_count = 0usize;
-            for job in &jobs {
-                let steps = self
-                    .trace
-                    .list_steps_by_job(&job.id)
-                    .await
-                    .map_err(TraceError::from)?
-                    .into_iter()
-                    .map(Step::from_row)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for step in &steps {
-                    let spans = self
-                        .trace
-                        .list_spans_by_step(&step.id)
-                        .await
-                        .map_err(TraceError::from)?
-                        .into_iter()
-                        .map(Span::from_row)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    span_count += spans.len();
-                }
-            }
-
-            let (input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens) =
-                match self.costs.as_ref() {
-                    Some(c) => match c.query_session(&session.id).await {
-                        Ok(s) => (
-                            s.total_input_tokens,
-                            s.total_output_tokens,
-                            s.total_cached_input_tokens,
-                            s.total_cache_creation_input_tokens,
-                        ),
-                        Err(_) => (0, 0, 0, 0),
-                    },
-                    None => (0, 0, 0, 0),
-                };
-
-            summaries.push(SessionSummary {
-                session_id: session.id.clone(),
-                created_at: session.created_at,
-                last_active: session.last_active,
-                latest_job_status: latest.map(|j| j.status.clone()),
-                kind: derive_session_kind(session),
-                job_count: jobs.len(),
-                span_count,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                cache_creation_input_tokens,
-            });
-        }
+        // Latest-status filter + drop sessions with no jobs, from the
+        // grouped stats alone — no per-session reads yet.
+        sessions.retain(|s| match job_stats.get(&s.id) {
+            None => false,
+            Some(stats) => filter
+                .status_kind
+                .is_none_or(|want| stats.latest_status_kind == want.as_snake_case()),
+        });
 
         // `SessionStore::list_all` already orders by `last_active`
-        // DESC, but the per-session work above preserves that order.
-        let total = summaries.len();
+        // DESC and every retain above preserves that order — paginate
+        // before paying any per-session aggregate cost.
+        let total = sessions.len();
         let start = page.offset.min(total);
         let end = if page.limit == 0 {
             total
         } else {
             start.saturating_add(page.limit).min(total)
         };
-        let items = summaries[start..end].to_vec();
+
+        // Page-item aggregates run concurrently across the (≤ page-size)
+        // sessions; parallelism is bounded by the store's connection pool.
+        let items =
+            futures::future::try_join_all(sessions[start..end].iter().map(|session| {
+                let session = session.clone();
+                async move {
+                    let jobs = self.jobs.list_by_session(&session.id, None).await?;
+                    // Same (created_at, id) tiebreak as the grouped stats query, so
+                    // the status shown always belongs to the job the filter judged.
+                    let latest = jobs.iter().max_by_key(|j| (j.created_at, j.id));
+
+                    let mut span_count = 0usize;
+                    for job in &jobs {
+                        span_count += self
+                            .trace
+                            .trace_counts_by_job(&job.id)
+                            .await
+                            .map_err(TraceError::from)?
+                            .1;
+                    }
+
+                    let (
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    ) = match self.costs.as_ref() {
+                        Some(c) => match c.query_session(&session.id).await {
+                            Ok(s) => (
+                                s.total_input_tokens,
+                                s.total_output_tokens,
+                                s.total_cached_input_tokens,
+                                s.total_cache_creation_input_tokens,
+                            ),
+                            Err(_) => (0, 0, 0, 0),
+                        },
+                        None => (0, 0, 0, 0),
+                    };
+
+                    Ok::<SessionSummary, QueryError>(SessionSummary {
+                        session_id: session.id.clone(),
+                        created_at: session.created_at,
+                        last_active: session.last_active,
+                        latest_job_status: latest.map(|j| j.status.clone()),
+                        kind: derive_session_kind(&session),
+                        job_count: jobs.len(),
+                        span_count,
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    })
+                }
+            }))
+            .await?;
+
         Ok(SessionSummaryListing { items, total })
     }
 
@@ -754,41 +832,85 @@ impl QueryApi {
             };
         }
 
+        // All three breakdowns are grouped aggregates in SQL — the raw
+        // records never cross the store boundary.
+        use baybo_store::CostGroupKey;
+        let day_buckets = costs
+            .query_range_grouped(range.clone(), CostGroupKey::Day)
+            .await
+            .map_err(CostError::from)?;
+        let model_groups = costs
+            .query_range_grouped(range.clone(), CostGroupKey::Model)
+            .await
+            .map_err(CostError::from)?;
+        let reason_groups = costs
+            .query_range_grouped(range.clone(), CostGroupKey::Reason)
+            .await
+            .map_err(CostError::from)?;
+
         let mut total_input = 0usize;
         let mut total_output = 0usize;
         let mut total_cached = 0usize;
         let mut total_cache_create = 0usize;
         let mut total_cost = MicroUsd::ZERO;
         let mut total_records = 0usize;
-        let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
-        let mut by_reason: HashMap<CallReason, AnalyticsReasonBucket> = HashMap::new();
-
-        let records = costs
-            .query_records_in_range(range.clone())
-            .await
-            .map_err(CostError::from)?;
-        for r in &records {
-            total_input += r.input_tokens;
-            total_output += r.output_tokens;
-            total_cached += r.cached_input_tokens;
-            total_cache_create += r.cache_creation_input_tokens;
-            total_cost += r.cost_usd;
-            total_records += 1;
-
-            let day_key = r.timestamp.date_naive().format("%Y-%m-%d").to_string();
-            if let Some(&i) = day_index.get(&day_key) {
+        for b in &day_buckets {
+            total_input += b.summary.total_input_tokens;
+            total_output += b.summary.total_output_tokens;
+            total_cached += b.summary.total_cached_input_tokens;
+            total_cache_create += b.summary.total_cache_creation_input_tokens;
+            total_cost += b.summary.total_cost_usd;
+            total_records += b.summary.record_count;
+            if let Some(&i) = day_index.get(&b.key) {
                 let bucket = &mut daily[i];
-                bucket.input_tokens += r.input_tokens;
-                bucket.output_tokens += r.output_tokens;
-                bucket.cached_input_tokens += r.cached_input_tokens;
-                bucket.cache_creation_input_tokens += r.cache_creation_input_tokens;
-                bucket.cost_usd += r.cost_usd;
+                bucket.input_tokens = b.summary.total_input_tokens;
+                bucket.output_tokens = b.summary.total_output_tokens;
+                bucket.cached_input_tokens = b.summary.total_cached_input_tokens;
+                bucket.cache_creation_input_tokens = b.summary.total_cache_creation_input_tokens;
+                bucket.cost_usd = b.summary.total_cost_usd;
             }
+        }
 
-            let entry = by_model
-                .entry(r.model.clone())
-                .or_insert_with(|| AnalyticsModelBucket {
-                    model: r.model.clone(),
+        // sessions_created per day: a flat created_at projection —
+        // no session blobs are decoded.
+        for created_at in self
+            .sessions
+            .session_created_times(range.from, range.to)
+            .await
+            .map_err(SessionError::from)?
+        {
+            let day_key = created_at.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&i) = day_index.get(&day_key) {
+                daily[i].sessions_created += 1;
+            }
+        }
+
+        let mut model_buckets: Vec<AnalyticsModelBucket> = model_groups
+            .into_iter()
+            .map(|b| AnalyticsModelBucket {
+                model: b.key,
+                input_tokens: b.summary.total_input_tokens,
+                output_tokens: b.summary.total_output_tokens,
+                cached_input_tokens: b.summary.total_cached_input_tokens,
+                cache_creation_input_tokens: b.summary.total_cache_creation_input_tokens,
+                cost_usd: b.summary.total_cost_usd,
+                call_count: b.summary.record_count,
+            })
+            .collect();
+        model_buckets.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+        });
+
+        // Distinct stored tokens can parse to the same `CallReason`
+        // (NULL and the explicit default both fold to the default
+        // variant), so re-merge after parsing.
+        let mut by_reason: HashMap<CallReason, AnalyticsReasonBucket> = HashMap::new();
+        for b in reason_groups {
+            let reason = CallReason::parse(&b.key).unwrap_or_default();
+            let entry = by_reason
+                .entry(reason.clone())
+                .or_insert_with(|| AnalyticsReasonBucket {
+                    reason,
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
@@ -796,50 +918,13 @@ impl QueryApi {
                     cost_usd: MicroUsd::ZERO,
                     call_count: 0,
                 });
-            entry.input_tokens += r.input_tokens;
-            entry.output_tokens += r.output_tokens;
-            entry.cached_input_tokens += r.cached_input_tokens;
-            entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
-            entry.cost_usd += r.cost_usd;
-            entry.call_count += 1;
-
-            let reason_entry =
-                by_reason
-                    .entry(r.reason.clone())
-                    .or_insert_with(|| AnalyticsReasonBucket {
-                        reason: r.reason.clone(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cached_input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cost_usd: MicroUsd::ZERO,
-                        call_count: 0,
-                    });
-            reason_entry.input_tokens += r.input_tokens;
-            reason_entry.output_tokens += r.output_tokens;
-            reason_entry.cached_input_tokens += r.cached_input_tokens;
-            reason_entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
-            reason_entry.cost_usd += r.cost_usd;
-            reason_entry.call_count += 1;
+            entry.input_tokens += b.summary.total_input_tokens;
+            entry.output_tokens += b.summary.total_output_tokens;
+            entry.cached_input_tokens += b.summary.total_cached_input_tokens;
+            entry.cache_creation_input_tokens += b.summary.total_cache_creation_input_tokens;
+            entry.cost_usd += b.summary.total_cost_usd;
+            entry.call_count += b.summary.record_count;
         }
-
-        // sessions_created per day. Single SessionStore::list_all call;
-        // sessions outside the range are skipped.
-        for s in self.sessions.list_all().await.map_err(SessionError::from)? {
-            if s.created_at < range.from || s.created_at >= range.to {
-                continue;
-            }
-            let day_key = s.created_at.date_naive().format("%Y-%m-%d").to_string();
-            if let Some(&i) = day_index.get(&day_key) {
-                daily[i].sessions_created += 1;
-            }
-        }
-
-        let mut model_buckets: Vec<AnalyticsModelBucket> = by_model.into_values().collect();
-        model_buckets.sort_by(|a, b| {
-            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
-        });
-
         let mut reason_buckets: Vec<AnalyticsReasonBucket> = by_reason.into_values().collect();
         reason_buckets.sort_by(|a, b| {
             (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
@@ -865,84 +950,39 @@ impl QueryApi {
         session_id: &SessionId,
         until_step_id: Option<StepId>,
     ) -> Result<ReplayedConversation> {
-        let summaries = self.list_jobs(session_id, JobFilter::default()).await?;
-        // Re-sort oldest-first for replay.
-        let mut summaries = summaries;
-        summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Full jobs, oldest-first for replay.
+        let mut full_jobs = self.jobs.list_by_session(session_id, None).await?;
+        full_jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-        let mut jobs = Vec::with_capacity(summaries.len());
-        // Truncation lookup is only needed when `until_step_id` is set.
-        // Skipping it on the common (CLI / gateway) path saves one
-        // `list_steps_by_job` round-trip per job.
+        // The truncation target's owning job comes from the step row
+        // itself — one point lookup instead of scanning every job's
+        // step list.
         let truncate_after_job: Option<JobId> = match until_step_id.as_ref() {
             None => None,
-            Some(target) => {
-                let mut found = None;
-                for s in &summaries {
-                    let steps = self
-                        .trace
-                        .list_steps_by_job(&s.id)
-                        .await
-                        .map_err(TraceError::from)?
-                        .into_iter()
-                        .map(Step::from_row)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    if steps.iter().any(|st| &st.id == target) {
-                        found = Some(s.id);
-                        break;
-                    }
-                }
-                found
-            }
-        };
-
-        for s in &summaries {
-            let job = match self.jobs.get(&s.id).await? {
-                Some(j) => j,
-                None => continue, // deleted between calls; skip
-            };
-            let mut steps = self
+            Some(target) => self
                 .trace
-                .list_steps_by_job(&job.id)
+                .load_step(target)
                 .await
                 .map_err(TraceError::from)?
-                .into_iter()
                 .map(Step::from_row)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            steps.sort_by_key(|s| s.started_at);
-            let mut step_blocks = Vec::with_capacity(steps.len());
-            for step in steps {
-                let mut spans = self
-                    .trace
-                    .list_spans_by_step(&step.id)
-                    .await
-                    .map_err(TraceError::from)?
-                    .into_iter()
-                    .map(Span::from_row)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for span in &mut spans {
-                    if span.events.is_empty() {
-                        span.events = self
-                            .trace
-                            .list_span_events(&span.id)
-                            .await
-                            .map_err(TraceError::from)?
-                            .into_iter()
-                            .map(SpanEvent::from_row)
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                    }
-                }
-                let stop_after = until_step_id == Some(step.id);
-                step_blocks.push(ReplayStep { step, spans });
-                if stop_after {
-                    break;
-                }
+                .transpose()?
+                .map(|s| s.job_id),
+        };
+
+        let mut jobs = Vec::with_capacity(full_jobs.len());
+        for job in full_jobs {
+            let job_id = job.id;
+            let mut step_blocks = self.load_step_tree_for_job(&job_id).await?;
+            if let Some(target) = until_step_id
+                && let Some(pos) = step_blocks.iter().position(|b| b.step.id == target)
+            {
+                step_blocks.truncate(pos + 1);
             }
             jobs.push(ReplayJob {
                 job,
                 steps: step_blocks,
             });
-            if Some(s.id) == truncate_after_job {
+            if Some(job_id) == truncate_after_job {
                 break;
             }
         }
@@ -974,53 +1014,86 @@ impl QueryApi {
     /// indirection. Returning the message log once and letting the
     /// client hydrate slices keeps the wire payload linear in
     /// `message_count + span_count`.
-    pub async fn load_trace_overview(&self, session_id: &SessionId) -> Result<TraceOverview> {
+    /// `since_ordinal`: when set, `session_messages` carries only rows
+    /// with a greater ordinal — the caller already holds the prefix and
+    /// re-validates it against [`TraceOverview::supersede_watermark`].
+    pub async fn load_trace_overview(
+        &self,
+        session_id: &SessionId,
+        since_ordinal: Option<i64>,
+    ) -> Result<TraceOverview> {
         // Re-sort oldest-first to match the trace sidebar's job
         // numbering (`#1, #2, ...` from earliest to latest).
         let mut summaries = self.list_jobs(session_id, JobFilter::default()).await?;
         summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-        let session_messages = self
-            .sessions
-            .load_session_messages_with_supersede(session_id)
-            .await
-            .map_err(SessionError::from)?
-            .into_iter()
-            .map(SessionMessageRow::from)
-            .collect();
+        let (session_messages, supersede_watermark): (Vec<SessionMessageRow>, Option<i64>) =
+            match since_ordinal {
+                // The incremental page holds only a suffix, so the watermark
+                // needs its own (indexed MAX) query.
+                Some(since) => {
+                    let rows = self
+                        .sessions
+                        .load_session_messages_with_supersede_since(session_id, since)
+                        .await
+                        .map_err(SessionError::from)?;
+                    let watermark = self
+                        .sessions
+                        .supersede_watermark(session_id)
+                        .await
+                        .map_err(SessionError::from)?;
+                    (
+                        rows.into_iter().map(SessionMessageRow::from).collect(),
+                        watermark,
+                    )
+                }
+                // The full load already carries every `superseded_by` marker —
+                // derive the watermark instead of re-scanning the partition.
+                None => {
+                    let rows: Vec<SessionMessageRow> = self
+                        .sessions
+                        .load_session_messages_with_supersede(session_id)
+                        .await
+                        .map_err(SessionError::from)?
+                        .into_iter()
+                        .map(SessionMessageRow::from)
+                        .collect();
+                    let watermark = rows.iter().filter_map(|r| r.superseded_by).max();
+                    (rows, watermark)
+                }
+            };
 
         // Per-job token aggregates power the sidebar's `↑in ↓out`
-        // chips. One cost-store lookup per job: cheap (each is an
-        // indexed range scan on `cost_records.job_id`) and bounded by
-        // the typical 1-5 jobs per session.
-        let mut jobs = Vec::with_capacity(summaries.len());
-        for summary in summaries {
-            let (input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens) =
-                match self.costs.as_ref() {
-                    Some(c) => match c.query_job(&summary.id).await {
-                        Ok(s) => (
-                            s.total_input_tokens,
-                            s.total_output_tokens,
-                            s.total_cached_input_tokens,
-                            s.total_cache_creation_input_tokens,
-                        ),
-                        Err(_) => (0, 0, 0, 0),
-                    },
-                    None => (0, 0, 0, 0),
-                };
-            jobs.push(TraceJobSummary {
-                summary,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                cache_creation_input_tokens,
-            });
-        }
+        // chips: one grouped cost query for the whole session. A cost
+        // failure degrades to zeroed chips rather than failing the
+        // overview.
+        let costs_by_job: HashMap<String, CostSummary> = match self.costs.as_ref() {
+            Some(c) => match c.query_session_by_job(session_id).await {
+                Ok(buckets) => buckets.into_iter().map(|b| (b.key, b.summary)).collect(),
+                Err(_) => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+        let jobs = summaries
+            .into_iter()
+            .map(|summary| {
+                let c = costs_by_job.get(&summary.id.to_string());
+                TraceJobSummary {
+                    input_tokens: c.map_or(0, |c| c.total_input_tokens),
+                    output_tokens: c.map_or(0, |c| c.total_output_tokens),
+                    cached_input_tokens: c.map_or(0, |c| c.total_cached_input_tokens),
+                    cache_creation_input_tokens: c
+                        .map_or(0, |c| c.total_cache_creation_input_tokens),
+                    summary,
+                }
+            })
+            .collect();
 
         Ok(TraceOverview {
             session_id: session_id.clone(),
             session_messages,
             jobs,
+            supersede_watermark,
         })
     }
 
@@ -1037,39 +1110,7 @@ impl QueryApi {
             .get(job_id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {job_id}")))?;
-        let mut steps = self
-            .trace
-            .list_steps_by_job(job_id)
-            .await
-            .map_err(TraceError::from)?
-            .into_iter()
-            .map(Step::from_row)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        steps.sort_by_key(|s| s.started_at);
-        let mut step_blocks = Vec::with_capacity(steps.len());
-        for step in steps {
-            let mut spans = self
-                .trace
-                .list_spans_by_step(&step.id)
-                .await
-                .map_err(TraceError::from)?
-                .into_iter()
-                .map(Span::from_row)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for span in &mut spans {
-                if span.events.is_empty() {
-                    span.events = self
-                        .trace
-                        .list_span_events(&span.id)
-                        .await
-                        .map_err(TraceError::from)?
-                        .into_iter()
-                        .map(SpanEvent::from_row)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                }
-            }
-            step_blocks.push(ReplayStep { step, spans });
-        }
+        let step_blocks = self.load_step_tree_for_job(job_id).await?;
         Ok(JobTrace {
             job,
             steps: step_blocks,
@@ -1268,6 +1309,7 @@ mod tests {
     use baybo_job::test_support::MemoryJobStore;
     use baybo_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use baybo_session::SessionStore;
+    use baybo_store::JobStore as _;
     use baybo_trace::test_support::MemoryTraceStore;
     use std::sync::Arc;
 
@@ -1392,12 +1434,6 @@ mod tests {
             }
             Ok(true)
         }
-        async fn read_cursor(
-            &self,
-            id: &SessionId,
-        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
-            Ok(self.read_cursors.lock().get(id).copied())
-        }
         async fn set_title(
             &self,
             id: &SessionId,
@@ -1425,7 +1461,11 @@ mod tests {
             Ok(Vec::new())
         }
         async fn list_all(&self) -> std::result::Result<Vec<Session>, baybo_store::StorageError> {
-            Ok(self.sessions.lock().values().cloned().collect())
+            // Contract: newest `last_active` first (matches the sqlite
+            // backend; `list_session_summaries` pagination relies on it).
+            let mut out: Vec<Session> = self.sessions.lock().values().cloned().collect();
+            out.sort_by_key(|s| std::cmp::Reverse(s.last_active));
+            Ok(out)
         }
         async fn list_lineage_children(
             &self,
@@ -1503,6 +1543,15 @@ mod tests {
         {
             Ok(Vec::new())
         }
+        async fn list_control_events_in_range(
+            &self,
+            _id: &SessionId,
+            _lower: i64,
+            _upper: i64,
+        ) -> std::result::Result<Vec<baybo_model::ControlEvent>, baybo_store::StorageError>
+        {
+            Ok(Vec::new())
+        }
         async fn apply_session_compaction(
             &self,
             id: &SessionId,
@@ -1558,6 +1607,162 @@ mod tests {
             id: &SessionId,
         ) -> std::result::Result<Vec<StoredMessage>, baybo_store::StorageError> {
             Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
+        }
+        async fn load_session_messages_with_supersede_since(
+            &self,
+            id: &SessionId,
+            after_ordinal: i64,
+        ) -> std::result::Result<Vec<StoredMessage>, baybo_store::StorageError> {
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|m| m.ordinal > after_ordinal)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+        async fn supersede_watermark(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .and_then(|rows| rows.iter().filter_map(|m| m.superseded_by).max()))
+        }
+        async fn session_created_times(
+            &self,
+            from: DateTime<Utc>,
+            to: DateTime<Utc>,
+        ) -> std::result::Result<Vec<DateTime<Utc>>, baybo_store::StorageError> {
+            Ok(self
+                .sessions
+                .lock()
+                .values()
+                .map(|s| s.created_at)
+                .filter(|t| *t >= from && *t < to)
+                .collect())
+        }
+        async fn last_user_messages(
+            &self,
+            session_ids: &[SessionId],
+        ) -> std::result::Result<
+            Vec<(SessionId, DateTime<Utc>, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
+        > {
+            let msgs = self.messages.lock();
+            Ok(session_ids
+                .iter()
+                .filter_map(|id| {
+                    msgs.get(id).and_then(|rows| {
+                        rows.iter()
+                            .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                            .max_by_key(|m| m.ordinal)
+                            .map(|m| (id.clone(), m.created_at, m.message.clone()))
+                    })
+                })
+                .collect())
+        }
+        async fn active_tails(
+            &self,
+            session_ids: &[SessionId],
+            limit: usize,
+        ) -> std::result::Result<
+            Vec<(SessionId, i64, DateTime<Utc>, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
+        > {
+            let msgs = self.messages.lock();
+            let mut out = Vec::new();
+            for id in session_ids {
+                if let Some(rows) = msgs.get(id) {
+                    let mut active: Vec<_> =
+                        rows.iter().filter(|m| m.superseded_by.is_none()).collect();
+                    active.sort_by_key(|m| m.ordinal);
+                    let start = active.len().saturating_sub(limit);
+                    out.extend(
+                        active[start..]
+                            .iter()
+                            .map(|m| (id.clone(), m.ordinal, m.created_at, m.message.clone())),
+                    );
+                }
+            }
+            Ok(out)
+        }
+        async fn unread_scan(
+            &self,
+            session_ids: &[SessionId],
+            limit: usize,
+        ) -> std::result::Result<
+            Vec<(SessionId, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
+        > {
+            let msgs = self.messages.lock();
+            let cursors = self.read_cursors.lock();
+            let mut out = Vec::new();
+            for id in session_ids {
+                let cursor = cursors.get(id).copied().unwrap_or(-1);
+                if let Some(rows) = msgs.get(id) {
+                    let mut active: Vec<_> = rows
+                        .iter()
+                        .filter(|m| m.superseded_by.is_none() && m.ordinal > cursor)
+                        .collect();
+                    active.sort_by_key(|m| m.ordinal);
+                    out.extend(
+                        active
+                            .into_iter()
+                            .take(limit)
+                            .map(|m| (id.clone(), m.message.clone())),
+                    );
+                }
+            }
+            Ok(out)
+        }
+        async fn session_titles(
+            &self,
+            session_ids: &[SessionId],
+        ) -> std::result::Result<Vec<(SessionId, Option<String>)>, baybo_store::StorageError>
+        {
+            let sessions = self.sessions.lock();
+            Ok(session_ids
+                .iter()
+                .filter_map(|id| sessions.get(id).map(|s| (id.clone(), s.title.clone())))
+                .collect())
+        }
+        async fn session_channels(
+            &self,
+            session_ids: &[SessionId],
+        ) -> std::result::Result<Vec<(SessionId, String)>, baybo_store::StorageError> {
+            let sessions = self.sessions.lock();
+            Ok(session_ids
+                .iter()
+                .filter_map(|id| {
+                    sessions
+                        .get(id)
+                        .map(|s| (id.clone(), s.channel.as_str().to_string()))
+                })
+                .collect())
+        }
+        async fn touch_last_active(
+            &self,
+            id: &SessionId,
+            now: DateTime<Utc>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut sessions = self.sessions.lock();
+            match sessions.get_mut(id) {
+                Some(s) => {
+                    s.last_active = now;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        async fn count_sessions(&self) -> std::result::Result<usize, baybo_store::StorageError> {
+            Ok(self.sessions.lock().len())
         }
         async fn active_index_of_ordinal(
             &self,
@@ -1671,20 +1876,6 @@ mod tests {
                     .map(|m| m.ordinal)
             }))
         }
-        async fn load_last_user_message(
-            &self,
-            id: &SessionId,
-        ) -> std::result::Result<
-            Option<(chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)>,
-            baybo_store::StorageError,
-        > {
-            Ok(self.messages.lock().get(id).and_then(|log| {
-                log.iter()
-                    .filter(|m| m.superseded_by.is_none() && m.message.from_user())
-                    .max_by_key(|m| m.ordinal)
-                    .map(|m| (m.created_at, m.message.clone()))
-            }))
-        }
     }
 
     fn make_session(id: &str) -> Session {
@@ -1761,6 +1952,24 @@ mod tests {
             &self,
             _: &StepId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
+        }
+        async fn trace_counts_by_job(
+            &self,
+            _: &JobId,
+        ) -> baybo_store::trace::Result<(usize, usize)> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_spans_by_job(
+            &self,
+            _: &JobId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_span_events_for_spans(
+            &self,
+            _: &[baybo_model::SpanId],
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
         async fn append_span_event(
@@ -2776,7 +2985,7 @@ mod tests {
             Arc::new(MemoryTraceStore::new()),
             Arc::new(MemoryCostStore::default()),
         );
-        let overview = api.load_trace_overview(&s.id).await.unwrap();
+        let overview = api.load_trace_overview(&s.id, None).await.unwrap();
 
         assert_eq!(overview.session_id, s.id);
         // Pre-compaction rows are preserved, with `superseded_by`
@@ -2791,6 +3000,176 @@ mod tests {
 
         assert_eq!(overview.jobs.len(), 2);
         assert!(overview.jobs[0].summary.created_at <= overview.jobs[1].summary.created_at);
+        assert_eq!(overview.supersede_watermark, Some(2));
+
+        // Incremental poll: only rows above the client's ordinal, same
+        // watermark so the client can validate its cached prefix.
+        let delta = api.load_trace_overview(&s.id, Some(1)).await.unwrap();
+        assert_eq!(delta.session_messages.len(), 1);
+        assert_eq!(delta.session_messages[0].ordinal, 2);
+        assert_eq!(delta.supersede_watermark, Some(2));
+        assert_eq!(delta.jobs.len(), 2, "job summaries always ship in full");
+    }
+
+    #[tokio::test]
+    async fn list_session_summaries_paginates_before_aggregating() {
+        use baybo_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind,
+        };
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let job_store = Arc::new(MemoryJobStore::new());
+        let trace_store = Arc::new(MemoryTraceStore::new());
+        let base = Utc::now();
+
+        // Three sessions with one job each (newest-active first), plus a
+        // zero-job session that must stay invisible even though it is
+        // the newest of all.
+        let mut with_jobs = Vec::new();
+        for (i, name) in ["sum-new", "sum-mid", "sum-old"].iter().enumerate() {
+            let mut s = make_session(name);
+            s.last_active = base - chrono::Duration::hours(i as i64);
+            session_store.save(&s).await.unwrap();
+            let mut j = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+            j.created_at = base;
+            job_store.create(&j.to_row().unwrap()).await.unwrap();
+            with_jobs.push((s, j));
+        }
+        let mut empty = make_session("sum-empty");
+        empty.last_active = base + chrono::Duration::hours(1);
+        session_store.save(&empty).await.unwrap();
+
+        // "sum-mid" carries one step with two spans.
+        let (mid_session, mid_job) = &with_jobs[1];
+        let step = Step {
+            id: StepId::new(),
+            job_id: mid_job.id,
+            kind: StepKind::LlmIteration,
+            started_at: base,
+            ended_at: None,
+            outcome: LifecycleState::Pending,
+        };
+        trace_store
+            .save_step(&step.to_row().unwrap())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let span = Span {
+                id: baybo_model::SpanId::new(),
+                step_id: step.id,
+                kind: SpanKind::LlmCall {
+                    begin: LlmCallBegin {
+                        model_id: "m".into(),
+                        provider: "p".into(),
+                        provider_config_hash: "h".into(),
+                        input_messages: LlmCallInputs::empty(),
+                        temperature: None,
+                    },
+                    result: None,
+                },
+                parallel_group: None,
+                started_at: base,
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+                events: vec![],
+            };
+            trace_store
+                .save_span(&span.to_row().unwrap())
+                .await
+                .unwrap();
+        }
+
+        let api = QueryApi::new(
+            session_store,
+            Arc::new(JobLifecycle::new(job_store)),
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let listing = api
+            .list_session_summaries(
+                SessionSummaryFilter::default(),
+                SessionSummaryPage {
+                    offset: 1,
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(listing.total, 3, "zero-job session must not count");
+        assert_eq!(listing.items.len(), 1);
+        let item = &listing.items[0];
+        assert_eq!(item.session_id, mid_session.id);
+        assert_eq!(item.job_count, 1);
+        assert_eq!(item.span_count, 2);
+        assert!(matches!(item.latest_job_status, Some(JobStatus::Pending)));
+    }
+
+    #[tokio::test]
+    async fn list_session_summaries_status_filter_matches_latest_job_only() {
+        let session_store = Arc::new(MemSessionStore::default());
+        let job_store = Arc::new(MemoryJobStore::new());
+        let s = make_session("sum-status");
+        session_store.save(&s).await.unwrap();
+        let base = Utc::now();
+
+        let mut done = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+        done.created_at = base;
+        let _ = done.start().unwrap();
+        let _ = done
+            .complete(baybo_job::JobOutput::Message {
+                content: vec![ContentBlock::Text("ok".into())],
+                ordinal: None,
+            })
+            .unwrap();
+        job_store.create(&done.to_row().unwrap()).await.unwrap();
+
+        let mut pending = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+        pending.created_at = base + chrono::Duration::seconds(1);
+        job_store.create(&pending.to_row().unwrap()).await.unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            Arc::new(JobLifecycle::new(job_store)),
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let page = SessionSummaryPage {
+            offset: 0,
+            limit: 0,
+        };
+
+        let completed = api
+            .list_session_summaries(
+                SessionSummaryFilter {
+                    status_kind: Some(JobStatusKind::Completed),
+                    ..Default::default()
+                },
+                page,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.total, 0,
+            "an older completed job must not match — the latest job is pending"
+        );
+
+        let pending_hits = api
+            .list_session_summaries(
+                SessionSummaryFilter {
+                    status_kind: Some(JobStatusKind::Pending),
+                    ..Default::default()
+                },
+                page,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_hits.total, 1);
+        assert_eq!(pending_hits.items[0].job_count, 2);
+        assert!(matches!(
+            pending_hits.items[0].latest_job_status,
+            Some(JobStatus::Pending)
+        ));
     }
 
     /// `load_job_trace` returns the per-job step/span tree with

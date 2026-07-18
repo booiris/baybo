@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   RiArrowLeftLine,
@@ -29,6 +29,7 @@ import type {
   ContentBlock,
   JobTrace,
   LifecycleState,
+  LlmCallInputs,
   ReplayStep,
   SecretKind,
   SessionMessageRow,
@@ -1396,6 +1397,91 @@ function traceHasPendingSpan(trace: JobTrace | undefined): boolean {
   return false;
 }
 
+// Precomputed lookup over a session's transcript so the per-span
+// interjection count is O(log N) instead of rebuilding + re-scanning the
+// whole message log for every LLM span on every poll tick.
+interface InterjectionIndex {
+  // Interjection rows in ascending ordinal order (a small subset), carrying
+  // just what the hydration window predicate needs.
+  entries: { ordinal: number; supersededBy: number | null }[];
+  // Every row's ordinal (ascending) paired with a running max of its parsed
+  // created-at — the input for the hydration epoch guard.
+  ordinals: number[];
+  prefixMaxCreated: number[];
+}
+
+// Highest ordinal in a transcript page, or undefined when empty — the
+// `since_ordinal` cursor for the next incremental overview poll.
+function maxOrdinal(rows: SessionMessageRow[]): number | undefined {
+  if (rows.length === 0) return undefined;
+  let max = rows[0].ordinal;
+  for (const r of rows) if (r.ordinal > max) max = r.ordinal;
+  return max;
+}
+
+function buildInterjectionIndex(log: SessionMessageRow[]): InterjectionIndex {
+  const ordered = [...log].sort((a, b) => a.ordinal - b.ordinal);
+  const entries: { ordinal: number; supersededBy: number | null }[] = [];
+  const ordinals: number[] = [];
+  const prefixMaxCreated: number[] = [];
+  let running = Number.NEGATIVE_INFINITY;
+  for (const row of ordered) {
+    const createdMs = new Date(row.created_at).getTime();
+    if (createdMs > running) running = createdMs;
+    ordinals.push(row.ordinal);
+    prefixMaxCreated.push(running);
+    if (row.message.source === 'user_interjection') {
+      entries.push({ ordinal: row.ordinal, supersededBy: row.superseded_by ?? null });
+    }
+  }
+  return { entries, ordinals, prefixMaxCreated };
+}
+
+// Max parsed created-at over rows with ordinal ≤ `lastOrdinal`. Excluding
+// superseded rows never lowers this (a superseded row predates its
+// higher-ordinal replacement), so it equals the max over the reconstructed
+// prefix — exactly what the hydration epoch guard tests.
+function maxCreatedUpToOrdinal(index: InterjectionIndex, lastOrdinal: number): number {
+  const { ordinals, prefixMaxCreated } = index;
+  let lo = 0;
+  let hi = ordinals.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ordinals[mid] <= lastOrdinal) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found >= 0 ? prefixMaxCreated[found] : Number.NEGATIVE_INFINITY;
+}
+
+// Count of `user_interjection` messages an LLM span's resolved input folds
+// in, without rebuilding the message list. Mirrors `resolveInputMessages` /
+// `hydratePersistedInput`: the epoch guard drops the whole input (count 0)
+// when the reconstructed prefix holds a row created after the span started;
+// otherwise it is (in-window prefix interjections) + (suffix ones).
+function interjectionInputCount(
+  input: LlmCallInputs,
+  spanStartedAt: string,
+  index: InterjectionIndex,
+): number {
+  if (Array.isArray(input)) {
+    return input.filter((m) => m.source === 'user_interjection').length;
+  }
+  const lastOrdinal = input.last_ordinal;
+  const spanStart = new Date(spanStartedAt).getTime();
+  if (maxCreatedUpToOrdinal(index, lastOrdinal) > spanStart) return 0;
+  let count = (input.suffix ?? []).filter((m) => m.source === 'user_interjection').length;
+  for (const e of index.entries) {
+    if (e.ordinal > lastOrdinal) break;
+    if (e.supersededBy == null || e.supersededBy > lastOrdinal) count++;
+  }
+  return count;
+}
+
 export function TraceSessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -1412,16 +1498,52 @@ export function TraceSessionPage() {
   const [overviewRefreshKey, setOverviewRefreshKey] = useState(0);
   const [jobRefreshKey, setJobRefreshKey] = useState(0);
 
+  // Mirror the latest committed overview so the incremental poll can read the
+  // currently-held transcript (its cursor + supersede watermark) without
+  // adding `overview` to the fetch effect's deps — which would refire the
+  // effect on every appended delta.
+  const overviewRef = useRef<TraceOverview | null>(null);
+  overviewRef.current = overview;
+
   const sessionId = id ?? '';
   const jobIdParam = searchParams.get('job');
   const spanIdParam = searchParams.get('span');
   const tabParam = (searchParams.get('tab') as 'io' | 'meta' | 'events' | null) ?? 'io';
 
-  // Fetch the cheap overview (session messages + job summaries).
-  // Reset per-session caches when the session id changes.
+  // Fetch the overview (session messages + job summaries). A same-session
+  // poll pulls only the transcript delta above the cursor it already holds
+  // (`since_ordinal`); a fresh session or cold start pulls the full page.
+  // `jobs` is always the full (tiny) array — replaced, never merged.
   useEffect(() => {
     let cancelled = false;
-    async function fetchOverview() {
+
+    type OverviewFetch =
+      | { status: 'ok'; overview: TraceOverview }
+      | { status: 'error'; message: string }
+      | { status: 'aborted' }; // cancelled or 401 (already logged out)
+
+    async function fetchPage(sinceOrdinal: number | undefined): Promise<OverviewFetch> {
+      const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}', {
+        params: {
+          path: { session_id: sessionId },
+          query: sinceOrdinal != null ? { since_ordinal: sinceOrdinal } : undefined,
+        },
+      });
+      if (cancelled) return { status: 'aborted' };
+      if (response.status === 401) {
+        logout();
+        return { status: 'aborted' };
+      }
+      if (apiError || !response.ok) {
+        return {
+          status: 'error',
+          message: (apiError as { error?: string })?.error || `HTTP Error ${response.status}`,
+        };
+      }
+      return { status: 'ok', overview: data as unknown as TraceOverview };
+    }
+
+    async function loadOverview() {
       if (!sessionId) return;
       if (isMock) {
         setOverview(getMockTraceOverview(sessionId));
@@ -1429,22 +1551,49 @@ export function TraceSessionPage() {
         setOverviewLoading(false);
         return;
       }
+      const held = overviewRef.current;
+      const sinceOrdinal =
+        held != null && held.session_id === sessionId
+          ? maxOrdinal(held.session_messages)
+          : undefined;
+
       setOverviewLoading(true);
       setError(null);
       try {
-        const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}', {
-          params: { path: { session_id: sessionId } },
-        });
-        if (cancelled) return;
-        if (response.status === 401) {
-          logout();
+        const first = await fetchPage(sinceOrdinal);
+        if (first.status === 'aborted') return;
+        if (first.status === 'error') {
+          setError(first.message);
           return;
         }
-        if (apiError || !response.ok) {
-          setError((apiError as { error?: string })?.error || `HTTP Error ${response.status}`);
+        // A moved supersede watermark means a compaction re-marked rows we may
+        // already hold: the cached prefix is stale, so drop it and pull the
+        // whole transcript once. (`held != null` whenever `sinceOrdinal` is
+        // set, but the compiler needs the explicit guard to narrow it.)
+        if (
+          sinceOrdinal != null &&
+          held != null &&
+          first.overview.supersede_watermark !== held.supersede_watermark
+        ) {
+          const full = await fetchPage(undefined);
+          if (full.status === 'aborted') return;
+          if (full.status === 'error') {
+            setError(full.message);
+            return;
+          }
+          setOverview(full.overview);
           return;
         }
-        setOverview(data as unknown as TraceOverview);
+        if (sinceOrdinal != null && held != null) {
+          // Delta rows are strictly newer than everything held — append them
+          // (no dedup) and take the fresh full `jobs` array + watermark.
+          setOverview({
+            ...first.overview,
+            session_messages: [...held.session_messages, ...first.overview.session_messages],
+          });
+        } else {
+          setOverview(first.overview);
+        }
       } catch (e) {
         if (cancelled) return;
         setError(
@@ -1454,7 +1603,7 @@ export function TraceSessionPage() {
         if (!cancelled) setOverviewLoading(false);
       }
     }
-    void fetchOverview();
+    void loadOverview();
     return () => {
       cancelled = true;
     };
@@ -1466,10 +1615,15 @@ export function TraceSessionPage() {
     setJobTraces(new Map());
   }, [sessionId]);
 
-  // Derive the active job id from URL ∩ overview. Default to the
-  // oldest job (sidebar's `#1`) when no URL hint resolves.
+  // Derive the active job id from URL ∩ overview. Default to the oldest job
+  // (sidebar's `#1`) when no URL hint resolves. On a deep link
+  // (`?job=<id>`) the param is trusted *optimistically* until the overview
+  // arrives, so the per-job trace fetch fires concurrently with the
+  // overview instead of waiting to validate it; if the overview then
+  // disowns the id, this recomputes to the default job (and its harmless
+  // 404 fetch is discarded).
   const activeJobId =
-    jobIdParam && overview?.jobs.some((j) => j.job_id === jobIdParam)
+    jobIdParam && (!overview || overview.jobs.some((j) => j.job_id === jobIdParam))
       ? jobIdParam
       : (overview?.jobs[0]?.job_id ?? '');
   const activeJobSummary = overview?.jobs.find((j) => j.job_id === activeJobId);
@@ -1505,6 +1659,7 @@ export function TraceSessionPage() {
     return counts;
   }, [interjectionsByJob]);
 
+  const interjectionIndex = useMemo(() => buildInterjectionIndex(messageLog), [messageLog]);
   // LLM-call spans of the active job whose input first folds in a mid-turn
   // interjection — i.e. the iteration where the user's steering message
   // entered the context. Walk LLM calls in time order: the interjection count
@@ -1525,17 +1680,16 @@ export function TraceSessionPage() {
     let seen = 0;
     for (const span of llmSpans) {
       if (span.kind.kind !== 'llm_call') continue;
-      const messages = resolveInputMessages(
+      const count = interjectionInputCount(
         span.kind.begin.input_messages,
-        messageLog,
         span.started_at,
+        interjectionIndex,
       );
-      const count = messages.filter((m) => m.source === 'user_interjection').length;
       if (count > seen) ids.add(span.id);
       seen = Math.max(seen, count);
     }
     return ids;
-  }, [activeJobTrace, messageLog]);
+  }, [activeJobTrace, interjectionIndex]);
 
   // Fetch the active job's step/span tree on demand. Re-fires when the
   // user picks a different sidebar entry or the polling tick bumps
@@ -1606,14 +1760,25 @@ export function TraceSessionPage() {
 
   useEffect(() => {
     if (isMock || !polling) return;
-    const tick = () => {
-      if (document.visibilityState !== 'visible') return;
-      if (activeIsLive) setJobRefreshKey((k) => k + 1);
-      setOverviewRefreshKey((k) => k + 1);
-    };
-    const cadence = activeIsLive ? POLL_ACTIVE_MS : POLL_TERMINAL_MS;
-    const t = window.setInterval(tick, cadence);
-    return () => window.clearInterval(t);
+    const visible = () => document.visibilityState === 'visible';
+    const timers: number[] = [];
+    // Job tree is light — poll the active job fast.
+    if (activeIsLive) {
+      timers.push(
+        window.setInterval(() => {
+          if (visible()) setJobRefreshKey((k) => k + 1);
+        }, POLL_ACTIVE_MS),
+      );
+    }
+    // Overview carries the full transcript (avg ~150KB, up to ~1.5MB), so it
+    // must refresh on its own slow cadence even while the active job polls
+    // fast — never dragged to the 2s tick.
+    timers.push(
+      window.setInterval(() => {
+        if (visible()) setOverviewRefreshKey((k) => k + 1);
+      }, POLL_TERMINAL_MS),
+    );
+    return () => timers.forEach((t) => window.clearInterval(t));
   }, [isMock, polling, activeIsLive]);
 
   const spanIndex = useMemo(() => deriveSpanIndex(activeJobTrace), [activeJobTrace]);

@@ -1502,22 +1502,28 @@ export function ChatPage() {
         ...(isReconnect ? (wsRef.current?.subscribedSessions() ?? []) : []),
         ...outbox.sessionIds(),
       ]);
-      for (const sid of sids) {
-        // Sync first: a send whose ack was lost but that DID persist is
-        // confirmed (and released) here instead of being re-sent.
-        await runSyncSession(sid);
-        for (const entry of outbox.entries(sid)) {
-          if (entry.state === 'unknown') await resolveUnknownEntry(sid, entry.platformMsgId);
-        }
-        for (const entry of outbox.entries(sid)) {
-          if (entry.state !== 'sending' && entry.state !== 'sent') continue;
-          if (entry.transmissions >= MAX_AUTO_TRANSMISSIONS) {
-            failOutboxEntry(sid, entry.platformMsgId);
-            continue;
+      // Recover sessions in parallel — each session's own sync→outbox order
+      // is preserved, but one slow session no longer blocks the rest. The
+      // set is bounded by the view cache (~VIEW_CACHE_LIMIT) plus outbox
+      // sessions, so the reconnect burst stays small.
+      await Promise.all(
+        [...sids].map(async (sid) => {
+          // Sync first: a send whose ack was lost but that DID persist is
+          // confirmed (and released) here instead of being re-sent.
+          await runSyncSession(sid);
+          for (const entry of outbox.entries(sid)) {
+            if (entry.state === 'unknown') await resolveUnknownEntry(sid, entry.platformMsgId);
           }
-          resendOutboxEntry(sid, entry);
-        }
-      }
+          for (const entry of outbox.entries(sid)) {
+            if (entry.state !== 'sending' && entry.state !== 'sent') continue;
+            if (entry.transmissions >= MAX_AUTO_TRANSMISSIONS) {
+              failOutboxEntry(sid, entry.platformMsgId);
+              continue;
+            }
+            resendOutboxEntry(sid, entry);
+          }
+        }),
+      );
     })();
   }, [
     status.state,

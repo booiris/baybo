@@ -914,24 +914,26 @@ async fn search_messages(
     }
 
     // Titles are fetched AFTER the cut, so the scan window's width costs no
-    // extra lookups. Point lookups rather than `list_by_channel`: that scans
-    // every session and json-decodes every blob (the channel lives inside `data`
-    // and is unindexed), and a debounced search box fires per keystroke burst
-    // where the sidebar refreshes once.
-    let mut groups = Vec::with_capacity(order.len().min(limit));
-    for sid in order.into_iter().take(limit) {
+    // extra lookups — and in one grouped flat-column query instead of a
+    // point lookup per result conversation. A title batch this build cannot
+    // load is a missing subtitle, not a failed search: degrade to empty
+    // rather than 500 the whole result set.
+    let cut: Vec<String> = order.into_iter().take(limit).collect();
+    let title_ids: Vec<SessionId> = cut
+        .iter()
+        .map(|sid| SessionId::from(sid.as_str()))
+        .collect();
+    let mut titles = state
+        .session_manager
+        .session_titles(&title_ids)
+        .await
+        .unwrap_or_default();
+    let mut groups = Vec::with_capacity(cut.len());
+    for sid in cut {
         let Some(mut group) = grouped.remove(&sid) else {
             continue;
         };
-        // A title this build cannot load is a missing subtitle, not a failed
-        // search: degrade to `None` rather than 500 the whole result set.
-        group.session_title = state
-            .session_manager
-            .get(&SessionId::from(sid))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.title);
+        group.session_title = titles.remove(&SessionId::from(sid.as_str())).flatten();
         groups.push(group);
     }
     Ok(Json(ChatSearchResults { groups, truncated }))
@@ -974,54 +976,32 @@ async fn list_sessions(
         .filter(|s| query.include_hidden || !s.hidden)
         .filter(|s| query.include_cron || !is_hidden_cron_session(s))
         .collect();
-    // Fan out the per-session preview fetch — each row is a single
-    // back-of-the-index lookup (`load_last_user_message`,
-    // `ORDER BY ordinal DESC LIMIT 1`) but they add up serially when a tab
-    // has dozens of conversations open. `join_all` overlaps them; the real
-    // parallelism is whatever the store's connection pool can hand out, and
-    // the rest queue behind it, so a wide fan-out costs latency rather than
-    // connections. A preview that fails to load is dropped to `None` rather
-    // than failing the whole list — the sidebar still renders the row, just
-    // without a preview, and the next list refresh will retry.
-    let previews = futures::future::join_all(visible.iter().map(|s| {
-        let manager = state.session_manager.clone();
-        let sid = s.id.clone();
-        async move { last_user_preview(&manager, &sid).await }
-    }))
-    .await;
-    // Fan out the per-session unread count the same way: bounded read-cursor
-    // scans, concurrent, each degrading to `0` on error so one bad row can't
-    // fail the whole list. Server-computed so it survives a cold restart and
-    // is consistent across devices (unlike a client-local ping counter).
-    let unread_counts = futures::future::join_all(visible.iter().map(|s| {
-        let manager = state.session_manager.clone();
-        let sid = s.id.clone();
-        async move {
-            manager
-                .unread_reply_count(&sid, UNREAD_COUNT_CAP)
-                .await
-                .unwrap_or(0)
-        }
-    }))
-    .await;
-    // The Telegram-style second-line preview: the newest displayable message
-    // regardless of author. Fanned out concurrently like the user-only preview
-    // above, each degrading to `None` on error so one bad row can't fail the
-    // whole list.
-    let last_messages = futures::future::join_all(visible.iter().map(|s| {
-        let manager = state.session_manager.clone();
-        let sid = s.id.clone();
-        async move { last_message_preview(&manager, &sid).await }
-    }))
-    .await;
+    // One grouped scan for every per-session aggregate the sidebar
+    // needs (first-line previews, second-line tail windows, unread
+    // counts) — three store queries for the whole list instead of a
+    // per-session round-trip fan-out. A failed scan degrades to empty
+    // maps (no previews, zero badges) rather than failing the list;
+    // the next refresh retries.
+    let ids: Vec<SessionId> = visible.iter().map(|s| s.id.clone()).collect();
+    let scan = state
+        .session_manager
+        .chat_list_scan(&ids, LAST_MESSAGE_PREVIEW_SCAN, UNREAD_COUNT_CAP)
+        .await
+        .unwrap_or_default();
     let cron_jobs = live_cron_job_meta(&state, &visible).await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
-        .zip(previews)
-        .zip(unread_counts)
-        .zip(last_messages)
-        .map(
-            |(((s, last_user_text), unread), last_message_text)| ChatSessionSummary {
+        .map(|s| {
+            let last_user_text = scan
+                .last_user
+                .get(&s.id)
+                .and_then(|(created_at, msg)| last_user_preview(*created_at, msg));
+            let last_message_text = scan
+                .tails
+                .get(&s.id)
+                .and_then(|tail| last_message_preview(tail));
+            let unread = scan.unread_counts.get(&s.id).copied().unwrap_or(0);
+            ChatSessionSummary {
                 cron_job_title: cron_group_label(&s, &cron_jobs),
                 cron_job_id: cron_group_id(&s).map(str::to_owned),
                 cron_group_pinned: cron_group_pinned(&s, &cron_jobs),
@@ -1036,8 +1016,8 @@ async fn list_sessions(
                 folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
                 unread_count: unread as i64,
                 title: s.title.clone(),
-            },
-        )
+            }
+        })
         .collect();
     Ok(Json(ChatSessionsList { items }))
 }
@@ -1221,11 +1201,12 @@ async fn build_history_page(
     let control_events: Vec<ControlEvent> = match (oldest_ordinal, newest_ordinal) {
         (Some(first), Some(last)) => {
             let lower = if has_more { first } else { i64::MIN };
-            match state.session_manager.list_control_events(sid).await {
-                Ok(events) => events
-                    .into_iter()
-                    .filter(|ev| ev.after_ordinal >= lower && ev.after_ordinal <= last)
-                    .collect(),
+            match state
+                .session_manager
+                .list_control_events_in_range(sid, lower, last)
+                .await
+            {
+                Ok(events) => events,
                 Err(e) => {
                     tracing::warn!(session_id = %sid, error = %e, "chat: list control events failed");
                     Vec::new()
@@ -1373,11 +1354,12 @@ async fn sync_difference(
     // holds), and the client dedups by the stable `n<seq>` row id.
     let upper = next_cursor.unwrap_or(i64::MIN);
     let control_events: Vec<ControlEvent> = if upper >= since {
-        match state.session_manager.list_control_events(sid).await {
-            Ok(events) => events
-                .into_iter()
-                .filter(|ev| ev.after_ordinal >= since && ev.after_ordinal <= upper)
-                .collect(),
+        match state
+            .session_manager
+            .list_control_events_in_range(sid, since, upper)
+            .await
+        {
+            Ok(events) => events,
             Err(e) => {
                 tracing::warn!(session_id = %sid, error = %e, "chat: list control events failed");
                 Vec::new()
@@ -1731,11 +1713,7 @@ async fn mark_sessions_read(
     let authed = authed.as_ref().map(|ext| &ext.0);
     // Scope-check every id BEFORE writing anything: a batch that would touch a
     // session this client cannot see is refused whole, not half-applied.
-    let mut sids = Vec::with_capacity(req.session_ids.len());
-    for session_id in &req.session_ids {
-        let (sid, _) = load_scoped_chat_session(&state, session_id, authed).await?;
-        sids.push(sid);
-    }
+    let sids = check_scoped_chat_sessions(&state, &req.session_ids, authed).await?;
     // "Fully read" is the session's own tail, resolved server-side — a chat-list
     // client has no ordinals. A session with no rows yet has no tail and needs
     // no cursor. The write is the same max-wins flat-column update the
@@ -1835,17 +1813,15 @@ async fn hide_sessions(
     }
     let authed = authed.as_ref().map(|ext| &ext.0);
     // Scope-check every id BEFORE writing anything: a batch that would touch a
-    // session this client cannot see is refused whole, not half-applied.
-    let mut targets = Vec::with_capacity(req.session_ids.len());
-    for session_id in &req.session_ids {
-        let (sid, session) = load_scoped_chat_session(&state, session_id, authed).await?;
-        targets.push((sid, session.channel));
-    }
+    // session this client cannot see is refused whole, not half-applied. Every
+    // in-scope session sits on the caller's chat channel by definition.
+    let targets = check_scoped_chat_sessions(&state, &req.session_ids, authed).await?;
+    let channel = chat_list_channel(authed);
     // Sequential, and the first failure propagates — unlike the mark-read batch,
     // which warns and skips. A read cursor converges on the next list pull; a
     // hide is a user-visible mutation the client has already applied
     // optimistically, so it must learn that the batch did not fully land.
-    for (sid, channel) in targets {
+    for sid in targets {
         state
             .session_manager
             .set_hidden(&sid, true)
@@ -2386,6 +2362,34 @@ async fn load_scoped_chat_session(
     Ok((sid, session))
 }
 
+/// Batch form of [`load_scoped_chat_session`]'s scope check: one grouped
+/// flat-column query instead of a session load per id. Refuses the whole
+/// batch when any id is unknown or off the caller's chat channel —
+/// callers write nothing on error, so a bad batch is rejected whole, not
+/// half-applied.
+async fn check_scoped_chat_sessions(
+    state: &AdminState,
+    session_ids: &[String],
+    authed: Option<&AuthedClient>,
+) -> Result<Vec<SessionId>> {
+    let sids: Vec<SessionId> = session_ids
+        .iter()
+        .map(|s| SessionId::from(s.as_str()))
+        .collect();
+    let channels = state
+        .session_manager
+        .session_channels(&sids)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load sessions: {e}")))?;
+    let want = chat_list_channel(authed);
+    for sid in &sids {
+        if channels.get(sid).map(String::as_str) != Some(want.as_str()) {
+            return Err(GatewayError::NotFound(format!("chat session {sid}")));
+        }
+    }
+    Ok(sids)
+}
+
 /// Push a [`Frame::SessionUpdated`] patch to every open chat client on
 /// `channel` — the `owner` pool, so a web tab and a phone on the session both
 /// receive it. The patch carries the truth (no refetch round-trip); see the
@@ -2435,98 +2439,91 @@ async fn transcript_attachments(
     rows: &[(i64, DateTime<Utc>, ChatMessage)],
     blob_store: &dyn baybo_store::BlobStore,
 ) -> HashMap<i64, Vec<ChatAttachment>> {
-    let mut attachments = HashMap::new();
-    for (ordinal, _created_at, msg) in rows {
-        if !msg.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::File { .. }
+    // Concurrent per-row resolution: each attachment-carrying row costs
+    // a blob `stat` lookup, and an image-heavy page paid them serially.
+    let resolved = futures::future::join_all(
+        rows.iter()
+            .filter(|(_, _, msg)| {
+                msg.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Image { .. }
+                            | ContentBlock::Audio { .. }
+                            | ContentBlock::File { .. }
+                    )
+                })
+            })
+            .map(|(ordinal, _created_at, msg)| async move {
+                let (_text, wire_attachments) =
+                    crate::channel::adapter::split_content(&msg.content, blob_store).await;
+                (*ordinal, wire_attachments)
+            }),
+    )
+    .await;
+    resolved
+        .into_iter()
+        .filter(|(_, wire)| !wire.is_empty())
+        .map(|(ordinal, wire)| {
+            (
+                ordinal,
+                wire.into_iter().map(ChatAttachment::from).collect(),
             )
-        }) {
-            continue;
-        }
-        let (_text, wire_attachments) =
-            crate::channel::adapter::split_content(&msg.content, blob_store).await;
-        if !wire_attachments.is_empty() {
-            attachments.insert(
-                *ordinal,
-                wire_attachments
-                    .into_iter()
-                    .map(ChatAttachment::from)
-                    .collect(),
-            );
-        }
-    }
-    attachments
+        })
+        .collect()
 }
 
-/// Fetch the most-recent user-authored text for `session_id` and shape it
-/// into the sidebar preview the list endpoint serves. Returns `None` when
-/// the session has no user turn, when that turn is media-only, or when the
-/// lookup fails — the sidebar treats all three as "no preview" rather than
-/// surfacing an error, so a single bad row never breaks the whole list.
-/// One indexed lookup ([`baybo_session::SessionManager::last_user_message`]),
-/// so a prompt buried under a long tool loop is still found.
-async fn last_user_preview(
-    manager: &baybo_session::SessionManager,
-    session_id: &SessionId,
+/// Shape a session's most-recent user-authored message (from the
+/// grouped chat-list scan) into the sidebar's first-line preview.
+/// `None` when the turn is media-only — the sidebar renders "no
+/// preview". `message_item` extracts the display text the same way
+/// the transcript does; the ordinal it stamps is unused here.
+fn last_user_preview(
+    created_at: chrono::DateTime<chrono::Utc>,
+    msg: &baybo_model::ChatMessage,
 ) -> Option<String> {
-    // One indexed lookup for the freshest human-authored turn — no
-    // tail-walking, so a long tool loop can't bury the prompt past a fixed
-    // window (which used to make a tool-retry session show "New
-    // conversation" despite having a clear prompt). `message_item`
-    // extracts the display text the same way the transcript does; the
-    // ordinal it stamps is unused here.
-    let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
-    let item = message_item(0, created_at, "user", &msg, Vec::new())?;
+    let item = message_item(0, created_at, "user", msg, Vec::new())?;
     (!item.text.is_empty()).then(|| truncate_preview(&item.text))
 }
 
 /// Newest **displayable** message regardless of author — the freshest user
 /// prompt or final assistant answer carrying text — collapsed into the chat
-/// list's second-line preview. Walks the transcript tail newest-first and
-/// returns the first row that renders as a message BUBBLE, applying the same
-/// visibility rules as [`reconstruct_transcript`] so the preview never surfaces
+/// list's second-line preview. Walks the tail window (from the grouped
+/// chat-list scan) newest-first and returns the first row that renders as a
+/// message BUBBLE, applying the same visibility rules as
+/// [`reconstruct_transcript`] so the preview never surfaces
 /// something the transcript itself hides: only a real user turn
 /// ([`ChatMessage::from_user`]) or a tool-free final assistant answer counts —
 /// agent-injected user rows (cron / recalled-memory framing), work-block
 /// narration (an assistant row with tool calls), and tool rows are skipped, and
 /// the model-facing cancelled-turn marker is stripped. `None` when the scanned
 /// tail holds no such bubble (media-only, a mid-tool-loop turn, or a fresh
-/// session) or the lookup fails — the row then falls back to its title / user
-/// preview client-side. Bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
+/// session) — the row then falls back to its title / user preview client-side.
+/// The window is bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
 /// tool loop can't turn one preview into an unbounded tail read.
-async fn last_message_preview(
-    manager: &baybo_session::SessionManager,
-    session_id: &SessionId,
+fn last_message_preview(
+    tail: &[(i64, chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)],
 ) -> Option<String> {
-    let tail = manager
-        .history_tail(session_id, None, LAST_MESSAGE_PREVIEW_SCAN)
-        .await
-        .ok()?;
-    tail.into_iter()
-        .rev()
-        .find_map(|(_ordinal, created_at, msg)| {
-            // Match reconstruct_transcript's bubble rules: a real user turn, or a
-            // tool-free final assistant answer. Everything else (agent-injected
-            // user rows, assistant work-block narration, tool results) renders no
-            // bubble there, so it must not become a preview here.
-            let role = if msg.from_user() {
-                "user"
-            } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
-                "assistant"
-            } else {
-                return None;
-            };
-            let item = message_item(0, created_at, role, &msg, Vec::new())?;
-            // Strip the model-facing cancelled-turn marker (a no-op when absent):
-            // a /stop-salvaged reply keeps only its partial text, and a
-            // thinking-only marker-only row strips to empty and is skipped — the
-            // same "frame for the model, strip for the user" contract the
-            // transcript honours.
-            let text = baybo_context::prompts::cancelled_turn::strip_marker(&item.text);
-            (!text.is_empty()).then(|| truncate_preview(text))
-        })
+    tail.iter().rev().find_map(|(_ordinal, created_at, msg)| {
+        // Match reconstruct_transcript's bubble rules: a real user turn, or a
+        // tool-free final assistant answer. Everything else (agent-injected
+        // user rows, assistant work-block narration, tool results) renders no
+        // bubble there, so it must not become a preview here.
+        let role = if msg.from_user() {
+            "user"
+        } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
+            "assistant"
+        } else {
+            return None;
+        };
+        let item = message_item(0, *created_at, role, msg, Vec::new())?;
+        // Strip the model-facing cancelled-turn marker (a no-op when absent):
+        // a /stop-salvaged reply keeps only its partial text, and a
+        // thinking-only marker-only row strips to empty and is skipped — the
+        // same "frame for the model, strip for the user" contract the
+        // transcript honours.
+        let text = baybo_context::prompts::cancelled_turn::strip_marker(&item.text);
+        (!text.is_empty()).then(|| truncate_preview(text))
+    })
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the

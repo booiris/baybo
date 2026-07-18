@@ -57,7 +57,10 @@ const KIND_BADGE_LABEL: Record<SessionKind, string> = {
   subagent: 'subagent',
 };
 
-const ACTIVE_KINDS: JobStatusKind[] = ['pending', 'in_progress', 'stuck'];
+// Only genuinely in-flight kinds keep the list poll alive. `stuck` is
+// excluded on purpose: a stuck row never advances on its own, so polling
+// for it would run forever with nothing to observe.
+const ACTIVE_KINDS: JobStatusKind[] = ['pending', 'in_progress'];
 
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';

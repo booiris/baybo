@@ -100,10 +100,10 @@ async fn concurrent_readers_and_writers_do_not_corrupt_the_connection() {
             for _ in 0..ROUNDS {
                 for id in &ids {
                     let got = store
-                        .load_last_user_message(id)
+                        .last_user_messages(std::slice::from_ref(id))
                         .await
-                        .expect("load_last_user_message");
-                    assert!(got.is_some(), "seeded session must have a user message");
+                        .expect("last_user_messages");
+                    assert!(!got.is_empty(), "seeded session must have a user message");
                 }
                 store
                     .list_by_channel(&ChannelType::tui())
@@ -136,11 +136,11 @@ async fn concurrent_readers_and_writers_do_not_corrupt_the_connection() {
     // The data is still coherent — corruption that stops short of a segfault
     // would surface here as a bad decode or a lost row.
     for id in &ids {
-        let (_, msg) = store
-            .load_last_user_message(id)
+        let rows = store
+            .last_user_messages(std::slice::from_ref(id))
             .await
-            .expect("final read")
-            .expect("final row");
+            .expect("final read");
+        let (_, _, msg) = rows.first().expect("final row");
         assert!(
             matches!(msg.content.first(), Some(ContentBlock::Text(t)) if t.starts_with("round ")),
             "decoded TEXT column survived the concurrent hammering",

@@ -151,10 +151,6 @@ impl SessionStore for MemorySessionStore {
         Ok(true)
     }
 
-    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
-        Ok(self.read_cursors.lock().get(session_id).copied())
-    }
-
     async fn set_last_llm(
         &self,
         session_id: &SessionId,
@@ -342,6 +338,26 @@ impl SessionStore for MemorySessionStore {
             .unwrap_or_default())
     }
 
+    async fn list_control_events_in_range(
+        &self,
+        session_id: &SessionId,
+        lower: i64,
+        upper: i64,
+    ) -> Result<Vec<ControlEvent>> {
+        Ok(self
+            .control_events
+            .lock()
+            .get(session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|ev| ev.after_ordinal >= lower && ev.after_ordinal <= upper)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn apply_session_compaction(
         &self,
         session_id: &SessionId,
@@ -397,6 +413,15 @@ impl SessionStore for MemorySessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredMessage>> {
+        self.load_session_messages_with_supersede_since(session_id, i64::MIN)
+            .await
+    }
+
+    async fn load_session_messages_with_supersede_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+    ) -> Result<Vec<StoredMessage>> {
         Ok(self
             .transcripts
             .lock()
@@ -404,6 +429,7 @@ impl SessionStore for MemorySessionStore {
             .map(|log| {
                 let mut rows: Vec<_> = log
                     .iter()
+                    .filter(|m| (m.ordinal as i64) > after_ordinal)
                     .map(|m| StoredMessage {
                         ordinal: m.ordinal as i64,
                         superseded_by: m.superseded_by.map(|v| v as i64),
@@ -415,6 +441,139 @@ impl SessionStore for MemorySessionStore {
                 rows
             })
             .unwrap_or_default())
+    }
+
+    async fn supersede_watermark(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .and_then(|log| log.iter().filter_map(|m| m.superseded_by).max())
+            .map(|v| v as i64))
+    }
+
+    async fn session_created_times(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<chrono::DateTime<chrono::Utc>>> {
+        Ok(self
+            .data
+            .lock()
+            .values()
+            .map(|s| s.created_at)
+            .filter(|t| *t >= from && *t < to)
+            .collect())
+    }
+
+    async fn last_user_messages(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, DateTime<Utc>, ChatMessage)>> {
+        let transcripts = self.transcripts.lock();
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| {
+                transcripts.get(id).and_then(|log| {
+                    log.iter()
+                        .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                        .max_by_key(|m| m.ordinal)
+                        .map(|m| (id.clone(), m.created_at, m.message.clone()))
+                })
+            })
+            .collect())
+    }
+
+    async fn active_tails(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, i64, DateTime<Utc>, ChatMessage)>> {
+        let transcripts = self.transcripts.lock();
+        let mut out = Vec::new();
+        for id in session_ids {
+            if let Some(log) = transcripts.get(id) {
+                let mut active: Vec<_> = log.iter().filter(|m| m.superseded_by.is_none()).collect();
+                active.sort_by_key(|m| m.ordinal);
+                let start = active.len().saturating_sub(limit);
+                out.extend(active[start..].iter().map(|m| {
+                    (
+                        id.clone(),
+                        m.ordinal as i64,
+                        m.created_at,
+                        m.message.clone(),
+                    )
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn unread_scan(
+        &self,
+        session_ids: &[SessionId],
+        limit: usize,
+    ) -> Result<Vec<(SessionId, ChatMessage)>> {
+        let transcripts = self.transcripts.lock();
+        let cursors = self.read_cursors.lock();
+        let mut out = Vec::new();
+        for id in session_ids {
+            let cursor = cursors.get(id).copied().unwrap_or(-1);
+            if let Some(log) = transcripts.get(id) {
+                let mut active: Vec<_> = log
+                    .iter()
+                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) > cursor)
+                    .collect();
+                active.sort_by_key(|m| m.ordinal);
+                out.extend(
+                    active
+                        .into_iter()
+                        .take(limit)
+                        .map(|m| (id.clone(), m.message.clone())),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn session_titles(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, Option<String>)>> {
+        let data = self.data.lock();
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| data.get(id).map(|s| (id.clone(), s.title.clone())))
+            .collect())
+    }
+
+    async fn session_channels(
+        &self,
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, String)>> {
+        let data = self.data.lock();
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| {
+                data.get(id)
+                    .map(|s| (id.clone(), s.channel.as_str().to_string()))
+            })
+            .collect())
+    }
+
+    async fn touch_last_active(&self, session_id: &SessionId, now: DateTime<Utc>) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.last_active = now;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn count_sessions(&self) -> Result<usize> {
+        Ok(self.data.lock().len())
     }
 
     async fn active_index_of_ordinal(
@@ -532,18 +691,6 @@ impl SessionStore for MemorySessionStore {
                 .filter(|m| m.message.platform_msg_id() == platform_msg_id)
                 .max_by_key(|m| m.ordinal)
                 .map(|m| m.ordinal as i64)
-        }))
-    }
-
-    async fn load_last_user_message(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>> {
-        Ok(self.transcripts.lock().get(session_id).and_then(|log| {
-            log.iter()
-                .filter(|m| m.superseded_by.is_none() && m.message.from_user())
-                .max_by_key(|m| m.ordinal)
-                .map(|m| (m.created_at, m.message.clone()))
         }))
     }
 }

@@ -37,15 +37,24 @@ fn format_numbered_line(line_no: usize, line: &str) -> String {
     }
 }
 
+/// The exclusive last line index a `Read` with these params will emit —
+/// the same offset/limit defaulting [`paginate_numbered`] applies
+/// (default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`]). Exported so a
+/// [`crate::VirtualReadResolver`] can stop materialising content at the
+/// window's end without re-deriving the paginator's defaults.
+pub fn paginate_end_line(offset: Option<usize>, limit: Option<usize>) -> usize {
+    let start = offset.unwrap_or(1).saturating_sub(1);
+    start.saturating_add(limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT))
+}
+
 /// Render an in-memory string as `Read`-style numbered output, honoring the
 /// same 1-based `offset` / `limit` (default [`DEFAULT_LIMIT`], capped at
-/// [`MAX_LIMIT`]) and per-line byte cap as a real read. Used by the
-/// virtual-file path in [`ReadTool::execute`] to present provider content
-/// identically to a file.
-fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+/// [`MAX_LIMIT`]) and per-line byte cap as a real read. Exported for
+/// [`crate::VirtualReadResolver`] implementations, which paginate their own
+/// content so they can stop materialising it at the window's end.
+pub fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     let start = offset.unwrap_or(1).saturating_sub(1);
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let end = start.saturating_add(limit);
+    let end = paginate_end_line(offset, limit);
     let mut out = String::new();
     for (idx, line) in content.lines().enumerate() {
         if idx >= end {
@@ -153,12 +162,15 @@ impl Tool for ReadTool {
                 session_id: &ctx.session_id,
                 user: &ctx.user,
             };
-            match resolver.resolve(&p.file_path, &access).await {
-                Some(Ok(content)) => {
-                    return Ok(ToolOutput::Text(paginate_numbered(
-                        &content, p.offset, p.limit,
-                    )));
-                }
+            let window = crate::VirtualReadWindow {
+                offset: p.offset,
+                limit: p.limit,
+            };
+            // The resolver returns finished `Read`-style output for the
+            // window — pagination happens at the source so the whole
+            // virtual file is never materialised per page.
+            match resolver.resolve(&p.file_path, &access, &window).await {
+                Some(Ok(content)) => return Ok(ToolOutput::Text(content)),
                 Some(Err(reason)) => return Err(ToolError::Execution(reason)),
                 None => {}
             }
@@ -264,10 +276,15 @@ mod tests {
             &self,
             _path: &Path,
             _access: &VirtualReadAccess<'_>,
+            window: &crate::VirtualReadWindow,
         ) -> Option<Result<String, String>> {
             match self {
                 StubResolver::Unclaimed => None,
-                StubResolver::Content(s) => Some(Ok(s.clone())),
+                // Honour the contract: the resolver ships finished
+                // `Read`-style output for the window.
+                StubResolver::Content(s) => {
+                    Some(Ok(paginate_numbered(s, window.offset, window.limit)))
+                }
                 StubResolver::Denied => Some(Err("not yours".into())),
             }
         }

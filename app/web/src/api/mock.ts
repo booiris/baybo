@@ -489,6 +489,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         cache_creation_input_tokens: 38,
       },
     ],
+    supersede_watermark: null,
   };
 
   const fixture = { job, overview };

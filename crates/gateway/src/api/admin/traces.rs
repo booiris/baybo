@@ -27,7 +27,9 @@ use utoipa_axum::routes;
 
 use baybo_query::{SessionSummaryFilter, SessionSummaryPage};
 
-use crate::api::dto::{ErrorBody, TraceSessionSummary, TracesListQuery, TracesListResponse};
+use crate::api::dto::{
+    ErrorBody, TraceOverviewQuery, TraceSessionSummary, TracesListQuery, TracesListResponse,
+};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -88,11 +90,12 @@ async fn list_traces(
     tag = "traces",
     params(
         ("session_id" = String, Path, description = "Session id whose trace overview to fetch"),
+        TraceOverviewQuery,
     ),
     responses(
         (
             status = 200,
-            description = "Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            description = "Per-session trace overview: session_messages log + job summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
@@ -103,11 +106,12 @@ async fn list_traces(
 async fn get_trace(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    Query(q): Query<TraceOverviewQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let typed_session = baybo_model::SessionId::from(session_id.as_str());
     let overview = state
         .query_api
-        .load_trace_overview(&typed_session)
+        .load_trace_overview(&typed_session, q.since_ordinal)
         .await
         .map_err(|e| GatewayError::Trace(e.to_string()))?;
 
@@ -139,6 +143,7 @@ async fn get_trace(
         "session_id": overview.session_id.as_str(),
         "session_messages": overview.session_messages,
         "jobs": jobs,
+        "supersede_watermark": overview.supersede_watermark,
     })))
 }
 

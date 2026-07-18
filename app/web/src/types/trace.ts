@@ -335,6 +335,11 @@ export interface TraceOverview {
   session_id: string;
   session_messages: SessionMessageRow[];
   jobs: TraceJobSummary[];
+  // Highest `superseded_by` marker in the session. Advances only when a
+  // compaction re-marks rows the client may already hold; an incremental
+  // (`since_ordinal`) poll compares it against the cached value to decide
+  // whether the cached prefix is still valid or needs a full reload.
+  supersede_watermark: number | null;
 }
 
 /** Response shape of `GET /v1/traces/{session_id}/jobs/{job_id}`. */
