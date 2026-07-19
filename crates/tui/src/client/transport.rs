@@ -435,10 +435,12 @@ fn map_frame(
         }
         Frame::SessionUpdated { .. }
         | Frame::SessionActivity { .. }
-        | Frame::FoldersChanged { .. } => {
-            // Web-chat sidebar signals — TUI tracks a single session
-            // of its own and has no list view, so it ignores rather
-            // than warning.
+        | Frame::FoldersChanged { .. }
+        | Frame::DeckCardData { .. }
+        | Frame::DeckChanged => {
+            // Web-chat sidebar / deck signals — TUI tracks a single
+            // session of its own and has no list or deck view, so it
+            // ignores rather than warning.
             None
         }
         Frame::Gap { .. } => {

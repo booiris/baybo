@@ -943,6 +943,7 @@ mod sleep_tool {
                 trust_level: TrustLevel::Trusted,
                 parameters_schema: json!({"type": "object", "additionalProperties": true}),
                 capabilities: vec![],
+                channels: Vec::new(),
             }
         }
 
@@ -2979,6 +2980,7 @@ mod interjecting_tool {
                 trust_level: TrustLevel::Trusted,
                 parameters_schema: json!({"type": "object", "additionalProperties": true}),
                 capabilities: vec![],
+                channels: Vec::new(),
             }
         }
     }

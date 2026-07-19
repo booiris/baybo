@@ -51,6 +51,9 @@ type InboundKind =
   | 'folders_changed'
   | 'session_updated'
   | 'session_activity'
+  // deck frames — no deck UI here; the native deck shell consumes them
+  | 'deck_card_data'
+  | 'deck_changed'
   | 'ping'
   | 'pong';
 

@@ -89,12 +89,40 @@ pub fn parse_skill_md(content: &str, default_name: &str) -> Result<SkillDefiniti
     let disable_model_invocation = read_bool(&fm, "disable-model-invocation")?.unwrap_or(false);
     let user_invocable = read_bool(&fm, "user-invocable")?.unwrap_or(true);
 
+    let command_override = match fm.get("command") {
+        Some(YamlValue::Scalar(s)) => Some(s.clone()),
+        Some(_) => return Err("`command` must be a scalar".into()),
+        None => None,
+    };
+    if let Some(cmd) = &command_override {
+        if !user_invocable {
+            return Err("`command` requires `user-invocable: true`".into());
+        }
+        if !validate_skill_name(cmd) {
+            return Err(format!(
+                "command '{cmd}' is invalid: must start with alphanumeric, then contain only [a-zA-Z0-9._-], 1-64 chars"
+            ));
+        }
+    }
     let command = if user_invocable {
-        Some(name.clone())
+        Some(command_override.unwrap_or_else(|| name.clone()))
     } else {
         None
     };
     let agent_invocable = !disable_model_invocation;
+
+    let channels = match fm.get("channels") {
+        Some(YamlValue::List(items)) => items
+            .iter()
+            .map(|s| baybo_model::ChannelType(s.clone()))
+            .collect(),
+        Some(YamlValue::Scalar(s)) => s
+            .split_whitespace()
+            .map(|t| baybo_model::ChannelType(t.to_string()))
+            .collect(),
+        Some(YamlValue::Bool(_)) => return Err("`channels` must be a list or string".into()),
+        None => Vec::new(),
+    };
 
     let argument_hint = read_scalar(&fm, "argument-hint");
     let version = read_scalar(&fm, "version").unwrap_or_else(|| "0.0.0".to_string());
@@ -110,6 +138,7 @@ pub fn parse_skill_md(content: &str, default_name: &str) -> Result<SkillDefiniti
         description,
         command,
         agent_invocable,
+        channels,
         argument_hint,
         prompt_template: body.trim_start_matches('\n').to_string(),
         allowed_tools,
@@ -325,6 +354,41 @@ mod tests {
         let skill = parse_skill_md(src, "s").unwrap();
         assert!(skill.command.is_none());
         assert!(skill.agent_invocable);
+    }
+
+    #[test]
+    fn command_override_replaces_the_name_derived_command() {
+        let src = "---\nname: deck\ncommand: deck-cmd\n---\n";
+        let skill = parse_skill_md(src, "deck").unwrap();
+        assert_eq!(skill.command.as_deref(), Some("deck-cmd"));
+        assert_eq!(skill.name, "deck");
+    }
+
+    #[test]
+    fn command_with_user_invocable_false_is_rejected() {
+        let src = "---\nname: s\ncommand: c\nuser-invocable: false\n---\n";
+        assert!(parse_skill_md(src, "s").is_err());
+    }
+
+    #[test]
+    fn command_with_bad_grammar_is_rejected() {
+        let src = "---\nname: s\ncommand: \"has space\"\n---\n";
+        assert!(parse_skill_md(src, "s").is_err());
+    }
+
+    #[test]
+    fn channels_accepts_block_list_and_defaults_empty() {
+        let src = "---\nname: s\nchannels:\n  - owner\n  - tui\n---\n";
+        let skill = parse_skill_md(src, "s").unwrap();
+        assert_eq!(
+            skill.channels,
+            vec![
+                baybo_model::ChannelType::owner(),
+                baybo_model::ChannelType::tui()
+            ]
+        );
+        let bare = parse_skill_md("---\nname: s\n---\n", "s").unwrap();
+        assert!(bare.channels.is_empty());
     }
 
     #[test]

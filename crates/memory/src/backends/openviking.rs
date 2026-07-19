@@ -896,6 +896,7 @@ fn tool_pair(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::Http],
+        channels: Vec::new(),
     };
     (tool, manifest)
 }

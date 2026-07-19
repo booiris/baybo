@@ -48,6 +48,11 @@ pub const SKILLS_DIR: &str = "skills";
 /// concern, only a frontmatter + system-prompt body).
 pub const AGENTS_DIR: &str = "agents";
 
+/// Deck card bundles at `<root>/deck/<uuid>/` — agent-authored plain
+/// files (docs/modules/deck.md). Installed atomically via a `.staging/`
+/// sibling inside this dir so the rename stays same-filesystem.
+pub const DECK_DIR: &str = "deck";
+
 /// Master encryption-key directory at `<root>/.key/`. Not
 /// version-controlled. Setup mints the key file inside on first run with
 /// 0600 permissions.
@@ -364,6 +369,10 @@ impl WorkspacePaths {
 
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join(AGENTS_DIR)
+    }
+
+    pub fn deck_dir(&self) -> PathBuf {
+        self.root.join(DECK_DIR)
     }
 
     pub fn key_dir(&self) -> PathBuf {

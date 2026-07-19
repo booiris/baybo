@@ -153,6 +153,48 @@ impl ToolRegistry {
         out
     }
 
+    /// [`Self::tool_definitions`] minus tools whose manifest restricts
+    /// `channels` to a set excluding `channel`. This is what the agent
+    /// loop sends the LLM: a session's channel never changes, so the
+    /// filtered list stays byte-stable within a session and the
+    /// prompt-cache constraint above still holds. A tool with no
+    /// manifest is treated as unrestricted (defensive — `register`
+    /// always stores one).
+    pub fn tool_definitions_for_channel(
+        &self,
+        channel: &baybo_model::ChannelType,
+    ) -> Vec<ToolDefinition> {
+        let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
+        for (name, tool) in &self.builtin {
+            if self
+                .builtin_manifests
+                .get(name)
+                .is_none_or(|m| m.allows_channel(channel))
+            {
+                let def = tool_definition_for(tool.as_ref());
+                defs.insert(def.name.clone(), def);
+            }
+        }
+        let dynamic = self.dynamic.read();
+        for (name, tool) in &dynamic.tools {
+            if dynamic
+                .manifests
+                .get(name)
+                .is_none_or(|m| m.allows_channel(channel))
+            {
+                let def = tool_definition_for(tool.as_ref());
+                defs.insert(def.name.clone(), def);
+            } else {
+                // A restricted dynamic tool must not fall back to a
+                // same-named builtin it shadows.
+                defs.remove(name);
+            }
+        }
+        let mut out: Vec<ToolDefinition> = defs.into_values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     /// Look up a tool by name. Dynamic registrations shadow builtins.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(t) = self.dynamic.read().tools.get(name) {
@@ -279,5 +321,31 @@ mod tests {
             ToolConcurrency::Exclusive,
             "an unclassifiable tool must never be parallelized"
         );
+    }
+
+    #[test]
+    fn channel_filter_hides_restricted_tools_and_keeps_the_rest() {
+        let mut registry = default_registry();
+        let echo = crate::test_support::EchoTool::new("OwnerOnly");
+        let mut manifest = echo.manifest();
+        manifest.channels = vec![baybo_model::ChannelType::owner()];
+        registry.register(Arc::new(echo), manifest);
+
+        let names =
+            |defs: Vec<crate::ToolDefinition>| defs.into_iter().map(|d| d.name).collect::<Vec<_>>();
+
+        let owner =
+            names(registry.tool_definitions_for_channel(&baybo_model::ChannelType::owner()));
+        assert!(owner.contains(&"OwnerOnly".to_string()));
+
+        let telegram =
+            names(registry.tool_definitions_for_channel(&baybo_model::ChannelType::telegram()));
+        assert!(!telegram.contains(&"OwnerOnly".to_string()));
+        // Unrestricted tools are unaffected, and the two lists differ by
+        // exactly the restricted entry.
+        assert!(telegram.contains(&"AttachFile".to_string()));
+        assert_eq!(owner.len(), telegram.len() + 1);
+        // The unfiltered listing still carries everything.
+        assert_eq!(registry.tool_definitions().len(), owner.len());
     }
 }

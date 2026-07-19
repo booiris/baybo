@@ -224,6 +224,16 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let (agent_output_tx, _agent_output_rx) = mpsc::channel(1);
     let supervisor = baybo_agent::supervisor::AgentSupervisor::new(agent_output_tx);
 
+    let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
+        store: stores.deck.clone(),
+        vault: Arc::clone(&secret_vault),
+        events: Arc::new(crate::deck_events::GatewayDeckEvents::new(Arc::clone(
+            &channel_registry,
+        ))),
+        deck_root: tempdir.path().join("deck"),
+        scratch_root: tempdir.path().join("deck-scratch"),
+    });
+
     let deps = GatewayDeps {
         config,
         config_path: None,
@@ -245,6 +255,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores,
         channel_control,
         bot_reconciler,
+        deck_manager,
     };
 
     TestGateway {

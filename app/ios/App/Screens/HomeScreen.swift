@@ -44,7 +44,9 @@ struct HomeTabView: View {
             ChatListScreen()
         case .settings:
             section { SettingsScreen() }
-        case .agents, .projects:
+        case .deck:
+            section { DeckScreen() }
+        case .projects:
             section { PlaceholderScreen(icon: tab.icon, titleKey: tab.labelKey) }
         }
     }
@@ -63,7 +65,7 @@ struct HomeTabView: View {
         /// switch is recordable headlessly (`simctl io recordVideo` + ffmpeg).
         private func demoTabCycleIfRequested() async {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-tabs") else { return }
-            let order: [AppStore.HomeTab] = [.chats, .agents, .settings, .projects, .agents, .chats]
+            let order: [AppStore.HomeTab] = [.chats, .deck, .settings, .projects, .deck, .chats]
             while !Task.isCancelled {
                 for tab in order {
                     try? await Task.sleep(for: .milliseconds(1000))
@@ -80,7 +82,7 @@ extension AppStore.HomeTab {
     /// A line-weight SF Symbol tuned for the tab bar.
     var icon: String {
         switch self {
-        case .agents: return "waveform.path.ecg"
+        case .deck: return "rectangle.stack"
         case .projects: return "square.stack.3d.up"
         case .chats: return "message"
         case .settings: return "gearshape"
@@ -89,7 +91,7 @@ extension AppStore.HomeTab {
 
     var labelKey: String {
         switch self {
-        case .agents: return "home.tab.agents"
+        case .deck: return "home.tab.deck"
         case .projects: return "home.tab.projects"
         case .chats: return "home.tab.chats"
         case .settings: return "home.tab.settings"

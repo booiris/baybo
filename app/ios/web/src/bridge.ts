@@ -99,6 +99,9 @@ declare global {
     webkit?: {
       messageHandlers?: {
         baybo?: { postMessage(message: unknown): void };
+        /// The deck shell's handler (src/deck/bridge.ts) — declared here
+        /// because a global interface may only be declared once per shape.
+        deck?: { postMessage(message: unknown): void };
       };
     };
   }

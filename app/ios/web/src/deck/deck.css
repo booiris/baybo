@@ -1,0 +1,345 @@
+/* Deck shell — monochrome soft line minimalism (the app's system). */
+
+:root {
+  --deck-ink: #1c1b19;
+  --deck-paper: #ffffff;
+  --deck-line: rgba(28, 27, 25, 0.14);
+  --deck-muted: rgba(28, 27, 25, 0.55);
+  --deck-gap: 12px;
+  --deck-row-h: 150px;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--deck-paper);
+  color: var(--deck-ink);
+  font-family: -apple-system, "SF Pro Text", sans-serif;
+  -webkit-text-size-adjust: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The shell is a widget surface, not a document: without this, a
+   long-press anywhere the SHELL owns starts WebKit text selection —
+   the loupe magnifier, and the <iframe> element itself getting
+   selected as an atomic node (blue box around the whole card). The
+   card INTERIORS are covered separately by cardBase.css; this covers
+   the parent document. */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.deck-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: var(--deck-row-h);
+  grid-auto-flow: dense;
+  gap: var(--deck-gap);
+  /* The webview is full-bleed under the native header (46pt bar + 8
+     breathing); this padding is the resting offset, and scrolling runs
+     the cards under the header's paper veil like the chat list. */
+  padding: calc(env(safe-area-inset-top) + 54px) 16px
+    calc(env(safe-area-inset-bottom) + 24px);
+}
+
+.deck-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--deck-line);
+  border-radius: 16px;
+  background: var(--deck-paper);
+  overflow: hidden;
+}
+
+.deck-card[data-size="small"],
+.deck-drop-slot[data-size="small"] {
+  grid-column: span 1;
+  grid-row: span 1;
+}
+.deck-card[data-size="wide"],
+.deck-drop-slot[data-size="wide"] {
+  grid-column: span 2;
+  grid-row: span 1;
+}
+.deck-card[data-size="large"],
+.deck-drop-slot[data-size="large"] {
+  grid-column: span 2;
+  grid-row: span 2;
+}
+
+.deck-card.faulted {
+  border-color: rgba(180, 60, 40, 0.5);
+}
+
+/* The card owns its visible heading — the shell shows this identity
+   chip only while editing (deleting/resizing needs a name), so normal
+   view never duplicates the card's own title and content gets the full
+   tile. Absolute → no layout shift when edit mode toggles. */
+.deck-card-header {
+  display: none;
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  max-width: 55%;
+  z-index: 2;
+  padding: 2px 10px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--deck-line);
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--deck-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.deck-grid.editing .deck-card-header {
+  display: block;
+}
+
+.deck-card-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.deck-card-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+
+.deck-card-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  color: var(--deck-muted);
+}
+
+.deck-face-btn {
+  border: 1px solid var(--deck-ink);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--deck-ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 16px;
+}
+
+.deck-empty {
+  /* Sit just below the native header, not halfway down the screen. */
+  padding: calc(env(safe-area-inset-top) + 88px) 32px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--deck-muted);
+}
+
+/* Primary CTA on the empty board: one solid ink pill (monochrome, so
+   still on-language) that opens a prefilled /deck draft. */
+.deck-empty-cta {
+  border: 1px solid var(--deck-ink);
+  border-radius: 999px;
+  background: var(--deck-ink);
+  color: var(--deck-paper);
+  font: inherit;
+  font-size: 14px;
+  padding: 9px 22px;
+}
+.deck-empty-cta:active {
+  opacity: 0.7;
+}
+.deck-empty-cta.inflight {
+  display: inline-flex;
+  align-items: center;
+}
+.deck-cta-spin {
+  width: 13px;
+  height: 13px;
+  margin-right: 8px;
+  border: 2px solid var(--deck-paper);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: deck-cta-spin 0.7s linear infinite;
+}
+@keyframes deck-cta-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Edit mode: wiggle + controls. */
+.deck-size-btn,
+.deck-remove-btn {
+  position: absolute;
+  top: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--deck-line);
+  background: var(--deck-paper);
+  color: var(--deck-ink);
+  font-size: 13px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+.deck-size-btn {
+  right: 38px;
+}
+.deck-remove-btn {
+  right: 6px;
+}
+
+.deck-grid.editing .deck-size-btn,
+.deck-grid.editing .deck-remove-btn {
+  display: flex;
+}
+
+/* A card that implements only one size has nothing to resize to — hide the
+   ⤢ even in edit mode (more specific than the show rule above). */
+.deck-grid.editing .deck-card.single-size .deck-size-btn {
+  display: none;
+}
+
+/* ⛶ maximize — the tile's own top-right control, shown on a maximize-capable
+   card outside edit mode. Borderless (a bare ink glyph, per the app's line
+   minimalism); the card's max layout reserves the corner for it. EXIT from a
+   maximized card is the native header's ✕ (true top-right corner, above the
+   header veil the webview can't paint over), so the tile button hides entirely
+   while any card is maximized. */
+.deck-max-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: transparent;
+  color: var(--deck-ink);
+  font-size: 15px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+}
+.deck-grid:not(.editing) .deck-card.can-maximize .deck-max-btn {
+  display: flex;
+}
+.deck-grid.has-max .deck-max-btn {
+  display: none;
+}
+.deck-max-btn:active {
+  opacity: 0.5;
+}
+
+/* A maximized card fills a fixed overlay; the grid behind it must not scroll
+   (its scrollbar would peek at the screen edge). Locked while maximized. */
+html.deck-maximized,
+html.deck-maximized body {
+  overflow: hidden;
+}
+
+@keyframes deck-wiggle {
+  0% { transform: rotate(-0.4deg); }
+  50% { transform: rotate(0.4deg); }
+  100% { transform: rotate(-0.4deg); }
+}
+
+.deck-grid.editing .deck-card {
+  animation: deck-wiggle 0.3s ease-in-out infinite;
+}
+
+/* The live drag (iOS-home-screen mechanics; see shell.ts drag engine).
+   The REAL tile lifts out of flow and follows the finger — fixed +
+   transform, never a DOM move, so its iframe keeps painting live
+   content the whole way. The placeholder is the drop slot the grid
+   reflows around. Wiggle pauses during a drag so the FLIP slides own
+   the transform channel.
+
+   `pan-y` — NOT `none` — so the deck still SCROLLS in edit mode: the
+   pickup is a long press (shell.ts), and reorder only wins the gesture
+   after it arms (pointer capture + touchmove preventDefault kick in on
+   arm). A move before the press fires stays a scroll and cancels the
+   pickup. */
+.deck-grid.editing .deck-card {
+  touch-action: pan-y;
+}
+
+.deck-grid.has-drag .deck-card {
+  animation: none;
+}
+
+/* No pointer-events:none here: the lifted tile is the pointer-capture
+   target, and it must stay event-eligible for the move stream. Nothing
+   hit-tests under the finger anyway — dropIndexAt works on rects. Once
+   lifted it must never yield to scroll, hence touch-action: none. */
+.deck-card.deck-dragging-live {
+  position: fixed;
+  z-index: 10;
+  margin: 0;
+  animation: none;
+  touch-action: none;
+  box-shadow: 0 12px 32px rgba(28, 27, 25, 0.22);
+  will-change: transform;
+}
+
+.deck-drop-slot {
+  border: 1px dashed var(--deck-line);
+  border-radius: 16px;
+  background: rgba(28, 27, 25, 0.03);
+}
+
+/* The maximize placeholder only reserves the grid slot for the collapse — it
+   is NOT a drop target, so it shows no dashed outline or fill (that outline
+   flashing behind the expanding/collapsing tile read as a stray border). */
+.deck-drop-slot.deck-max-slot {
+  border: none;
+  background: transparent;
+}
+
+/* Maximized card: lifted out of flow and filling the viewport (inline
+   left/top/width/height drive the rect). Full-bleed, so no border or radius;
+   the placeholder holds its grid slot for the collapse. The tab bar floats
+   over the bottom (per the maximize design) — the card's own max layout keeps
+   content clear of it. */
+.deck-card.maximized {
+  position: fixed;
+  z-index: 20;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: var(--deck-paper);
+}
+.deck-card.deck-max-animate {
+  transition:
+    left 260ms cubic-bezier(0.2, 0, 0, 1),
+    top 260ms cubic-bezier(0.2, 0, 0, 1),
+    width 260ms cubic-bezier(0.2, 0, 0, 1),
+    height 260ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Cards must never receive pointer events while editing — the drag owns
+   the surface, and a wiggling iframe eating the gesture would stall it. */
+.deck-grid.editing .deck-card-frame {
+  pointer-events: none;
+}

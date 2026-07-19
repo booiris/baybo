@@ -140,5 +140,6 @@ pub(crate) fn build_manifest(
         trust_level,
         parameters_schema,
         capabilities,
+        channels: Vec::new(),
     }
 }

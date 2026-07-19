@@ -122,6 +122,9 @@ pub struct GatewayDeps {
     /// (avoiding a double-send on the first tick) and so the
     /// disconnect path can `forget` the cached bots.
     pub bot_reconciler: Arc<crate::channel::ChannelBotReconciler>,
+    /// Deck card manager (`/v1/deck/*`). Built by the runtime alongside
+    /// the other managers; its boot/shutdown are driven by the caller.
+    pub deck_manager: Arc<baybo_deck::DeckManager>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -159,6 +162,8 @@ pub struct AdminState {
     pub blob_store: Arc<dyn BlobStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
+    /// Deck card manager (`/v1/deck/*` — docs/modules/deck.md).
+    pub deck_manager: Arc<baybo_deck::DeckManager>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -207,6 +212,7 @@ impl AdminState {
             blob_store: Arc::clone(&deps.stores.blob),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
+            deck_manager: Arc::clone(&deps.deck_manager),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }

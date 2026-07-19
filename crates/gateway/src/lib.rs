@@ -23,6 +23,7 @@ pub mod auth;
 pub mod channel;
 pub mod channel_listener;
 pub mod config;
+pub mod deck_events;
 pub mod device;
 pub mod error;
 pub mod installer;

@@ -12,8 +12,10 @@ import type { Frame } from "../../../../sidecars/sdk/channel-ts/src/generated/Fr
 // the hand-written mirror (`types.ts`) or the ts-rs contract (`Frame`) drops a
 // kind, and the source scan fails HERE if the switch and the mirror drift apart.
 
-/// Kinds that mirror a real wire frame the Rust side synthesizes. Same set as
-/// `wireSentinel.ts`'s `MirroredKind`, asserted against the generated contract.
+/// Kinds that mirror a real wire frame the Rust side synthesizes AND the router
+/// renders — `wireSentinel.ts`'s `MirroredKind` minus the deck frames, which
+/// are pinned there for the native deck shell but deliberately fall through the
+/// router's `default` here (no deck UI in the transcript).
 const WIRE_KINDS = [
   "message",
   "answer_delta",

@@ -474,13 +474,27 @@ impl ToolExecutor {
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
-        if let Some(manifest) = self.tool_registry.get_manifest(tool_name)
-            && let Err(e) = self.validate_trust(tool_name, &manifest)
-        {
-            return ExecutedTool {
-                output: Err(e),
-                approval: None,
-            };
+        if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
+            if let Err(e) = self.validate_trust(tool_name, &manifest) {
+                return ExecutedTool {
+                    output: Err(e),
+                    approval: None,
+                };
+            }
+            // The channel-restricted tool is already omitted from the
+            // LLM's list for this session; refusing here closes the gap
+            // a hallucinated or skill-body-prompted name would slip
+            // through.
+            if !manifest.allows_channel(&user.channel) {
+                return ExecutedTool {
+                    output: Err(anyhow::anyhow!(
+                        "security: tool '{}' is not available on channel '{}'",
+                        tool_name,
+                        user.channel.as_str()
+                    )),
+                    approval: None,
+                };
+            }
         }
 
         let job_id = step.job_id;

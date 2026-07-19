@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::api::{FrameSink, SessionListSink};
+use crate::api::{DeckSink, FrameSink, SessionListSink};
 use crate::core::{
     Frame, MobileError, WireApprovalDecision, WireAttachment, resolve_approval_frame,
     subscribe_frame,
@@ -182,6 +182,12 @@ struct HandleSlot {
 /// plain slot read on the frame path, never held across an await.
 pub(crate) type SharedListSink = Arc<parking_lot::Mutex<Option<Arc<dyn SessionListSink>>>>;
 
+/// The connection-global deck sink — the [`SharedListSink`] pattern. Deck
+/// frames (`DeckCardData` / `DeckChanged`) are session-less broadcasts with no
+/// subscription to route by, so they land here and never on a per-session
+/// [`FrameSink`].
+pub(crate) type SharedDeckSink = Arc<parking_lot::Mutex<Option<Arc<dyn DeckSink>>>>;
+
 /// The single live chat leg for one binding. The socket itself is global, while
 /// `sinks` maps each subscribed session to the Swift owner that should receive
 /// that session's frames.
@@ -191,6 +197,8 @@ pub(crate) struct SessionRegistry {
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
     /// Connection-global `SessionActivity` pings (chat-list unread) land here.
     list_sink: SharedListSink,
+    /// Connection-global deck pushes (`DeckCardData` / `DeckChanged`) land here.
+    deck_sink: SharedDeckSink,
 }
 
 impl Default for SessionRegistry {
@@ -200,6 +208,7 @@ impl Default for SessionRegistry {
             connect_lock: Mutex::new(()),
             sinks: Arc::new(Mutex::new(HashMap::new())),
             list_sink: Arc::new(parking_lot::Mutex::new(None)),
+            deck_sink: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
@@ -368,6 +377,7 @@ impl SessionRegistry {
             conn,
             self.sinks.clone(),
             self.list_sink.clone(),
+            self.deck_sink.clone(),
             outbound_rx,
         ));
         if let Some(prev) = slot.handle.take() {
@@ -499,6 +509,12 @@ impl SessionRegistry {
     pub(crate) fn set_list_sink(&self, sink: Option<Arc<dyn SessionListSink>>) {
         *self.list_sink.lock() = sink;
     }
+
+    /// Install (or clear) the connection-global deck sink. Idempotent; both
+    /// legs point at the same foreign sink.
+    pub(crate) fn set_deck_sink(&self, sink: Option<Arc<dyn DeckSink>>) {
+        *self.deck_sink.lock() = sink;
+    }
 }
 
 /// The user message payload `connect_and_send` enqueues right after the
@@ -619,6 +635,11 @@ pub(crate) fn set_list_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn Session
     leg.registry().set_list_sink(sink);
 }
 
+/// Point `leg`'s registry at the connection-global deck sink.
+pub(crate) fn set_deck_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn DeckSink>>) {
+    leg.registry().set_deck_sink(sink);
+}
+
 /// Own the socket for the binding's lifetime: fan inbound frames to per-session
 /// sinks and seal outbound user messages.
 /// The codec hides whether bytes are Noise-sealed (relay) or raw msgpack
@@ -631,9 +652,10 @@ async fn pump(
     conn: Connection,
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
     list_sink: SharedListSink,
+    deck_sink: SharedDeckSink,
     outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
-    run_pump(conn, sinks.clone(), list_sink, outbound_rx).await;
+    run_pump(conn, sinks.clone(), list_sink, deck_sink, outbound_rx).await;
     let sinks: Vec<(String, Arc<dyn FrameSink>)> = sinks
         .lock()
         .await
@@ -651,6 +673,7 @@ async fn run_pump(
     conn: Connection,
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
     list_sink: SharedListSink,
+    deck_sink: SharedDeckSink,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let Connection {
@@ -695,7 +718,7 @@ async fn run_pump(
                             // The sink is a foreign callback and can't signal a
                             // dropped consumer (unlike the old webview channel);
                             // session lifetime is owned by explicit disconnects.
-                            dispatch_inbound_frame(&sinks, &list_sink, frame).await;
+                            dispatch_inbound_frame(&sinks, &list_sink, &deck_sink, frame).await;
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -786,63 +809,105 @@ async fn run_pump(
     let _ = sink_ws.close().await;
 }
 
+/// Run `deliver` against a connection-global sink slot, if one is installed.
+/// The clone-outside-the-lock shape matters: a foreign (Swift) callback must
+/// never run under the slot's mutex.
+fn with_global_sink<S: ?Sized>(
+    slot: &parking_lot::Mutex<Option<Arc<S>>>,
+    deliver: impl FnOnce(&S),
+) {
+    let sink = slot.lock().clone();
+    if let Some(sink) = sink {
+        deliver(&sink);
+    }
+}
+
 async fn dispatch_inbound_frame(
     sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>,
     list_sink: &SharedListSink,
+    deck_sink: &SharedDeckSink,
     frame: Frame,
 ) {
-    // A connection-global activity ping for ANY session (subscribed or not): it
-    // drives the chat-list unread/recency, not a per-session sink. Special-cased
-    // before routing so it isn't dropped for a session with no sink.
-    if let Frame::SessionActivity {
-        session_id,
-        source,
-        at,
-    } = &frame
-    {
-        let sink = list_sink.lock().clone();
-        if let Some(sink) = sink {
+    // Connection-global lanes first. These frames have no per-session routing
+    // target (or, for `SessionActivity`, deliberately ignore it): letting them
+    // continue would fan them to per-session transcript sinks that can't use
+    // them — and reach NOBODY while the user is parked on the chat list or the
+    // Deck tab with nothing subscribed, the one moment they matter. A missing
+    // sink drops the frame silently by design: the list/deck repaint from
+    // their REST snapshots on next open, so nothing is lost.
+    //
+    // The match yields whether the frame STILL routes per-session: a lane
+    // consumes its frame (`false`); the `SessionUpdated` tee and everything
+    // unmatched continue (`true`).
+    let routes_per_session = match &frame {
+        // Activity ping for ANY session — drives chat-list unread/recency.
+        Frame::SessionActivity {
+            session_id,
+            source,
+            at,
+        } => {
             let source = match source {
                 wire::ActivityKind::User => "user",
                 wire::ActivityKind::Assistant => "assistant",
             };
-            sink.on_activity(
-                session_id.as_str().to_owned(),
-                source.to_owned(),
-                at.timestamp_millis(),
-            );
+            with_global_sink(list_sink, |sink| {
+                sink.on_activity(
+                    session_id.as_str().to_owned(),
+                    source.to_owned(),
+                    at.timestamp_millis(),
+                )
+            });
+            false
         }
-        return;
-    }
-    // The gateway dropped a session-less broadcast on this connection (its
-    // bounded queue was full) — among them the `SessionActivity` that announces
-    // a brand-new session. Route the nudge to the connection-global list sink
-    // and `return`, exactly like `SessionActivity` above: a `Gap` with no
-    // session id has no routing target, so falling through would fan it to the
-    // per-session frame sinks and reach NOBODY while the user is parked on the
-    // chat list with nothing subscribed — the one moment it matters. A `Gap`
-    // that DOES name a session is a transcript concern and keeps its old path.
-    if let Frame::Gap { session_id: None } = &frame {
-        let sink = list_sink.lock().clone();
-        if let Some(sink) = sink {
-            sink.on_list_stale();
+        // The gateway dropped a session-less broadcast on this connection
+        // (bounded queue full) — among them the `SessionActivity` that
+        // announces a brand-new session — so the whole list is suspect. A
+        // `Gap` that DOES name a session is a transcript concern and keeps
+        // the per-session path below.
+        Frame::Gap { session_id: None } => {
+            with_global_sink(list_sink, |sink| sink.on_list_stale());
+            false
         }
-        return;
-    }
-    // A `SessionUpdated` patch carrying a freshly-generated title: forward it
-    // to the connection-global list sink so a row (subscribed or not) can swap
-    // its bold first line live. NOT a `return` — the frame still falls through
-    // to per-session routing exactly as before (the transcript webview simply
-    // ignores it), so only the added title hop is new behavior. Pin / archive /
-    // hide patches carry no title and stay entirely on the existing path.
-    if let Frame::SessionUpdated { session_id, patch } = &frame
-        && let Some(title) = &patch.title
-    {
-        let sink = list_sink.lock().clone();
-        if let Some(sink) = sink {
-            sink.on_title(session_id.as_str().to_owned(), title.clone());
+        // Deck pushes for the connection-global Deck tab.
+        Frame::DeckCardData {
+            card_id,
+            seq,
+            payload,
+        } => {
+            with_global_sink(deck_sink, |sink| {
+                sink.on_card_data(card_id.clone(), *seq, payload.clone())
+            });
+            false
         }
+        // Deck structure changed (install, delete, restore, layout, …); the
+        // sink answers by refetching `GET /v1/deck`.
+        Frame::DeckChanged => {
+            with_global_sink(deck_sink, |sink| sink.on_deck_changed());
+            false
+        }
+        // TEE, not a lane: a `SessionUpdated` patch carrying a freshly-
+        // generated title feeds the list sink so a row (subscribed or not)
+        // can swap its bold first line live — and STILL routes per-session
+        // exactly as before (the transcript webview simply ignores it). Pin /
+        // archive / hide patches carry no title and skip the title hop.
+        Frame::SessionUpdated { session_id, patch } => {
+            if let Some(title) = &patch.title {
+                with_global_sink(list_sink, |sink| {
+                    sink.on_title(session_id.as_str().to_owned(), title.clone())
+                });
+            }
+            true
+        }
+        _ => true,
+    };
+    if routes_per_session {
+        route_per_session(sinks, frame).await;
     }
+}
+
+/// The per-session tail: a frame that names a session goes to that session's
+/// sink (or is dropped); a session-less frame broadcasts to every sink.
+async fn route_per_session(sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>, frame: Frame) {
     let target = frame
         .routing_session_id()
         .map(|session_id| session_id.as_str().to_owned());
@@ -977,15 +1042,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingDeckSink {
+        cards: parking_lot::Mutex<Vec<(String, u32, String)>>,
+        changed: parking_lot::Mutex<usize>,
+    }
+
+    impl DeckSink for RecordingDeckSink {
+        fn on_card_data(&self, card_id: String, seq: u32, payload: String) {
+            self.cards.lock().push((card_id, seq, payload));
+        }
+
+        fn on_deck_changed(&self) {
+            *self.changed.lock() += 1;
+        }
+    }
+
     struct Fixture {
         sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
         list_sink: SharedListSink,
+        deck_sink: SharedDeckSink,
         list: Arc<RecordingListSink>,
+        deck: Arc<RecordingDeckSink>,
     }
 
     impl Fixture {
         fn new(session_ids: &[&str]) -> (Self, Vec<Arc<RecordingSink>>) {
             let list = Arc::new(RecordingListSink::default());
+            let deck = Arc::new(RecordingDeckSink::default());
             let mut map: HashMap<String, Arc<dyn FrameSink>> = HashMap::new();
             let mut sinks = Vec::new();
             for session_id in session_ids {
@@ -999,7 +1083,11 @@ mod tests {
                     list_sink: Arc::new(parking_lot::Mutex::new(Some(
                         list.clone() as Arc<dyn SessionListSink>
                     ))),
+                    deck_sink: Arc::new(parking_lot::Mutex::new(Some(
+                        deck.clone() as Arc<dyn DeckSink>
+                    ))),
                     list,
+                    deck,
                 },
                 sinks,
             )
@@ -1012,8 +1100,15 @@ mod tests {
             self
         }
 
+        /// Drop the connection-global deck sink: a leg can pump before Swift
+        /// has installed one (or the deck tab was never opened).
+        fn without_deck_sink(self) -> Self {
+            *self.deck_sink.lock() = None;
+            self
+        }
+
         async fn dispatch(&self, frame: Frame) {
-            dispatch_inbound_frame(&self.sinks, &self.list_sink, frame).await;
+            dispatch_inbound_frame(&self.sinks, &self.list_sink, &self.deck_sink, frame).await;
         }
     }
 
@@ -1094,6 +1189,84 @@ mod tests {
             0,
             "a session-scoped gap is not a list-plane nudge",
         );
+    }
+
+    fn deck_card_data(card_id: &str, seq: u32, payload: &str) -> Frame {
+        Frame::DeckCardData {
+            card_id: card_id.to_string(),
+            seq,
+            payload: payload.to_string(),
+        }
+    }
+
+    /// A deck push has no session to route by. Without the special case it
+    /// would fan out to every per-session transcript sink (as an unknown
+    /// frame) while a user parked on the Deck tab with nothing subscribed got
+    /// nothing — the exact hole the connection-global sink exists to close.
+    #[tokio::test]
+    async fn deck_card_data_goes_to_the_deck_sink_and_never_to_a_session_sink() {
+        let (fixture, sinks) = Fixture::new(&["s1"]);
+
+        fixture
+            .dispatch(deck_card_data("c1", 41, r#"{"used":0.4}"#))
+            .await;
+
+        assert_eq!(
+            fixture.deck.cards.lock().as_slice(),
+            [("c1".to_string(), 41, r#"{"used":0.4}"#.to_string())]
+        );
+        assert!(
+            sinks[0].frames().is_empty(),
+            "a deck push must never reach a transcript sink"
+        );
+        assert_eq!(*fixture.deck.changed.lock(), 0);
+    }
+
+    /// Same routing for the structural nudge, which carries nothing at all.
+    #[tokio::test]
+    async fn deck_changed_goes_to_the_deck_sink_and_never_to_a_session_sink() {
+        let (fixture, sinks) = Fixture::new(&["s1"]);
+
+        fixture.dispatch(Frame::DeckChanged).await;
+
+        assert_eq!(*fixture.deck.changed.lock(), 1);
+        assert!(fixture.deck.cards.lock().is_empty());
+        assert!(
+            sinks[0].frames().is_empty(),
+            "the deck nudge must never reach a transcript sink"
+        );
+    }
+
+    /// No deck sink installed (the Deck tab was never opened, or the leg
+    /// pumped before Swift registered one): deck frames are DROPPED, never
+    /// rerouted to the per-session sinks. The `GET /v1/deck` pull on the tab's
+    /// first open repaints from the stored snapshot, so nothing is lost.
+    #[tokio::test]
+    async fn a_deck_frame_without_a_deck_sink_is_dropped_not_broadcast() {
+        let (fixture, sinks) = Fixture::new(&["s1"]);
+        let fixture = fixture.without_deck_sink();
+
+        fixture.dispatch(deck_card_data("c1", 1, "{}")).await;
+        fixture.dispatch(Frame::DeckChanged).await;
+
+        assert!(sinks[0].frames().is_empty());
+    }
+
+    /// The deck special-cases must not swallow the fan-out path: any OTHER
+    /// session-less frame (here the approval broadcast, standing in for every
+    /// unknown future one) still reaches every session sink exactly as before,
+    /// and never the deck sink.
+    #[tokio::test]
+    async fn a_session_less_non_deck_frame_still_broadcasts_past_the_deck_sink() {
+        let (fixture, sinks) = Fixture::new(&["s1", "s2"]);
+
+        fixture.dispatch(approval_resolved("call-1")).await;
+
+        for sink in &sinks {
+            assert_eq!(sink.kinds(), ["approval_resolved"]);
+        }
+        assert!(fixture.deck.cards.lock().is_empty());
+        assert_eq!(*fixture.deck.changed.lock(), 0);
     }
 
     #[tokio::test]

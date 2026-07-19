@@ -789,6 +789,22 @@ pub struct ToolManifest {
     pub trust_level: baybo_model::TrustLevel,
     pub parameters_schema: Value,
     pub capabilities: Vec<ToolCapability>,
+    /// Channels whose sessions may see and call this tool. Empty = every
+    /// channel, the norm. Enforced twice: the agent loop omits the tool
+    /// from the LLM-visible list for other sessions
+    /// (`ToolRegistry::tool_definitions_for_channel`), and the executor
+    /// refuses a call that names it anyway — omission alone is not a
+    /// gate against a hallucinated or prompted-by-skill-body call.
+    #[serde(default)]
+    pub channels: Vec<baybo_model::ChannelType>,
+}
+
+impl ToolManifest {
+    /// Whether a session on `channel` may see or call this tool.
+    /// An empty `channels` list means no restriction.
+    pub fn allows_channel(&self, channel: &baybo_model::ChannelType) -> bool {
+        self.channels.is_empty() || self.channels.contains(channel)
+    }
 }
 
 /// Coarse capability ceiling declared in a tool's manifest.

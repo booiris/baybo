@@ -14,6 +14,7 @@ pub mod channel_pairing;
 pub mod channel_session;
 pub mod cost;
 pub mod cron;
+pub mod deck;
 pub mod device;
 pub mod error;
 pub mod job;
@@ -33,6 +34,7 @@ pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus}
 pub use channel_session::ChannelSessionStore;
 pub use cost::{CostGroupBucket, CostGroupKey, CostStore};
 pub use cron::{CronFire, CronStore, ExecutionCompletion};
+pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, JobTransitionRow, SessionJobStats};

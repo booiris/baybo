@@ -9,7 +9,8 @@ by side against the same manager graph:
    operator controls (config, jobs, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
-   dashboard. The admin listener also **co-hosts** the admin/device-
+   dashboard and the `/v1/deck/*` live-card family
+   ([`deck.md`](./deck.md)). The admin listener also **co-hosts** the admin/device-
    authed `/v1/channel-ws` + `/v1/blobs` subrouter (see
    `build_admin_router` in `src/server.rs`) so a browser chat tab loaded
    from the admin origin can open its WebSocket without discovering the
@@ -607,6 +608,18 @@ GET    /v1/push/params                  the gateway's Ed25519 push verifying key
 POST   /v1/push/register                register a direct-mode device push binding (device id + APNs token + push_key + delegation)
 POST   /v1/mobile/apns-token            store a device's APNs token
 
+GET    /v1/deck                         live cards + latest snapshot per card (the deck paint source)
+PUT    /v1/deck/layout                  apply the full layout ({ card_id, position, size } entries); 204
+GET    /v1/deck/recycle                 soft-deleted cards, most recent first
+POST   /v1/deck/cards/:card_id/enable   re-run the dry-run gate and start the service; 400 leaves it quarantined
+POST   /v1/deck/cards/:card_id/disable  stop the card's service
+DELETE /v1/deck/cards/:card_id          soft-delete into the recycle bin; 204
+POST   /v1/deck/cards/:card_id/restore  out of the recycle bin (re-passes the dry-run gate first)
+POST   /v1/deck/cards/:card_id/purge    hard-delete a recycled card: row, snapshots, bundle files
+GET    /v1/deck/cards/:card_id/bundle   the card's frontend (card.html) for the deck shell
+GET    /v1/deck/services/:card_id/openapi.json   the card's own op contract
+POST   /v1/deck/services/:card_id/:op   invoke a card op (admitted against that contract first)
+
 GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
 GET    /v1/logs                         paged snapshot from LogBuffer
 GET    /v1/logs/stream                  SSE tail of the same buffer
@@ -655,6 +668,14 @@ anchored-at-cursor rows re-deliver and dedup client-side by `n<seq>`.
 durability point lookup backing the client outbox's rebase-floor
 resolution. The WS never replays history — `Subscribe` answers with one
 `SubscribeState` bundle and live frames follow.
+
+`/v1/deck/*` is the deck live-card family (`api/admin/deck.rs`, OpenAPI
+tag `deck`): the management surface over `DeckManager` plus the per-card
+dynamic op surface (`POST /v1/deck/services/:card_id/:op`), where a call
+is validated against the card's own `openapi.json` admission contract
+before any card code runs. See [`deck.md`](./deck.md) for the whole
+subsystem (`crates/deck`, the `DeckCard*` agent tools, the sandboxed
+service runtime).
 
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
@@ -747,6 +768,13 @@ The full frame set (see `crates/wire/src/lib.rs`):
   plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
   re-broadcast after any folder mutation).
+- **Deck (server → client, the `owner` subscribed channel):**
+  `DeckCardData { card_id, seq, payload }` — a card service's accepted
+  snapshot push, broadcast to every owner connection regardless of
+  subscription (the deck tab has no session to subscribe to); clients
+  apply it iff `seq` beats their cached per-card cursor. `DeckChanged`
+  (no payload) — deck structure changed; clients refetch `GET /v1/deck`.
+  Clients without deck UI ignore both. See [`deck.md`](./deck.md).
 
 A note on `AnswerDelta`: `agent_output_to_frame` maps
 `AgentEvent::AnswerDelta` to `Frame::AnswerDelta` and the
@@ -801,7 +829,9 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
 `llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
-`LeakDetector`, `ChannelRegistry`, `CostManager` — plus a
+`LeakDetector`, `ChannelRegistry`, `CostManager`, `DeckManager` (its
+`DeckCard*` agent tools register at build; `gateway_cmd` boots/stops the
+card services — [`deck.md`](./deck.md)) — plus a
 `ShutdownSignal` and a `TaskTracker` for graceful teardown. The wiring
 lives in `crates/baybo/src/runtime.rs` (the binary crate's `src/`, not under
 `crates/gateway/`):
@@ -895,6 +925,7 @@ crates/gateway/
 │   ├── spawn.rs             # ChannelSpawner — spawn a subprocess client with a channel token
 │   ├── reload.rs            # ConfigReloader trait + ReloadOutcome/ReloadError (in-process config hot-reload)
 │   ├── log_buffer.rs        # LogBuffer ring + tracing Layer behind /v1/logs[/stream]
+│   ├── deck_events.rs       # GatewayDeckEvents — DeckCardData/DeckChanged fan-out over the owner channel
 │   ├── device.rs            # the gateway's long-term static Noise identity (device pairing + E2E sessions)
 │   ├── push/                # A-side push dispatcher
 │   │   ├── mod.rs           #   push dispatch fan-out
@@ -945,7 +976,7 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs}.rs
+│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs,deck}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start

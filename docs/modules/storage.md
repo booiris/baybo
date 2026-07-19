@@ -10,7 +10,8 @@ Its job is:
   `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
-  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`) via sqlite
+  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`,
+  `DeckCardStore`) via sqlite
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
@@ -60,6 +61,7 @@ sqlite/session_folder.rs  → impl SessionFolderStore                   (trait +
 sqlite/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
 sqlite/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
 sqlite/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
+sqlite/deck.rs            → impl DeckCardStore                        (trait + DeckCardRow / DeckSnapshotRow / DeckLayoutEntry / DeckSize from baybo-store; deck_cards + latest-N-pruned deck_snapshots)
 ```
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
@@ -222,15 +224,17 @@ Session rows and transcripts are user-facing core data: runtime/background
 cleanup must not call the delete path. It exists for explicit destructive flows
 initiated by the user.
 
-### Hard delete everywhere but `cron_jobs`
+### Hard delete everywhere but `cron_jobs` and `deck_cards`
 
-Deletion is a plain `DELETE FROM` in every table but one: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+Deletion is a plain `DELETE FROM` in every table but two: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
 
-**`cron_jobs` is the exception: it soft-deletes.** The table carries a `deleted_at INTEGER` tombstone (Unix µs; NULL = live), `CronStore::delete` stamps it, `CronStore::restore` clears it, and no code path anywhere issues a `DELETE FROM cron_jobs`.
+**`cron_jobs` is the first exception: it soft-deletes.** The table carries a `deleted_at INTEGER` tombstone (Unix µs; NULL = live), `CronStore::delete` stamps it, `CronStore::restore` clears it, and no code path anywhere issues a `DELETE FROM cron_jobs`.
 
 The reason is that a cron job's output outlives the job. Each fire leaves a `cron_executions` row, a session with a full transcript, and — for a one-shot — a notification appended into the conversation that scheduled it. Those are permanent (session rows and transcripts are core data that is never deleted), and the job row is the only thing that ties them to where they came from. Drop it and every one of them is stranded: an execution row points at a `job_id` that resolves to nothing, and a conversation that opened by itself can no longer say which scheduled task opened it. So the row stays, and `CronStore::get` keeps resolving it by id after deletion; only the *listings* stop returning it. `deleted_at` is orthogonal to the job's `status` — a deleted one-shot that already fired stays `executed` — so a restore can put the job back in exactly the state it was taken away in.
 
 What makes the tombstone safe is that the filter lives in SQL, not in Rust: `list_due`, `list_enabled`, `list_by_user` and `list_all` all carry `WHERE … deleted_at IS NULL`, so a deleted job cannot reach the scheduler's tick loop or a user's list. `list_deleted` is the sole query that inverts it, for the recycle-bin view. Two partial indexes back this: `idx_cron_jobs_live_due` on `(status, next_trigger_at) WHERE deleted_at IS NULL` for the tick query, and `idx_cron_jobs_deleted` on `(deleted_at) WHERE deleted_at IS NOT NULL` for the bin. The full delete/restore contract — including why a restored job's `next_trigger_at` is recomputed from now — is in [`cron.md`](cron.md).
+
+**`deck_cards` is the second, with one difference: its recycle bin can be emptied.** The mechanics mirror `cron_jobs` — a `deleted_at INTEGER` tombstone (Unix µs; NULL = live) that `DeckCardStore::set_deleted` stamps and clears, the filter in SQL (`list_live`, `count_live`, `set_layout` and the `record_snapshot` seq bump all carry `WHERE … deleted_at IS NULL`, backed by the partial index `idx_deck_cards_live` on `(position) WHERE deleted_at IS NULL`), `get` still resolving a deleted row by id, and `list_deleted` inverting the filter for the recycle-bin view. What differs is what the tombstone protects: nothing outlives a card — its `deck_snapshots` are ephemeral render state, pruned to a small latest-N by a plain `DELETE` on every insert (the push counter survives pruning because `last_seq` lives on the card row) — so a hard delete strands nothing. Hence `DeckCardStore::purge`: user-triggered from the bin (`DeckManager` refuses to purge a card that is not already deleted), never a background sweep, it removes the row and its snapshots in one transaction and the manager deletes the bundle directory.
 
 ## Constraints
 

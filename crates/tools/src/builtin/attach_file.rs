@@ -291,6 +291,7 @@ pub fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {
         trust_level: TrustLevel::Trusted,
         parameters_schema: attach.parameters_schema(),
         capabilities: vec![ToolCapability::ReadFile],
+        channels: Vec::new(),
     };
     (Arc::new(attach), manifest)
 }

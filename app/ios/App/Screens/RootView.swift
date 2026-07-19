@@ -45,6 +45,8 @@ struct RootView: View {
                                     CronGroupScreen(jobId: jobId)
                                 case .cronJobs:
                                     CronJobsScreen()
+                                case .deckRecycle:
+                                    DeckRecycleScreen()
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)

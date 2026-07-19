@@ -547,6 +547,26 @@ impl<'a> SubscribedView<'a> {
         self.0.broadcast_frame(Frame::Gap { session_id: None });
     }
 
+    /// Broadcast a [`Frame::DeckCardData`] snapshot push to every
+    /// connection on this channel. Session-less by design — the deck tab
+    /// has no session to subscribe to. Emission is already rate/size
+    /// policed by the deck manager; clients without deck UI ignore the
+    /// frame.
+    pub fn broadcast_deck_card_data(&self, card_id: String, seq: u32, payload: String) {
+        self.0.broadcast_frame(Frame::DeckCardData {
+            card_id,
+            seq,
+            payload,
+        });
+    }
+
+    /// Broadcast a [`Frame::DeckChanged`] structural nudge (install /
+    /// update / delete / restore / enable / disable / quarantine /
+    /// layout). Clients respond by refetching `GET /v1/deck`.
+    pub fn broadcast_deck_changed(&self) {
+        self.0.broadcast_frame(Frame::DeckChanged);
+    }
+
     /// Broadcast a [`Frame::SessionActivity`] pulse for sidebar
     /// freshness / unread accounting. Fan-out is best-effort and
     /// throttled by the caller (see `SessionPulse`).

@@ -262,6 +262,10 @@ export type Frame =
   | { kind: 'folders_changed'; folders: WireFolder[] }
   | { kind: 'session_updated'; session_id: string; patch: SessionPatch }
   | { kind: 'session_activity'; session_id: string; source: ActivityKind; at: string }
+  /** Server → client deck stream — no deck UI here; the native deck shell
+   *  consumes them. The page ignores them (routeInboundFrame's default arm). */
+  | { kind: 'deck_card_data'; card_id: string; seq: number; payload: string }
+  | { kind: 'deck_changed' }
   | { kind: 'ping' }
   | { kind: 'pong' };
 

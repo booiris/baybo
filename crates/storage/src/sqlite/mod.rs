@@ -5,6 +5,7 @@ mod channel_pairing;
 mod channel_session;
 mod cost;
 mod cron;
+mod deck;
 mod device;
 mod job;
 mod search;
@@ -24,6 +25,7 @@ pub use channel_pairing::SqliteChannelPairingStore;
 pub use channel_session::SqliteChannelSessionStore;
 pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
+pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
 pub use job::SqliteJobStore;
 pub use search::SqliteMessageSearchStore;
@@ -737,7 +739,46 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- DeviceStore::create_replacing_approved), whose row goes Revoked
                 -- and drops out of this partial index.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved
-                    ON devices(status) WHERE status = 'approved';",
+                    ON devices(status) WHERE status = 'approved';
+
+                -- Deck cards (docs/modules/deck.md). The row is authoritative
+                -- runtime state; the agent-authored bundle lives on disk at
+                -- workspace/deck/<id>/. last_seq is the push counter — on the
+                -- card row, never derived from the prunable snapshot table,
+                -- so it cannot regress across a restart. deleted_at is the
+                -- soft-delete recycle bin (the cron_jobs pattern).
+                CREATE TABLE IF NOT EXISTS deck_cards (
+                    id             TEXT    PRIMARY KEY,
+                    title          TEXT    NOT NULL,
+                    position       INTEGER NOT NULL,
+                    size           TEXT    NOT NULL,
+                    -- Comma-separated grid sizes the card implements; the ⤢
+                    -- cycle stays inside this set. Empty on a row migrated
+                    -- before the column existed → the reader falls back to
+                    -- [size] (a legacy single-size card).
+                    sizes          TEXT    NOT NULL DEFAULT '',
+                    -- Whether the card declares a maximized layout (⛶).
+                    maximize       INTEGER NOT NULL DEFAULT 0,
+                    enabled        INTEGER NOT NULL DEFAULT 1,
+                    quarantined_at INTEGER,
+                    deleted_at     INTEGER,
+                    spec_hash      TEXT    NOT NULL,
+                    last_seq       INTEGER NOT NULL DEFAULT 0,
+                    created_at     INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_deck_cards_live
+                    ON deck_cards(position) WHERE deleted_at IS NULL;
+
+                -- Ephemeral render snapshots, pruned to latest-N on insert by
+                -- the store impl (no background sweeper).
+                CREATE TABLE IF NOT EXISTS deck_snapshots (
+                    card_id    TEXT    NOT NULL,
+                    seq        INTEGER NOT NULL,
+                    payload    TEXT    NOT NULL,
+                    fetched_at INTEGER NOT NULL,
+                    error      TEXT,
+                    PRIMARY KEY (card_id, seq)
+                );",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
@@ -765,6 +806,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN channel TEXT",
         "ALTER TABLE session_control_events ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE deck_cards ADD COLUMN sizes TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {

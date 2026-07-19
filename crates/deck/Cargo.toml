@@ -1,0 +1,33 @@
+[package]
+name = "baybo-deck"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-security = { workspace = true }
+baybo-tools = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonschema = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio-util = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+baybo-storage = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

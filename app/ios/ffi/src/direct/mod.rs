@@ -234,6 +234,27 @@ impl GatewayJsonClient for DirectHttp {
             parse_empty_response(resp).await
         }
     }
+
+    fn post_raw<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+        // Plain one-shot HTTP: nothing is ever auto-replayed on this leg, so
+        // the declaration has no direct-mode consumer.
+        _retryable: bool,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'a {
+        async move {
+            let resp = self
+                .client()
+                .post(self.url(path))
+                .header(reqwest::header::CONTENT_TYPE, MEDIA_TYPE_JSON)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_raw_response(resp).await
+        }
+    }
 }
 
 async fn parse_json_response<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, String> {
@@ -256,6 +277,21 @@ async fn parse_empty_response(resp: reqwest::Response) -> Result<(), String> {
         return Err(format!("Baybo returned HTTP {}", resp.status().as_u16()));
     }
     Ok(())
+}
+
+/// The 401 fold + status check of [`parse_json_response`], body returned
+/// unparsed (the deck op surface — the response shape is the card's own).
+async fn parse_raw_response(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(INVALID_TOKEN_CODE.into());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Baybo returned HTTP {}", resp.status().as_u16()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read response: {e}"))
 }
 
 impl DirectHttpCache {

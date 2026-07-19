@@ -21,12 +21,13 @@ final class AppStore: ObservableObject {
         case direct
     }
 
-    /// The home shell's bottom-menu sections. Only `chats` and `settings` have
-    /// real screens today; `agents`/`projects` are placeholders. Compose and
+    /// The home shell's bottom-menu sections. `deck` (the board of
+    /// agent-authored live cards — docs/modules/deck.md), `chats`, and
+    /// `settings` have real screens; `projects` is a placeholder. Compose and
     /// push-tap routing force `chats` so backing out of a conversation lands on
     /// the list, not whatever section was showing.
     enum HomeTab: CaseIterable {
-        case agents
+        case deck
         case projects
         case chats
         case settings
@@ -47,6 +48,9 @@ final class AppStore: ObservableObject {
         /// sibling of `archived`: same ☰ menu, same push, no argument (the list
         /// fetches itself).
         case cronJobs
+        /// The Deck's recycle bin: soft-deleted cards, each restorable. Pushed
+        /// from the Deck header's ☰ menu, mirroring `archived` for Chats.
+        case deckRecycle
     }
 
     /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
@@ -162,6 +166,10 @@ final class AppStore: ObservableObject {
     static let maxResidentStores = 12
     private var transcriptHost: TranscriptHost?
     private var prewarmedDraftId: String?
+    /// The Deck tab's engine + its kept-warm shell webview (the app's second
+    /// webview; prewarmed once a binding reaches home, torn down with the binding).
+    let deckStore = DeckStore()
+    private var _deckHost: DeckHost?
     /// Sessions with an archive/hide request on the wire — the per-session
     /// serialization gate (`pumpSessionMutation`).
     private var sessionMutationsInFlight: Set<String> = []
@@ -204,6 +212,9 @@ final class AppStore: ObservableObject {
         // The chat list's live unread/recency source: connection-global
         // `SessionActivity` pings land here for ANY session, subscribed or not.
         Baybo.client.setSessionListSink(sink: SessionActivityHandler())
+        // Deck pushes are session-less by design; the connection-global sink
+        // is the only way they reach a user parked on the Deck tab.
+        Baybo.client.setDeckSink(sink: DeckEventsRelay(store: { AppStore.shared?.deckStore }))
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
@@ -326,7 +337,7 @@ final class AppStore: ObservableObject {
             }
             if let idx = args.firstIndex(of: "-baybo-home-tab"), idx + 1 < args.count {
                 switch args[idx + 1] {
-                case "agents": homeTab = .agents
+                case "deck": homeTab = .deck
                 case "projects": homeTab = .projects
                 case "settings": homeTab = .settings
                 default: homeTab = .chats
@@ -367,6 +378,7 @@ final class AppStore: ObservableObject {
             route = .home
             consumePendingPushRoute()
             prewarmTranscriptHost()
+            prewarmDeckHost()
             resumeStrandedSends()
         }
     }
@@ -408,6 +420,7 @@ final class AppStore: ObservableObject {
         resumeStrandedSends()
         if route == .home {
             prewarmTranscriptHost()
+            prewarmDeckHost()
         }
     }
 
@@ -552,6 +565,17 @@ final class AppStore: ObservableObject {
         return host
     }
 
+    /// The deck shell webview, kept warm for the binding's lifetime and torn
+    /// down in `resetChatStores`.
+    func deckHost() -> DeckHost {
+        if let host = _deckHost {
+            return host
+        }
+        let host = DeckHost(store: deckStore)
+        _deckHost = host
+        return host
+    }
+
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
         Task {
@@ -579,6 +603,13 @@ final class AppStore: ObservableObject {
     func openCronJobs() {
         guard !chatPath.contains(.cronJobs) else { return }
         chatPath.append(.cronJobs)
+    }
+
+    /// The Deck header's ☰ menu entry: push the card recycle bin. Guarded like
+    /// `openArchived`.
+    func openDeckRecycle() {
+        guard !chatPath.contains(.deckRecycle) else { return }
+        chatPath.append(.deckRecycle)
     }
 
     /// Tapping a cron group row: push that job's fires. Guarded like `openArchived`.
@@ -799,11 +830,34 @@ final class AppStore: ObservableObject {
         return nil
     }
 
+    /// The Deck empty-board CTA. First tap: open a fresh chat on the Chats
+    /// tab and auto-send a `/deck …` request (seed the store BEFORE
+    /// activating so `ComposerView` sends it on appear), tracking the session
+    /// as the in-flight setup. A re-tap while it's still running (no card
+    /// yet) returns to THAT chat instead of spawning a duplicate — the
+    /// tracked session clears once a card lands (`DeckStore.refreshNow`).
+    func startCardDraft(prompt: String) {
+        if let existing = deckStore.setupSessionId {
+            Task { await activateSession(existing, ensureListed: false) }
+            return
+        }
+        let sessionId = prewarmedDraftId ?? newChatSessionId()
+        prewarmedDraftId = nil
+        chatStore(for: sessionId).initialDraft = prompt
+        deckStore.setSetupSession(sessionId)
+        Task { await activateSession(sessionId, ensureListed: false) }
+    }
+
     private func prewarmTranscriptHost() {
         guard route == .home, transcriptHost == nil else { return }
         let sessionId = newChatSessionId()
         prewarmedDraftId = sessionId
         _ = transcriptHost(for: sessionId)
+    }
+
+    private func prewarmDeckHost() {
+        guard route == .home, _deckHost == nil else { return }
+        _ = deckHost()
     }
 
     /// A push-notification tap targeting `sessionId`: route straight into that
@@ -1069,6 +1123,10 @@ final class AppStore: ObservableObject {
         transcriptHost?.teardown()
         transcriptHost = nil
         prewarmedDraftId = nil
+        // The deck belongs to the departing gateway too.
+        _deckHost?.teardown()
+        _deckHost = nil
+        DeckStore.removeMirror()
         for store in stores {
             await store.disconnect()
         }
@@ -1085,6 +1143,7 @@ final class AppStore: ObservableObject {
         if !directBound {
             preconnectRelayBestEffort()
         }
+        prewarmDeckHost()
     }
 
     /// Log out: tear down the live leg, wipe both credential sets, drop the

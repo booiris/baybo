@@ -1,5 +1,7 @@
 // English strings (the source locale; `zh.ts` mirrors this shape). Only the
-// transcript's own strings live here — all other chrome is native SwiftUI.
+// web bundle's own strings live here (transcript + deck shell) — all other
+// chrome is native SwiftUI. The deck entry imports this file as plain data;
+// the i18next runtime stays out of that React-free chunk.
 export const en = {
   translation: {
     chat: {
@@ -29,6 +31,15 @@ export const en = {
       durMS: "{{m}}m {{s}}s",
       durH: "{{h}}h",
       durHM: "{{h}}h {{m}}m",
+    },
+    deck: {
+      empty: "No cards yet — type /deck in a chat to make one.",
+      quickSetup: "Create a card",
+      createCardInflight: "Creating · view",
+      quickSetupPrompt: "/deck Make a card that monitors baybo's token usage",
+      quarantined: "This card was stopped after repeated failures.",
+      disabled: "Paused",
+      reenable: "Re-enable",
     },
   },
 };

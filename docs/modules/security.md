@@ -82,6 +82,8 @@ Because `ResourceAccess::ReadFile` bypasses the approval gate (see `ToolExecutor
 
 Out of scope: the SSRF floor is an RFC-level deny list, not topology-aware. A literal *public* IP that happens to point at internal infrastructure (cloud VPC, professional-line backend, public-IP admin port) is the one shape neither layer can decide on its own — that case routes to the approval gate via `ResourceAccess::Http { host }` so a human catches it. Public hostnames that resolve to public IPs which are actually internal still slip through; egress-firewall / network-segmentation is the only real fix and lives outside the tools layer.
 
+The floor's second consumer sits outside the tools layer: deck's host-mediated `ctx.fetch` (`crates/deck/src/host.rs`) reimplements both layers over `is_blocked_ip` — literal IPs are rejected at parse time; hostnames are resolved once, blocked addresses dropped, and the connection pinned to the vetted survivors (`resolve_to_addrs`), with redirects disabled outright.
+
 Any future HTTP-emitting builtin must apply the same two layers (`validate_url_with` + a `SafeResolver`-equivalent custom DNS resolver) at its entry point — the approval gate alone is not a substitute for the SSRF floor.
 
 ### SecretVault encryption
@@ -126,7 +128,7 @@ described above.
 
 ### Network decision boundary
 
-Security only decides allow/deny. It does not execute network access. There is no central network-policy decider — the SSRF guard is inline in `WebFetch::validate_url_with` (parse-time literal-IP rejection via `baybo_security::is_blocked_ip`) plus the per-fetch `SafeResolver` (DNS-time resolved-IP filter). Process-level network containment for sandboxed tools comes from `baybo_sandbox::NetworkPolicy::{None, All}` at spec-build time. This separates permission decisions from execution.
+Security only decides allow/deny. It does not execute network access. There is no central network-policy decider — the SSRF guard is inline in `WebFetch::validate_url_with` (parse-time literal-IP rejection via `baybo_security::is_blocked_ip`) plus the per-fetch `SafeResolver` (DNS-time resolved-IP filter), with a second inline copy in deck's host-mediated `ctx.fetch` (`crates/deck/src/host.rs`). Process-level network containment for sandboxed tools comes from `baybo_sandbox::NetworkPolicy::{None, All}` at spec-build time. This separates permission decisions from execution.
 
 ## Constraints
 
@@ -135,7 +137,7 @@ Security only decides allow/deny. It does not execute network access. There is n
 - Job `input/output` stores sanitized versions only
 - Structured logs must not print `SecretValue` directly; reveal warnings log only a SHA-256 fingerprint prefix
 - Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
-- Plaintext at egress is permitted only at three points: the tool executor's post-reveal `params_revealed` into `tool_registry.execute`, `reveal_llm_response` on tool-side LLM replies (`billed_chat`), and `SecretAccess::resolve_env` for child-process env injection; stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
+- Plaintext at egress is permitted only at four points: the tool executor's post-reveal `params_revealed` into `tool_registry.execute`, `reveal_llm_response` on tool-side LLM replies (`billed_chat`), `SecretAccess::resolve_env` for child-process env injection, and deck's host-mediated `ctx.fetch` reveal (`crates/deck/src/host.rs` — URL/header/body placeholders revealed at egress, audit-logged with card id + host); stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
 - Any tool that emits HTTP MUST apply both layers of the SSRF floor (`validate_url_with`-equivalent literal-IP rejection + a `SafeResolver`-equivalent DNS-time resolved-IP filter using `is_blocked_ip`) at its entry point, regardless of approval-gate status

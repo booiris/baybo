@@ -63,6 +63,7 @@ async fn admin_router() -> axum::Router {
         blob_store: tg.deps.stores.blob.clone(),
         channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
+        deck_manager: std::sync::Arc::clone(&tg.deps.deck_manager),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
