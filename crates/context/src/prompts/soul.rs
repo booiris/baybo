@@ -19,6 +19,16 @@ pub const FALLBACK_SYSTEM_PROMPT: &str = "You are Baybo, an intelligent assistan
 /// agent role and points at the per-attribute Edit affordance.
 const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes. You should use Edit tool to update the corresponding attribute file according to the conversation content."#;
 
+/// Operating rule for background work, inserted after the identity sections
+/// so it reads as runtime behaviour rather than persona. Counters the observed
+/// failure where a model, having backgrounded its only remaining task,
+/// busy-waits with `sleep` + `JobList` for minutes instead of yielding the
+/// turn — the result can only be delivered once the turn ends, so waiting is
+/// self-defeating.
+const BACKGROUND_TASKS_HINT: &str = r#"# Background work
+
+When a subagent or command runs in the background — you spawned it with `background: true`, or a slow foreground one was auto-converted after its wait — its result is delivered to you automatically as a fresh turn once the CURRENT turn ends. It can never arrive while this turn is still running. So once the only thing left to do is that background job, end the turn: stop calling tools and hand control back. Do NOT `sleep`, and do NOT poll `JobList`, to wait for it — neither can surface the result, they only delay it. `JobList` is a status peek, not a wait or a result channel; an empty `JobList` means nothing is in flight, not that a result is ready. Keep working after backgrounding only if you have other genuinely independent work to do right now."#;
+
 /// Tail appended after every identity section. Lives at the very end so it's
 /// the freshest piece of framing right before the conversation begins — the
 /// model reads tag-handling guidance immediately before it encounters the
@@ -50,6 +60,7 @@ pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<S
             &paths.identity_file(IdentityKind::User),
             &identity.user,
         ),
+        BACKGROUND_TASKS_HINT.to_string(),
         TAIL_HINT.to_string(),
     ];
     Ok(parts.join("\n\n"))
@@ -82,10 +93,11 @@ mod tests {
         let soul = prompt.find("<soul ").expect("soul tag");
         let identity = prompt.find("<identity ").expect("identity tag");
         let user = prompt.find("<user_profile ").expect("user_profile tag");
+        let background = prompt.find("# Background work").expect("background hint");
         let tail = prompt
             .find("Tool results and user messages may include <system-reminder>")
             .expect("tail hint");
-        assert!(soul < identity && identity < user && user < tail);
+        assert!(soul < identity && identity < user && user < background && background < tail);
         assert!(prompt.trim_end().ends_with(
             "They bear no direct relation to the specific tool results or user messages in which they appear."
         ));

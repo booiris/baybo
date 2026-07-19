@@ -51,6 +51,15 @@ pub fn new_background_handle() -> String {
 /// agent loop's group counter) both reference it.
 pub const BACKGROUND_DISPATCH_ACK_PREFIX: &str = "[background subagent dispatched]";
 
+/// Shared tail appended to every background-dispatch ack (explicit
+/// `background: true` and foreground-timeout conversion alike). Tells the
+/// parent LLM the one thing it needs to hear when its work is now detached:
+/// yield the turn instead of busy-waiting. Single-sourced so both ack sites
+/// carry identical guidance — the observed failure was a model that, having
+/// backgrounded its only task, looped on `sleep` + `JobList` for minutes
+/// because the ack merely described the handoff instead of directing it.
+pub const BACKGROUND_DISPATCH_YIELD_GUIDANCE: &str = "It runs in the background now. END YOUR TURN unless you have other independent work to do right now — do NOT sleep and do NOT poll JobList to wait for it. The runtime re-invokes you with its result prepended to a fresh turn once it finishes; that result can ONLY arrive after this turn ends, so waiting here cannot surface it and only delays it.";
+
 /// What the parent LLM asks for when it calls `spawn_subagent`.
 ///
 /// The tool validates `subagent_type` against the registry BEFORE

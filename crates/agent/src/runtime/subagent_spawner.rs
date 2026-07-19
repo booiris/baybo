@@ -6,10 +6,11 @@ use baybo_cost::CostManager;
 use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use baybo_llm::TokenUsage;
 use baybo_model::{
-    BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
-    JobId, Lineage, LineageKind, MessageMetadata, OnTimeout, PendingBackgroundResult,
-    SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
-    SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
+    BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE, ChannelType, ChatMessage,
+    ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata, OnTimeout,
+    PendingBackgroundResult, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
+    SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind,
+    User,
 };
 use baybo_session::SessionManager;
 use baybo_workspace::WorkspacePaths;
@@ -617,7 +618,7 @@ impl ActorSubagentSpawner {
     ) -> String {
         let handle_id = baybo_model::new_background_handle();
         let ack_text = format!(
-            "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
+            "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\n{BACKGROUND_DISPATCH_YIELD_GUIDANCE}"
         );
         let _ = result_tx.send(SubagentResult {
             child_session_id: child_session_id.clone(),
@@ -932,7 +933,7 @@ async fn convert_foreground_to_background(
 ) -> String {
     let handle_id = baybo_model::new_background_handle();
     let ack_text = format!(
-        "[foreground subagent exceeded its {}s foreground wait — converted to background]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nIt keeps running; the runtime will surface its final message as a system reminder on a later turn.",
+        "[foreground subagent exceeded its {}s foreground wait — converted to background]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\n{BACKGROUND_DISPATCH_YIELD_GUIDANCE}",
         SUBAGENT_FOREGROUND_WAIT.as_secs()
     );
     let _ = result_tx.send(SubagentResult {
