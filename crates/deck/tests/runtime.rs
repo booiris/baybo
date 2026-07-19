@@ -147,6 +147,52 @@ export const ops = {
 };
 "#;
 
+/// Refresh seeds a fake `.sock` into the gate's tmux dir, standing in for
+/// the tmux server a real interactive-CLI card would leave running.
+const TMUX_SEEDING_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    await ctx.exec('mkdir -p "$BAYBO_DECK_TMUX_DIR" && touch "$BAYBO_DECK_TMUX_DIR/fake.sock"');
+    return { ok: true };
+  },
+  add: async ({ a, b }) => ({ sum: a + b }),
+};
+"#;
+
+/// Same seeding, then a null snapshot — the gate's failure outcome.
+const TMUX_SEEDING_NULL_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    await ctx.exec('mkdir -p "$BAYBO_DECK_TMUX_DIR" && touch "$BAYBO_DECK_TMUX_DIR/fake.sock"');
+    return null;
+  },
+  add: async ({ a, b }) => ({ sum: a + b }),
+};
+"#;
+
+/// Names under `dir` carrying the gate prefix (empty when `dir` is absent).
+fn gate_entries(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("gate-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Backdate a path's mtime far past the boot sweep's age threshold.
+fn make_old(path: &Path) {
+    let out = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "touch failed: {out:?}");
+}
+
 #[tokio::test]
 async fn install_call_lifecycle() {
     let Some(h) = harness_or_skip("install_call_lifecycle").await else {
@@ -471,27 +517,117 @@ async fn purge_reaps_tmux_sockets_and_scratch() {
     assert!(scratch_root.join("card-b").exists(), "other scratch intact");
 }
 
-/// A crash mid-gate leaks `state/deck-scratch/gate-<uuid>`; boot reaps
-/// every `gate-*` entry (none can be in flight at boot) and leaves
-/// per-card scratch alone.
+/// The dry-run gate is hermetic: a tmux-driving card's refresh op pins a
+/// socket into the gate-scoped `tmux-socks/gate-<uuid>` dir, and the gate
+/// reaps it — servers killed, dir removed, scratch removed — on BOTH
+/// outcomes, so install/update/enable/boot re-gates can't accrete one
+/// fresh tmux server per run.
 #[tokio::test]
-async fn boot_reaps_stale_gate_scratch() {
+async fn dry_run_gate_reaps_its_tmux_socket_dir() {
+    let Some(h) = harness_or_skip("dry_run_gate_reaps_its_tmux_socket_dir").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), TMUX_SEEDING_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap();
+    let tmux_root = h.manager.deck_root().join("tmux-socks");
+    assert_eq!(
+        gate_entries(&tmux_root),
+        Vec::<String>::new(),
+        "pass outcome: gate tmux dir reaped"
+    );
+    assert_eq!(
+        gate_entries(&h.scratch_root()),
+        Vec::<String>::new(),
+        "pass outcome: gate scratch reaped"
+    );
+
+    // Failure outcome: the op seeds a sock, then returns a null snapshot —
+    // the gate rejects the bundle but still reaps its runtime.
+    let restaged = tempfile::tempdir().unwrap();
+    stage_bundle(restaged.path(), TMUX_SEEDING_NULL_SERVICE);
+    assert!(h.manager.update(&card.id, restaged.path()).await.is_err());
+    assert_eq!(
+        gate_entries(&tmux_root),
+        Vec::<String>::new(),
+        "fail outcome: gate tmux dir reaped"
+    );
+    assert_eq!(
+        gate_entries(&h.scratch_root()),
+        Vec::<String>::new(),
+        "fail outcome: gate scratch reaped"
+    );
+
+    h.manager.shutdown().await;
+}
+
+/// Boot's orphan sweep reaps runtime dirs (tmux socket dirs + exec
+/// scratch) that belong to no existing card row — gate residue from a
+/// crash mid-gate, per-card residue from a crash mid-purge — but only past
+/// the age threshold (boot races the live server), and residue of existing
+/// rows survives whether live or recycled (a soft-deleted card keeps its
+/// runtime residue for restore).
+#[tokio::test]
+async fn boot_reaps_only_stale_orphan_runtime() {
     let h = harness().await;
     let scratch_root = h.scratch_root();
-    std::fs::create_dir_all(scratch_root.join("gate-dead").join("nested")).unwrap();
-    std::fs::write(scratch_root.join("gate-dead/nested/f"), "x").unwrap();
-    std::fs::create_dir_all(scratch_root.join("card-live")).unwrap();
+    let tmux_root = h.manager.deck_root().join("tmux-socks");
+
+    h.store.create(&card_row("card-live")).await.unwrap();
+    h.store.create(&card_row("card-bin")).await.unwrap();
+    h.store
+        .set_deleted("card-bin", Some(Utc::now()))
+        .await
+        .unwrap();
+
+    let seed = |root: &Path, name: &str, old: bool| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cli.sock"), "").unwrap();
+        if old {
+            make_old(&dir);
+        }
+    };
+    for (name, old) in [
+        ("gate-dead", true),
+        ("gate-fresh", false),
+        ("card-live", true),
+        ("card-bin", true),
+        ("orphan-x", true),
+        ("orphan-fresh", false),
+    ] {
+        seed(&tmux_root, name, old);
+        seed(&scratch_root, name, old);
+    }
 
     h.manager.boot().await;
 
-    assert!(
-        !scratch_root.join("gate-dead").exists(),
-        "stale gate scratch reaped at boot"
-    );
-    assert!(
-        scratch_root.join("card-live").exists(),
-        "card scratch untouched"
-    );
+    for (root, label) in [(&tmux_root, "tmux"), (&scratch_root, "scratch")] {
+        assert!(
+            !root.join("gate-dead").exists(),
+            "{label}: stale gate residue reaped"
+        );
+        assert!(
+            !root.join("orphan-x").exists(),
+            "{label}: stale rowless residue reaped"
+        );
+        assert!(
+            root.join("gate-fresh").exists(),
+            "{label}: fresh gate survives the boot race guard"
+        );
+        assert!(
+            root.join("orphan-fresh").exists(),
+            "{label}: fresh dir survives the boot race guard"
+        );
+        assert!(
+            root.join("card-live").exists(),
+            "{label}: live card residue kept"
+        );
+        assert!(
+            root.join("card-bin").exists(),
+            "{label}: recycled card residue kept"
+        );
+    }
 }
 
 #[tokio::test]

@@ -59,9 +59,15 @@ impl DeckHost {
     }
 
     /// The card's private tmux socket dir — what exec exports as
-    /// `DECK_TMUX_DIR_ENV`, and what purge reaps.
+    /// `DECK_TMUX_DIR_ENV`, and what the runtime reap (purge, gate finish)
+    /// clears.
     pub(crate) fn tmux_dir(&self, card_id: &str) -> PathBuf {
         self.tmux_socks_root.join(card_id)
+    }
+
+    /// `<deck_root>/tmux-socks` — what the boot orphan sweep walks.
+    pub(crate) fn tmux_socks_root(&self) -> &Path {
+        &self.tmux_socks_root
     }
 
     /// Replace every `[{REDACTED_SECRET_…}]` placeholder with the vault

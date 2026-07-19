@@ -7,7 +7,7 @@
 //! validation, a real sandboxed boot, one refresh-op invocation, and a
 //! checked first snapshot, all before the card is enabled or broadcast.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,10 +34,22 @@ use crate::supervisor::{DeckSupervisor, QuarantineSink};
 /// are refused.
 pub const MAX_CARDS: usize = 64;
 
-/// Scratch-dir name prefix for dry-run gate runs (`gate-<uuid>`). Gate
-/// scratch is removed when the gate finishes; anything still carrying the
-/// prefix at boot is residue from a crash mid-gate and is reaped.
+/// Id prefix for dry-run gate runs (`gate-<uuid>`). The gate's runtime
+/// dirs — its exec scratch and its private tmux socket dir — carry it;
+/// both are reaped when the gate finishes (pass or fail), and anything
+/// still carrying the prefix is crash residue for the boot orphan sweep.
 const GATE_SCRATCH_PREFIX: &str = "gate-";
+
+/// Wall clock for one best-effort `tmux kill-server` during runtime reap,
+/// matching the crate's other bounded subprocess calls; a hung tmux client
+/// is logged and skipped, never blocks the lifecycle op.
+const TMUX_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum age (mtime) before the boot orphan sweep may reap a runtime
+/// dir. `boot()` runs in a spawned task racing the live server, so a
+/// legitimately in-flight gate can already exist at sweep time; only
+/// entries old enough to be certain residue are touched.
+const BOOT_REAP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Deck push hooks; the gateway broadcasts `Frame::DeckCardData` /
 /// `Frame::DeckChanged` on the owner channel from these.
@@ -581,11 +593,15 @@ impl DeckManager {
             ));
         }
         self.store.purge(card_id).await?;
+        // Runtime residue first: the reap never fails, while the bundle
+        // removal below can — and once the row is gone a retry returns
+        // NotFound, so an fs error here must not strand live tmux servers
+        // until the next boot's orphan sweep.
+        self.reap_card_runtime(card_id).await;
         let dir = self.bundle_dir(card_id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        self.reap_card_runtime(card_id).await;
         self.spec_cache.lock().remove(card_id);
         provenance("purge", card_id, "hard");
         self.commit_bundle(card_id, &row.title, "purge", "hard")
@@ -594,12 +610,13 @@ impl DeckManager {
         Ok(())
     }
 
-    /// Boot-time start of every enabled card. A card whose recorded SDK
-    /// stamp differs from the current preamble re-passes the gate first
-    /// (the post-upgrade re-admission); a gate failure quarantines it
-    /// visibly instead of letting it fail on a timer at 3 a.m.
+    /// Boot-time start of every enabled card, after the orphan sweep has
+    /// reaped runtime residue stranded by crashes. A card whose recorded
+    /// SDK stamp differs from the current preamble re-passes the gate
+    /// first (the post-upgrade re-admission); a gate failure quarantines
+    /// it visibly instead of letting it fail on a timer at 3 a.m.
     pub async fn boot(&self) {
-        self.reap_gate_scratch();
+        self.reap_orphan_runtime().await;
         let rows = match self.store.list_live().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -662,46 +679,46 @@ impl DeckManager {
 
     // ---- internals ----------------------------------------------------
 
-    /// Best-effort purge tail: kill any tmux server the card pinned into
-    /// its private socket dir (`tmux -S <sock> kill-server` — the server
-    /// may already be dead, so every failure is ignored), then drop the
-    /// socket dir and the card's exec scratch dir. Missing residue is the
-    /// common case and never fails the purge.
+    /// Best-effort runtime reap shared by purge, the dry-run gate's
+    /// finish, and the boot orphan sweep: kill any tmux server the id
+    /// pinned into its private socket dir, then drop the socket dir and
+    /// the exec scratch dir. Missing residue is the common case and never
+    /// fails the caller.
     async fn reap_card_runtime(&self, card_id: &str) {
         let socks = self.host.tmux_dir(card_id);
-        if let Ok(entries) = std::fs::read_dir(&socks) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("sock") {
-                    continue;
-                }
-                let _ = tokio::process::Command::new("tmux")
-                    .arg("-S")
-                    .arg(&path)
-                    .arg("kill-server")
-                    .output()
-                    .await;
-            }
-        }
+        kill_tmux_servers(&socks).await;
         remove_residue_dir(&socks);
         remove_residue_dir(&self.scratch_root.join(card_id));
     }
 
-    /// Boot-time reap of `gate-*` dry-run scratch dirs leaked by a crash
-    /// mid-gate. By construction no gate can be in flight at boot, so
-    /// every survivor is residue.
-    fn reap_gate_scratch(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.scratch_root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(GATE_SCRATCH_PREFIX)
-            {
-                remove_residue_dir(&entry.path());
+    /// Boot-time orphan sweep: runtime dirs (tmux socket dirs, exec
+    /// scratch) that belong to no existing card row — `gate-*` residue
+    /// from a crash mid-gate, per-card residue from a crash mid-purge.
+    /// Live and soft-deleted rows both count as existing (a recycled card
+    /// keeps its runtime residue for restore). `boot()` races the live
+    /// server, so only entries past [`BOOT_REAP_MIN_AGE`] are reaped — a
+    /// just-started gate's fresh dirs must survive. A row-listing failure
+    /// skips the sweep: without the full id set everything looks orphaned.
+    async fn reap_orphan_runtime(&self) {
+        let mut existing: HashSet<String> = HashSet::new();
+        for rows in [
+            self.store.list_live().await,
+            self.store.list_deleted().await,
+        ] {
+            match rows {
+                Ok(rows) => existing.extend(rows.into_iter().map(|r| r.id)),
+                Err(e) => {
+                    tracing::warn!("deck: orphan sweep skipped, row listing failed: {e}");
+                    return;
+                }
             }
+        }
+        for dir in stale_orphan_dirs(self.host.tmux_socks_root(), &existing) {
+            kill_tmux_servers(&dir).await;
+            remove_residue_dir(&dir);
+        }
+        for dir in stale_orphan_dirs(&self.scratch_root, &existing) {
+            remove_residue_dir(&dir);
         }
     }
 
@@ -830,9 +847,27 @@ impl DeckManager {
     /// against the bundle's own directory, invoke the refresh op once,
     /// and check the returned snapshot. Kills the throwaway process
     /// before returning. Emits during the dry run are discarded.
+    ///
+    /// Gates are hermetic: whatever runtime the gate's execs left behind —
+    /// its scratch dir AND any tmux server pinned into its gate-scoped
+    /// `tmux-socks/gate-<uuid>` dir — is reaped on BOTH outcomes, so a
+    /// tmux-driving card's every install/update/enable/boot re-gate can't
+    /// accrete one fresh tmux server per run (and a dry run never touches
+    /// the resident card's server).
     async fn dry_run(&self, bundle: &DeckBundle) -> Result<Value> {
-        let host = self.host.clone();
+        let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
+        let outcome = self.dry_run_exec(bundle, &gate_id).await;
+        self.reap_card_runtime(&gate_id).await;
+        let snapshot = outcome?;
+        if snapshot.is_null() {
+            return Err(DeckError::DryRun(
+                "refresh op returned null — a card's refresh must return its snapshot JSON".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
 
+    async fn dry_run_exec(&self, bundle: &DeckBundle, gate_id: &str) -> Result<Value> {
         struct DiscardEmits;
         #[async_trait]
         impl EmitSink for DiscardEmits {
@@ -845,15 +880,14 @@ impl DeckManager {
             }
         }
 
-        let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
         let running = spawn_service(
             crate::service::SpawnConfig {
-                card_id: gate_id.clone(),
+                card_id: gate_id.to_string(),
                 bundle_dir: bundle.dir.clone(),
-                scratch_dir: self.scratch_root.join(&gate_id),
+                scratch_dir: self.scratch_root.join(gate_id),
                 emit_interval: Duration::from_secs(bundle.emit_interval_secs()),
             },
-            host,
+            self.host.clone(),
             Arc::new(DiscardEmits),
             Arc::new(StrikeRecorder::default()),
         )
@@ -870,19 +904,74 @@ impl DeckManager {
             .call(&bundle.manifest.refresh.op, params)
             .await;
         let _ = running.kill.send(()).await;
-        let scratch = self.scratch_root.join(&gate_id);
-        if scratch.exists() {
-            let _ = std::fs::remove_dir_all(&scratch);
-        }
-
-        let snapshot = outcome.map_err(|e| DeckError::DryRun(format!("refresh op failed: {e}")))?;
-        if snapshot.is_null() {
-            return Err(DeckError::DryRun(
-                "refresh op returned null — a card's refresh must return its snapshot JSON".into(),
-            ));
-        }
-        Ok(snapshot)
+        outcome.map_err(|e| DeckError::DryRun(format!("refresh op failed: {e}")))
     }
+}
+
+/// `tmux -S <sock> kill-server` every eligible `*.sock` entry in `socks`
+/// (the server may already be dead, so failures are ignored). Symlinks are
+/// skipped — consistent with `copy_src_tree`/`read_src_tree`'s hostile-
+/// symlink stance, a planted `x.sock -> /tmp/tmux-<uid>/default` must not
+/// aim `kill-server` at the user's own server. Each kill is bounded by
+/// [`TMUX_KILL_TIMEOUT`]; a timeout is logged and the sweep continues.
+async fn kill_tmux_servers(socks: &Path) {
+    let Ok(entries) = std::fs::read_dir(socks) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_killable_sock(&path) {
+            continue;
+        }
+        let mut kill = tokio::process::Command::new("tmux");
+        kill.arg("-S")
+            .arg(&path)
+            .arg("kill-server")
+            .kill_on_drop(true);
+        if tokio::time::timeout(TMUX_KILL_TIMEOUT, kill.output())
+            .await
+            .is_err()
+        {
+            tracing::warn!(sock = %path.display(), "deck: tmux kill-server timed out; continuing");
+        }
+    }
+}
+
+/// A `kill-server` target must be a non-symlink `*.sock` entry.
+fn is_killable_sock(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+        return false;
+    }
+    std::fs::symlink_metadata(path)
+        .map(|m| !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Entries under `root` eligible for the boot orphan sweep: named as gate
+/// residue (`gate-*`) or matching no existing card row, AND older than
+/// [`BOOT_REAP_MIN_AGE`] (an unreadable mtime counts as fresh — never reap
+/// what can't be aged).
+fn stale_orphan_dirs(root: &Path, existing: &HashSet<String>) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name.starts_with(GATE_SCRATCH_PREFIX) || !existing.contains(&name))
+                && older_than(&e.path(), BOOT_REAP_MIN_AGE)
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+fn older_than(path: &Path, min_age: Duration) -> bool {
+    std::fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age >= min_age)
 }
 
 /// The size correction to apply on an update/boot re-gate: `None` keeps the
@@ -1065,6 +1154,37 @@ mod tests {
         let dst = to.path().join(SRC_DIR);
         copy_src_tree(&from.path().join(SRC_DIR), &dst).unwrap();
         assert!(!dst.exists(), "no src/ → nothing copied");
+    }
+
+    #[test]
+    fn killable_sock_skips_symlinks_and_non_socks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sock");
+        std::fs::write(&real, "").unwrap();
+        assert!(is_killable_sock(&real));
+
+        let planted = dir.path().join("planted.sock");
+        std::os::unix::fs::symlink(&real, &planted).unwrap();
+        assert!(
+            !is_killable_sock(&planted),
+            "a symlinked .sock must never be a kill-server target"
+        );
+
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "").unwrap();
+        assert!(!is_killable_sock(&txt));
+        assert!(!is_killable_sock(&dir.path().join("missing.sock")));
+    }
+
+    #[test]
+    fn older_than_treats_fresh_entries_as_unreapable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !older_than(dir.path(), BOOT_REAP_MIN_AGE),
+            "a just-created dir must survive the boot sweep"
+        );
+        assert!(older_than(dir.path(), Duration::ZERO));
+        assert!(!older_than(&dir.path().join("missing"), Duration::ZERO));
     }
 
     #[test]
