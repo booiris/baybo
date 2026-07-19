@@ -15,6 +15,7 @@ import {
   applyToolCompletedStep,
   markStepAwaitingApproval,
   resolveStepApproval,
+  foldAdjacentWork,
   type TranscriptRow,
   type WorkStep,
 } from './ChatPage';
@@ -460,5 +461,148 @@ describe('work-step approval labelling', () => {
     const out = applyToolCompletedStep(withCall(), 'call-1', 'ok', '3 files', undefined, true);
     expect(out[0].steps?.[0].approval).toBeUndefined();
     expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
+  });
+});
+
+// The server reconstructs a turn's work block per page window, so a turn longer
+// than one page comes back as two `w<ordinal>` items — the older page's
+// tail-of-turn half and the current thread's head-of-turn half. Scrolling up
+// (or a mid-turn forward sync) puts them adjacent; `foldAdjacentWork` fuses
+// them so one turn stays one card. Mirrors the iOS transcript's join.
+describe('foldAdjacentWork — a turn cut by a page boundary is still one turn', () => {
+  // Absolute-ms timings off one turn: user prompt at TURN_START, the older
+  // page's trailing flush at FIRST_END, the newer page's half opening at
+  // SECOND_START and closing on the answer at TURN_END. Neither half's own
+  // span is the turn's.
+  const TURN_START = 1784173283804;
+  const FIRST_END = 1784173863833;
+  const SECOND_START = 1784173872143;
+  const TURN_END = 1784174854449;
+  const wkey = (ord: number): string => `row-s1-w${ord}`;
+  // `complete` mirrors the server's `turn_complete`: a cut-off head is `false`
+  // (its turn continues into the next page), a whole block `true`.
+  const half = (
+    ord: number,
+    label: string,
+    started: number,
+    ended: number,
+    complete: boolean,
+  ): TranscriptRow => ({
+    key: wkey(ord),
+    role: 'system',
+    text: '',
+    kind: 'work',
+    workActive: false,
+    workComplete: complete,
+    workStartedAt: started,
+    workEndedAt: ended,
+    steps: [{ key: `${wkey(ord)}-0`, kind: 'tool', tool: 'fetch', toolLabel: label, toolStatus: 'ok' }],
+  });
+  // The older page's cut-off head, and the newer page's half that closes on the answer.
+  const first = (): TranscriptRow => half(3, 'Fetch(a)', TURN_START, FIRST_END, false);
+  const second = (): TranscriptRow => half(43, 'Fetch(b)', SECOND_START, TURN_END, true);
+
+  it('spans the whole turn — neither half owns the turn duration', () => {
+    const [row] = foldAdjacentWork([first(), second()]);
+    expect(row.workStartedAt).toBe(TURN_START);
+    expect(row.workEndedAt).toBe(TURN_END);
+  });
+
+  it('keeps one card, the earlier-ordinal key, and every step from both halves', () => {
+    const out = foldAdjacentWork([first(), second()]);
+    expect(out).toHaveLength(1);
+    expect(out[0].key).toBe(wkey(3));
+    expect(out[0].steps).toHaveLength(2);
+  });
+
+  it('stays live when the newer half is still running, anchored at the turn start', () => {
+    const live: TranscriptRow = { ...second(), workActive: true, workEndedAt: undefined };
+    const [row] = foldAdjacentWork([first(), live]);
+    expect(row.workActive).toBe(true);
+    expect(row.workStartedAt).toBe(TURN_START);
+  });
+
+  it('carries a cancel flag from either half', () => {
+    const [row] = foldAdjacentWork([{ ...first(), workCancelled: true }, second()]);
+    expect(row.workCancelled).toBe(true);
+  });
+
+  it("leaves a healthy thread alone — a turn's block is separated by its answer", () => {
+    const rows: TranscriptRow[] = [
+      first(),
+      { key: 'row-s1-m91', role: 'assistant', text: 'done' },
+      second(),
+    ];
+    expect(foldAdjacentWork(rows)).toHaveLength(3);
+  });
+
+  it('is idempotent, so it is safe to run at every seam', () => {
+    const once = foldAdjacentWork([first(), second()]);
+    expect(foldAdjacentWork(once)).toEqual(once);
+  });
+
+  it('collapses a run of three halves (a turn spanning three pages)', () => {
+    // Two cut-off halves then the closing half: fold chains until the whole half arrives.
+    const head = half(3, 'Fetch(a)', TURN_START, FIRST_END, false);
+    const middle = half(43, 'Fetch(b)', SECOND_START, SECOND_START + 1_000, false);
+    const tail = half(80, 'Fetch(c)', SECOND_START + 1_000, TURN_END, true);
+    const out = foldAdjacentWork([head, middle, tail]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ key: wkey(3), workStartedAt: TURN_START, workEndedAt: TURN_END, workComplete: true });
+    expect(out[0].steps).toHaveLength(3);
+  });
+
+  it('dedups a tool step shared across halves by call id (start + result straddled the seam)', () => {
+    const a: TranscriptRow = {
+      ...first(),
+      steps: [{ key: 'a0', kind: 'tool', toolCallId: 'c9', tool: 'bash', toolStatus: 'running' }],
+    };
+    const b: TranscriptRow = {
+      ...second(),
+      steps: [{ key: 'b0', kind: 'tool', toolCallId: 'c9', tool: 'bash', toolStatus: 'running' }],
+    };
+    expect(foldAdjacentWork([a, b])[0].steps).toHaveLength(1);
+  });
+
+  it('reconciles a live block with its own reconstruction rather than spanning it', () => {
+    // A live block's key isn't `w<ordinal>`, so it's one span in two forms —
+    // adopt the server's timing, keep the live key + active state.
+    const live: TranscriptRow = {
+      key: 'work-999-0',
+      role: 'system',
+      text: '',
+      kind: 'work',
+      workActive: true,
+      workStartedAt: 999,
+      steps: [{ key: 'l0', kind: 'tool', toolCallId: 'c1', tool: 'bash', toolStatus: 'running' }],
+    };
+    const recon: TranscriptRow = { ...second(), workStartedAt: SECOND_START, workEndedAt: SECOND_START + 4_000 };
+    const [row] = foldAdjacentWork([live, recon]);
+    expect(row).toMatchObject({
+      key: 'work-999-0',
+      workActive: true,
+      workStartedAt: SECOND_START,
+      workEndedAt: SECOND_START + 4_000,
+    });
+  });
+
+  it('reconciles the same block re-delivered (one key, one span, no doubled steps)', () => {
+    const [row] = foldAdjacentWork([first(), first()]);
+    expect(row).toMatchObject({ key: wkey(3), workStartedAt: TURN_START, workEndedAt: FIRST_END });
+    expect(row.steps).toHaveLength(1);
+  });
+
+  it('does NOT fuse a completed turn with the following one (two turns, two cards)', () => {
+    // The dangerous edge: a whole turn (its empty final reply left no bubble)
+    // ends the older page, and the newer page leads with a DIFFERENT turn's work
+    // (a cron / subagent fire). Ordinals differ, but `turn_complete` keeps them
+    // apart — a purely positional fold would have wrongly merged them.
+    const completeHead: TranscriptRow = { ...first(), workComplete: true };
+    expect(foldAdjacentWork([completeHead, second()])).toHaveLength(2);
+  });
+
+  it('declines to fuse when completeness is unknown (older server) — degrades to two blocks', () => {
+    const unknownHead: TranscriptRow = { ...first(), workComplete: undefined };
+    expect(foldAdjacentWork([unknownHead, second()])).toHaveLength(2);
   });
 });

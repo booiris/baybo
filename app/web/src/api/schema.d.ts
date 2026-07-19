@@ -1329,6 +1329,19 @@ export interface components {
              *     items.
              */
             text: string;
+            /**
+             * @description For a `work` item: `true` when the turn ENDED inside this reconstruction
+             *     window (a real boundary — the final answer, the next user turn, or a
+             *     `/stop` — closed the block); `false` when the block was cut off by the
+             *     page window's edge and the turn continues into the adjacent (older) page.
+             *     The client fuses a cut-off head (`false`) with the following half so a
+             *     turn split across a page boundary stays one card, and NEVER fuses a
+             *     complete block (`true`) with its neighbour — that neighbour is a
+             *     different turn (e.g. a completed turn whose empty final reply produced no
+             *     bubble, abutting a following cron fire). `None` for `message` / `notice`
+             *     items, which never participate in the fold.
+             */
+            turn_complete?: boolean | null;
             /** Format: date-time */
             work_ended_at?: string | null;
             /**
