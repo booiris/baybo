@@ -5,6 +5,7 @@ pub mod compressor;
 pub mod error;
 pub mod prompts;
 pub mod tokenizer;
+mod transcript_repair;
 
 pub use background_summary::{
     BackgroundSummaryCallback, BackgroundSummaryConfig, BackgroundSummaryFuture,
@@ -1104,10 +1105,31 @@ impl ContextManager {
         let session_id = self.session_id.clone();
         let sessions = Arc::clone(&self.sessions);
 
-        // Step 1: restore the transcript itself.
+        // Step 1: restore the transcript itself. A crash mid-tool-batch
+        // leaves dangling `ToolUse` rows that strict providers reject on
+        // the next request, so normalize pairing before the window goes
+        // live: synthetic fills are persisted (append-only) and the
+        // repaired order is what the loop builds requests from.
         match sessions.load_active_session_messages(&session_id).await {
             Ok(messages) if !messages.is_empty() => {
-                self.restore_messages(messages);
+                let (repaired, fills) = transcript_repair::repair_tool_pairing(messages);
+                if !fills.is_empty() {
+                    warn!(
+                        session_id = %session_id,
+                        fills = fills.len(),
+                        "hydration: repaired dangling tool_use rows from an interrupted turn"
+                    );
+                    for fill in &fills {
+                        if let Err(e) = sessions.append_session_message(&session_id, fill).await {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "hydration: failed to persist synthetic tool_result fill"
+                            );
+                        }
+                    }
+                }
+                self.restore_messages(repaired);
             }
             Ok(_) => {}
             Err(e) => {
@@ -2241,6 +2263,50 @@ mod tests {
             ctx.maybe_compress("test-model", never_chat).await.unwrap(),
             CompressionOutcome::BelowThreshold
         ));
+    }
+
+    #[tokio::test]
+    async fn restore_repairs_dangling_tool_use_and_persists_fills() {
+        let sessions = test_sessions();
+        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+
+        // The wedged shape: crash left an unanswered ToolUse, then a
+        // resume nudge landed after it (pre-repair behavior).
+        ctx.append(&ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call_dangling".into(),
+            name: "Bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }]))
+        .await;
+        ctx.append(&make_msg(Role::User, "请立即返回最终结果"))
+            .await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        // In-memory: fill sits directly after the assistant row, nudge after.
+        assert_eq!(restored.messages().len(), 3);
+        assert!(
+            matches!(&restored.messages()[1].content[0], ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "call_dangling" && content.contains("interrupted"))
+        );
+        assert_eq!(restored.messages()[2].role, Role::User);
+
+        // The fill was persisted (append-only), so a SECOND hydration
+        // finds pairing complete and synthesizes nothing new.
+        let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        again.restore_from_store().await;
+        assert_eq!(
+            again.messages().len(),
+            3,
+            "no duplicate fills on rehydration"
+        );
+        assert!(
+            matches!(&again.messages()[1].content[0], ContentBlock::ToolResult { tool_use_id, .. }
+                if tool_use_id == "call_dangling"),
+            "persisted fill must be repositioned adjacent on rehydration"
+        );
     }
 
     #[tokio::test]

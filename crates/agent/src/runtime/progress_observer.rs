@@ -87,8 +87,15 @@ pub(crate) fn build_observer_prompt(prior_notices: &[String]) -> String {
 /// Sidecars are exactly the gateway's `Multiplexed` channel kinds: anything
 /// that isn't the `Subscribed` owner surface (`owner` — web + mobile) or the
 /// CLI/TUI (`tui`). See the `ChannelKind` mapping in the gateway's channel boot.
+///
+/// The internal `subagent` tag is not a gateway channel at all — a child
+/// session's live Progress frames are dropped by the parent's waiter, so
+/// firing the observer there burns a full-context LLM call per tick with no
+/// consumer. Excluded explicitly rather than left to pass as a pseudo-sidecar.
 pub(crate) fn channel_wants_progress(channel: &ChannelType) -> bool {
-    *channel != ChannelType::owner() && *channel != ChannelType::tui()
+    *channel != ChannelType::owner()
+        && *channel != ChannelType::tui()
+        && channel.as_str() != baybo_model::SUBAGENT_CHANNEL_TAG
 }
 
 /// Pure gate (everything except the live cancel check, which the caller
@@ -381,6 +388,11 @@ mod gate_tests {
         assert!(channel_wants_progress(&ChannelType::weixin()));
         assert!(!channel_wants_progress(&ChannelType::owner()));
         assert!(!channel_wants_progress(&ChannelType::tui()));
+        // Subagent sessions have no live Progress consumer — the parent's
+        // waiter drops the frames — so the observer must not fire there.
+        assert!(!channel_wants_progress(&ChannelType::from(
+            baybo_model::SUBAGENT_CHANNEL_TAG
+        )));
     }
 }
 

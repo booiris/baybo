@@ -170,6 +170,18 @@ changing that terminal job. During the current process,
 a user-facing crash notice. The TurnState inactive edge still comes from the job
 lifecycle event via the projector, not from the runner directly.
 
+The transcript side of a crash heals lazily at hydration, not at boot: a death
+mid-tool-batch persists an assistant row whose `ToolUse` ids have no
+`ToolResult` (the loop appends results per call as they complete), and strict
+providers reject any request built from that shape. When the actor is next
+rebuilt, `ContextManager::restore_from_store` runs
+`baybo-context`'s `transcript_repair::repair_tool_pairing`: dangling ids get a
+persisted synthetic "interrupted" `ToolResult` (append-only), and displaced
+result rows are repositioned adjacent to their issuing assistant row in the
+in-memory window. The streaming twin of this guard is
+`salvage_partial_blocks`, which drops streamed-but-undispatched `ToolUse` on
+mid-stream cancel so the dangling row is never persisted in the first place.
+
 ### Router's upstream responsibilities
 
 Before a message enters an actor, Router completes: session identification/creation, user-level rate limiting, quota check via `CostManager::check`, select/create target `AgentActor`.

@@ -44,6 +44,13 @@ const STREAM_BUFFER_HIGH_WATER: usize = 128;
 /// reaches the LLM (capped separately) and the trace.
 const TOOL_SUMMARY_MAX: usize = 80;
 
+/// Cap on `MultiModalText::llm_images` forwarded to the model per
+/// iteration. Each image bills real provider tokens, and a page-each
+/// screenshot loop would otherwise stack unbounded vision input; newest
+/// win (FIFO eviction) because earlier screenshots are typically stale —
+/// the page state has moved on.
+const MAX_LLM_IMAGES_PER_ITERATION: usize = 8;
+
 /// Upper bound on how many [`ToolConcurrency::Concurrent`] tool calls
 /// run at once within a single LLM response. A
 /// [`ToolConcurrency::Exclusive`] call (any tool that mutates state)
@@ -111,6 +118,21 @@ fn extend_unique_attachments(acc: &mut Vec<ContentBlock>, incoming: &[ContentBlo
             continue;
         }
         acc.push(block.clone());
+    }
+}
+
+/// Append LLM-visible images while keeping the accumulator at or under
+/// [`MAX_LLM_IMAGES_PER_ITERATION`] via FIFO eviction — newest win, since
+/// an earlier screenshot is stale once the page state has moved on.
+fn push_bounded_images<I: IntoIterator<Item = ContentBlock>>(
+    dst: &mut Vec<ContentBlock>,
+    items: I,
+) {
+    for item in items {
+        if dst.len() >= MAX_LLM_IMAGES_PER_ITERATION {
+            dst.remove(0);
+        }
+        dst.push(item);
     }
 }
 
@@ -1294,6 +1316,7 @@ impl AgentLoop {
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
+        let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
         for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
             let (status, raw_summary) = tool_completion_summary(&executed);
             let call_approval = executed.approval;
@@ -1347,12 +1370,17 @@ impl AgentLoop {
                 // Media a tool produced for the *user* (e.g. `AttachFile`) is
                 // hoisted onto the turn's final assistant row; the LLM sees
                 // only the text result. `MultiModalText`'s images are for the
-                // LLM's own next turn, so they are NOT hoisted here.
+                // LLM's own next turn: accumulated here and appended as one
+                // follow-up user-role message after the tool-result loop, so
+                // provider tool_use/tool_result adjacency stays intact.
                 Ok(ToolOutput::WithAttachments { text, attachments }) => {
                     extend_unique_attachments(turn_attachments, attachments);
                     text.clone()
                 }
-                Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
+                Ok(ToolOutput::MultiModalText { text, llm_images }) => {
+                    push_bounded_images(&mut llm_visible_images, llm_images.iter().cloned());
+                    text.clone()
+                }
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
@@ -1410,6 +1438,24 @@ impl AgentLoop {
             );
             let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
             self.context_manager.append(&tool_msg).await;
+        }
+
+        // Images a tool returned for the model (`MultiModalText`, e.g. a
+        // browser screenshot) ride ONE follow-up user-role row appended
+        // after every tool_result, so the next request's vision path
+        // (`user_content_for_block`) picks them up without breaking the
+        // provider's tool_use/tool_result adjacency validation.
+        // `agent_context` = user role / agent source, so the row is never
+        // mistaken for a genuine user prompt.
+        if !llm_visible_images.is_empty() {
+            let mut content: Vec<ContentBlock> = Vec::with_capacity(llm_visible_images.len() + 1);
+            content.push(ContentBlock::Text(
+                "[image attachment(s) returned by the tool call(s) above]".to_string(),
+            ));
+            content.append(&mut llm_visible_images);
+            self.context_manager
+                .append(&ChatMessage::agent_context(content))
+                .await;
         }
 
         // Flush accumulated approvals back into session state.
