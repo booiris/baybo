@@ -1557,7 +1557,7 @@ mod tests {
             &self,
             id: &SessionId,
             new_active: &[baybo_model::ChatMessage],
-        ) -> std::result::Result<(), baybo_store::StorageError> {
+        ) -> std::result::Result<i64, baybo_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1575,7 +1575,7 @@ mod tests {
                     message: msg.clone(),
                 });
             }
-            Ok(())
+            Ok(next_ordinal)
         }
         async fn load_active_session_messages(
             &self,

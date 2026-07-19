@@ -364,7 +364,7 @@ impl SessionStore for MemorySessionStore {
         &self,
         session_id: &SessionId,
         new_active: &[ChatMessage],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let mut guard = self.transcripts.lock();
         let log = guard.entry(session_id.clone()).or_default();
         let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -383,7 +383,7 @@ impl SessionStore for MemorySessionStore {
                 source_event_id: None,
             });
         }
-        Ok(())
+        Ok(next_ordinal as i64)
     }
 
     async fn load_active_session_messages(
@@ -749,6 +749,23 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
         entry.updated_at = updated_at;
         entry.error_count = 0;
         Ok(())
+    }
+
+    async fn repoint_cursor(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut guard = self.rows.lock();
+        match guard.get_mut(session_id) {
+            Some(entry) => {
+                entry.cursor = cursor;
+                entry.updated_at = updated_at;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn bump_error_count(

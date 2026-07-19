@@ -59,7 +59,18 @@ pub enum CompressOutput {
     /// the skill list — summary stages by construction, and the
     /// truncate fallback whenever the reminder lands in the dropped
     /// middle.
-    Replaced { messages: Vec<ChatMessage> },
+    Replaced {
+        messages: Vec<ChatMessage>,
+        /// Index (into `messages`) of the continuation-summary row when
+        /// this replacement came from the **stage-1 fast path** — whose
+        /// summary body is `summary.md` verbatim, so after the apply the
+        /// `session_summaries.cursor` may legally re-point at that row
+        /// and keep the fast path alive for a back-to-back compaction.
+        /// `None` for the live-LLM and truncate stages: their output is
+        /// NOT on disk, so a re-pointed cursor would claim coverage
+        /// `summary.md` doesn't have.
+        fast_path_summary_index: Option<usize>,
+    },
 }
 
 fn find_tagged_block(text: &str, tag: &str) -> Option<std::ops::Range<usize>> {
@@ -429,6 +440,7 @@ impl ContextManager {
         }
 
         let mut new_messages = system_msgs;
+        let summary_index = new_messages.len();
         new_messages.push(summary_msg);
         new_messages.extend(recent_slice);
 
@@ -446,6 +458,7 @@ impl ContextManager {
 
         Some(CompressOutput::Replaced {
             messages: new_messages,
+            fast_path_summary_index: Some(summary_index),
         })
     }
 
@@ -483,7 +496,10 @@ impl ContextManager {
             let initial_split = non_system.len().saturating_sub(self.keep_recent);
             let split = pair_preserving_cut(&non_system, initial_split);
             out.extend_from_slice(&non_system[split..]);
-            CompressOutput::Replaced { messages: out }
+            CompressOutput::Replaced {
+                messages: out,
+                fast_path_summary_index: None,
+            }
         };
 
         let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
@@ -498,6 +514,7 @@ impl ContextManager {
                     ));
                     CompressOutput::Replaced {
                         messages: new_messages,
+                        fast_path_summary_index: None,
                     }
                 }
                 None => {

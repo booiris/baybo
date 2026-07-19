@@ -137,10 +137,13 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
          captured a request whose trailing message carries SUMMARIZE_INSTRUCTION: {captured:#?}"
     );
 
-    // The fast-path is read-only against `session_summaries`: it reads
-    // the cursor we seeded above to map summary.md into the recent
-    // slice, but never writes the row. The cursor stays exactly where
-    // `record_summary_success` left it.
+    // On a transcript this small the fast-path assembly (summary
+    // boilerplate + the ≥RECENT_SLICE_MIN_TOKENS recent slice) can never
+    // undercut the original, so the manager refuses the apply
+    // (`NoSavings`) — and without an apply the cursor re-point must not
+    // fire either. The cursor stays exactly where `record_summary_success`
+    // left it. The apply-and-re-point behavior is covered at the context
+    // layer (`fast_path_apply_repoints_summary_cursor`).
     let row = harness
         .session_manager
         .summary_metadata(&harness.session.id)
@@ -149,7 +152,7 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
         .expect("metadata exists");
     assert_eq!(
         row.cursor, 2,
-        "fast-path read path must not mutate the summary cursor"
+        "no apply -> no cursor re-point; the seeded cursor must survive"
     );
 
     harness.shutdown().await;

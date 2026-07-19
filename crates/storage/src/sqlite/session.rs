@@ -755,7 +755,7 @@ impl SessionStore for SqliteSessionStore {
         &self,
         session_id: &SessionId,
         new_active: &[ChatMessage],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let session_param = session_id.as_str().to_string();
         // Serialize the message contents up front: a failure here is a
         // `StorageError::Storage`, which the pool's `anyhow` closure can't
@@ -859,7 +859,7 @@ impl SessionStore for SqliteSessionStore {
                 // search would go blind exactly where a session got long enough
                 // to be worth searching. See `docs/search.md`.
                 tx.commit()?;
-                Ok(())
+                Ok(next_ordinal)
             })
             .await
     }

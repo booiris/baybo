@@ -78,6 +78,22 @@ pub trait SessionSummaryStore: Send + Sync {
         updated_at: DateTime<Utc>,
     ) -> Result<()>;
 
+    /// Move `cursor` (and stamp `updated_at`) WITHOUT touching
+    /// pass_count / cost / error telemetry. Returns `Ok(false)` when no
+    /// row exists — this never inserts, unlike the upsert above, because
+    /// a re-point is only meaningful when a real pass already recorded
+    /// what `summary.md` covers. Used after a fast-path compaction apply
+    /// to advance the cursor onto the freshly-inserted continuation-
+    /// summary row (whose body is `summary.md` verbatim), so the fast
+    /// path survives a back-to-back compaction instead of falling
+    /// through to a full-transcript LLM summarize.
+    async fn repoint_cursor(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool>;
+
     /// Hard-delete the row. Idempotent; returns `Ok(false)` if the
     /// row did not exist. Cascade from `sessions` is the normal path;
     /// this exists for orphan-reap of FS files whose session_id has

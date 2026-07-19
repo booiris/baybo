@@ -249,6 +249,8 @@ Any of the following → fall through to stage 2 (LLM summary) / stage 3 (trunca
 
 The first compression on every session pays a one-time synchronous-LLM-summary latency cost; subsequent compressions use the fast-path.
 
+**Cursor re-point on fast-path apply.** A compaction apply supersedes every active row — including the one the cursor names — which would leave the cursor dead until the next background pass lands. For a **fast-path** apply the flow closes that window itself: `apply_session_compaction` returns the base ordinal of the new rows, and `run_compression` re-points `session_summaries.cursor` at the freshly-inserted continuation-summary row (`SessionManager::repoint_summary_cursor` — cursor + `updated_at` only, never pass_count/cost/error telemetry). This is sound because the fast-path summary row's body is `summary.md` verbatim, so the on-disk file still covers everything at or before the row; a back-to-back compaction (one giant turn leaping past the threshold, an immediate `/compact`) hits the fast path again instead of a full-transcript stage-2 call. Stage-2 / truncate applies never re-point — their output is not on disk, so an advanced cursor would claim coverage `summary.md` doesn't have, and the "cursor isn't in the active log" fall-through above remains their (recoverable) resting state.
+
 ### `force_compress` (`/compact`)
 
 `force_compress` runs the same 3-stage flow but skips the budget threshold gate. The fast-path stage still applies when summary.md is fresh, so a user-typed `/compact` after a successful background pass reuses the cached summary instead of burning a fresh LLM call.
