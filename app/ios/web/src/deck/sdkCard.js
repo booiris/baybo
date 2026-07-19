@@ -6,6 +6,7 @@
 (function () {
   "use strict";
   let port = null;
+  let initialized = false;
   let size = "wide";
   let latest;
   let hasData = false;
@@ -59,7 +60,22 @@
   }
 
   window.addEventListener("message", function (e) {
-    if (e.data && e.data.type === "deck_init" && e.ports && e.ports[0]) {
+    // The shell is this iframe's direct parent; a co-resident card is not.
+    // Pinning the port to the FIRST `deck_init` that came from `window.parent`
+    // stops a sibling card from postMessage-ing a forged init with its own
+    // port to hijack this card's channel (read its op params, inject spoofed
+    // snapshot/result data). Opaque-origin frames all report origin "null", so
+    // identity is the source check, not the origin. The shell sends `deck_init`
+    // exactly once per mount, so the once-guard never drops a legitimate init.
+    if (
+      !initialized &&
+      e.source === window.parent &&
+      e.data &&
+      e.data.type === "deck_init" &&
+      e.ports &&
+      e.ports[0]
+    ) {
+      initialized = true;
       port = e.ports[0];
       if (e.data.size) size = e.data.size;
       port.onmessage = onPortMessage;

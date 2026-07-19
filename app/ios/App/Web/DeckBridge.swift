@@ -19,7 +19,15 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == Self.messageHandlerName,
+        // Only the shell (main frame) may drive the native bridge. Cards are
+        // sandboxed subframes, and WKWebView injects the message handler into
+        // EVERY frame — so without this guard a card's own JS could call the
+        // native surface directly (`quickSetup` seeds and auto-sends an agent
+        // prompt with no user tap; `cardAction`/`layout`/`delete` mutate the
+        // deck), bypassing the port-mediated shell. Cards reach the shell over
+        // their per-card MessagePort, never this handler.
+        guard message.frameInfo.isMainFrame,
+            message.name == Self.messageHandlerName,
             let body = message.body as? [String: Any],
             let type = body["type"] as? String
         else { return }
