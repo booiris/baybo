@@ -51,8 +51,8 @@ on the host (it's installed), e.g.
 readable/diffable). Put the sources under `src/` and they ride along with the
 bundle: the gateway never runs or reads them, but `DeckCardGet` hands them
 back so a later edit works from the real inputs, not the built output. Caps:
-≤32 files, ≤256 KB each, ≤2 MB total; no symlinks. Most cards need no `src/`
-— write `card.html` directly.
+≤30 MB per file, ≤60 MB total; no symlinks (file count is unbounded). Most
+cards need no `src/` — write `card.html` directly.
 
 ### manifest.json
 
@@ -82,7 +82,7 @@ back so a later edit works from the real inputs, not the built output. Caps:
 - `refresh.op` must exist in `openapi.json`; the gate calls it once with
   `refresh.params` (optional object).
 - `min_emit_interval_secs`: your emit floor. The gateway accepts at most
-  one emit per window (clamped to ≥10s); excess emits coalesce to latest.
+  one emit per window (clamped to ≥1s); excess emits coalesce to latest.
 
 ### openapi.json — the op contract
 
@@ -134,13 +134,13 @@ snapshot JSON (not null).**
   addresses are blocked (SSRF floor); redirects are not followed.
 - `await ctx.exec(cmd)` → `{code, stdout, stderr}`. Runs `/bin/sh -c` on
   the host with the inherited environment (installed CLIs and credential
-  dirs resolve, network available), 10s cap, 256KB output cap. Use for
+  dirs resolve, network available), 30s cap, 4MB output cap. Use for
   host state and CLIs: `df -k`, `uptime`, `ps`, `git -C <dir> log`,
   `codex …`, etc.
 - `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed).
 - `ctx.log(msg)` — diagnostic logging (console.log also routes here).
 
-Per-op calls have a 10s budget; a timeout fails the call, not the
+Per-op calls have a 30s budget; a timeout fails the call, not the
 process. Repeated crashes/timeouts quarantine the card (visible error
 face + Re-enable), so keep ops fast and handle upstream errors — return
 `{error: "..."}`-style JSON rather than throwing when the upstream is

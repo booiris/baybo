@@ -22,14 +22,12 @@ use baybo_security::{PlaceholderMinter, SecretVault};
 use crate::service::{HostExecResponse, HostFetchRequest, HostFetchResponse, HostServices};
 
 /// Wall clock for one host-mediated fetch.
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-/// Response-body cap for one host-mediated fetch.
-pub const FETCH_BODY_MAX: usize = 2 * 1024 * 1024;
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wall clock for one `ctx.exec` command.
-pub const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout/stderr cap for one `ctx.exec` command (each, after which the
 /// stream is truncated with a marker).
-pub const EXEC_OUTPUT_MAX: usize = 256 * 1024;
+pub const EXEC_OUTPUT_MAX: usize = 4 * 1024 * 1024;
 
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
@@ -155,12 +153,12 @@ impl DeckHost {
                 )
             })
             .collect();
+        // No response-body cap by design: a card's service is trusted
+        // author code (see docs/modules/deck.md), and cards that back a
+        // game / rich frontend may legitimately pull large payloads.
         let mut body: Vec<u8> = Vec::new();
         let mut resp = resp;
         while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
-            if body.len() + chunk.len() > FETCH_BODY_MAX {
-                return Err(format!("response body exceeds {FETCH_BODY_MAX} bytes"));
-            }
             body.extend_from_slice(&chunk);
         }
         Ok(HostFetchResponse {

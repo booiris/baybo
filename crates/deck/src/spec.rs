@@ -25,13 +25,13 @@ use serde_json::{Map, Value, json};
 use crate::error::{DeckError, Result};
 
 /// Byte cap on `openapi.json` itself.
-pub const MAX_SPEC_BYTES: usize = 64 * 1024;
+pub const MAX_SPEC_BYTES: usize = 256 * 1024;
 /// Ops per card.
-pub const MAX_OPS: usize = 32;
+pub const MAX_OPS: usize = 128;
 /// Params per op.
-pub const MAX_PARAMS_PER_OP: usize = 32;
+pub const MAX_PARAMS_PER_OP: usize = 128;
 /// Byte cap on a serialized op-call params object.
-pub const MAX_CALL_PARAMS_BYTES: usize = 16 * 1024;
+pub const MAX_CALL_PARAMS_BYTES: usize = 1024 * 1024;
 /// Validation errors quoted back to the caller per rejected call.
 const MAX_REPORTED_ERRORS: usize = 3;
 

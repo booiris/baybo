@@ -21,8 +21,8 @@ use baybo_security::SecretVault;
 use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 
 use crate::bundle::{
-    self, CARD_FILE, DeckBundle, MANIFEST_FILE, MAX_SOURCE_BYTES, MAX_SRC_FILES,
-    MAX_SRC_TOTAL_BYTES, OPENAPI_FILE, SDK_VERSION, SERVICE_FILE, SRC_DIR, load_bundle,
+    self, CARD_FILE, DeckBundle, MANIFEST_FILE, MAX_SOURCE_BYTES, MAX_SRC_TOTAL_BYTES,
+    OPENAPI_FILE, SDK_VERSION, SERVICE_FILE, SRC_DIR, load_bundle,
 };
 use crate::error::{DeckError, Result};
 use crate::host::DeckHost;
@@ -32,7 +32,7 @@ use crate::supervisor::{DeckSupervisor, QuarantineSink};
 
 /// Hard cap on live (non-deleted) cards; installs and restores past it
 /// are refused.
-pub const MAX_CARDS: usize = 24;
+pub const MAX_CARDS: usize = 64;
 
 /// Deck push hooks; the gateway broadcasts `Frame::DeckCardData` /
 /// `Frame::DeckChanged` on the owner channel from these.
@@ -849,9 +849,9 @@ fn clamp_size(current: DeckSize, sizes: &[DeckSize], default: DeckSize) -> Optio
 
 /// Best-effort read of a card's `src/` subtree into `relative-path → contents`
 /// (keys prefixed `src/…`), for `DeckCardGet`. Non-UTF-8 files and anything
-/// past the caps are skipped rather than failing the read — the required four
-/// files are the contract; `src/` is a convenience. Symlinks are ignored (a
-/// bundle's `src/` is plain agent-written text).
+/// past the byte caps are skipped rather than failing the read — the required
+/// four files are the contract; `src/` is a convenience. Symlinks are ignored
+/// (a bundle's `src/` is plain agent-written text).
 fn read_src_tree(src_dir: &Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let mut total: u64 = 0;
@@ -861,9 +861,6 @@ fn read_src_tree(src_dir: &Path) -> std::collections::BTreeMap<String, String> {
             continue;
         };
         for entry in entries.flatten() {
-            if out.len() >= MAX_SRC_FILES {
-                return out;
-            }
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
@@ -897,13 +894,12 @@ fn read_src_tree(src_dir: &Path) -> std::collections::BTreeMap<String, String> {
 /// Copy an optional `src/` subtree into the staging bundle under caps. A
 /// missing source dir is a no-op (most cards have no `src/`). Symlinks are
 /// refused (an agent must not smuggle `/etc/passwd` into the deck root via a
-/// symlinked `src/` entry); the file/byte caps bound the copy so a stray
+/// symlinked `src/` entry); the byte caps bound the copy so a stray
 /// `node_modules` can't bloat the deck root.
 fn copy_src_tree(from: &Path, to: &Path) -> Result<()> {
     if !from.exists() {
         return Ok(());
     }
-    let mut count: usize = 0;
     let mut total: u64 = 0;
     let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
     while let Some((src, dst)) = stack.pop() {
@@ -923,12 +919,6 @@ fn copy_src_tree(from: &Path, to: &Path) -> Result<()> {
             if meta.is_dir() {
                 stack.push((src_path, dst_path));
                 continue;
-            }
-            count += 1;
-            if count > MAX_SRC_FILES {
-                return Err(DeckError::InvalidBundle(format!(
-                    "src/ exceeds {MAX_SRC_FILES} files"
-                )));
             }
             if meta.len() > MAX_SOURCE_BYTES as u64 {
                 return Err(DeckError::InvalidBundle(format!(
@@ -1021,18 +1011,5 @@ mod tests {
         let to = tempfile::tempdir().unwrap();
         let err = copy_src_tree(&src, &to.path().join(SRC_DIR)).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
-    }
-
-    #[test]
-    fn copy_src_tree_enforces_the_file_cap() {
-        let from = tempfile::tempdir().unwrap();
-        let src = from.path().join(SRC_DIR);
-        std::fs::create_dir_all(&src).unwrap();
-        for i in 0..=MAX_SRC_FILES {
-            std::fs::write(src.join(format!("f{i}.txt")), "x").unwrap();
-        }
-        let to = tempfile::tempdir().unwrap();
-        let err = copy_src_tree(&src, &to.path().join(SRC_DIR)).unwrap_err();
-        assert!(err.to_string().contains("files"), "{err}");
     }
 }

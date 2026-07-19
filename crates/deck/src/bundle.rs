@@ -22,25 +22,26 @@ pub const OPENAPI_FILE: &str = "openapi.json";
 pub const SERVICE_FILE: &str = "service.js";
 pub const CARD_FILE: &str = "card.html";
 
-/// Byte cap per agent-written source file (`service.js`, `card.html`).
-pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
+/// Byte cap per agent-written source file (`service.js`, `card.html`, and
+/// each `src/` file) — large enough that a card can inline a game's engine
+/// and assets into `card.html`, which (CSP-network-blocked in the iframe) is
+/// the only channel for static assets.
+pub const MAX_SOURCE_BYTES: usize = 30 * 1024 * 1024;
 /// Byte cap on `manifest.json`.
-pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 /// Optional `src/` subdirectory carried verbatim with the bundle: the card's
 /// pre-build sources (e.g. TypeScript compiled to `card.html` with `bun
 /// build` on the host). It is inert data — the gateway never reads or
 /// executes it; it exists so `DeckCardGet` can hand the real sources back for
-/// a cross-chat edit. These caps bound the copy so a stray `node_modules`
-/// can't bloat the deck root.
+/// a cross-chat edit. The total-bytes cap bounds the copy so a stray
+/// `node_modules` can't bloat the deck root.
 pub const SRC_DIR: &str = "src";
-/// Max files under `src/`.
-pub const MAX_SRC_FILES: usize = 32;
 /// Byte cap on the whole `src/` subtree.
-pub const MAX_SRC_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_SRC_TOTAL_BYTES: u64 = 60 * 1024 * 1024;
 /// Floor on a card's declared emit interval; the emit clamp enforces
 /// `max(declared, floor)`.
-pub const MIN_EMIT_INTERVAL_FLOOR_SECS: u64 = 10;
+pub const MIN_EMIT_INTERVAL_FLOOR_SECS: u64 = 1;
 
 /// The service-side SDK version materialized by the current gateway. A
 /// card whose recorded stamp differs gets a re-dry-run at boot (the
@@ -414,7 +415,7 @@ mod tests {
             tmp.path().join(MANIFEST_FILE),
             serde_json::json!({
                 "title": "t", "size": "small",
-                "refresh": {"op": "refresh", "min_emit_interval_secs": 1}
+                "refresh": {"op": "refresh", "min_emit_interval_secs": 0}
             })
             .to_string(),
         )

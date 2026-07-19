@@ -30,14 +30,16 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{DeckError, Result};
 
 /// Per-op-call wall clock: the call fails, the process survives.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bun cold start + module import budget before the spawn counts as a crash.
-pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Byte cap on an accepted emit payload / op result (the snapshot cap).
-pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+pub const SNAPSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
 /// Emits arriving faster than the clamp are coalesced; more than this many
-/// coalesced inside one window is an emit flood (a quarantine strike).
-pub const EMIT_FLOOD_MAX: u64 = 100;
+/// coalesced inside one window is an emit flood (a quarantine strike). Sized
+/// against the 1s emit floor so a legitimately lively (e.g. game) pusher
+/// doesn't trip quarantine — only a pathological tight loop does.
+pub const EMIT_FLOOD_MAX: u64 = 1000;
 
 /// Override for the `bun` binary used to run card services. Shares the
 /// channel-sidecar override name (`sidecar::supervisor::BUN_BINARY_ENV`)
