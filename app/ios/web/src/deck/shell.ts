@@ -31,6 +31,13 @@ const STRINGS: Record<"en" | "zh", Partial<Record<string, string>>> = {
   zh: zh.translation.deck,
 };
 
+/// Reorder is a LONG-PRESS pickup, not a hair-trigger slide: the drag arms
+/// only after the finger has held roughly still on a tile for this long.
+const REORDER_HOLD_MS = 320;
+/// Movement (px) past which the pending long-press is cancelled — a slide is
+/// not a pickup.
+const REORDER_HOLD_TOLERANCE = 10;
+
 type Tile = {
   card: DeckCard;
   el: HTMLElement;
@@ -398,8 +405,8 @@ export class DeckShell {
   // (fixed + translate — its document keeps painting live), a plain-div
   // placeholder holds the target slot via `order`, neighbors FLIP-slide,
   // and the drop is pure style. Zero reloads at any point. In edit mode
-  // the drag arms on the first few px of movement — no hold delay,
-  // matching the wiggle-mode feel.
+  // the drag arms on a LONG PRESS (held roughly still) — a slide alone no
+  // longer reorders, so a stray touch can't rearrange the deck.
 
   private wireDrag(el: HTMLElement, cardId: string): void {
     // The one thing that reliably stops WKWebView's native UIScrollView
@@ -431,14 +438,35 @@ export class DeckShell {
         // degrades to the uncaptured behavior.
       }
       let started = false;
+      // Arm the drag only after a long press held roughly still — a slide no
+      // longer picks a card up.
+      let holdTimer = window.setTimeout(() => {
+        holdTimer = 0;
+        if (this.dragCardId !== null) return;
+        started = true;
+        this.beginDrag(el, cardId, startX, startY);
+        this.lastPoint = { x: startX, y: startY };
+        // A pickup haptic is what makes the long press read as "grabbed".
+        bridge.postHaptic();
+      }, REORDER_HOLD_MS);
+      const clearHold = () => {
+        if (holdTimer !== 0) {
+          clearTimeout(holdTimer);
+          holdTimer = 0;
+        }
+      };
       const move = (ev: PointerEvent) => {
         if (ev.pointerId !== down.pointerId) return;
         if (!started) {
-          if (Math.abs(ev.clientX - startX) < 4 && Math.abs(ev.clientY - startY) < 4) {
-            return;
+          // Before the long press fires, a move past the tolerance cancels
+          // the pickup (the user is sliding, not reordering).
+          if (
+            Math.abs(ev.clientX - startX) > REORDER_HOLD_TOLERANCE ||
+            Math.abs(ev.clientY - startY) > REORDER_HOLD_TOLERANCE
+          ) {
+            clearHold();
           }
-          started = true;
-          this.beginDrag(el, cardId, startX, startY);
+          return;
         }
         this.lastPoint = { x: ev.clientX, y: ev.clientY };
         if (this.dragRaf === 0) {
@@ -449,6 +477,7 @@ export class DeckShell {
         }
       };
       const up = () => {
+        clearHold();
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         window.removeEventListener("pointercancel", up);

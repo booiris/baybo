@@ -121,6 +121,11 @@ export function postMaximize(active: boolean): void {
   post({ type: "maximize", active });
 }
 
+/// Fire a native impact haptic (the long-press reorder pickup).
+export function postHaptic(): void {
+  postSafe({ type: "haptic" });
+}
+
 /// Empty-board "Quick setup": ask native to open a fresh chat on the Chats
 /// tab and auto-send `prompt` (a `/deck …` request) so the user lands in the
 /// conversation already working.

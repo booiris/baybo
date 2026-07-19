@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import WebKit
 
 /// Deck shell ⇄ native bridge (the transcript bridge's shape, deck-sized):
@@ -65,6 +66,9 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             // The shell entered/left a card's full-screen layout; native
             // hides the wordmark header while it's up.
             store?.setMaximized(body["active"] as? Bool ?? false)
+        case "haptic":
+            // The long-press reorder pickup.
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         case "quickSetup":
             // Empty-board CTA: open a fresh chat and auto-send a `/deck …`
             // request.
