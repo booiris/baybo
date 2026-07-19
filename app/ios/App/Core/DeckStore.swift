@@ -174,6 +174,7 @@ final class DeckStore: ObservableObject {
             let snapshots = view.snapshots.map(Self.snapshot(from:))
             state = StatePayload(cards: cards, snapshots: snapshots)
             persist()
+            Self.pruneBundleCache(keeping: Set(cards.map { $0.cardId }))
             bridge?.deliverState(state)
             // A card landed → the empty-board setup finished; drop the
             // in-flight session so the CTA returns to its normal state.
@@ -207,11 +208,23 @@ final class DeckStore: ObservableObject {
     // MARK: shell requests
 
     func requestBundle(cardId: String) {
+        // `spec_hash` is the content hash of the card's bundle files, so a
+        // cached card.html tagged with the current hash IS the current code —
+        // deliver it straight from disk (renders fully offline). Only a new
+        // card or a spec change misses and needs the leg.
+        let specHash = state.cards.first { $0.cardId == cardId }?.specHash
+        if let specHash, let html = Self.cachedBundle(cardId: cardId, specHash: specHash) {
+            bridge?.deliverBundle(cardId: cardId, cardHtml: html)
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
                 let html = try await self.client.deckFetchBundle(cardId: cardId)
                 self.bridge?.deliverBundle(cardId: cardId, cardHtml: html)
+                if let specHash {
+                    Self.cacheBundle(cardId: cardId, specHash: specHash, html: html)
+                }
             } catch {
                 NSLog("deck: bundle fetch failed for %@: %@", cardId, String(describing: error))
             }
@@ -379,6 +392,59 @@ final class DeckStore: ObservableObject {
 
     static func removeMirror() {
         try? FileManager.default.removeItem(at: mirrorURL)
+        // Bundles belong to the departing gateway too.
+        try? FileManager.default.removeItem(at: bundleCacheDir)
+    }
+
+    // MARK: bundle cache
+    //
+    // Each card's `card.html` cached under its `spec_hash` so a card the device
+    // has rendered before paints fully offline on a cold start (the snapshot
+    // DATA is already in the `deck.json` mirror; this holds the rendering CODE).
+    // spec_hash is the content hash of the bundle, so a hash match is a
+    // byte-identical hit and a spec change is a clean miss. Bounded: pruned to
+    // the live card set on refresh, wiped on logout/rebind.
+
+    private struct CachedBundle: Codable {
+        let specHash: String
+        let html: String
+    }
+
+    private static var bundleCacheDir: URL {
+        SessionIndex.supportDirectory().appendingPathComponent("deck-bundles", isDirectory: true)
+    }
+
+    private static func bundleFileURL(_ cardId: String) -> URL {
+        bundleCacheDir.appendingPathComponent(cardId + ".json")
+    }
+
+    private static func cachedBundle(cardId: String, specHash: String) -> String? {
+        guard let data = try? Data(contentsOf: bundleFileURL(cardId)),
+            let entry = try? JSONDecoder().decode(CachedBundle.self, from: data),
+            entry.specHash == specHash
+        else { return nil }
+        return entry.html
+    }
+
+    private static func cacheBundle(cardId: String, specHash: String, html: String) {
+        try? FileManager.default.createDirectory(
+            at: bundleCacheDir, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(CachedBundle(specHash: specHash, html: html))
+        else { return }
+        try? data.write(to: bundleFileURL(cardId), options: .atomic)
+    }
+
+    /// Drop cached bundles for cards no longer live (deleted here or elsewhere).
+    private static func pruneBundleCache(keeping ids: Set<String>) {
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: bundleCacheDir, includingPropertiesForKeys: nil)
+        else { return }
+        for file in files where file.pathExtension == "json" {
+            if !ids.contains(file.deletingPathExtension().lastPathComponent) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
     // MARK: FFI mapping
