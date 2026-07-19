@@ -398,9 +398,16 @@ button {
    wraps within the cap. The table sizes to its (capped) content, and when that
    overflows the reading band it scrolls left/right inside the wrapper (its own
    box) rather than squeezing to fit. */
-.md-table-wrap {
+.md-table-scroller {
   overflow-x: auto;
+  /* Our own indicator bar (below) is the affordance, and it must stay visible
+     even at rest — so suppress the platform overlay bar to avoid doubling up
+     during an active drag. `scrollbar-width` is the standard property; the
+     `-webkit-` pseudo covers WebKit/Blink. (iOS may still flash its own overlay
+     mid-drag regardless; harmless — ours is the persistent one.) */
+  scrollbar-width: none;
 }
+.md-table-scroller::-webkit-scrollbar { display: none; }
 .md-table-wrap table {
   /* max-content = the table takes each column's own content width (capped by the
      cell max-width below) instead of shrinking to fit the band — so a wide table
@@ -448,6 +455,27 @@ button {
   transform: scaleY(0.5);
   transform-origin: bottom;
   pointer-events: none;
+}
+/* Horizontal-scroll indicator for a table wider than the reading band. iOS
+   WKWebView only flashes its overlay scrollbar during an active scroll and
+   ignores `::-webkit-scrollbar`, so an overflowing table reads as static — this
+   bar sits under the table as a persistent "there's more sideways" hint. It is
+   in normal flow (no overlap with the last row) and `display:none` until
+   `Markdown.tsx` adds `.scrollable` on real overflow, so a table that fits adds
+   no height. The thumb's `width`/`translateX` are written inline as the scroll
+   window moves. */
+.md-table-bar {
+  display: none;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-line);
+}
+.md-table-bar.scrollable { display: block; }
+.md-table-bar-thumb {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--color-line-strong);
 }
 
 /* The turn's work block (thinking trace + tool progress). Active: a soft card
