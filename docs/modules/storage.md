@@ -226,7 +226,7 @@ initiated by the user.
 
 ### Hard delete everywhere but `cron_jobs` and `deck_cards`
 
-Deletion is a plain `DELETE FROM` in every table but two: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+Deletion is a plain `DELETE FROM` in every table but two: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it). The one blob-side reap is filesystem scratch, not rows: `SqliteBlobStore` construction removes `<blob_root>/.tmp` entries whose mtime is older than 24h — upload temp files stranded by a crash mid-`put_stream`; younger entries are left alone because another process may still be writing them.
 
 **`cron_jobs` is the first exception: it soft-deletes.** The table carries a `deleted_at INTEGER` tombstone (Unix µs; NULL = live), `CronStore::delete` stamps it, `CronStore::restore` clears it, and no code path anywhere issues a `DELETE FROM cron_jobs`.
 

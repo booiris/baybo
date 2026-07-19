@@ -26,6 +26,13 @@ use baybo_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA
 // `CLAUDE.md`) so neither needs a cfg gate.
 const BLOB_PATH_LOCK_STRIPES: usize = 64;
 
+const INFLIGHT_TMP_DIR: &str = ".tmp";
+
+/// A scratch entry older than this at construction is an orphan from a
+/// crashed mid-upload process and gets reaped; anything younger may
+/// belong to a live upload in another process and is left alone.
+const INFLIGHT_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 pub struct SqliteBlobStore {
     pool: SqlitePool,
     root: PathBuf,
@@ -38,9 +45,11 @@ impl SqliteBlobStore {
     /// for creating `root` (or using [`Self::open`] which does it for
     /// you).
     pub fn new(pool: SqlitePool, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        reap_stale_inflight_tmp(&root);
         Self {
             pool,
-            root: root.into(),
+            root,
             path_locks: new_path_locks(),
         }
     }
@@ -53,11 +62,7 @@ impl SqliteBlobStore {
             .mode(0o700)
             .create(&root)
             .map_err(|e| anyhow::anyhow!("failed to create blob root {}: {e}", root.display()))?;
-        Ok(Self {
-            pool,
-            root,
-            path_locks: new_path_locks(),
-        })
+        Ok(Self::new(pool, root))
     }
 
     fn blob_path(&self, hex: &str, ext: &str) -> PathBuf {
@@ -77,7 +82,7 @@ impl SqliteBlobStore {
     /// shard scan can never collide. Contents are unique-per-attempt
     /// and reaped on success (rename) or error (explicit cleanup).
     fn scratch_dir(&self) -> PathBuf {
-        self.root.join(".tmp")
+        self.root.join(INFLIGHT_TMP_DIR)
     }
 
     async fn content_path_guard(&self, hex: &str, ext: &str) -> tokio::sync::MutexGuard<'_, ()> {
@@ -151,6 +156,33 @@ impl SqliteBlobStore {
                 error = %e,
                 "blob touch failed",
             );
+        }
+    }
+}
+
+/// Construction-time reap of upload scratch leaked by a crash mid-upload
+/// (success renames the file away, error paths delete it — only a crash
+/// strands one). Best-effort: entries past `INFLIGHT_TMP_MAX_AGE` by
+/// mtime are removed, younger ones stay untouched, and any I/O failure
+/// is ignored — the store must construct regardless.
+fn reap_stale_inflight_tmp(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(INFLIGHT_TMP_DIR)) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let stale = now
+            .duration_since(mtime)
+            .map(|age| age > INFLIGHT_TMP_MAX_AGE)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -947,6 +979,40 @@ mod tests {
             let mut left = tokio::fs::read_dir(&scratch).await.unwrap();
             assert!(left.next_entry().await.unwrap().is_none(), "tmp leaked");
         }
+    }
+
+    #[tokio::test]
+    async fn construction_reaps_only_stale_inflight_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        let tmp = root.join(INFLIGHT_TMP_DIR);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let stale = tmp.join("inflight.1.0.aaaa.tmp");
+        let fresh = tmp.join("inflight.2.0.bbbb.tmp");
+        std::fs::write(&stale, b"crashed upload").unwrap();
+        std::fs::write(&fresh, b"live upload").unwrap();
+        let old_mtime = std::time::SystemTime::now()
+            - (INFLIGHT_TMP_MAX_AGE + std::time::Duration::from_secs(3600));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(old_mtime)
+                .set_modified(old_mtime),
+        )
+        .unwrap();
+        drop(file);
+
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let _store = SqliteBlobStore::open(pool, &root).await.unwrap();
+
+        assert!(!stale.exists(), "stale inflight tmp reaped at construction");
+        assert!(
+            fresh.exists(),
+            "young tmp may belong to a live upload elsewhere — untouched"
+        );
     }
 
     #[tokio::test]
