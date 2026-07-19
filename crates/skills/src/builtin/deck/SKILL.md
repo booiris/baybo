@@ -224,8 +224,8 @@ Set `"maximize": true` only if you build a full-screen layout for
 `deck.size === "max"`. On a maximize-capable card the shell shows a ⛶ button
 in the tile's top-right; a tap expands the card (the card never reloads — same
 document, `deck.size` flips to `"max"`). The user restores it with the ✕ in
-the app's header or by **swiping right** — both are handled for you, so a `max`
-layout needs no exit control of its own. The maximized layout **may scroll**
+the app's header or by **swiping in from the left edge** — both are handled for
+you, so a `max` layout needs no exit control of its own. The maximized layout **may scroll**
 (it's the whole screen, not a tile) and is where a card earns its detail: a
 full history, a chart, a table. Rules:
 

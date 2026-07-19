@@ -109,18 +109,24 @@
     },
   };
 
-  // Swipe-right-to-exit while maximized. The card content scrolls only
-  // vertically, so a clearly-horizontal rightward drag is an unambiguous
-  // "collapse" intent — reported to the shell, which runs the restore
-  // animation. Touches inside this iframe never reach the shell document, so
-  // the gesture must be detected here in the injected SDK, not the shell.
+  // Edge-swipe-right-to-exit while maximized: a rightward drag that STARTS at
+  // the left edge (the iOS back-gesture idiom) collapses the card — reported
+  // to the shell, which runs the restore animation. Requiring the edge start
+  // keeps a mid-content horizontal drag from exiting by accident. Touches
+  // inside this iframe never reach the shell document, so the gesture must be
+  // detected here in the injected SDK, not the shell.
+  var EDGE_ZONE = 28;
   let swipeX = 0;
   let swipeY = 0;
   let swiping = false;
   window.addEventListener(
     "touchstart",
     function (e) {
-      if (size !== "max" || e.touches.length !== 1) {
+      if (
+        size !== "max" ||
+        e.touches.length !== 1 ||
+        e.touches[0].clientX > EDGE_ZONE
+      ) {
         swiping = false;
         return;
       }
