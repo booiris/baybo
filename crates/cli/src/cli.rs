@@ -197,6 +197,12 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: CostCmd,
     },
+    /// Workspace maintenance. `gc` reports (and with `--apply` reclaims)
+    /// accumulated scratch in the agent's work directory.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCmd,
+    },
     /// One-shot prompt: send PROMPT to Baybo, stream the assistant's
     /// answer to stdout, then exit — the non-interactive sibling of
     /// `tui`. With no PROMPT argument the prompt is read from stdin, so
@@ -870,6 +876,29 @@ pub enum CostCmd {
         /// Defaults to start-of-tomorrow.
         #[arg(long)]
         until: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCmd {
+    /// Scan the top-level entries of `<workspace>/work` and report what
+    /// is reclaimable, by category: git clones, stale entries (newest
+    /// in-tree mtime older than `--days`), empty directories, and the
+    /// contents of the disposable `work/tmp` scratch dir. Protected
+    /// runtime state (uv cache, tool spills, external-agent roots, …)
+    /// is never listed. Report-only by default; `--apply` deletes each
+    /// category after a y/N confirmation.
+    Gc {
+        /// Staleness threshold in days for the `stale` category.
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+        /// Actually delete the reported entries. Asks y/N per category
+        /// unless `--yes` is also passed.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the per-category confirmation prompts (with `--apply`).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

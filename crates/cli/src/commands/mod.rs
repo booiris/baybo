@@ -19,6 +19,7 @@ pub(crate) mod select;
 pub mod session;
 pub mod skills;
 pub mod status;
+pub mod workspace;
 
 /// Parse a `YYYY-MM-DD` CLI argument with a consistent error message
 /// across every command that accepts a date flag (`--date`, `--since`,

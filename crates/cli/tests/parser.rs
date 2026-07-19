@@ -239,7 +239,9 @@ fn llm_subcommands_parse() {
 }
 
 #[test]
-fn workspace_is_no_longer_a_subcommand() {
+fn workspace_family_exposes_only_gc() {
+    // The family's sole subcommand is `gc`; a bare `workspace` needs a
+    // subcommand and identity editing does not live here.
     for argv in [
         &["baybo", "workspace"][..],
         &["baybo", "workspace", "show"][..],
@@ -254,7 +256,7 @@ fn workspace_is_no_longer_a_subcommand() {
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),
-            "expected rejection of removed workspace subcommand: {argv:?}"
+            "expected rejection of non-gc workspace subcommand: {argv:?}"
         );
     }
 }
@@ -926,5 +928,33 @@ fn log_channel_rejects_path_traversal_and_other_unsafe_inputs() {
             Cli::try_parse_from(argv).is_ok(),
             "expected accept of legitimate channel name: {argv:?}"
         );
+    }
+}
+
+#[test]
+fn workspace_gc_parses_flags_and_defaults() {
+    use baybo_cli::cli::WorkspaceCmd;
+    let cli = parse(&["workspace", "gc"]);
+    match cli.command {
+        Some(Commands::Workspace {
+            cmd: WorkspaceCmd::Gc { days, apply, yes },
+        }) => {
+            assert_eq!(days, 14, "default staleness window");
+            assert!(!apply, "report-only by default");
+            assert!(!yes);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = parse(&["workspace", "gc", "--days", "30", "--apply", "-y"]);
+    match cli.command {
+        Some(Commands::Workspace {
+            cmd: WorkspaceCmd::Gc { days, apply, yes },
+        }) => {
+            assert_eq!(days, 30);
+            assert!(apply);
+            assert!(yes);
+        }
+        other => panic!("unexpected: {other:?}"),
     }
 }
