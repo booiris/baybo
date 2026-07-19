@@ -87,7 +87,9 @@ Both checkpoints call `AgentLoop::maybe_run_background_compression(session, …,
 | End-of-iteration | After tool-result append, before next `compress_if_needed` (`agent_loop.rs`, `job_done = false`) | `tool_calls_since_anchor > 3` |
 | End-of-job | At terminal `Final` of a `UserChat` or `Cron` turn (`agent_loop.rs`, `job_done = true`) | `job_done = true` |
 
-The threshold evaluation itself lives in `ContextManager::maybe_request_background_summary(job_done)` — it returns `Some(BackgroundCompressionPayload { up_to_ordinal })` when the gate passes, `None` otherwise. `maybe_run_background_compression` owns only the at-most-one check and the detached spawn.
+The threshold evaluation itself lives in `ContextManager::maybe_request_background_summary(job_done)` — it returns `Some(BackgroundCompressionPayload { up_to_ordinal })` when the gate passes, `None` otherwise. `maybe_run_background_compression` owns the **lineage skip**, the at-most-one check, and the detached spawn.
+
+**Subagent lineage skip.** Before either gate is measured, `maybe_run_background_compression` returns early for `is_subagent(session)` (`LineageKind::Subagent`). A subagent runs one spawned task to completion and is never resumed, so a precomputed `summary.md` — which only ever feeds a *future* inline compaction of the *same* session — can't pay off; the pass would spend an agentic Read/Edit loop (a runaway one when the model won't converge on the empty-tool-call turn) writing a summary nothing reads. Root `User`/`Cron` sessions still run it.
 
 `up_to_ordinal` is pinned at trigger time to the **latest** `session_messages.ordinal` (`SessionManager::latest_session_ordinal`) so concurrent appends made while the pass runs don't bleed into its input window. The pass loads only the active rows at or below that ordinal.
 
@@ -159,7 +161,9 @@ Key properties:
 2. Load `summary.md` from `<workspace>/state/sessions/<session_id>/summary.md`.
 3. **Seed the notes file when absent** (`ensure_notes_file`): write `DEFAULT_NOTES_TEMPLATE` — the canonical section scaffold — via tempfile + rename, so the model's `Edit` calls always land against a real file.
 4. Append the session-notes prompt after the transcript (`build_summary_prompt`: `PROMPT_TEMPLATE` with `{{notesPath}}` / `{{currentNotes}}` substituted, plus the size-budget appendices — see Appendix A).
-5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session. The loop ends when the model responds without tool calls.
+5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. A **failed `Edit`** carries `FAILED_EDIT_RETRY_GUIDANCE`, which tells the model to `Read` the notes file and re-`Edit`: the prompt embeds the file once, and once an earlier `Edit` lands that snapshot is stale, so a model that dribbles edits across turns keeps missing on `old_string not found`. The prompt embeds the notes and asks for parallel `Edit`s; `Read` stays available for exactly this recovery. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session.
+
+   The loop terminates on the **first** of three conditions: (a) the model responds without tool calls (the happy path — the prompt asks for parallel edits in one message then stop); (b) **converge-or-stop** — `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS` = 3 consecutive rounds issue tool calls but land no successful `Edit` (only `Read`s, or `Edit`s that all errored), meaning the model is thrashing and re-sending the whole transcript for nothing; both (a) and (b) fall through to `record_summary_success` (the edits that landed are kept, cursor advances); (c) the hard cap `MAX_BACKGROUND_SUMMARY_ITERATIONS`, which is pathological non-termination and instead `record_summary_failure`s. A "productive" round is detected by reading the `ERROR:`-prefix convention back off the `Edit` tool_result. The tolerance of 3 covers the intended recovery — a failed `Edit`, then a `Read` to refresh, then a corrected `Edit` — which spends two no-progress rounds before landing. Without (b), a model that never emits an empty-tool-call turn burns all 10 iterations — each re-sending the full (~100K+ token) transcript — before failing.
 6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
    ```sql
    INSERT INTO session_summaries
@@ -279,7 +283,7 @@ A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadat
 
 ## Subagent Inheritance
 
-- **Subagent sessions** (`LineageKind::Subagent`): start fresh, no summary inheritance (φ-ii a). Almost never long enough to trigger; if they do, develop their own.
+- **Subagent sessions** (`LineageKind::Subagent`): **never run the background pass** — `maybe_run_background_compression` skips them via `is_subagent(session)` (see "Subagent lineage skip" under Trigger Conditions). They still compress inline if a single spawned task somehow outgrows the budget; they just never precompute a `summary.md` that would only feed a resumption they never get.
 
 `<workspace>/state/sessions/<id>/summary.md` is strictly per-session — no symlinks, no shared paths.
 

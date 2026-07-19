@@ -281,6 +281,124 @@ async fn background_pass_writes_summary_and_advances_cursor_without_extra_sessio
     );
 }
 
+/// Build a callback modelling a model that lands one real `Edit`, then
+/// never terminates: every later call re-issues an `Edit` against the
+/// already-replaced marker, so the real `EditTool` errors (`ERROR:`
+/// tool_result) and the round makes no progress. Counts calls so the test
+/// can assert the pass bailed early instead of re-sending the transcript up
+/// to the hard iteration cap.
+fn fake_edit_then_thrash(
+    notes_path: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> baybo_context::BackgroundSummaryCallback {
+    use std::sync::atomic::Ordering;
+    Box::new(move |_req, _marker| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let notes_path = notes_path.clone();
+        Box::pin(async move {
+            // Round 0 replaces the seeded marker; every later round tries to
+            // replace it again — it is gone, so the Edit fails and the round
+            // is unproductive.
+            let new_string = if n == 0 {
+                PASS_SUMMARY_TEXT
+            } else {
+                "irrelevant"
+            };
+            let response = LlmResponse {
+                content: String::new(),
+                content_blocks: vec![],
+                tool_calls: vec![ToolCallInfo {
+                    id: format!("edit-{n}"),
+                    name: "Edit".into(),
+                    arguments: serde_json::json!({
+                        "file_path": notes_path.display().to_string(),
+                        "old_string": SEEDED_WORKLOG_MARKER,
+                        "new_string": new_string,
+                    }),
+                    signature: None,
+                }],
+                usage: TokenUsage::default(),
+                thinking: None,
+            };
+            Ok(SummaryChatRun {
+                response,
+                span_id: format!("span-{n}"),
+                cost_micros: 100,
+            })
+        })
+    })
+}
+
+/// A model that keeps calling tools but stops making progress must NOT burn
+/// the full iteration cap: the pass bails after `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS`
+/// no-progress rounds, keeps the edits that landed, and records the pass as a
+/// SUCCESS (cursor advances) — not the hard-cap failure. Regression guard for
+/// the runaway background loop that re-sent a ~129K-token transcript ten times.
+#[tokio::test]
+async fn background_pass_stops_early_when_model_stops_making_progress() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-thrash");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    ));
+
+    let up_to_ordinal = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::user(vec![ContentBlock::Text("summarize this".into())]),
+        )
+        .await
+        .unwrap();
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = run_background_summary(
+        config,
+        fake_edit_then_thrash(notes_path.clone(), Arc::clone(&calls)),
+    )
+    .await
+    .expect("early-stop must resolve as success, not the iteration-cap error");
+
+    // One productive round + three no-progress rounds (the third trips
+    // MAX_UNPRODUCTIVE_SUMMARY_ROUNDS = 3) = 4 LLM calls, far under the
+    // 10-iteration hard cap.
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "pass must bail after MAX_UNPRODUCTIVE_SUMMARY_ROUNDS, not spin to the cap"
+    );
+
+    // The one real Edit is kept and the cursor advanced — a successful pass.
+    assert_eq!(outcome.cursor, up_to_ordinal);
+    let body = tokio::fs::read_to_string(&notes_path).await.unwrap();
+    assert!(
+        body.contains(PASS_SUMMARY_TEXT),
+        "the landed edit must survive"
+    );
+    let meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(
+        meta.pass_count, 1,
+        "early-stop records success, not failure"
+    );
+    assert_eq!(meta.error_count, 0);
+}
+
 #[tokio::test]
 async fn agent_background_pass_records_compression_step_on_parent_job() {
     let workspace_root = TempDir::new().expect("tempdir");

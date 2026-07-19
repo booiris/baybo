@@ -405,23 +405,30 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
     }
 }
 
+/// True for sessions spawned as a subagent (lineage `Subagent`); false for
+/// root sessions (no lineage). The single home for the subagent-vs-root
+/// classification — exhaustive on `LineageKind` so a new spawn kind forces a
+/// decision here rather than silently defaulting at each call site.
+fn is_subagent(session: &Session) -> bool {
+    match &session.lineage {
+        None => false,
+        Some(l) => match &l.kind {
+            LineageKind::Subagent => true,
+        },
+    }
+}
+
 /// Whether the `on_session_end` memory hook should fire for this session.
 /// The session-level analogue of [`memory_recall_query`]: only sessions a person
 /// would call "theirs" — root `User`/`Cron` sessions, not subagents.
 /// Subagent actors send `ActorStop` when they finish, but their shutdown
-/// is not a user-session ending. Exhaustive arms force a classification
-/// when a new `TriggerSource` / `LineageKind` variant is added.
+/// is not a user-session ending. The exhaustive `TriggerSource` arm forces a
+/// classification when a new trigger variant is added.
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
     };
-    let user_lineage = match &session.lineage {
-        None => true,
-        Some(l) => match &l.kind {
-            LineageKind::Subagent => false,
-        },
-    };
-    user_trigger && user_lineage
+    user_trigger && !is_subagent(session)
 }
 
 pub struct AgentLoop {
@@ -2727,6 +2734,16 @@ impl AgentLoop {
         current_job_id: JobId,
         job_done: bool,
     ) {
+        // Subagents run a single spawned task to completion and are never
+        // resumed, so a precomputed `summary.md` — which only ever feeds a
+        // *future* inline compaction of the same session — can't pay off.
+        // Skip rather than spend an agentic Read/Edit loop (a runaway one when
+        // the model won't converge) on a summary nothing will read. Root
+        // User/Cron sessions still run it.
+        if is_subagent(session) {
+            return;
+        }
+
         // At-most-one: a still-running pass blocks a second.
         if let Some(handle) = self.bg_compression.as_ref()
             && !handle.is_finished()
@@ -3337,8 +3354,9 @@ mod session_end_gate_tests {
     //! `should_fire_session_end` decides whether `Memory::on_session_end`
     //! runs when an actor processes `ActorStop`. Subagent actors also stop,
     //! but their teardown is not a user-session ending — firing the hook for
-    //! them would write garbage memory.
-    use super::should_fire_session_end;
+    //! them would write garbage memory. Also covers the shared `is_subagent`
+    //! predicate that gates the background-summary pass (subagents skip it).
+    use super::{is_subagent, should_fire_session_end};
     use baybo_model::{
         ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,
         User,
@@ -3405,6 +3423,21 @@ mod session_end_gate_tests {
         assert!(!should_fire_session_end(&session_with(
             TriggerSource::User,
             Some(lineage),
+        )));
+    }
+
+    #[test]
+    fn is_subagent_true_only_for_lineage_subagent() {
+        assert!(!is_subagent(&session_with(TriggerSource::User, None)));
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::Subagent,
+        };
+        assert!(is_subagent(&session_with(
+            TriggerSource::User,
+            Some(lineage)
         )));
     }
 }

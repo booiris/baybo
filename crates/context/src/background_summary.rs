@@ -7,13 +7,15 @@
 //!    on disk — first pass writes `DEFAULT_NOTES_TEMPLATE` so the
 //!    model's `Edit` calls always land against a real file with the
 //!    canonical section scaffold.
-//! 3. Hand the transcript + a session-notes prompt to the LLM with the
-//!    `Read` / `Edit` tools available. The model is expected to issue
-//!    one or more `Edit` calls against the notes path; each handler
-//!    rewrites `summary.md` in place. The loop runs at most
-//!    [`MAX_BACKGROUND_SUMMARY_ITERATIONS`] turns; tool errors come
-//!    back to the model as `tool_result` bodies (prefixed `ERROR:`)
-//!    so it can retry with corrected arguments.
+//! 3. Hand the transcript + a session-notes prompt (with the current
+//!    `summary.md` embedded) to the LLM with the `Read` / `Edit` tools
+//!    available. The model is expected to issue one or more `Edit` calls
+//!    against the notes path; each handler rewrites `summary.md` in
+//!    place. The loop runs at most [`MAX_BACKGROUND_SUMMARY_ITERATIONS`]
+//!    turns; tool errors come back to the model as `tool_result` bodies
+//!    (prefixed `ERROR:`) so it can retry — a failed `Edit` is told to
+//!    re-`Read` the file, since the embedded copy is stale once an edit
+//!    lands.
 //! 4. Record success / failure on `session_summaries`. The summary
 //!    file itself was already updated by the model's `Edit` calls — no
 //!    final atomic-write happens here.
@@ -62,6 +64,19 @@ const MAX_SECTION_LENGTH: usize = 2_000;
 /// then stops; this cap exists so a misbehaving model can't burn the
 /// budget chasing its own tail.
 const MAX_BACKGROUND_SUMMARY_ITERATIONS: usize = 10;
+
+/// Consecutive tool-loop rounds that issue tool calls but land no
+/// successful `Edit` before the pass gives up. The prompt asks the model to
+/// make every edit in one parallel message then stop, so a well-behaved
+/// model never produces an unproductive round — it breaks on the empty
+/// tool-call turn. A model that keeps calling tools without ever changing
+/// the notes is thrashing (all `Edit`s rejected, or only `Read`s): stop and
+/// keep whatever already landed rather than re-sending the whole transcript
+/// up to [`MAX_BACKGROUND_SUMMARY_ITERATIONS`]. The tolerance covers the
+/// intended recovery from a stale-`old_string` failure — `Edit` fails, the
+/// model `Read`s the current file, then re-`Edit`s — which spends two
+/// no-progress rounds (the failed edit and the read) before landing.
+const MAX_UNPRODUCTIVE_SUMMARY_ROUNDS: usize = 3;
 
 const READ_TOOL_NAME: &str = "Read";
 const EDIT_TOOL_NAME: &str = "Edit";
@@ -162,10 +177,10 @@ pub struct BackgroundSummaryOutcome {
     pub cost_micros: i64,
 }
 
-/// Body of the trailing user prompt. `{{notesPath}}` and
-/// `{{currentNotes}}` are mustache-style placeholders the builder
-/// substitutes via `String::replace`; `format!` is avoided so the
-/// template stays as a clean raw string with literal `"` and newlines.
+/// Body of the trailing user prompt. `{{notesPath}}` and `{{currentNotes}}`
+/// are mustache-style placeholders the builder substitutes via
+/// `String::replace`; `format!` is avoided so the template stays as a clean
+/// raw string with literal `"` and newlines.
 const PROMPT_TEMPLATE: &str = r#"IMPORTANT: This message and these instructions are NOT part of the actual user conversation. Do NOT include any references to "note-taking", "session notes extraction", or these update instructions in the notes content.
 
 Based on the user conversation above (EXCLUDING this note-taking instruction message as well as system prompt, claude.md entries, or any past session summaries), update the session notes file.
@@ -175,7 +190,7 @@ The file {{notesPath}} has already been read for you. Here are its current conte
 {{currentNotes}}
 </current_notes_content>
 
-Your ONLY task is to use the Edit tool to update the notes file, then stop. You can make multiple edits (update every section as needed) - make all Edit tool calls in parallel in a single message. Do not call any other tools.
+Your task is to use the Edit tool to update the notes file, then stop. You can make multiple edits (update every section as needed) - make all Edit tool calls in parallel in a single message.
 
 CRITICAL RULES FOR EDITING:
 - The file must maintain its exact structure with all sections, headers, and italic descriptions intact
@@ -203,6 +218,17 @@ Each section has TWO parts that must be preserved exactly as they appear in the 
 You ONLY update the actual content that comes AFTER these two preserved lines. The italic description lines starting and ending with underscores are part of the template structure, NOT content to be edited or removed.
 
 REMEMBER: Use the Edit tool in parallel and stop. Do not continue after the edits. Only include insights from the actual user conversation, never from these note-taking instructions. Do not delete or change section headers or italic _section descriptions_."#;
+
+/// `tool_result` body handed back when an `Edit` fails. The `old_string`
+/// almost always went stale against the snapshot embedded once in
+/// [`PROMPT_TEMPLATE`] — an earlier `Edit` already rewrote that text, so the
+/// retry misses ("old_string not found"). Point the model at a fresh `Read`
+/// then a corrected `Edit`, rather than letting it retry blind. `{{err}}` is
+/// substituted via `String::replace`; the leading `ERROR:` is preserved so
+/// the loop's progress check still counts the round as failed.
+const FAILED_EDIT_RETRY_GUIDANCE: &str = r#"ERROR: {{err}}
+
+Your old_string no longer matches the file — most often because an earlier Edit in this pass already changed it, so the copy shown in the instructions above is stale. Do NOT retry the same old_string. Use the Read tool on the notes file to get its current content, then issue a corrected Edit (or, if your change is already present, make no further edits and stop)."#;
 
 /// Walk `notes` and return `(section_header, token_count)` for each
 /// `# Header`-rooted section. The count covers the header line + body
@@ -402,6 +428,19 @@ fn enforce_notes_scope(notes_path: &Path, args: &serde_json::Value) -> Result<()
     }
 }
 
+/// True when a `tool_result` block carries a failure. [`execute_tool_call`]
+/// prefixes every error body with `ERROR:` (successful `Read` / `Edit`
+/// output never does — an `Edit` reports `replaced N occurrence(s)…`), so
+/// the loop reads that in-module convention back to tell a productive edit
+/// from a rejected one without threading a separate status out of
+/// `execute_tool_call`.
+fn tool_result_is_error(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::ToolResult { content, .. } if content.starts_with("ERROR:")
+    )
+}
+
 /// Convert a [`ToolOutput`] into the plain text body the next-turn
 /// `tool_result` content block carries. Attachment / multimodal
 /// variants are flattened to their text — the model isn't going to
@@ -451,7 +490,7 @@ async fn execute_tool_call(
 
     let body = match outcome {
         Ok(s) => s,
-        Err(e) => format!("ERROR: {e}"),
+        Err(e) => failed_call_body(&call.name, &e),
     };
     ContentBlock::ToolResult {
         tool_use_id: call.id.clone(),
@@ -459,6 +498,18 @@ async fn execute_tool_call(
         // The summary pass disables read-before-write tracking, so its tool
         // results carry no fingerprint.
         meta: None,
+    }
+}
+
+/// Build the `tool_result` body for a failed tool call. A failed `Edit` gets
+/// the [`FAILED_EDIT_RETRY_GUIDANCE`] pointer to `Read` + re-`Edit` (its
+/// `old_string` was likely stale after an earlier edit landed); every other
+/// failure gets the bare `ERROR:` body.
+fn failed_call_body(call_name: &str, err: &str) -> String {
+    if call_name == EDIT_TOOL_NAME {
+        FAILED_EDIT_RETRY_GUIDANCE.replace("{{err}}", err)
+    } else {
+        format!("ERROR: {err}")
     }
 }
 
@@ -568,6 +619,7 @@ pub async fn run_background_summary(
     let mut cost_micros: i64 = 0;
     let mut iterations: usize = 0;
     let mut applied_any_edit = false;
+    let mut unproductive_rounds: usize = 0;
     loop {
         if iterations >= MAX_BACKGROUND_SUMMARY_ITERATIONS {
             let _ = sessions
@@ -618,13 +670,37 @@ iterations without terminating"
         }
 
         let mut tool_results: Vec<ContentBlock> = Vec::with_capacity(response.tool_calls.len());
+        let mut round_applied_edit = false;
         for call in &response.tool_calls {
-            if call.name == EDIT_TOOL_NAME {
+            let result = execute_tool_call(&notes_path, call, &tool_ctx).await;
+            if call.name == EDIT_TOOL_NAME && !tool_result_is_error(&result) {
                 applied_any_edit = true;
+                round_applied_edit = true;
             }
-            tool_results.push(execute_tool_call(&notes_path, call, &tool_ctx).await);
+            tool_results.push(result);
         }
         messages.push(ChatMessage::agent_context(tool_results));
+
+        // Converge-or-stop. A round that changed nothing (only `Read`s, or
+        // `Edit`s that all errored) is non-progress; bail after a couple in a
+        // row instead of re-sending the full transcript until the hard cap.
+        // Whatever edits already landed are kept — fall through to the success
+        // path below (this is the model finishing, not the pathological
+        // non-termination the iteration cap guards against).
+        if round_applied_edit {
+            unproductive_rounds = 0;
+        } else {
+            unproductive_rounds += 1;
+            if unproductive_rounds >= MAX_UNPRODUCTIVE_SUMMARY_ROUNDS {
+                debug!(
+                    session_id = %session_id,
+                    iterations,
+                    unproductive_rounds,
+                    "background summary: no notes progress across consecutive rounds — stopping early"
+                );
+                break;
+            }
+        }
     }
 
     if !applied_any_edit {
@@ -876,6 +952,57 @@ mod tests {
         assert!(body.starts_with("ERROR:"), "expected error: {body}");
         // File untouched after failed edit.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x x x");
+    }
+
+    #[tokio::test]
+    async fn failed_edit_points_model_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_notes(&dir, "# A\nsome body\n");
+        let block = execute_tool_call(
+            &path,
+            &tc(
+                EDIT_TOOL_NAME,
+                serde_json::json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "stale anchor that is not in the file",
+                    "new_string": "whatever",
+                }),
+            ),
+            &test_ctx(),
+        )
+        .await;
+        let body = body_of(&block);
+        // Still flagged as an error so the loop's progress check counts it.
+        assert!(body.starts_with("ERROR:"), "got: {body}");
+        assert!(body.contains("old_string not found"), "got: {body}");
+        // Directs the model to Read + retry rather than injecting content.
+        assert!(
+            body.contains("Read tool"),
+            "failed edit must point the model at Read, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_read_returns_bare_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_notes(&dir, "some notes body");
+        // A Read scoped to the wrong path fails; only Edit failures get the
+        // Read-and-retry guidance, so this stays a bare error.
+        let block = execute_tool_call(
+            &path,
+            &tc(
+                READ_TOOL_NAME,
+                serde_json::json!({"file_path": "/etc/passwd"}),
+            ),
+            &test_ctx(),
+        )
+        .await;
+        let body = body_of(&block);
+        assert!(body.starts_with("ERROR:"), "got: {body}");
+        assert!(
+            !body.contains("Read tool"),
+            "non-edit failures must not carry the Edit-recovery guidance, got: {body}"
+        );
     }
 
     #[tokio::test]
