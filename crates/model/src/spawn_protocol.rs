@@ -187,8 +187,10 @@ pub enum SubagentExitStatus {
 /// surfaced to the parent LLM as the "dispatched" handle, so a later
 /// notification can name the same id the parent saw at dispatch time.
 /// `label` is a short display title (the subagent task summary, or the
-/// command line); `summary_text` is the result body shown in the
-/// notification (the subagent's report, or the command's output tail).
+/// command line); `summary_text` is the result body carried into the
+/// **LLM-only** notification prompt (the subagent's report, or the command's
+/// output tail) — the user never sees it directly, only the parent's analysed
+/// report of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingBackgroundResult {
     pub handle_id: String,

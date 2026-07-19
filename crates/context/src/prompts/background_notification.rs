@@ -7,10 +7,11 @@
 
 use baybo_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
 
-/// Deterministic assistant-reply lead sent before the parent starts analysing
-/// a finished background batch.
+/// Assistant-reply lead sent before the parent starts analysing a finished
+/// background batch. Carries no result content (see [`build_completion_reply`]);
+/// `{{count_noun}}` is pluralised per batch size ("result" / "results").
 const BACKGROUND_COMPLETION_REPLY_LEAD: &str =
-    "Background work has finished. I'm reviewing the result now.";
+    "Background work has finished. I'm reviewing the {{count_noun}} now.";
 
 /// Opening framing for a notification turn's content. Lives in per-turn
 /// content (never the system prompt) so the prompt-cache prefix is identical
@@ -44,24 +45,27 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="
 /// failure) and left permanent rows in the append-only log.
 const RETRY_CUE: &str = "[the user has received only the completion acknowledgement; no complete report for the background results above has reached them yet — produce the complete report now.]";
 
-/// Build the persisted, non-LLM completion reply that precedes the streamed
-/// analysis turn. It includes each result's bounded `summary_text` so the user
-/// immediately sees what finished while the parent prepares its full report.
+/// Build the persisted, user-facing acknowledgement that precedes the streamed
+/// analysis turn. It is a bland "work finished, reviewing now" notice with **no
+/// result content**: a finished job's raw output stays LLM-only (it rides
+/// [`build_notification_content`] as a hidden `agent_context` row), so the user
+/// learns the actual outcome solely from the parent's analysed report, never
+/// from the unprocessed result body.
+///
+/// Keeping the raw result out of this row is load-bearing, not cosmetic: the
+/// row is an ordinary assistant bubble, so anything in it also renders in the
+/// chat transcript, is full-text indexed (`is_searchable()`), and can surface
+/// as the chat-list preview — all of which must show only what the parent
+/// chose to report.
 pub fn build_completion_reply(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
-    let mut reply = String::from(BACKGROUND_COMPLETION_REPLY_LEAD);
-    if pending.len() == 1 {
-        reply.push_str("\n\nSummary:\n");
-        reply.push_str(&truncate_for_notice(&pending[0].summary_text));
-    } else if !pending.is_empty() {
-        reply.push_str("\n\nSummaries:");
-        for result in pending {
-            reply.push_str("\n\n");
-            reply.push_str(&result.label);
-            reply.push_str(":\n");
-            reply.push_str(&truncate_for_notice(&result.summary_text));
-        }
-    }
-    vec![ContentBlock::Text(reply)]
+    let count_noun = if pending.len() > 1 {
+        "results"
+    } else {
+        "result"
+    };
+    vec![ContentBlock::Text(
+        BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", count_noun),
+    )]
 }
 
 /// The request-time retry cue (see [`RETRY_CUE`]). Stateless — the same for
@@ -223,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_reply_is_deterministic_assistant_copy() {
+    fn completion_reply_is_bland_acknowledgement_without_result() {
         let pending = vec![PendingBackgroundResult::subagent(
             "h1",
             "explorer",
@@ -232,16 +236,18 @@ mod tests {
             "found it at src/lib.rs",
             SubagentExitStatus::Completed,
         )];
+        // The raw result is LLM-only (it rides build_notification_content), so
+        // the user-facing acknowledgement is exactly the lead — no result body.
         assert_eq!(
             build_completion_reply(&pending),
             vec![ContentBlock::Text(
-                "Background work has finished. I'm reviewing the result now.\n\nSummary:\nfound it at src/lib.rs".into()
+                BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "result")
             )]
         );
     }
 
     #[test]
-    fn completion_reply_labels_batched_summaries() {
+    fn completion_reply_omits_every_result_body_for_a_batch() {
         let pending = vec![
             PendingBackgroundResult::subagent(
                 "h1",
@@ -263,8 +269,22 @@ mod tests {
         let ContentBlock::Text(reply) = &build_completion_reply(&pending)[0] else {
             panic!("completion reply must be text");
         };
-        assert!(reply.contains("Summaries:"));
-        assert!(reply.contains("first task:\nfirst summary"));
-        assert!(reply.contains("second task:\nsecond summary"));
+        assert_eq!(
+            reply,
+            &BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "results")
+        );
+        // Neither a result body nor a task label may leak into the batch
+        // acknowledgement.
+        for leaked in [
+            "first summary",
+            "second summary",
+            "first task",
+            "second task",
+        ] {
+            assert!(
+                !reply.contains(leaked),
+                "acknowledgement leaked job content: {leaked:?} in {reply:?}"
+            );
+        }
     }
 }
