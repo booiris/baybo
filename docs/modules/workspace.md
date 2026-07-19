@@ -22,7 +22,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   agents/          # standalone git repo: subagent profile definitions
   .key/            # not version-controlled: encryption.key (mode 0600)
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile, sessions/<id>/summary.md
-  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, future scratch
+  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
   logs/            # not version-controlled: baybo.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
 ```
 
@@ -49,6 +49,7 @@ checkout rather than polluting the real user home.
 | uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
 | browser fonts    | `<workspace.path>/work/.fonts/`            |
 | tool-output spills | `<workspace.path>/work/.baybo-tool-spills/` |
+| disposable scratch | `<workspace.path>/work/tmp/` (`WORK_TMP_SUBDIR`; janitor-swept, see below) |
 | gateway logs     | `<workspace.path>/logs/baybo.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
 | session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read) |
@@ -59,7 +60,7 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/` if missing.
+- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
 - Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, and `agents/` if the directory isn't already a git repo (`<dir>/.git` check).
 
 `config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
@@ -87,6 +88,27 @@ Identity file changes usually affect the system prompt; memory changes usually a
 - **memory**: retrievable, recallable, and expirable user memory
 
 They complement each other without overlapping.
+
+### Scratch hygiene: `work/tmp` + `baybo workspace gc`
+
+`work/` is the agent's only writable surface — every chat, cron fire, and
+subagent shares it flat, and nothing in it is deleted implicitly, so it
+accumulates. Two mechanisms keep it bounded:
+
+- **`work/tmp/` is the disposable-scratch convention.** `WORK_TMP_SUBDIR`
+  + `work_tmp_dir()` name it, `ensure_layout` creates it, and the Bash
+  tool description tells the model to put intermediate files there while
+  keeping user-facing deliverables elsewhere under `work/`. The janitor
+  removes any `work/tmp` top-level entry whose newest in-tree mtime is
+  older than `WORK_TMP_TTL_DAYS` (7 — the const lives here so the sweep
+  and the model-facing prompt quote one number); see
+  [`janitor.md`](janitor.md).
+- **`baybo workspace gc`** is the user-triggered reclaim for the rest of
+  `work/`: it reports git clones, stale entries, empty dirs, and `tmp/`
+  contents, and deletes only with `--apply` + per-category confirmation.
+  Runtime state dirs (`.uv/`, `.fonts/`, `.baybo-tool-spills/`, the
+  external-agent roots, …) are never touched; see
+  [`cli.md`](cli.md).
 
 ### Why split state/work/logs from profile/skills
 

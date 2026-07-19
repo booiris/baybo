@@ -14,7 +14,7 @@ impl WorkspaceManager {
     }
 
     /// Materialise the workspace skeleton: create `config/`, `profile/`,
-    /// `skills/`, `.key/`, `state/`, `work/`, `logs/`, and initialise a
+    /// `skills/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/`, and initialise a
     /// standalone git repo inside each of `config/`, `profile/`, and
     /// `skills/` if it isn't one already. Idempotent — safe to call on
     /// every boot.
@@ -33,6 +33,7 @@ impl WorkspaceManager {
             // the parent dir exists so the lazy create can land.
             paths.state_sessions_dir(),
             paths.work_dir(),
+            paths.work_tmp_dir(),
             paths.logs_dir(),
         ] {
             tokio::fs::create_dir_all(&dir)
@@ -175,6 +176,7 @@ mod tests {
             paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
+            paths.work_tmp_dir(),
             paths.logs_dir(),
         ] {
             assert!(d.exists(), "missing dir {}", d.display());

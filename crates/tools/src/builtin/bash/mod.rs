@@ -74,7 +74,8 @@ const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 /// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
 /// `{{work_dir_scope}}` (writability), and `{{python_runtime}}` (uv-shimmed vs
 /// native) — substituted by [`render_description`] along with
-/// `{{max_output_kib}}`, `{{work_dir}}`, and `{{platform}}`. Each varying section
+/// `{{max_output_kib}}`, `{{work_dir}}`, `{{work_tmp_dir}}`,
+/// `{{work_tmp_ttl_days}}`, and `{{platform}}`. Each varying section
 /// describes ONLY its own concern so a permission swap re-skins exactly what changed
 /// and nothing is said twice. Work-dir/platform live here, not the system
 /// prompt, so they sit next to the tool that consumes them.
@@ -92,6 +93,8 @@ Reserve Bash for system commands, git operations, build/test, and terminal tasks
 {{approval}}
 
 DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
+
+SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}.
 
 PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
 
@@ -376,6 +379,17 @@ fn render_description(
         .replace("{{python_runtime}}", python_runtime)
         .replace("{{approval}}", approval)
         .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
+        .replace(
+            "{{work_tmp_dir}}",
+            &work_dir
+                .join(baybo_workspace::paths::WORK_TMP_SUBDIR)
+                .display()
+                .to_string(),
+        )
+        .replace(
+            "{{work_tmp_ttl_days}}",
+            &baybo_workspace::paths::WORK_TMP_TTL_DAYS.to_string(),
+        )
         .replace("{{work_dir}}", &work_dir.display().to_string())
         .replace("{{platform}}", platform)
 }
