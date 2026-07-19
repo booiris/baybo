@@ -268,7 +268,5 @@ The dry-run gate (§Authoring pipeline) covers tool-path install/update, but pat
 ## Deferred and open items
 
 - **Web parity** (`app/web` `/deck` page) — deferred; requires extracting the shell from `app/ios/web`.
-- **WebKit probe** — CSP-meta + `srcdoc` behavior inside a custom-scheme page (simulator, day one).
-- **Quota data sources** — the motivating card's weakest link: Anthropic usage/cost needs an org admin key; Claude-Max and Codex usage endpoints are unofficial. Expect iteration against unofficial APIs; the architecture is indifferent.
 - **Egress budgets** — considered, declined; revisit only if a real card burns real quota.
 - **Vendored SDK pinning** — documented escape hatch, not scheduled.
