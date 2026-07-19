@@ -220,21 +220,22 @@ body {
   display: none;
 }
 
-/* ⛶ maximize / ✕ close — one button, top-right, outside edit mode. Shown on
-   a maximize-capable tile; while a card is maximized only that tile keeps it
-   (as the ✕). Sits where a card's heading never does (top-left), honoring
-   the SKILL's "leave the top-right clear" rule. */
+/* ⛶ maximize — the tile's own top-right control, shown on a maximize-capable
+   card outside edit mode. Borderless (a bare ink glyph, per the app's line
+   minimalism); the card's max layout reserves the corner for it. EXIT from a
+   maximized card is the native header's ✕ (true top-right corner, above the
+   header veil the webview can't paint over), so the tile button hides entirely
+   while any card is maximized. */
 .deck-max-btn {
   position: absolute;
   top: 6px;
   right: 6px;
   width: 30px;
   height: 30px;
-  border-radius: 50%;
-  border: 1px solid var(--deck-line);
-  background: rgba(255, 255, 255, 0.92);
+  border: none;
+  background: transparent;
   color: var(--deck-ink);
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1;
   display: none;
   align-items: center;
@@ -244,11 +245,18 @@ body {
 .deck-grid:not(.editing) .deck-card.can-maximize .deck-max-btn {
   display: flex;
 }
-.deck-grid.has-max .deck-card:not(.maximized) .deck-max-btn {
+.deck-grid.has-max .deck-max-btn {
   display: none;
 }
 .deck-max-btn:active {
-  opacity: 0.7;
+  opacity: 0.5;
+}
+
+/* A maximized card fills a fixed overlay; the grid behind it must not scroll
+   (its scrollbar would peek at the screen edge). Locked while maximized. */
+html.deck-maximized,
+html.deck-maximized body {
+  overflow: hidden;
 }
 
 @keyframes deck-wiggle {
@@ -321,13 +329,6 @@ body {
     top 260ms cubic-bezier(0.2, 0, 0, 1),
     width 260ms cubic-bezier(0.2, 0, 0, 1),
     height 260ms cubic-bezier(0.2, 0, 0, 1);
-}
-/* The header STAYS visible on a maximized card, so the ✕ drops below it
-   (the grid's header offset is safe-area + 54px) into the card's top-right,
-   where the card's own max layout reserves space for it. */
-.deck-card.maximized .deck-max-btn {
-  top: calc(env(safe-area-inset-top) + 60px);
-  right: calc(env(safe-area-inset-right) + 14px);
 }
 
 /* Cards must never receive pointer events while editing — the drag owns

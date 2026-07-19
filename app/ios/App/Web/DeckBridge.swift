@@ -149,6 +149,11 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
         eval("setSetupInflight", active ? "true" : "false")
     }
 
+    /// Ask the shell to collapse the maximized card (the native header's ✕).
+    func restoreMaximized() {
+        eval("restoreMaximized", "")
+    }
+
     func setLanguage(_ code: String) {
         evalEncodable("setLanguage", code)
     }

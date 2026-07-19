@@ -136,10 +136,16 @@ final class DeckStore: ObservableObject {
     }
 
     /// The shell entered/left a card's maximized layout. Purely reflective —
-    /// the shell owns the animation and card state; native only hides the
-    /// header so the maximized card is unobstructed.
+    /// the shell owns the animation and card state; native reflects it in the
+    /// header (the edit pill becomes a ✕).
     func setMaximized(_ active: Bool) {
         maximized = active
+    }
+
+    /// Header ✕ tapped: ask the shell to collapse the maximized card. The
+    /// shell drives the animation and echoes `maximize=false` back.
+    func requestRestore() {
+        bridge?.restoreMaximized()
     }
 
     /// Set (or clear, with nil) the in-flight card-setup session and reflect

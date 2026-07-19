@@ -36,6 +36,9 @@ window.deckShell = {
   setSetupInflight(active) {
     shell.setSetupInflight(active);
   },
+  restoreMaximized() {
+    shell.restoreMaximizedCard();
+  },
 };
 
 // Native buffers deckShell calls until this lands (the transcript

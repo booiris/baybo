@@ -646,8 +646,9 @@ export class DeckShell {
 
     this.maximizedCardId = cardId;
     this.grid.classList.add("has-max");
+    // Lock the grid page behind the fixed overlay so its scrollbar can't peek.
+    document.documentElement.classList.add("deck-maximized");
     el.classList.add("maximized");
-    tile.maxBtn.textContent = "✕";
 
     // Lift out of flow at the exact on-screen rect, commit that starting
     // frame, then transition to fill the viewport.
@@ -690,10 +691,8 @@ export class DeckShell {
     el.style.width = `${target.width}px`;
     el.style.height = `${target.height}px`;
 
-    // State (card size, glyph, native header) flips now; only the geometry
-    // animates.
+    // State (card size, native header) flips now; only the geometry animates.
     tile.port?.postMessage({ type: "size", size: tile.card.size });
-    tile.maxBtn.textContent = "⛶";
     bridge.postMaximize(false);
     this.maximizedCardId = null;
 
@@ -703,10 +702,17 @@ export class DeckShell {
       ph.remove();
       this.maxPlaceholder = null;
       this.grid.classList.remove("has-max");
+      document.documentElement.classList.remove("deck-maximized");
       this.maxAnimating = false;
       // cssText wipe cleared `order`/`data-size` — reconcile re-applies them.
       this.reconcileTiles();
     });
+  }
+
+  /// Restore the maximized card — the entry point for the native header's ✕
+  /// (which lives in the true top-right corner the webview can't paint over).
+  restoreMaximizedCard(): void {
+    this.restoreCard();
   }
 
   /// Hard, non-animated collapse — used when the maximized card is deleted or
@@ -720,12 +726,12 @@ export class DeckShell {
     if (tile) {
       tile.el.classList.remove("maximized", "deck-max-animate");
       tile.el.style.cssText = "";
-      tile.maxBtn.textContent = "⛶";
       tile.port?.postMessage({ type: "size", size: tile.card.size });
     }
     this.maxPlaceholder?.remove();
     this.maxPlaceholder = null;
     this.grid.classList.remove("has-max");
+    document.documentElement.classList.remove("deck-maximized");
     this.maxAnimating = false;
     bridge.postMaximize(false);
   }

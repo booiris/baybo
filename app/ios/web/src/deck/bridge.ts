@@ -37,6 +37,8 @@ export type DeckShellGlobal = {
   setEditMode(active: boolean): void;
   setLanguage(lang: string): void;
   setSetupInflight(active: boolean): void;
+  /// Native → web: the header's ✕ was tapped; collapse the maximized card.
+  restoreMaximized(): void;
 };
 
 export type CardAction = "enable" | "disable" | "delete";

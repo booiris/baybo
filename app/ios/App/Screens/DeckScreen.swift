@@ -79,26 +79,40 @@ private struct DeckContent: View {
                     .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
                     .padding(.leading, 20)
                 }
-                .overlay(alignment: .trailing) {
-                    // The header pill is the ONLY way in and out of edit
-                    // mode (reorder/resize/remove) — no long-press entry;
-                    // holds inside a card belong to the card. Hidden while a
-                    // card is maximized (editing is meaningless then; the ✕ in
-                    // the card's corner is the way back).
-                    Button {
-                        deck.setEditMode(!deck.editMode)
-                    } label: {
-                        Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit"))
-                            .font(Theme.mono(13))
-                            .foregroundStyle(Theme.ink)
-                            .padding(.horizontal, 14)
-                            .frame(height: 34)
-                    }
-                    .glassEffect(.regular.interactive(), in: .capsule)
-                    .padding(.trailing, 20)
-                    .opacity(deck.maximized ? 0 : 1)
-                    .allowsHitTesting(!deck.maximized)
-                    .animation(.easeInOut(duration: 0.2), value: deck.maximized)
-                }
+                .overlay(alignment: .trailing) { trailingControl }
+    }
+
+    /// The header's top-right control. While a card is maximized it is the ✕
+    /// that collapses it (the true top-right corner, above the header veil the
+    /// webview can't paint over); otherwise it is the edit pill — the only way
+    /// in and out of edit mode (reorder/resize/remove), no long-press entry.
+    @ViewBuilder private var trailingControl: some View {
+        if deck.maximized {
+            Button {
+                deck.requestRestore()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 45, height: 45)
+            }
+            .glassEffect(.regular.interactive(), in: .circle)
+            .padding(.trailing, 20)
+            .accessibilityLabel(Text(verbatim: lang.t("deck.editDone")))
+            .transition(.opacity)
+        } else {
+            Button {
+                deck.setEditMode(!deck.editMode)
+            } label: {
+                Text(verbatim: lang.t(deck.editMode ? "deck.editDone" : "deck.edit"))
+                    .font(Theme.mono(13))
+                    .foregroundStyle(Theme.ink)
+                    .padding(.horizontal, 14)
+                    .frame(height: 34)
+            }
+            .glassEffect(.regular.interactive(), in: .capsule)
+            .padding(.trailing, 20)
+            .transition(.opacity)
+        }
     }
 }
