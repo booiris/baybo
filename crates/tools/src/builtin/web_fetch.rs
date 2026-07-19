@@ -307,7 +307,7 @@ Usage notes:
   - This tool is read-only and does not modify any files
   - Results may be summarized if the content is very large
   - The reply is prefixed with a metadata header line: `[WebFetch] summarized=<bool> raw_content_file=<absolute path>`. `summarized=true` means a side LLM rewrote the body to answer your `prompt`; `summarized=false` means the body is the verbatim rendered page (possibly truncated). The full pre-summary rendered page is always archived to `raw_content_file` — use the `Read` tool on that path when you need the untruncated/unsummarised content.
-  - The archived file lives under `<workspace>/state/blobs/` and is GC'd by the janitor's LRU sweep, so treat the path as ephemeral within a session.
+  - The archived file lives under `<workspace>/state/blobs/` and persists across turns; still, prefer re-fetching over relying on a stale archived copy when freshness matters.
   - Binary/non-text content types are still refused; for downloading `.zip`/images/archives use Bash with `curl` or `wget` instead.
   - For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view, gh api).
 "#

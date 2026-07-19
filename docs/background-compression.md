@@ -68,7 +68,7 @@ CREATE TABLE session_summaries (
 );
 ```
 
-The live table additionally carries two legacy inert columns — `in_flight` / `in_flight_owner`, left over from the DB-flag at-most-one mechanism the in-memory `JoinHandle` replaced. Nothing reads or writes them; they stay only so old DBs need no migration.
+DBs created before the 2026-07 unused-column audit may additionally carry two orphan columns — `in_flight` / `in_flight_owner`, left over from the DB-flag at-most-one mechanism the in-memory `JoinHandle` replaced. Nothing reads or writes them; they stay inert there (no data migration), and fresh DBs no longer create them.
 
 ## Trigger Conditions (session side)
 

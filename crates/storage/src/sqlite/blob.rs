@@ -443,10 +443,11 @@ impl BlobStore for SqliteBlobStore {
             )));
         }
 
-        // LRU touch: refresh the access timestamp so the janitor's
-        // sweep treats this blob as alive. Done only after the token
-        // check passes so a probe with a wrong token doesn't extend
-        // the victim's TTL.
+        // LRU touch: refresh the access timestamp. No sweep consumes it
+        // yet — blobs are never GC'd today — but keeping it accurate
+        // means a future janitor LRU sweep can trust the column from day
+        // one. Done only after the token check passes so a probe with a
+        // wrong token wouldn't extend a victim's TTL under that sweep.
         self.touch(blob_id).await;
 
         Ok(BlobMeta {

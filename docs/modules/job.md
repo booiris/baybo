@@ -61,7 +61,7 @@ pub enum JobInputKind { UserChat, Cron, CronNotification, Compact, Spawned, Suba
 `Job` is not a passive data struct — it encapsulates the state machine:
 
 - `Job::new(session_id, origin, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `origin` is supplied by the caller; `input_kind` is projected from `input`.
-- `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record. `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
+- `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns a `JobTransition` legality receipt (consumed and dropped by `JobLifecycle`; the per-transition audit table was retired in the 2026-07 unused-column audit). `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
 - Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover(reason)`
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
 - `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck` (consumed by admin queries that surface in-flight jobs)
@@ -74,7 +74,7 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 ### JobLifecycle is a thin persistence orchestrator
 
-`JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
+`JobLifecycle` does only: load from store → call `job.transition()` → `store.save()`. No state machine logic in the orchestrator. It additionally owns:
 
 - A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase, input kind; the `Completed` phase additionally carries the reply's persisted `session_messages.ordinal`) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers: the subagent runtime waits for terminal phases, the TurnState projection treats every phase as a recompute trigger, and the push dispatcher filters `Completed` events to the kinds a user is meant to read (`UserChat`, `Cron` — confirmed against the session's `conversation` marker — and `CronNotification`). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
 - A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
@@ -126,7 +126,6 @@ A running turn drains the leading run of non-slash user inputs at each tool boun
 ## Constraints
 
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
-- `save()` and `record_transition()` are always invoked as a pair by `JobLifecycle::persist` — two sequential writes, not one DB transaction. A crash between them can leave a terminal row whose transition audit is missing its last entry; only rows left non-terminal are reconciled, by the boot recovery scan
 - `Job.origin` is supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin`) and passed straight into `Job::new`; it is not validated against the payload. Only `input_kind` is projected from `input`
 - Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `baybo-model` (IDs) and `baybo-store` (the `JobStore` trait + row DTOs).
 - `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-job = { workspace = true, features = ["test-support"] }`.
