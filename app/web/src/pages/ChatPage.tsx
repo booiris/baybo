@@ -155,6 +155,15 @@ export interface TranscriptRow {
   /** True when this block's turn was cancelled (`/stop`) rather than run to a
    *  normal reply — the collapsed summary reads "Cancelled · Worked Xs". */
   workCancelled?: boolean;
+  /** For a reconstructed history block: whether the turn ENDED inside the page
+   *  window that produced it (`true`), or the window's edge cut it off and the
+   *  turn continues in the adjacent page (`false`). `foldAdjacentWork` fuses a
+   *  cut-off head with the following half so a page-split turn stays one card,
+   *  and never fuses a complete block with its neighbour (a different turn).
+   *  `undefined` for a live/optimistic block or an older server without the
+   *  field — the fold then declines, degrading to the pre-fix two-block view
+   *  rather than risking a wrong merge. Mirrors the server's `turn_complete`. */
+  workComplete?: boolean;
   /** True for a block closed mid-turn by a user interjection: relabelled
    *  "Worked Xs" but kept EXPANDED (steps visible) until the turn fully ends,
    *  so the work the interjection split off doesn't vanish behind a collapse
@@ -1618,7 +1627,10 @@ export function ChatPage() {
           ...prev,
           [sessionId]: {
             ...cur,
-            transcript: [...newRows, ...cur.transcript],
+            // Fold at the seam: a turn longer than one page comes back as two
+            // `work` items (the older page's tail-of-turn half above the current
+            // thread's head-of-turn half). One turn must stay one card.
+            transcript: foldAdjacentWork([...newRows, ...cur.transcript]),
             oldestOrdinal: newOldest,
             hasMore: data.has_more,
             olderLoading: false,
@@ -4267,12 +4279,17 @@ export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem):
       kind: 'work',
       workActive: false,
       workCancelled: item.cancelled ?? false,
+      workComplete: item.turn_complete ?? undefined,
       workStartedAt: parseEpochMs(item.work_started_at) ?? undefined,
       workEndedAt: parseEpochMs(item.work_ended_at) ?? undefined,
       steps: (item.steps ?? []).map((s, i) => ({
         key: `${key}-${i}`,
         kind: s.kind,
         text: s.text,
+        // The call's stable identity — carried so a work block split across a
+        // page boundary can fold its two reconstructed halves back into one
+        // without doubling or dropping tool steps (see `mergeWorkSteps`).
+        toolCallId: s.call_id ?? undefined,
         tool: s.tool ?? undefined,
         toolLabel: s.tool_label ?? null,
         // Backend sends `ok` / `error` / `denied` (or null when the result
@@ -4315,6 +4332,125 @@ function findOpenWorkIndex(rows: TranscriptRow[], startedAt: number): number {
     if (row.kind === 'work' && row.workActive && row.workStartedAt === startedAt) return i;
   }
   return -1;
+}
+
+/** The server reconstructs a turn's work block per page window, so a turn
+ *  longer than one page comes back as two `work` items keyed `w<ordinal>` by
+ *  whichever intermediate row led each window. Pull the ordinal back out of a
+ *  reconstructed row's key (`row-<sessionId>-w<ordinal>`) so a fold can tell the
+ *  two halves apart. `null` for a live/optimistic block, whose key isn't
+ *  server-derived — which is exactly what routes such a pair to `reconcileWork`
+ *  (one span, two representations) rather than `joinWorkHalves`. */
+function workRowOrdinal(key: string): number | null {
+  const id = key.slice(key.lastIndexOf('-') + 1);
+  const match = /^[mw](\d+)$/.exec(id);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/** Identity of a work step for dedup when fusing two work blocks. A tool step
+ *  keys by its call id (both the live and reconstructed shapes now carry it); a
+ *  call with no id keys by what it DID (label + status + summary, NUL-separated
+ *  so one field can't forge another's boundary) and never collides with the id
+ *  form. Non-tool steps key by kind + text. Mirrors iOS `workStepKey`. */
+function workStepKey(s: WorkStep): string {
+  if (s.kind !== 'tool') return `${s.kind}:${s.text ?? ''}`;
+  if (s.toolCallId !== undefined && s.toolCallId !== '') return `tool:${s.toolCallId}`;
+  return ['tool!', s.toolLabel ?? '', s.toolStatus ?? '', s.toolSummary ?? ''].join('\u0000');
+}
+
+/** Concatenate two blocks' steps WITHOUT duplicating shared ones — so the
+ *  disjoint halves of a page-torn turn append cleanly, while two overlapping
+ *  representations of one span (a live block beside its reconstruction, or a
+ *  redelivered row) collapse to a single copy instead of doubling every step. */
+function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
+  const seen = new Set(a.map(workStepKey));
+  const out = [...a];
+  for (const s of b) {
+    const k = workStepKey(s);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** Fuse two representations of ONE work span — a live/already-rendered block
+ *  (`base`) with the server's reconstruction of the same turn (`recon`): union
+ *  the steps, keep `base`'s identity/live state, adopt the server's
+ *  authoritative timing. */
+function reconcileWork(base: TranscriptRow, recon: TranscriptRow): TranscriptRow {
+  return {
+    ...base,
+    steps: mergeWorkSteps(base.steps ?? [], recon.steps ?? []),
+    workStartedAt: recon.workStartedAt ?? base.workStartedAt,
+    workEndedAt: recon.workEndedAt ?? base.workEndedAt,
+    workCancelled: (base.workCancelled ?? false) || (recon.workCancelled ?? false),
+    workComplete: recon.workComplete ?? base.workComplete,
+  };
+}
+
+/** Join the two halves of ONE turn that a page boundary cut in two. Each page
+ *  folds on its own, so neither half's span is the turn's: the older half
+ *  (`first`) times from the real turn start, the newer half (`second`) closes at
+ *  the true end. Span the pair — first's start, second's end — union the steps,
+ *  and keep the earlier-ordinal id so a three-page turn folds down repeatably.
+ *  Completeness follows the newer half: the fused block is whole once the half
+ *  carrying the turn's end is in, and stays cut-off (fusable again) until then. */
+function joinWorkHalves(first: TranscriptRow, second: TranscriptRow): TranscriptRow {
+  return {
+    ...first,
+    steps: mergeWorkSteps(first.steps ?? [], second.steps ?? []),
+    workActive: (first.workActive ?? false) || (second.workActive ?? false),
+    workStartedAt: first.workStartedAt,
+    workEndedAt: second.workEndedAt ?? first.workEndedAt,
+    workCancelled: (first.workCancelled ?? false) || (second.workCancelled ?? false),
+    workComplete: second.workComplete ?? first.workComplete,
+  };
+}
+
+/** Fold two ADJACENT work rows into one. Different `w<ordinal>` ids ⇒ sequential
+ *  halves of one turn ⇒ span them; anything else (a live block beside its own
+ *  reconstruction, a redelivered row) is one span in two forms ⇒ reconcile. */
+function foldWork(prev: TranscriptRow, next: TranscriptRow): TranscriptRow {
+  const prevOrd = workRowOrdinal(prev.key);
+  const nextOrd = workRowOrdinal(next.key);
+  return prevOrd !== null && nextOrd !== null && prevOrd !== nextOrd
+    ? joinWorkHalves(prev, next)
+    : reconcileWork(prev, next);
+}
+
+/** Whether two adjacent work rows are the SAME continuing turn and should fuse.
+ *  A reconstructed head fuses only when the server marked it cut off by the page
+ *  edge (`workComplete === false`) — a whole block (`true`) is its own turn and
+ *  never fuses with the neighbour (e.g. a completed turn whose empty final reply
+ *  produced no bubble, abutting a following cron fire). A live block's key isn't
+ *  `w<ordinal>`, so it carries no flag — it fuses with its own server
+ *  reconstruction (the one work row that follows an in-flight block). An
+ *  `undefined` flag (older server) declines, degrading to the pre-fix two-block
+ *  view rather than risking a wrong merge. */
+function sameContinuingTurn(prev: TranscriptRow): boolean {
+  if (workRowOrdinal(prev.key) === null) return true;
+  return prev.workComplete === false;
+}
+
+/** Collapse each adjacent same-turn work pair in an assembled row list.
+ *  Idempotent — a healthy list has no adjacency — so it's safe to run at each
+ *  seam where two independently-reconstructed pages are stitched: the scroll-up
+ *  prepend (`loadOlder`) and the forward-sync merge (`applySyncMerge`). */
+export function foldAdjacentWork(rows: TranscriptRow[]): TranscriptRow[] {
+  const out: TranscriptRow[] = [];
+  for (const r of rows) {
+    const prev = out.length > 0 ? out[out.length - 1] : undefined;
+    if (r.kind === 'work' && prev !== undefined && prev.kind === 'work' && sameContinuingTurn(prev)) {
+      out[out.length - 1] = foldWork(prev, r);
+      continue;
+    }
+    out.push(r);
+  }
+  return out;
 }
 
 /** Merge a difference sync page into the rendered thread. Dedup is by
@@ -4395,7 +4531,10 @@ export function applySyncMerge(prev: TranscriptRow[], page: TranscriptRow[]): Tr
     next.push(row);
     changed = true;
   }
-  return changed ? next : prev;
+  // Same seam as the scroll-up prepend, forward: when the cursor fell mid-turn,
+  // the already-rendered thread's trailing work half meets this page's leading
+  // half. Fold so the straddled turn stays one card (no-op on a healthy thread).
+  return changed ? foldAdjacentWork(next) : prev;
 }
 
 /** REPLACE the thread with a baseline / rebased page, then re-overlay

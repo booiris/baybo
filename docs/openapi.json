@@ -5112,6 +5112,13 @@
             "type": "string",
             "description": "Plain text content, newline-joined when multiple text blocks\nwere present. Empty when the message was media-only or for `work`\nitems."
           },
+          "turn_complete": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "For a `work` item: `true` when the turn ENDED inside this reconstruction\nwindow (a real boundary — the final answer, the next user turn, or a\n`/stop` — closed the block); `false` when the block was cut off by the\npage window's edge and the turn continues into the adjacent (older) page.\nThe client fuses a cut-off head (`false`) with the following half so a\nturn split across a page boundary stays one card, and NEVER fuses a\ncomplete block (`true`) with its neighbour — that neighbour is a\ndifferent turn (e.g. a completed turn whose empty final reply produced no\nbubble, abutting a following cron fire). `None` for `message` / `notice`\nitems, which never participate in the fold."
+          },
           "work_ended_at": {
             "type": [
               "string",
