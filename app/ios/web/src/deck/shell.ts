@@ -187,6 +187,9 @@ export class DeckShell {
       bridge.postCall(globalId, cardId, m.op, m.params ?? {});
     } else if (m.type === "log") {
       bridge.log(m.level === "error" ? "error" : "info", `[card ${cardId}] ${m.message ?? ""}`);
+    } else if (m.type === "exitMax" && cardId === this.maximizedCardId) {
+      // Swipe-right-to-exit reported by the maximized card's SDK.
+      this.restoreCard();
     }
     // Anything else from a card is ignored: port identity is the card's
     // only capability, and the surface is exactly call + log.

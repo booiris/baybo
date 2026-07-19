@@ -221,20 +221,23 @@ Hard rules:
 ### Maximizing (optional) — the `"max"` size
 
 Set `"maximize": true` only if you build a full-screen layout for
-`deck.size === "max"`. The shell then shows a ⛶ button in the tile's
-top-right; a tap expands the card (the card never reloads — same document,
-`deck.size` flips to `"max"`), and a ✕ in the top-right restores it. The
-maximized layout **may scroll** (it's the whole screen, not a tile) and is
-where a card earns its detail: a full history, a chart, a table. Three rules:
+`deck.size === "max"`. On a maximize-capable card the shell shows a ⛶ button
+in the tile's top-right; a tap expands the card (the card never reloads — same
+document, `deck.size` flips to `"max"`). The user restores it with the ✕ in
+the app's header or by **swiping right** — both are handled for you, so a `max`
+layout needs no exit control of its own. The maximized layout **may scroll**
+(it's the whole screen, not a tile) and is where a card earns its detail: a
+full history, a chart, a table. Rules:
 
-- **The shell owns the top-right in every size.** The ⛶ (and the ✕ at max)
-  sit in the tile's top-right (~40pt). Keep the top-right corner clear of your
-  own tappable controls / key numbers in **all** sizes — e.g. give a top row
-  that puts a control on the right `padding-right: 42px`.
+- **Leave the tile's top-right for the ⛶ in the grid sizes.** In `small` /
+  `wide` / `large`, the ⛶ sits in the tile's top-right (~40pt) — keep your own
+  tappable controls / key numbers out of that corner (e.g. a top row that
+  right-aligns a control: `padding-right: 42px`). At `max` the corner is
+  yours again (the ✕ is up in the app header), so a right-aligned control can
+  go to the far right.
 - **Clear the header at max.** The app's header stays visible above the
   maximized card, so start your `max` content below it:
-  `padding-top: calc(env(safe-area-inset-top) + 54px)` (the ✕ sits just below
-  the header, in the top-right).
+  `padding-top: calc(env(safe-area-inset-top) + 54px)`.
 - **Clear the tab bar at max.** It floats over the bottom. End your content
   with `padding-bottom: calc(env(safe-area-inset-bottom) + 64px)`.
 
