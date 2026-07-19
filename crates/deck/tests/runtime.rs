@@ -14,7 +14,8 @@ use serde_json::json;
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_storage::sqlite::{SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
-use baybo_store::{DeckLayoutEntry, DeckSize};
+use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize};
+use chrono::Utc;
 
 #[derive(Default)]
 struct RecordingEvents {
@@ -42,14 +43,19 @@ fn bun_usable() -> bool {
 struct Harness {
     manager: Arc<DeckManager>,
     events: Arc<RecordingEvents>,
-    _root: tempfile::TempDir,
+    store: Arc<SqliteDeckCardStore>,
+    root: tempfile::TempDir,
 }
 
-async fn harness_or_skip(test: &str) -> Option<Harness> {
-    if !bun_usable() {
-        eprintln!("skipping {test}: bun not installed");
-        return None;
+impl Harness {
+    fn scratch_root(&self) -> std::path::PathBuf {
+        self.root.path().join("scratch")
     }
+}
+
+/// Build the manager against tempdirs; no bun required until a service
+/// actually spawns (install / boot with enabled rows).
+async fn harness() -> Harness {
     let root = tempfile::tempdir().unwrap();
     let pool = SqlitePool::open_in_memory().await.unwrap();
     let store = Arc::new(SqliteDeckCardStore::new(pool.clone()));
@@ -59,17 +65,26 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
     ));
     let events = Arc::new(RecordingEvents::default());
     let manager = DeckManager::from_config(DeckManagerConfig {
-        store,
+        store: store.clone(),
         vault,
         events: events.clone(),
         deck_root: root.path().join("deck"),
         scratch_root: root.path().join("scratch"),
     });
-    Some(Harness {
+    Harness {
         manager,
         events,
-        _root: root,
-    })
+        store,
+        root,
+    }
+}
+
+async fn harness_or_skip(test: &str) -> Option<Harness> {
+    if !bun_usable() {
+        eprintln!("skipping {test}: bun not installed");
+        return None;
+    }
+    Some(harness().await)
 }
 
 /// Count commits in the deck root's git history touching `pathspec`.
@@ -211,30 +226,46 @@ async fn install_call_lifecycle() {
     h.manager.shutdown().await;
 }
 
-/// Every `ctx.exec` is handed `BAYBO_DECK_TMUX_DIR` = `<deck_root>/tmux-socks`,
-/// the private-socket dir a tmux-driving card pins its session onto (so the
-/// server stays off the user's default `/tmp/tmux-<uid>/default` socket and
-/// out of `/tmp`).
+/// Every `ctx.exec` is handed `BAYBO_DECK_TMUX_DIR` =
+/// `<deck_root>/tmux-socks/<card_id>` — the card's own private-socket dir a
+/// tmux-driving card pins its session onto (off the user's default
+/// `/tmp/tmux-<uid>/default` socket, out of `/tmp`, and reapable per card
+/// at purge).
 #[tokio::test]
-async fn exec_sees_injected_tmux_socket_dir() {
-    let Some(h) = harness_or_skip("exec_sees_injected_tmux_socket_dir").await else {
+async fn exec_sees_injected_per_card_tmux_socket_dir() {
+    let Some(h) = harness_or_skip("exec_sees_injected_per_card_tmux_socket_dir").await else {
         return;
     };
     let staged = tempfile::tempdir().unwrap();
     stage_bundle(staged.path(), TMUX_DIR_SERVICE);
 
-    h.manager.install(staged.path()).await.unwrap();
+    let card = h.manager.install(staged.path()).await.unwrap();
     let expected = h
         .manager
         .deck_root()
         .join("tmux-socks")
+        .join(&card.id)
         .to_string_lossy()
         .into_owned();
 
+    // The resident service's exec runs under the real card id.
+    let got = h
+        .manager
+        .call_op(&card.id, "refresh", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        got["tmuxDir"].as_str(),
+        Some(expected.as_str()),
+        "exec should see BAYBO_DECK_TMUX_DIR={expected}"
+    );
+
+    // The dry-run gate's exec ran under its throwaway gate id — still a
+    // per-card subdir, never the shared root.
     let view = h.manager.deck_view().await.unwrap();
     assert!(
-        view.snapshots[0].payload.contains(&expected),
-        "snapshot {:?} should carry BAYBO_DECK_TMUX_DIR={expected}",
+        view.snapshots[0].payload.contains("tmux-socks/gate-"),
+        "gate snapshot {:?} should carry a gate-scoped tmux dir",
         view.snapshots[0].payload
     );
 
@@ -377,6 +408,90 @@ async fn dry_run_gate_returns_boot_failures_to_the_agent() {
     assert!(err.to_string().contains("null"), "{err}");
 
     h.manager.shutdown().await;
+}
+
+fn card_row(id: &str) -> DeckCardRow {
+    DeckCardRow {
+        id: id.to_string(),
+        title: format!("Card {id}"),
+        position: 0,
+        size: DeckSize::Wide,
+        sizes: vec![DeckSize::Wide],
+        maximize: false,
+        enabled: false,
+        quarantined_at: None,
+        deleted_at: None,
+        spec_hash: "hash".to_string(),
+        last_seq: 0,
+        created_at: Utc::now(),
+    }
+}
+
+/// Purge reaps the card's runtime residue — its private tmux socket dir
+/// (a stale `.sock` file stands in for a dead server; `kill-server`
+/// against it fails and is ignored) and its exec scratch dir — while
+/// another card's residue survives. No bun needed: rows are seeded
+/// directly and purge never spawns a service.
+#[tokio::test]
+async fn purge_reaps_tmux_sockets_and_scratch() {
+    let h = harness().await;
+    let deck_root = h.manager.deck_root().to_path_buf();
+    let scratch_root = h.scratch_root();
+
+    for id in ["card-a", "card-b"] {
+        h.store.create(&card_row(id)).await.unwrap();
+        let bundle = deck_root.join(id);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("service.js"), "x").unwrap();
+        let socks = deck_root.join("tmux-socks").join(id);
+        std::fs::create_dir_all(&socks).unwrap();
+        std::fs::write(socks.join("cli.sock"), "").unwrap();
+        let scratch = scratch_root.join(id);
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("residue.txt"), "x").unwrap();
+    }
+
+    h.store
+        .set_deleted("card-a", Some(Utc::now()))
+        .await
+        .unwrap();
+    h.manager.purge("card-a").await.unwrap();
+
+    assert!(!deck_root.join("card-a").exists(), "bundle removed");
+    assert!(
+        !deck_root.join("tmux-socks").join("card-a").exists(),
+        "socket dir reaped"
+    );
+    assert!(!scratch_root.join("card-a").exists(), "scratch reaped");
+    assert!(deck_root.join("card-b").exists(), "other bundle intact");
+    assert!(
+        deck_root.join("tmux-socks").join("card-b").exists(),
+        "other socket dir intact"
+    );
+    assert!(scratch_root.join("card-b").exists(), "other scratch intact");
+}
+
+/// A crash mid-gate leaks `state/deck-scratch/gate-<uuid>`; boot reaps
+/// every `gate-*` entry (none can be in flight at boot) and leaves
+/// per-card scratch alone.
+#[tokio::test]
+async fn boot_reaps_stale_gate_scratch() {
+    let h = harness().await;
+    let scratch_root = h.scratch_root();
+    std::fs::create_dir_all(scratch_root.join("gate-dead").join("nested")).unwrap();
+    std::fs::write(scratch_root.join("gate-dead/nested/f"), "x").unwrap();
+    std::fs::create_dir_all(scratch_root.join("card-live")).unwrap();
+
+    h.manager.boot().await;
+
+    assert!(
+        !scratch_root.join("gate-dead").exists(),
+        "stale gate scratch reaped at boot"
+    );
+    assert!(
+        scratch_root.join("card-live").exists(),
+        "card scratch untouched"
+    );
 }
 
 #[tokio::test]

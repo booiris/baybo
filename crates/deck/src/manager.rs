@@ -34,6 +34,11 @@ use crate::supervisor::{DeckSupervisor, QuarantineSink};
 /// are refused.
 pub const MAX_CARDS: usize = 64;
 
+/// Scratch-dir name prefix for dry-run gate runs (`gate-<uuid>`). Gate
+/// scratch is removed when the gate finishes; anything still carrying the
+/// prefix at boot is residue from a crash mid-gate and is reaped.
+const GATE_SCRATCH_PREFIX: &str = "gate-";
+
 /// Deck push hooks; the gateway broadcasts `Frame::DeckCardData` /
 /// `Frame::DeckChanged` on the owner channel from these.
 pub trait DeckEvents: Send + Sync + 'static {
@@ -561,7 +566,9 @@ impl DeckManager {
         self.row_view(card_id).await
     }
 
-    /// Hard delete from the recycle bin: row, snapshots, and bundle files.
+    /// Hard delete from the recycle bin: row, snapshots, bundle files, and
+    /// runtime residue (the card's tmux servers + socket dir, its exec
+    /// scratch dir).
     pub async fn purge(&self, card_id: &str) -> Result<()> {
         let row = self
             .store
@@ -578,6 +585,7 @@ impl DeckManager {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
+        self.reap_card_runtime(card_id).await;
         self.spec_cache.lock().remove(card_id);
         provenance("purge", card_id, "hard");
         self.commit_bundle(card_id, &row.title, "purge", "hard")
@@ -591,6 +599,7 @@ impl DeckManager {
     /// (the post-upgrade re-admission); a gate failure quarantines it
     /// visibly instead of letting it fail on a timer at 3 a.m.
     pub async fn boot(&self) {
+        self.reap_gate_scratch();
         let rows = match self.store.list_live().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -652,6 +661,49 @@ impl DeckManager {
     }
 
     // ---- internals ----------------------------------------------------
+
+    /// Best-effort purge tail: kill any tmux server the card pinned into
+    /// its private socket dir (`tmux -S <sock> kill-server` — the server
+    /// may already be dead, so every failure is ignored), then drop the
+    /// socket dir and the card's exec scratch dir. Missing residue is the
+    /// common case and never fails the purge.
+    async fn reap_card_runtime(&self, card_id: &str) {
+        let socks = self.host.tmux_dir(card_id);
+        if let Ok(entries) = std::fs::read_dir(&socks) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+                    continue;
+                }
+                let _ = tokio::process::Command::new("tmux")
+                    .arg("-S")
+                    .arg(&path)
+                    .arg("kill-server")
+                    .output()
+                    .await;
+            }
+        }
+        remove_residue_dir(&socks);
+        remove_residue_dir(&self.scratch_root.join(card_id));
+    }
+
+    /// Boot-time reap of `gate-*` dry-run scratch dirs leaked by a crash
+    /// mid-gate. By construction no gate can be in flight at boot, so
+    /// every survivor is residue.
+    fn reap_gate_scratch(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.scratch_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(GATE_SCRATCH_PREFIX)
+            {
+                remove_residue_dir(&entry.path());
+            }
+        }
+    }
 
     /// Best-effort: record this bundle-file mutation as a commit in the
     /// deck root's git history. A git failure (no `git`, detached HEAD,
@@ -793,7 +845,7 @@ impl DeckManager {
             }
         }
 
-        let gate_id = format!("gate-{}", uuid::Uuid::new_v4());
+        let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
         let running = spawn_service(
             crate::service::SpawnConfig {
                 card_id: gate_id.clone(),
@@ -844,6 +896,19 @@ fn clamp_size(current: DeckSize, sizes: &[DeckSize], default: DeckSize) -> Optio
         None
     } else {
         Some(default)
+    }
+}
+
+/// Remove a runtime-residue dir, tolerating its absence (the common case)
+/// and logging — never propagating — anything else: residue cleanup must
+/// not fail the lifecycle operation it rides on.
+fn remove_residue_dir(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), "deck: residue cleanup failed: {e}");
+        }
     }
 }
 
