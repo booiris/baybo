@@ -414,10 +414,13 @@ export class DeckShell {
     // killing the drag — `touch-action: none` alone did NOT hold once
     // beginDrag's position:fixed flip triggered gesture re-arbitration).
     // touchMOVE only, so taps still synthesize clicks for the buttons.
+    // preventDefault ONLY after the drag arms — before that a touchmove must
+    // stay a native scroll so the deck scrolls in edit mode. Once `dragCardId`
+    // is set the reorder owns the gesture.
     el.addEventListener(
       "touchmove",
       (e) => {
-        if (this.editMode) e.preventDefault();
+        if (this.editMode && this.dragCardId !== null) e.preventDefault();
       },
       { passive: false },
     );
@@ -428,22 +431,23 @@ export class DeckShell {
         return;
       const startX = down.clientX;
       const startY = down.clientY;
-      // Capture the pointer: beginDrag flips the tile to position:fixed
-      // mid-gesture, and without capture WebKit re-hit-tests and drops
-      // the move stream right there (observed: drags died ~16px in).
-      try {
-        el.setPointerCapture(down.pointerId);
-      } catch {
-        // Capture is best-effort; an already-released pointer just
-        // degrades to the uncaptured behavior.
-      }
+      const pointerId = down.pointerId;
       let started = false;
       // Arm the drag only after a long press held roughly still — a slide no
-      // longer picks a card up.
+      // longer picks a card up, it scrolls the deck. Capture happens HERE (not
+      // on pointerdown) so the native scroll is unhindered until the pickup:
+      // beginDrag flips the tile to position:fixed and without capture WebKit
+      // re-hit-tests and drops the move stream (drags died ~16px in).
       let holdTimer = window.setTimeout(() => {
         holdTimer = 0;
         if (this.dragCardId !== null) return;
         started = true;
+        try {
+          el.setPointerCapture(pointerId);
+        } catch {
+          // Capture is best-effort; an already-released pointer degrades to
+          // the uncaptured behavior.
+        }
         this.beginDrag(el, cardId, startX, startY);
         this.lastPoint = { x: startX, y: startY };
         // A pickup haptic is what makes the long press read as "grabbed".

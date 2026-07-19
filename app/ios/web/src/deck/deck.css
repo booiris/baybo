@@ -274,10 +274,15 @@ html.deck-maximized body {
    transform, never a DOM move, so its iframe keeps painting live
    content the whole way. The placeholder is the drop slot the grid
    reflows around. Wiggle pauses during a drag so the FLIP slides own
-   the transform channel. Drags must win over scrolling on tiles while
-   editing (the wiggle-mode contract), hence touch-action. */
+   the transform channel.
+
+   `pan-y` — NOT `none` — so the deck still SCROLLS in edit mode: the
+   pickup is a long press (shell.ts), and reorder only wins the gesture
+   after it arms (pointer capture + touchmove preventDefault kick in on
+   arm). A move before the press fires stays a scroll and cancels the
+   pickup. */
 .deck-grid.editing .deck-card {
-  touch-action: none;
+  touch-action: pan-y;
 }
 
 .deck-grid.has-drag .deck-card {
@@ -286,12 +291,14 @@ html.deck-maximized body {
 
 /* No pointer-events:none here: the lifted tile is the pointer-capture
    target, and it must stay event-eligible for the move stream. Nothing
-   hit-tests under the finger anyway — dropIndexAt works on rects. */
+   hit-tests under the finger anyway — dropIndexAt works on rects. Once
+   lifted it must never yield to scroll, hence touch-action: none. */
 .deck-card.deck-dragging-live {
   position: fixed;
   z-index: 10;
   margin: 0;
   animation: none;
+  touch-action: none;
   box-shadow: 0 12px 32px rgba(28, 27, 25, 0.22);
   will-change: transform;
 }
