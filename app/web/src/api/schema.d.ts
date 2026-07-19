@@ -1717,6 +1717,11 @@ export interface components {
              * @description The card's persisted push counter — the client's seq cursor seed.
              */
             last_seq: number;
+            /**
+             * @description Whether the card declares a maximized (full-screen) layout — the ⛶
+             *     affordance in the top-right.
+             */
+            maximize: boolean;
             /** Format: int64 */
             position: number;
             quarantined: boolean;
@@ -1727,6 +1732,12 @@ export interface components {
             retryable_ops: string[];
             /** @description `small` (1×1) | `wide` (2×1) | `large` (2×2). */
             size: string;
+            /**
+             * @description The grid sizes the card implements; the client's ⤢ resize cycle stays
+             *     inside this set and a single entry hides the control. Always contains
+             *     `size`.
+             */
+            sizes: string[];
             spec_hash: string;
             title: string;
         };

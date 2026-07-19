@@ -5462,6 +5462,8 @@
           "title",
           "position",
           "size",
+          "sizes",
+          "maximize",
           "enabled",
           "quarantined",
           "spec_hash",
@@ -5493,6 +5495,10 @@
             "format": "int64",
             "description": "The card's persisted push counter — the client's seq cursor seed."
           },
+          "maximize": {
+            "type": "boolean",
+            "description": "Whether the card declares a maximized (full-screen) layout — the ⛶\naffordance in the top-right."
+          },
           "position": {
             "type": "integer",
             "format": "int64"
@@ -5510,6 +5516,13 @@
           "size": {
             "type": "string",
             "description": "`small` (1×1) | `wide` (2×1) | `large` (2×2)."
+          },
+          "sizes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The grid sizes the card implements; the client's ⤢ resize cycle stays\ninside this set and a single entry hides the control. Always contains\n`size`."
           },
           "spec_hash": {
             "type": "string"
