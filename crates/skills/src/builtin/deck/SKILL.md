@@ -131,7 +131,9 @@ snapshot JSON (not null).**
   reveals vault secrets. Put a secret's `[{REDACTED_SECRET_…}]`
   placeholder in a header or the URL and it is substituted only at egress
   in the parent; never ask for or embed a raw secret. Loopback/LAN
-  addresses are blocked (SSRF floor); redirects are not followed.
+  addresses are blocked (SSRF floor); redirects are not followed. The whole
+  response buffers in the gateway, so fetch API/JSON and small assets — not
+  multi-GB downloads or endless streams.
 - `await ctx.exec(cmd)` → `{code, stdout, stderr}`. Runs `/bin/sh -c` on
   the host with the inherited environment (installed CLIs and credential
   dirs resolve, network available), 30s cap, 4MB output cap. Use for
@@ -161,6 +163,12 @@ images only). The shell injects a `deck` global before your code runs:
 - `deck.onSizeChange(fn)` — called with the current size immediately and
   again whenever it changes (resize, or maximize/restore). This is how you
   adapt: show more rows at `large`, the full view at `max`, less at `small`.
+
+**Render snapshot data as text, not markup.** The iframe blocks network, but
+the data you paint (a `ctx.fetch` body, an emitted snapshot) is untrusted — set
+`el.textContent`, never `el.innerHTML`, or injected `<img onerror=…>` markup
+would run inside the card. Build DOM with `createElement` + `textContent` (the
+worked examples do).
 
 ### Adapting to size — one document, `deck.onSizeChange`
 
