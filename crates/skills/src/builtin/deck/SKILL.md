@@ -221,19 +221,22 @@ Hard rules:
 ### Maximizing (optional) — the `"max"` size
 
 Set `"maximize": true` only if you build a full-screen layout for
-`deck.size === "max"`. The shell then shows a ⛶ button in the top-right; a
-tap expands the card to fill the screen (the card never reloads — same
-document, `deck.size` flips to `"max"`), and a ✕ in the same corner
-restores it. The maximized layout **may scroll** (it's the whole screen, not
-a tile) and is where a card earns its detail: a full history, a chart, a
-table. Two rules:
+`deck.size === "max"`. The shell then shows a ⛶ button in the tile's
+top-right; a tap expands the card (the card never reloads — same document,
+`deck.size` flips to `"max"`), and a ✕ in the top-right restores it. The
+maximized layout **may scroll** (it's the whole screen, not a tile) and is
+where a card earns its detail: a full history, a chart, a table. Three rules:
 
-- **Keep the top-right clear** — the ✕ lives there (~34×34pt below the
-  status bar); don't put a tappable control or key number under it.
-- **Keep the bottom clear** — the tab bar floats over the bottom of the
-  maximized card. End your content with
-  `padding-bottom: calc(env(safe-area-inset-bottom) + 64px)` so nothing
-  important hides behind it.
+- **The shell owns the top-right in every size.** The ⛶ (and the ✕ at max)
+  sit in the tile's top-right (~40pt). Keep the top-right corner clear of your
+  own tappable controls / key numbers in **all** sizes — e.g. give a top row
+  that puts a control on the right `padding-right: 42px`.
+- **Clear the header at max.** The app's header stays visible above the
+  maximized card, so start your `max` content below it:
+  `padding-top: calc(env(safe-area-inset-top) + 54px)` (the ✕ sits just below
+  the header, in the top-right).
+- **Clear the tab bar at max.** It floats over the bottom. End your content
+  with `padding-bottom: calc(env(safe-area-inset-bottom) + 64px)`.
 
 If you don't provide a `"max"` layout, leave `maximize` out — a ⛶ that
 expands to the same tile layout stretched full-screen looks broken.

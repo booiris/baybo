@@ -638,7 +638,7 @@ export class DeckShell {
     this.maxAnimating = true;
 
     const ph = document.createElement("div");
-    ph.className = "deck-drop-slot";
+    ph.className = "deck-drop-slot deck-max-slot";
     ph.dataset.size = el.dataset.size ?? "wide";
     ph.style.order = el.style.order;
     this.maxPlaceholder = ph;

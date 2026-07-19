@@ -27,14 +27,12 @@ private struct DeckContent: View {
             // header's paper veil instead of hitting a hard edge.
             DeckWebView(host: host)
                 .ignoresSafeArea()
+            // The header (wordmark + ☰ menu) STAYS on a maximized card — the
+            // maximized card fills the area below it and its content scrolls
+            // under the header's paper veil, same as the grid. Only the edit
+            // pill is suppressed while maximized (you can't reorder/resize a
+            // card that's expanded); see `header`.
             header
-                // A maximized card owns the whole surface: fade the wordmark
-                // header out and stop it hit-testing (the tab bar stays, per
-                // the deck maximize design). The shell drives the card's own
-                // expand animation; this rides the same beat.
-                .opacity(deck.maximized ? 0 : 1)
-                .allowsHitTesting(!deck.maximized)
-                .animation(.easeInOut(duration: 0.24), value: deck.maximized)
         }
         .onChange(of: lang.code) { _, code in
             host.bridge.setLanguage(code)
@@ -84,7 +82,9 @@ private struct DeckContent: View {
                 .overlay(alignment: .trailing) {
                     // The header pill is the ONLY way in and out of edit
                     // mode (reorder/resize/remove) — no long-press entry;
-                    // holds inside a card belong to the card.
+                    // holds inside a card belong to the card. Hidden while a
+                    // card is maximized (editing is meaningless then; the ✕ in
+                    // the card's corner is the way back).
                     Button {
                         deck.setEditMode(!deck.editMode)
                     } label: {
@@ -96,6 +96,9 @@ private struct DeckContent: View {
                     }
                     .glassEffect(.regular.interactive(), in: .capsule)
                     .padding(.trailing, 20)
+                    .opacity(deck.maximized ? 0 : 1)
+                    .allowsHitTesting(!deck.maximized)
+                    .animation(.easeInOut(duration: 0.2), value: deck.maximized)
                 }
     }
 }
