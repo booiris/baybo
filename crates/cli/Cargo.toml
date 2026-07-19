@@ -66,4 +66,5 @@ test-support = []
 baybo-cron = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-workspace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

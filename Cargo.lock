@@ -740,7 +740,6 @@ dependencies = [
  "baybo-store",
  "baybo-workspace",
  "chrono",
- "libc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1198,6 +1197,8 @@ name = "baybo-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "tempfile",
  "tokio",
 ]
 

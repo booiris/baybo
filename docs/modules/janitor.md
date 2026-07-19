@@ -38,12 +38,15 @@ is what makes "swept after 7 days" true. It removes **top-level** entries
 only — an entry (file or whole directory) goes when the *newest* mtime
 anywhere in its tree is past `WORK_TMP_TTL`, so a scratch checkout the
 agent still touches survives as a unit instead of being hollowed out
-file-by-file. The walk never follows symlinks: a symlinked entry is
-measured by the link's own lstat mtime and removed with `remove_file`
-(the link, never the target), and links inside a directory don't pull
-outside trees into the staleness read. The day count
-(`WORK_TMP_TTL_DAYS`) lives in `baybo-workspace` because the Bash tool
-description quotes the same figure.
+file-by-file. The newest-mtime read is the shared sync walker
+`baybo_workspace::walk::tree_stats`, called through
+`tokio::task::spawn_blocking` (`baybo workspace gc` uses the same walker
+directly, so the two staleness gates can't drift). The walk never
+follows symlinks: a symlinked entry is measured by the link's own lstat
+mtime and removed with `remove_file` (the link, never the target), and
+links inside a directory don't pull outside trees into the staleness
+read. The day count (`WORK_TMP_TTL_DAYS`) lives in `baybo-workspace`
+because the Bash tool description quotes the same figure.
 
 ### Sidecar-cache sweep is the rarest
 
@@ -55,7 +58,7 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 
 ## Constraints
 
-- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge) and `baybo-workspace` (path resolution). It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
+- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge) and `baybo-workspace` (path resolution + the shared `walk::tree_stats` walker). It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
 - Both DB-touching and sidecar sweeps are opt-in: without `with_pairing_store` the pairing sweep is skipped; without `with_sidecar_cache` the sidecar sweep is a no-op.
 
 ## Collaboration

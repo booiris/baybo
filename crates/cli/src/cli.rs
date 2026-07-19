@@ -885,9 +885,10 @@ pub enum WorkspaceCmd {
     /// is reclaimable, by category: git clones, stale entries (newest
     /// in-tree mtime older than `--days`), empty directories, and the
     /// contents of the disposable `work/tmp` scratch dir. Protected
-    /// runtime state (uv cache, tool spills, external-agent roots, …)
-    /// is never listed. Report-only by default; `--apply` deletes each
-    /// category after a y/N confirmation.
+    /// entries — every dot-prefixed name (live HOME state: sandboxed
+    /// Bash runs with `HOME` = the work dir), `tmp` itself, and the
+    /// external-agent roots — are never listed. Report-only by default;
+    /// `--apply` deletes each category after a y/N confirmation.
     Gc {
         /// Staleness threshold in days for the `stale` category.
         #[arg(long, default_value_t = 14)]
@@ -896,8 +897,9 @@ pub enum WorkspaceCmd {
         /// unless `--yes` is also passed.
         #[arg(long)]
         apply: bool,
-        /// Skip the per-category confirmation prompts (with `--apply`).
-        #[arg(long, short = 'y')]
+        /// Skip the per-category confirmation prompts. Only meaningful
+        /// with `--apply`; rejected without it.
+        #[arg(long, short = 'y', requires = "apply")]
         yes: bool,
     },
 }

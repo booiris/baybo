@@ -13,9 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use baybo_model::ExternalAgentKind;
 use baybo_workspace::WorkspacePaths;
-use baybo_workspace::paths::{
-    BROWSER_FONTS_SUBDIR, TOOL_SPILLS_SUBDIR, UV_STATE_SUBDIR, WORK_TMP_SUBDIR,
-};
+use baybo_workspace::paths::WORK_TMP_SUBDIR;
 use serde_json::json;
 
 use crate::cli::WorkspaceCmd;
@@ -24,30 +22,28 @@ use crate::context::CommandContext;
 use crate::error::Result;
 use crate::format::CommandOutput;
 
-/// Protected `work/` entries without a `baybo-workspace` const or an
-/// [`ExternalAgentKind`] root: `.claude` / `.claude.json` / `.codex` are
-/// the external CLIs' HOME-level state, `runtime` and `deck-cards` hold
-/// live agent-authored state.
-const PROTECTED_LOCAL_NAMES: &[&str] =
-    &[".claude", ".claude.json", ".codex", "runtime", "deck-cards"];
-
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Whether a top-level `work/` entry is off-limits for the gc
+/// categories. Protection is a policy, not an allowlist:
+///
+/// - **Every dot-prefixed name.** Sandboxed Bash runs with `HOME` set to
+///   the work dir, so tools drop live HOME state at `work/` top level —
+///   `.gitconfig`, `.config/`, `.npm/`, `.cargo/`, the external CLIs'
+///   `.claude`/`.claude.json`/`.codex`, and baybo's own
+///   `.uv/`/`.fonts/`/`.baybo-tool-spills/`. Reads never refresh an
+///   mtime, so age says nothing about whether such state is still live.
+/// - **`tmp/` itself** ([`WORK_TMP_SUBDIR`]): its *contents* are the
+///   dedicated `tmp` category instead.
+/// - **The [`ExternalAgentKind`] work roots**, derived from the enum.
+///
+/// Everything else — including non-dotted agent-authored conventions —
+/// is an ordinary candidate: gc's job is to surface the grey zone and
+/// let the user decide.
 fn is_protected(name: &str) -> bool {
-    if PROTECTED_LOCAL_NAMES.contains(&name) {
-        return true;
-    }
-    if [
-        UV_STATE_SUBDIR,
-        BROWSER_FONTS_SUBDIR,
-        TOOL_SPILLS_SUBDIR,
-        WORK_TMP_SUBDIR,
-    ]
-    .contains(&name)
-    {
-        return true;
-    }
-    ExternalAgentKind::ALL.iter().any(|k| k.as_str() == name)
+    name.starts_with('.')
+        || name == WORK_TMP_SUBDIR
+        || ExternalAgentKind::ALL.iter().any(|k| k.as_str() == name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +105,10 @@ fn gc(ctx: &CommandContext, days: u64, apply: bool, yes: bool) -> Result<Command
     }
 
     // The prompts sit between the report and the summary, so the report
-    // goes straight to stdout instead of through `CommandOutput`.
-    println!("{report}");
+    // is interactive chatter and goes to stderr (like `prompt::confirm`
+    // itself). Stdout carries only the final `CommandOutput` payload —
+    // JSON under `--json` must not be preceded by the table.
+    eprintln!("{report}");
     let mut reclaimed: u64 = 0;
     let mut removed: usize = 0;
     for category in GcCategory::ALL {
@@ -237,6 +235,9 @@ fn list_dir(dir: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// One entry's lstat metadata plus its `baybo_workspace::walk` du-style
+/// totals (summed lstat file sizes, newest in-tree lstat mtime, symlinks
+/// never followed).
 fn stat_entry(path: &Path) -> Option<(std::fs::Metadata, u64, SystemTime)> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -245,42 +246,13 @@ fn stat_entry(path: &Path) -> Option<(std::fs::Metadata, u64, SystemTime)> {
             return None;
         }
     };
-    match walk_stats(path, &meta) {
-        Ok((bytes, newest)) => Some((meta, bytes, newest)),
+    match baybo_workspace::walk::tree_stats(path) {
+        Ok(stats) => Some((meta, stats.bytes, stats.newest_mtime)),
         Err(e) => {
             eprintln!("warning: cannot scan {}: {e}", path.display());
             None
         }
     }
-}
-
-/// du-style totals for one entry: summed lstat file sizes plus the
-/// newest lstat mtime anywhere in the tree (directory mtimes included).
-/// Symlinks contribute their own link metadata and are never followed.
-fn walk_stats(root: &Path, meta: &std::fs::Metadata) -> std::io::Result<(u64, SystemTime)> {
-    let mut newest = meta.modified()?;
-    if !meta.file_type().is_dir() {
-        return Ok((meta.len(), newest));
-    }
-    let mut bytes = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let m = entry.metadata()?;
-            if let Ok(t) = m.modified()
-                && t > newest
-            {
-                newest = t;
-            }
-            if m.file_type().is_dir() {
-                stack.push(entry.path());
-            } else {
-                bytes += m.len();
-            }
-        }
-    }
-    Ok((bytes, newest))
 }
 
 fn dir_is_empty(path: &Path) -> bool {
@@ -415,60 +387,11 @@ fn format_age(age: Duration) -> String {
 mod tests {
     use super::*;
 
+    use baybo_workspace::test_support::{back_date, back_date_symlink, back_date_tree};
     use tempfile::TempDir;
 
     const STALE_AFTER: Duration = Duration::from_secs(14 * SECS_PER_DAY);
     const OVER_STALE: Duration = Duration::from_secs(15 * SECS_PER_DAY);
-
-    fn back_date(path: &Path, age: Duration) {
-        let mtime = SystemTime::now() - age;
-        let f = std::fs::File::open(path).unwrap();
-        f.set_modified(mtime).unwrap();
-    }
-
-    fn back_date_tree(root: &Path, age: Duration) {
-        let mtime = SystemTime::now() - age;
-        let mut stack = vec![root.to_path_buf()];
-        let mut seen = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let p = entry.path();
-                if entry.file_type().unwrap().is_dir() {
-                    stack.push(p.clone());
-                }
-                seen.push(p);
-            }
-            seen.push(dir);
-        }
-        for p in seen {
-            let f = std::fs::File::open(&p).unwrap();
-            let _ = f.set_modified(mtime);
-        }
-    }
-
-    fn back_date_symlink(path: &Path, age: Duration) {
-        use std::os::unix::ffi::OsStrExt;
-        let mtime = SystemTime::now() - age;
-        let secs = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let ts = libc::timespec {
-            tv_sec: secs,
-            tv_nsec: 0,
-        };
-        let times = [ts, ts];
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let rc = unsafe {
-            libc::utimensat(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        assert_eq!(rc, 0, "utimensat failed for {}", path.display());
-    }
 
     fn category_of<'a>(entries: &'a [GcEntry], name: &str) -> Option<&'a GcEntry> {
         entries.iter().find(|e| e.display_name == name)
@@ -542,16 +465,21 @@ mod tests {
 
     #[test]
     fn scan_never_lists_protected_names() {
+        use baybo_workspace::paths::{BROWSER_FONTS_SUBDIR, TOOL_SPILLS_SUBDIR, UV_STATE_SUBDIR};
+
         let tmp = TempDir::new().unwrap();
         let work = tmp.path();
+        // Every dot-prefixed dir is protected — sandboxed Bash has
+        // `HOME` = work/, so these are live HOME state, not scratch.
         let mut protected: Vec<String> = [
             UV_STATE_SUBDIR,
             BROWSER_FONTS_SUBDIR,
             TOOL_SPILLS_SUBDIR,
-            "runtime",
-            "deck-cards",
             ".claude",
             ".codex",
+            ".config",
+            ".npm",
+            ".cargo",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -565,10 +493,14 @@ mod tests {
             std::fs::write(dir.join("state.bin"), b"x").unwrap();
             back_date_tree(&dir, OVER_STALE);
         }
-        // `.claude.json` is a file, not a dir.
-        let claude_json = work.join(".claude.json");
-        std::fs::write(&claude_json, b"{}").unwrap();
-        back_date(&claude_json, OVER_STALE);
+        // Dot-prefixed top-level files are protected too — `.gitconfig`
+        // and `.claude.json` mtimes never refresh on read, so a stale
+        // classification would delete live credentials/config.
+        for name in [".gitconfig", ".claude.json"] {
+            let file = work.join(name);
+            std::fs::write(&file, b"{}").unwrap();
+            back_date(&file, OVER_STALE);
+        }
         // An empty `tmp/` contributes nothing either.
         std::fs::create_dir_all(work.join(WORK_TMP_SUBDIR)).unwrap();
 
@@ -577,6 +509,30 @@ mod tests {
             entries.is_empty(),
             "protected entries leaked into the report: {entries:?}"
         );
+    }
+
+    #[test]
+    fn non_dotted_agent_conventions_are_ordinary_candidates() {
+        // `runtime` / `deck-cards` are agent-authored names, not
+        // baybo-created dirs: gc surfaces them like any other entry and
+        // the user decides at the `--apply` confirm.
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path();
+        for name in ["runtime", "deck-cards"] {
+            let dir = work.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("state.bin"), b"x").unwrap();
+            back_date_tree(&dir, OVER_STALE);
+        }
+
+        let entries = scan(work, STALE_AFTER, SystemTime::now());
+        for name in ["runtime", "deck-cards"] {
+            assert_eq!(
+                category_of(&entries, name).unwrap().category,
+                GcCategory::Stale,
+                "{name} must be reported, not silently protected"
+            );
+        }
     }
 
     #[test]

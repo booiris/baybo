@@ -110,8 +110,9 @@ pub(crate) async fn sweep_tree_entries(dir: &Path, ttl: Duration) -> Result<usiz
                 continue;
             }
         };
-        let newest = match newest_mtime(&path, &metadata).await {
-            Ok(t) => t,
+        let newest = match spawn_tree_stats(&path).await {
+            Ok(stats) => stats.newest_mtime,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -146,49 +147,16 @@ pub(crate) async fn sweep_tree_entries(dir: &Path, ttl: Duration) -> Result<usiz
     Ok(removed)
 }
 
-/// Newest mtime observed under `path` without following symlinks: the
-/// entry's own lstat mtime plus — for a real directory — the lstat
-/// mtime of everything beneath it (directories included, so a create or
-/// delete inside refreshes its parent). A symlink contributes only the
-/// link's own mtime.
-async fn newest_mtime(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-) -> Result<SystemTime, JanitorError> {
-    let mut newest = metadata
-        .modified()
-        .map_err(|e| JanitorError::fs(path.display(), e))?;
-    if !metadata.file_type().is_dir() {
-        return Ok(newest);
-    }
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut reader = tokio::fs::read_dir(&dir)
-            .await
-            .map_err(|e| JanitorError::fs(dir.display(), e))?;
-        loop {
-            let entry = match reader.next_entry().await {
-                Ok(Some(e)) => e,
-                Ok(None) => break,
-                Err(e) => return Err(JanitorError::fs(dir.display(), e)),
-            };
-            let child = entry.path();
-            let meta = match tokio::fs::symlink_metadata(&child).await {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(JanitorError::fs(child.display(), e)),
-            };
-            if let Ok(t) = meta.modified()
-                && t > newest
-            {
-                newest = t;
-            }
-            if meta.file_type().is_dir() {
-                stack.push(child);
-            }
-        }
-    }
-    Ok(newest)
+/// Run the shared sync tree walker (`baybo_workspace::walk::tree_stats`
+/// — newest lstat mtime anywhere in the tree, symlinks never followed)
+/// off the async runtime. A cancelled/panicked blocking task surfaces as
+/// an `io::Error` so the caller's warn-and-skip path handles it like any
+/// other unreadable entry.
+async fn spawn_tree_stats(path: &Path) -> std::io::Result<baybo_workspace::walk::TreeStats> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || baybo_workspace::walk::tree_stats(&path))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 pub(crate) fn is_log_file(name: &str) -> bool {

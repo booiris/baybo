@@ -957,4 +957,16 @@ fn workspace_gc_parses_flags_and_defaults() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+
+    // `--yes` only skips prompts that `--apply` would raise — alone it
+    // would parse as a silent no-op, so it is rejected up front.
+    for argv in [
+        &["baybo", "workspace", "gc", "-y"][..],
+        &["baybo", "workspace", "gc", "--yes"][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "--yes without --apply must be a parse error: {argv:?}"
+        );
+    }
 }
