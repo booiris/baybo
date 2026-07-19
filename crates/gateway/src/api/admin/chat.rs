@@ -426,6 +426,18 @@ pub struct ChatTranscriptItem {
     /// `message` / `notice` items.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
+    /// For a `work` item: `true` when the turn ENDED inside this reconstruction
+    /// window (a real boundary — the final answer, the next user turn, or a
+    /// `/stop` — closed the block); `false` when the block was cut off by the
+    /// page window's edge and the turn continues into the adjacent (older) page.
+    /// The client fuses a cut-off head (`false`) with the following half so a
+    /// turn split across a page boundary stays one card, and NEVER fuses a
+    /// complete block (`true`) with its neighbour — that neighbour is a
+    /// different turn (e.g. a completed turn whose empty final reply produced no
+    /// bubble, abutting a following cron fire). `None` for `message` / `notice`
+    /// items, which never participate in the fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_complete: Option<bool>,
     /// Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
     /// colors it the way the live frame did. `None` for `message` / `work` items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2559,7 +2571,16 @@ struct WorkAccumulator {
 }
 
 impl WorkAccumulator {
-    fn flush(&mut self, items: &mut Vec<ChatTranscriptItem>, ended_at: Option<DateTime<Utc>>) {
+    /// `complete` is `true` when a real turn boundary (final answer, next user
+    /// turn, `/stop`) closes the block, `false` when the page window's trailing
+    /// edge cut it off mid-turn — the client fuses only a cut-off block with the
+    /// half in the adjacent page.
+    fn flush(
+        &mut self,
+        items: &mut Vec<ChatTranscriptItem>,
+        ended_at: Option<DateTime<Utc>>,
+        complete: bool,
+    ) {
         if !self.steps.is_empty() {
             let started = self.started;
             let ordinal = self.ordinal.unwrap_or_default();
@@ -2577,6 +2598,7 @@ impl WorkAccumulator {
                 work_started_at: started,
                 work_ended_at: ended_at.or(self.last).or(started),
                 cancelled: self.cancelled,
+                turn_complete: Some(complete),
                 notice_level: None,
             });
         }
@@ -2740,7 +2762,7 @@ fn reconstruct_transcript_with_attachments(
                     work.cancelled = true;
                 }
                 let ended_at = ev.created_at;
-                work.flush(&mut items, Some(ended_at));
+                work.flush(&mut items, Some(ended_at), true);
                 items.push(control_event_item(ev));
                 // The event also ends the turn (`/stop`) or sits on a turn
                 // boundary (`/compact`): a later turn with no user row of its
@@ -2753,7 +2775,7 @@ fn reconstruct_transcript_with_attachments(
         };
         match msg.role {
             Role::User if msg.from_user() => {
-                work.flush(&mut items, None);
+                work.flush(&mut items, None, true);
                 turn_started = Some(created_at);
                 if let Some(item) = message_item(
                     ordinal,
@@ -2849,7 +2871,7 @@ fn reconstruct_transcript_with_attachments(
                 if cancelled {
                     work.cancelled = true;
                 }
-                work.flush(&mut items, Some(created_at));
+                work.flush(&mut items, Some(created_at), true);
                 if let Some(mut item) = message_item(
                     ordinal,
                     created_at,
@@ -2952,7 +2974,10 @@ fn reconstruct_transcript_with_attachments(
     {
         work.started = Some(start);
     }
-    work.flush(&mut items, None);
+    // Trailing flush: the page window's edge closed the block, not a real turn
+    // boundary — so the turn continues in the adjacent (older) page. Mark it
+    // cut-off so the client fuses it with that page's other half.
+    work.flush(&mut items, None, false);
     items
 }
 
@@ -3000,6 +3025,7 @@ fn message_item(
         work_started_at: None,
         work_ended_at: None,
         cancelled: false,
+        turn_complete: None,
         notice_level: None,
     })
 }
@@ -3037,6 +3063,7 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
         work_started_at: None,
         work_ended_at: None,
         cancelled: false,
+        turn_complete: None,
         notice_level: level.map(str::to_owned),
     }
 }
@@ -3351,6 +3378,11 @@ mod tests {
             "starts at the user turn, not the first persisted iteration"
         );
         assert_eq!(work.work_ended_at, Some(ts(9)), "ends at the final reply");
+        assert_eq!(
+            work.turn_complete,
+            Some(true),
+            "the final reply closed the turn in-window — a whole block, never fused with a neighbour"
+        );
         assert_eq!(work.steps.len(), 3);
         assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
         assert_eq!(work.steps[0].text, "I'll write it");
@@ -3890,6 +3922,11 @@ mod tests {
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
         assert_eq!(work.work_ended_at, Some(ts(5)), "ends at last seen row");
+        assert_eq!(
+            work.turn_complete,
+            Some(false),
+            "no boundary in-window — the page edge cut the turn off, so the client fuses it"
+        );
         assert_eq!(work.steps.len(), 1);
         assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
         assert_eq!(work.steps[0].tool_summary.as_deref(), Some("ok output"));
