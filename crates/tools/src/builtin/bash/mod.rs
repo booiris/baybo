@@ -72,13 +72,16 @@ const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
 /// Shared Bash tool description. Four sections vary by permission —
 /// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
-/// `{{work_dir_scope}}` (writability), and `{{python_runtime}}` (uv-shimmed vs
-/// native) — substituted by [`render_description`] along with
-/// `{{max_output_kib}}`, `{{work_dir}}`, `{{work_tmp_dir}}`,
-/// `{{work_tmp_ttl_days}}`, and `{{platform}}`. Each varying section
-/// describes ONLY its own concern so a permission swap re-skins exactly what changed
-/// and nothing is said twice. Work-dir/platform live here, not the system
-/// prompt, so they sit next to the tool that consumes them.
+/// `{{work_dir_scope}}` (writability + the `work/tmp` SCRATCH advertisement,
+/// which must not reach the bench profile: there is no janitor in a bench
+/// container, so a swept-scratch promise there would be false), and
+/// `{{python_runtime}}` (uv-shimmed vs native) — substituted by
+/// [`render_description`] along with `{{max_output_kib}}`, `{{work_dir}}`,
+/// `{{work_tmp_dir}}`, `{{work_tmp_ttl_days}}`, and `{{platform}}`. Each
+/// varying section describes ONLY its own concern so a permission swap
+/// re-skins exactly what changed and nothing is said twice. Work-dir/platform
+/// live here, not the system prompt, so they sit next to the tool that
+/// consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
 Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution. Do NOT use it for tasks with a dedicated tool:
@@ -93,8 +96,6 @@ Reserve Bash for system commands, git operations, build/test, and terminal tasks
 {{approval}}
 
 DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
-
-SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}.
 
 PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
 
@@ -112,7 +113,9 @@ ENVIRONMENT:
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Baybo state dir under `~/.baybo`/`$BAYBO_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
+
+SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
 
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
@@ -3089,6 +3092,10 @@ mod tests {
         );
         assert!(d.contains("SANDBOX:"), "isolation section present");
         assert!(d.contains("/some/ws/work"), "work dir filled");
+        assert!(
+            d.contains("SCRATCH:") && d.contains("/some/ws/work/tmp"),
+            "sandboxed profile advertises the swept work/tmp scratch dir"
+        );
     }
 
     #[tokio::test]
@@ -3236,6 +3243,10 @@ mod tests {
             );
             assert!(!d.contains("masked with empty tmpfs"));
             assert!(d.contains("own interpreters"), "bench uses native python");
+            assert!(
+                !d.contains("SCRATCH:"),
+                "bench must not advertise a swept scratch dir (no janitor runs there)"
+            );
         }
 
         #[test]
