@@ -25,7 +25,7 @@ const GIT_AUTHOR_EMAIL: &str = "baybo@local";
 
 /// Keeps the atomic-rename staging scratch (and the update-path `.old`
 /// backups, which live under it) out of version history.
-const GITIGNORE_BODY: &str = ".staging/\n";
+const GITIGNORE_BODY: &str = ".staging/\ntmux-socks/\n";
 
 /// Stage the card's directory (plus the repo `.gitignore`) and commit iff
 /// anything changed. Returns the short SHA, or `None` when the working

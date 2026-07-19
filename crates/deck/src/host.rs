@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,17 +29,29 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream is truncated with a marker).
 pub const EXEC_OUTPUT_MAX: usize = 4 * 1024 * 1024;
 
+/// Env var injected into every `ctx.exec` naming a per-deck directory
+/// (`<workspace>/deck/tmux-socks`) where a card should place its own tmux
+/// socket (`tmux -S "$BAYBO_DECK_TMUX_DIR/<name>.sock"`). It keeps an
+/// agent-driven CLI's tmux server off the user's default socket
+/// (`/tmp/tmux-<uid>/default`, so out of their `tmux ls`) and out of
+/// `/tmp` (so a `/tmp` wipe can't kill it). Documented in the `deck` skill.
+pub const DECK_TMUX_DIR_ENV: &str = "BAYBO_DECK_TMUX_DIR";
+const TMUX_SOCKS_SUBDIR: &str = "tmux-socks";
+
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
+    /// `<deck_root>/tmux-socks` — exported to exec as `DECK_TMUX_DIR_ENV`.
+    tmux_socks_dir: PathBuf,
 }
 
 impl DeckHost {
-    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf) -> Self {
+    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf, deck_root: &Path) -> Self {
         Self {
             vault,
             scratch_root,
+            tmux_socks_dir: deck_root.join(TMUX_SOCKS_SUBDIR),
         }
     }
 
@@ -211,6 +223,7 @@ impl HostServices for DeckHost {
             .arg("-c")
             .arg(&cmd)
             .current_dir(&scratch)
+            .env(DECK_TMUX_DIR_ENV, &self.tmux_socks_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

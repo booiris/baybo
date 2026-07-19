@@ -122,6 +122,16 @@ export const ops = {
 };
 "#;
 
+const TMUX_DIR_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    const r = await ctx.exec('printf %s "$BAYBO_DECK_TMUX_DIR"');
+    return { ok: true, tmuxDir: (r.stdout || "").trim() };
+  },
+  add: async ({ a, b }) => ({ sum: a + b }),
+};
+"#;
+
 #[tokio::test]
 async fn install_call_lifecycle() {
     let Some(h) = harness_or_skip("install_call_lifecycle").await else {
@@ -197,6 +207,36 @@ async fn install_call_lifecycle() {
     // Purge removed the files but git history survives (install + purge),
     // so a purged card's code stays recoverable.
     assert_eq!(git_log_count(h.manager.deck_root(), &card.id), 2);
+
+    h.manager.shutdown().await;
+}
+
+/// Every `ctx.exec` is handed `BAYBO_DECK_TMUX_DIR` = `<deck_root>/tmux-socks`,
+/// the private-socket dir a tmux-driving card pins its session onto (so the
+/// server stays off the user's default `/tmp/tmux-<uid>/default` socket and
+/// out of `/tmp`).
+#[tokio::test]
+async fn exec_sees_injected_tmux_socket_dir() {
+    let Some(h) = harness_or_skip("exec_sees_injected_tmux_socket_dir").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), TMUX_DIR_SERVICE);
+
+    h.manager.install(staged.path()).await.unwrap();
+    let expected = h
+        .manager
+        .deck_root()
+        .join("tmux-socks")
+        .to_string_lossy()
+        .into_owned();
+
+    let view = h.manager.deck_view().await.unwrap();
+    assert!(
+        view.snapshots[0].payload.contains(&expected),
+        "snapshot {:?} should carry BAYBO_DECK_TMUX_DIR={expected}",
+        view.snapshots[0].payload
+    );
 
     h.manager.shutdown().await;
 }

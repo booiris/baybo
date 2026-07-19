@@ -208,7 +208,7 @@ impl DeckManager {
         // Card services run on the host (no sandbox), so the runtime is
         // always available — a missing `bun` surfaces as a spawn error at
         // install/boot, not a silent CRUD-only degradation.
-        let host = Arc::new(DeckHost::new(vault, scratch_root.clone()));
+        let host = Arc::new(DeckHost::new(vault, scratch_root.clone(), &deck_root));
         let supervisor = Arc::new(DeckSupervisor::new(
             host.clone(),
             Arc::new(ManagerEmitSink {
