@@ -394,12 +394,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- per-session monotonic id (stable key + same-anchor tiebreak);
                 -- `created_at` is the event's own time, shown in the UI.
                 CREATE TABLE IF NOT EXISTS session_control_events (
-                    session_id    TEXT    NOT NULL,
-                    seq           INTEGER NOT NULL,
-                    after_ordinal INTEGER NOT NULL,
-                    kind          TEXT    NOT NULL,
-                    text          TEXT    NOT NULL,
-                    created_at    INTEGER NOT NULL,
+                    session_id      TEXT    NOT NULL,
+                    seq             INTEGER NOT NULL,
+                    after_ordinal   INTEGER NOT NULL,
+                    kind            TEXT    NOT NULL,
+                    text            TEXT    NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    platform_msg_id TEXT    NOT NULL DEFAULT '',
                     PRIMARY KEY (session_id, seq)
                 );
 
@@ -804,6 +805,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
         "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN channel TEXT",
+        "ALTER TABLE session_control_events ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE deck_cards ADD COLUMN sizes TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
     ];

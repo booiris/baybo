@@ -78,8 +78,12 @@ type ApiAttachment = components['schemas']['ChatAttachment'];
  *  bubble. */
 export interface WorkStep {
   key: string;
-  kind: 'reasoning' | 'tool' | 'status' | 'prose';
+  kind: 'reasoning' | 'tool' | 'status' | 'prose' | 'notice';
   text?: string;
+  /** Severity of a `notice` step — an out-of-band notice that landed while
+   *  the turn's block was still active, folded in as a leveled line instead
+   *  of severing the block (see `foldNoticeIntoActiveWork`). */
+  noticeLevel?: 'info' | 'warn' | 'error';
   toolCallId?: string;
   tool?: string;
   toolLabel?: string | null;
@@ -3441,8 +3445,33 @@ export function routeInboundFrame(
       }
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;
-        // A notice is terminal for the turn (slash-command reply,
-        // refusal, compaction confirmation, …) — close any open work
+        const isStopCancel = isStopCancellationNotice(frame.text);
+        // A tool-authored mid-turn aside (`mid_turn` — the SERVER declares
+        // fold-eligibility; timing proves nothing, a terminal notice races
+        // ahead of `turn_state{inactive}`) landing while the turn's block is
+        // still ACTIVE folds in as a leveled step (mirroring the iOS
+        // transcript): committing a notice row here would sever the block —
+        // no longer the transcript tail — so the turn's next work frame would
+        // fork a second card ([work][notice][work]). The turn keeps running;
+        // its own turn_state / message still closes the block. Everything
+        // else — turn failures, `/stop` acks, `/compact` confirmations,
+        // persisted notices — keeps the sever path below and stays a visible
+        // committed row.
+        if (frame.mid_turn === true) {
+          const folded = foldNoticeIntoActiveWork(
+            view.transcript,
+            noticeLevel(frame.level),
+            frame.text,
+          );
+          if (folded !== null) {
+            return {
+              ...prev,
+              [sid]: { ...view, transcript: folded, awaitingReply: false },
+            };
+          }
+        }
+        // No active tail block — the notice IS the turn's reply (slash-command
+        // reply, refusal, compaction confirmation, …): close any open work
         // block so it collapses above the notice instead of dangling.
         // When the notice is a `/stop` that actually cancelled the reply,
         // label that block "Cancelled" — this is the path EVERY tab takes
@@ -3450,7 +3479,6 @@ export function routeInboundFrame(
         // originator (which marked it optimistically) and with a reload.
         // `markLast` also covers the case where `turn_state{inactive}`
         // already closed the block to "Worked" a moment earlier.
-        const isStopCancel = isStopCancellationNotice(frame.text);
         // On a cancelling /stop, keep the in-progress reply as its own bubble
         // (finalizeTrailingAnswer) below the collapsed, "Cancelled"-labelled
         // work block — mirroring the REST reload path — rather than folding it
@@ -3459,20 +3487,34 @@ export function routeInboundFrame(
           isStopCancel ? finalizeTrailingAnswer(view.transcript) : view.transcript,
         );
         const base = isStopCancel ? markLastWorkCancelled(closed) : closed;
+        // A durably-persisted notice (blank-reply fallback, /compact
+        // confirmation) carries its `n<seq>` row id — keying the live row by
+        // it makes the sync-redelivered twin dedup by key instead of
+        // rendering the same text twice. And the twin may have raced AHEAD
+        // (persist precedes emit, and a gap/reconnect sync is unordered
+        // w.r.t. the WS frame), so skip the mint when the key is already on
+        // screen — appending would double the card under a duplicate key.
+        const durableId = frame.durable_id ?? '';
+        const noticeKey =
+          durableId !== ''
+            ? transcriptRowKey(sid, durableId)
+            : `notice-${sid}-${base.length}-${Date.now()}`;
         return {
           ...prev,
           [sid]: {
             ...view,
-            transcript: [
-              ...base,
-              {
-                key: `notice-${sid}-${base.length}-${Date.now()}`,
-                role: 'system',
-                text: '',
-                notice: { level: noticeLevel(frame.level), text: frame.text },
-                createdAt: new Date().toISOString(),
-              },
-            ],
+            transcript: base.some((r) => r.key === noticeKey)
+              ? base
+              : [
+                  ...base,
+                  {
+                    key: noticeKey,
+                    role: 'system',
+                    text: '',
+                    notice: { level: noticeLevel(frame.level), text: frame.text },
+                    createdAt: new Date().toISOString(),
+                  },
+                ],
             // Some turns reply with `AgentOutput::Notice` and never
             // emit a Delta/Message — slash commands like `/compact`,
             // refusal / error paths, etc. Without this, the working
@@ -3673,15 +3715,24 @@ function ensureWork(
     }
     rows = rows.slice(0, -1);
   }
-  const tail = rows[rows.length - 1];
+  // Find the turn's block by scanning back over any trailing committed notice
+  // rows — a notice row between the block and a late work frame breaks tail
+  // adjacency, and the straggler would fork a second card
+  // ([work][notice][work]). The scan stops at any non-notice row, so a later
+  // turn (separated by its own answer bubble or user message) still gets its
+  // own block.
+  let scan = rows.length - 1;
+  while (scan >= 0 && rows[scan].notice !== undefined) scan -= 1;
+  const tail = rows[scan];
   let idx: number;
   if (tail?.kind === 'work' && (tail.workActive || turnActive === false)) {
-    // Reuse the trailing work block: an active one (a live turn), OR —
+    // Reuse the turn's work block: an active one (a live turn), OR —
     // when the server says the turn already ended — its just-closed block,
     // so a late trailing frame (e.g. a tool call that completed after a
     // `/stop` cancel) folds into that turn's collapsed block instead of
     // spawning a perpetual "Working" box that no turn-end frame will close.
-    idx = rows.length - 1;
+    // Only steps are appended — a frozen block keeps its `workEndedAt`.
+    idx = scan;
   } else {
     // No reusable block. Open one — pre-closed when the server says the
     // turn already ended, so a late frame renders as a collapsed summary
@@ -3886,6 +3937,57 @@ function pushStatusStep(
   return next;
 }
 
+/** Fold an out-of-band notice into the turn's ACTIVE work block, as a leveled
+ *  `notice` step (the iOS transcript's model). The block may sit under a
+ *  trailing STREAMING answer bubble — the web keeps the streamed reply as a
+ *  transcript row below the block where iOS holds it out-of-band — in which
+ *  case the bubble folds into the block as a `prose` step ahead of the notice
+ *  (severing there instead would freeze the block mid-stream and the turn's
+ *  continuation would fork a second card). Returns null when there is no
+ *  active block to fold into (between turns, a frozen block) — the caller
+ *  falls back to the committed notice row — and for an active block with NO
+ *  steps yet: that is the eagerly-opened working affordance (`applyTurnState`
+ *  opens it on `turn_state{active}` before any work lands; iOS opens no block
+ *  until a real work frame), and a notice landing on it is the turn's only
+ *  output — the turn-failed / blank-reply notice racing ahead of
+ *  `turn_state{inactive}` — which must stay a visible card, not be buried
+ *  inside a bare "Worked Xs ›" stub. */
+export function foldNoticeIntoActiveWork(
+  prev: TranscriptRow[],
+  level: 'info' | 'warn' | 'error',
+  text: string,
+): TranscriptRow[] | null {
+  if (prev.length === 0) return null;
+  let i = prev.length - 1;
+  const tail = prev[i];
+  const overBubble =
+    i > 0 && tail.kind !== 'work' && tail.role === 'assistant' && tail.streaming === true;
+  if (overBubble) i -= 1;
+  const block = prev[i];
+  if (block.kind !== 'work' || block.workActive !== true) return null;
+  const steps = block.steps ?? [];
+  if (steps.length === 0) return null;
+  // The bubble's streamed text folds in as a `prose` step AHEAD of the notice
+  // step (exactly ensureWork's fold on any other progress frame). Leaving the
+  // bubble at the tail is not an option: the notice's pacer flush deletes the
+  // pacer, and the next delta's recreated pacer would adopt the stale bubble
+  // as its write target and wholesale-replace — erase — the pre-notice text.
+  // With the bubble gone, that delta opens a fresh bubble instead.
+  const folded: WorkStep[] = [...steps];
+  if (overBubble && tail.text.trim().length > 0) {
+    folded.push({ key: `prose-${tail.key}`, kind: 'prose', text: tail.text });
+  }
+  folded.push({
+    key: `notice-${folded.length}-${Date.now()}`,
+    kind: 'notice',
+    noticeLevel: level,
+    text,
+  });
+  const next = overBubble ? prev.slice(0, -1) : prev.slice();
+  next[i] = { ...block, steps: folded };
+  return next;
+}
+
 /** Close the turn's open work block: stamp `workEndedAt` and clear
  *  `workActive` so it collapses to a `Worked Xs ›` summary. An empty
  *  block (the turn produced no intermediate steps — a direct answer) is
@@ -3989,7 +4091,6 @@ const STOP_CANCELLED_NOTICE_MARKER = 'Cancelled the in-progress reply';
 export function isStopCancellationNotice(text: string): boolean {
   return text.includes(STOP_CANCELLED_NOTICE_MARKER);
 }
-
 /** Mark the turn-just-stopped's work block cancelled. The block is the last
  *  row, or sits just above a salvaged trailing reply bubble (a /stop'd partial
  *  answer kept as its own bubble). Only that one block is touched and only an
@@ -4049,7 +4150,19 @@ export function applyTurnState(
   // off it, or a finished turn resurfaces as a phantom "Working" box whose
   // elapsed counts from the wrong (old) start.
   if (startedAt === null) return prev;
-  const last = prev[prev.length - 1];
+  // The turn's block may not be the literal tail: its partial answer bubble
+  // and committed notice rows land below it. Scan back over that trailing
+  // answer/notice run — anything else (a user message, another block) is the
+  // barrier — so the reconciliation finds the same turn's block instead of
+  // opening a duplicate below it.
+  let i = prev.length - 1;
+  while (i >= 0) {
+    const row = prev[i];
+    if (row.kind === 'work') break;
+    if (row.role !== 'assistant' && row.notice === undefined) break;
+    i -= 1;
+  }
+  const last = prev[i];
   if (last?.kind === 'work' && (last.workActive || last.workStartedAt === startedAt)) {
     // Re-pin an already-open block, or re-open a *closed* block only when
     // its start matches this turn — the same in-flight turn a REST reload
@@ -4058,7 +4171,7 @@ export function applyTurnState(
     // rather than resurrecting that turn's steps.
     if (last.workActive && last.workStartedAt === startedAt) return prev;
     const next = prev.slice();
-    next[next.length - 1] = {
+    next[i] = {
       ...last,
       workActive: true,
       workStartedAt: startedAt,
@@ -4252,6 +4365,29 @@ export function applySyncMerge(prev: TranscriptRow[], page: TranscriptRow[]): Tr
         // The live final frame was lost (that's why we're syncing) — the
         // persisted final lands in the streaming bubble it finalizes.
         next[next.length - 1] = { ...row, createdAt: last.createdAt ?? row.createdAt };
+        changed = true;
+        continue;
+      }
+    }
+    const notice = row.notice;
+    if (notice !== undefined) {
+      // A durable notice whose live twin was minted with a client key (the
+      // `/stop` ack: persisted AFTER its emit, so the frame carried no
+      // `durable_id` for a key-dedup) reconciles by content instead of
+      // doubling. This is safe because it is the ONLY un-durable persisted
+      // notice — the blank-reply and `/compact` notices ride a `durable_id`
+      // and so already dedup by key above — and a content collision is
+      // impossible (a second `/stop` acks with different text). Adopt the
+      // durable key so a later sync dedups by key.
+      const idx = next.findIndex(
+        (r) =>
+          r.key.startsWith('notice-') &&
+          r.notice !== undefined &&
+          r.notice.level === notice.level &&
+          r.notice.text === notice.text,
+      );
+      if (idx >= 0) {
+        next[idx] = row;
         changed = true;
         continue;
       }
@@ -4947,6 +5083,24 @@ function WorkStepView({ step }: { step: WorkStep }) {
       </div>
     );
   }
+  if (step.kind === 'notice') {
+    // An out-of-band notice folded into the block mid-turn (see
+    // `foldNoticeIntoActiveWork`): a leveled line inside the card rather than
+    // a committed row that would sever the block. △ is text-presentation (no
+    // emoji), matching the block's other glyphs.
+    const color =
+      step.noticeLevel === 'error'
+        ? 'text-err'
+        : step.noticeLevel === 'warn'
+          ? 'text-warn'
+          : 'text-ink-soft';
+    return (
+      <div className={`flex items-start gap-2 font-mono text-xs ${color}`}>
+        <span className="select-none">△</span>
+        <span className="whitespace-pre-wrap">{step.text}</span>
+      </div>
+    );
+  }
   const statusColor =
     step.toolStatus === 'error'
       ? 'text-err'
@@ -5014,12 +5168,34 @@ export function workBlockDisplay(
   };
 }
 
+/** Humanized duration: whole seconds under a minute, `Xm Ys` under an hour
+ *  (seconds dropped when zero), `Xh Ym` beyond (seconds dropped, minutes
+ *  rounded — a 60-minute carry rolls the hour). Mirrors the iOS transcript's
+ *  formatDuration so both clients label a turn identically. */
+export function formatDuration(ms: number): string {
+  const total = Math.round(ms / 1000);
+  if (total < 60) return `${total}s`;
+  if (total < 3600) {
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  let h = Math.floor(total / 3600);
+  let m = Math.round((total % 3600) / 60);
+  if (m === 60) {
+    h += 1;
+    m = 0;
+  }
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
 /** Collapsed-summary label for a finished work block. A sub-second turn drops
  *  the duration (never "Worked 0s"); a cancelled turn (`/stop`) is labelled
  *  "Cancelled" so it reads distinctly from a turn that ran to completion. */
-export function formatWorkedLabel(secs: number, cancelled = false): string {
-  const worked = secs >= 1 ? `Worked ${secs}s` : 'Worked';
-  return cancelled ? (secs >= 1 ? `Cancelled · ${worked}` : 'Cancelled') : worked;
+export function formatWorkedLabel(elapsedMs: number, cancelled = false): string {
+  const timed = elapsedMs >= 1000;
+  const worked = timed ? `Worked ${formatDuration(elapsedMs)}` : 'Worked';
+  return cancelled ? (timed ? `Cancelled · ${worked}` : 'Cancelled') : worked;
 }
 
 // The turn's aggregated progress. A live turn that hasn't produced a step
@@ -5076,14 +5252,12 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
 
   if (!active && steps.length === 0) return null;
 
-  const secs =
-    row.workEndedAt && row.workStartedAt
-      ? Math.max(0, Math.round((row.workEndedAt - row.workStartedAt) / 1000))
-      : 0;
+  const elapsedMs =
+    row.workEndedAt && row.workStartedAt ? Math.max(0, row.workEndedAt - row.workStartedAt) : 0;
   // Never surface a "0s" duration; a cancelled (`/stop`) turn reads
   // "Cancelled · Worked Xs" instead of a plain completion summary.
   const cancelled = !!row.workCancelled;
-  const workedLabel = formatWorkedLabel(secs, cancelled);
+  const workedLabel = formatWorkedLabel(elapsedMs, cancelled);
 
   // One persistent element tree across active / collapsed / expanded so
   // the transitions actually animate (a branch swap would just hard-cut).
@@ -5134,7 +5308,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             </>
           ) : (
             <>
-              <span className={cancelled ? 'text-error' : 'text-ink-soft'}>{workedLabel}</span>
+              <span className={cancelled ? 'text-err' : 'text-ink-soft'}>{workedLabel}</span>
               <RiArrowRightSLine
                 className={`text-sm text-ink-soft shrink-0 transition-transform duration-300 ease-out ${
                   panelOpen ? 'rotate-90' : ''
@@ -5172,18 +5346,19 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   );
 }
 
-// Live-ticking elapsed seconds for the active work header. Self-contained
-// 1s interval so the rest of the transcript doesn't re-render on the tick.
+// Live-ticking elapsed for the active work header, humanized like the
+// collapsed label. Self-contained 1s interval so the rest of the transcript
+// doesn't re-render on the tick.
 function LiveElapsed({ startedAt }: { startedAt: number }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
-  const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const ms = now - startedAt;
   // Hold the counter back for the first second so a just-started turn reads
   // "Working", never "Working 0s".
-  return secs < 1 ? null : <>{secs}s</>;
+  return ms < 1000 ? null : <>{formatDuration(ms)}</>;
 }
 
 // True when the trailing closed `work` block at position `i` represents
@@ -5207,7 +5382,12 @@ function isCancelledWorkAt(
   if (i !== transcript.length - 1) return false;
   if (turn === null || turn.active) return false;
   const row = transcript[i];
-  return row.kind === 'work' && !row.workActive;
+  if (row.kind !== 'work' || row.workActive === true) return false;
+  // A block whose LAST step is a folded notice ended WITH terminal output —
+  // the notice was the turn's reply, folded in rather than committed as its
+  // own row — so it isn't a silent cancellation.
+  const lastStep = row.steps?.[row.steps.length - 1];
+  return lastStep?.kind !== 'notice';
 }
 
 function CancelledTurnIndicator() {

@@ -315,6 +315,7 @@ impl SessionStore for MemorySessionStore {
         kind: ControlEventKind,
         text: &str,
         created_at: DateTime<Utc>,
+        platform_msg_id: &str,
     ) -> Result<i64> {
         let mut guard = self.control_events.lock();
         let log = guard.entry(session_id.clone()).or_default();
@@ -325,6 +326,7 @@ impl SessionStore for MemorySessionStore {
             kind,
             text: text.to_string(),
             created_at,
+            platform_msg_id: platform_msg_id.to_string(),
         });
         Ok(seq)
     }

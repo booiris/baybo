@@ -1533,6 +1533,7 @@ mod tests {
             _kind: baybo_model::ControlEventKind,
             _text: &str,
             _created_at: DateTime<Utc>,
+            _platform_msg_id: &str,
         ) -> std::result::Result<i64, baybo_store::StorageError> {
             Ok(0)
         }

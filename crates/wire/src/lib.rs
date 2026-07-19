@@ -667,6 +667,34 @@ pub enum Frame {
         /// terminal notices are byte-identical.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+        /// `Some(true)` only for a tool-authored aside emitted while the turn
+        /// keeps running (`SessionNotifier`): work-block clients may fold it
+        /// into the open turn card as a leveled step. `Some(false)` for
+        /// terminal or durable notices — turn failures, `/stop` acks,
+        /// `/compact` confirmations — which must stay a visible standalone
+        /// row. The emitter declares this because the client cannot infer it:
+        /// a terminal notice races ahead of `turn_state{inactive}`, so "the
+        /// turn looks live" proves nothing.
+        ///
+        /// Deliberately a TRI-STATE, not a defaulted bool: the gateway always
+        /// sets `Some`, so `None` means the frame crossed a peer that
+        /// predates the field — clients then fall back to the legacy
+        /// fold-if-active heuristic. A defaulted `bool` cannot survive a
+        /// re-encode hop (the iOS FFI decodes into this shared struct and
+        /// re-encodes for its webview): absence would be manufactured into
+        /// `false` and the fallback could never fire. `skip_serializing_if`
+        /// keeps `None` absent across exactly that hop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mid_turn: Option<bool>,
+        /// The persisted control event's stable transcript row id (`n<seq>`)
+        /// when this notice was recorded durably BEFORE being emitted (the
+        /// blank-reply fallback, the `/compact` confirmation). Clients key
+        /// their live-minted notice row by it so the row the next sync
+        /// redelivers dedups by id instead of rendering the same text twice.
+        /// Absent for live-only notices and for ones persisted only after
+        /// the emit (the `/stop` acks, which clients pull via sync instead).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        durable_id: Option<String>,
     },
     /// Server → client: the session's full planning checklist after it changed
     /// (a `Task*` call) or at turn start. An idempotent snapshot
@@ -1281,6 +1309,8 @@ mod tests {
             level: "warn".into(),
             text: "heads up".into(),
             transient: false,
+            mid_turn: Some(false),
+            durable_id: None,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -1293,6 +1323,59 @@ mod tests {
             level: "info".into(),
             text: "still working on it".into(),
             transient: true,
+            mid_turn: Some(false),
+            durable_id: None,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_mid_turn_notice() {
+        let frame = Frame::Notice {
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            level: "warn".into(),
+            text: "sandbox downgraded".into(),
+            transient: false,
+            mid_turn: Some(true),
+            durable_id: None,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn legacy_notice_keeps_mid_turn_absent_across_a_re_encode_hop() {
+        // An old gateway's notice carries no `mid_turn`. The iOS FFI decodes
+        // into this struct and re-encodes for its webview — if `None` were
+        // manufactured into a serialized `false`, the client-side legacy
+        // fold fallback (keyed on the field's ABSENCE) could never fire.
+        let frame = Frame::Notice {
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            level: "warn".into(),
+            text: "degraded".into(),
+            transient: false,
+            mid_turn: None,
+            durable_id: None,
+        };
+        let bytes = encode(&frame).unwrap();
+        assert!(
+            !bytes.windows(b"mid_turn".len()).any(|w| w == b"mid_turn"),
+            "None must stay absent on the wire"
+        );
+        assert_eq!(frame, decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn round_trip_durable_notice() {
+        let frame = Frame::Notice {
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            level: "info".into(),
+            text: "Context compacted.".into(),
+            transient: false,
+            mid_turn: Some(false),
+            durable_id: Some("n7".into()),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

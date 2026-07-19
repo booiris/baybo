@@ -152,8 +152,22 @@ export type WireFrame =
   // SubscribeState staleness test and for re-opening a restored work block.
   | { kind: "turn_state"; active: boolean; started_at?: string }
   // `transient: true` marks mid-turn progress narration (folded into the work
-  // block); absent/false is a terminal notice (its own centered row).
-  | { kind: "notice"; level: string; text: string; transient?: boolean }
+  // block as a status step). `mid_turn: true` marks a tool-authored aside
+  // emitted while the turn keeps running (`SessionNotifier`) — the only class
+  // the client may fold as a leveled step. Absent/false for both: a terminal
+  // or durable notice (turn failures, `/stop` acks, `/compact` confirmations),
+  // rendered as its own centered row.
+  // `durable_id` is the persisted control event's `n<seq>` row id when the
+  // notice was recorded durably before the emit — the live-minted row is keyed
+  // by it so the sync-redelivered twin dedups instead of doubling.
+  | {
+      kind: "notice";
+      level: string;
+      text: string;
+      transient?: boolean;
+      mid_turn?: boolean | null;
+      durable_id?: string | null;
+    }
   // The one atomic state-plane bundle, sent right after every Subscribe: turn
   // activity + the in-flight work block streamed so far (plus approvals/tasks,
   // which have no iOS surface — ignored). Staleness of the turn/work halves is

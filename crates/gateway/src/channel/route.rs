@@ -313,6 +313,8 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                                 level: "error".to_string(),
                                 text: "session does not belong to this channel".to_string(),
                                 transient: false,
+                                mid_turn: Some(false),
+                                durable_id: None,
                             })
                             .await
                         {
@@ -421,6 +423,8 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                                 level: "error".to_string(),
                                 text: reason,
                                 transient: false,
+                                mid_turn: Some(false),
+                                durable_id: None,
                             })
                             .await
                     {
@@ -856,6 +860,8 @@ async fn enforce_pairing(
                 level: "warn".to_owned(),
                 text,
                 transient: false,
+                mid_turn: Some(false),
+                durable_id: None,
             };
             if let Err(e) = sidecar.send_frame(notice).await {
                 tracing::debug!(error = %e, "send pairing notice failed");

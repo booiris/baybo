@@ -80,6 +80,7 @@ impl Router {
                 &channel,
                 &crate::actor::slash_command_text(&incoming.message.content),
                 incoming.message.timestamp,
+                &incoming.platform_msg_id,
             )
             .await;
             return Ok(());
@@ -339,6 +340,7 @@ impl Router {
         channel: &ChannelType,
         command_text: &str,
         stopped_at: chrono::DateTime<chrono::Utc>,
+        command_msg_id: &str,
     ) {
         // Drain the in-flight background subagents first: the removal both
         // gives us the cancel targets + ack summaries AND suppresses each
@@ -416,6 +418,10 @@ impl Router {
             event: AgentEvent::Notice {
                 level: NoticeLevel::Info,
                 text: text.clone(),
+                mid_turn: false,
+                // Persisted only AFTER this emit (the id is unknown here);
+                // clients pull the durable row via sync instead.
+                durable_id: None,
             },
         })
         .await;
@@ -443,12 +449,16 @@ impl Router {
         {
             Ok(max) => {
                 let after = max.unwrap_or(-1);
+                // The Command echo carries the send's id so a client's
+                // optimistic `/stop` bubble reconciles with it; the ack notice
+                // is server-authored, so it has none.
                 self.persist_control_event(
                     session_id,
                     after,
                     ControlEventKind::Command,
                     command_text,
                     stopped_at,
+                    command_msg_id,
                 )
                 .await;
                 self.persist_control_event(
@@ -457,6 +467,7 @@ impl Router {
                     ControlEventKind::NoticeInfo,
                     &text,
                     stopped_at,
+                    "",
                 )
                 .await;
             }
@@ -478,10 +489,11 @@ impl Router {
         kind: ControlEventKind,
         text: &str,
         at: chrono::DateTime<chrono::Utc>,
+        platform_msg_id: &str,
     ) {
         if let Err(e) = self
             .session_manager
-            .append_control_event(session_id, after_ordinal, kind, text, at)
+            .append_control_event(session_id, after_ordinal, kind, text, at, platform_msg_id)
             .await
         {
             warn!(%session_id, error = %e, "failed to persist control event");

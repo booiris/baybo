@@ -137,7 +137,28 @@ pub enum AgentEvent {
     /// `Suspicious`, so it still runs but the user should know).
     /// Channels decide how to render; the TUI inlines it into scrollback
     /// styled by `level`, transports without a banner surface may drop it.
-    Notice { level: NoticeLevel, text: String },
+    Notice {
+        level: NoticeLevel,
+        text: String,
+        /// `true` only for a tool-authored aside emitted WHILE the turn keeps
+        /// running (`SessionNotifier` — sandbox downgrades, skill warnings):
+        /// work-block clients may fold it into the open turn card. `false`
+        /// for everything terminal or durable — the turn-failed / crash /
+        /// blank-reply notices, `/stop` acks, `/compact` confirmations —
+        /// which must stay a visible standalone row: the client cannot
+        /// reliably tell the two apart from text or timing (a terminal
+        /// notice races ahead of `turn_state{inactive}`), so the emitter
+        /// declares it.
+        mid_turn: bool,
+        /// The persisted control event's stable transcript row id
+        /// (`control_event_row_id`, `n<seq>`) when this notice was ALSO
+        /// recorded durably before being emitted (the blank-reply fallback,
+        /// the `/compact` confirmation). Clients key their live-minted notice
+        /// row by it so the row the next sync redelivers dedups instead of
+        /// rendering the same text twice. `None` for live-only notices and
+        /// for ones persisted only after the emit (the `/stop` acks).
+        durable_id: Option<String>,
+    },
     /// Out-of-band, *transient* progress narration for the in-flight turn
     /// — the progress observer's one-line "what's happening now". Unlike
     /// [`AgentEvent::Notice`] it is **not** terminal: the turn keeps

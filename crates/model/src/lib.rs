@@ -22,7 +22,7 @@ pub use agent_profile::{
     AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, MAX_AGENT_PROFILE_NAME_CHARS,
 };
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
-pub use control_event::{ControlEvent, ControlEventKind};
+pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{
     CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus, ExecutionOutcome,

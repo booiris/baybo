@@ -616,6 +616,7 @@ async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
             baybo_model::ControlEventKind::NoticeInfo,
             "compacted",
             chrono::Utc::now(),
+            "",
         )
         .await
         .expect("append control event");
@@ -1897,6 +1898,8 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         event: AgentEvent::Notice {
             level: baybo_channels::NoticeLevel::Info,
             text: "ignored".into(),
+            mid_turn: false,
+            durable_id: None,
         },
     });
     assert_eq!(

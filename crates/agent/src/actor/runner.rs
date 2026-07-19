@@ -74,6 +74,8 @@ pub fn spawn_actor(
                 event: AgentEvent::Notice {
                     level: NoticeLevel::Error,
                     text: "The assistant crashed mid-turn; the turn was cancelled.".to_string(),
+                    mid_turn: false,
+                    durable_id: None,
                 },
             };
             let _ = ctx.response_tx.send(notice).await;
