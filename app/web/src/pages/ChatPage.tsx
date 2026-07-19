@@ -2742,7 +2742,7 @@ export function ChatPage() {
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="chat-scroll chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
+          className="chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
           <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
@@ -5466,7 +5466,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             onScroll={handleStepsScroll}
             className={`min-h-0 ${
               panelOpen
-                ? 'chat-scroll max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
+                ? 'max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
                 : 'overflow-hidden'
             }`}
           >

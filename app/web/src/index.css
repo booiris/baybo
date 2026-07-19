@@ -62,10 +62,39 @@
   }
 }
 
-/* Tinted scrollbar that blends into the canvas background. */
-.chat-scroll {
+/* Global tinted scrollbar: every scroll area blends into the warm canvas
+   (transparent track shows the background behind it; thumb is a faint warm
+   ink) instead of falling back to the browser's white/gray default. Applies
+   app-wide — the `.chat-scroll` opt-in is no longer needed, though a component
+   can still opt OUT (e.g. QueuePanel hides its bar via a higher-specificity
+   class rule). */
+* {
   scrollbar-width: thin;
   scrollbar-color: rgba(42, 37, 32, 0.22) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-clip: padding-box;
+  background-color: rgba(42, 37, 32, 0.22);
+  border: 2px solid transparent;
+  border-radius: 6px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(42, 37, 32, 0.4);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* Transcript-only: reserve the gutter on BOTH edges so (a) content doesn't
@@ -77,30 +106,6 @@
    away from both edges. */
 .chat-scroll-centered {
   scrollbar-gutter: stable both-edges;
-}
-
-.chat-scroll::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-.chat-scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.chat-scroll::-webkit-scrollbar-thumb {
-  background-clip: padding-box;
-  background-color: rgba(42, 37, 32, 0.22);
-  border: 2px solid transparent;
-  border-radius: 6px;
-}
-
-.chat-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(42, 37, 32, 0.4);
-}
-
-.chat-scroll::-webkit-scrollbar-corner {
-  background: transparent;
 }
 
 /* Chat markdown lists: render bullet / number markers in a fixed left slot
