@@ -539,9 +539,7 @@ pub async fn build_managers(
     // --- Deck manager (docs/modules/deck.md) — built here so its tools
     // register while `tool_registry` still has a single Arc owner. Push
     // hooks ride the owner channel; boot (service start + post-upgrade
-    // re-gates) and shutdown are driven by the gateway entrypoint. The
-    // `baybo://` internal read registry is an open item — `None` until
-    // its read surface is designed.
+    // re-gates) and shutdown are driven by the gateway entrypoint.
     let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
         store: stores.deck.clone(),
         vault: Arc::clone(&secret_vault),
@@ -550,7 +548,6 @@ pub async fn build_managers(
         )),
         deck_root: workspace_paths.deck_dir(),
         scratch_root: workspace_paths.state_dir().join("deck-scratch"),
-        internal: None,
     });
     for (tool, manifest) in baybo_deck::tools::agent_tools(Arc::clone(&deck_manager)) {
         tool_registry.register(tool, manifest);

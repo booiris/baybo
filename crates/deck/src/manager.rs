@@ -25,7 +25,7 @@ use crate::bundle::{
     MAX_SRC_TOTAL_BYTES, OPENAPI_FILE, SDK_VERSION, SERVICE_FILE, SRC_DIR, load_bundle,
 };
 use crate::error::{DeckError, Result};
-use crate::host::{DeckHost, InternalReads};
+use crate::host::DeckHost;
 use crate::service::{EmitSink, SNAPSHOT_MAX_BYTES, StrikeRecorder, spawn_service};
 use crate::spec::CardSpec;
 use crate::supervisor::{DeckSupervisor, QuarantineSink};
@@ -130,8 +130,6 @@ pub struct DeckManagerConfig {
     pub deck_root: PathBuf,
     /// Scratch root for service + exec working dirs.
     pub scratch_root: PathBuf,
-    /// The curated `baybo://` read registry; `None` disables internal reads.
-    pub internal: Option<Arc<dyn InternalReads>>,
 }
 
 struct ManagerEmitSink {
@@ -206,12 +204,11 @@ impl DeckManager {
             events,
             deck_root,
             scratch_root,
-            internal,
         } = config;
         // Card services run on the host (no sandbox), so the runtime is
         // always available — a missing `bun` surfaces as a spawn error at
         // install/boot, not a silent CRUD-only degradation.
-        let host = Arc::new(DeckHost::new(vault, internal, scratch_root.clone()));
+        let host = Arc::new(DeckHost::new(vault, scratch_root.clone()));
         let supervisor = Arc::new(DeckSupervisor::new(
             host.clone(),
             Arc::new(ManagerEmitSink {

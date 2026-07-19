@@ -232,7 +232,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         ))),
         deck_root: tempdir.path().join("deck"),
         scratch_root: tempdir.path().join("deck-scratch"),
-        internal: None,
     });
 
     let deps = GatewayDeps {

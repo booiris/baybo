@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
 use tokio::process::Command;
 
 use baybo_security::{PlaceholderMinter, SecretVault};
@@ -32,37 +31,16 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream is truncated with a marker).
 pub const EXEC_OUTPUT_MAX: usize = 256 * 1024;
 
-/// Curated in-process read surface behind the `baybo://` pseudo-scheme —
-/// the only way a card can see gateway-internal data (the SSRF floor
-/// rightly blocks loopback HTTP). The gateway wires the real registry;
-/// tests and headless setups run without one.
-#[async_trait]
-pub trait InternalReads: Send + Sync + 'static {
-    /// `path` is `<host>/<path>` of the `baybo://` URL (e.g.
-    /// `llm/usage`); `query` its query pairs. Read-only by contract.
-    async fn get(
-        &self,
-        path: &str,
-        query: &HashMap<String, String>,
-    ) -> std::result::Result<Value, String>;
-}
-
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
-    internal: Option<Arc<dyn InternalReads>>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
 }
 
 impl DeckHost {
-    pub fn new(
-        vault: Arc<SecretVault>,
-        internal: Option<Arc<dyn InternalReads>>,
-        scratch_root: PathBuf,
-    ) -> Self {
+    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf) -> Self {
         Self {
             vault,
-            internal,
             scratch_root,
         }
     }
@@ -191,30 +169,6 @@ impl DeckHost {
             body: String::from_utf8_lossy(&body).into_owned(),
         })
     }
-
-    async fn fetch_internal(
-        &self,
-        url: &url::Url,
-    ) -> std::result::Result<HostFetchResponse, String> {
-        let Some(internal) = &self.internal else {
-            return Err("baybo:// internal reads are not configured on this gateway".into());
-        };
-        let path = format!(
-            "{}{}",
-            url.host_str().unwrap_or_default(),
-            url.path().trim_end_matches('/')
-        );
-        let query: HashMap<String, String> = url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        let value = internal.get(&path, &query).await?;
-        Ok(HostFetchResponse {
-            status: 200,
-            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-            body: value.to_string(),
-        })
-    }
 }
 
 fn truncate_output(bytes: &[u8]) -> String {
@@ -234,11 +188,6 @@ impl HostServices for DeckHost {
         card_id: &str,
         req: HostFetchRequest,
     ) -> std::result::Result<HostFetchResponse, String> {
-        if let Ok(url) = url::Url::parse(&req.url)
-            && url.scheme() == "baybo"
-        {
-            return self.fetch_internal(&url).await;
-        }
         self.fetch_external(card_id, req).await
     }
 

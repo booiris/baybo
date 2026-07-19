@@ -64,7 +64,6 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
         events: events.clone(),
         deck_root: root.path().join("deck"),
         scratch_root: root.path().join("scratch"),
-        internal: None,
     });
     Some(Harness {
         manager,
