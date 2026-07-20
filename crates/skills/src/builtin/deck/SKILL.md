@@ -152,13 +152,11 @@ the bytes. Put a ref into the snapshot you `emit`; the card renders it with
   returning the body — use it for an image/file you want to DISPLAY or hand
   back, of any size. 2xx only, bounded redirects, same secret-placeholder
   reveal as `ctx.fetch`.
-- `await ctx.blobPut(base64, contentType)` → `ref`. Store bytes you built
-  inline (≤ 8 MB; larger content goes through `fetchBlob` / `blobPutFile`).
 - `await ctx.blobPutFile(path, contentType)` → `ref`. Store a file a
   `ctx.exec` produced (relative `path` resolves against the exec working dir).
-- `await ctx.blobGet(blobId)` → `{base64, contentType, size}` (≤ 8 MB). You
-  rarely need this — move the `blobId`, not the bytes.
-- `ctx.fetch(url, {bodyBlob})` — stream a stored blob as the request body.
+  This is the path for content your service *generates*: write it to disk in
+  an `exec`, then hand the file over. (For a small image you only need to
+  DISPLAY, not save, just emit a `data:` URI in your snapshot — no blob needed.)
 
 **Reuse a `blobId` for unchanged content — do NOT re-fetch every tick.** A
 `blobId` is stable only while you keep the same one: fetching or putting the

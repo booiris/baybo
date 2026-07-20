@@ -31,7 +31,7 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
 
     /// Cap on a single blob served for display. Card imagery is small; a card
     /// that points `deck.blobUrl` at something huge fails to render rather than
-    /// pulling it all into memory. Mirrors the service-side `blobGet` cap.
+    /// pulling it all into memory.
     private static let blobServeCap = 8 * 1024 * 1024
 
     init(blobRouteEnabled: Bool = false) {

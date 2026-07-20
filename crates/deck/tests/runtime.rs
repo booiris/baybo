@@ -145,28 +145,27 @@ export const ops = {
 };
 "#;
 
-/// A card whose refresh op exercises the whole ref-first blob plane: inline
-/// `blobPut` → `blobGet` round-trip, plus an `exec`-produced file streamed in
-/// via `blobPutFile`. Returns the refs so the test can assert they landed in
-/// the shared store.
+/// A card whose refresh op exercises the ref-first blob plane: two
+/// `exec`-produced files streamed into the shared store via `blobPutFile`.
+/// Returns the refs so the test can assert they landed.
 const BLOB_SERVICE: &str = r#"
 export const ops = {
   refresh: async (_p, ctx) => {
-    const put = await ctx.blobPut(btoa("hello deck"), "text/plain");
-    const got = await ctx.blobGet(put.blobId);
     await ctx.exec("printf 'from-exec' > out.bin");
     const filed = await ctx.blobPutFile("out.bin", "application/octet-stream");
+    await ctx.exec("printf 'hello deck' > note.txt");
+    const noted = await ctx.blobPutFile("note.txt", "text/plain");
     return {
-      putId: put.blobId, putSize: put.size, putCt: put.contentType,
-      roundtrip: got.base64, fileId: filed.blobId, fileSize: filed.size,
+      fileId: filed.blobId, fileSize: filed.size, fileCt: filed.contentType,
+      noteId: noted.blobId, noteSize: noted.size, noteCt: noted.contentType,
     };
   },
 };
 "#;
 
 #[tokio::test]
-async fn blob_plane_round_trips_through_store() {
-    let Some(h) = harness_or_skip("blob_plane_round_trips_through_store").await else {
+async fn blob_plane_stores_exec_files() {
+    let Some(h) = harness_or_skip("blob_plane_stores_exec_files").await else {
         return;
     };
     let staged = tempfile::tempdir().unwrap();
@@ -179,18 +178,17 @@ async fn blob_plane_round_trips_through_store() {
     let view = h.manager.deck_view().await.unwrap();
     let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
 
-    // Inline put/get round-trip: base64 of "hello deck".
-    assert_eq!(snap["putCt"], "text/plain");
-    assert_eq!(snap["putSize"], 10);
-    assert_eq!(snap["roundtrip"], "aGVsbG8gZGVjaw==");
+    assert_eq!(snap["fileCt"], "application/octet-stream");
+    assert_eq!(snap["fileSize"], 9); // "from-exec"
+    assert_eq!(snap["noteCt"], "text/plain");
+    assert_eq!(snap["noteSize"], 10); // "hello deck"
 
-    // Both refs resolve to real bytes in the shared blob store.
-    let put_id = snap["putId"].as_str().unwrap();
+    // Both refs resolve to distinct real bytes in the shared blob store.
     let file_id = snap["fileId"].as_str().unwrap();
-    assert_ne!(put_id, file_id);
-    assert_eq!(h.blob.get(put_id).await.unwrap(), b"hello deck");
+    let note_id = snap["noteId"].as_str().unwrap();
+    assert_ne!(file_id, note_id);
     assert_eq!(h.blob.get(file_id).await.unwrap(), b"from-exec");
-    assert_eq!(snap["fileSize"], 9);
+    assert_eq!(h.blob.get(note_id).await.unwrap(), b"hello deck");
 
     let _ = card;
     h.manager.shutdown().await;
@@ -208,8 +206,8 @@ async fn purge_reclaims_the_cards_blobs() {
     // The dry-run gate produced two blobs stamped deck:<card_id>.
     let view = h.manager.deck_view().await.unwrap();
     let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
-    let put_id = snap["putId"].as_str().unwrap().to_string();
     let file_id = snap["fileId"].as_str().unwrap().to_string();
+    let note_id = snap["noteId"].as_str().unwrap().to_string();
     let ident = format!("deck:{}", card.id);
     assert_eq!(
         h.blob
@@ -219,7 +217,7 @@ async fn purge_reclaims_the_cards_blobs() {
             .len(),
         2
     );
-    assert!(h.blob.get(&put_id).await.is_ok());
+    assert!(h.blob.get(&file_id).await.is_ok());
 
     // Delete → purge → the card's blobs are reclaimed (its own snapshot is
     // gone, so nothing protects them).
@@ -232,8 +230,8 @@ async fn purge_reclaims_the_cards_blobs() {
             .unwrap()
             .is_empty()
     );
-    assert!(h.blob.get(&put_id).await.is_err());
     assert!(h.blob.get(&file_id).await.is_err());
+    assert!(h.blob.get(&note_id).await.is_err());
 
     h.manager.shutdown().await;
 }

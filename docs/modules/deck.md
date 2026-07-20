@@ -89,7 +89,7 @@ This section reversed twice during design; the history matters. The first design
 - **`ctx.fetch(url, opts)`** — external HTTP, executed by the Rust parent. The parent applies the SSRF floor — the shared primitive is `baybo_security::is_blocked_ip` (loopback / RFC1918 / link-local / CGNAT / ULA and friends); the URL-validation + safe-resolution pair wrapping it is reimplemented over `is_blocked_ip` in deck's `host.rs` — vet the URL, resolve the host, drop blocked addresses, pin the connection to the vetted ones (`web_fetch.rs`'s own pair stays private to that tool) — then reveals `[{REDACTED_SECRET_…}]` placeholders (note the asymmetric `[{ }]` delimiters: `{{ }}` was explicitly rejected in `placeholder.rs` because every mainstream template engine parses it) from the `SecretVault` into headers at egress, performs TLS, and returns the body. **Secrets remain parent-only** — the `SecretVault` never crosses to the child, so the placeholder reveal stays the *only* path a secret reaches a request, and every such reveal is audited. What the host-run model gives up is enforcement of the SSRF floor for I/O the card initiates *itself*: nothing now stops a card opening its own socket to loopback. The floor still governs `ctx.fetch`; for card-initiated sockets it is advisory, consistent with the trusted-author model below.
 - **`ctx.exec(cmd)`** — `/bin/sh -c <cmd>` run **directly on the host** with the inherited environment (installed CLIs and credential dirs resolve), in a per-card scratch cwd, bounded by a 30s wall clock + stdout/stderr size caps. This is what makes "any card the user can describe" true: `docker ps`, `df`, `git log`, `smartctl`, `nvidia-smi`, `codex …` — anything the operator's own shell could run. On top of the inherited env, `host.rs` injects one var: **`BAYBO_DECK_TMUX_DIR`** = `<workspace>/deck/tmux-socks/<card_id>` (`DECK_TMUX_DIR_ENV`, a per-card subdir), the directory a card that drives an interactive CLI through tmux should pin its socket into (`tmux -S "$BAYBO_DECK_TMUX_DIR/<name>.sock"`). It keeps that agent-driven tmux server off the user's default socket (`/tmp/tmux-<uid>/default` — so out of their `tmux ls`) and out of `/tmp` (so a `/tmp` wipe can't drop it), and the per-card scoping is what lets purge reap exactly the departing card's servers; the runtime exports the path but the card `mkdir -p`s it. The `tmux-socks/` tree is gitignored in the deck root (`repo.rs`).
 - **`ctx.emit(json)`** — a snapshot push (see data plane).
-- **Blob primitives** — `ctx.fetchBlob` / `blobPut` / `blobPutFile` / `blobGet`, plus `ctx.fetch`'s `bodyBlob`: the file/image plane, ref-first so bytes stay out of the child. See §Blobs.
+- **Blob primitives** — `ctx.fetchBlob` (fetch → store) and `ctx.blobPutFile` (an `exec` artifact → store): the file/image plane, ref-first so bytes stay out of the child. See §Blobs.
 
 **Trust model, stated honestly.** There is **no service sandbox** — timeouts and quarantine are *reliability* machinery, not a security boundary against the card author, and the author is the operator's own agent, the same one trusted to run `Bash` on this host. Running the service on the host (full filesystem, host network, host CLIs) is exactly that same trust, made explicit; the removed `crates/sandbox` jail only ever added reliability caps we kept and network isolation the real cards couldn't work under. What makes deck different from chat-driven `Bash` is that services run **unattended, forever**, with no per-call approval gate and no human watching call #4,000; and the author is *steerable* (the agent reads untrusted content, and a prompt-injected card revision is a standing channel rather than a one-shot command). The final design accepts that residual risk explicitly — a prompt-injected card edit can self-grant secret egress with no gate. What still stands: secrets exist only parent-side and reach requests only by placeholder reveal; **every secret-bearing egress is audit-logged with card id + host**; and on the tool path (`DeckCardCreate`/`DeckCardUpdate`) the dry-run gate means new code executes once under the agent's eyes — with its output in the transcript — before it runs unattended. The non-tool dry-runs (post-upgrade boot re-runs, REST/FFI-triggered enable) run the same gate with no transcript; their failures surface as trace events plus the quarantine face, nowhere else. (Restore deliberately does NOT gate — see the recycle-bin section.) (The design's advisory install pre-screen via the skills risk assessor did not land — nothing scans a bundle for exfil shapes.)
 
@@ -200,18 +200,12 @@ bytes off the child's stdio wherever they can:
   revealed into — the manual follow bypasses reqwest's own cross-origin
   stripping), and stores only a 2xx body. Inside an op it is still bounded by the
   30 s `CALL_TIMEOUT`; large pulls belong in `start()` / timer contexts.
-- **`ctx.fetch(url, {bodyBlob})`** — streams a stored blob as the request body
-  (`stat` for the `Content-Length`, then the store's reader).
-- **`ctx.blobPut(base64, contentType) → ref`** — stores inline card-produced
-  bytes (≤ `BLOB_INLINE_MAX_BYTES` 8 MiB — the stdio line stays small; larger
-  content takes `fetchBlob` / `blobPutFile`).
 - **`ctx.blobPutFile(path, contentType) → ref`** — streams an `exec`-produced
   file into the store. Relative paths resolve against the card's exec scratch
   cwd; absolute is allowed (trusted author); a `..` climb out of scratch is
-  rejected as a footgun.
-- **`ctx.blobGet(blobId) → {base64, contentType, size}`** — reads a blob back,
-  capped at 8 MiB via `stat` before `get`. Rarely needed — move the ref, not the
-  bytes.
+  rejected as a footgun. This is the only *put* path: a service that generates
+  content writes it to disk in an `exec`, then hands over the file; small
+  display-only content can instead ride a `data:` URI in the snapshot (no blob).
 
 Every service-side put stamps `uploader_identity = "deck:<card_id>"` so GC can
 target deck blobs without ever touching chat data. The identity is threaded
@@ -327,12 +321,13 @@ never bumps the server clock).
 
 ### Versioning and deferred
 
-`SDK_VERSION` is 2 (the blob `ctx` / preamble additions). The boot re-gate
-re-runs the dry-run once per existing card and re-stamps — the additions are
-additive, so v1 cards pass; a network-flavoured refresh that can't reach its
-source on the first post-upgrade offline boot may quarantine that card, and
-`enable` is the recovery. **No wire-frame changes** — refs ride snapshot /
-call-result JSON opaquely, `SNAPSHOT_MAX_BYTES` is unaffected.
+`SDK_VERSION` **stays 1**. The `ctx` blob additions are additive — an old card
+never calls them and runs unchanged against the always-fresh (`include_str!`d)
+preamble — so no fleet re-gate is forced. Bumping it would only force a one-time
+boot re-verification of every card (and risk quarantining a network card on an
+offline boot for no gain); a future *breaking* preamble change is what would
+earn the bump. **No wire-frame changes** — refs ride snapshot / call-result JSON
+opaquely, `SNAPSHOT_MAX_BYTES` is unaffected.
 
 Deferred: in-card video/audio playback (`media-src` + range-request scheme
 serving, which forces chunked `didReceive`); in-card fullscreen preview

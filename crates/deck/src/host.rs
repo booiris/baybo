@@ -1,7 +1,7 @@
 //! Parent-side capability RPCs the child calls over stdio: the
 //! host-mediated `ctx.fetch` (SSRF floor + placeholder reveal + audit
 //! log), `ctx.exec`, and the blob plane (`docs/modules/deck.md` §Blobs) —
-//! `ctx.fetchBlob` / `ctx.blobPut` / `ctx.blobPutFile` / `ctx.blobGet`.
+//! `ctx.fetchBlob` / `ctx.blobPutFile`.
 //! `ctx.fetch` keeps a raw secret from ever entering the child — the card
 //! carries only the `[{REDACTED_SECRET_…}]` placeholder and the parent
 //! reveals it at egress. Routing effects through here is an SDK
@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use futures::{StreamExt, TryStreamExt};
 use tokio::process::Command;
 
@@ -26,8 +25,8 @@ use baybo_store::blob::MAX_BLOB_BYTES;
 use baybo_store::{BlobStore, ByteStream};
 
 use crate::service::{
-    HostBlobGetResponse, HostBlobPutFileRequest, HostBlobPutRequest, HostBlobRef, HostExecResponse,
-    HostFetchRequest, HostFetchResponse, HostServices,
+    HostBlobPutFileRequest, HostBlobRef, HostExecResponse, HostFetchRequest, HostFetchResponse,
+    HostServices,
 };
 
 /// Wall clock for one host-mediated `ctx.fetch` (the whole request/response,
@@ -48,11 +47,6 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout/stderr cap for one `ctx.exec` command (each, after which the
 /// stream is truncated with a marker).
 pub const EXEC_OUTPUT_MAX: usize = 4 * 1024 * 1024;
-/// Cap on a blob that crosses stdio inline as base64 (`ctx.blobPut` in,
-/// `ctx.blobGet` out) — an NDJSON line, so it must stay small. Large content
-/// takes the streaming paths (`fetchBlob` / `blobPutFile`), capped at
-/// [`MAX_BLOB_BYTES`].
-pub const BLOB_INLINE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Default mime when neither the card nor the response/extension names one.
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 
@@ -173,23 +167,6 @@ impl DeckHost {
             let (body, r) = self.reveal(body).await;
             revealed |= r;
             builder = builder.body(body);
-        } else if let Some(blob_id) = &req.body_blob {
-            // `ctx.fetch({bodyBlob})`: stream a stored blob as the request body
-            // (the bytes never enter the child). Content-Length from the meta.
-            let meta = self
-                .blob
-                .stat(blob_id)
-                .await
-                .map_err(|e| format!("bodyBlob stat: {e}"))?;
-            let reader = self
-                .blob
-                .open(blob_id)
-                .await
-                .map_err(|e| format!("bodyBlob open: {e}"))?;
-            let stream = tokio_util::io::ReaderStream::new(reader);
-            builder = builder
-                .header(reqwest::header::CONTENT_LENGTH, meta.size)
-                .body(reqwest::Body::wrap_stream(stream));
         }
 
         if revealed {
@@ -498,41 +475,6 @@ impl HostServices for DeckHost {
         self.run_fetch_blob(uploader_card_id, req).await
     }
 
-    async fn blob_put(
-        &self,
-        uploader_card_id: &str,
-        req: HostBlobPutRequest,
-    ) -> std::result::Result<HostBlobRef, String> {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(req.base64.as_bytes())
-            .map_err(|e| format!("blobPut: invalid base64: {e}"))?;
-        if bytes.len() > BLOB_INLINE_MAX_BYTES {
-            return Err(format!(
-                "blobPut: {} bytes exceeds the inline cap ({BLOB_INLINE_MAX_BYTES}); \
-                 use blobPutFile or fetchBlob for larger content",
-                bytes.len()
-            ));
-        }
-        let content_type = req
-            .content_type
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_BLOB_MIME.to_string());
-        let blob = self
-            .blob
-            .put(
-                &bytes,
-                &content_type,
-                Some(&deck_identity(uploader_card_id)),
-            )
-            .await
-            .map_err(|e| format!("blobPut: store: {e}"))?;
-        Ok(HostBlobRef {
-            blob_id: blob.blob_id,
-            content_type,
-            size: bytes.len() as u64,
-        })
-    }
-
     async fn blob_put_file(
         &self,
         card_id: &str,
@@ -599,31 +541,6 @@ impl HostServices for DeckHost {
             blob_id: blob.blob_id,
             content_type,
             size,
-        })
-    }
-
-    async fn blob_get(&self, blob_id: &str) -> std::result::Result<HostBlobGetResponse, String> {
-        let meta = self
-            .blob
-            .stat(blob_id)
-            .await
-            .map_err(|e| format!("blobGet: {e}"))?;
-        if meta.size > BLOB_INLINE_MAX_BYTES as u64 {
-            return Err(format!(
-                "blobGet: {} bytes exceeds the inline cap ({BLOB_INLINE_MAX_BYTES}); \
-                 display it via deck.blobUrl instead of pulling the bytes",
-                meta.size
-            ));
-        }
-        let bytes = self
-            .blob
-            .get(blob_id)
-            .await
-            .map_err(|e| format!("blobGet: {e}"))?;
-        Ok(HostBlobGetResponse {
-            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            content_type: meta.mime_type,
-            size: meta.size,
         })
     }
 }

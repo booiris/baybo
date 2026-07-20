@@ -45,16 +45,14 @@ pub const MIN_EMIT_INTERVAL_FLOOR_SECS: u64 = 1;
 
 /// The service-side SDK version materialized by the current gateway. A
 /// card whose recorded stamp differs gets a re-dry-run at boot (the
-/// post-upgrade re-admission) instead of a silent behavior change.
-///
-/// **v2 (2026-07): the blob plane** (docs/modules/deck.md §Blobs). The
-/// preamble gained `ctx.fetchBlob` / `ctx.blobPut` / `ctx.blobPutFile` /
-/// `ctx.blobGet` and `ctx.fetch`'s `bodyBlob` — all additive, so every v1 card
-/// re-passes the boot re-gate untouched. The bump makes the first post-upgrade
-/// boot re-verify the fleet once; a network-flavoured refresh that can't reach
-/// its source while offline may quarantine that card, and `enable` is the
-/// recovery (the existing re-gate behavior).
-pub const SDK_VERSION: u32 = 2;
+/// post-upgrade re-admission) instead of a silent behavior change. Bump this
+/// ONLY for a **breaking** preamble/`ctx` change, so the whole fleet
+/// re-verifies against it once at the next boot. The blob-plane additions
+/// (`ctx.fetchBlob` / `ctx.blobPutFile`) were purely **additive** — old cards
+/// never call them and run unchanged against the freshly `include_str!`'d
+/// preamble — so they did NOT bump it (a forced re-gate would have risked
+/// quarantining a network-flavoured card on an offline boot for no gain).
+pub const SDK_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RefreshSpec {

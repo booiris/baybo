@@ -82,13 +82,6 @@ pub(crate) trait HostServices: Send + Sync + 'static {
         uploader_card_id: &str,
         req: HostFetchRequest,
     ) -> std::result::Result<HostBlobRef, String>;
-    /// Store base64-decoded inline bytes (card-produced content). Capped small
-    /// — large content uses `fetch_blob` / `blob_put_file`.
-    async fn blob_put(
-        &self,
-        uploader_card_id: &str,
-        req: HostBlobPutRequest,
-    ) -> std::result::Result<HostBlobRef, String>;
     /// Stream a file from disk into the store (an `exec`-produced artifact).
     /// `card_id` resolves the relative-path base (the process scratch);
     /// `uploader_card_id` stamps the identity.
@@ -98,9 +91,6 @@ pub(crate) trait HostServices: Send + Sync + 'static {
         uploader_card_id: &str,
         req: HostBlobPutFileRequest,
     ) -> std::result::Result<HostBlobRef, String>;
-    /// Read a blob back as base64 (capped). A pure read — possession of the
-    /// capability id is the authorization, so no identity is threaded.
-    async fn blob_get(&self, blob_id: &str) -> std::result::Result<HostBlobGetResponse, String>;
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -112,10 +102,6 @@ pub(crate) struct HostFetchRequest {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub body: Option<String>,
-    /// `ctx.fetch({bodyBlob})`: stream a stored blob as the request body
-    /// (mutually exclusive with `body`; `body` wins if both are set).
-    #[serde(default)]
-    pub body_blob: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -141,24 +127,10 @@ pub(crate) struct HostBlobRef {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(crate) struct HostBlobPutRequest {
-    pub base64: String,
-    #[serde(default)]
-    pub content_type: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 pub(crate) struct HostBlobPutFileRequest {
     pub path: String,
     #[serde(default)]
     pub content_type: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct HostBlobGetResponse {
-    pub base64: String,
-    pub content_type: String,
-    pub size: u64,
 }
 
 /// Where accepted emits go (the manager: size check → snapshot row →
@@ -488,25 +460,6 @@ pub(crate) async fn spawn_service(
                             let _ = writer.send(host_result_line(id, outcome)).await;
                         });
                     }
-                    Some("blobPut") => {
-                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
-                            continue;
-                        };
-                        let req = serde_json::from_value::<HostBlobPutRequest>(msg.clone());
-                        let host = host.clone();
-                        let writer = writer.clone();
-                        let uploader = uploader_card_id.clone();
-                        tokio::spawn(async move {
-                            let outcome = match req {
-                                Ok(req) => host
-                                    .blob_put(&uploader, req)
-                                    .await
-                                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
-                                Err(e) => Err(format!("malformed blobPut request: {e}")),
-                            };
-                            let _ = writer.send(host_result_line(id, outcome)).await;
-                        });
-                    }
                     Some("blobPutFile") => {
                         let Some(id) = msg.get("id").and_then(Value::as_u64) else {
                             continue;
@@ -524,25 +477,6 @@ pub(crate) async fn spawn_service(
                                     .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
                                 Err(e) => Err(format!("malformed blobPutFile request: {e}")),
                             };
-                            let _ = writer.send(host_result_line(id, outcome)).await;
-                        });
-                    }
-                    Some("blobGet") => {
-                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
-                            continue;
-                        };
-                        let blob_id = msg
-                            .get("blob_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let host = host.clone();
-                        let writer = writer.clone();
-                        tokio::spawn(async move {
-                            let outcome = host
-                                .blob_get(&blob_id)
-                                .await
-                                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null));
                             let _ = writer.send(host_result_line(id, outcome)).await;
                         });
                     }
