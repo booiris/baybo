@@ -407,6 +407,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         read_tracker: None,
         background_jobs: None,
         background_control: None,
+        notify_silence: None,
     }
 }
 

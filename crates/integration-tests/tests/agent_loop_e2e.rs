@@ -2478,6 +2478,148 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     harness.shutdown().await;
 }
 
+/// A recurring fire that calls `report_nothing` notifies no one: no channel
+/// `Message` is dispatched (no live pulse), the fire's own conversation is
+/// hidden (no chat-list row), and its `Cron` job completes with a reply-less
+/// `Structured` output so the push dispatcher skips it (`gateway::push` returns
+/// early when the `Completed` edge carries no reply ordinal). The reply row and
+/// transcript survive — suppression hides, it never deletes. Drives the real
+/// actor path (`AgentMessage::CronTrigger` → `dispatch_cron_prompt`), with the
+/// model scripted to call the tool.
+#[tokio::test]
+async fn recurring_fire_that_reports_nothing_notifies_no_one() {
+    use baybo_job::{Job, JobInputKind, JobOutput};
+    use baybo_store::JobStore;
+
+    // Stand-in for `report_nothing`: flips the fire's silence handle exactly as
+    // the real tool does (its own flip is unit-tested in `baybo-cron`).
+    struct SilenceProbe;
+    #[async_trait::async_trait]
+    impl Tool for SilenceProbe {
+        fn name(&self) -> &str {
+            "report_nothing"
+        }
+        fn description(&self) -> String {
+            "test stand-in for report_nothing".to_string()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn trigger_scope(&self) -> baybo_tools::ToolTriggerScope {
+            baybo_tools::ToolTriggerScope::CronFire
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            ctx: &baybo_tools::ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            if let Some(silence) = &ctx.notify_silence {
+                silence.request();
+            }
+            Ok(ToolOutput::Text("noted".into()))
+        }
+    }
+
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-watch".into(),
+        origin_session_id: None,
+        conversation: true,
+        job_title: Some("Watcher".into()),
+    };
+    let fire_session_id = session.id.clone();
+
+    let manifest = baybo_tools::ToolManifest {
+        name: "report_nothing".into(),
+        description: "test stand-in for report_nothing".into(),
+        trust_level: baybo_model::TrustLevel::Trusted,
+        parameters_schema: json!({"type": "object"}),
+        capabilities: vec![],
+        channels: Vec::new(),
+    };
+    let mut harness = AgentTestHarness::builder()
+        .session(session)
+        .with_tool(Arc::new(SilenceProbe) as Arc<dyn Tool>, manifest)
+        .build();
+
+    // Cron dispatch is non-streaming (`chat`). Iter 1: the fire calls
+    // `report_nothing`. Iter 2: nothing more to do, so the loop exits.
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "c1".into(),
+            name: "report_nothing".into(),
+            arguments: json!({}),
+            signature: None,
+        }],
+        usage: Default::default(),
+        thinking: None,
+    });
+    harness.stub_llm.push_response(LlmResponse {
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronTrigger {
+            job_id: "cj-watch".into(),
+            title: "Watcher".into(),
+            prompt: "check the build; report only if it broke".into(),
+            delivery: baybo_agent::actor::CronDelivery::Channel,
+        })
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // No channel Message — no live pulse, nothing for the user to see.
+    assert!(
+        !outs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
+        "a silenced fire must not dispatch a Message, got {outs:?}"
+    );
+
+    // The fire's own conversation is hidden — no empty chat-list row.
+    let stored = harness
+        .session_manager
+        .get(&fire_session_id)
+        .await
+        .unwrap()
+        .expect("fire session still exists — hidden, not deleted");
+    assert!(
+        stored.hidden,
+        "a silenced fire's conversation must be hidden"
+    );
+
+    // Its Cron job completed with a reply-less `Structured` output (not a
+    // `Message`), so the push dispatcher skips it (`gateway::push` returns early
+    // on a `Completed` edge with no reply ordinal).
+    let rows = JobStore::list_all(harness.job_store.as_ref())
+        .await
+        .unwrap();
+    let cron_job = rows
+        .iter()
+        .map(|r| serde_json::from_str::<Job>(&r.data).expect("job row deserializes"))
+        .find(|j| j.input_kind() == JobInputKind::Cron)
+        .expect("a cron fire job");
+    assert!(
+        matches!(cron_job.final_result, Some(JobOutput::Structured { .. })),
+        "a silenced fire's job must complete Structured, got {:?}",
+        cron_job.final_result
+    );
+
+    harness.shutdown().await;
+}
+
 /// A one-shot fire's result reaches the conversation that scheduled it — the
 /// whole point of the one-shot path. The fire ran in its own isolated session
 /// (invisible, dispatching nothing); this drives what the router's cron waiter
