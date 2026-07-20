@@ -40,8 +40,7 @@ anywhere in its tree is past `WORK_TMP_TTL`, so a scratch checkout the
 agent still touches survives as a unit instead of being hollowed out
 file-by-file. The newest-mtime read is the shared sync walker
 `baybo_workspace::walk::tree_stats`, called through
-`tokio::task::spawn_blocking` (`baybo workspace gc` uses the same walker
-directly, so the two staleness gates can't drift). The walk never
+`tokio::task::spawn_blocking`. The walk never
 follows symlinks: a symlinked entry is measured by the link's own lstat
 mtime and removed with `remove_file` (the link, never the target), and
 links inside a directory don't pull outside trees into the staleness

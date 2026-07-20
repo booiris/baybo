@@ -1,6 +1,6 @@
 //! Test-only mtime back-dating helpers for code that gates on
 //! [`crate::walk::tree_stats`]-style newest-mtime reads (the janitor
-//! sweeps, `baybo workspace gc`). Gated behind `test-support` so nothing
+//! sweeps). Gated behind `test-support` so nothing
 //! here ships in a release build; downstream crates pull it in with
 //! `baybo-workspace = { workspace = true, features = ["test-support"] }`
 //! in their `[dev-dependencies]`.

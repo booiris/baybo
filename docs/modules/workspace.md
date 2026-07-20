@@ -7,7 +7,7 @@ The `workspace` crate is the single source of truth for Baybo's workspace layout
 - **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
-- **Tree measurement** (`walk` module, always available, std-only): `tree_stats` — the one sync walker behind every "newest in-tree mtime" staleness gate (janitor `work/tmp` sweep via `spawn_blocking`, `baybo workspace gc` directly). Summed lstat file sizes + newest lstat mtime anywhere in the tree; symlinks are measured as links and never followed. The mtime back-dating fixtures for testing against it live in `test_support` behind the `test-support` feature.
+- **Tree measurement** (`walk` module, always available, std-only): `tree_stats` — the one sync walker behind the janitor's `work/tmp` "newest in-tree mtime" staleness gate (called via `spawn_blocking`). Summed lstat file sizes + newest lstat mtime anywhere in the tree; symlinks are measured as links and never followed. The mtime back-dating fixtures for testing against it live in `test_support` behind the `test-support` feature.
 
 Pure-data consumers (e.g. `baybo-config`, `baybo-tools`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`baybo-agent`, `baybo-cli`, `baybo-gateway`, the binary) depend on it with `features = ["io"]`.
 
@@ -90,31 +90,20 @@ Identity file changes usually affect the system prompt; memory changes usually a
 
 They complement each other without overlapping.
 
-### Scratch hygiene: `work/tmp` + `baybo workspace gc`
+### Scratch hygiene: `work/tmp`
 
 `work/` is the agent's only writable surface — every chat, cron fire, and
 subagent shares it flat, and nothing in it is deleted implicitly, so it
-accumulates. Two mechanisms keep it bounded:
-
-- **`work/tmp/` is the disposable-scratch convention.** `WORK_TMP_SUBDIR`
-  + `work_tmp_dir()` name it, `ensure_layout` creates it, and the Bash
-  tool description tells the model to put intermediate files there while
-  keeping user-facing deliverables elsewhere under `work/`. The janitor
-  removes any `work/tmp` top-level entry whose newest in-tree mtime is
-  older than `WORK_TMP_TTL_DAYS` (7 — the const lives here so the sweep
-  and the model-facing prompt quote one number); see
-  [`janitor.md`](janitor.md).
-- **`baybo workspace gc`** is the user-triggered reclaim for the rest of
-  `work/`: it reports git clones, stale entries, empty dirs, and `tmp/`
-  contents, and deletes only with `--apply` + per-category confirmation.
-  Every dot-prefixed top-level entry is protected by policy — sandboxed
-  Bash runs with `HOME` = the work dir, so dotfiles there (`.gitconfig`,
-  `.config/`, `.npm/`, `.cargo/`, the external CLIs' state, and baybo's
-  own `.uv/`/`.fonts/`/`.baybo-tool-spills/`) are live HOME state, not
-  scratch — as are the external-agent roots and `tmp/` itself; see
-  [`cli.md`](cli.md). Both the gc scan and the janitor sweep measure
-  staleness with the shared `baybo_workspace::walk::tree_stats` walker
-  (newest lstat mtime anywhere in the tree, symlinks never followed).
+accumulates. `work/tmp/` is the disposable-scratch convention that keeps
+the growth bounded: `WORK_TMP_SUBDIR` + `work_tmp_dir()` name it,
+`ensure_layout` creates it, and the Bash tool description tells the model
+to put intermediate files there while keeping user-facing deliverables
+elsewhere under `work/`. The janitor removes any `work/tmp` top-level
+entry whose newest in-tree mtime is older than `WORK_TMP_TTL_DAYS` (7 —
+the const lives here so the sweep and the model-facing prompt quote one
+number), measuring staleness with the shared
+`baybo_workspace::walk::tree_stats` walker (newest lstat mtime anywhere
+in the tree, symlinks never followed); see [`janitor.md`](janitor.md).
 
 ### Why split state/work/logs from profile/skills
 

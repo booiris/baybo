@@ -21,7 +21,6 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,
         Commands::Cron { cmd } => commands::cron::handle(ctx, cmd).await,
         Commands::Log { cmd } => commands::log::handle(ctx, cmd).await,
-        Commands::Workspace { cmd } => commands::workspace::handle(ctx, cmd).await,
         Commands::Cost { cmd } => commands::cost::handle(ctx, cmd).await,
         Commands::Status { live } => commands::status::handle(ctx, live).await,
         Commands::Doctor => commands::doctor::handle(ctx).await,

@@ -108,14 +108,7 @@ impl SlashHandler for CliSlashHandler {
             // this is the cosmetic mirror so the menu stays coherent.
             if matches!(
                 name,
-                "help"
-                    | "completion"
-                    | "setup"
-                    | "tui"
-                    | "gateway"
-                    | "memory"
-                    | "device"
-                    | "workspace"
+                "help" | "completion" | "setup" | "tui" | "gateway" | "memory" | "device"
             ) {
                 continue;
             }
@@ -325,9 +318,6 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         // commands are not exposed to slash unless explicitly admitted.
         Commands::Device { .. } => {
             Err("`device` commands are terminal-only; run them from a shell")
-        }
-        Commands::Workspace { .. } => {
-            Err("`workspace gc` deletes files behind interactive confirms; run it from a shell")
         }
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
@@ -550,7 +540,7 @@ mod tests {
     fn slash_menu_drops_process_lifecycle_families() {
         let handler = handler_with(SkillRegistry::new());
         let names: Vec<String> = handler.commands().into_iter().map(|c| c.name).collect();
-        for forbidden in ["/tui", "/gateway", "/setup", "/completion", "/workspace"] {
+        for forbidden in ["/tui", "/gateway", "/setup", "/completion"] {
             assert!(
                 !names.contains(&forbidden.to_string()),
                 "{forbidden} must not appear in the slash menu, got {names:?}"
@@ -641,31 +631,6 @@ mod tests {
             })
             .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn slash_rejects_workspace_gc() {
-        // `workspace gc` prompts on stdin and deletes files — the whole
-        // family is shell-only.
-        let handler = handler_with(SkillRegistry::new());
-        for raw in ["/workspace gc", "/workspace gc --apply --yes"] {
-            match handler.handle(raw).await {
-                SlashOutcome::Handled(blocks) => {
-                    let text = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text(t) => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .collect::<String>();
-                    assert!(
-                        text.contains("not available in slash"),
-                        "expected slash-rejection for {raw}, got: {text}"
-                    );
-                }
-                other => panic!("expected Handled rejection for {raw}, got {other:?}"),
-            }
-        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
-//! Sync directory-tree measurement shared by the janitor's `work/tmp`
-//! sweep and the `baybo workspace gc` scan. One walker so the two
-//! staleness gates can never disagree about what "newest mtime" means.
+//! Sync directory-tree measurement behind the janitor's `work/tmp`
+//! sweep — the single definition of "newest in-tree mtime" its staleness
+//! gate reads.
 
 use std::path::Path;
 use std::time::SystemTime;
