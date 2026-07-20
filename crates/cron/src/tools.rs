@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::{CronError, CronJobPatch, CronSchedule, CronScheduler, NewCronJob};
 use async_trait::async_trait;
 use baybo_model::SessionId;
-use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_tools::{
+    Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput, ToolTriggerScope,
+};
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
@@ -55,6 +57,9 @@ pub fn agent_tools(scheduler: Arc<CronScheduler>) -> Vec<(Arc<dyn Tool>, ToolMan
         Arc::new(CronPauseTool::new(Arc::clone(&scheduler))),
         Arc::new(CronResumeTool::new(Arc::clone(&scheduler))),
         Arc::new(CronListTool::new(scheduler)),
+        // Holds no scheduler state: its only effect is to flip the fire's
+        // `NotifySilence` handle, and it is visible only inside a recurring fire.
+        Arc::new(CronReportNothingTool),
     ];
 
     tools.into_iter().map(with_manifest).collect()
@@ -70,6 +75,59 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         channels: Vec::new(),
     };
     (tool, manifest)
+}
+
+// ---------------------------------------------------------------------------
+// report_nothing (recurring cron fires only)
+// ---------------------------------------------------------------------------
+
+/// A recurring cron fire calls this to declare that its scheduled check found
+/// nothing worth telling the user, so this run should notify no one. It is
+/// visible only inside a recurring fire ([`ToolTriggerScope::CronFire`]) and
+/// takes effect only there: it flips the fire's `NotifySilence` handle, which
+/// the agent loop reads to complete the fire without a notification (no chat
+/// row, no push, no live pulse). Where the handle is absent — a user reply in a
+/// cron conversation, or a one-shot fire — it is a no-op.
+struct CronReportNothingTool;
+
+#[async_trait]
+impl Tool for CronReportNothingTool {
+    fn name(&self) -> &str {
+        "report_nothing"
+    }
+
+    fn description(&self) -> String {
+        r#"For a recurring scheduled run ONLY: call this when the check you just performed found nothing the user needs to know about right now, so this run notifies no one — no message, no push. Use it for a job whose intent is to WATCH for a condition and speak up only when it holds (e.g. "check the build and tell me only if it broke", "let me know if that PR gets a review"). Do NOT use it to skip work you were asked to do: a job told to always produce something — a daily digest, a summary, a recurring reminder — must still produce it every run, even when the content is thin. When in doubt, report: a missed notification is worse than an extra one. Calling this suppresses this run's notification entirely, so produce no other reply."#
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::CronFire
+    }
+
+    async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        match &ctx.notify_silence {
+            Some(silence) => {
+                silence.request();
+                Ok(ToolOutput::Text(
+                    "Acknowledged — this scheduled run will not notify the user.".to_string(),
+                ))
+            }
+            // No pending notification to suppress: a user reply inside a cron
+            // conversation, or any turn that is not a recurring fire.
+            None => Ok(ToolOutput::Text(
+                "There is no scheduled notification to suppress on this turn.".to_string(),
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +715,44 @@ mod tests {
             session_trigger: trigger,
             ..ToolContext::for_test()
         }
+    }
+
+    #[test]
+    fn report_nothing_is_visible_only_to_recurring_fires() {
+        assert_eq!(
+            CronReportNothingTool.trigger_scope(),
+            ToolTriggerScope::CronFire
+        );
+    }
+
+    #[tokio::test]
+    async fn report_nothing_requests_silence_when_a_handle_is_present() {
+        let silence = baybo_tools::NotifySilence::new();
+        let ctx = ToolContext {
+            notify_silence: Some(silence.clone()),
+            ..ToolContext::for_test()
+        };
+        let out = CronReportNothingTool
+            .execute(json!({}), &ctx)
+            .await
+            .expect("executes");
+        assert!(matches!(out, ToolOutput::Text(_)));
+        assert!(
+            silence.requested(),
+            "a recurring fire's notification must be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_nothing_is_a_no_op_without_a_handle() {
+        // A user reply in a cron conversation, or any non-fire turn: the handle
+        // is absent, which is the guard — the call is a harmless no-op.
+        let ctx = ToolContext::for_test();
+        let out = CronReportNothingTool
+            .execute(json!({}), &ctx)
+            .await
+            .expect("executes");
+        assert!(matches!(out, ToolOutput::Text(_)));
     }
 
     /// A scheduler over the in-memory store, plus the trigger receiver (held so

@@ -471,6 +471,9 @@ impl ToolExecutor {
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
         read_tracker: ReadTracker,
+        // Handle a cron-fire tool (`report_nothing`) flips to suppress this
+        // fire's notification. `None` for every turn that cannot be silenced.
+        notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
@@ -754,6 +757,7 @@ impl ToolExecutor {
                     } else {
                         None
                     },
+                    notify_silence,
                 };
 
                 // Reveal placeholders in the tool's arguments just

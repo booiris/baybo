@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The sqlite implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronUpdate` / `CronDelete` / `CronPause` / `CronResume` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
+The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The sqlite implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronUpdate` / `CronDelete` / `CronPause` / `CronResume` / `CronList`, plus `report_nothing` for recurring fires) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id`: the conversation it was created from, which for a one-shot is where the fire's result is reported back.
 
@@ -39,7 +39,7 @@ Both paths land an ordinary assistant row in an ordinary session, so the existin
 
 ### Every outcome notifies — for both kinds of fire
 
-A scheduled task that silently evaporates is the worst failure this feature can have, so **every** fire produces exactly one notification, whichever kind it is and however it ended. There is no blank-reply suppression (unlike `SubagentNotification`, where the model's silence is a legitimate "not worth interrupting" judgment):
+A scheduled task that silently evaporates is the worst failure this feature can have, so by default **every** fire produces exactly one notification, whichever kind it is and however it ended. There is no blank-reply suppression (unlike `SubagentNotification`, where the model's silence is a legitimate "not worth interrupting" judgment). The single exception is opt-in and explicit — a recurring fire that calls the `report_nothing` tool (see [A recurring fire can stay silent](#a-recurring-fire-can-stay-silent)); everything below is the default that still holds for every other fire:
 
 | Fire outcome | One-shot → origin conversation | Recurring → its own conversation |
 |---|---|---|
@@ -50,6 +50,24 @@ A scheduled task that silently evaporates is the worst failure this feature can 
 The non-reply outcomes go out as a real `CronNotification` **assistant row**, never as a `Notice`, and the difference is not cosmetic. A row survives a reload, is read back by the model on a follow-up turn, raises the conversation's unread badge, and rides its `CronNotification` job's `Completed { reply_ordinal }` edge to the user's phone. A notice does none of those — a failed scheduled task would surface as an unbadged, unpushed conversation the user has to spot for themselves.
 
 Two behaviour changes fall out of this, both deliberate: a fire that produces nothing now says so (it used to be dropped on the floor), and a **failed recurring fire now pushes** (an earlier revision reported it as a notice, and therefore not at all on a phone).
+
+### A recurring fire can stay silent
+
+A recurring job whose intent is to *watch* for a condition and speak up only when it holds ("check the build; tell me only if it broke") would otherwise fire an empty conversation and a push on every quiet run. So a recurring fire — and only a recurring fire — is offered a `report_nothing` tool (`baybo-cron::tools`) that suppresses its own notification for that run.
+
+The signal is **explicit and positive**, which is what keeps "silence is the worst failure" intact: the model calls the tool to declare the run had nothing to report. A crash, timeout, or error never calls it, so a **failed fire still notifies**; and a blank run that did *not* call it is still treated as a possible cutoff and notifies with "It ran, but produced no output." Only a healthy fire that explicitly opts out goes silent.
+
+There is **no per-job flag** — every recurring job's fire may make this call, so the tool's description carries the guard: it is for a scheduled *check* that found nothing, never a way to skip work a job was told to always do (a digest must still produce its digest). The tool is a no-op anywhere it cannot apply.
+
+Mechanically, suppression is local to the recurring fire (which has no delivery ledger or waiter — that is the one-shot path) and covers all three of a fire's independent visibility surfaces at once:
+
+- **Push** — the fire's `Cron` job completes with a reply-less `JobOutput::Structured` result, so its `Completed` edge carries no reply ordinal and `PushDispatcher` skips it (`gateway::push` returns early on `reply_ordinal: None`).
+- **Live pulse** — `dispatch_cron_prompt` dispatches nothing, so no `Frame::SessionActivity` fires.
+- **Chat-list row** — the fire's own conversation is hidden (`set_hidden(true)`), so it leaves no empty row.
+
+The fire still ran and its reply row and transcript survive in the (hidden) session — suppression hides, it never deletes, so a run that goes wrongly silent stays inspectable (`include_cron`).
+
+**Visibility scope, not just a runtime no-op.** The tool is omitted from the LLM's tool list outside a recurring fire, via a trigger-scope axis on `ToolRegistry::tool_definitions_for_session` (`Tool::trigger_scope` → `ToolTriggerScope::CronFire`, keyed on `is_cron_conversation()`) that mirrors the manifest's `channels` axis. Both the channel and the trigger are fixed for a session's whole life, so the tool list stays byte-stable within a session and the prompt cache holds. The effect guard is separate: the fire's `NotifySilence` handle (`ToolContext::notify_silence`) is present only on a recurring fire turn, so a call on a user reply in a cron conversation — where the tool is visible for cache-stability but should not act — is a no-op.
 
 ## Design Decisions
 
@@ -201,7 +219,7 @@ A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous
 
 ### LLM-invocable cron tools live in baybo-cron
 
-`tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`tools::agent_tools` returns `CronCreateTool`, `CronUpdateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`), plus `CronReportNothingTool` (holds no scheduler — its only effect is to flip the fire's `NotifySilence` handle, and it is visible only inside a recurring fire; see [A recurring fire can stay silent](#a-recurring-fire-can-stay-silent)). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 The three single-job tools (`CronDelete` / `CronPause` / `CronResume`) share one `{ id }` parameter shape — one `JobIdParams`, one schema builder, one progress label — so the only thing that distinguishes them to the model is the description, and each description carries the distinction it has to get right: delete stops the job and leaves the list *but is recoverable from the recycle bin*, pause keeps the job listed and stops it *until resumed*, resume computes the next fire *from now* and cannot revive a one-shot whose moment has passed. Both of the descriptions a model reads when it is about to *replace* a job — delete's, and resume's refusal of a fired one-shot — point it at `CronUpdate` instead, because that is the moment it would otherwise reach for delete + create.
 
