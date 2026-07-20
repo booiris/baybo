@@ -5,6 +5,7 @@ pub mod compressor;
 pub mod error;
 pub mod prompts;
 pub mod tokenizer;
+mod transcript_repair;
 
 pub use background_summary::{
     BackgroundSummaryCallback, BackgroundSummaryConfig, BackgroundSummaryFuture,
@@ -974,9 +975,12 @@ impl ContextManager {
         let chat_box: compressor::ChatCallback =
             Box::new(move |req, marker| Box::pin(chat(req, marker)));
         let plan = self.run_compression_flow(chat_box).await?;
-        let mut new_messages = match plan {
+        let (mut new_messages, fast_path_summary_index) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
-            CompressOutput::Replaced { messages } => messages,
+            CompressOutput::Replaced {
+                messages,
+                fast_path_summary_index,
+            } => (messages, fast_path_summary_index),
         };
 
         // Refuse to apply an empty replacement: persist would mark
@@ -996,14 +1000,17 @@ impl ContextManager {
         // `<system-reminder>` by construction; the truncate fallback
         // can drop it too when it lands in the dropped middle.
         // Cheaper to always re-insert than to track whether the kept
-        // slice still carries one.
-        insert_skill_trailer(
+        // slice still carries one. The trailer rows land between the
+        // system block and the summary row, so the fast-path summary
+        // index shifts by however many were inserted.
+        let trailer_rows = insert_skill_trailer(
             &mut new_messages,
             self.skill_registry.as_ref(),
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),
         );
+        let fast_path_summary_index = fast_path_summary_index.map(|i| i + trailer_rows);
 
         let before_tokens = self.budget.current();
         let start = Instant::now();
@@ -1056,7 +1063,34 @@ impl ContextManager {
             "proactive context compression"
         );
 
-        self.persist_compaction().await;
+        let base_ordinal = self.persist_compaction().await;
+        // After a FAST-PATH apply, advance `session_summaries.cursor` onto
+        // the freshly-inserted continuation-summary row: its body is
+        // `summary.md` verbatim, so the on-disk summary still covers
+        // everything at or before it and a back-to-back compaction (giant
+        // single turn, immediate `/compact`) hits the fast path again
+        // instead of burning a full-transcript stage-2 summarize. Stage-2 /
+        // truncate replacements never re-point — their summary text is NOT
+        // on disk, so the cursor would claim coverage `summary.md` lacks.
+        if let (Some(base), Some(idx)) = (base_ordinal, fast_path_summary_index) {
+            match self
+                .sessions
+                .repoint_summary_cursor(&self.session_id, base + idx as i64, chrono::Utc::now())
+                .await
+            {
+                Ok(true) => {}
+                // No summary row: unreachable in practice (the fast path
+                // only fires when summary metadata exists), but harmless.
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "failed to re-point summary cursor after fast-path compaction"
+                    );
+                }
+            }
+        }
         // Refresh the system row from the workspace soul now that the shrink
         // decision is committed + persisted — kept out of the savings gate
         // above so a grown soul can't veto a real compaction, and after
@@ -1065,17 +1099,24 @@ impl ContextManager {
         Ok(CompressionOutcome::Compressed)
     }
 
-    async fn persist_compaction(&self) {
-        if let Err(e) = self
+    /// Returns the base ordinal of the newly-inserted active rows, or
+    /// `None` when the persist failed (logged; the in-memory window is
+    /// still the source of truth for this actor's lifetime).
+    async fn persist_compaction(&self) -> Option<i64> {
+        match self
             .sessions
             .apply_session_compaction(&self.session_id, &self.messages)
             .await
         {
-            warn!(
-                session_id = %self.session_id,
-                error = %e,
-                "failed to persist session compaction"
-            );
+            Ok(base) => Some(base),
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "failed to persist session compaction"
+                );
+                None
+            }
         }
     }
 
@@ -1104,10 +1145,31 @@ impl ContextManager {
         let session_id = self.session_id.clone();
         let sessions = Arc::clone(&self.sessions);
 
-        // Step 1: restore the transcript itself.
+        // Step 1: restore the transcript itself. A crash mid-tool-batch
+        // leaves dangling `ToolUse` rows that strict providers reject on
+        // the next request, so normalize pairing before the window goes
+        // live: synthetic fills are persisted (append-only) and the
+        // repaired order is what the loop builds requests from.
         match sessions.load_active_session_messages(&session_id).await {
             Ok(messages) if !messages.is_empty() => {
-                self.restore_messages(messages);
+                let (repaired, fills) = transcript_repair::repair_tool_pairing(messages);
+                if !fills.is_empty() {
+                    warn!(
+                        session_id = %session_id,
+                        fills = fills.len(),
+                        "hydration: repaired dangling tool_use rows from an interrupted turn"
+                    );
+                    for fill in &fills {
+                        if let Err(e) = sessions.append_session_message(&session_id, fill).await {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "hydration: failed to persist synthetic tool_result fill"
+                            );
+                        }
+                    }
+                }
+                self.restore_messages(repaired);
             }
             Ok(_) => {}
             Err(e) => {
@@ -2051,11 +2113,12 @@ pub(crate) fn insert_skill_trailer(
     // keyed on `called_skills` unfiltered: a skill actually invoked in
     // this session must keep its definition re-broadcast.
     advertised: &[SkillSummary],
-) {
+) -> usize {
     let mut insert_at = 0;
     while insert_at < messages.len() && messages[insert_at].role == Role::System {
         insert_at += 1;
     }
+    let mut inserted = 0;
     if !advertised.is_empty() {
         let reminder = render_skill_reminder(advertised);
         messages.insert(
@@ -2063,13 +2126,16 @@ pub(crate) fn insert_skill_trailer(
             ChatMessage::agent_context(vec![ContentBlock::Text(reminder)]),
         );
         insert_at += 1;
+        inserted += 1;
     }
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
         messages.insert(
             insert_at,
             ChatMessage::agent_context(vec![ContentBlock::Text(detail)]),
         );
+        inserted += 1;
     }
+    inserted
 }
 
 /// Estimate the **token cost** of the skill trailer that
@@ -2241,6 +2307,50 @@ mod tests {
             ctx.maybe_compress("test-model", never_chat).await.unwrap(),
             CompressionOutcome::BelowThreshold
         ));
+    }
+
+    #[tokio::test]
+    async fn restore_repairs_dangling_tool_use_and_persists_fills() {
+        let sessions = test_sessions();
+        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+
+        // The wedged shape: crash left an unanswered ToolUse, then a
+        // resume nudge landed after it (pre-repair behavior).
+        ctx.append(&ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call_dangling".into(),
+            name: "Bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }]))
+        .await;
+        ctx.append(&make_msg(Role::User, "请立即返回最终结果"))
+            .await;
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+
+        // In-memory: fill sits directly after the assistant row, nudge after.
+        assert_eq!(restored.messages().len(), 3);
+        assert!(
+            matches!(&restored.messages()[1].content[0], ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "call_dangling" && content.contains("interrupted"))
+        );
+        assert_eq!(restored.messages()[2].role, Role::User);
+
+        // The fill was persisted (append-only), so a SECOND hydration
+        // finds pairing complete and synthesizes nothing new.
+        let mut again = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        again.restore_from_store().await;
+        assert_eq!(
+            again.messages().len(),
+            3,
+            "no duplicate fills on rehydration"
+        );
+        assert!(
+            matches!(&again.messages()[1].content[0], ContentBlock::ToolResult { tool_use_id, .. }
+                if tool_use_id == "call_dangling"),
+            "persisted fill must be repositioned adjacent on rehydration"
+        );
     }
 
     #[tokio::test]
@@ -2425,6 +2535,138 @@ mod tests {
         // system + 2 most recent non-system.
         assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn fast_path_apply_repoints_summary_cursor() {
+        // A transcript big enough that dropping the pre-cursor bulk beats
+        // the summary boilerplate + the ≥RECENT_SLICE_MIN_TOKENS recent
+        // slice, so the fast-path Replaced actually APPLIES — and the
+        // apply must advance `session_summaries.cursor` onto the
+        // freshly-inserted continuation-summary row (keeping the fast
+        // path alive for a back-to-back compaction).
+        let workspace_root = tempfile::tempdir().expect("tempdir");
+        let sessions = test_sessions();
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
+                workspace_root.path().to_path_buf(),
+            )),
+            keep_recent: 2,
+            compression_threshold: 0.2,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: Arc::clone(&sessions),
+            subagent_profile: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+
+        // system + 14 big turns (~2K tokens each with SimpleTokenizer).
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        let big = "x".repeat(8_000);
+        let mut cursor_seed = 0;
+        for i in 0..14 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let ordinal = ctx
+                .append(&make_msg(role, &format!("m{i} {big}")))
+                .await
+                .expect("persisted append");
+            // Cursor at turn #9: post-cursor tail (5 msgs ≈ 10K tokens)
+            // satisfies the recent-slice minima without pulling the walk
+            // past the cursor.
+            if i == 9 {
+                cursor_seed = ordinal;
+            }
+        }
+
+        let summary_path = ctx.workspace.session_summary_file(ctx.session_id.as_str());
+        tokio::fs::create_dir_all(summary_path.parent().expect("dir"))
+            .await
+            .expect("summary dir");
+        tokio::fs::write(&summary_path, "PRECOMPUTED SUMMARY BODY")
+            .await
+            .expect("write summary.md");
+        sessions
+            .record_summary_success(
+                &ctx.session_id,
+                cursor_seed,
+                0,
+                "m",
+                "s",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        // `never_chat`: the fast path must serve this without an LLM call.
+        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        let row = sessions
+            .summary_metadata(&ctx.session_id)
+            .await
+            .unwrap()
+            .expect("metadata row");
+        assert_ne!(
+            row.cursor, cursor_seed,
+            "cursor must advance off the superseded row"
+        );
+        assert_eq!(row.pass_count, 1, "re-point must not count as a pass");
+
+        // The new cursor resolves into the ACTIVE set (what keeps the fast
+        // path alive) and lands on the continuation-summary row.
+        let idx = sessions
+            .active_index_of_ordinal(&ctx.session_id, row.cursor)
+            .await
+            .unwrap()
+            .expect("re-pointed cursor must reference an active row");
+        assert!(
+            ctx.messages()[idx].content.iter().any(
+                |b| matches!(b, ContentBlock::Text(t) if t.contains("PRECOMPUTED SUMMARY BODY"))
+            ),
+            "cursor must land on the continuation-summary row, got {:?}",
+            ctx.messages()[idx].content
+        );
+    }
+
+    #[tokio::test]
+    async fn stage2_apply_does_not_repoint_summary_cursor() {
+        // Metadata exists (cursor=1) but summary.md is absent (the test
+        // workspace root doesn't exist), so the fast path falls through
+        // and the truncate/stage-2 lane applies. That lane's output is
+        // NOT on disk, so the cursor must stay where the last real
+        // background pass left it — re-pointing would claim coverage
+        // summary.md doesn't have.
+        let sessions = test_sessions();
+        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 2, 200, 0.25);
+        ctx.append(&make_msg(Role::System, "You are helpful")).await;
+        ctx.append(&make_msg(Role::User, &padded("First"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("Reply 1")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("Second"))).await;
+        sessions
+            .record_summary_success(&ctx.session_id, 1, 0, "m", "s", chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        let row = sessions
+            .summary_metadata(&ctx.session_id)
+            .await
+            .unwrap()
+            .expect("metadata row");
+        assert_eq!(
+            row.cursor, 1,
+            "a non-fast-path apply must leave the summary cursor untouched"
+        );
     }
 
     #[tokio::test]

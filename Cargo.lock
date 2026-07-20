@@ -1201,6 +1201,8 @@ name = "baybo-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "tempfile",
  "tokio",
 ]
 

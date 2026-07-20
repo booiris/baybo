@@ -16,7 +16,7 @@
 //!   agents/            # standalone git repo: subagent profile definitions
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
-//!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), other scratch
+//!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), tmp/ (disposable, swept), other scratch
 //!   logs/              # not version-controlled: baybo.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
@@ -153,6 +153,20 @@ pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
 /// so the LLM can `Read` the rest. Hidden (leading dot) to keep
 /// glob/grep noise down on the agent's working directory.
 pub const TOOL_SPILLS_SUBDIR: &str = ".baybo-tool-spills";
+
+/// Disposable-scratch dir inside [`WORK_DIR`]. The Bash tool advertises
+/// it as the destination for intermediate files (probe scripts, one-off
+/// downloads, temp build output); the janitor removes any of its
+/// top-level entries whose newest in-tree mtime is older than
+/// [`WORK_TMP_TTL_DAYS`]. Deliverables meant for the user belong
+/// elsewhere under [`WORK_DIR`], where nothing is auto-deleted.
+pub const WORK_TMP_SUBDIR: &str = "tmp";
+
+/// Sweep TTL, in days, for [`WORK_TMP_SUBDIR`] entries. Lives here (not
+/// in `baybo-janitor`) because the Bash tool description advertises the
+/// same figure — the model's contract and the sweep must quote one
+/// number.
+pub const WORK_TMP_TTL_DAYS: u64 = 7;
 
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (not version-controlled)
@@ -522,6 +536,11 @@ impl WorkspacePaths {
     pub fn tool_spills_dir(&self) -> PathBuf {
         self.work_dir().join(TOOL_SPILLS_SUBDIR)
     }
+
+    /// Disposable scratch: `<root>/work/tmp/`. See [`WORK_TMP_SUBDIR`].
+    pub fn work_tmp_dir(&self) -> PathBuf {
+        self.work_dir().join(WORK_TMP_SUBDIR)
+    }
 }
 
 /// Replace any character that isn't `[A-Za-z0-9_\-.]` with `_`, then
@@ -609,6 +628,7 @@ mod tests {
             p.tool_spills_dir(),
             PathBuf::from("/var/baybo/work/.baybo-tool-spills"),
         );
+        assert_eq!(p.work_tmp_dir(), PathBuf::from("/var/baybo/work/tmp"));
         assert_eq!(
             p.state_sessions_dir(),
             PathBuf::from("/var/baybo/state/sessions"),

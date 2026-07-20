@@ -21,7 +21,7 @@ use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use baybo_store::{JobRow, JobStore, JobTransitionRow};
+pub use baybo_store::{JobRow, JobStore};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
@@ -395,13 +395,13 @@ impl Job {
     }
 }
 
-/// Audit record for a single state transition.
-///
-/// Dropping a `JobTransition` without persisting it loses the audit
-/// trail the state machine exists to produce; the `JobLifecycle`
-/// lifecycle methods (`start`/`complete`/`fail`/`cancel`/`stuck`/`recover`)
-/// are the intended consumers.
-#[must_use = "JobTransition is the audit trail; let JobLifecycle persist it via its lifecycle methods"]
+/// Legality receipt for a single state transition: `Job`'s edge methods
+/// only produce one when the move was valid, so an illegal edge errors
+/// before any state changes. The receipt itself is no longer persisted
+/// (the `job_transitions` audit table was retired in the 2026-07
+/// unused-column audit — its read API had no reachable surface); the
+/// `JobLifecycle` methods consume and drop it after the edge applies.
+#[must_use = "a JobTransition proves the edge was legal; route state changes through JobLifecycle rather than discarding the receipt ad hoc"]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobTransition {
     pub job_id: JobId,

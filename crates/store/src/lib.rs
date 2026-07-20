@@ -37,7 +37,7 @@ pub use cron::{CronFire, CronStore, ExecutionCompletion};
 pub use deck::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
-pub use job::{JobRow, JobStore, JobTransitionRow, SessionJobStats};
+pub use job::{JobRow, JobStore, SessionJobStats};
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
 pub use secret::SecretStore;
 pub use session::{SessionMessageAppendOutcome, SessionStore, StoredMessage};

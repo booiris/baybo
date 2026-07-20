@@ -34,14 +34,6 @@ pub struct JobRow {
     pub data: String,
 }
 
-/// Persistence row for a job-state-transition audit record. `data` holds
-/// the serialized `JobTransition`.
-#[derive(Debug, Clone)]
-pub struct JobTransitionRow {
-    pub job_id: JobId,
-    pub data: String,
-}
-
 /// Per-session job aggregates for list surfaces: how many jobs a
 /// session has and the `status_kind` of its newest job (by
 /// `created_at`). One grouped query replaces a `list_by_session`
@@ -55,9 +47,8 @@ pub struct SessionJobStats {
     pub latest_status_kind: String,
 }
 
-/// Persistence backend for jobs and their transition audit log. Trades
-/// in [`JobRow`] / [`JobTransitionRow`] rather than the rich `baybo-job`
-/// types so the contract stays in this leaf crate.
+/// Persistence backend for jobs. Trades in [`JobRow`] rather than the
+/// rich `baybo-job` types so the contract stays in this leaf crate.
 #[async_trait]
 pub trait JobStore: Send + Sync {
     async fn create(&self, job: &JobRow) -> Result<()>;
@@ -94,8 +85,4 @@ pub trait JobStore: Send + Sync {
     /// Jobs whose status is non-terminal (`pending` / `in_progress` /
     /// `stuck`). Used by admin queries surfacing jobs needing attention.
     async fn list_recoverable(&self) -> Result<Vec<JobRow>>;
-
-    /// Append a state-machine transition audit row.
-    async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()>;
-    async fn get_transitions(&self, job_id: &JobId) -> Result<Vec<JobTransitionRow>>;
 }

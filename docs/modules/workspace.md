@@ -7,6 +7,7 @@ The `workspace` crate is the single source of truth for Baybo's workspace layout
 - **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
+- **Tree measurement** (`walk` module, always available, std-only): `tree_stats` — the one sync walker behind the janitor's `work/tmp` "newest in-tree mtime" staleness gate (called via `spawn_blocking`). Summed lstat file sizes + newest lstat mtime anywhere in the tree; symlinks are measured as links and never followed. The mtime back-dating fixtures for testing against it live in `test_support` behind the `test-support` feature.
 
 Pure-data consumers (e.g. `baybo-config`, `baybo-tools`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`baybo-agent`, `baybo-cli`, `baybo-gateway`, the binary) depend on it with `features = ["io"]`.
 
@@ -22,7 +23,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   agents/          # standalone git repo: subagent profile definitions
   .key/            # not version-controlled: encryption.key (mode 0600)
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile, sessions/<id>/summary.md
-  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, future scratch
+  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
   logs/            # not version-controlled: baybo.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
 ```
 
@@ -49,6 +50,7 @@ checkout rather than polluting the real user home.
 | uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
 | browser fonts    | `<workspace.path>/work/.fonts/`            |
 | tool-output spills | `<workspace.path>/work/.baybo-tool-spills/` |
+| disposable scratch | `<workspace.path>/work/tmp/` (`WORK_TMP_SUBDIR`; janitor-swept, see below) |
 | gateway logs     | `<workspace.path>/logs/baybo.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
 | session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read) |
@@ -59,7 +61,7 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/` if missing.
+- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
 - Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, and `agents/` if the directory isn't already a git repo (`<dir>/.git` check).
 
 `config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
@@ -88,13 +90,28 @@ Identity file changes usually affect the system prompt; memory changes usually a
 
 They complement each other without overlapping.
 
+### Scratch hygiene: `work/tmp`
+
+`work/` is the agent's only writable surface — every chat, cron fire, and
+subagent shares it flat, and nothing in it is deleted implicitly, so it
+accumulates. `work/tmp/` is the disposable-scratch convention that keeps
+the growth bounded: `WORK_TMP_SUBDIR` + `work_tmp_dir()` name it,
+`ensure_layout` creates it, and the Bash tool description tells the model
+to put intermediate files there while keeping user-facing deliverables
+elsewhere under `work/`. The janitor removes any `work/tmp` top-level
+entry whose newest in-tree mtime is older than `WORK_TMP_TTL_DAYS` (7 —
+the const lives here so the sweep and the model-facing prompt quote one
+number), measuring staleness with the shared
+`baybo_workspace::walk::tree_stats` walker (newest lstat mtime anywhere
+in the tree, symlinks never followed); see [`janitor.md`](janitor.md).
+
 ### Why split state/work/logs from profile/skills
 
 The split exists so the user's git workflow stays clean: `config/`, `profile/`, `skills/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (sqlite DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the four declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
 
 ## Constraints
 
-- No baybo-* dependencies. The crate is leaf-level: `paths` is pure data, and `io` only adds optional `tokio` + `anyhow`.
+- No baybo-* dependencies. The crate is leaf-level: `paths` is pure data, `walk` is std-only, `io` only adds optional `tokio` + `anyhow`, and `test-support` only adds optional `libc` for the symlink back-dating fixture.
 - Does not record message-level Trace or Job data
 - Missing identity files should degrade gracefully, not block startup
 - Identity file changes should carry a version stamp or content hash for Trace provenance

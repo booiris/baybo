@@ -68,7 +68,7 @@ CREATE TABLE session_summaries (
 );
 ```
 
-The live table additionally carries two legacy inert columns — `in_flight` / `in_flight_owner`, left over from the DB-flag at-most-one mechanism the in-memory `JoinHandle` replaced. Nothing reads or writes them; they stay only so old DBs need no migration.
+DBs created before the 2026-07 unused-column audit may additionally carry two orphan columns — `in_flight` / `in_flight_owner`, left over from the DB-flag at-most-one mechanism the in-memory `JoinHandle` replaced. Nothing reads or writes them; they stay inert there (no data migration), and fresh DBs no longer create them.
 
 ## Trigger Conditions (session side)
 
@@ -248,6 +248,8 @@ Any of the following → fall through to stage 2 (LLM summary) / stage 3 (trunca
 - file read / parse error
 
 The first compression on every session pays a one-time synchronous-LLM-summary latency cost; subsequent compressions use the fast-path.
+
+**Cursor re-point on fast-path apply.** A compaction apply supersedes every active row — including the one the cursor names — which would leave the cursor dead until the next background pass lands. For a **fast-path** apply the flow closes that window itself: `apply_session_compaction` returns the base ordinal of the new rows, and `run_compression` re-points `session_summaries.cursor` at the freshly-inserted continuation-summary row (`SessionManager::repoint_summary_cursor` — cursor + `updated_at` only, never pass_count/cost/error telemetry). This is sound because the fast-path summary row's body is `summary.md` verbatim, so the on-disk file still covers everything at or before the row; a back-to-back compaction (one giant turn leaping past the threshold, an immediate `/compact`) hits the fast path again instead of a full-transcript stage-2 call. Stage-2 / truncate applies never re-point — their output is not on disk, so an advanced cursor would claim coverage `summary.md` doesn't have, and the "cursor isn't in the active log" fall-through above remains their (recoverable) resting state.
 
 ### `force_compress` (`/compact`)
 

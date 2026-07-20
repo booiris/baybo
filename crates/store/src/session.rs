@@ -257,11 +257,16 @@ pub trait SessionStore: Send + Sync {
     /// transcript, system message included. The caller passes it
     /// through unfiltered; rows are typed by `role` so the leading
     /// system row resurfaces on the next `load_active_session_messages`.
+    ///
+    /// Returns the ordinal of the FIRST newly-inserted row; `new_active`
+    /// lands contiguously, so `base + i` addresses row `i` — the
+    /// compression flow uses this to re-point `session_summaries.cursor`
+    /// at the fresh continuation-summary row after a fast-path apply.
     async fn apply_session_compaction(
         &self,
         session_id: &SessionId,
         new_active: &[ChatMessage],
-    ) -> Result<()>;
+    ) -> Result<i64>;
 
     /// Load the active transcript (rows where `superseded_by IS NULL`)
     /// in ordinal order. Used by the router on actor cold start to

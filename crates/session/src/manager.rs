@@ -566,9 +566,28 @@ impl SessionManager {
         &self,
         session_id: &SessionId,
         new_active: &[ChatMessage],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.store
             .apply_session_compaction(session_id, new_active)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Re-point `session_summaries.cursor` without touching pass_count /
+    /// cost / error telemetry. Used after a fast-path compaction apply:
+    /// the fresh continuation-summary row carries `summary.md` verbatim,
+    /// so the on-disk summary still covers everything at or before it and
+    /// the cursor may legally advance there — keeping the fast path alive
+    /// for a back-to-back compaction. Returns `false` when the session
+    /// has no summary row (nothing to re-point).
+    pub async fn repoint_summary_cursor(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.summary_store
+            .repoint_cursor(session_id, cursor, updated_at)
             .await
             .map_err(SessionError::from)
     }

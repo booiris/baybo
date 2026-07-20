@@ -56,6 +56,17 @@ pub const BLOB_INLINE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Default mime when neither the card nor the response/extension names one.
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 
+/// Env var injected into every `ctx.exec` naming a per-card directory
+/// (`<workspace>/deck/tmux-socks/<card_id>`) where a card should place its
+/// own tmux socket (`tmux -S "$BAYBO_DECK_TMUX_DIR/<name>.sock"`). It keeps
+/// an agent-driven CLI's tmux server off the user's default socket
+/// (`/tmp/tmux-<uid>/default`, so out of their `tmux ls`) and out of
+/// `/tmp` (so a `/tmp` wipe can't kill it); the per-card subdir lets purge
+/// reap exactly the departing card's servers. Documented in the `deck`
+/// skill.
+pub const DECK_TMUX_DIR_ENV: &str = "BAYBO_DECK_TMUX_DIR";
+const TMUX_SOCKS_SUBDIR: &str = "tmux-socks";
+
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
     /// Scratch root for exec working dirs (per card).
@@ -63,6 +74,9 @@ pub(crate) struct DeckHost {
     /// Shared blob store — the same one chat attachments use. Deck blobs are
     /// stamped `deck:<card_id>` so GC can find them without touching chat data.
     blob: Arc<dyn BlobStore>,
+    /// `<deck_root>/tmux-socks` — each card's `DECK_TMUX_DIR_ENV` is a
+    /// subdir of this keyed by card id.
+    tmux_socks_root: PathBuf,
 }
 
 /// The `uploader_identity` stamped on every deck-produced blob: a stable,
@@ -72,12 +86,30 @@ fn deck_identity(card_id: &str) -> String {
 }
 
 impl DeckHost {
-    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf, blob: Arc<dyn BlobStore>) -> Self {
+    pub fn new(
+        vault: Arc<SecretVault>,
+        scratch_root: PathBuf,
+        blob: Arc<dyn BlobStore>,
+        deck_root: &Path,
+    ) -> Self {
         Self {
             vault,
             scratch_root,
             blob,
+            tmux_socks_root: deck_root.join(TMUX_SOCKS_SUBDIR),
         }
+    }
+
+    /// The card's private tmux socket dir — what exec exports as
+    /// `DECK_TMUX_DIR_ENV`, and what the runtime reap (purge, gate finish)
+    /// clears.
+    pub(crate) fn tmux_dir(&self, card_id: &str) -> PathBuf {
+        self.tmux_socks_root.join(card_id)
+    }
+
+    /// `<deck_root>/tmux-socks` — what the boot orphan sweep walks.
+    pub(crate) fn tmux_socks_root(&self) -> &Path {
+        &self.tmux_socks_root
     }
 
     /// Replace every `[{REDACTED_SECRET_…}]` placeholder with the vault
@@ -440,6 +472,7 @@ impl HostServices for DeckHost {
             .arg("-c")
             .arg(&cmd)
             .current_dir(&scratch)
+            .env(DECK_TMUX_DIR_ENV, self.tmux_dir(card_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

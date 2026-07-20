@@ -10,16 +10,14 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use baybo_model::{JobId, SessionId};
 use baybo_store::job::Result;
-use baybo_store::{JobRow, JobStore, JobTransitionRow, SessionJobStats};
+use baybo_store::{JobRow, JobStore, SessionJobStats};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
-/// In-memory `JobStore` for tests. Keyed by `row.id`. `record_transition`
-/// appends to a per-job vector so the order of transitions is preserved.
+/// In-memory `JobStore` for tests. Keyed by `row.id`.
 #[derive(Debug, Default)]
 pub struct MemoryJobStore {
     jobs: Mutex<HashMap<JobId, JobRow>>,
-    transitions: Mutex<HashMap<JobId, Vec<JobTransitionRow>>>,
 }
 
 impl MemoryJobStore {
@@ -161,23 +159,5 @@ impl JobStore for MemoryJobStore {
                 },
             )
             .collect())
-    }
-
-    async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()> {
-        self.transitions
-            .lock()
-            .entry(transition.job_id)
-            .or_default()
-            .push(transition.clone());
-        Ok(())
-    }
-
-    async fn get_transitions(&self, job_id: &JobId) -> Result<Vec<JobTransitionRow>> {
-        Ok(self
-            .transitions
-            .lock()
-            .get(job_id)
-            .cloned()
-            .unwrap_or_default())
     }
 }

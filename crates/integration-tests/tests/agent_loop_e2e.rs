@@ -579,6 +579,78 @@ async fn attachments_accumulate_across_iterations_and_reset_per_turn() {
     harness.shutdown().await;
 }
 
+/// `MultiModalText` images (e.g. a browser screenshot) are for the MODEL:
+/// the loop must append one follow-up user-role row carrying the Image
+/// blocks after every tool_result of the iteration, so the next request's
+/// vision path picks them up without breaking provider tool_use/tool_result
+/// adjacency. Regression guard: PR #79 collapsed this variant into the
+/// text-only arm and vision models silently stopped seeing screenshots.
+#[tokio::test]
+async fn multimodal_tool_images_are_injected_as_a_followup_user_row() {
+    use baybo_store::SessionStore;
+
+    let tool = Arc::new(RecordingTool::new("browser_screenshot"));
+    tool.set_response(ToolOutput::multi_modal_text(
+        "Took a screenshot of the current page's viewport".into(),
+        vec![ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: format!("{SHA256_PREFIX}{}.tok", "e".repeat(64)),
+            },
+            mime_type: "image/png".into(),
+            filename: None,
+        }],
+    ));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![call("shot-1", "browser_screenshot")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("I can see the page".into())]);
+
+    harness.send_text("look at the page").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let log = harness
+        .memory_session_store
+        .load_session_messages_with_supersede(&harness.session.id)
+        .await
+        .unwrap();
+    let result_idx = log
+        .iter()
+        .position(|row| {
+            row.message
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "shot-1"))
+        })
+        .expect("the screenshot tool_result row must be persisted");
+    let image_row = log
+        .get(result_idx + 1)
+        .expect("a follow-up row must exist after the tool_result");
+    assert_eq!(
+        image_row.message.role,
+        Role::User,
+        "the image row rides the user role so the vision path picks it up"
+    );
+    assert!(
+        image_row
+            .message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "the follow-up row must carry the screenshot Image block, got {:?}",
+        image_row.message.content
+    );
+
+    harness.shutdown().await;
+}
+
 /// A turn whose answer is only the file — no prose — must still reach the
 /// user. `is_blank_reply` (crates/agent/src/actor/mod.rs) suppresses an
 /// all-blank-text reply behind a fallback notice; a media block survives it

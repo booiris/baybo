@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use super::SqlitePool;
 use baybo_model::{JobId, SessionId};
 use baybo_store::job::Result;
-use baybo_store::{JobRow, JobStore, JobTransitionRow, SessionJobStats, StorageError};
+use baybo_store::{JobRow, JobStore, SessionJobStats, StorageError};
 
 pub struct SqliteJobStore {
     pool: SqlitePool,
@@ -300,38 +300,6 @@ impl JobStore for SqliteJobStore {
             })
             .await
     }
-
-    async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()> {
-        let job_id = transition.job_id.to_string();
-        let data = transition.data.clone();
-        self.pool
-            .interact("jobs.record_transition", move |conn| {
-                conn.execute(
-                    "INSERT INTO job_transitions (job_id, data) VALUES (?1, ?2)",
-                    rusqlite::params![job_id, data],
-                )?;
-                Ok(())
-            })
-            .await
-    }
-
-    async fn get_transitions(&self, job_id: &JobId) -> Result<Vec<JobTransitionRow>> {
-        let id = job_id.to_string();
-        let job_id = *job_id;
-        self.pool
-            .interact("jobs.get_transitions", move |conn| {
-                let mut stmt =
-                    conn.prepare("SELECT data FROM job_transitions WHERE job_id = ?1 ORDER BY id")?;
-                let out = stmt
-                    .query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-                    .into_iter()
-                    .map(|data| JobTransitionRow { job_id, data })
-                    .collect();
-                Ok(out)
-            })
-            .await
-    }
 }
 
 impl SqliteJobStore {
@@ -556,19 +524,5 @@ mod tests {
         assert_eq!(stats[&sess_a].latest_status_kind, "pending");
         assert_eq!(stats[&sess_b].job_count, 1);
         assert_eq!(stats[&sess_b].latest_status_kind, "in_progress");
-    }
-
-    #[tokio::test]
-    async fn record_and_get_transitions() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
-        let store = SqliteJobStore::new(pool);
-        let mut j = test_job();
-        create(&store, &j).await;
-        let t = j.start().unwrap();
-        store.record_transition(&t.to_row().unwrap()).await.unwrap();
-        let ts = store.get_transitions(&j.id).await.unwrap();
-        assert_eq!(ts.len(), 1);
-        let t0 = baybo_job::JobTransition::from_row(ts.into_iter().next().unwrap()).unwrap();
-        assert!(matches!(t0.to, JobStatus::InProgress));
     }
 }

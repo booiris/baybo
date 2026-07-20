@@ -1,12 +1,12 @@
-//! Conversions between the rich `Job` / `JobTransition` domain types and
-//! the persistence rows (`baybo_store::JobRow` / `JobTransitionRow`).
+//! Conversions between the rich `Job` domain type and its
+//! persistence row (`baybo_store::JobRow`).
 //!
 //! The `JobStore` trait itself lives in `baybo-store` and trades in rows,
 //! so the job state machine stays in this crate while the store contract
 //! sits alongside every other one. Callers convert at the boundary.
 
-use crate::{Job, JobError, JobInputKind, JobTransition, Result};
-use baybo_store::{JobRow, JobTransitionRow};
+use crate::{Job, JobError, JobInputKind, Result};
+use baybo_store::JobRow;
 
 /// Snake-case string for the denormalised `jobs.kind` column. The column
 /// is display-only (never filtered in SQL; `from_row` rebuilds the whole
@@ -45,22 +45,6 @@ impl Job {
     pub fn from_row(row: JobRow) -> Result<Job> {
         serde_json::from_str(&row.data)
             .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))
-    }
-}
-
-impl JobTransition {
-    pub fn to_row(&self) -> Result<JobTransitionRow> {
-        let data = serde_json::to_string(self)
-            .map_err(|e| JobError::Storage(format!("failed to serialize transition: {e}")))?;
-        Ok(JobTransitionRow {
-            job_id: self.job_id,
-            data,
-        })
-    }
-
-    pub fn from_row(row: JobTransitionRow) -> Result<JobTransition> {
-        serde_json::from_str(&row.data)
-            .map_err(|e| JobError::Storage(format!("failed to deserialize transition: {e}")))
     }
 }
 

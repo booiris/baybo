@@ -158,9 +158,8 @@ impl JobLifecycle {
     /// event — the start edge the turn-state projector turns into the
     /// web chat's "turn began".
     pub async fn start(&self, job_id: &JobId) -> Result<()> {
-        let (job, transition) = self.apply(job_id, |j| j.start()).await?;
-        self.persist_and_publish(job, transition, JobPhase::Started)
-            .await
+        let job = self.apply(job_id, |j| j.start()).await?;
+        self.persist_and_publish(job, JobPhase::Started).await
     }
 
     /// Move `InProgress → Completed` with a final output.
@@ -172,17 +171,16 @@ impl JobLifecycle {
             crate::JobOutput::Message { ordinal, .. } => *ordinal,
             crate::JobOutput::Structured { .. } => None,
         };
-        let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist_and_publish(job, transition, JobPhase::Completed { reply_ordinal })
+        let job = self.apply(job_id, |j| j.complete(output)).await?;
+        self.persist_and_publish(job, JobPhase::Completed { reply_ordinal })
             .await
     }
 
     /// Move to `Failed { reason }`.
     pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let (job, transition) = self.apply(job_id, |j| j.fail(&reason)).await?;
-        self.persist_and_publish(job, transition, JobPhase::Failed)
-            .await
+        let job = self.apply(job_id, |j| j.fail(&reason)).await?;
+        self.persist_and_publish(job, JobPhase::Failed).await
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
@@ -205,11 +203,10 @@ impl JobLifecycle {
         if job.is_terminal() {
             return Ok(());
         }
-        let (job, transition) = self
+        let job = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
-        self.persist_and_publish(job, transition, JobPhase::Cancelled)
-            .await
+        self.persist_and_publish(job, JobPhase::Cancelled).await
     }
 
     /// Wait (bounded by `timeout`) until `job_id`'s in-flight run has fully
@@ -240,27 +237,26 @@ impl JobLifecycle {
         if job.is_terminal() {
             return Ok(());
         }
-        let (job, transition) = self
+        let job = self
             .apply(job_id, |j| {
                 j.cancel_at(reason, partial_artifacts.clone(), at)
             })
             .await?;
-        self.persist_and_publish(job, transition, JobPhase::Cancelled)
-            .await
+        self.persist_and_publish(job, JobPhase::Cancelled).await
     }
 
     /// Move to `Stuck { reason }` from `InProgress`.
     pub async fn stuck(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let (job, transition) = self.apply(job_id, |j| j.stuck(&reason)).await?;
-        self.persist(job, transition).await
+        let job = self.apply(job_id, |j| j.stuck(&reason)).await?;
+        self.persist(job).await
     }
 
     /// Move `Stuck → InProgress`.
     pub async fn recover(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let (job, transition) = self.apply(job_id, |j| j.recover(&reason)).await?;
-        self.persist(job, transition).await
+        let job = self.apply(job_id, |j| j.recover(&reason)).await?;
+        self.persist(job).await
     }
 
     pub async fn get(&self, job_id: &JobId) -> Result<Option<Job>> {
@@ -414,27 +410,21 @@ impl JobLifecycle {
             .collect()
     }
 
-    pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
-        self.store
-            .get_transitions(job_id)
-            .await?
-            .into_iter()
-            .map(JobTransition::from_row)
-            .collect()
-    }
-
-    async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<(Job, JobTransition)>
+    async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<Job>
     where
         F: FnOnce(&mut Job) -> Result<JobTransition>,
     {
         let mut job = self.load_job(job_id).await?;
-        let transition = f(&mut job)?;
-        Ok((job, transition))
+        // The state machine returns a legality receipt for the edge; the
+        // edge has already mutated `job`, and the per-transition audit
+        // table (`job_transitions`) was retired in the 2026-07
+        // unused-column audit, so the receipt is dropped here.
+        let _transition = f(&mut job)?;
+        Ok(job)
     }
 
-    async fn persist(&self, job: Job, transition: JobTransition) -> Result<()> {
+    async fn persist(&self, job: Job) -> Result<()> {
         self.store.save(&job.to_row()?).await?;
-        self.store.record_transition(&transition.to_row()?).await?;
         Ok(())
     }
 
@@ -446,12 +436,7 @@ impl JobLifecycle {
     /// floor — broadcast `send` only fails when there are no subscribers,
     /// which is the normal state for a process with no live chat tab and
     /// no in-flight subagent.
-    async fn persist_and_publish(
-        &self,
-        job: Job,
-        transition: JobTransition,
-        phase: JobPhase,
-    ) -> Result<()> {
+    async fn persist_and_publish(&self, job: Job, phase: JobPhase) -> Result<()> {
         let event = JobLifecycleEvent {
             job_id: job.id,
             session_id: job.session_id.clone(),
@@ -459,7 +444,7 @@ impl JobLifecycle {
             phase,
             kind: job.input_kind(),
         };
-        self.persist(job, transition).await?;
+        self.persist(job).await?;
         let _ = self.lifecycle_events.send(event);
         Ok(())
     }
@@ -514,9 +499,8 @@ mod tests {
         lc.start(&job.id).await.unwrap();
         lc.complete(&job.id, dummy_output()).await.unwrap();
 
-        let history = lc.get_history(&job.id).await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(matches!(history[1].to, JobStatus::Completed));
+        let done = lc.get(&job.id).await.unwrap().expect("job exists");
+        assert!(matches!(done.status, JobStatus::Completed));
     }
 
     #[tokio::test]

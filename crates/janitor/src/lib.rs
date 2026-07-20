@@ -13,9 +13,14 @@ use std::time::{Duration, Instant};
 use baybo_store::{BlobStore, ChannelPairingStore, DeckCardStore};
 use baybo_workspace::WorkspacePaths;
 
-use fs_sweep::{DirSweep, is_log_file, sweep_directory};
+use fs_sweep::{DirSweep, is_log_file, sweep_directory, sweep_tree_entries};
 
 const LOG_FILE_TTL: Duration = Duration::from_secs(30 * 86_400);
+// Disposable-scratch window for `<workspace>/work/tmp`. The day count
+// lives in `baybo-workspace` because the Bash tool description
+// advertises the same figure to the model.
+const WORK_TMP_TTL: Duration =
+    Duration::from_secs(baybo_workspace::paths::WORK_TMP_TTL_DAYS * 86_400);
 // Pairing approvals — short-lived auth-flow ephemera, kept long enough
 // for the next channel reload to confirm them, then dropped.
 const PAIRING_APPROVAL_TTL: Duration = Duration::from_secs(7 * 86_400);
@@ -51,6 +56,7 @@ const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JanitorReport {
     pub log_files_removed: usize,
+    pub work_tmp_removed: usize,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
     pub deck_blobs_purged: u64,
@@ -139,6 +145,14 @@ impl Janitor {
         }
         report.log_files_removed = logs_total;
 
+        let scratch = self.paths.work_tmp_dir();
+        match sweep_tree_entries(&scratch, WORK_TMP_TTL).await {
+            Ok(n) => report.work_tmp_removed = n,
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %scratch.display(), "work/tmp sweep failed")
+            }
+        }
+
         // Pairings get a daily sweep here too so a long-running process
         // that never trips the hourly tick (e.g. heavy load deferring
         // every interval fire) still eventually reaps stale rows.
@@ -152,6 +166,7 @@ impl Janitor {
 
         tracing::info!(
             log_files_removed = report.log_files_removed,
+            work_tmp_removed = report.work_tmp_removed,
             pairings_purged = report.pairings_purged,
             deck_blobs_purged = report.deck_blobs_purged,
             "janitor sweep complete",
@@ -286,15 +301,10 @@ mod tests {
     use std::path::Path;
     use std::time::SystemTime;
 
+    use baybo_workspace::test_support::{back_date, back_date_symlink, back_date_tree};
     use tempfile::TempDir;
 
     use super::*;
-
-    fn back_date(path: &Path, age: Duration) {
-        let mtime = SystemTime::now() - age;
-        let file = std::fs::File::open(path).unwrap();
-        file.set_modified(mtime).unwrap();
-    }
 
     fn back_date_dir(path: &Path, age: Duration) {
         // Directory mtime: use std::fs::set_modified is unstable, so
@@ -417,6 +427,90 @@ mod tests {
         assert!(!stale_main.exists());
         assert!(fresh_main.exists());
         assert!(!stale_chan.exists());
+    }
+
+    #[tokio::test]
+    async fn work_tmp_sweep_removes_only_wholly_stale_entries() {
+        // Layout under work/tmp:
+        //   stale.txt   old file                          → removed
+        //   stale-dir/  everything inside old             → removed
+        //   mixed-dir/  old shell, one fresh file deep in → kept
+        //   fresh.txt   new file                          → kept
+        let tmp = TempDir::new().unwrap();
+        let paths = workspace_paths(tmp.path());
+        let scratch = paths.work_tmp_dir();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let over_ttl = WORK_TMP_TTL + Duration::from_secs(60);
+
+        let stale_file = scratch.join("stale.txt");
+        std::fs::write(&stale_file, b"x").unwrap();
+        back_date(&stale_file, over_ttl);
+
+        let stale_dir = scratch.join("stale-dir");
+        std::fs::create_dir_all(stale_dir.join("nested")).unwrap();
+        std::fs::write(stale_dir.join("nested").join("a.txt"), b"x").unwrap();
+        back_date_tree(&stale_dir, over_ttl);
+
+        let mixed_dir = scratch.join("mixed-dir");
+        std::fs::create_dir_all(mixed_dir.join("nested")).unwrap();
+        std::fs::write(mixed_dir.join("nested").join("old.txt"), b"x").unwrap();
+        back_date_tree(&mixed_dir, over_ttl);
+        std::fs::write(mixed_dir.join("nested").join("fresh.txt"), b"x").unwrap();
+
+        let fresh_file = scratch.join("fresh.txt");
+        std::fs::write(&fresh_file, b"x").unwrap();
+
+        let report = Janitor::new(paths).sweep_once().await;
+
+        assert_eq!(report.work_tmp_removed, 2);
+        assert!(!stale_file.exists());
+        assert!(!stale_dir.exists());
+        assert!(
+            mixed_dir.join("nested").join("fresh.txt").exists(),
+            "one fresh file must keep the whole entry"
+        );
+        assert!(fresh_file.exists());
+    }
+
+    #[tokio::test]
+    async fn work_tmp_sweep_removes_symlinks_as_links_without_traversal() {
+        // A stale top-level symlink is unlinked (target untouched); a
+        // stale dir containing a symlink to a *fresh* outside target is
+        // still removed — proof the walk never follows the link, or the
+        // fresh target would have kept the dir alive.
+        let tmp = TempDir::new().unwrap();
+        let paths = workspace_paths(tmp.path());
+        let scratch = paths.work_tmp_dir();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let over_ttl = WORK_TMP_TTL + Duration::from_secs(60);
+
+        let target_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("fresh.txt"), b"keep").unwrap();
+
+        let top_link = scratch.join("stale-link");
+        std::os::unix::fs::symlink(&target_dir, &top_link).unwrap();
+        back_date_symlink(&top_link, over_ttl);
+
+        let dir_with_link = scratch.join("stale-dir-with-link");
+        std::fs::create_dir_all(&dir_with_link).unwrap();
+        let inner_link = dir_with_link.join("link");
+        std::os::unix::fs::symlink(&target_dir, &inner_link).unwrap();
+        back_date_symlink(&inner_link, over_ttl);
+        back_date_tree(&dir_with_link, over_ttl);
+
+        let report = Janitor::new(paths).sweep_once().await;
+
+        assert_eq!(report.work_tmp_removed, 2);
+        assert!(
+            std::fs::symlink_metadata(&top_link).is_err(),
+            "top-level link unlinked"
+        );
+        assert!(!dir_with_link.exists());
+        assert!(
+            target_dir.join("fresh.txt").exists(),
+            "symlink target must never be deleted"
+        );
     }
 
     #[tokio::test]

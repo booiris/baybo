@@ -132,6 +132,29 @@ impl SessionSummaryStore for SqliteSessionSummaryStore {
             .await
     }
 
+    async fn repoint_cursor(
+        &self,
+        session_id: &SessionId,
+        cursor: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        let updated_at_us = super::time::to_us(updated_at);
+        let affected = self
+            .pool
+            .interact("session_summaries.repoint_cursor", move |conn| {
+                // Plain UPDATE, never an insert: a cursor re-point is only
+                // meaningful when a real pass already recorded coverage.
+                Ok(conn.execute(
+                    "UPDATE session_summaries SET cursor = ?2, updated_at = ?3 \
+                     WHERE session_id = ?1",
+                    rusqlite::params![sid, cursor, updated_at_us],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
     async fn bump_error_count(
         &self,
         session_id: &SessionId,
@@ -279,6 +302,42 @@ mod tests {
         assert_eq!(row.pass_count, 3);
         assert_eq!(row.cost_micros, 3_500);
         assert_eq!(row.span_id, "span-3");
+    }
+
+    #[tokio::test]
+    async fn repoint_cursor_moves_cursor_without_touching_telemetry() {
+        let pool = fresh_pool().await;
+        let sessions = SqliteSessionStore::new(pool.clone());
+        sessions.save(&make_session("s-repoint")).await.unwrap();
+        let store = SqliteSessionSummaryStore::new(pool);
+        let id = SessionId::from("s-repoint");
+
+        store
+            .upsert_success(&id, 10, 1_000, "m", "span-1", Utc::now())
+            .await
+            .unwrap();
+
+        let moved = store.repoint_cursor(&id, 99, Utc::now()).await.unwrap();
+        assert!(moved);
+        let row = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(row.cursor, 99);
+        assert_eq!(row.pass_count, 1, "repoint must not bump pass_count");
+        assert_eq!(row.cost_micros, 1_000, "repoint must not touch cost");
+        assert_eq!(row.error_count, 0);
+        assert_eq!(row.span_id, "span-1", "repoint must not touch span_id");
+    }
+
+    #[tokio::test]
+    async fn repoint_cursor_never_inserts_a_missing_row() {
+        let pool = fresh_pool().await;
+        let sessions = SqliteSessionStore::new(pool.clone());
+        sessions.save(&make_session("s-absent")).await.unwrap();
+        let store = SqliteSessionSummaryStore::new(pool);
+        let id = SessionId::from("s-absent");
+
+        let moved = store.repoint_cursor(&id, 5, Utc::now()).await.unwrap();
+        assert!(!moved, "no row -> nothing to re-point");
+        assert!(store.get(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]

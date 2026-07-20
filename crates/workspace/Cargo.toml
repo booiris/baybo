@@ -9,6 +9,7 @@ doctest = false
 [dependencies]
 tokio = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 # `io` brings in async identity-file readers/writers and `WorkspaceManager`.
@@ -17,7 +18,14 @@ anyhow = { workspace = true, optional = true }
 # they only need path constants and `WorkspacePaths`.
 default = ["io"]
 io = ["dep:tokio", "dep:anyhow"]
+# Exposes the mtime back-dating fixtures in `test_support` to downstream
+# crates' `[dev-dependencies]`.
+test-support = ["dep:libc"]
 # Bench builds run inside an ephemeral single-task container: `ensure_layout`
 # skips the identity-repo `git init`, so baybo boots without `git` on PATH (no
 # slow per-task `apt-get install git`). Enabled via the root crate's `bench-bash`.
 bench-bash = []
+
+[dev-dependencies]
+libc = { workspace = true }
+tempfile = { workspace = true }

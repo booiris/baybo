@@ -1,6 +1,6 @@
 ---
 name: deck
-version: 0.3.0
+version: 0.3.1
 description: "Author and install a live card on the user's Deck (the dashboard tab of agent-written cards) — e.g. a Claude/Codex quota monitor, a machine-status board, an API watcher. Invoked explicitly by the user typing /deck <request>; never auto-selected. Covers the bundle contract, per-size adaptation and the optional maximized layout, the service and card SDK surface, worked examples, and the install flow via DeckCardCreate/DeckCardUpdate."
 command: deck
 user-invocable: true
@@ -175,6 +175,45 @@ process. Repeated crashes/timeouts quarantine the card (visible error
 face + Re-enable), so keep ops fast and handle upstream errors — return
 `{error: "..."}`-style JSON rather than throwing when the upstream is
 merely down.
+
+### Driving a terminal CLI through tmux — use the injected private socket
+
+Some cards report on a CLI that only speaks through a real terminal (an
+interactive quota TUI, `claude`, `codex`). `ctx.exec` gives no PTY and caps
+each call at 30s, so run the CLI in a **detached tmux session** that outlives
+the op: create it once, then `capture-pane` (or `send-keys`) on later refreshes.
+
+Never invoke bare `tmux` — that binds the **user's own default socket**
+(`/tmp/tmux-<uid>/default`), so your card's session pollutes their `tmux ls`
+and a `/tmp` wipe kills it. Every `ctx.exec` is handed **`$BAYBO_DECK_TMUX_DIR`**
+(`<workspace>/deck/tmux-socks/<card-id>` — private to your card) for exactly
+this — pin your socket there with `-S`:
+
+```js
+refresh: async (_p, ctx) => {
+  const { stdout } = await ctx.exec(`
+    S="$BAYBO_DECK_TMUX_DIR/quota.sock"        # injected per-card dir, never /tmp
+    mkdir -p "$(dirname "$S")"
+    tmux -S "$S" has-session -t q 2>/dev/null ||
+      tmux -S "$S" new-session -d -s q -x 140 -y 48 'exec claude --safe-mode'
+    tmux -S "$S" capture-pane -p -t q
+  `);
+  return parseQuota(stdout);
+},
+```
+
+- **`-S "$BAYBO_DECK_TMUX_DIR/…"` is the whole isolation.** The socket lives
+  under `<workspace>/deck`, not `/tmp`, so a `/tmp` wipe can't kill it and the
+  user's `tmux ls` never sees it. It hides the session from their *list*, not
+  from a same-UID `tmux -S <path> attach` — that's fine; the goal is to keep
+  deck plumbing out of their view, not to sandbox it. (`mkdir -p` it first —
+  the runtime exports the path but doesn't create the dir.)
+- **The session is shared host state, not per-op.** Guard creation with
+  `has-session` so each refresh reuses the running session instead of spawning
+  a fresh server every tick; `kill-session` it once the card's job is done.
+  Purging the card kills whatever servers still sit behind `*.sock` files in
+  its dir — but that's the last-resort sweep, not a reason to leave one
+  running.
 
 ### card.html — the frontend
 

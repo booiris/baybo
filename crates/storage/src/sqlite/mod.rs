@@ -303,8 +303,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     title                 TEXT,
                     data                  TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_sessions_root
-                    ON sessions(root_session_id);
+                -- idx_sessions_root is no longer created (2026-07
+                -- unused-column audit: it indexed a column no query
+                -- filters on). Old DBs keep their orphan copy. The
+                -- root_session_id column itself stays written — the data
+                -- blob's copy is what consumers read today.
                 -- User-created folders for organising the chat-session list.
                 -- Two-level tree via self-referential `parent_id` (NULL =
                 -- top-level; the depth cap of 2 is enforced in the session
@@ -430,15 +433,14 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- failure burns one LLM call per trigger event until the
                     -- underlying issue resolves; that's an explicit design
                     -- choice (no backoff complexity).
-                    error_count INTEGER NOT NULL DEFAULT 0,
-                    -- LEGACY (inert): the DB-flag at-most-one-in-flight
-                    -- mechanism for background compression was removed when
-                    -- the pass moved to an in-actor detached step gated by an
-                    -- in-memory JoinHandle. The columns stay in the schema so
-                    -- old DBs need no migration; nothing reads or writes them.
-                    in_flight   INTEGER NOT NULL DEFAULT 0,
-                    in_flight_owner TEXT
+                    error_count INTEGER NOT NULL DEFAULT 0
                 );
+                -- Old DBs may additionally carry two orphan columns,
+                -- `in_flight` / `in_flight_owner` — the DB-flag
+                -- at-most-one-in-flight mechanism the in-memory JoinHandle
+                -- replaced. Nothing reads or writes them; they stay inert
+                -- there (no data migration), and fresh DBs no longer
+                -- create them.
 
                 -- The session planning checklist (Task*). One row
                 -- per task; each TaskUpdate is a per-row UPDATE so it never
@@ -516,12 +518,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_jobs_parent
                     ON jobs(parent_job_id);
 
-                CREATE TABLE IF NOT EXISTS job_transitions (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id     TEXT NOT NULL,
-                    data       TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_job_transitions_job_id ON job_transitions(job_id);
+                -- Old DBs may carry an orphan `job_transitions` table (+
+                -- idx_job_transitions_job_id): a per-transition audit
+                -- ledger whose read API was never wired to any surface, so
+                -- it only ever grew. Retired in the 2026-07 unused-column
+                -- audit — the writer is gone, existing rows stay inert
+                -- (no data migration), and fresh DBs no longer create it.
 
                 -- Trace tables: a single canonical JSON `data` blob per
                 -- row plus VIRTUAL generated columns extracted by
@@ -557,25 +559,17 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_spans_open_step
                     ON spans(step_id) WHERE ended_at IS NULL;
 
+                -- Old DBs may additionally carry two orphan GENERATED
+                -- VIRTUAL columns (`kind`, `tool_event_kind`) plus
+                -- `idx_span_events_kind` — pre-built for kind-filtered
+                -- analytics that never landed; fresh DBs no longer create
+                -- any of it (2026-07 unused-column audit).
                 CREATE TABLE IF NOT EXISTS span_events (
                     span_id         TEXT    NOT NULL,
                     seq             INTEGER NOT NULL,
                     data            TEXT    NOT NULL,
-                    -- Outer SpanEventKind tag ('sanitize_hit' | 'approval'
-                    -- | 'tool_event'); extracted from the JSON blob so
-                    -- the writer never has to populate it explicitly.
-                    kind            TEXT
-                        GENERATED ALWAYS AS (json_extract(data, '$.kind.kind')) VIRTUAL,
-                    -- Inner ToolEventPayload tag ('phase' | 'http_fetch'
-                    -- | 'llm_call'); NULL for non-tool_event rows. The
-                    -- nested path means SQLite returns NULL automatically
-                    -- when the outer kind is not `tool_event`.
-                    tool_event_kind TEXT
-                        GENERATED ALWAYS AS (json_extract(data, '$.kind.payload.type')) VIRTUAL,
                     PRIMARY KEY (span_id, seq)
                 );
-                CREATE INDEX IF NOT EXISTS idx_span_events_kind
-                    ON span_events(kind, tool_event_kind);
 
                 CREATE TABLE IF NOT EXISTS cron_jobs (
                     id              TEXT    PRIMARY KEY,
@@ -599,7 +593,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     pinned          INTEGER NOT NULL DEFAULT 0,
                     data            TEXT    NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
+                -- idx_cron_jobs_user_id is no longer created (2026-07
+                -- unused-column audit: per-user cron queries are dead code
+                -- in a single-user product). Old DBs keep their orphan copy.
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_due ON cron_jobs(status, next_trigger_at);
 
                 CREATE TABLE IF NOT EXISTS cron_executions (
@@ -622,10 +618,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     data                TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
-                CREATE INDEX IF NOT EXISTS idx_cron_executions_user_id ON cron_executions(user_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_executions_dedup ON cron_executions(job_id, scheduled_fire_time);
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_status ON cron_executions(status);
-                CREATE INDEX IF NOT EXISTS idx_cron_executions_triggered_at ON cron_executions(triggered_at);
+                -- idx_cron_executions_user_id / _triggered_at are no longer
+                -- created (2026-07 unused-column audit: they backed queries
+                -- that never shipped; consumers read both fields from the
+                -- data blob). Old DBs keep their orphan copies.
 
                 CREATE TABLE IF NOT EXISTS skill_risk_assessments (
                     skill_name   TEXT NOT NULL,
@@ -648,8 +646,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     updated_at   INTEGER NOT NULL,
                     PRIMARY KEY (skill_name, content_hash)
                 );
-                CREATE INDEX IF NOT EXISTS idx_skill_risk_jobs_status
-                    ON skill_risk_assessment_jobs(status);
+                -- idx_skill_risk_jobs_status is no longer created (2026-07
+                -- unused-column audit: status is operator-inspection
+                -- telemetry; no query filters on it). Old DBs keep their
+                -- orphan copy.
 
                 CREATE TABLE IF NOT EXISTS channel_sessions (
                     channel_type TEXT    NOT NULL,
