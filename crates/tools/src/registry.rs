@@ -153,35 +153,38 @@ impl ToolRegistry {
         out
     }
 
-    /// [`Self::tool_definitions`] minus tools whose manifest restricts
-    /// `channels` to a set excluding `channel`. This is what the agent
-    /// loop sends the LLM: a session's channel never changes, so the
-    /// filtered list stays byte-stable within a session and the
-    /// prompt-cache constraint above still holds. A tool with no
-    /// manifest is treated as unrestricted (defensive — `register`
+    /// [`Self::tool_definitions`] minus tools out of scope for a session on
+    /// `channel` started by `trigger`: the manifest's `channels` axis (e.g.
+    /// owner-only deck tools) and the tool's [`Tool::trigger_scope`] axis (e.g.
+    /// `report_nothing`, visible only in a recurring cron fire). This is what
+    /// the agent loop sends the LLM: a session's channel *and* trigger are both
+    /// fixed for its whole life, so the filtered list stays byte-stable within a
+    /// session and the prompt-cache constraint above still holds. A tool with no
+    /// manifest is treated as channel-unrestricted (defensive — `register`
     /// always stores one).
-    pub fn tool_definitions_for_channel(
+    pub fn tool_definitions_for_session(
         &self,
         channel: &baybo_model::ChannelType,
+        trigger: &baybo_model::TriggerSource,
     ) -> Vec<ToolDefinition> {
         let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
         for (name, tool) in &self.builtin {
-            if self
+            let channel_ok = self
                 .builtin_manifests
                 .get(name)
-                .is_none_or(|m| m.allows_channel(channel))
-            {
+                .is_none_or(|m| m.allows_channel(channel));
+            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
                 let def = tool_definition_for(tool.as_ref());
                 defs.insert(def.name.clone(), def);
             }
         }
         let dynamic = self.dynamic.read();
         for (name, tool) in &dynamic.tools {
-            if dynamic
+            let channel_ok = dynamic
                 .manifests
                 .get(name)
-                .is_none_or(|m| m.allows_channel(channel))
-            {
+                .is_none_or(|m| m.allows_channel(channel));
+            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
                 let def = tool_definition_for(tool.as_ref());
                 defs.insert(def.name.clone(), def);
             } else {
@@ -334,12 +337,16 @@ mod tests {
         let names =
             |defs: Vec<crate::ToolDefinition>| defs.into_iter().map(|d| d.name).collect::<Vec<_>>();
 
-        let owner =
-            names(registry.tool_definitions_for_channel(&baybo_model::ChannelType::owner()));
+        let owner = names(registry.tool_definitions_for_session(
+            &baybo_model::ChannelType::owner(),
+            &baybo_model::TriggerSource::User,
+        ));
         assert!(owner.contains(&"OwnerOnly".to_string()));
 
-        let telegram =
-            names(registry.tool_definitions_for_channel(&baybo_model::ChannelType::telegram()));
+        let telegram = names(registry.tool_definitions_for_session(
+            &baybo_model::ChannelType::telegram(),
+            &baybo_model::TriggerSource::User,
+        ));
         assert!(!telegram.contains(&"OwnerOnly".to_string()));
         // Unrestricted tools are unaffected, and the two lists differ by
         // exactly the restricted entry.
@@ -347,5 +354,65 @@ mod tests {
         assert_eq!(owner.len(), telegram.len() + 1);
         // The unfiltered listing still carries everything.
         assert_eq!(registry.tool_definitions().len(), owner.len());
+    }
+
+    #[test]
+    fn trigger_scope_shows_cron_fire_tools_only_to_a_recurring_fire() {
+        use crate::{Tool, ToolContext, ToolOutput, ToolTriggerScope};
+        use baybo_model::TriggerSource;
+
+        struct FireOnly;
+        #[async_trait::async_trait]
+        impl Tool for FireOnly {
+            fn name(&self) -> &str {
+                "report_nothing"
+            }
+            fn description(&self) -> String {
+                "x".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn trigger_scope(&self) -> ToolTriggerScope {
+                ToolTriggerScope::CronFire
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+                _c: &ToolContext,
+            ) -> crate::Result<ToolOutput> {
+                Ok(ToolOutput::Text(String::new()))
+            }
+        }
+
+        let mut registry = default_registry();
+        let manifest = crate::ToolManifest {
+            name: "report_nothing".into(),
+            description: "x".into(),
+            trust_level: baybo_model::TrustLevel::Trusted,
+            parameters_schema: serde_json::json!({"type": "object"}),
+            capabilities: vec![],
+            channels: Vec::new(),
+        };
+        registry.register(Arc::new(FireOnly), manifest);
+
+        let has = |trigger: &TriggerSource| {
+            registry
+                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger)
+                .into_iter()
+                .any(|d| d.name == "report_nothing")
+        };
+        let cron = |conversation: bool| TriggerSource::Cron {
+            cron_job_id: "cj".into(),
+            origin_session_id: None,
+            conversation,
+            job_title: None,
+        };
+
+        // A recurring fire (its own conversation) sees it; an ordinary session
+        // and a one-shot fire's private workspace do not.
+        assert!(has(&cron(true)));
+        assert!(!has(&TriggerSource::User));
+        assert!(!has(&cron(false)));
     }
 }

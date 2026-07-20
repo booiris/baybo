@@ -136,7 +136,68 @@ pub trait Tool: Send + Sync {
         ToolConcurrency::Exclusive
     }
 
+    /// Which session-trigger contexts this tool is visible in. The default
+    /// [`ToolTriggerScope::Any`] is unrestricted (the norm); a tool that is
+    /// only meaningful inside a specific kind of turn (e.g. `report_nothing`,
+    /// which suppresses a recurring cron fire's notification) narrows it so it
+    /// never appears where it cannot act. Mirrors the manifest's `channels`
+    /// axis — the agent loop omits an out-of-scope tool from the LLM's list
+    /// (`ToolRegistry::tool_definitions_for_session`), keeping the list
+    /// byte-stable within a session (the trigger, like the channel, never
+    /// changes) so the prompt cache holds.
+    fn trigger_scope(&self) -> ToolTriggerScope {
+        ToolTriggerScope::Any
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;
+}
+
+/// Which session-trigger contexts a tool is visible in (see
+/// [`Tool::trigger_scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolTriggerScope {
+    /// Visible in every session — the default.
+    #[default]
+    Any,
+    /// Visible only in a recurring cron fire's own conversation
+    /// (`TriggerSource::Cron { conversation: true }`). Used by `report_nothing`,
+    /// which can only suppress a recurring fire's own notification.
+    CronFire,
+}
+
+impl ToolTriggerScope {
+    /// Whether a session started by `trigger` may see this tool.
+    pub fn allows_trigger(&self, trigger: &TriggerSource) -> bool {
+        match self {
+            ToolTriggerScope::Any => true,
+            ToolTriggerScope::CronFire => trigger.is_cron_conversation(),
+        }
+    }
+}
+
+/// A tool's request that the current turn produce **no** user-facing
+/// notification. The agent loop hands a fresh signal to the tools of a turn
+/// that *can* be silenced — today only a recurring cron fire, for its
+/// `report_nothing` tool — and reads it back after the turn; it is `None`
+/// everywhere else, so a tool that flips it outside such a turn is a no-op.
+/// Cheap to clone: the flag is shared through an `Arc`.
+#[derive(Clone, Default)]
+pub struct NotifySilence(Arc<std::sync::atomic::AtomicBool>);
+
+impl NotifySilence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request that this turn stay silent (no notification row, push, or pulse).
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a tool requested silence during this turn.
+    pub fn requested(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Context injected into tool execution by the agent layer.
@@ -241,6 +302,12 @@ pub struct ToolContext {
     /// View + control of this session's in-flight background jobs, for the
     /// `JobList` / `JobStop` tools. Gated like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
+    /// Handle a tool flips to suppress this turn's user-facing notification.
+    /// `Some` **only for a recurring cron fire turn** (wired by the actor's
+    /// cron dispatch, read by the `report_nothing` tool); `None` everywhere
+    /// else, so the tool no-ops on a user reply, a one-shot fire, or any
+    /// ordinary turn. See [`NotifySilence`].
+    pub notify_silence: Option<NotifySilence>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -281,6 +348,7 @@ impl ToolContext {
             read_tracker: None,
             background_jobs: None,
             background_control: None,
+            notify_silence: None,
         }
     }
 }
@@ -792,7 +860,7 @@ pub struct ToolManifest {
     /// Channels whose sessions may see and call this tool. Empty = every
     /// channel, the norm. Enforced twice: the agent loop omits the tool
     /// from the LLM-visible list for other sessions
-    /// (`ToolRegistry::tool_definitions_for_channel`), and the executor
+    /// (`ToolRegistry::tool_definitions_for_session`), and the executor
     /// refuses a call that names it anyway — omission alone is not a
     /// gate against a hallucinated or prompted-by-skill-body call.
     #[serde(default)]

@@ -741,6 +741,10 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
+        // A recurring cron fire hands its tools a silence handle here so
+        // `report_nothing` can suppress the fire's notification. `None` for
+        // every other turn (see `AgentActor::dispatch_cron_prompt`).
+        notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
         // Memory recall query (and write eligibility) for this job — `None`
@@ -782,14 +786,27 @@ impl AgentLoop {
                         interjections,
                         memory_query,
                         is_user_turn,
+                        notify_silence.clone(),
                     )
                     .await?;
-                let output = JobOutput::Message {
-                    content: outgoing.content.clone(),
-                    // The reply's persisted ordinal (captured from the store
-                    // append) rides the Completed event so push reads exactly
-                    // this row without a read-after-write poll.
-                    ordinal: outgoing.ordinal,
+                let output = if notify_silence.as_ref().is_some_and(|s| s.requested()) {
+                    // A recurring cron fire called `report_nothing`: complete
+                    // with a reply-less structured result so the Completed edge
+                    // carries no reply ordinal and the push dispatcher skips it
+                    // (`gateway::push` returns early on `reply_ordinal: None`).
+                    // The dispatch is suppressed and the fire session hidden by
+                    // `dispatch_cron_prompt`; nothing is deleted.
+                    JobOutput::Structured {
+                        value: serde_json::json!({ "notify": "suppressed" }),
+                    }
+                } else {
+                    JobOutput::Message {
+                        content: outgoing.content.clone(),
+                        // The reply's persisted ordinal (captured from the store
+                        // append) rides the Completed event so push reads exactly
+                        // this row without a read-after-write poll.
+                        ordinal: outgoing.ordinal,
+                    }
                 };
                 let pending_with_id = pending.map(|p| (job_id, p));
                 Ok((output, (outgoing, pending_with_id)))
@@ -823,6 +840,7 @@ impl AgentLoop {
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
         is_user_turn: bool,
+        notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         self.context_manager.ensure_seeded().await;
 
@@ -982,6 +1000,7 @@ impl AgentLoop {
                         notifier.clone(),
                         &cancel_token,
                         &mut turn_attachments,
+                        notify_silence.clone(),
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1107,6 +1126,7 @@ impl AgentLoop {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
         turn_attachments: &mut Vec<ContentBlock>,
+        notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
@@ -1251,9 +1271,11 @@ impl AgentLoop {
         // response boundary (by when the model has actually seen its result).
         self.read_tracker.begin_response();
         let read_tracker_for_calls = self.read_tracker.clone();
+        let notify_silence_for_calls = notify_silence.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
+            let notify_silence = notify_silence_for_calls.clone();
             let session_id = session_id_for_calls.clone();
             let session_trigger = session_trigger_for_calls.clone();
             let user = user_for_calls.clone();
@@ -1308,6 +1330,7 @@ impl AgentLoop {
                         Some(&bind_source),
                         background_eligible,
                         read_tracker,
+                        notify_silence,
                     )
                     .await
             }
@@ -1530,13 +1553,13 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        // Channel-filtered: a tool whose manifest restricts `channels`
-        // (e.g. the owner-only deck tools) is invisible to sessions on
-        // other channels. The channel is session-stable, so the list
-        // stays byte-identical across calls and prompt caching holds.
+        // Filtered by the session's channel (owner-only deck tools) and its
+        // trigger (`report_nothing`, visible only in a recurring cron fire).
+        // Both are session-stable, so the list stays byte-identical across this
+        // session's calls and prompt caching holds.
         let tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
-            .tool_definitions_for_channel(&session.channel)
+            .tool_definitions_for_session(&session.channel, &session.trigger)
             .into_iter()
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,

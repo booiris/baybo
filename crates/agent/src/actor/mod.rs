@@ -493,6 +493,9 @@ impl AgentActor {
         // otherwise leave to run as follow-up turns. Caught after the loop fully
         // returns, so it covers every cancellation path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
+        // A recurring cron fire's silence handle for `report_nothing`; `None`
+        // for every other turn. See `dispatch_cron_prompt`.
+        notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
@@ -516,6 +519,7 @@ impl AgentActor {
                 delta_tx,
                 turn_token.clone(),
                 interjections,
+                notify_silence,
             )
             .await;
         if let Some(out) = stopped_out {
@@ -577,11 +581,25 @@ impl AgentActor {
             .agent_loop
             .append_cron_fire(job_id, prompt)
             .await?;
+        // Only a recurring fire (which owns a listed conversation) can be
+        // silenced by `report_nothing`; a one-shot always reports back, so it
+        // gets no handle and the tool is never even offered in its session.
+        let silence =
+            matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
         let response = self
-            .run_agent_loop(job_input, None, None, None, None)
+            .run_agent_loop(job_input, None, None, None, None, silence.clone())
             .await?;
+        let silenced = silence.as_ref().is_some_and(|s| s.requested());
         match delivery {
             CronDelivery::OriginSession => {}
+            CronDelivery::Channel if silenced => {
+                // `report_nothing`: this fire notifies no one. Push was already
+                // skipped (its job completed with no reply ordinal) and we
+                // dispatch nothing here, so no activity pulse fires; hide the
+                // fire's own conversation so it leaves no empty row in the list.
+                // The reply row and transcript survive — nothing is deleted.
+                self.hide_silenced_cron_fire().await;
+            }
             CronDelivery::Channel if is_blank_reply(&response.content) => {
                 // The conversation IS the notification here, so a fire that
                 // produced nothing must still say so. Suppressing the send
@@ -596,6 +614,28 @@ impl AgentActor {
             }
         }
         Ok(())
+    }
+
+    /// A recurring fire that called `report_nothing`: drop it from the user's
+    /// chat list, leaving no empty conversation behind. The inverse of
+    /// `unhide_for_cron_notification`'s targeted write — the fire's reply row
+    /// and transcript stay in the store, recoverable and inspectable
+    /// (`include_cron`); only its listing is removed.
+    async fn hide_silenced_cron_fire(&mut self) {
+        if let Err(e) = self
+            .volatile
+            .session_manager
+            .set_hidden(&self.durable.session.id, true)
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to hide a silenced cron fire"
+            );
+            return;
+        }
+        self.durable.session.hidden = true;
     }
 
     /// Report a fire's non-reply outcome — a failure, or a run that produced
@@ -962,6 +1002,7 @@ impl AgentActor {
                 Some(response_tx),
                 None,
                 None,
+                None,
             )
             .await?;
         self.send_user_reply(response).await;
@@ -1023,6 +1064,7 @@ impl AgentActor {
                 Some(response_tx),
                 Some(&mut interjections),
                 Some(&mut stopped),
+                None,
             )
             .await;
         // A `/stop` halts the whole pipeline: drop any interjections the client
@@ -1261,6 +1303,7 @@ impl AgentActor {
                 },
                 Some(parent_job_id),
                 Some(response_tx),
+                None,
                 None,
                 None,
             )
