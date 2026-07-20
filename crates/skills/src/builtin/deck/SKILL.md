@@ -158,13 +158,13 @@ the op: create it once, then `capture-pane` (or `send-keys`) on later refreshes.
 Never invoke bare `tmux` — that binds the **user's own default socket**
 (`/tmp/tmux-<uid>/default`), so your card's session pollutes their `tmux ls`
 and a `/tmp` wipe kills it. Every `ctx.exec` is handed **`$BAYBO_DECK_TMUX_DIR`**
-(`<workspace>/deck/tmux-socks`) for exactly this — pin your socket there with
-`-S`:
+(`<workspace>/deck/tmux-socks/<card-id>` — private to your card) for exactly
+this — pin your socket there with `-S`:
 
 ```js
 refresh: async (_p, ctx) => {
   const { stdout } = await ctx.exec(`
-    S="$BAYBO_DECK_TMUX_DIR/quota.sock"        # injected per-deck dir, never /tmp
+    S="$BAYBO_DECK_TMUX_DIR/quota.sock"        # injected per-card dir, never /tmp
     mkdir -p "$(dirname "$S")"
     tmux -S "$S" has-session -t q 2>/dev/null ||
       tmux -S "$S" new-session -d -s q -x 140 -y 48 'exec claude --safe-mode'
@@ -183,6 +183,9 @@ refresh: async (_p, ctx) => {
 - **The session is shared host state, not per-op.** Guard creation with
   `has-session` so each refresh reuses the running session instead of spawning
   a fresh server every tick; `kill-session` it once the card's job is done.
+  Purging the card kills whatever servers still sit behind `*.sock` files in
+  its dir — but that's the last-resort sweep, not a reason to leave one
+  running.
 
 ### card.html — the frontend
 
