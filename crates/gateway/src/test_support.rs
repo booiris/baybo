@@ -230,6 +230,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         events: Arc::new(crate::deck_events::GatewayDeckEvents::new(Arc::clone(
             &channel_registry,
         ))),
+        blob: stores.blob.clone(),
         deck_root: tempdir.path().join("deck"),
         scratch_root: tempdir.path().join("deck-scratch"),
     });

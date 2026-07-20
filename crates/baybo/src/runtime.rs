@@ -546,6 +546,7 @@ pub async fn build_managers(
         events: Arc::new(baybo_gateway::deck_events::GatewayDeckEvents::new(
             Arc::clone(&channels_registry),
         )),
+        blob: stores.blob.clone(),
         deck_root: workspace_paths.deck_dir(),
         scratch_root: workspace_paths.state_dir().join("deck-scratch"),
     });

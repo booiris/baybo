@@ -215,6 +215,52 @@ fn mime_extension(mime: &str) -> &'static str {
 
 #[async_trait]
 impl BlobStore for SqliteBlobStore {
+    async fn list_ids_by_uploader(
+        &self,
+        prefix: &str,
+        older_than_us: Option<i64>,
+    ) -> Result<Vec<String>> {
+        let lower = prefix.to_string();
+        // Successor bound: an identity extending `prefix` sorts below `prefix`
+        // with a trailing 0x7F (DEL) — hex/uuid chars are all < 0x7F — so this
+        // stays an indexed range scan on `idx_blobs_uploader_identity_size`,
+        // never a full-table filter.
+        let upper = format!("{prefix}\u{7f}");
+        self.pool
+            .interact("blobs.list_by_uploader", move |conn| {
+                let mut ids = Vec::new();
+                match older_than_us {
+                    Some(cut) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT blob_id FROM blobs \
+                             WHERE uploader_identity >= ?1 AND uploader_identity < ?2 \
+                               AND created_at < ?3",
+                        )?;
+                        let rows = stmt.query_map(rusqlite::params![lower, upper, cut], |r| {
+                            r.get::<_, String>(0)
+                        })?;
+                        for r in rows {
+                            ids.push(r?);
+                        }
+                    }
+                    None => {
+                        let mut stmt = conn.prepare(
+                            "SELECT blob_id FROM blobs \
+                             WHERE uploader_identity >= ?1 AND uploader_identity < ?2",
+                        )?;
+                        let rows = stmt.query_map(rusqlite::params![lower, upper], |r| {
+                            r.get::<_, String>(0)
+                        })?;
+                        for r in rows {
+                            ids.push(r?);
+                        }
+                    }
+                }
+                Ok(ids)
+            })
+            .await
+    }
+
     async fn put(
         &self,
         bytes: &[u8],
@@ -521,18 +567,24 @@ impl SqliteBlobStore {
     /// concurrent capability for the same content doesn't lose its
     /// bytes.
     async fn any_live_for_path(&self, hex: &str, ext: &'static str) -> Result<bool> {
-        let hex = hex.to_string();
+        // PK range on the digest instead of a full-table scan: `blob_id` is the
+        // primary key `sha256:<hex>.<token>`, so `[sha256:<hex>, sha256:<hex>~)`
+        // is served by the PK index and touches ONLY same-digest rows. `~`
+        // (0x7e) sorts above `.` and every hex digit; a 64-hex digest can't
+        // prefix another, so no cross-digest bleed. No trailing `.` on the lower
+        // bound keeps a legacy tokenless `sha256:<hex>` id in range. This keeps
+        // the per-delete cost O(rows-for-this-digest), so the janitor's deck
+        // sweep can't go quadratic against the whole (chat + deck) blob table.
+        let lower = format!("{SHA256_PREFIX}{hex}");
+        let upper = format!("{SHA256_PREFIX}{hex}~");
         self.pool
             .interact("blobs.any_live_for_path", move |conn| {
-                let mut stmt = conn.prepare("SELECT blob_id, mime_type FROM blobs")?;
-                let mut rows = stmt.query([])?;
+                let mut stmt = conn
+                    .prepare("SELECT mime_type FROM blobs WHERE blob_id >= ?1 AND blob_id < ?2")?;
+                let mut rows = stmt.query(rusqlite::params![lower, upper])?;
                 while let Some(row) = rows.next()? {
-                    let other_id: String = row.get(0)?;
-                    let other_mime: String = row.get(1)?;
-                    if let Ok((other_hex, _token)) = split_id(&other_id)
-                        && other_hex == hex
-                        && mime_extension(&other_mime) == ext
-                    {
+                    let other_mime: String = row.get(0)?;
+                    if mime_extension(&other_mime) == ext {
                         return Ok(true);
                     }
                 }
@@ -769,6 +821,55 @@ mod tests {
         store.delete(&id).await.unwrap();
         // Calling again is fine.
         store.delete(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_ids_by_uploader_ranges_on_identity_and_age() {
+        let (store, _dir) = build().await;
+        let a = store
+            .put(b"a", "text/plain", Some("deck:card1"))
+            .await
+            .unwrap();
+        let _bu = store
+            .put(b"b", "text/plain", Some("deck-user:card1"))
+            .await
+            .unwrap();
+        let _dev = store
+            .put(b"c", "text/plain", Some("device:x"))
+            .await
+            .unwrap();
+
+        // "deck:" catches only the service-produced blob — never `deck-user:`
+        // (picker uploads) nor `device:` (chat).
+        assert_eq!(
+            store.list_ids_by_uploader("deck:", None).await.unwrap(),
+            vec![a.blob_id.clone()]
+        );
+        // An exact card identity targets that one card.
+        assert_eq!(
+            store
+                .list_ids_by_uploader("deck:card1", None)
+                .await
+                .unwrap(),
+            vec![a.blob_id.clone()]
+        );
+        // Age cutoff: nothing predates a far-past cutoff; everything predates a
+        // far-future one.
+        let now = chrono::Utc::now().timestamp_micros();
+        assert!(
+            store
+                .list_ids_by_uploader("deck:", Some(now - 10_000_000_000))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_ids_by_uploader("deck:", Some(now + 10_000_000_000))
+                .await
+                .unwrap(),
+            vec![a.blob_id]
+        );
     }
 
     #[tokio::test]

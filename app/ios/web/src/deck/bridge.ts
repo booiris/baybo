@@ -28,12 +28,22 @@ export type CallResultPayload = {
   error?: string;
 };
 
+export type PickResultPayload = {
+  id: string;
+  ok: boolean;
+  ref?: unknown;
+  error?: string;
+};
+
 export type DeckShellGlobal = {
   init(payload: DeckInitPayload): void;
   deckState(payload: DeckStatePayload): void;
   cardData(payload: CardDataPayload): void;
   bundle(payload: BundlePayload): void;
   callResult(payload: CallResultPayload): void;
+  /// Native → web: a `deck.pickBlob` request resolved (a blob ref) or failed
+  /// (busy / cancelled / upload error).
+  pickResult(payload: PickResultPayload): void;
   setEditMode(active: boolean): void;
   setLanguage(lang: string): void;
   setSetupInflight(active: boolean): void;
@@ -102,6 +112,22 @@ export function postCall(
 
 export function postLayout(entries: LayoutEntry[]): void {
   post({ type: "layout", entries });
+}
+
+/// A card asked to pick a blob (`deck.pickBlob`): native presents the photo
+/// picker, uploads the choice, and answers via `deckShell.pickResult`.
+export function postPick(id: string, cardId: string, accept: string | null): void {
+  post({ type: "pick", id, cardId, accept });
+}
+
+/// A card asked to share a blob (`deck.shareBlob`): native fetches the bytes
+/// and presents the system share sheet. Fire-and-forget (no reply).
+export function postShare(
+  blobId: string,
+  filename: string | null,
+  contentType: string | null,
+): void {
+  post({ type: "share", blobId, filename, contentType });
 }
 
 /// Destructive actions (delete) are CONFIRMED natively — the shell only

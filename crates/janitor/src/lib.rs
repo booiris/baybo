@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use baybo_store::ChannelPairingStore;
+use baybo_store::{BlobStore, ChannelPairingStore, DeckCardStore};
 use baybo_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, is_log_file, sweep_directory};
@@ -34,6 +34,14 @@ const PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // outside the realistic case.
 const SIDECAR_CACHE_TTL: Duration = Duration::from_secs(7 * 86_400);
 const TICK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+// Deck-blob TTL. A service-produced `deck:*` blob unreferenced by any retained
+// snapshot for this long is dead garbage (a refresh-loop card rotates old
+// snapshot refs out of its keep-window). `last_accessed_at` is deliberately NOT
+// consulted — the device cache is content-addressed and never re-fetches, so a
+// blob a card renders daily still shows no server access. Long enough that a
+// transient display blob (delivered in a call result, never snapshotted) that a
+// card meant to keep has ample time to appear in a snapshot first.
+const DECK_BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
 // Sidecar-cache cleanup is much rarer than the other sweeps — it only
 // reclaims after a binary upgrade lands a fresh content hash, and the
 // total cruft per upgrade is single-digit MB. Daily cadence keeps the
@@ -45,6 +53,7 @@ pub struct JanitorReport {
     pub log_files_removed: usize,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
+    pub deck_blobs_purged: u64,
 }
 
 /// Live-set view consumed by the sidecar-cache sweep. `cache_root` is
@@ -62,6 +71,8 @@ pub struct Janitor {
     paths: WorkspacePaths,
     sidecar_cache: Option<SidecarCache>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
+    deck_blob: Option<Arc<dyn BlobStore>>,
+    deck_store: Option<Arc<dyn DeckCardStore>>,
 }
 
 impl Janitor {
@@ -70,6 +81,8 @@ impl Janitor {
             paths,
             sidecar_cache: None,
             pairings: None,
+            deck_blob: None,
+            deck_store: None,
         }
     }
 
@@ -88,6 +101,21 @@ impl Janitor {
     #[must_use]
     pub fn with_pairing_store(mut self, pairings: Arc<dyn ChannelPairingStore>) -> Self {
         self.pairings = Some(pairings);
+        self
+    }
+
+    /// Wire the blob + deck stores for the deck-blob sweep (docs/modules/deck.md
+    /// §Blobs). Without this call the deck-blob sweep doesn't run. Only `deck:*`
+    /// blobs are ever touched — chat blobs and picker `deck-user:*` uploads are
+    /// never in range.
+    #[must_use]
+    pub fn with_deck_blobs(
+        mut self,
+        blob: Arc<dyn BlobStore>,
+        deck: Arc<dyn DeckCardStore>,
+    ) -> Self {
+        self.deck_blob = Some(blob);
+        self.deck_store = Some(deck);
         self
     }
 
@@ -118,13 +146,53 @@ impl Janitor {
             report.pairings_purged += self.sweep_pairings_once(chrono::Utc::now()).await;
         }
 
+        report.deck_blobs_purged += self
+            .sweep_deck_blobs_once(chrono::Utc::now().timestamp_micros())
+            .await;
+
         tracing::info!(
             log_files_removed = report.log_files_removed,
             pairings_purged = report.pairings_purged,
+            deck_blobs_purged = report.deck_blobs_purged,
             "janitor sweep complete",
         );
 
         report
+    }
+
+    /// Delete `deck:*` blobs older than [`DECK_BLOB_TTL`] that no retained
+    /// snapshot (binned cards included) still references. `now_us` is unix µs.
+    /// Best-effort — a failed step logs and the sweep moves on; deck blob GC is
+    /// never a correctness dependency. No-op unless [`Self::with_deck_blobs`]
+    /// wired the stores.
+    pub async fn sweep_deck_blobs_once(&self, now_us: i64) -> u64 {
+        let (Some(blob), Some(deck)) = (&self.deck_blob, &self.deck_store) else {
+            return 0;
+        };
+        let cutoff = now_us - DECK_BLOB_TTL.as_micros() as i64;
+        let candidates = match blob.list_ids_by_uploader("deck:", Some(cutoff)).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "deck-blob sweep: list failed");
+                return 0;
+            }
+        };
+        let mut purged = 0u64;
+        for id in candidates {
+            match deck.snapshot_references(&id).await {
+                Ok(true) => continue, // still live in some (maybe binned) snapshot
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "deck-blob sweep: reference check failed");
+                    continue;
+                }
+            }
+            match blob.delete(&id).await {
+                Ok(()) => purged += 1,
+                Err(e) => tracing::warn!(error = %e, "deck-blob sweep: delete failed"),
+            }
+        }
+        purged
     }
 
     /// Hourly pairing sweep. Returns the number of rows hard-deleted.
@@ -249,6 +317,75 @@ mod tests {
 
     fn workspace_paths(root: &Path) -> WorkspacePaths {
         WorkspacePaths::new(root.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn deck_blob_sweep_respects_ttl_reference_and_prefix() {
+        use baybo_storage::sqlite::{SqliteBlobStore, SqliteDeckCardStore, SqlitePool};
+        use baybo_store::{DeckCardRow, DeckSize};
+
+        let tmp = TempDir::new().unwrap();
+        let paths = workspace_paths(tmp.path());
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let blob = Arc::new(
+            SqliteBlobStore::open(pool.clone(), tmp.path().join("blobs"))
+                .await
+                .unwrap(),
+        );
+        let deck = Arc::new(SqliteDeckCardStore::new(pool));
+        deck.create(&DeckCardRow {
+            id: "card1".into(),
+            title: "card1".into(),
+            position: 0,
+            size: DeckSize::Wide,
+            sizes: vec![DeckSize::Wide],
+            maximize: false,
+            enabled: true,
+            quarantined_at: None,
+            deleted_at: None,
+            spec_hash: "h".into(),
+            last_seq: 0,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let unref = blob
+            .put(b"unref", "text/plain", Some("deck:card1"))
+            .await
+            .unwrap();
+        let refd = blob
+            .put(b"refd", "text/plain", Some("deck:card1"))
+            .await
+            .unwrap();
+        let dev = blob
+            .put(b"chat", "text/plain", Some("device:x"))
+            .await
+            .unwrap();
+        // A snapshot points at `refd` — the sweep must keep it.
+        deck.record_snapshot(
+            "card1",
+            &format!("{{\"img\":\"{}\"}}", refd.blob_id),
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let j = Janitor::new(paths).with_deck_blobs(blob.clone(), deck.clone());
+        // A real-now sweep finds nothing older than the 7-day TTL.
+        assert_eq!(
+            j.sweep_deck_blobs_once(chrono::Utc::now().timestamp_micros())
+                .await,
+            0
+        );
+        // 8 days on, every blob qualifies by age — but only the unreferenced
+        // deck: one is swept; the referenced deck: blob and the chat blob stay.
+        let future = chrono::Utc::now().timestamp_micros() + 8 * 86_400 * 1_000_000;
+        assert_eq!(j.sweep_deck_blobs_once(future).await, 1);
+        assert!(blob.get(&unref.blob_id).await.is_err());
+        assert!(blob.get(&refd.blob_id).await.is_ok());
+        assert!(blob.get(&dev.blob_id).await.is_ok());
     }
 
     #[tokio::test]

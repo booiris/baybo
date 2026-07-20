@@ -58,6 +58,19 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             {
                 store?.requestCall(id: id, cardId: cardId, op: op, params: body["params"])
             }
+        case "pick":
+            if let id = body["id"] as? String,
+                let cardId = body["cardId"] as? String
+            {
+                store?.requestPick(id: id, cardId: cardId, accept: body["accept"] as? String)
+            }
+        case "share":
+            if let blobId = body["blobId"] as? String {
+                store?.requestShare(
+                    blobId: blobId,
+                    filename: body["filename"] as? String,
+                    contentType: body["contentType"] as? String)
+            }
         case "layout":
             if let entries = body["entries"] as? [[String: Any]] {
                 store?.requestLayout(entries: entries)
@@ -151,6 +164,24 @@ final class DeckBridge: NSObject, WKScriptMessageHandler {
             head += ",\"value\":\(valueJSON)}"
         }
         eval("callResult", head)
+    }
+
+    /// `refJSON` is the blob ref's raw JSON (or nil on failure) — spliced
+    /// verbatim so the card resolves with the object, not a quoted string.
+    func deliverPickResult(id: String, ok: Bool, refJSON: String?, error: String?) {
+        struct Head: Encodable {
+            let id: String
+            let ok: Bool
+            let error: String?
+        }
+        guard let headData = try? JSONEncoder().encode(Head(id: id, ok: ok, error: error)),
+            var head = String(data: headData, encoding: .utf8)
+        else { return }
+        if let refJSON, ok {
+            head.removeLast()  // strip trailing '}'
+            head += ",\"ref\":\(refJSON)}"
+        }
+        eval("pickResult", head)
     }
 
     func setEditMode(_ active: Bool) {

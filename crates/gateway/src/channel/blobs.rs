@@ -26,7 +26,7 @@ use tokio_util::io::ReaderStream;
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 
-pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) use baybo_store::blob::MAX_BLOB_BYTES;
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
 const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";

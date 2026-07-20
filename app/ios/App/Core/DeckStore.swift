@@ -64,6 +64,16 @@ final class DeckStore: ObservableObject {
         var id: String { cardId }
     }
 
+    /// The blob ref returned to a card from `deck.pickBlob` — serialized as the
+    /// `pick_result.ref` the card SDK resolves with.
+    struct PickRef: Encodable {
+        let blobId: String
+        let contentType: String
+        let size: Int64
+        /// Synthesized (`photo.<ext>`) — PhotosPicker exposes no filename.
+        let name: String?
+    }
+
     /// Mirrored from the shell's edit mode so the native header can show Done.
     @Published var editMode = false
     /// A card is maximized full-screen in the shell (driven by the ⛶ tap the
@@ -75,6 +85,27 @@ final class DeckStore: ObservableObject {
     @Published var pendingDelete: String?
     /// The recycle bin, most recently deleted first (server order).
     @Published private(set) var recycle: [RecycledCard] = []
+
+    /// Drives the native photo picker's presentation (`deck.pickBlob`). The
+    /// picker is a single shared surface — one pick at a time; a concurrent
+    /// request is rejected `busy` rather than queued (a picker popping up
+    /// seconds later reads as a ghost dialog).
+    @Published var pickerActive = false
+    /// The in-flight pick (id + card). Non-nil ⇒ a pick is presenting OR
+    /// uploading — the slot stays busy across the whole flow so a second
+    /// request is rejected `busy`, not accepted mid-upload. Cleared only when
+    /// the pick settles (`settlePick`), never conditioned on delivery.
+    private var activePick: (id: String, cardId: String)?
+    /// True once a photo was chosen (upload underway). Distinguishes a
+    /// dismissal-after-selection (not a cancel) from a dismissal-with-no-choice
+    /// (a cancel) in `pickerDismissed`.
+    private var pickChosen = false
+    /// The last pick outcome, for tests (the real result rides the bridge).
+    private(set) var lastPickResult: (id: String, ok: Bool, error: String?)?
+
+    /// A blob materialized on disk and awaiting the system share sheet
+    /// (`deck.shareBlob`). Presented by `DeckScreen`; cleared when dismissed.
+    @Published var shareItem: FilePreview?
 
     private(set) var state = StatePayload(cards: [], snapshots: [])
     /// The chat session of an in-flight empty-board `/deck` creation (set by
@@ -255,6 +286,169 @@ final class DeckStore: ObservableObject {
                 self.bridge?.deliverCallResult(
                     id: id, ok: false, valueJSON: nil, error: String(describing: error))
             }
+        }
+    }
+
+    // MARK: pick (deck.pickBlob)
+
+    /// A card asked to pick a blob. Present the picker unless one is already up
+    /// (then reject `busy`). Every request terminates in exactly one
+    /// resolve/reject via `settlePick`.
+    func requestPick(id: String, cardId: String, accept: String?) {
+        guard activePick == nil else {
+            settlePick(id: id, ok: false, refJSON: nil, error: "busy")
+            return
+        }
+        _ = accept  // advisory in v1 (photo library); reserved for file types.
+        activePick = (id, cardId)
+        pickerActive = true
+    }
+
+    /// A photo was chosen: mark the pick as chosen (so the dismissal that
+    /// follows is a no-op, not a spurious cancel) and return the pending id —
+    /// but KEEP the slot busy so a second request during the upload is rejected
+    /// `busy`, not accepted. The caller (the `DeckScreen` view, which owns the
+    /// `PhotosPickerItem`) loads the bytes and hands them to `finishPick`; the
+    /// engine stays free of the PhotosUI type. `nil` if no pick is active.
+    func consumePick() -> String? {
+        guard let pick = activePick else { return nil }
+        pickChosen = true
+        return pick.id
+    }
+
+    /// The picker dismissed. Only a dismissal with NOTHING chosen is a cancel;
+    /// a dismissal AFTER a selection (`pickChosen`) leaves the upload running.
+    /// Deferred one runloop turn so a selection landing in the same tick (which
+    /// sets `pickChosen` first) wins the race.
+    func pickerDismissed() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let pick = self.activePick, !self.pickChosen else { return }
+            self.settlePick(id: pick.id, ok: false, refJSON: nil, error: "cancelled")
+        }
+    }
+
+    /// Upload the loaded photo bytes and resolve the card's promise with a ref.
+    /// `data == nil` means the transfer failed. Size-checked BEFORE upload.
+    func finishPick(id: String, data: Data?, mime: String) {
+        guard let data else {
+            settlePick(id: id, ok: false, refJSON: nil, error: "load failed")
+            return
+        }
+        guard data.count <= ChatStore.maxAttachmentBytes else {
+            settlePick(id: id, ok: false, refJSON: nil, error: "too large")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let blobId = try await self.client.blobUploadBytes(bytes: data, mimeType: mime)
+                let ref = PickRef(
+                    blobId: blobId, contentType: mime, size: Int64(data.count),
+                    name: Self.synthesizedName(mime: mime))
+                if let json = try? JSONEncoder().encode(ref),
+                    let text = String(data: json, encoding: .utf8)
+                {
+                    self.settlePick(id: id, ok: true, refJSON: text, error: nil)
+                } else {
+                    self.settlePick(id: id, ok: false, refJSON: nil, error: "encode failed")
+                }
+            } catch {
+                self.settlePick(id: id, ok: false, refJSON: nil, error: bayboErrorText(error))
+            }
+        }
+    }
+
+    private func settlePick(id: String, ok: Bool, refJSON: String?, error: String?) {
+        // Free the slot only when the id that settled IS the in-flight pick — a
+        // `busy` rejection carries a DIFFERENT (later) id and must not clear the
+        // pick it was rejected against.
+        if activePick?.id == id {
+            activePick = nil
+            pickChosen = false
+        }
+        lastPickResult = (id, ok, error)
+        bridge?.deliverPickResult(id: id, ok: ok, refJSON: refJSON, error: error)
+    }
+
+    private static func synthesizedName(mime: String) -> String {
+        let ext: String
+        switch mime {
+        case "image/png": ext = "png"
+        case "image/gif": ext = "gif"
+        case "image/heic", "image/heif": ext = "heic"
+        case "image/webp": ext = "webp"
+        default: ext = "jpg"
+        }
+        return "photo.\(ext)"
+    }
+
+    // MARK: share (deck.shareBlob)
+
+    /// Fetch a blob (cache-first) and hand it to the system share sheet under a
+    /// real filename, so Save-to-Photos / Files / AirDrop keep the encoding.
+    /// Silently no-ops if the bytes can't be fetched (offline miss).
+    func requestShare(blobId: String, filename: String?, contentType: String?) {
+        Task { [weak self] in
+            guard let self else { return }
+            var data = await self.client.blobReadCached(blobId: blobId)
+            if data == nil {
+                data = try? await self.client.blobDownloadBytes(blobId: blobId, progress: nil)
+            }
+            guard let data else {
+                NSLog("deck: share fetch failed for %@", blobId)
+                return
+            }
+            let name = Self.shareFilename(filename: filename, contentType: contentType)
+            guard let url = Self.writeShareFile(blobId: blobId, name: name, data: data) else {
+                return
+            }
+            self.shareItem = FilePreview(url: url)
+        }
+    }
+
+    private static func shareFilename(filename: String?, contentType: String?) -> String {
+        if let filename, !filename.isEmpty {
+            // A filename never contains a path separator on the wire; guard anyway.
+            return filename.replacingOccurrences(of: "/", with: "_")
+        }
+        let ext = Self.shareExt(contentType)
+        return ext.isEmpty ? "attachment" : "attachment.\(ext)"
+    }
+
+    private static func shareExt(_ mime: String?) -> String {
+        switch mime {
+        case "image/png": return "png"
+        case "image/jpeg": return "jpg"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/heic", "image/heif": return "heic"
+        case "application/pdf": return "pdf"
+        case "text/csv": return "csv"
+        case "text/plain": return "txt"
+        case "application/json": return "json"
+        case "video/mp4": return "mp4"
+        case "audio/mpeg": return "mp3"
+        default: return ""
+        }
+    }
+
+    /// `<tmp>/baybo-deck-share/<blob digest>/<filename>` — the digest dir keeps
+    /// two blobs sharing a filename apart and lets a re-share reuse the file.
+    private static func writeShareFile(blobId: String, name: String, data: Data) -> URL? {
+        let hex = blobId.drop(while: { $0 != ":" }).dropFirst().prefix(while: { $0 != "." })
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("baybo-deck-share", isDirectory: true)
+            .appendingPathComponent(hex.isEmpty ? "blob" : String(hex), isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent(name)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try data.write(to: url, options: .atomic)
+            }
+            return url
+        } catch {
+            NSLog("deck: share materialize failed: %@", String(describing: error))
+            return nil
         }
     }
 

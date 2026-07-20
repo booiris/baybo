@@ -20,7 +20,8 @@ final class DeckHost {
         let config = WKWebViewConfiguration()
         config.userContentController.add(bridge, name: DeckBridge.messageHandlerName)
         config.setURLSchemeHandler(
-            TranscriptSchemeHandler(), forURLScheme: TranscriptSchemeHandler.scheme)
+            TranscriptSchemeHandler(blobRouteEnabled: true),
+            forURLScheme: TranscriptSchemeHandler.scheme)
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.isOpaque = false

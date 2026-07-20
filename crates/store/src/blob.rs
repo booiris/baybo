@@ -20,6 +20,13 @@ pub type ByteStream = BoxStream<'static, std::io::Result<Bytes>>;
 /// body without buffering the file.
 pub type BlobReader = Pin<Box<dyn AsyncRead + Send>>;
 
+/// Hard cap on a single stored blob, shared by every producer so the limit
+/// cannot drift between them: the gateway `POST /v1/blobs` body limit + relay
+/// tunnel guard, the `AttachFile` tool, and deck's `ctx.fetchBlob` /
+/// `blobPutFile`. Passed to [`BlobStore::put_stream`] as `max_bytes` (cast to
+/// `u64`).
+pub const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+
 /// Algorithm prefix on every minted `BlobRef::blob_id`. Re-exported from
 /// [`baybo_model`] (its single source of truth, next to `BlobRef`) so existing
 /// `baybo_store::SHA256_PREFIX` / `baybo_store::blob::SHA256_PREFIX` callers are
@@ -130,4 +137,17 @@ pub trait BlobStore: Send + Sync {
     /// (when no other live row resolves to the same content path).
     /// Idempotent on missing ids.
     async fn delete(&self, blob_id: &str) -> Result<()>;
+
+    /// List blob ids whose `uploader_identity` starts with `prefix`,
+    /// optionally only those created strictly before `older_than_us` (unix µs).
+    /// Deck GC's targeting query: `prefix = "deck:"` enumerates every
+    /// service-produced deck blob; `prefix = "deck:<card_id>"` (an exact
+    /// identity) targets one card at purge. A chat blob is never returned — its
+    /// identity never starts `deck:`. Implementations must use an indexed range
+    /// scan on `uploader_identity`, not a full-table filter.
+    async fn list_ids_by_uploader(
+        &self,
+        prefix: &str,
+        older_than_us: Option<i64>,
+    ) -> Result<Vec<String>>;
 }

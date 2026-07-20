@@ -188,4 +188,12 @@ pub trait DeckCardStore: Send + Sync {
 
     /// Latest snapshot for one card.
     async fn latest_snapshot(&self, card_id: &str) -> Result<Option<DeckSnapshotRow>>;
+
+    /// Whether `blob_id` appears verbatim in ANY retained snapshot payload —
+    /// the deck-blob GC liveness guard. Deliberately spans soft-deleted
+    /// (binned) cards' snapshots too (they are retained until purge), so a
+    /// binned card's referenced blobs survive the sweep and a restore repaints
+    /// live refs. Must NOT filter on `deleted_at` (both `latest_snapshot*`
+    /// queries do, which is exactly why neither can serve this).
+    async fn snapshot_references(&self, blob_id: &str) -> Result<bool>;
 }

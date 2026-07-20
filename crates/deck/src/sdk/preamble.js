@@ -6,14 +6,24 @@
 //   export function start(ctx) { /* own timer, ctx.emit(...) */ }
 //
 // ctx surface (universal, undeclared — see docs/modules/deck.md):
-//   ctx.fetch(url, {method, headers, body}) -> {status, headers, body, json()}
+//   ctx.fetch(url, {method, headers, body, bodyBlob}) -> {status, headers, body, json()}
 //     host-mediated: SSRF floor + [{REDACTED_SECRET_…}] reveal happen in
 //     the Rust parent. The child itself is trusted host code and can perform
-//     direct I/O, but secrets remain parent-only.
+//     direct I/O, but secrets remain parent-only. `bodyBlob` streams a stored
+//     blob as the request body (the bytes never enter the child).
 //   ctx.exec(cmd) -> {code, stdout, stderr}
 //     host /bin/sh -c, inherited environment, 10s wall clock + output caps
 //   ctx.emit(payload)                          policed + seq'd by the parent
 //   ctx.log(msg)
+//   --- blobs (docs/modules/deck.md §Blobs), ref-first so bytes stay out of bun:
+//   ctx.fetchBlob(url, {method, headers, body}) -> {blobId, contentType, size}
+//     host fetches the URL and streams the response straight into the blob
+//     store (2xx only; bounded redirects); the card gets only the ref.
+//   ctx.blobPut(base64, contentType) -> {blobId, contentType, size}
+//     store inline card-produced bytes (small — capped for the stdio line).
+//   ctx.blobPutFile(path, contentType) -> {blobId, contentType, size}
+//     store an exec-produced file (relative to the exec scratch cwd, streamed).
+//   ctx.blobGet(blobId) -> {base64, contentType, size}   read back (capped).
 //
 // Run as: bun preamble.js /abs/path/to/service.js
 
@@ -45,6 +55,7 @@ async function hostFetch(url, opts = {}) {
     method: opts.method || "GET",
     headers: opts.headers || {},
     body: opts.body == null ? null : String(opts.body),
+    body_blob: opts.bodyBlob == null ? null : String(opts.bodyBlob),
   });
   return {
     status: res.status,
@@ -56,11 +67,47 @@ async function hostFetch(url, opts = {}) {
   };
 }
 
+// The Rust host serializes blob refs snake_case; present the card a camelCase
+// ref so the SDK boundary owns the wire shape (it can evolve behind this).
+function toBlobRef(v) {
+  return { blobId: v.blob_id, contentType: v.content_type, size: v.size };
+}
+
+async function hostFetchBlob(url, opts = {}) {
+  return toBlobRef(
+    await hostRequest({
+      type: "fetchBlob",
+      url: String(url),
+      method: opts.method || "GET",
+      headers: opts.headers || {},
+      body: opts.body == null ? null : String(opts.body),
+    }),
+  );
+}
+
 const ctx = {
   fetch: hostFetch,
   exec: (cmd) => hostRequest({ type: "exec", cmd: String(cmd) }),
   emit: (payload) => send({ type: "emit", payload }),
   log: (msg) => send({ type: "log", level: "info", msg: String(msg) }),
+  fetchBlob: hostFetchBlob,
+  blobPut: async (base64, contentType) =>
+    toBlobRef(
+      await hostRequest({
+        type: "blobPut",
+        base64: String(base64),
+        content_type: contentType == null ? null : String(contentType),
+      }),
+    ),
+  blobPutFile: async (path, contentType) =>
+    toBlobRef(
+      await hostRequest({
+        type: "blobPutFile",
+        path: String(path),
+        content_type: contentType == null ? null : String(contentType),
+      }),
+    ),
+  blobGet: (blobId) => hostRequest({ type: "blobGet", blob_id: String(blobId) }),
 };
 
 let mod = null;

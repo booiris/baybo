@@ -28,7 +28,7 @@ pub mod task;
 pub mod trace;
 
 pub use agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate};
-pub use blob::{BlobMeta, BlobReader, BlobStore, ByteStream, SHA256_PREFIX};
+pub use blob::{BlobMeta, BlobReader, BlobStore, ByteStream, MAX_BLOB_BYTES, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;

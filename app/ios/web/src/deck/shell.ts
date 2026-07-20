@@ -56,7 +56,15 @@ export class DeckShell {
   private emptyEl: HTMLElement;
   private state: DeckState = EMPTY_STATE;
   private tiles = new Map<string, Tile>();
-  private pendingCalls = new Map<string, { cardId: string; localId: number }>();
+  // Correlates a native call/pick result back to the card that asked. `port`
+  // pins the entry to the tile GENERATION that made the request: an iframe that
+  // reloads (spec change) or is removed gets a fresh port, so a late result is
+  // dropped rather than mis-delivered to (or resolving the wrong promise in) the
+  // new generation. pickBlob's minutes-long window makes this routine, not rare.
+  private pendingCalls = new Map<
+    string,
+    { cardId: string; localId: number; port: MessagePort | null; kind: "call" | "pick" }
+  >();
   private nextCallSerial = 1;
   private editMode = false;
   private setupInflight = false;
@@ -164,17 +172,37 @@ export class DeckShell {
   }
 
   applyCallResult(id: string, ok: boolean, value: unknown, error?: string): void {
+    this.deliverResult(id, "call_result", { ok, value, error });
+  }
+
+  applyPickResult(id: string, ok: boolean, ref: unknown, error?: string): void {
+    this.deliverResult(id, "pick_result", { ok, ref, error });
+  }
+
+  /// Post a correlated result to the card, but ONLY to the same tile
+  /// generation that made the request (`pending.port === tile.port`). A result
+  /// addressed to a reloaded/removed generation is dropped — never delivered to
+  /// the wrong port (which would resolve an unrelated promise and then silently
+  /// eat the new generation's real answer).
+  private deliverResult(
+    id: string,
+    type: "call_result" | "pick_result",
+    body: Record<string, unknown>,
+  ): void {
     const pending = this.pendingCalls.get(id);
     if (!pending) return;
     this.pendingCalls.delete(id);
     const tile = this.tiles.get(pending.cardId);
-    tile?.port?.postMessage({
-      type: "call_result",
-      id: pending.localId,
-      ok,
-      value,
-      error,
-    });
+    if (!tile || tile.port === null || tile.port !== pending.port) return;
+    tile.port.postMessage({ type, id: pending.localId, ...body });
+  }
+
+  /// Drop every pending call/pick for a card whose iframe is being torn down,
+  /// so the map can't leak and a late result can't resolve a dead generation.
+  private purgePending(cardId: string): void {
+    for (const [id, entry] of this.pendingCalls) {
+      if (entry.cardId === cardId) this.pendingCalls.delete(id);
+    }
   }
 
   // ---- internals ----------------------------------------------------
@@ -185,13 +213,27 @@ export class DeckShell {
       id?: number;
       op?: string;
       params?: unknown;
+      accept?: string | null;
+      blobId?: string;
+      filename?: string | null;
+      contentType?: string | null;
       level?: string;
       message?: string;
     };
+    // The port this message arrived on IS the card's current generation — pin
+    // the pending entry to it so a later reload can't claim the result.
+    const port = this.tiles.get(cardId)?.port ?? null;
     if (m.type === "call" && typeof m.id === "number" && typeof m.op === "string") {
       const globalId = `${cardId}#${this.nextCallSerial++}`;
-      this.pendingCalls.set(globalId, { cardId, localId: m.id });
+      this.pendingCalls.set(globalId, { cardId, localId: m.id, port, kind: "call" });
       bridge.postCall(globalId, cardId, m.op, m.params ?? {});
+    } else if (m.type === "pick" && typeof m.id === "number") {
+      const globalId = `${cardId}#${this.nextCallSerial++}`;
+      this.pendingCalls.set(globalId, { cardId, localId: m.id, port, kind: "pick" });
+      bridge.postPick(globalId, cardId, m.accept ?? null);
+    } else if (m.type === "share" && typeof m.blobId === "string") {
+      // Fire-and-forget: native fetches + presents the share sheet.
+      bridge.postShare(m.blobId, m.filename ?? null, m.contentType ?? null);
     } else if (m.type === "log") {
       bridge.log(m.level === "error" ? "error" : "info", `[card ${cardId}] ${m.message ?? ""}`);
     } else if (m.type === "exitMax" && cardId === this.maximizedCardId) {
@@ -269,12 +311,14 @@ export class DeckShell {
       if (!isMax) tile.el.dataset.size = card.size;
       else if (this.maxPlaceholder) this.maxPlaceholder.dataset.size = card.size;
       if (specChanged && tile.frame) {
-        // New code: tear the old iframe down and refetch the bundle.
+        // New code: tear the old iframe down and refetch the bundle. The old
+        // generation's pending calls/picks die with it.
         tile.port?.close();
         tile.port = null;
         tile.frame.remove();
         tile.frame = null;
         tile.bundleRequested = false;
+        this.purgePending(card.cardId);
       }
       if (!tile.bundleRequested) {
         tile.bundleRequested = true;
@@ -288,6 +332,7 @@ export class DeckShell {
         tile.port?.close();
         tile.el.remove();
         this.tiles.delete(cardId);
+        this.purgePending(cardId);
       }
     }
     // Placement is CSS `order`, NEVER a DOM move: relocating an <iframe>

@@ -407,7 +407,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     {
         let mut janitor = baybo_janitor::Janitor::new(workspace_paths.clone())
-            .with_pairing_store(graph.stores.channel_pairing.clone());
+            .with_pairing_store(graph.stores.channel_pairing.clone())
+            .with_deck_blobs(graph.stores.blob.clone(), graph.stores.deck.clone());
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {

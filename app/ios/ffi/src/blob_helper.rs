@@ -245,6 +245,28 @@ pub(crate) async fn is_cached(blob_id: &str) -> bool {
     }
 }
 
+/// Read a cached blob's bytes with NO network and NO active-binding check —
+/// the deck display path's fast path, so a card image renders even while the
+/// device is unbound/offline. `None` when the id is malformed or not cached.
+pub(crate) async fn read_cached_bytes(blob_id: &str) -> Option<Vec<u8>> {
+    let entry = cache_entry(blob_id).await.ok()?;
+    if !cache_exists(&entry).await {
+        return None;
+    }
+    read_cached(&entry).await.ok()
+}
+
+/// The size of a cached blob without reading it (a `stat`) — lets the deck
+/// display route reject an over-cap blob before materializing it. `None` when
+/// the id is malformed or not cached.
+pub(crate) async fn cached_size(blob_id: &str) -> Option<u64> {
+    let entry = cache_entry(blob_id).await.ok()?;
+    tokio::fs::metadata(entry.path())
+        .await
+        .ok()
+        .map(|m| m.len())
+}
+
 /// A foreign progress observer, absent when the caller doesn't want ticks.
 pub(crate) type ProgressSink = Option<Arc<dyn crate::api::BlobProgress>>;
 

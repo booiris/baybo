@@ -1,45 +1,82 @@
 //! Parent-side capability RPCs the child calls over stdio: the
 //! host-mediated `ctx.fetch` (SSRF floor + placeholder reveal + audit
-//! log) and `ctx.exec`. `ctx.fetch` keeps a raw secret from ever
-//! entering the child — the card carries only the `[{REDACTED_SECRET_…}]`
-//! placeholder and the parent reveals it at egress. Routing effects
-//! through here is an SDK convenience (and the reveal's enforcement
-//! point), not a sandbox: the child runs on the host and could open its
-//! own socket, consistent with the trusted-author model.
+//! log), `ctx.exec`, and the blob plane (`docs/modules/deck.md` §Blobs) —
+//! `ctx.fetchBlob` / `ctx.blobPut` / `ctx.blobPutFile` / `ctx.blobGet`.
+//! `ctx.fetch` keeps a raw secret from ever entering the child — the card
+//! carries only the `[{REDACTED_SECRET_…}]` placeholder and the parent
+//! reveals it at egress. Routing effects through here is an SDK
+//! convenience (and the reveal's enforcement point), not a sandbox: the
+//! child runs on the host and could open its own socket, consistent with
+//! the trusted-author model.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use futures::{StreamExt, TryStreamExt};
 use tokio::process::Command;
 
 use baybo_security::{PlaceholderMinter, SecretVault};
+use baybo_store::blob::MAX_BLOB_BYTES;
+use baybo_store::{BlobStore, ByteStream};
 
-use crate::service::{HostExecResponse, HostFetchRequest, HostFetchResponse, HostServices};
+use crate::service::{
+    HostBlobGetResponse, HostBlobPutFileRequest, HostBlobPutRequest, HostBlobRef, HostExecResponse,
+    HostFetchRequest, HostFetchResponse, HostServices,
+};
 
-/// Wall clock for one host-mediated fetch.
+/// Wall clock for one host-mediated `ctx.fetch` (the whole request/response,
+/// body included — a card fetch returns the body inline so it must complete).
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// `ctx.fetchBlob` streams a possibly-large body straight to disk, so it can't
+/// wear a total-request cap (a 100 MiB pull would need ~1.7 MiB/s to beat 60s).
+/// It uses a connect cap plus an IDLE read cap instead: a healthy transfer of
+/// any size is fine; a stalled one dies.
+pub const FETCH_BLOB_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const FETCH_BLOB_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects are disabled at the reqwest layer (address pinning below vets one
+/// host's addresses); `ctx.fetchBlob` follows them MANUALLY so each hop is
+/// re-vetted. This bounds the chain (release assets → presigned CDN is 1–2 hops).
+pub const MAX_FETCH_REDIRECTS: u32 = 5;
 /// Wall clock for one `ctx.exec` command.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout/stderr cap for one `ctx.exec` command (each, after which the
 /// stream is truncated with a marker).
 pub const EXEC_OUTPUT_MAX: usize = 4 * 1024 * 1024;
+/// Cap on a blob that crosses stdio inline as base64 (`ctx.blobPut` in,
+/// `ctx.blobGet` out) — an NDJSON line, so it must stay small. Large content
+/// takes the streaming paths (`fetchBlob` / `blobPutFile`), capped at
+/// [`MAX_BLOB_BYTES`].
+pub const BLOB_INLINE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Default mime when neither the card nor the response/extension names one.
+const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
+    /// Shared blob store — the same one chat attachments use. Deck blobs are
+    /// stamped `deck:<card_id>` so GC can find them without touching chat data.
+    blob: Arc<dyn BlobStore>,
+}
+
+/// The `uploader_identity` stamped on every deck-produced blob: a stable,
+/// greppable prefix so purge/GC can target `deck:*` and never a chat blob.
+fn deck_identity(card_id: &str) -> String {
+    format!("deck:{card_id}")
 }
 
 impl DeckHost {
-    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf) -> Self {
+    pub fn new(vault: Arc<SecretVault>, scratch_root: PathBuf, blob: Arc<dyn BlobStore>) -> Self {
         Self {
             vault,
             scratch_root,
+            blob,
         }
     }
 
@@ -85,40 +122,11 @@ impl DeckHost {
         // a secret-bearing query param still yields a valid URL.
         let (url_str, mut revealed) = self.reveal(&req.url).await;
         let url = url::Url::parse(&url_str).map_err(|e| format!("invalid URL: {e}"))?;
-        match url.scheme() {
-            "http" | "https" => {}
-            other => return Err(format!("unsupported scheme `{other}`")),
-        }
-        let host = url.host_str().ok_or("URL has no host")?.to_string();
-        let port = url
-            .port_or_known_default()
-            .ok_or("URL has no usable port")?;
-
-        // SSRF floor: literal IPs are checked directly; hostnames are
-        // resolved here and the connection pinned to the vetted
-        // addresses so a rebinding resolver can't swap them later.
-        let mut client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(FETCH_TIMEOUT);
-        match host.parse::<IpAddr>() {
-            Ok(ip) => {
-                if baybo_security::is_blocked_ip(&ip, false) {
-                    return Err(format!("blocked address: {ip}"));
-                }
-            }
-            Err(_) => {
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-                    .await
-                    .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
-                    .filter(|a| !baybo_security::is_blocked_ip(&a.ip(), false))
-                    .collect();
-                if addrs.is_empty() {
-                    return Err(format!("{host} resolves only to blocked addresses"));
-                }
-                client = client.resolve_to_addrs(&host, &addrs);
-            }
-        }
-        let client = client.build().map_err(|e| format!("client: {e}"))?;
+        let (host, addrs) = vet_url(&url).await?;
+        // SSRF floor: literal IPs were checked directly by `vet_url`;
+        // hostnames were resolved there and the connection is pinned to the
+        // vetted addresses so a rebinding resolver can't swap them later.
+        let client = build_client(&host, &addrs, |b| b.timeout(FETCH_TIMEOUT))?;
 
         let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
         let method = reqwest::Method::from_bytes(method.as_bytes())
@@ -133,6 +141,23 @@ impl DeckHost {
             let (body, r) = self.reveal(body).await;
             revealed |= r;
             builder = builder.body(body);
+        } else if let Some(blob_id) = &req.body_blob {
+            // `ctx.fetch({bodyBlob})`: stream a stored blob as the request body
+            // (the bytes never enter the child). Content-Length from the meta.
+            let meta = self
+                .blob
+                .stat(blob_id)
+                .await
+                .map_err(|e| format!("bodyBlob stat: {e}"))?;
+            let reader = self
+                .blob
+                .open(blob_id)
+                .await
+                .map_err(|e| format!("bodyBlob open: {e}"))?;
+            let stream = tokio_util::io::ReaderStream::new(reader);
+            builder = builder
+                .header(reqwest::header::CONTENT_LENGTH, meta.size)
+                .body(reqwest::Body::wrap_stream(stream));
         }
 
         if revealed {
@@ -167,6 +192,181 @@ impl DeckHost {
             body: String::from_utf8_lossy(&body).into_owned(),
         })
     }
+
+    async fn run_fetch_blob(
+        &self,
+        uploader_card_id: &str,
+        req: HostFetchRequest,
+    ) -> std::result::Result<HostBlobRef, String> {
+        // Reveal card-authored inputs once — they don't change across hops
+        // (a redirect target comes from the server's Location, not the card).
+        let (url_str, mut revealed) = self.reveal(&req.url).await;
+        let mut url = url::Url::parse(&url_str).map_err(|e| format!("invalid URL: {e}"))?;
+        let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("invalid method `{method}`"))?;
+        // Header names (lowercased) that must NOT survive a cross-host redirect:
+        // the always-sensitive ones plus any the card revealed a vault secret
+        // into. Redirects are followed manually below (Policy::none), which
+        // bypasses reqwest's own cross-origin sensitive-header stripping — so a
+        // server that 302s to another host would otherwise receive the secret.
+        let mut sensitive: std::collections::HashSet<String> =
+            ["authorization", "cookie", "proxy-authorization"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(req.headers.len());
+        for (name, value) in &req.headers {
+            let (value, r) = self.reveal(value).await;
+            revealed |= r;
+            if r {
+                sensitive.insert(name.to_ascii_lowercase());
+            }
+            headers.push((name.clone(), value));
+        }
+        let body = match &req.body {
+            Some(b) => {
+                let (b, r) = self.reveal(b).await;
+                revealed |= r;
+                Some(b)
+            }
+            None => None,
+        };
+
+        let mut hops = 0u32;
+        loop {
+            let (host, addrs) = vet_url(&url).await?;
+            let client = build_client(&host, &addrs, |b| {
+                b.connect_timeout(FETCH_BLOB_CONNECT_TIMEOUT)
+                    .read_timeout(FETCH_BLOB_READ_IDLE_TIMEOUT)
+            })?;
+            let mut builder = client.request(method.clone(), url.clone());
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(body) = &body {
+                builder = builder.body(body.clone());
+            }
+            if revealed {
+                tracing::info!(card = %uploader_card_id, host = %host, "deck: secret-bearing egress (fetchBlob)");
+            }
+
+            let resp = builder.send().await.map_err(|e| format!("fetch: {e}"))?;
+            let status = resp.status();
+            if status.is_redirection() {
+                if hops >= MAX_FETCH_REDIRECTS {
+                    return Err(format!(
+                        "fetchBlob: too many redirects (> {MAX_FETCH_REDIRECTS})"
+                    ));
+                }
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or("fetchBlob: redirect without a Location header")?;
+                let prev_host = url.host_str().map(|h| h.to_ascii_lowercase());
+                url = url
+                    .join(loc)
+                    .map_err(|e| format!("fetchBlob: bad redirect target: {e}"))?;
+                // Cross-host redirect: drop credential-bearing headers before the
+                // next hop (matches reqwest's automatic cross-origin stripping,
+                // which the manual follow above bypasses). A presigned-CDN target
+                // (the common release-asset case) carries its auth in the query,
+                // not a header, so this doesn't break it.
+                if url.host_str().map(|h| h.to_ascii_lowercase()) != prev_host {
+                    headers.retain(|(name, _)| !sensitive.contains(&name.to_ascii_lowercase()));
+                }
+                hops += 1;
+                continue;
+            }
+            // Only a 2xx body is stored — a 4xx/5xx error page must not be
+            // handed back as a successful-looking blob.
+            if !status.is_success() {
+                return Err(format!("fetchBlob: status {}", status.as_u16()));
+            }
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(';').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_BLOB_MIME)
+                .to_string();
+            let stream = resp.bytes_stream().map_err(std::io::Error::other);
+            let boxed: ByteStream = stream.boxed();
+            let blob = self
+                .blob
+                .put_stream(
+                    boxed,
+                    &content_type,
+                    Some(&deck_identity(uploader_card_id)),
+                    MAX_BLOB_BYTES as u64,
+                )
+                .await
+                .map_err(|e| format!("fetchBlob: store: {e}"))?;
+            let size = self
+                .blob
+                .stat(&blob.blob_id)
+                .await
+                .map(|m| m.size)
+                .unwrap_or(0);
+            return Ok(HostBlobRef {
+                blob_id: blob.blob_id,
+                content_type,
+                size,
+            });
+        }
+    }
+}
+
+/// Vet a URL against the SSRF floor. Returns the host plus the vetted socket
+/// addresses to pin the connection to — an EMPTY vec means the host was a
+/// literal IP already checked, so no `resolve_to_addrs` pin is needed.
+async fn vet_url(url: &url::Url) -> std::result::Result<(String, Vec<SocketAddr>), String> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("unsupported scheme `{other}`")),
+    }
+    let host = url.host_str().ok_or("URL has no host")?.to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or("URL has no usable port")?;
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            if baybo_security::is_blocked_ip(&ip, false) {
+                return Err(format!("blocked address: {ip}"));
+            }
+            Ok((host, Vec::new()))
+        }
+        Err(_) => {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?
+                .filter(|a| !baybo_security::is_blocked_ip(&a.ip(), false))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{host} resolves only to blocked addresses"));
+            }
+            Ok((host, addrs))
+        }
+    }
+}
+
+/// Build a redirect-disabled client pinned to `addrs` (the SSRF floor), with
+/// per-call timeouts applied by `configure`.
+fn build_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> std::result::Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if !addrs.is_empty() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    configure(builder)
+        .build()
+        .map_err(|e| format!("client: {e}"))
 }
 
 fn truncate_output(bytes: &[u8]) -> String {
@@ -177,6 +377,35 @@ fn truncate_output(bytes: &[u8]) -> String {
         s.push_str("\n[truncated]");
         s
     }
+}
+
+/// Best-effort mime from a file extension for `blobPutFile` when the card
+/// names none. Unknown extensions fall back to octet-stream.
+fn guess_mime_from_path(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "txt" | "log" => "text/plain",
+        "html" | "htm" => "text/html",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "zip" => "application/zip",
+        _ => DEFAULT_BLOB_MIME,
+    };
+    mime.to_string()
 }
 
 #[async_trait]
@@ -225,6 +454,143 @@ impl HostServices for DeckHost {
             code: out.status.code().unwrap_or(-1),
             stdout: truncate_output(&out.stdout),
             stderr: truncate_output(&out.stderr),
+        })
+    }
+
+    async fn fetch_blob(
+        &self,
+        uploader_card_id: &str,
+        req: HostFetchRequest,
+    ) -> std::result::Result<HostBlobRef, String> {
+        self.run_fetch_blob(uploader_card_id, req).await
+    }
+
+    async fn blob_put(
+        &self,
+        uploader_card_id: &str,
+        req: HostBlobPutRequest,
+    ) -> std::result::Result<HostBlobRef, String> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(req.base64.as_bytes())
+            .map_err(|e| format!("blobPut: invalid base64: {e}"))?;
+        if bytes.len() > BLOB_INLINE_MAX_BYTES {
+            return Err(format!(
+                "blobPut: {} bytes exceeds the inline cap ({BLOB_INLINE_MAX_BYTES}); \
+                 use blobPutFile or fetchBlob for larger content",
+                bytes.len()
+            ));
+        }
+        let content_type = req
+            .content_type
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_BLOB_MIME.to_string());
+        let blob = self
+            .blob
+            .put(
+                &bytes,
+                &content_type,
+                Some(&deck_identity(uploader_card_id)),
+            )
+            .await
+            .map_err(|e| format!("blobPut: store: {e}"))?;
+        Ok(HostBlobRef {
+            blob_id: blob.blob_id,
+            content_type,
+            size: bytes.len() as u64,
+        })
+    }
+
+    async fn blob_put_file(
+        &self,
+        card_id: &str,
+        uploader_card_id: &str,
+        req: HostBlobPutFileRequest,
+    ) -> std::result::Result<HostBlobRef, String> {
+        // Relative paths resolve against the exec scratch cwd (where an
+        // `ctx.exec`-produced file lands); absolute paths are allowed
+        // (trusted author). A `..` climb out of scratch is a footgun, not an
+        // attack — reject it with a clear message.
+        let path = {
+            let p = Path::new(&req.path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                if p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(format!(
+                        "blobPutFile: a relative path must stay within scratch (no `..`): {}",
+                        req.path
+                    ));
+                }
+                self.scratch_root.join(card_id).join(p)
+            }
+        };
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| format!("blobPutFile: {}: {e}", path.display()))?;
+        if !meta.is_file() {
+            return Err(format!("blobPutFile: not a file: {}", path.display()));
+        }
+        if meta.len() > MAX_BLOB_BYTES as u64 {
+            return Err(format!(
+                "blobPutFile: {} bytes exceeds the cap ({MAX_BLOB_BYTES})",
+                meta.len()
+            ));
+        }
+        let content_type = req
+            .content_type
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| guess_mime_from_path(&path));
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| format!("blobPutFile: open {}: {e}", path.display()))?;
+        let boxed: ByteStream = tokio_util::io::ReaderStream::new(file).boxed();
+        let blob = self
+            .blob
+            .put_stream(
+                boxed,
+                &content_type,
+                Some(&deck_identity(uploader_card_id)),
+                MAX_BLOB_BYTES as u64,
+            )
+            .await
+            .map_err(|e| format!("blobPutFile: store: {e}"))?;
+        let size = self
+            .blob
+            .stat(&blob.blob_id)
+            .await
+            .map(|m| m.size)
+            .unwrap_or(meta.len());
+        Ok(HostBlobRef {
+            blob_id: blob.blob_id,
+            content_type,
+            size,
+        })
+    }
+
+    async fn blob_get(&self, blob_id: &str) -> std::result::Result<HostBlobGetResponse, String> {
+        let meta = self
+            .blob
+            .stat(blob_id)
+            .await
+            .map_err(|e| format!("blobGet: {e}"))?;
+        if meta.size > BLOB_INLINE_MAX_BYTES as u64 {
+            return Err(format!(
+                "blobGet: {} bytes exceeds the inline cap ({BLOB_INLINE_MAX_BYTES}); \
+                 display it via deck.blobUrl instead of pulling the bytes",
+                meta.size
+            ));
+        }
+        let bytes = self
+            .blob
+            .get(blob_id)
+            .await
+            .map_err(|e| format!("blobGet: {e}"))?;
+        Ok(HostBlobGetResponse {
+            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            content_type: meta.mime_type,
+            size: meta.size,
         })
     }
 }

@@ -13,8 +13,8 @@ use serde_json::json;
 
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
 use baybo_security::{EncryptionKey, SecretVault};
-use baybo_storage::sqlite::{SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
-use baybo_store::{DeckLayoutEntry, DeckSize};
+use baybo_storage::sqlite::{SqliteBlobStore, SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
+use baybo_store::{BlobStore, DeckLayoutEntry, DeckSize};
 
 #[derive(Default)]
 struct RecordingEvents {
@@ -42,6 +42,7 @@ fn bun_usable() -> bool {
 struct Harness {
     manager: Arc<DeckManager>,
     events: Arc<RecordingEvents>,
+    blob: Arc<SqliteBlobStore>,
     _root: tempfile::TempDir,
 }
 
@@ -53,6 +54,11 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
     let root = tempfile::tempdir().unwrap();
     let pool = SqlitePool::open_in_memory().await.unwrap();
     let store = Arc::new(SqliteDeckCardStore::new(pool.clone()));
+    let blob = Arc::new(
+        SqliteBlobStore::open(pool.clone(), root.path().join("blobs"))
+            .await
+            .unwrap(),
+    );
     let vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"deck-test-master-key-32-bytes!!!".to_vec()).unwrap(),
         Arc::new(SqliteSecretStore::new(pool)),
@@ -62,12 +68,14 @@ async fn harness_or_skip(test: &str) -> Option<Harness> {
         store,
         vault,
         events: events.clone(),
+        blob: blob.clone(),
         deck_root: root.path().join("deck"),
         scratch_root: root.path().join("scratch"),
     });
     Some(Harness {
         manager,
         events,
+        blob,
         _root: root,
     })
 }
@@ -121,6 +129,99 @@ export const ops = {
   add: async ({ a, b }) => ({ sum: a + b }),
 };
 "#;
+
+/// A card whose refresh op exercises the whole ref-first blob plane: inline
+/// `blobPut` → `blobGet` round-trip, plus an `exec`-produced file streamed in
+/// via `blobPutFile`. Returns the refs so the test can assert they landed in
+/// the shared store.
+const BLOB_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    const put = await ctx.blobPut(btoa("hello deck"), "text/plain");
+    const got = await ctx.blobGet(put.blobId);
+    await ctx.exec("printf 'from-exec' > out.bin");
+    const filed = await ctx.blobPutFile("out.bin", "application/octet-stream");
+    return {
+      putId: put.blobId, putSize: put.size, putCt: put.contentType,
+      roundtrip: got.base64, fileId: filed.blobId, fileSize: filed.size,
+    };
+  },
+};
+"#;
+
+#[tokio::test]
+async fn blob_plane_round_trips_through_store() {
+    let Some(h) = harness_or_skip("blob_plane_round_trips_through_store").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_SERVICE);
+
+    // Install runs the dry-run gate, which invokes the refresh op once — so the
+    // blobs are produced under the REAL (pre-minted) card id, and the stored
+    // first snapshot carries their refs.
+    let card = h.manager.install(staged.path()).await.unwrap();
+    let view = h.manager.deck_view().await.unwrap();
+    let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
+
+    // Inline put/get round-trip: base64 of "hello deck".
+    assert_eq!(snap["putCt"], "text/plain");
+    assert_eq!(snap["putSize"], 10);
+    assert_eq!(snap["roundtrip"], "aGVsbG8gZGVjaw==");
+
+    // Both refs resolve to real bytes in the shared blob store.
+    let put_id = snap["putId"].as_str().unwrap();
+    let file_id = snap["fileId"].as_str().unwrap();
+    assert_ne!(put_id, file_id);
+    assert_eq!(h.blob.get(put_id).await.unwrap(), b"hello deck");
+    assert_eq!(h.blob.get(file_id).await.unwrap(), b"from-exec");
+    assert_eq!(snap["fileSize"], 9);
+
+    let _ = card;
+    h.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_reclaims_the_cards_blobs() {
+    let Some(h) = harness_or_skip("purge_reclaims_the_cards_blobs").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap();
+
+    // The dry-run gate produced two blobs stamped deck:<card_id>.
+    let view = h.manager.deck_view().await.unwrap();
+    let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
+    let put_id = snap["putId"].as_str().unwrap().to_string();
+    let file_id = snap["fileId"].as_str().unwrap().to_string();
+    let ident = format!("deck:{}", card.id);
+    assert_eq!(
+        h.blob
+            .list_ids_by_uploader(&ident, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(h.blob.get(&put_id).await.is_ok());
+
+    // Delete → purge → the card's blobs are reclaimed (its own snapshot is
+    // gone, so nothing protects them).
+    h.manager.soft_delete(&card.id).await.unwrap();
+    h.manager.purge(&card.id).await.unwrap();
+    assert!(
+        h.blob
+            .list_ids_by_uploader(&ident, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.blob.get(&put_id).await.is_err());
+    assert!(h.blob.get(&file_id).await.is_err());
+
+    h.manager.shutdown().await;
+}
 
 #[tokio::test]
 async fn install_call_lifecycle() {

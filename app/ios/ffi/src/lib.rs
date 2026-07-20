@@ -864,6 +864,27 @@ impl BayboClient {
             .await
             .unwrap_or(false)
     }
+
+    /// Read a cached blob's bytes with NO network and NO active-binding check.
+    /// The deck display path's fast path (`baybo-transcript://…/blob/<id>`): a
+    /// cached card image renders even while the device is unbound/offline,
+    /// where [`Self::blob_download_bytes`] would fail on the missing leg. `None`
+    /// when the id is malformed or not cached — the caller then falls back to a
+    /// full download.
+    pub async fn blob_read_cached(self: Arc<Self>, blob_id: String) -> Option<Vec<u8>> {
+        runtime::run(async move { Ok::<_, String>(blob_helper::read_cached_bytes(&blob_id).await) })
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Size of a cached blob without reading it (a `stat`). The deck display
+    /// route preflights this to refuse an over-cap blob before pulling it into
+    /// memory. `None` when the id is malformed or not cached.
+    pub async fn blob_cached_size(self: Arc<Self>, blob_id: String) -> Option<u64> {
+        runtime::run(async move { Ok::<_, String>(blob_helper::cached_size(&blob_id).await) })
+            .await
+            .unwrap_or(None)
+    }
 }
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
