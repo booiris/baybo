@@ -437,22 +437,6 @@ impl DeckCardStore for SqliteDeckCardStore {
             .await?;
         raw.map(snapshot_from_raw).transpose()
     }
-
-    async fn snapshot_references(&self, blob_id: &str) -> Result<bool> {
-        let needle = blob_id.to_string();
-        self.pool
-            .interact("deck_cards.snapshot_references", move |conn| {
-                // `instr` avoids any LIKE-metachar escaping; NO `deleted_at`
-                // join — a binned card's snapshots keep its blobs alive.
-                Ok(conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM deck_snapshots \
-                     WHERE instr(payload, ?1) > 0)",
-                    rusqlite::params![needle],
-                    |row| row.get::<_, i64>(0),
-                )? != 0)
-            })
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -474,30 +458,6 @@ mod tests {
             last_seq: 0,
             created_at: chrono::Utc::now(),
         }
-    }
-
-    #[tokio::test]
-    async fn snapshot_references_spans_binned_cards() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
-        let store = SqliteDeckCardStore::new(pool);
-        store.create(&card("live", 0)).await.unwrap();
-        store.create(&card("binned", 1)).await.unwrap();
-        let now = chrono::Utc::now();
-        store
-            .record_snapshot("live", "{\"img\":\"blob-LIVE\"}", None, now)
-            .await
-            .unwrap();
-        store
-            .record_snapshot("binned", "{\"img\":\"blob-BINNED\"}", None, now)
-            .await
-            .unwrap();
-        // Bin one card — its snapshots stay, and the guard must still see them
-        // (a binned card's referenced blobs must survive the sweep).
-        store.set_deleted("binned", Some(now)).await.unwrap();
-
-        assert!(store.snapshot_references("blob-LIVE").await.unwrap());
-        assert!(store.snapshot_references("blob-BINNED").await.unwrap());
-        assert!(!store.snapshot_references("blob-ABSENT").await.unwrap());
     }
 
     #[tokio::test]

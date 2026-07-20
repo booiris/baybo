@@ -855,31 +855,24 @@ impl DeckManager {
         Ok(())
     }
 
-    /// Delete a purged card's blobs — service-produced `deck:<id>` and any
-    /// picker-uploaded `deck-user:<id>` — skipping any still referenced by
-    /// ANOTHER card's retained snapshot. Best-effort: blob GC is a convenience,
-    /// never a correctness dependency (a leftover is dead-but-harmless bytes).
+    /// Delete a purged card's service-produced blobs (`deck:<card_id>`).
+    /// Best-effort — blob GC is a convenience, never a correctness dependency
+    /// (a leftover is dead-but-harmless bytes); `delete()`'s own
+    /// `any_live_for_path` still spares a content file shared with another live
+    /// blob, so only this card's own rows go. (Picker uploads carry `device:*`
+    /// and, like every chat attachment, are not reclaimed here.)
     async fn reclaim_card_blobs(&self, card_id: &str) {
-        for prefix in [format!("deck:{card_id}"), format!("deck-user:{card_id}")] {
-            let ids = match self.blob.list_ids_by_uploader(&prefix, None).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    tracing::warn!(card = %card_id, "deck: blob list for purge failed: {e}");
-                    continue;
-                }
-            };
-            for id in ids {
-                match self.store.snapshot_references(&id).await {
-                    Ok(true) => continue, // another card still points at it
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(blob = %id, "deck: snapshot_references failed: {e}");
-                        continue;
-                    }
-                }
-                if let Err(e) = self.blob.delete(&id).await {
-                    tracing::warn!(blob = %id, "deck: blob purge delete failed: {e}");
-                }
+        let prefix = format!("deck:{card_id}");
+        let ids = match self.blob.list_ids_by_uploader(&prefix, None).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(card = %card_id, "deck: blob list for purge failed: {e}");
+                return;
+            }
+        };
+        for id in ids {
+            if let Err(e) = self.blob.delete(&id).await {
+                tracing::warn!(blob = %id, "deck: blob purge delete failed: {e}");
             }
         }
     }

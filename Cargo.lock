@@ -740,7 +740,6 @@ name = "baybo-janitor"
 version = "0.1.0"
 dependencies = [
  "baybo-model",
- "baybo-storage",
  "baybo-store",
  "baybo-workspace",
  "chrono",
