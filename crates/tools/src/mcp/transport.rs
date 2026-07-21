@@ -19,6 +19,7 @@ use tokio::process::{ChildStderr, Command};
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
 use crate::mcp::error::{McpError, McpResult};
+use crate::mcp::log_line::SidecarLogLine;
 use crate::mcp::vault_keys;
 
 pub struct McpServerSession {
@@ -147,6 +148,40 @@ async fn connect_stdio(
         .map_err(|e| McpError::Connection(e.to_string()))
 }
 
+/// Per-spawn budget on how many stderr lines a stdio MCP server may emit
+/// at their routed level before the drain demotes the remainder to
+/// `debug!`. First-party sidecars normally write a handful of NDJSON
+/// lines per boot, but one can shell out to a chatty subprocess — a
+/// `docker build` transcript is thousands of `apt`/layer lines — and an
+/// operator-added third-party server has no such contract at all. The
+/// budget keeps a single spawn's output from burying `baybo.log`; the
+/// overflow is still reachable at `RUST_LOG=debug`.
+const MCP_STDERR_INFO_LINE_BUDGET: usize = 300;
+
+/// Routing level recovered from a sidecar NDJSON line (or the plain-text
+/// default). Kept as an enum so emission goes through distinct `tracing`
+/// callsites rather than a runtime-`Level` dispatch.
+enum StderrLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Map a sidecar NDJSON `level` string onto a routing level, mirroring
+/// the aliases the gateway's `LogLevel::parse` accepts. `info` and any
+/// unrecognized label route to `Info` — the safe default that preserves
+/// today's behavior for third-party servers whose stderr isn't our
+/// NDJSON shape.
+fn routed_stderr_level(level: &str) -> StderrLevel {
+    match level.to_ascii_lowercase().as_str() {
+        "error" | "err" => StderrLevel::Error,
+        "warn" | "warning" => StderrLevel::Warn,
+        "debug" | "trace" => StderrLevel::Debug,
+        _ => StderrLevel::Info,
+    }
+}
+
 /// Forward a stdio MCP server's stderr into the tracing subscriber.
 ///
 /// rmcp inherits the child's stderr by default; [`connect_stdio`] spawns
@@ -154,15 +189,49 @@ async fn connect_stdio(
 /// event tagged with `mcp_server`, so the gateway's file subscriber
 /// records server diagnostics in `baybo.log` (and the admin LogBuffer)
 /// rather than scrolling them past on the terminal. The task ends on EOF
-/// when the child exits. No per-line cap: MCP servers are operator-added
-/// (`baybo mcp add`) and write line-oriented diagnostics, unlike the
-/// untrusted channel sidecars that justify the supervisor's pipe cap.
+/// when the child exits.
+///
+/// First-party sidecars log NDJSON (`{"level","msg","target"?}`, the
+/// shared [`SidecarLogLine`] shape); each line is re-emitted at its
+/// declared level so boot-progress chatter demotes to `debug!` while
+/// warnings and errors stay loud. A line that isn't that shape — every
+/// third-party MCP server's plain-text stderr — is passed through
+/// unchanged at `info!`. A per-spawn [`MCP_STDERR_INFO_LINE_BUDGET`]
+/// caps the routed-level output: past the budget every remaining line
+/// drops to `debug!` (one `warn!` marks the trip so the truncation is
+/// visible), which keeps a runaway subprocess transcript from flooding
+/// the log at default verbosity.
 fn drain_mcp_stderr(server_name: String, stderr: ChildStderr) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
+        let mut lines_seen: usize = 0;
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => tracing::info!(mcp_server = %server_name, "{line}"),
+                Ok(Some(line)) => {
+                    lines_seen += 1;
+                    let (routed, msg) = match serde_json::from_str::<SidecarLogLine>(&line) {
+                        Ok(parsed) => (routed_stderr_level(&parsed.level), parsed.msg),
+                        Err(_) => (StderrLevel::Info, line),
+                    };
+                    if lines_seen == MCP_STDERR_INFO_LINE_BUDGET + 1 {
+                        tracing::warn!(
+                            mcp_server = %server_name,
+                            budget = MCP_STDERR_INFO_LINE_BUDGET,
+                            "mcp server stderr exceeded line budget this spawn; further output demoted to debug",
+                        );
+                    }
+                    let effective = if lines_seen > MCP_STDERR_INFO_LINE_BUDGET {
+                        StderrLevel::Debug
+                    } else {
+                        routed
+                    };
+                    match effective {
+                        StderrLevel::Debug => tracing::debug!(mcp_server = %server_name, "{msg}"),
+                        StderrLevel::Info => tracing::info!(mcp_server = %server_name, "{msg}"),
+                        StderrLevel::Warn => tracing::warn!(mcp_server = %server_name, "{msg}"),
+                        StderrLevel::Error => tracing::error!(mcp_server = %server_name, "{msg}"),
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!(
@@ -285,4 +354,47 @@ async fn load_string_map(vault: &Arc<SecretVault>, key: &str) -> McpResult<Vec<(
         out.push((k.clone(), s.to_string()));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routed_level_mirrors_loglevel_aliases() {
+        assert!(matches!(routed_stderr_level("error"), StderrLevel::Error));
+        assert!(matches!(routed_stderr_level("ERR"), StderrLevel::Error));
+        assert!(matches!(routed_stderr_level("warn"), StderrLevel::Warn));
+        assert!(matches!(routed_stderr_level("Warning"), StderrLevel::Warn));
+        assert!(matches!(routed_stderr_level("debug"), StderrLevel::Debug));
+        assert!(matches!(routed_stderr_level("trace"), StderrLevel::Debug));
+        assert!(matches!(routed_stderr_level("info"), StderrLevel::Info));
+    }
+
+    #[test]
+    fn unknown_level_falls_back_to_info() {
+        assert!(matches!(routed_stderr_level(""), StderrLevel::Info));
+        assert!(matches!(routed_stderr_level("verbose"), StderrLevel::Info));
+    }
+
+    #[test]
+    fn ndjson_line_yields_declared_level_and_msg() {
+        let parsed: SidecarLogLine =
+            serde_json::from_str(r#"{"level":"debug","msg":"[browser-mcp] image cached"}"#)
+                .expect("valid NDJSON parses");
+        assert!(matches!(
+            routed_stderr_level(&parsed.level),
+            StderrLevel::Debug
+        ));
+        assert_eq!(parsed.msg, "[browser-mcp] image cached");
+    }
+
+    #[test]
+    fn plain_text_line_is_not_ndjson() {
+        // The third-party passthrough path: a non-JSON stderr line does
+        // not parse, so the drain keeps it at info! verbatim.
+        assert!(serde_json::from_str::<SidecarLogLine>("Listening on stdio").is_err());
+        // A JSON value of the wrong shape (no level/msg) also falls back.
+        assert!(serde_json::from_str::<SidecarLogLine>(r#"{"foo":1}"#).is_err());
+    }
 }

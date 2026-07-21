@@ -44,6 +44,22 @@ const EMPTY_USER_REPLY_NOTICE: &str =
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
 
+/// Attached (via anyhow context) to the error a turn returns when its
+/// cancellation token tripped — a user `/stop` or actor shutdown, which is
+/// normal operation, not a failure. The mailbox log sites downcast on it to
+/// log the outcome at info instead of error, keeping ERROR a page-worthy
+/// signal. `run_agent_loop` is the single choke point that tags it, since the
+/// token discriminator only exists there.
+#[derive(Debug, thiserror::Error)]
+#[error("turn cancelled")]
+pub(crate) struct TurnCancelled;
+
+/// True when `err` carries the [`TurnCancelled`] marker anywhere in its
+/// context chain — i.e. the turn ended via `/stop` or shutdown, not a failure.
+fn is_turn_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TurnCancelled>().is_some()
+}
+
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
 pub enum AgentMessage {
@@ -359,11 +375,15 @@ impl AgentActor {
                         batch.push(*inc);
                     }
                     if let Err(e) = self.handle_merged_user_turn(batch, &mut mailbox).await {
-                        error!(
-                            session_id = %session_id,
-                            error = %e,
-                            "failed to handle user input"
-                        );
+                        if is_turn_cancelled(&e) {
+                            info!(session_id = %session_id, "turn cancelled");
+                        } else {
+                            error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "failed to handle user input"
+                            );
+                        }
                     }
                 }
                 // A pre-coalesced batch (the gateway already grouped these as one
@@ -378,11 +398,15 @@ impl AgentActor {
                         batch.push(*inc);
                     }
                     if let Err(e) = self.handle_merged_user_turn(batch, &mut mailbox).await {
-                        error!(
-                            session_id = %session_id,
-                            error = %e,
-                            "failed to handle user input batch"
-                        );
+                        if is_turn_cancelled(&e) {
+                            info!(session_id = %session_id, "turn cancelled");
+                        } else {
+                            error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "failed to handle user input batch"
+                            );
+                        }
                     }
                 }
                 other => {
@@ -409,7 +433,11 @@ impl AgentActor {
         match msg {
             AgentMessage::UserInput(incoming) => {
                 if let Err(e) = self.handle_user_input(*incoming).await {
-                    error!(session_id = %session_id, error = %e, "failed to handle user input");
+                    if is_turn_cancelled(&e) {
+                        info!(session_id = %session_id, "turn cancelled");
+                    } else {
+                        error!(session_id = %session_id, error = %e, "failed to handle user input");
+                    }
                 }
             }
             AgentMessage::CronTrigger {
@@ -423,15 +451,21 @@ impl AgentActor {
                     .dispatch_cron_prompt(&prompt, &job_id, &title, delivery)
                     .await
                 {
-                    error!(session_id = %session_id, job_id = %job_id, error = %e, "failed to handle cron trigger");
-                    // A failed fire would otherwise leave a conversation that
-                    // is empty when opened and never announced itself. Report
-                    // it where the fire lives — but only for a fire that OWNS
-                    // its conversation: a one-shot's failure is reported into
-                    // the conversation that scheduled it, off this job's
-                    // terminal lifecycle edge.
-                    if matches!(delivery, CronDelivery::Channel) {
-                        self.report_cron_outcome(&title, true, &e.to_string()).await;
+                    if is_turn_cancelled(&e) {
+                        // A cancelled fire (shutdown / `/stop`) is not a failed
+                        // fire: log it as such and announce nothing.
+                        info!(session_id = %session_id, job_id = %job_id, "turn cancelled");
+                    } else {
+                        error!(session_id = %session_id, job_id = %job_id, error = %e, "failed to handle cron trigger");
+                        // A failed fire would otherwise leave a conversation that
+                        // is empty when opened and never announced itself. Report
+                        // it where the fire lives — but only for a fire that OWNS
+                        // its conversation: a one-shot's failure is reported into
+                        // the conversation that scheduled it, off this job's
+                        // terminal lifecycle edge.
+                        if matches!(delivery, CronDelivery::Channel) {
+                            self.report_cron_outcome(&title, true, &e.to_string()).await;
+                        }
                     }
                 }
             }
@@ -446,7 +480,11 @@ impl AgentActor {
                     .handle_subagent_spawned(*initial_message, parent_job_id)
                     .await
                 {
-                    error!(session_id = %session_id, error = %e, "failed to handle subagent spawn");
+                    if is_turn_cancelled(&e) {
+                        info!(session_id = %session_id, "turn cancelled");
+                    } else {
+                        error!(session_id = %session_id, error = %e, "failed to handle subagent spawn");
+                    }
                 }
             }
             AgentMessage::BackgroundJobFinished(pending) => {
@@ -522,8 +560,9 @@ impl AgentActor {
                 notify_silence,
             )
             .await;
+        let cancelled = turn_token.is_cancelled();
         if let Some(out) = stopped_out {
-            *out = turn_token.is_cancelled();
+            *out = cancelled;
         }
         // A user is waiting on this turn — a genuine failure must surface as
         // a terminal notice, not silence (the log line alone leaves the chat
@@ -531,7 +570,7 @@ impl AgentActor {
         // `/stop` already acknowledged with its own notice. Non-user turns
         // keep their own policies (cron logs, background-notification retries).
         if is_user_turn
-            && !turn_token.is_cancelled()
+            && !cancelled
             && let Err(e) = &result
         {
             let notice = AgentOutput {
@@ -547,7 +586,15 @@ impl AgentActor {
             };
             self.send_response(notice, "user_turn_failed").await;
         }
-        result
+        // Tag a cancelled turn's error so the mailbox log sites classify a
+        // user `/stop` (or shutdown) as info, not a page-worthy error. The
+        // token check is the one discriminator that also covers the untyped
+        // cancellation errors on this path (agent-loop-cancelled, and the
+        // `scope.rs` job-cancelled / already-terminal strings).
+        match result {
+            Err(e) if cancelled => Err(e.context(TurnCancelled)),
+            other => other,
+        }
     }
 
     /// Dispatch a fired cron job through the agent loop.
@@ -1432,6 +1479,23 @@ mod tests {
             content: "/compact".into(),
             meta: None,
         }]));
+    }
+
+    // The cancellation classification hinges on anyhow's downcast walking the
+    // context chain: `run_agent_loop` tags a cancelled turn's error with
+    // `.context(TurnCancelled)`, and the mailbox log sites downcast on it after
+    // the error propagates up. Lock in that the marker survives — including
+    // under further context a caller might add — and that a genuine failure is
+    // never misclassified.
+    #[test]
+    fn turn_cancelled_marker_is_downcastable_through_context() {
+        let tagged = anyhow::anyhow!("agent loop cancelled").context(TurnCancelled);
+        assert!(is_turn_cancelled(&tagged));
+
+        let wrapped = tagged.context("failed to handle user input");
+        assert!(is_turn_cancelled(&wrapped));
+
+        assert!(!is_turn_cancelled(&anyhow::anyhow!("provider 400")));
     }
 
     fn incoming(body: &str) -> IncomingMessage {

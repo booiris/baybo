@@ -384,7 +384,7 @@ Usage notes:
             .map_err(|e| ToolError::InvalidParams(format!("WebFetch: {e}")))?;
         let host = parsed.host_str().unwrap_or_default().to_string();
 
-        tracing::info!(host = %host, "WebFetch start");
+        tracing::debug!(host = %host, "WebFetch start");
 
         let response = {
             let _t = start_timer(&ctx.events, "http_request");
@@ -396,11 +396,15 @@ Usage notes:
                 res = send_fut => match res {
                     Ok(r) => r,
                     Err(e) if e.is_timeout() => {
+                        tracing::warn!(host = %host, reason = "timeout", "WebFetch failed");
                         return Err(ToolError::Timeout(format!(
                             "WebFetch exceeded {:?}", ctx.timeout
                         )));
                     }
-                    Err(e) => return Err(ToolError::Execution(reqwest_error_chain(&e))),
+                    Err(e) => {
+                        tracing::warn!(host = %host, reason = send_failure_reason(&e), "WebFetch failed");
+                        return Err(ToolError::Execution(reqwest_error_chain(&e)));
+                    }
                 }
             }
         };
@@ -416,7 +420,9 @@ Usage notes:
         if !status.is_success() {
             let body = {
                 let _t = start_timer(&ctx.events, "read_error_body");
-                read_body(response, ERROR_BODY_PREVIEW_BYTES, ctx).await?
+                read_body(response, ERROR_BODY_PREVIEW_BYTES, ctx)
+                    .await
+                    .inspect_err(|e| warn_read_failure(&host, e, ctx))?
             };
             let snippet = truncate_utf8(&body, ERROR_BODY_PREVIEW_BYTES);
             ctx.events.emit(
@@ -452,7 +458,9 @@ Usage notes:
 
         let body = {
             let _t = start_timer(&ctx.events, "read_body");
-            read_body(response, MAX_RESPONSE_BYTES, ctx).await?
+            read_body(response, MAX_RESPONSE_BYTES, ctx)
+                .await
+                .inspect_err(|e| warn_read_failure(&host, e, ctx))?
         };
         let body_bytes_read = body.len();
         let raw_text = String::from_utf8_lossy(&body);
@@ -678,7 +686,7 @@ fn extract_article(raw_html: &str, host: &str) -> String {
     let article = match readability.parse() {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!(host = %host, error = %e, "WebFetch readability parse failed; returning raw");
+            tracing::info!(host = %host, error = %e, "WebFetch readability parse failed; returning raw");
             return raw_html.to_string();
         }
     };
@@ -741,6 +749,36 @@ fn format_output(summarized: bool, raw_content_file: Option<&Path>, body: &str) 
         None => format!("[WebFetch] summarized={summarized}"),
     };
     format!("{header}\n\n{body}")
+}
+
+/// Classify a failed request send into a stable, URL-free reason. The
+/// raw `reqwest::Error` Display embeds the full target URL, so the warn
+/// logs this instead of the error text.
+fn send_failure_reason(e: &reqwest::Error) -> &'static str {
+    if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "send"
+    }
+}
+
+/// Emit the single `WebFetch failed` warn for a body-read error. Skips
+/// cancellation (a caller/system abort, not a fetch failure) and logs a
+/// classified reason rather than the raw reqwest chain, which would
+/// embed the full URL.
+fn warn_read_failure(host: &str, e: &ToolError, ctx: &ToolContext) {
+    if ctx.cancellation_token.is_cancelled() {
+        return;
+    }
+    let reason = match e {
+        ToolError::Timeout(_) => "read_timeout",
+        _ => "read",
+    };
+    tracing::warn!(host = %host, reason, "WebFetch failed");
 }
 
 fn reqwest_error_chain(e: &reqwest::Error) -> String {

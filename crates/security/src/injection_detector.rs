@@ -222,13 +222,13 @@ impl InjectionDetector {
             rx(
                 r"(?i)\beval\s*\(",
                 "eval_call",
-                InjectionSeverity::High,
+                InjectionSeverity::Medium,
                 "`eval(` call in content",
             ),
             rx(
                 r"(?i)\bexec\s*\(",
                 "exec_call",
-                InjectionSeverity::High,
+                InjectionSeverity::Medium,
                 "`exec(` call in content",
             ),
             rx(

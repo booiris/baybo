@@ -15,9 +15,9 @@ use baybo_channels::OutgoingMessage;
 use baybo_job::JobInput;
 use baybo_model::{BackgroundNotificationDelivery, ContentBlock, PendingBackgroundResult};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
-use super::{AgentActor, AgentMessage, is_blank_reply, mailbox};
+use super::{AgentActor, AgentMessage, is_blank_reply, is_turn_cancelled, mailbox};
 
 /// Maximum terminal results waiting to be committed to a notification prompt.
 /// Dropped results remain recoverable from their child transcript or command
@@ -641,13 +641,23 @@ impl AgentActor {
                     .await;
             }
             Err(error) => {
-                error!(
-                    session_id = %self.durable.session.id,
-                    error = %error,
-                    "background notification turn failed"
-                );
-                self.record_background_notification_failure("notification turn failed")
-                    .await;
+                if is_turn_cancelled(&error) {
+                    // A cancelled turn (shutdown / `/stop`) is not a delivery
+                    // failure: log it and leave the ledger untouched so a
+                    // cancellation can't degrade delivery toward passive.
+                    info!(
+                        session_id = %self.durable.session.id,
+                        "turn cancelled"
+                    );
+                } else {
+                    error!(
+                        session_id = %self.durable.session.id,
+                        error = %error,
+                        "background notification turn failed"
+                    );
+                    self.record_background_notification_failure("notification turn failed")
+                        .await;
+                }
             }
         }
     }

@@ -137,6 +137,11 @@ pub(crate) struct Sidecar {
     pub connection: Arc<Connection>,
     frame_tx: mpsc::Sender<Frame>,
     pump: JoinHandle<()>,
+    /// Latches the first time a `Multiplexed` sidecar sends a `session_id` on a
+    /// `Message` (a permanent wire-protocol misbuild): the message is still
+    /// processed, but the warning fires once per connection instead of on every
+    /// inbound frame.
+    warned_session_id_on_multiplexed: std::sync::atomic::AtomicBool,
 }
 
 /// Resolve the channel for `channel_type` from the registry, falling
@@ -211,6 +216,7 @@ impl Sidecar {
             connection,
             frame_tx,
             pump,
+            warned_session_id_on_multiplexed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -235,6 +241,16 @@ impl Sidecar {
     /// logs and for the route layer's per-connection bookkeeping.
     pub(crate) fn connection_id(&self) -> ConnectionId {
         self.connection.id()
+    }
+
+    /// Latch the "a `Multiplexed` sidecar supplied a `session_id`" warning to once
+    /// per connection: `true` the first time it is called, `false` thereafter.
+    /// Lock-free — the condition is a permanent client misbuild, so a relaxed
+    /// compare is enough on this hot inbound path.
+    pub(crate) fn first_session_id_on_multiplexed_offence(&self) -> bool {
+        !self
+            .warned_session_id_on_multiplexed
+            .fetch_or(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Resolve a pending approval and broadcast `ApprovalResolved` to

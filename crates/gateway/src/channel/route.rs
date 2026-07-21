@@ -101,9 +101,13 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         std::sync::Arc::clone(&state.blob_store),
     );
 
+    // Captured before `sidecar.into_pump()` consumes `sidecar` below, so the
+    // disconnect log can pair with this attach by connection_id + lifetime.
+    let connection_id = sidecar.connection_id();
+    let attached_at = std::time::Instant::now();
     tracing::info!(
         channel_type = %channel_type,
-        connection_id = %sidecar.connection_id(),
+        %connection_id,
         "channel-ws client attached"
     );
 
@@ -164,6 +168,8 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 
     tracing::info!(
         %channel_type,
+        %connection_id,
+        duration_ms = attached_at.elapsed().as_millis() as u64,
         "channel-ws client disconnected"
     );
 }
@@ -754,9 +760,16 @@ async fn resolve_inbound_session(
             Some(session_id)
         }
         ChannelKind::Multiplexed => {
-            if !wire_msg.session_id.as_str().is_empty() {
+            // A misbuilt sidecar that always sets session_id would otherwise warn
+            // on every inbound message; the condition is permanent, so warn once
+            // per connection with the attach identity of the offender.
+            if !wire_msg.session_id.as_str().is_empty()
+                && sidecar.first_session_id_on_multiplexed_offence()
+            {
                 tracing::warn!(
                     %channel_type,
+                    connection_id = %sidecar.connection_id(),
+                    bot_id = %wire_msg.bot_id,
                     "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
                 );
             }

@@ -178,9 +178,36 @@ function defaultChromeCacheDir(): string {
   return join(xdgCacheHome(), "baybo", "browser", "chrome");
 }
 
+const LOG_PREFIX = "[browser-mcp]";
+
 const log = (msg: string): void => {
-  process.stderr.write(`[browser-mcp] ${msg}\n`);
+  process.stderr.write(`${LOG_PREFIX} ${msg}\n`);
 };
+
+// Steady-state per-boot progress lines go out as NDJSON `debug` so the
+// gateway's MCP stderr drain (crates/tools/src/mcp/transport.rs) routes
+// them below the default INFO filter instead of forwarding them at INFO
+// like a plain-text line. The tiny helper is mirrored in docker.ts (which
+// server.ts imports — a shared module would be a back-import cycle).
+const logDebug = (msg: string): void => {
+  writeSidecarNdjson("debug", `${LOG_PREFIX} ${msg}`);
+};
+
+function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: string): void {
+  let line: string;
+  try {
+    line = `${JSON.stringify({ level, msg })}\n`;
+  } catch {
+    return;
+  }
+  try {
+    // MCP speaks JSON-RPC over stdout, so every log line — including
+    // NDJSON — must go to stderr where the gateway's drain reads it.
+    process.stderr.write(line);
+  } catch {
+    // EPIPE / closed stream — nothing useful to do from inside a logger.
+  }
+}
 
 /**
  * Synchronous fast path: if a Chrome is already on disk (operator
@@ -573,6 +600,12 @@ function isLikelyChromeProcess(pid: number): boolean {
 
 function clearStaleChromeLocks(profileDir: string): void {
   const myHostname = osHostname();
+  // Only SingletonLock carries Chrome's `hostname-pid` symlink target.
+  // SingletonCookie (a random cookie id) and SingletonSocket (a socket
+  // path) are non-`hostname-pid` by design, so we process the lock first,
+  // remember whether we cleared it, and treat the other two as its stale
+  // companions.
+  let lockCleared = false;
   for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
     const lockPath = join(profileDir, name);
     let target: string;
@@ -583,7 +616,17 @@ function clearStaleChromeLocks(profileDir: string): void {
     }
     const m = target.match(/^(.+)-(\d+)$/);
     if (!m) {
-      log(`Chrome lock ${lockPath} has unexpected target '${target}'; leaving alone`);
+      // A non-`hostname-pid` target is the steady state for
+      // SingletonCookie/SingletonSocket — warning "unexpected target" on
+      // it fired a false alarm on every boot. Clear them only as stale
+      // companions of a cleared lock; otherwise leave them silently. On
+      // SingletonLock a non-pid target really is unexpected, so keep the
+      // line there.
+      if (name === "SingletonLock") {
+        log(`Chrome lock ${lockPath} has unexpected target '${target}'; leaving alone`);
+      } else if (lockCleared) {
+        removeChromeLock(lockPath);
+      }
       continue;
     }
     const lockHostname = m[1] ?? "";
@@ -605,11 +648,19 @@ function clearStaleChromeLocks(profileDir: string): void {
         `clearing stale Chrome lock ${lockPath} (target ${target} from a different host or container)`,
       );
     }
-    try {
-      unlinkSync(lockPath);
-    } catch (e) {
-      log(`failed to remove ${lockPath}: ${(e as Error).message}`);
+    if (removeChromeLock(lockPath) && name === "SingletonLock") {
+      lockCleared = true;
     }
+  }
+}
+
+function removeChromeLock(lockPath: string): boolean {
+  try {
+    unlinkSync(lockPath);
+    return true;
+  } catch (e) {
+    log(`failed to remove ${lockPath}: ${(e as Error).message}`);
+    return false;
   }
 }
 
@@ -647,7 +698,7 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
   if (!check.ok) {
     throw new Error(`docker not available: ${check.reason}`);
   }
-  log(`docker daemon reachable (server ${check.serverVersion}); sweeping stale containers`);
+  logDebug(`docker daemon reachable (server ${check.serverVersion}); sweeping stale containers`);
   // Operator-set browser.sandbox=true doesn't reach Chrome in docker mode:
   // the container's entrypoint hardcodes --no-sandbox because the slim
   // base ships no SUID chrome-sandbox helper. Warn loudly so the operator
@@ -751,7 +802,9 @@ async function main(): Promise<void> {
       dockerHandle = outcome.handle;
       state.phase = "ready";
       mode = "docker";
-      log(`docker container ${dockerHandle.containerName} (image ${dockerHandle.imageTag}) ready; CDP=${dockerHandle.cdpUrl}`);
+      // The container name + image tag are folded into the single
+      // "chrome-devtools-mcp ready" summary below (CDP url already rides
+      // args.browserUrl there), so no separate per-boot ready line here.
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       log(`docker mode unavailable: ${reason}; falling back to host-headless`);
@@ -824,8 +877,11 @@ async function main(): Promise<void> {
   const target = args.browserUrl
     ? `browserUrl=${args.browserUrl}`
     : `executable=${args.executablePath ?? "<pending install>"}`;
+  const dockerStr = dockerHandle
+    ? ` container=${dockerHandle.containerName} image=${dockerHandle.imageTag}`
+    : "";
   log(
-    `chrome-devtools-mcp ready: mode=${mode} userDataDir=${args.userDataDir} ${target} ` +
+    `chrome-devtools-mcp ready: mode=${mode}${dockerStr} userDataDir=${args.userDataDir} ${target} ` +
       `viewport=${viewportStr} headless=${args.headless} ` +
       `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
       `telemetry=off page_id_routing=${args.experimentalPageIdRouting ? "on" : "off"} ` +
