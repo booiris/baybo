@@ -45,13 +45,7 @@ pub const MIN_EMIT_INTERVAL_FLOOR_SECS: u64 = 1;
 
 /// The service-side SDK version materialized by the current gateway. A
 /// card whose recorded stamp differs gets a re-dry-run at boot (the
-/// post-upgrade re-admission) instead of a silent behavior change. Bump this
-/// ONLY for a **breaking** preamble/`ctx` change, so the whole fleet
-/// re-verifies against it once at the next boot. The blob-plane additions
-/// (`ctx.fetchBlob` / `ctx.blobPutFile`) were purely **additive** — old cards
-/// never call them and run unchanged against the freshly `include_str!`'d
-/// preamble — so they did NOT bump it (a forced re-gate would have risked
-/// quarantining a network-flavoured card on an offline boot for no gain).
+/// post-upgrade re-admission) instead of a silent behavior change.
 pub const SDK_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
