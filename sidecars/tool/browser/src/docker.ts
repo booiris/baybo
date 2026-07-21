@@ -61,9 +61,42 @@ export interface DockerHandle {
     stop: () => Promise<void>;
 }
 
+const LOG_PREFIX = "[browser-mcp:docker]";
+
 const log = (msg: string): void => {
-    process.stderr.write(`[browser-mcp:docker] ${msg}\n`);
+    process.stderr.write(`${LOG_PREFIX} ${msg}\n`);
 };
+
+// Steady-state per-boot progress lines go out as NDJSON `debug` so the
+// gateway's MCP stderr drain (crates/tools/src/mcp/transport.rs) routes
+// them below the default INFO filter instead of forwarding them at INFO
+// like a plain-text line. Kept a one-liner rather than a shared module
+// because docker.ts is imported by server.ts — a back-import for the
+// helper would be a cycle.
+const logDebug = (msg: string): void => {
+    writeSidecarNdjson("debug", `${LOG_PREFIX} ${msg}`);
+};
+
+function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: string): void {
+    let line: string;
+    try {
+        line = `${JSON.stringify({ level, msg })}\n`;
+    } catch {
+        return;
+    }
+    try {
+        // MCP speaks JSON-RPC over stdout, so every log line — including
+        // NDJSON — must go to stderr where the gateway's drain reads it.
+        process.stderr.write(line);
+    } catch {
+        // EPIPE / closed stream — nothing useful to do from inside a logger.
+    }
+}
+
+// How many trailing docker-build stderr lines to retain and surface when
+// a build fails. Enough to carry the actual apt/network error without
+// re-dumping the whole (multi-thousand-line) transcript.
+const BUILD_STDERR_TAIL_LINES = 30;
 
 export async function checkDockerAvailable(): Promise<
     { ok: true; serverVersion: string } | { ok: false; reason: string }
@@ -160,14 +193,36 @@ async function imageExists(tag: string): Promise<boolean> {
 async function buildImage(dockerDir: string, tag: string): Promise<void> {
     log(`building image ${tag} (consumer google-chrome-stable); this takes 1-3 minutes on first boot`);
     const args = ["build", "-t", tag, dockerDir];
-    // Stream stderr so the operator sees apt-get progress in real time
-    // rather than a 3-minute silent wait.
+    // Capture (not inherit) the build's stderr. Inheriting piped the
+    // whole apt/layer transcript — hundreds-to-thousands of lines — into
+    // the gateway's own stderr and thence baybo.log at INFO. We keep only
+    // a trailing window and surface it if the build fails, so a broken
+    // build stays diagnosable without the success-path flood.
     await new Promise<void>((resolve, reject) => {
-        const child = spawn("docker", args, { stdio: ["ignore", "ignore", "inherit"] });
+        const child = spawn("docker", args, { stdio: ["ignore", "ignore", "pipe"] });
+        const tail: string[] = [];
+        let pending = "";
+        child.stderr?.on("data", (chunk: Buffer) => {
+            pending += chunk.toString("utf8");
+            const parts = pending.split("\n");
+            pending = parts.pop() ?? "";
+            for (const line of parts) {
+                tail.push(line);
+                if (tail.length > BUILD_STDERR_TAIL_LINES) tail.shift();
+            }
+        });
         child.on("error", reject);
         child.on("exit", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`docker build exited ${code}`));
+            if (code === 0) {
+                resolve();
+                return;
+            }
+            if (pending.length > 0) {
+                tail.push(pending);
+                if (tail.length > BUILD_STDERR_TAIL_LINES) tail.shift();
+            }
+            const captured = tail.length > 0 ? `\nlast ${tail.length} stderr lines:\n${tail.join("\n")}` : "";
+            reject(new Error(`docker build exited ${code}${captured}`));
         });
     });
     log(`image ${tag} built`);
@@ -249,7 +304,7 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
     const tag = await computeImageTag(opts.dockerDir);
     opts.onPhase("docker-building-image");
     if (await imageExists(tag)) {
-        log(`image ${tag} already cached`);
+        logDebug(`image ${tag} already cached`);
         return tag;
     }
     try {
@@ -363,7 +418,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     } catch (e) {
         throw new Error(`docker run failed: ${(e as Error).message}`);
     }
-    log(`container ${containerName} started; resolving published CDP port`);
+    logDebug(`container ${containerName} started; resolving published CDP port`);
 
     // Anything that fails after `docker run` succeeded must force-remove
     // the container before propagating: otherwise the caller's
@@ -376,7 +431,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     // next-boot sweep.
     try {
         const cdpUrl = await readPublishedCdpUrl(containerName);
-        log(`container CDP at ${cdpUrl}; waiting for Chrome to come up`);
+        logDebug(`container CDP at ${cdpUrl}; waiting for Chrome to come up`);
 
         opts.onPhase("docker-waiting-for-cdp");
         await waitForCdp(cdpUrl, containerName);

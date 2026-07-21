@@ -69,6 +69,23 @@ use parse::{
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
+/// Cap for the one-line command digest logged on sandbox-bypass events.
+const COMMAND_HEAD_MAX_CHARS: usize = 160;
+
+/// One-line, log-safe digest of a shell command for a structured log
+/// field: the first line with control chars flattened via `escape_debug`
+/// (so a multi-line script can never spill into bare, un-timestamped log
+/// continuation lines), truncated on a char boundary. The full command
+/// still reaches the user notice and the persisted tool-call trace span.
+fn command_head(command: &str) -> String {
+    command
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .escape_debug()
+        .take(COMMAND_HEAD_MAX_CHARS)
+        .collect()
+}
 
 /// Shared Bash tool description. Four sections vary by permission —
 /// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
@@ -2011,14 +2028,16 @@ impl BashTool {
         let Some(reason) = ctx.sandbox_bypass_reason.as_deref() else {
             tracing::debug!(
                 target: "baybo::tools::bash",
-                command = %command,
+                command_head = %command_head(command),
+                command_len = command.len(),
                 "running Bash without the inner OS sandbox; user notice suppressed"
             );
             return;
         };
         tracing::warn!(
             target: "baybo::tools::bash",
-            command = %command,
+            command_head = %command_head(command),
+            command_len = command.len(),
             reason = %reason,
             "running Bash without the inner OS sandbox"
         );
@@ -2036,7 +2055,8 @@ impl BashTool {
     fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
         tracing::warn!(
             target: "baybo::tools::bash",
-            command = %command,
+            command_head = %command_head(command),
+            command_len = command.len(),
             rationale = %rationale,
             "running a failed command outside the OS sandbox"
         );

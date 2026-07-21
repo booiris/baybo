@@ -70,7 +70,7 @@ pub(crate) fn device_apns_secret_name(device_id: &str) -> String {
 /// The per-device APNs registration A persists at pairing (vault, keyed by
 /// device_id) so the dispatcher can restore C's APNs binding before its first
 /// push when the token was available to A.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeviceApnsRegistration {
     pub apns_token: String,
     pub apns_env: device_proto::pairing::ApnsEnv,
@@ -188,6 +188,21 @@ fn push_status_error(op: &str, status: reqwest::StatusCode, body: &str) -> Strin
         msg.push_str(&snippet);
     }
     msg
+}
+
+/// Outcome of [`PushDispatcher::ensure_registered`], driving the `/notify` 404
+/// self-heal: a retry is only worth sending after C plausibly (re)learned the
+/// binding — i.e. a register landed, now or earlier this run. A skipped or
+/// rejected register cannot have taught C the device, so retrying a 404'd
+/// notify would fail identically (and double the log noise + round-trips).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RegisterOutcome {
+    /// C accepted a register for the current token (now or cached this run).
+    Registered,
+    /// Nothing was sent: no registrar wired, or no usable durable material.
+    Skipped,
+    /// A register was sent and failed (transport error or a non-2xx from C).
+    Rejected,
 }
 
 /// Why a `/notify` POST to C failed. Distinguishes the one outcome the
@@ -532,6 +547,7 @@ impl PushDispatcher {
                 targets.push(binding.into());
             }
         }
+        retain_routable_targets(&mut targets);
         if targets.is_empty() {
             tracing::debug!(
                 session = %ev.session_id,
@@ -574,40 +590,52 @@ impl PushDispatcher {
             return Err("push target has no relay url (re-pair to populate)".into());
         }
         let notify_url = remote_host_protocol::push::notify_url(&base);
-        self.ensure_registered(target, &base).await;
+        let first_register = self.ensure_registered(target, &base).await;
         match self
             .post_notify(target, session_id, preview, &notify_url)
             .await
         {
             Ok(()) => Ok(()),
             // C no longer knows this device — its in-memory token store was reset
-            // (typically a remote-host restart). Our "already registered" cache is
+            // (typically a remote-host restart) — while a register for this token
+            // did land (now or earlier this run). Our "already registered" cache is
             // stale: drop it, re-register from durable material, and retry the
             // push once so delivery self-heals on this very turn instead of
             // 404'ing until A restarts or the APNs token rotates.
-            Err(NotifyError::DeviceUnknown) => {
+            Err(NotifyError::DeviceUnknown) if first_register == RegisterOutcome::Registered => {
                 tracing::info!(
                     device = %target.device_id,
                     "push: remote host lost this device's binding (404); re-registering and \
                      retrying once"
                 );
                 self.registered.lock().remove(target.device_id.as_str());
-                self.ensure_registered(target, &base).await;
-                match self
-                    .post_notify(target, session_id, preview, &notify_url)
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        tracing::warn!(
-                            device = %target.device_id, error = %e,
-                            "push: target still unknown to remote host after re-register; \
-                             delivery wedged (missing delegation/apns material?)",
-                        );
-                        Err(e.to_string())
-                    }
+                if self.ensure_registered(target, &base).await != RegisterOutcome::Registered {
+                    return Err(
+                        "remote host does not know this device (404) and re-register failed".into(),
+                    );
                 }
+                // No inner warn here: the one per-target WARN in
+                // `dispatch_completed` logs this returned error, so the retry
+                // failure surfaces exactly once, with the re-register context.
+                self.post_notify(target, session_id, preview, &notify_url)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "notify rejected right after a successful re-register; \
+                             delivery wedged for this turn: {e}"
+                        )
+                    })
             }
+            // The register that ran just above was skipped or rejected, so C
+            // cannot have learned the binding since this 404 — a re-register +
+            // retry would fail identically. One error, no extra round-trips.
+            Err(NotifyError::DeviceUnknown) => Err(format!(
+                "remote host does not know this device (404); register {}",
+                match first_register {
+                    RegisterOutcome::Skipped => "was skipped (no registrar or APNs material)",
+                    _ => "was rejected",
+                }
+            )),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -644,13 +672,13 @@ impl PushDispatcher {
     /// a restarted or pruned remote-host token store leaves C unaware of the
     /// device, so `/notify` would be rejected as unknown until the app registers
     /// again. Cached so it costs at most one `/register` per device per run.
-    async fn ensure_registered(&self, target: &PushTarget, base_http: &str) {
+    async fn ensure_registered(&self, target: &PushTarget, base_http: &str) -> RegisterOutcome {
         let Some(registrar) = &self.apns_registrar else {
             tracing::debug!(
                 device = %target.device_id,
                 "push: no APNs registrar wired; register skipped"
             );
-            return;
+            return RegisterOutcome::Skipped;
         };
         let device_id = target.device_id.as_str();
         let secret = match self
@@ -664,7 +692,7 @@ impl PushDispatcher {
                     device = %device_id,
                     "push: skipping remote-host register (no APNs material persisted)"
                 );
-                return;
+                return RegisterOutcome::Skipped;
             }
             Err(e) => {
                 tracing::warn!(
@@ -672,7 +700,7 @@ impl PushDispatcher {
                     error = %e,
                     "push: vault read of APNs material failed; register skipped"
                 );
-                return;
+                return RegisterOutcome::Skipped;
             }
         };
         let reg = match serde_json::from_slice::<DeviceApnsRegistration>(secret.as_bytes()) {
@@ -684,7 +712,7 @@ impl PushDispatcher {
                     "push: persisted APNs registration is malformed; register skipped \
                      (re-pair or reconnect the app to rewrite it)"
                 );
-                return;
+                return RegisterOutcome::Skipped;
             }
         };
         if reg.apns_token.is_empty() {
@@ -692,13 +720,13 @@ impl PushDispatcher {
                 device = %device_id,
                 "push: skipping remote-host register (empty APNs token)"
             );
-            return;
+            return RegisterOutcome::Skipped;
         }
         // Already registered this exact token this run → nothing to do. A token
         // that changed (read from the vault after the app pushed a fresh one over
         // the content channel) differs here and re-registers below.
         if self.registered.lock().get(device_id) == Some(&reg.apns_token) {
-            return;
+            return RegisterOutcome::Registered;
         }
         let signing_key = match self.signing_key().await {
             Ok(key) => key,
@@ -708,7 +736,7 @@ impl PushDispatcher {
                     error = %e,
                     "push: gateway push signing key unavailable; register skipped"
                 );
-                return;
+                return RegisterOutcome::Skipped;
             }
         };
         // The binding is authenticated to C by the device's pairing-time
@@ -723,7 +751,7 @@ impl PushDispatcher {
             Ok(Some(sig)) => sig,
             Ok(None) => {
                 tracing::debug!(device = %device_id, "push: no delegation stored; skipping register");
-                return;
+                return RegisterOutcome::Skipped;
             }
             Err(e) => {
                 tracing::warn!(
@@ -731,7 +759,7 @@ impl PushDispatcher {
                     error = %e,
                     "push: vault read of push delegation failed; register skipped"
                 );
-                return;
+                return RegisterOutcome::Skipped;
             }
         };
         let body = build_register_body(
@@ -755,15 +783,17 @@ impl PushDispatcher {
                 self.registered
                     .lock()
                     .insert(device_id.to_string(), reg.apns_token);
+                RegisterOutcome::Registered
             }
             Err(e) => {
                 tracing::warn!(
                     device = %device_id,
                     register_url = %register_url,
                     error = %e,
-                    "push: device registration with remote host failed; notifies will 404 \
-                     until it succeeds"
-                )
+                    "push: device registration with remote host failed; binding not \
+                     refreshed (notify may 404 if the remote host does not already hold it)"
+                );
+                RegisterOutcome::Rejected
             }
         }
     }
@@ -891,6 +921,41 @@ fn build_register_body(
         delegation: b64.encode(delegation_sig),
         sig: b64.encode(sig.to_bytes()),
         counter,
+    }
+}
+
+/// Drop any target whose `device_id` is not self-certifying
+/// (`device-<hex(ed25519 pub)>`). C re-derives the device key from the id to
+/// verify the delegation chain, so a target of any other shape — e.g. a vault
+/// binding persisted under a retired id prefix — can never register or notify:
+/// every attempt would 403/404 and warn, on every turn, forever. The stale
+/// vault/store rows themselves stay in place (inert); pairing or registering
+/// again under the current prefix writes fresh, routable material.
+fn retain_routable_targets(targets: &mut Vec<PushTarget>) {
+    // Once per process, not per turn: the unroutable set is static durable
+    // state, so one INFO keeps the skip observable at default RUST_LOG without
+    // re-announcing it on every completed turn (per-target detail is at debug).
+    static LEGACY_TARGETS_NOTICE: std::sync::Once = std::sync::Once::new();
+    let before = targets.len();
+    targets.retain(|t| {
+        if delegation::device_pubkey_from_id(&t.device_id).is_ok() {
+            return true;
+        }
+        tracing::debug!(
+            device = %t.device_id,
+            "push: device id is not self-certifying; excluded from push fan-out"
+        );
+        false
+    });
+    let dropped = before - targets.len();
+    if dropped > 0 {
+        LEGACY_TARGETS_NOTICE.call_once(|| {
+            tracing::info!(
+                count = dropped,
+                "push: unverifiable legacy push bindings excluded from push fan-out; \
+                 pair or register those devices again to restore their push"
+            );
+        });
     }
 }
 
@@ -1246,6 +1311,104 @@ mod tests {
         // initial ensure + the forced re-register after cache invalidation).
         assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// An `ApnsRegistrar` that always fails and counts `/register` calls.
+    #[derive(Default)]
+    struct FailingRegistrar {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ApnsRegistrar for FailingRegistrar {
+        async fn register(&self, _url: &str, _body: &RegisterRequest) -> Result<(), String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err("register status 403 Forbidden (signature/counter rejected)".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_404_after_rejected_register_does_not_reregister_or_retry() {
+        // C rejected the register (e.g. 403), then 404'd the notify: a second
+        // register + retry would fail identically, so the turn ends after one
+        // notify attempt and one register attempt — no self-heal round-trips.
+        let sink = Arc::new(ScriptedSink {
+            calls: AtomicUsize::new(0),
+            fail_first: 99,
+        });
+        let registrar = Arc::new(FailingRegistrar::default());
+        let (dispatcher, row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+
+        let res = dispatcher
+            .dispatch_to_target(&PushTarget::from(&row), &SessionId::from("s1"), "preview")
+            .await;
+        let err = res.expect_err("delivery cannot succeed");
+        assert!(err.contains("was rejected"), "err: {err}");
+        assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn notify_404_with_no_register_material_does_not_retry() {
+        // No durable APNs material for this device (register skipped): a 404'd
+        // notify cannot be healed, so there is exactly one attempt and no
+        // register at all.
+        let sink = Arc::new(ScriptedSink {
+            calls: AtomicUsize::new(0),
+            fail_first: 99,
+        });
+        let registrar = Arc::new(CountingRegistrar::default());
+        let (dispatcher, row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+        let bare = DeviceRow {
+            device_id: "dev-2".into(),
+            ..row
+        };
+        dispatcher
+            .secret_vault
+            .store_secret(&device_push_key_secret_name("dev-2"), &[7u8; aead::KEY_LEN])
+            .await
+            .unwrap();
+
+        let res = dispatcher
+            .dispatch_to_target(&PushTarget::from(&bare), &SessionId::from("s1"), "preview")
+            .await;
+        let err = res.expect_err("delivery cannot succeed");
+        assert!(err.contains("was skipped"), "err: {err}");
+        assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fan_out_keeps_only_self_certifying_device_ids() {
+        let valid = delegation::device_id_for(&delegation::generate_signing_key().verifying_key());
+        let mut targets: Vec<PushTarget> = [
+            valid.as_str(),
+            // The retired pre-rename prefix: C can never verify these again.
+            "ios-7b26d0fce05cd672aa87a000000000000000000000000000000000000000000",
+            "device-zz",
+            "",
+        ]
+        .into_iter()
+        .map(|id| PushTarget {
+            device_id: id.to_string(),
+            relay_url: "wss://proxy.example".into(),
+        })
+        .collect();
+        retain_routable_targets(&mut targets);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![valid.as_str()]
+        );
     }
 
     #[tokio::test]

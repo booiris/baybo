@@ -392,7 +392,7 @@ async fn drain_pipe<R>(
         let parsed = if cap_hit {
             None
         } else {
-            serde_json::from_str::<SidecarLogLine>(&raw).ok()
+            serde_json::from_str::<baybo_tools::mcp::SidecarLogLine>(&raw).ok()
         };
         let (level, msg_text, line_target) = match parsed {
             Some(p) => (
@@ -437,14 +437,6 @@ async fn drain_pipe<R>(
             let _ = drain_until_newline(&mut reader).await;
         }
     }
-}
-
-#[derive(serde::Deserialize)]
-struct SidecarLogLine {
-    level: String,
-    msg: String,
-    #[serde(default)]
-    target: Option<String>,
 }
 
 /// Replace ASCII control bytes (0x00-0x1F except `\t`, plus 0x7F) with

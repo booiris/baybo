@@ -132,12 +132,22 @@ impl Janitor {
             report.pairings_purged += self.sweep_pairings_once(chrono::Utc::now()).await;
         }
 
-        tracing::info!(
-            log_files_removed = report.log_files_removed,
-            work_tmp_removed = report.work_tmp_removed,
-            pairings_purged = report.pairings_purged,
-            "janitor sweep complete",
-        );
+        if report.log_files_removed > 0 || report.work_tmp_removed > 0 || report.pairings_purged > 0
+        {
+            tracing::info!(
+                log_files_removed = report.log_files_removed,
+                work_tmp_removed = report.work_tmp_removed,
+                pairings_purged = report.pairings_purged,
+                "janitor sweep complete",
+            );
+        } else {
+            tracing::debug!(
+                log_files_removed = report.log_files_removed,
+                work_tmp_removed = report.work_tmp_removed,
+                pairings_purged = report.pairings_purged,
+                "janitor sweep complete",
+            );
+        }
 
         report
     }

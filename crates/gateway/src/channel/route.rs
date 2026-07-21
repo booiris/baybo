@@ -101,9 +101,13 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         std::sync::Arc::clone(&state.blob_store),
     );
 
+    // Captured before `sidecar.into_pump()` consumes `sidecar` below, so the
+    // disconnect log can pair with this attach by connection_id + lifetime.
+    let connection_id = sidecar.connection_id();
+    let attached_at = std::time::Instant::now();
     tracing::info!(
         channel_type = %channel_type,
-        connection_id = %sidecar.connection_id(),
+        %connection_id,
         "channel-ws client attached"
     );
 
@@ -164,6 +168,8 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 
     tracing::info!(
         %channel_type,
+        %connection_id,
+        duration_ms = attached_at.elapsed().as_millis() as u64,
         "channel-ws client disconnected"
     );
 }
@@ -754,11 +760,28 @@ async fn resolve_inbound_session(
             Some(session_id)
         }
         ChannelKind::Multiplexed => {
+            // A misbuilt sidecar that always sets session_id would otherwise warn
+            // on every inbound message; the condition is a permanent client
+            // misbuild, so the first offence process-wide warns with the
+            // offender's attach identity and the rest stay at debug.
             if !wire_msg.session_id.as_str().is_empty() {
-                tracing::warn!(
-                    %channel_type,
-                    "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
-                );
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        %channel_type,
+                        connection_id = %sidecar.connection_id(),
+                        bot_id = %wire_msg.bot_id,
+                        "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                    );
+                } else {
+                    tracing::warn!(
+                        %channel_type,
+                        connection_id = %sidecar.connection_id(),
+                        bot_id = %wire_msg.bot_id,
+                        "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                    );
+                }
             }
             if wire_msg.user_id.is_empty() {
                 tracing::warn!(

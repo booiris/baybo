@@ -44,8 +44,8 @@ use tower::ServiceExt;
 
 use super::blobs::MAX_BLOB_BYTES;
 use super::device_content::{
-    AuthenticatedDevice, BinarySink, BinarySource, RelayWs, TungBinSink, TungBinSource,
-    responder_handshake,
+    AuthenticatedDevice, BinarySink, BinarySource, RelaySessionError, RelayWs, TungBinSink,
+    TungBinSource, log_relay_session_end, responder_handshake,
 };
 use super::state::WsChannelState;
 use crate::auth::DEVICE_ID_HEADER;
@@ -132,10 +132,9 @@ pub(crate) async fn run_api_tunnel_over_relay(
     state: &WsChannelState,
 ) {
     let (sink, source) = ws.split();
-    if let Err(reason) =
-        run_tunnel_session(TungBinSink(sink), TungBinSource(source), class, state).await
+    if let Err(e) = run_tunnel_session(TungBinSink(sink), TungBinSource(source), class, state).await
     {
-        tracing::debug!(reason = %reason, "relay api tunnel aborted");
+        log_relay_session_end(&e, "relay api tunnel aborted");
     }
 }
 
@@ -158,7 +157,7 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
     mut source: So,
     class: LegClass,
     state: &WsChannelState,
-) -> Result<(), String> {
+) -> Result<(), RelaySessionError> {
     let (mut transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
     let mut reassembler = FrameReassembler::new();
     let mut pending = VecDeque::new();
@@ -170,7 +169,7 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
     let mut served: u64 = 0;
     let mut last_id: u64 = 0;
 
-    tracing::info!(
+    tracing::debug!(
         device = %super::short_hash(&device.device_id),
         class = ?class,
         reusable = reuse.is_some(),
@@ -191,12 +190,20 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
         {
             // A reused leg idling out is how it is SUPPOSED to end.
             Err(_) if served > 0 => return Ok(()),
-            Err(_) => return Err("timed out waiting for tunnel request".to_string()),
-            Ok(Err(reason)) => return Err(reason),
+            Err(_) => {
+                return Err(RelaySessionError::Ended(
+                    "timed out waiting for tunnel request".to_string(),
+                ));
+            }
+            Ok(Err(reason)) => return Err(reason.into()),
             // A one-shot client (or an old one) closes after its request. Leave at
             // once rather than sitting on the idle budget.
             Ok(Ok(None)) if served > 0 => return Ok(()),
-            Ok(Ok(None)) => return Err("peer closed before request head".into()),
+            Ok(Ok(None)) => {
+                return Err(RelaySessionError::Ended(
+                    "peer closed before request head".to_string(),
+                ));
+            }
             Ok(Ok(Some(req))) => req,
         };
 
@@ -255,7 +262,9 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
                 return Ok(());
             }
             TunnelRequest::Cancel { reason, .. } => {
-                return Err(format!("request canceled: {reason}"));
+                return Err(RelaySessionError::Ended(format!(
+                    "request canceled: {reason}"
+                )));
             }
         };
 
@@ -1016,7 +1025,7 @@ mod session_tests {
         transport: TransportState,
         reassembler: FrameReassembler,
         pending: VecDeque<TunnelResponse>,
-        session: tokio::task::JoinHandle<Result<(), String>>,
+        session: tokio::task::JoinHandle<Result<(), RelaySessionError>>,
     }
 
     impl Phone {
@@ -1088,7 +1097,7 @@ mod session_tests {
         }
 
         /// Hang up and report how the gateway's session ended.
-        async fn close(mut self) -> Result<(), String> {
+        async fn close(mut self) -> Result<(), RelaySessionError> {
             drop(self.tx);
             tokio::time::timeout(Duration::from_secs(5), &mut self.session)
                 .await

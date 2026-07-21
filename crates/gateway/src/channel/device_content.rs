@@ -50,6 +50,55 @@ pub(crate) struct AuthenticatedDevice {
     pub(crate) auth_token: String,
 }
 
+/// How a relay data-leg Noise session ended without an authenticated transport.
+/// Both leg types ([`run_content_over_relay`] and
+/// [`super::api_tunnel::run_api_tunnel_over_relay`]) route their failures through
+/// this so the shared [`log_relay_session_end`] can log an auth rejection or a
+/// gateway-side infra failure at warn — a leg only exists after a control-plane
+/// dial, so a peer failing device authentication here is genuine signal — while
+/// routine peer/transport ends stay at debug.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RelaySessionError {
+    /// The initiator failed device authentication: no approved device matched its
+    /// static key, it sent none, or its first handshake message was malformed —
+    /// all attacker-shaped.
+    #[error("{0}")]
+    AuthRejected(String),
+    /// A gateway-side dependency failed (device-store lookup, static-key vault
+    /// load). Kept distinct from [`AuthRejected`](RelaySessionError::AuthRejected)
+    /// so a store or vault hiccup is not misread as an attack.
+    #[error("{0}")]
+    Infra(String),
+    /// A routine end: the peer closed, a wait timed out, or a post-handshake
+    /// transport/framing error tore the leg down. Expected churn on the relay path.
+    #[error("{0}")]
+    Ended(String),
+}
+
+/// A bare reason string is a routine end unless a call site classifies it
+/// otherwise — lets the session loops keep returning `Result<_, String>` from
+/// their transport helpers and `?` them into a [`RelaySessionError`].
+impl From<String> for RelaySessionError {
+    fn from(reason: String) -> Self {
+        Self::Ended(reason)
+    }
+}
+
+/// Log a terminated relay data-leg session at the level its cause warrants:
+/// auth rejections and gateway-side infra failures at warn, routine ends at debug
+/// under `routine_msg`.
+pub(crate) fn log_relay_session_end(err: &RelaySessionError, routine_msg: &str) {
+    match err {
+        RelaySessionError::AuthRejected(reason) => {
+            tracing::warn!(%reason, "relay data leg: device authentication rejected")
+        }
+        RelaySessionError::Infra(reason) => {
+            tracing::warn!(%reason, "relay data leg: gateway-side handshake failure")
+        }
+        RelaySessionError::Ended(reason) => tracing::debug!(%reason, "{routine_msg}"),
+    }
+}
+
 /// Run the content responder over an outbound **relay** data leg (the gateway
 /// dialed C's `/content/host/{relay_key}` after a control-plane signal). No
 /// prior channel-auth ran — the gateway dialed blind — so the device is
@@ -61,10 +110,10 @@ pub(crate) async fn run_content_over_relay(
     dedup: Option<LegDedup>,
 ) {
     let (sink, source) = ws.split();
-    if let Err(reason) =
+    if let Err(e) =
         run_content_session(TungBinSink(sink), TungBinSource(source), state, dedup).await
     {
-        tracing::debug!(reason = %reason, "relay content session aborted");
+        log_relay_session_end(&e, "relay content session aborted");
     }
 }
 
@@ -77,7 +126,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     mut source: So,
     state: &WsChannelState,
     dedup: Option<LegDedup>,
-) -> Result<(), String> {
+) -> Result<(), RelaySessionError> {
     // Authenticate the device and bring up the Noise transport (shared with the
     // blob leg — both authenticate the same way before diverging).
     let (transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
@@ -130,7 +179,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     .await;
 
     let _ = sidecar.into_pump().await;
-    tracing::info!(device = %super::short_hash(&device_id), "device content session closed");
+    tracing::debug!(device = %super::short_hash(&device_id), "device content session closed");
     Ok(())
 }
 
@@ -157,32 +206,36 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
     sink: &mut Si,
     source: &mut So,
     state: &WsChannelState,
-) -> Result<(TransportState, AuthenticatedDevice), String> {
+) -> Result<(TransportState, AuthenticatedDevice), RelaySessionError> {
     let gateway_static = load_or_create_static_keypair(&state.secret_vault)
         .await
-        .map_err(|e| format!("gateway static key: {e}"))?;
+        .map_err(|e| RelaySessionError::Infra(format!("gateway static key: {e}")))?;
 
     // 2 messages: read the initiator's `msg1` (carrying its static key),
     // authenticate it, then send `msg2` and enter transport mode.
     let mut handshake = gateway_static
         .ik_responder()
-        .map_err(|e| format!("build ik responder: {e}"))?;
+        .map_err(|e| RelaySessionError::Infra(format!("build ik responder: {e}")))?;
+    // A timeout or peer-close waiting for msg1 is routine churn (`From<String>` →
+    // `Ended`); a malformed msg1 that fails to decrypt is attacker-shaped.
     let msg1 = recv_handshake(source, HANDSHAKE_TIMEOUT).await?;
     let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
     handshake
         .read_message(&msg1, &mut buf)
-        .map_err(|e| format!("read handshake msg1: {e}"))?;
+        .map_err(|e| RelaySessionError::AuthRejected(format!("read handshake msg1: {e}")))?;
     let remote_static = handshake
         .get_remote_static()
-        .ok_or_else(|| "initiator sent no static key".to_string())?
+        .ok_or_else(|| RelaySessionError::AuthRejected("initiator sent no static key".to_string()))?
         .to_vec();
 
     let row = state
         .device_store
         .lookup_approved_by_pubkey(&remote_static)
         .await
-        .map_err(|e| format!("device lookup by pubkey: {e}"))?
-        .ok_or_else(|| "no approved device for this static key".to_string())?;
+        .map_err(|e| RelaySessionError::Infra(format!("device lookup by pubkey: {e}")))?
+        .ok_or_else(|| {
+            RelaySessionError::AuthRejected("no approved device for this static key".to_string())
+        })?;
     let device = AuthenticatedDevice {
         device_id: row.device_id,
         auth_token: row.auth_token,
@@ -190,13 +243,13 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
 
     let n = handshake
         .write_message(&[], &mut buf)
-        .map_err(|e| format!("write handshake msg2: {e}"))?;
+        .map_err(|e| RelaySessionError::Infra(format!("write handshake msg2: {e}")))?;
     sink.send_bytes(buf[..n].to_vec())
         .await
-        .map_err(|()| "send handshake msg2".to_string())?;
+        .map_err(|()| RelaySessionError::Ended("send handshake msg2".to_string()))?;
     let transport = handshake
         .into_transport_mode()
-        .map_err(|e| format!("enter transport mode: {e}"))?;
+        .map_err(|e| RelaySessionError::Infra(format!("enter transport mode: {e}")))?;
 
     // Best-effort liveness bump for the operator's device list.
     let now = chrono::Utc::now().timestamp();

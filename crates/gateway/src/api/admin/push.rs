@@ -227,11 +227,32 @@ async fn update_device_apns_token(
         apns_token: apns_token.to_owned(),
         apns_env,
     };
+    // The app re-posts its token on every launch/foreground; skip the vault
+    // rewrite (and the INFO) when nothing changed. Any doubt — no stored
+    // entry, unreadable vault, undecodable bytes — falls open to the write:
+    // rewriting is also the recovery path for a malformed stored registration.
+    let secret_name = crate::push::device_apns_secret_name(&device_id);
+    let stored = state
+        .secret_vault
+        .get_secret(&secret_name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            serde_json::from_slice::<crate::push::DeviceApnsRegistration>(s.as_bytes()).ok()
+        });
+    if stored.as_ref() == Some(&reg) {
+        tracing::debug!(
+            device = %device_id,
+            "push: device re-posted an unchanged APNs token; registration untouched"
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let bytes = serde_json::to_vec(&reg)
         .map_err(|e| GatewayError::Internal(format!("encode APNs registration: {e}")))?;
     state
         .secret_vault
-        .store_secret(&crate::push::device_apns_secret_name(&device_id), &bytes)
+        .store_secret(&secret_name, &bytes)
         .await
         .map_err(|e| GatewayError::Internal(format!("persist APNs registration: {e}")))?;
 

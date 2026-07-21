@@ -1514,17 +1514,45 @@ impl AgentLoop {
                     // A `/stop` mid-call aborts the provider request inside
                     // `call_llm`; never retry it — the turn is unwinding, and
                     // a cancellation can otherwise read as a transient error.
-                    if cancel_token.is_cancelled() || !self.error_handler.should_retry(attempt, &e)
-                    {
+                    // A cancellation is not a failure, so it never logs a
+                    // give-up line.
+                    if cancel_token.is_cancelled() {
+                        return Err(e);
+                    }
+                    if !self.error_handler.should_retry(attempt, &e) {
+                        // Terminal after we already retried at least once:
+                        // record the attempts consumed so the upstream ERROR
+                        // carries the count it otherwise lacks. A first-attempt
+                        // non-retriable error already surfaces upstream as-is.
+                        if attempt > 0 {
+                            warn!(
+                                attempts = attempt,
+                                error = %e,
+                                "giving up on LLM call after retries"
+                            );
+                        }
                         return Err(e);
                     }
                     let backoff = self.error_handler.backoff_duration(attempt);
-                    warn!(
-                        attempt = attempt,
-                        backoff_ms = backoff.as_millis() as u64,
-                        error = %e,
-                        "retrying LLM call after transient error"
-                    );
+                    // One ongoing retry stall re-fires this line every attempt;
+                    // sample it (attempts 0/3/6/9) at warn and keep the rest at
+                    // debug, so a multi-minute backoff stays visible at info
+                    // without flooding it with near-identical lines.
+                    if attempt == 0 || attempt.is_multiple_of(3) {
+                        warn!(
+                            attempt = attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %e,
+                            "retrying LLM call after transient error"
+                        );
+                    } else {
+                        debug!(
+                            attempt = attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %e,
+                            "retrying LLM call after transient error"
+                        );
+                    }
                     // Honour a cancel that arrives during backoff too, so
                     // `/stop` isn't stalled waiting out the sleep.
                     tokio::select! {

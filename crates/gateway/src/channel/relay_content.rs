@@ -197,7 +197,7 @@ pub(crate) fn spawn(state: WsChannelState, shutdown: ShutdownSignal) -> JoinHand
     // and ring, so install aws-lc-rs explicitly before the first dial or
     // connect_async panics. Idempotent — Err means one is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    tracing::info!("relay-content: control manager started");
+    tracing::debug!("relay-content: control manager started");
     tokio::spawn(run(state, shutdown))
 }
 
@@ -250,7 +250,7 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
         if !was_paired {
             tracing::info!(
                 relay = %settings.relay_url,
-                "relay-content: device paired; holding control connection"
+                "relay-content: approved device present; holding control connection"
             );
             was_paired = true;
             consecutive_failures = 0;
@@ -399,7 +399,7 @@ async fn run_once(
         tokio::select! {
             signal = rx.recv() => match signal {
                 Some(ControlSignal::OpenDataLeg { relay_key, class }) => {
-                    tracing::info!(
+                    tracing::debug!(
                         class = ?class,
                         relay_key = %key_tag(&relay_key),
                         "relay-content: OpenDataLeg received; dialing content host leg"
@@ -497,8 +497,15 @@ async fn open_data_leg(
     let url = remote_host_protocol::relay::content_host_url(relay_url, relay_key);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "relay-content: bad data-leg url");
+        // The error stringifies the request URL, which embeds the raw relay_key;
+        // log the sanitized key_tag instead so the credential never reaches a log.
+        Err(_) => {
+            tracing::warn!(
+                class = ?class,
+                relay_key = %key_tag(relay_key),
+                relay = %relay_url,
+                "relay-content: bad data-leg url"
+            );
             return;
         }
     };
@@ -507,7 +514,12 @@ async fn open_data_leg(
             req.headers_mut().insert(REMOTE_API_KEY_HEADER, v);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "relay-content: bad remote_api_key header");
+            tracing::warn!(
+                class = ?class,
+                relay_key = %key_tag(relay_key),
+                error = %e,
+                "relay-content: bad remote_api_key header"
+            );
             return;
         }
     }
