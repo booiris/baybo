@@ -61,7 +61,7 @@ private struct DeckContent: View {
         // promise, dismissal-with-no-choice cancels it.
         .photosPicker(isPresented: $deck.pickerActive, selection: $pickedItem, matching: .images)
         .onChange(of: pickedItem) { _, item in
-            guard let item, let pickId = deck.consumePick() else {
+            guard let item, let pick = deck.consumePick() else {
                 pickedItem = nil
                 return
             }
@@ -69,7 +69,7 @@ private struct DeckContent: View {
             Task {
                 let mime = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
                 let data = (try? await item.loadTransferable(type: Data.self)) ?? nil
-                deck.finishPick(id: pickId, data: data, mime: mime)
+                deck.finishPick(id: pick.id, cardId: pick.cardId, data: data, mime: mime)
             }
         }
         .onChange(of: deck.pickerActive) { _, active in

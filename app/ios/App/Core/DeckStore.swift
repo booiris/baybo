@@ -310,10 +310,10 @@ final class DeckStore: ObservableObject {
     /// `busy`, not accepted. The caller (the `DeckScreen` view, which owns the
     /// `PhotosPickerItem`) loads the bytes and hands them to `finishPick`; the
     /// engine stays free of the PhotosUI type. `nil` if no pick is active.
-    func consumePick() -> String? {
+    func consumePick() -> (id: String, cardId: String)? {
         guard let pick = activePick else { return nil }
         pickChosen = true
-        return pick.id
+        return pick
     }
 
     /// The picker dismissed. Only a dismissal with NOTHING chosen is a cancel;
@@ -328,8 +328,10 @@ final class DeckStore: ObservableObject {
     }
 
     /// Upload the loaded photo bytes and resolve the card's promise with a ref.
-    /// `data == nil` means the transfer failed. Size-checked BEFORE upload.
-    func finishPick(id: String, data: Data?, mime: String) {
+    /// `data == nil` means the transfer failed. Size-checked BEFORE upload. The
+    /// upload carries `cardId` so the gateway stamps the blob `deck:<cardId>`
+    /// (card purge reclaims it) rather than the immortal `device:*`.
+    func finishPick(id: String, cardId: String, data: Data?, mime: String) {
         guard let data else {
             settlePick(id: id, ok: false, refJSON: nil, error: "load failed")
             return
@@ -341,7 +343,8 @@ final class DeckStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let blobId = try await self.client.blobUploadBytes(bytes: data, mimeType: mime)
+                let blobId = try await self.client.deckBlobUploadBytes(
+                    bytes: data, mimeType: mime, cardId: cardId)
                 let ref = PickRef(
                     blobId: blobId, contentType: mime, size: Int64(data.count),
                     name: Self.synthesizedName(mime: mime))

@@ -859,10 +859,11 @@ impl DeckManager {
     /// Best-effort — blob GC is a convenience, never a correctness dependency
     /// (a leftover is dead-but-harmless bytes); `delete()`'s own
     /// `any_live_for_path` still spares a content file shared with another live
-    /// blob, so only this card's own rows go. (Picker uploads carry `device:*`
-    /// and, like every chat attachment, are not reclaimed here.)
+    /// blob, so only this card's own rows go. This reclaims BOTH the service's
+    /// own blobs (`ctx.fetchBlob` / `blobPutFile`) and images a user uploaded
+    /// through this card's picker — the gateway stamps both `deck:<card_id>`.
     async fn reclaim_card_blobs(&self, card_id: &str) {
-        let prefix = format!("deck:{card_id}");
+        let prefix = baybo_store::blob::deck_uploader_identity(card_id);
         let ids = match self.blob.list_ids_by_uploader(&prefix, None).await {
             Ok(ids) => ids,
             Err(e) => {

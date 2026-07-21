@@ -16,15 +16,20 @@ impl GatewayBlobClient for super::DirectHttp {
         &self,
         bytes: Vec<u8>,
         mime_type: String,
+        deck_card: Option<String>,
     ) -> impl std::future::Future<Output = Result<String, String>> + Send + '_ {
         async move {
             let body = bytes::Bytes::from(bytes);
             let expected_hex = blob_helper::bytes_sha256_hex(&body);
-            let resp = self
+            let mut req = self
                 .client()
                 .post(self.url(PATH_BLOBS))
                 .header(reqwest::header::CONTENT_TYPE, mime_type)
-                .body(body.clone())
+                .body(body.clone());
+            if let Some(card_id) = &deck_card {
+                req = req.header(crate::gateway_api::HEADER_DECK_CARD, card_id);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| format!("could not reach Baybo: {e}"))?;

@@ -286,10 +286,14 @@ iframe reload/removal purges the card's pending entries — otherwise a spec-cha
 reload (whose minutes-long `pickBlob` window makes it routine) would resolve the
 wrong promise and then silently eat the new generation's real answer.
 
-Picker uploads keep the gateway's `device:<id>` identity, so — like every chat
-attachment — they are never GC-swept (human-paced uploads are self-limiting). A
-card-scoped `deck-user:` stamp (reclaimed at purge) would need a gateway
-upload-auth change and isn't done.
+A picker upload is stamped `deck:<card_id>`, the same identity a card's service
+produces — so it is **reclaimed at purge** alongside the card's other blobs. The
+device sends the card id on an `x-baybo-deck-card` header (`deck_blob_upload_bytes`
+FFI); the gateway's device-upload arm honors it (`device_upload_identity` in
+`crates/gateway/src/channel/blobs.rs`) in place of the plain `device:<id>` marker.
+The card id is unforgeable by card JS (it comes from the shell's port→card map,
+threaded as `DeckStore.activePick.cardId`); the gateway does not validate the
+card exists, since the identity is a GC/diagnostic marker, never an access gate.
 
 ### Share
 
@@ -308,7 +312,8 @@ deliberately." Purge deletes the card's `deck:<card_id>` blobs
 blobs are never in range); it runs after the row + snapshots are gone, and
 `delete()`'s own `any_live_for_path` (an indexed PK-range check on the digest,
 not a full-table scan) still spares a content file shared with another live blob.
-Picker uploads carry `device:*` and, like chat attachments, are not reclaimed.
+This covers both the service's own blobs and images a user uploaded through the
+card's picker — the gateway stamps both `deck:<card_id>` (see §Upload).
 
 There is **no timed sweep**. A machine-paced card that fetches a *new* image
 every tick — rather than reusing the blob id for unchanged content, the SDK's

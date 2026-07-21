@@ -65,8 +65,13 @@ impl GatewayJsonClient for ActiveGatewayClient {
 }
 
 impl GatewayBlobClient for ActiveGatewayClient {
-    async fn upload_blob(&self, bytes: Vec<u8>, mime_type: String) -> Result<String, String> {
-        forward!(self, c => c.upload_blob(bytes, mime_type))
+    async fn upload_blob(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: String,
+        deck_card: Option<String>,
+    ) -> Result<String, String> {
+        forward!(self, c => c.upload_blob(bytes, mime_type, deck_card))
     }
 
     async fn download_blob(

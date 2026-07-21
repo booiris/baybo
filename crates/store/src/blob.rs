@@ -27,6 +27,19 @@ pub type BlobReader = Pin<Box<dyn AsyncRead + Send>>;
 /// `u64`).
 pub const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
 
+/// Uploader-identity prefix stamped on every deck-owned blob: those a card's
+/// service produces (`ctx.fetchBlob` / `blobPutFile`) and those a user uploads
+/// through a card's picker. The single source of truth for the string — deck
+/// and the gateway both stamp it, deck GC targets it (see
+/// [`deck_uploader_identity`] and [`BlobStore::list_ids_by_uploader`]).
+pub const DECK_UPLOADER_PREFIX: &str = "deck:";
+
+/// The `uploader_identity` for a blob owned by deck card `card_id`
+/// (`deck:<card_id>`). Card purge reclaims exactly this identity.
+pub fn deck_uploader_identity(card_id: &str) -> String {
+    format!("{DECK_UPLOADER_PREFIX}{card_id}")
+}
+
 /// Algorithm prefix on every minted `BlobRef::blob_id`. Re-exported from
 /// [`baybo_model`] (its single source of truth, next to `BlobRef`) so existing
 /// `baybo_store::SHA256_PREFIX` / `baybo_store::blob::SHA256_PREFIX` callers are

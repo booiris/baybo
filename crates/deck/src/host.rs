@@ -21,7 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::process::Command;
 
 use baybo_security::{PlaceholderMinter, SecretVault};
-use baybo_store::blob::MAX_BLOB_BYTES;
+use baybo_store::blob::{MAX_BLOB_BYTES, deck_uploader_identity};
 use baybo_store::{BlobStore, ByteStream};
 
 use crate::service::{
@@ -71,12 +71,6 @@ pub(crate) struct DeckHost {
     /// `<deck_root>/tmux-socks` — each card's `DECK_TMUX_DIR_ENV` is a
     /// subdir of this keyed by card id.
     tmux_socks_root: PathBuf,
-}
-
-/// The `uploader_identity` stamped on every deck-produced blob: a stable,
-/// greppable prefix so purge/GC can target `deck:*` and never a chat blob.
-fn deck_identity(card_id: &str) -> String {
-    format!("deck:{card_id}")
 }
 
 impl DeckHost {
@@ -309,7 +303,7 @@ impl DeckHost {
                 .put_stream(
                     boxed,
                     &content_type,
-                    Some(&deck_identity(uploader_card_id)),
+                    Some(&deck_uploader_identity(uploader_card_id)),
                     MAX_BLOB_BYTES as u64,
                 )
                 .await
@@ -526,7 +520,7 @@ impl HostServices for DeckHost {
             .put_stream(
                 boxed,
                 &content_type,
-                Some(&deck_identity(uploader_card_id)),
+                Some(&deck_uploader_identity(uploader_card_id)),
                 MAX_BLOB_BYTES as u64,
             )
             .await

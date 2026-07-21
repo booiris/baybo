@@ -821,7 +821,24 @@ impl BayboClient {
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;
-            gateway_api::upload_bytes(&client, bytes, mime_type).await
+            gateway_api::upload_bytes(&client, bytes, mime_type, None).await
+        })
+        .await
+    }
+
+    /// Like [`Self::blob_upload_bytes`], but for an image a user picked inside a
+    /// deck card. The upload carries `card_id` so the gateway stamps the blob
+    /// `deck:<card_id>` instead of `device:<id>` — card purge then reclaims it,
+    /// where a plain device upload lives forever like a chat attachment.
+    pub async fn deck_blob_upload_bytes(
+        self: Arc<Self>,
+        bytes: Vec<u8>,
+        mime_type: String,
+        card_id: String,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::upload_bytes(&client, bytes, mime_type, Some(card_id)).await
         })
         .await
     }

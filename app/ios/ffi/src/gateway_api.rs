@@ -68,11 +68,20 @@ pub(crate) trait GatewayJsonClient {
     ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'a;
 }
 
+/// Sent by a companion device when the upload is a deck card's picker choice:
+/// the gateway stamps the blob `deck:<card_id>` (not `device:<id>`) so card
+/// purge reclaims it. Wire contract mirrored in the gateway's
+/// `crates/gateway/src/channel/blobs.rs`.
+pub(crate) const HEADER_DECK_CARD: &str = "x-baybo-deck-card";
+
 pub(crate) trait GatewayBlobClient {
+    /// `deck_card = Some(card_id)` for a deck picker upload (stamps
+    /// `deck:<card_id>`); `None` for an ordinary chat attachment.
     fn upload_blob(
         &self,
         bytes: Vec<u8>,
         mime_type: String,
+        deck_card: Option<String>,
     ) -> impl Future<Output = Result<String, String>> + Send + '_;
 
     fn download_blob(
@@ -815,8 +824,9 @@ pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
     client: &C,
     bytes: Vec<u8>,
     mime_type: String,
+    deck_card: Option<String>,
 ) -> Result<String, String> {
-    client.upload_blob(bytes, mime_type).await
+    client.upload_blob(bytes, mime_type, deck_card).await
 }
 
 pub(crate) async fn download_blob_bytes<C: GatewayBlobClient + Sync>(
