@@ -50,17 +50,18 @@ struct DeckStoreTests {
     }
 
     @Test func pickStaysBusyThroughUploadThenFreesOnSettle() async throws {
-        // FakeBayboClient.blobUploadBytes throws, so finishPick settles failed.
+        // FakeBayboClient.deckBlobUploadBytes throws, so finishPick settles failed.
         let store = makeStore(FakeBayboClient())
         store.requestPick(id: "a", cardId: "c1", accept: nil)
-        #expect(store.consumePick() == "a")  // photo chosen; upload about to run
+        // Photo chosen; upload about to run. consumePick returns (id, cardId).
+        #expect(store.consumePick()?.id == "a")
         // A concurrent request DURING the upload window is rejected busy — the
         // slot must stay held until the pick settles, not freed on selection.
         store.requestPick(id: "b", cardId: "c1", accept: nil)
         #expect(store.lastPickResult?.id == "b")
         #expect(store.lastPickResult?.error == "busy")
         // The upload settles → the slot frees.
-        store.finishPick(id: "a", data: Data([1, 2, 3]), mime: "image/png")
+        store.finishPick(id: "a", cardId: "c1", data: Data([1, 2, 3]), mime: "image/png")
         try await Task.sleep(nanoseconds: 40_000_000)
         // A new pick is now accepted (presents), not busy-rejected.
         store.requestPick(id: "d", cardId: "c1", accept: nil)

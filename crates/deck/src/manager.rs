@@ -365,15 +365,51 @@ impl DeckManager {
         if live >= MAX_CARDS {
             return Err(DeckError::DeckFull(MAX_CARDS));
         }
-        let bundle = load_bundle(staged_dir)?;
         // Mint the card id BEFORE the gate so a blob the gate's refresh op
         // produces is stamped `deck:<real-id>` (reclaimable), not a throwaway
         // gate identity that would leak. See `docs/modules/deck.md` §Blobs.
         let card_id = uuid::Uuid::new_v4().to_string();
-        let first = self.dry_run(&bundle, &card_id).await?;
+        // Gate → materialize → commit the row is the pre-create window: the gate
+        // may stamp `deck:<card_id>` blobs before any row owns them, and purge
+        // only reclaims a live/binned card — so a failure here (bad snapshot,
+        // timeout, fs/db error) would orphan up to 100 MiB per failed attempt.
+        // Reclaim on that path; once the row is committed the card owns the blobs
+        // and purge takes over, so post-row failures below do NOT reclaim.
+        let (installed, first) = match self.install_commit_row(staged_dir, &card_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.reclaim_card_blobs(&card_id).await;
+                return Err(e);
+            }
+        };
 
-        let dest = self.bundle_dir(&card_id);
-        self.materialize(staged_dir, &card_id, &dest)?;
+        let text = first.to_string();
+        let seq = self
+            .store
+            .record_snapshot(&card_id, &text, None, Utc::now())
+            .await?;
+        self.events.card_data(&card_id, seq, &text);
+
+        self.start_service(&card_id, &installed).await?;
+        self.events.deck_changed();
+        self.row_view(&card_id).await
+    }
+
+    /// The pre-create half of [`Self::install`]: run the dry-run gate,
+    /// materialize the bundle under the deck root, and commit the card row.
+    /// Returns the reloaded bundle + the gate's first snapshot. It fails iff no
+    /// row was committed — the caller reclaims the card's gate-stamped blobs on
+    /// exactly that path.
+    async fn install_commit_row(
+        &self,
+        staged_dir: &Path,
+        card_id: &str,
+    ) -> Result<(DeckBundle, Value)> {
+        let bundle = load_bundle(staged_dir)?;
+        let first = self.dry_run(&bundle, card_id).await?;
+
+        let dest = self.bundle_dir(card_id);
+        self.materialize(staged_dir, card_id, &dest)?;
         // Reload from the final dir so spec_hash covers the stamped manifest.
         let installed = load_bundle(&dest)?;
 
@@ -387,7 +423,7 @@ impl DeckManager {
             .unwrap_or(-1)
             + 1;
         let row = DeckCardRow {
-            id: card_id.clone(),
+            id: card_id.to_string(),
             title: installed.manifest.title.clone(),
             position,
             size: installed.manifest.size,
@@ -401,25 +437,15 @@ impl DeckManager {
             created_at: Utc::now(),
         };
         self.store.create(&row).await?;
-        provenance("install", &card_id, &installed.spec_hash);
+        provenance("install", card_id, &installed.spec_hash);
         self.commit_bundle(
-            &card_id,
+            card_id,
             &installed.manifest.title,
             "install",
             &installed.spec_hash,
         )
         .await;
-
-        let text = first.to_string();
-        let seq = self
-            .store
-            .record_snapshot(&card_id, &text, None, Utc::now())
-            .await?;
-        self.events.card_data(&card_id, seq, &text);
-
-        self.start_service(&card_id, &installed).await?;
-        self.events.deck_changed();
-        self.row_view(&card_id).await
+        Ok((installed, first))
     }
 
     /// Replace an existing card's bundle. Preserves the row's title /

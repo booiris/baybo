@@ -267,16 +267,18 @@ impl DeckHost {
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .ok_or("fetchBlob: redirect without a Location header")?;
-                let prev_host = url.host_str().map(|h| h.to_ascii_lowercase());
+                let prev_origin = url.origin();
                 url = url
                     .join(loc)
                     .map_err(|e| format!("fetchBlob: bad redirect target: {e}"))?;
-                // Cross-host redirect: drop credential-bearing headers before the
+                // Cross-ORIGIN redirect: drop credential-bearing headers before the
                 // next hop (matches reqwest's automatic cross-origin stripping,
-                // which the manual follow above bypasses). A presigned-CDN target
-                // (the common release-asset case) carries its auth in the query,
-                // not a header, so this doesn't break it.
-                if url.host_str().map(|h| h.to_ascii_lowercase()) != prev_host {
+                // which the manual follow above bypasses). Compare the full origin
+                // — scheme + host + port — so an https→http downgrade or a hop to a
+                // different port (another service) strips too, not only a different
+                // host. A presigned-CDN target (the common release-asset case)
+                // carries its auth in the query, not a header, so this is fine.
+                if url.origin() != prev_origin {
                     headers.retain(|(name, _)| !sensitive.contains(&name.to_ascii_lowercase()));
                 }
                 hops += 1;

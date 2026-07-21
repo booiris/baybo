@@ -236,6 +236,51 @@ async fn purge_reclaims_the_cards_blobs() {
     h.manager.shutdown().await;
 }
 
+/// The gate's refresh op stamps a `deck:<card_id>` blob, then returns null so
+/// the gate REJECTS the install. The blob must not orphan — `install` reclaims
+/// it on the pre-create failure path (no row ever owns it, so purge never would).
+const BLOB_THEN_FAIL_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    await ctx.exec("printf 'orphan' > out.bin");
+    await ctx.blobPutFile("out.bin", "application/octet-stream");
+    return null; // null snapshot → the gate fails the install
+  },
+};
+"#;
+
+#[tokio::test]
+async fn failed_install_reclaims_the_gate_blobs() {
+    let Some(h) = harness_or_skip("failed_install_reclaims_the_gate_blobs").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_THEN_FAIL_SERVICE);
+
+    let before = h
+        .blob
+        .list_ids_by_uploader("deck:", None)
+        .await
+        .unwrap()
+        .len();
+    let result = h.manager.install(staged.path()).await;
+    assert!(result.is_err(), "a null snapshot must fail the install");
+
+    // No deck blob leaked: the gate's blob was reclaimed on the failure path.
+    let after = h
+        .blob
+        .list_ids_by_uploader("deck:", None)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after, before,
+        "a failed install must not orphan a deck blob"
+    );
+
+    h.manager.shutdown().await;
+}
+
 const TMUX_DIR_SERVICE: &str = r#"
 export const ops = {
   refresh: async (_p, ctx) => {
