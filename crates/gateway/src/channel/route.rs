@@ -761,17 +761,27 @@ async fn resolve_inbound_session(
         }
         ChannelKind::Multiplexed => {
             // A misbuilt sidecar that always sets session_id would otherwise warn
-            // on every inbound message; the condition is permanent, so warn once
-            // per connection with the attach identity of the offender.
-            if !wire_msg.session_id.as_str().is_empty()
-                && sidecar.first_session_id_on_multiplexed_offence()
-            {
-                tracing::warn!(
-                    %channel_type,
-                    connection_id = %sidecar.connection_id(),
-                    bot_id = %wire_msg.bot_id,
-                    "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
-                );
+            // on every inbound message; the condition is a permanent client
+            // misbuild, so the first offence process-wide warns with the
+            // offender's attach identity and the rest stay at debug.
+            if !wire_msg.session_id.as_str().is_empty() {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        %channel_type,
+                        connection_id = %sidecar.connection_id(),
+                        bot_id = %wire_msg.bot_id,
+                        "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                    );
+                } else {
+                    tracing::warn!(
+                        %channel_type,
+                        connection_id = %sidecar.connection_id(),
+                        bot_id = %wire_msg.bot_id,
+                        "Multiplexed channel sidecar supplied session_id on Message; ignoring (resolver is canonical)",
+                    );
+                }
             }
             if wire_msg.user_id.is_empty() {
                 tracing::warn!(
