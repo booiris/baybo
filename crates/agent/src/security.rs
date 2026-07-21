@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use baybo_security::{
@@ -278,51 +278,32 @@ impl SecurityGateway {
     }
 
     fn log_injection_warnings(&self, source: &'static str, text: &str) {
-        let warnings = self.injection_detector.scan(text);
-        if warnings.is_empty() {
-            return;
-        }
-        for w in &warnings {
-            match w.severity {
-                InjectionSeverity::Critical | InjectionSeverity::High => {
-                    tracing::warn!(
-                        source,
-                        rule = %w.rule_name,
-                        severity = ?w.severity,
-                        "prompt-injection marker detected"
-                    );
-                }
-                InjectionSeverity::Medium => {
-                    tracing::info!(
-                        source,
-                        rule = %w.rule_name,
-                        severity = ?w.severity,
-                        "prompt-injection marker detected"
-                    );
-                }
-                InjectionSeverity::Low => {
-                    tracing::debug!(
-                        source,
-                        rule = %w.rule_name,
-                        severity = ?w.severity,
-                        "prompt-injection marker detected"
-                    );
-                }
-            }
-        }
+        let mut summary = InjectionSummary::default();
+        summary.add(&self.injection_detector.scan(text));
+        summary.emit(source);
     }
 
     fn log_injection_warnings_in_value(&self, source: &'static str, value: &serde_json::Value) {
+        let mut summary = InjectionSummary::default();
+        self.accumulate_injection_warnings(value, &mut summary);
+        summary.emit(source);
+    }
+
+    fn accumulate_injection_warnings(
+        &self,
+        value: &serde_json::Value,
+        summary: &mut InjectionSummary,
+    ) {
         match value {
-            serde_json::Value::String(s) => self.log_injection_warnings(source, s),
+            serde_json::Value::String(s) => summary.add(&self.injection_detector.scan(s)),
             serde_json::Value::Array(items) => {
                 for item in items {
-                    self.log_injection_warnings_in_value(source, item);
+                    self.accumulate_injection_warnings(item, summary);
                 }
             }
             serde_json::Value::Object(map) => {
-                for (_, v) in map {
-                    self.log_injection_warnings_in_value(source, v);
+                for v in map.values() {
+                    self.accumulate_injection_warnings(v, summary);
                 }
             }
             _ => {}
@@ -532,6 +513,73 @@ struct Mint {
     placeholder: String,
     original: String,
     rule_name: String,
+}
+
+/// Per-payload accumulator that folds every injection-scanner hit for one
+/// sanitized value into a single tracing event. Detection is log-only and
+/// the hot rules fire once per match occurrence; emitting per-occurrence
+/// floods the security channel (hundreds of identical lines per output), so
+/// we collapse to one line carrying every rule, its occurrence count, and the
+/// max severity — lossless for the operator, one event instead of a burst.
+#[derive(Default)]
+struct InjectionSummary {
+    counts: BTreeMap<String, usize>,
+    max_severity: Option<InjectionSeverity>,
+}
+
+impl InjectionSummary {
+    fn add(&mut self, warnings: &[InjectionWarning]) {
+        for w in warnings {
+            *self.counts.entry(w.rule_name.clone()).or_insert(0) += 1;
+            self.max_severity = Some(
+                self.max_severity
+                    .map_or(w.severity, |cur| cur.max(w.severity)),
+            );
+        }
+    }
+
+    /// Grep-able `rule:count` list in stable (BTreeMap) key order, e.g.
+    /// `exec_call:143,forged_tool_output:2`.
+    fn rules_summary(&self) -> String {
+        self.counts
+            .iter()
+            .map(|(rule, count)| format!("{rule}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn emit(&self, source: &'static str) {
+        let Some(max_severity) = self.max_severity else {
+            return;
+        };
+        let rules = self.rules_summary();
+        match max_severity {
+            InjectionSeverity::Critical | InjectionSeverity::High => {
+                tracing::warn!(
+                    source,
+                    rules = %rules,
+                    severity = ?max_severity,
+                    "prompt-injection markers detected"
+                );
+            }
+            InjectionSeverity::Medium => {
+                tracing::info!(
+                    source,
+                    rules = %rules,
+                    severity = ?max_severity,
+                    "prompt-injection markers detected"
+                );
+            }
+            InjectionSeverity::Low => {
+                tracing::debug!(
+                    source,
+                    rules = %rules,
+                    severity = ?max_severity,
+                    "prompt-injection markers detected"
+                );
+            }
+        }
+    }
 }
 
 fn sanitize_string(
@@ -1089,5 +1137,33 @@ mod tests {
     fn detect_injection_clean_text() {
         let (gw, _) = make_gateway();
         assert!(gw.detect_injection("Please list the files.").is_empty());
+    }
+
+    #[test]
+    fn injection_summary_folds_occurrences_into_one_event() {
+        let (gw, _) = make_gateway();
+        let mut summary = InjectionSummary::default();
+        // exec_call fires 3x and eval_call once (both Medium after the demotion);
+        // the null byte is Critical and must dominate the aggregate severity.
+        summary.add(&gw.detect_injection("exec(a) exec(b) exec(c) eval(d) \0"));
+
+        assert_eq!(summary.counts.get("exec_call"), Some(&3));
+        assert_eq!(summary.counts.get("eval_call"), Some(&1));
+        assert_eq!(summary.counts.get("null_byte"), Some(&1));
+        assert_eq!(summary.max_severity, Some(InjectionSeverity::Critical));
+        // Stable BTreeMap ordering keeps the grep-able summary deterministic.
+        assert_eq!(
+            summary.rules_summary(),
+            "eval_call:1,exec_call:3,null_byte:1"
+        );
+    }
+
+    #[test]
+    fn injection_summary_empty_when_clean() {
+        let (gw, _) = make_gateway();
+        let mut summary = InjectionSummary::default();
+        summary.add(&gw.detect_injection("Please list the files."));
+        assert!(summary.max_severity.is_none());
+        assert!(summary.rules_summary().is_empty());
     }
 }

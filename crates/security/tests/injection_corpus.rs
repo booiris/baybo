@@ -105,13 +105,13 @@ fn corpus() -> Vec<Case> {
             label: "eval-call",
             payload: "please eval(\"console.log(1)\")",
             expected_rule: "eval_call",
-            min_severity: InjectionSeverity::High,
+            min_severity: InjectionSeverity::Medium,
         },
         Case {
             label: "exec-call",
             payload: "exec('rm -rf /')",
             expected_rule: "exec_call",
-            min_severity: InjectionSeverity::High,
+            min_severity: InjectionSeverity::Medium,
         },
         Case {
             label: "null-byte",

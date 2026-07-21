@@ -512,21 +512,33 @@ Keys (all established at pairing — see
    C verifies `device_id == device-<hex(D_pub)>`, the delegation under `D_pub`, the
    register signature under `G_pub`, and `counter` strictly above the device's last
    accepted; on success it stores `device_id -> { apns_token, env, gateway_pubkey,
-   last_counter }`. Any failure → `403`, binding untouched. A caches the
-   last-registered token per device and re-registers at most once per
-   `(device, token)` per run — **except** that a `/notify` answered `404`
-   (C has no binding for the device, e.g. it restarted and lost its in-memory
-   store) invalidates that cache entry, forces a re-register from persisted
-   material, and retries the push once. So a remote-host restart self-heals on the
-   next push instead of wedging at `404` until A restarts or the token rotates. If
-   the device is still unknown after that re-register (missing delegation/APNs
-   material), A logs a warning rather than failing silently.
+   last_counter }`. Any failure → `403`, binding untouched. Because C re-derives
+   `D_pub` from the id, A's dispatcher drops any fan-out target whose `device_id`
+   is not self-certifying (e.g. material persisted under a retired id prefix)
+   before dialing at all — such a binding can never register or notify, so it is
+   excluded (one INFO summary per process, per-target detail at debug) and its
+   vault rows stay in place, inert, until the device pairs or registers again.
+   A caches the last-registered token per device and registers at most once per
+   `(device, token)` per run, tracking the outcome (registered / skipped for
+   missing material / rejected by C). A `/notify` answered `404` (C has no
+   binding for the device, e.g. it restarted and lost its in-memory store)
+   invalidates that cache entry, forces a re-register from persisted material,
+   and retries the push once — **but only when a register had actually landed
+   this run**: after a skipped or rejected register the retry would `404`
+   identically, so A surfaces a single per-target warning (carrying the register
+   outcome) instead of re-dialing. A remote-host restart therefore still
+   self-heals on the next push, while a binding C rejects cannot double its
+   round-trips or its log lines.
 4. **Token refresh.** A token that missed `DeviceHello`, or rotated after pairing,
    reaches A through the device API: P sends its current token with
    `POST /v1/mobile/apns-token`. A authenticates the device principal and
    persists it (`device.<device_id>.apns`); because the cached token now differs,
    the dispatcher re-registers (signed, as in step 3) on its next push — no
-   re-pair.
+   re-pair. The app re-posts its token on every launch/foreground, so a POST
+   whose token+env match the stored registration is a no-op: no vault rewrite,
+   no log line above debug. Anything short of a byte-identical stored entry
+   (absent, unreadable, undecodable, or differing) falls open to the write,
+   which doubles as the recovery path for malformed stored material.
 5. **Pruning.** When APNs rejects a token (`400`/`410`), C unbinds it (the device
    row on A is never touched); a later push re-registers from A's persisted material.
 
