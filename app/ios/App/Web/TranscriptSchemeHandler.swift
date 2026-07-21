@@ -98,14 +98,6 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             URLComponents(url: url, resolvingAgainstBaseURL: false)?
             .queryItems?.first(where: { $0.name == "ct" })?.value
             ?? "application/octet-stream"
-
-        // Validate the capability shape before it leaves the device (and before
-        // any network): a malformed id can never resolve, so fail it here rather
-        // than sending a free-form tail to the gateway.
-        guard Self.isValidBlobId(blobId) else {
-            task.didFailWithError(URLError(.badURL))
-            return
-        }
         let id = ObjectIdentifier(task)
         liveTasks.insert(id)
         Task { await serveBlob(url: url, task: task, id: id, blobId: blobId, contentType: contentType) }
@@ -114,65 +106,39 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
     private func serveBlob(
         url: URL, task: WKURLSchemeTask, id: ObjectIdentifier, blobId: String, contentType: String
     ) async {
-        // Preflight the cached size (a stat, no read): refuse an over-cap blob
-        // WITHOUT pulling it into memory. Only read/download when it's within
-        // the cap, or not cached (the download path is still guarded post-hoc
-        // below — it materializes once, then this stat guards every re-serve).
-        let cachedSize = await Baybo.client.blobCachedSize(blobId: blobId)
-        let overCap = cachedSize.map { $0 > UInt64(Self.blobServeCap) } ?? false
-        // Cache-first: a cached blob needs no binding, so a card image renders
-        // even while unbound/offline. Fall back to a full (leg-bound) download
-        // only on a miss.
-        var data: Data?
-        if !overCap {
-            data = await Baybo.client.blobReadCached(blobId: blobId)
-            if data == nil {
-                data = try? await Baybo.client.blobDownloadBytes(blobId: blobId, progress: nil)
-            }
-        }
-        // Back on the main actor after the awaits: confirm-and-consume the task
+        // The core owns the serve: id-shape validation, cache-first read (no
+        // binding — a cached image renders offline/unbound), leg-bound download
+        // on a miss, and the display cap (an over-cap cached blob is refused by
+        // its stat, never read). We only adapt the outcome to WebKit.
+        let outcome = await Baybo.client.blobBytesForDisplay(
+            blobId: blobId, maxBytes: UInt64(Self.blobServeCap))
+        // Back on the main actor after the await: confirm-and-consume the task
         // in one step. `nil` means `stop` already fired — do not touch it.
         guard liveTasks.remove(id) != nil else { return }
-        if overCap {
+        switch outcome {
+        case .bytes(let data):
+            let headers = [
+                "Content-Type": contentType,
+                "Access-Control-Allow-Origin": "*",
+                "Content-Length": String(data.count),
+            ]
+            guard
+                let response = HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
+            else {
+                task.didFailWithError(URLError(.badServerResponse))
+                return
+            }
+            task.didReceive(response)
+            task.didReceive(data)
+            task.didFinish()
+        case .overCap:
             task.didFailWithError(URLError(.dataLengthExceedsMaximum))
-            return
-        }
-        guard let data else {
+        case .badId:
+            task.didFailWithError(URLError(.badURL))
+        case .notFound:
             task.didFailWithError(URLError(.resourceUnavailable))
-            return
         }
-        guard data.count <= Self.blobServeCap else {
-            task.didFailWithError(URLError(.dataLengthExceedsMaximum))
-            return
-        }
-        let headers = [
-            "Content-Type": contentType,
-            "Access-Control-Allow-Origin": "*",
-            "Content-Length": String(data.count),
-        ]
-        guard
-            let response = HTTPURLResponse(
-                url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
-        else {
-            task.didFailWithError(URLError(.badServerResponse))
-            return
-        }
-        task.didReceive(response)
-        task.didReceive(data)
-        task.didFinish()
-    }
-
-    /// `sha256:<64 lowercase hex>.<≥1 lowercase hex read token>` — the blob
-    /// capability id shape minted by the store. Anything else is rejected.
-    private static func isValidBlobId(_ id: String) -> Bool {
-        let prefix = "sha256:"
-        guard id.hasPrefix(prefix), let dot = id.firstIndex(of: ".") else { return false }
-        let digest = id[id.index(id.startIndex, offsetBy: prefix.count)..<dot]
-        let token = id[id.index(after: dot)...]
-        func isLowerHex(_ s: Substring) -> Bool {
-            !s.isEmpty && s.allSatisfy { $0.isNumber || ("a"..."f").contains($0) }
-        }
-        return digest.count == 64 && isLowerHex(digest) && isLowerHex(token)
     }
 
     private static func mimeType(for ext: String) -> String {

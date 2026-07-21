@@ -31,9 +31,9 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo,
-    DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink, MessageLookup,
-    PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
+    BlobServeOutcome, ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary,
+    DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink,
+    MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -871,6 +871,53 @@ impl BayboClient {
         .await
     }
 
+    /// One-shot deck-display serve (`baybo-transcript://…/blob/<id>`): validate
+    /// the id shape, then return cache-first bytes under `max_bytes`. Collapses
+    /// the scheme handler's shape check + cache stat + cache read + leg-bound
+    /// download + display-cap decisions into a single call so
+    /// `TranscriptSchemeHandler` stays a thin WebKit adapter. An over-cap CACHED
+    /// blob is refused by its stat (never read); an over-cap DOWNLOADED blob is
+    /// materialized once, then refused. Never throws — every terminal state is a
+    /// [`BlobServeOutcome`] the handler maps to a scheme-task response.
+    pub async fn blob_bytes_for_display(
+        self: Arc<Self>,
+        blob_id: String,
+        max_bytes: u64,
+    ) -> BlobServeOutcome {
+        runtime::run(async move {
+            if !blob_helper::is_valid_blob_id_shape(&blob_id) {
+                return Ok::<_, String>(BlobServeOutcome::BadId);
+            }
+            // Cache-first (no network, no binding): the stat refuses an over-cap
+            // cached blob without reading it; otherwise serve the cached bytes.
+            if let Some(size) = blob_helper::cached_size(&blob_id).await {
+                if size > max_bytes {
+                    return Ok(BlobServeOutcome::OverCap);
+                }
+                if let Some(data) = blob_helper::read_cached_bytes(&blob_id).await {
+                    return Ok(BlobServeOutcome::Bytes { data });
+                }
+            }
+            // Miss → leg-bound download; unbound/offline just can't render yet.
+            let downloaded = match active_leg() {
+                Ok(ActiveLeg::Direct) => {
+                    direct::download_blob_bytes(&self.direct, blob_id, None).await
+                }
+                Ok(ActiveLeg::Relay) => {
+                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id, None).await
+                }
+                Err(_) => return Ok(BlobServeOutcome::NotFound),
+            };
+            Ok(match downloaded {
+                Ok(data) if data.len() as u64 > max_bytes => BlobServeOutcome::OverCap,
+                Ok(data) => BlobServeOutcome::Bytes { data },
+                Err(_) => BlobServeOutcome::NotFound,
+            })
+        })
+        .await
+        .unwrap_or(BlobServeOutcome::NotFound)
+    }
+
     /// Is this blob already in the on-device cache? Never downloads, never
     /// touches the network. The cache lives under the OS temp dir, which iOS
     /// purges under storage pressure — re-ask rather than remembering a `true`.
@@ -890,15 +937,6 @@ impl BayboClient {
     /// full download.
     pub async fn blob_read_cached(self: Arc<Self>, blob_id: String) -> Option<Vec<u8>> {
         runtime::run(async move { Ok::<_, String>(blob_helper::read_cached_bytes(&blob_id).await) })
-            .await
-            .unwrap_or(None)
-    }
-
-    /// Size of a cached blob without reading it (a `stat`). The deck display
-    /// route preflights this to refuse an over-cap blob before pulling it into
-    /// memory. `None` when the id is malformed or not cached.
-    pub async fn blob_cached_size(self: Arc<Self>, blob_id: String) -> Option<u64> {
-        runtime::run(async move { Ok::<_, String>(blob_helper::cached_size(&blob_id).await) })
             .await
             .unwrap_or(None)
     }

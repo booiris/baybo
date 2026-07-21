@@ -223,15 +223,18 @@ synchronous `deck.blobUrl(ref | id, ct?)` that composes
 canonically encoded — WebKit keys its memory cache on the full URL). Point an
 `<img>` at it. The app's `TranscriptSchemeHandler` (deck webview only — a
 `blobRouteEnabled` init flag) serves the `/blob/` route ahead of the bundle-file
-fallthrough, **cache-first**: `blob_read_cached` reads the content-addressed
-device cache with no network and no active binding (so a cached image renders
-offline / unbound), falling back to `blob_download_bytes` on a miss.
-`Content-Type` comes from `?ct=`, `Content-Length` is set, the id's shape is
-validated before it leaves the device, and a `blob_cached_size` stat refuses an
-over-cap cached blob (8 MiB serve cap) without reading it. That 8 MiB cap is a
-hard **display** ceiling: a service can store up to `MAX_BLOB_BYTES` (100 MiB)
-via `fetchBlob` / `blobPutFile`, but only a blob ≤8 MiB is displayable — a larger
-one stores fine and the `<img>` just fails.
+fallthrough. The serve logic lives in **one FFI call** —
+`blob_bytes_for_display(blob_id, max_bytes) → BlobServeOutcome` — so the handler
+stays a thin WebKit adapter. The core validates the id shape, reads the
+content-addressed device cache **cache-first** (no network, no binding — a cached
+image renders offline / unbound), downloads leg-bound on a miss, and enforces the
+display cap (an over-cap *cached* blob is refused by its stat, never read; an
+over-cap *downloaded* blob is materialized once, then refused). Swift maps the
+outcome (`Bytes` / `OverCap` / `NotFound` / `BadId`) to the `WKURLSchemeTask`
+response, filling `Content-Type` from `?ct=` and `Content-Length`. That 8 MiB cap
+is a hard **display** ceiling: a service can store up to `MAX_BLOB_BYTES`
+(100 MiB) via `fetchBlob` / `blobPutFile`, but only a blob ≤8 MiB is displayable —
+a larger one stores fine and the `<img>` just fails.
 
 That this WebKit path works at all was not answerable from code — whether a
 sandboxed opaque-origin `srcdoc` iframe's `<img>` subresource reaches the
