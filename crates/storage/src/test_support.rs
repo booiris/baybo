@@ -32,6 +32,7 @@ pub struct MemoryBlobStore {
 struct MemoryBlob {
     bytes: Vec<u8>,
     mime_type: String,
+    uploader_identity: Option<String>,
     created_at: i64,
     last_accessed_at: i64,
     read_token: String,
@@ -70,7 +71,7 @@ impl BlobStore for MemoryBlobStore {
         &self,
         bytes: &[u8],
         mime_type: &str,
-        _uploader_identity: Option<&str>,
+        uploader_identity: Option<&str>,
     ) -> BlobResult<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -88,11 +89,30 @@ impl BlobStore for MemoryBlobStore {
             .or_insert(MemoryBlob {
                 bytes: bytes.to_vec(),
                 mime_type: mime_type.to_owned(),
+                uploader_identity: uploader_identity.map(str::to_owned),
                 created_at: now,
                 last_accessed_at: now,
                 read_token,
             });
         Ok(BlobRef { blob_id })
+    }
+
+    async fn list_ids_by_uploader(
+        &self,
+        prefix: &str,
+        older_than_us: Option<i64>,
+    ) -> BlobResult<Vec<String>> {
+        let guard = self.blobs.lock();
+        Ok(guard
+            .iter()
+            .filter(|(_, b)| {
+                b.uploader_identity
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(prefix))
+                    && older_than_us.is_none_or(|cut| b.created_at < cut)
+            })
+            .map(|(id, _)| id.clone())
+            .collect())
     }
 
     async fn put_stream(

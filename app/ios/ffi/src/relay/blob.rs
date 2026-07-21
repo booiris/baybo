@@ -114,9 +114,14 @@ async fn download_to_path(
     }
 }
 
-async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, String> {
+async fn upload_bytes(
+    bytes: Vec<u8>,
+    mime_type: String,
+    deck_card: Option<String>,
+) -> Result<String, String> {
     let expected_hex = blob_helper::bytes_sha256_hex(&bytes);
-    let blob_id = upload_bytes_over_tunnel(&bytes, &mime_type, &expected_hex).await?;
+    let blob_id =
+        upload_bytes_over_tunnel(&bytes, &mime_type, &expected_hex, deck_card.as_deref()).await?;
     blob_helper::cache_uploaded_bytes_best_effort(&expected_hex, &bytes).await;
     Ok(blob_id)
 }
@@ -125,6 +130,7 @@ async fn upload_bytes_over_tunnel(
     bytes: &[u8],
     mime_type: &str,
     expected_hex: &str,
+    deck_card: Option<&str>,
 ) -> Result<String, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
@@ -132,15 +138,22 @@ async fn upload_bytes_over_tunnel(
     let mut leg =
         dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
+    let mut headers = vec![
+        TunnelHeader::new(HEADER_CONTENT_TYPE, mime_type),
+        TunnelHeader::new(HEADER_CONTENT_LENGTH, size.to_string()),
+        TunnelHeader::new(HEADER_CONTENT_SHA256, expected_hex),
+    ];
+    if let Some(card_id) = deck_card {
+        headers.push(TunnelHeader::new(
+            crate::gateway_api::HEADER_DECK_CARD,
+            card_id,
+        ));
+    }
     leg.send(&TunnelRequest::Head {
         request_id: BLOB_REQUEST_ID,
         method: "POST".into(),
         path: PATH_BLOBS.into(),
-        headers: vec![
-            TunnelHeader::new(HEADER_CONTENT_TYPE, mime_type),
-            TunnelHeader::new(HEADER_CONTENT_LENGTH, size.to_string()),
-            TunnelHeader::new(HEADER_CONTENT_SHA256, expected_hex),
-        ],
+        headers,
         body_len: Some(size),
     })
     .await?;
@@ -183,8 +196,9 @@ impl GatewayBlobClient for super::GatewayApi {
         &self,
         bytes: Vec<u8>,
         mime_type: String,
+        deck_card: Option<String>,
     ) -> impl std::future::Future<Output = Result<String, String>> + Send + '_ {
-        async move { upload_bytes(bytes, mime_type).await }
+        async move { upload_bytes(bytes, mime_type, deck_card).await }
     }
 
     fn download_blob(

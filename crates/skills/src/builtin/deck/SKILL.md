@@ -142,6 +142,32 @@ snapshot JSON (not null).**
 - `ctx.emit(json)` — push a fresh snapshot to the phone (rate-policed).
 - `ctx.log(msg)` — diagnostic logging (console.log also routes here).
 
+Blobs (files/images). Bytes stay out of your service — you pass around a
+small `ref` (`{blobId, contentType, size}`) and let the phone fetch/display
+the bytes. Put a ref into the snapshot you `emit`; the card renders it with
+`deck.blobUrl` (below).
+
+- `await ctx.fetchBlob(url, {method, headers, body})` → `ref`. Like
+  `ctx.fetch`, but streams the response straight into storage instead of
+  returning the body — use it for an image/file you want to DISPLAY or hand
+  back, of any size. 2xx only, bounded redirects, same secret-placeholder
+  reveal as `ctx.fetch`.
+- `await ctx.blobPutFile(path, contentType)` → `ref`. Store a file a
+  `ctx.exec` produced (relative `path` resolves against the exec working dir).
+  This is the path for content your service *generates*: write it to disk in
+  an `exec`, then hand the file over. (For a small image you only need to
+  DISPLAY, not save, just emit a `data:` URI in your snapshot — no blob needed.)
+
+**Reuse a `blobId` for unchanged content — do NOT re-fetch every tick.** A
+`blobId` is stable only while you keep the same one: fetching or putting the
+SAME bytes AGAIN mints a NEW id (each is a fresh read capability). A
+refresh-loop card that re-`fetchBlob`s the same image every tick emits a
+different id each time, and the phone visibly re-paints the picture on every
+refresh — it does not re-download (the bytes are cached), but the image blinks.
+So cache the id in your `start()` closure: fetch/put once, keep the `blobId`,
+re-emit the SAME id, and only fetch again when the content actually changes
+(e.g. the upstream `ETag`/`Last-Modified` moved, or a new day's chart).
+
 Per-op calls have a 30s budget; a timeout fails the call, not the
 process. Repeated crashes/timeouts quarantine the card (visible error
 face + Re-enable), so keep ops fast and handle upstream errors — return
@@ -190,8 +216,9 @@ refresh: async (_p, ctx) => {
 ### card.html — the frontend
 
 A fragment rendered inside a sandboxed iframe (opaque origin, CSP: no
-network, no external resources, inline `<script>`/`<style>` + `data:`
-images only). The shell injects a `deck` global before your code runs:
+network except displaying stored blobs via `deck.blobUrl`, no external
+resources, inline `<script>`/`<style>` + `data:`/blob images). The shell
+injects a `deck` global before your code runs:
 
 - `deck.onData(fn)` — called with the latest snapshot immediately (the
   cached one) and again on every live push. Render from here.
@@ -202,6 +229,19 @@ images only). The shell injects a `deck` global before your code runs:
 - `deck.onSizeChange(fn)` — called with the current size immediately and
   again whenever it changes (resize, or maximize/restore). This is how you
   adapt: show more rows at `large`, the full view at `max`, less at `small`.
+- `deck.blobUrl(ref)` → a URL string for an `<img src>`. `ref` is a blob ref
+  from your snapshot (`{blobId, contentType}`) or a bare `blobId`. Point an
+  `<img>` at it — the shell serves the bytes (cache-first, so it works
+  offline once fetched). The same ref always yields the same URL, so the
+  image only re-paints when you emit a NEW ref — see the reuse rule above.
+  Handle `<img onerror>` if a blob might be unavailable.
+- `await deck.pickBlob({accept})` → `{blobId, contentType, size, name}` — ask
+  the user to pick a photo (the native picker). Resolves once the pick
+  uploads; pass the `blobId` into `deck.call(op, {blobId})` for your service
+  to consume. Rejects on cancel, or `busy` if a pick is already open (one at
+  a time). Every call settles exactly once.
+- `deck.shareBlob(ref, {filename})` — offer a blob to the system share sheet
+  (save to Photos/Files, AirDrop). Fire-and-forget.
 
 **Render snapshot data as text, not markup.** The iframe blocks network, but
 the data you paint (a `ctx.fetch` body, an emitted snapshot) is untrusted — set
@@ -351,6 +391,60 @@ export function start(ctx) {
     document.getElementById("v").textContent = s.error ?? s.load ?? "–";
     document.getElementById("d").textContent =
       s.at ? new Date(s.at).toLocaleTimeString() + " 更新" : "";
+  });
+</script>
+```
+
+## Worked example 3 — cover image (blob-shaped)
+
+Fetch a picture ONCE and reuse its `blobId` until the source changes, so the
+card doesn't blink every tick (the reuse rule above).
+
+```js
+// service.js — a daily featured image.
+const META = "https://api.example.com/v1/featured";
+let last = { url: null, cover: null }; // remembered across ticks
+export const ops = {
+  refresh: async (_p, ctx) => {
+    const r = await ctx.fetch(META);
+    if (r.status !== 200) return { error: `upstream ${r.status}` };
+    const d = r.json();
+    // Re-fetch the image ONLY when the source changed — otherwise keep the
+    // blobId we already have (a fresh fetchBlob would mint a new id and blink
+    // the picture on every refresh).
+    if (d.imageUrl !== last.url) {
+      last = { url: d.imageUrl, cover: await ctx.fetchBlob(d.imageUrl) };
+    }
+    return { title: d.title, cover: last.cover, at: Date.now() };
+  },
+};
+export function start(ctx) {
+  const tick = async () => ctx.emit(await ops.refresh({}, ctx));
+  setInterval(tick, 3_600_000);
+}
+```
+
+```html
+<!-- card.html — deck.blobUrl turns the ref into an <img src>; the same ref
+     yields the same URL, so the image only repaints when a NEW cover lands. -->
+<style>
+  .cover {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 6px;
+  }
+</style>
+<div class="card">
+  <img class="cover" id="img" alt="" />
+  <div class="label" id="t">–</div>
+</div>
+<script>
+  deck.onData((s) => {
+    document.getElementById("t").textContent = s.error ?? s.title ?? "–";
+    const img = document.getElementById("img");
+    if (s.cover) img.src = deck.blobUrl(s.cover);
+    img.onerror = () => deck.log("cover unavailable");
   });
 </script>
 ```

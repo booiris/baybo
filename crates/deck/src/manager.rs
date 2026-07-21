@@ -18,7 +18,9 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use baybo_security::SecretVault;
-use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow};
+use baybo_store::{
+    BlobStore, DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize, DeckSnapshotRow,
+};
 
 use crate::bundle::{
     self, CARD_FILE, DeckBundle, MANIFEST_FILE, MAX_SOURCE_BYTES, MAX_SRC_TOTAL_BYTES,
@@ -143,6 +145,10 @@ pub struct DeckManagerConfig {
     pub store: Arc<dyn DeckCardStore>,
     pub vault: Arc<SecretVault>,
     pub events: Arc<dyn DeckEvents>,
+    /// Shared blob store (the same one chat attachments use). Deck-produced
+    /// blobs are stamped `deck:<card_id>` so GC can target them without ever
+    /// touching chat data. See `docs/modules/deck.md` §Blobs.
+    pub blob: Arc<dyn BlobStore>,
     /// `<workspace>/deck` — bundle directories live here.
     pub deck_root: PathBuf,
     /// Scratch root for service + exec working dirs.
@@ -202,6 +208,9 @@ impl QuarantineSink for ManagerQuarantine {
 pub struct DeckManager {
     store: Arc<dyn DeckCardStore>,
     events: Arc<dyn DeckEvents>,
+    /// Shared blob store — for reclaiming a card's `deck:<id>` blobs at purge
+    /// (the janitor sweeps live-card garbage separately). See §Blobs.
+    blob: Arc<dyn BlobStore>,
     deck_root: PathBuf,
     scratch_root: PathBuf,
     host: Arc<DeckHost>,
@@ -219,13 +228,19 @@ impl DeckManager {
             store,
             vault,
             events,
+            blob,
             deck_root,
             scratch_root,
         } = config;
         // Card services run on the host (no sandbox), so the runtime is
         // always available — a missing `bun` surfaces as a spawn error at
         // install/boot, not a silent CRUD-only degradation.
-        let host = Arc::new(DeckHost::new(vault, scratch_root.clone(), &deck_root));
+        let host = Arc::new(DeckHost::new(
+            vault,
+            scratch_root.clone(),
+            blob.clone(),
+            &deck_root,
+        ));
         let supervisor = Arc::new(DeckSupervisor::new(
             host.clone(),
             Arc::new(ManagerEmitSink {
@@ -242,6 +257,7 @@ impl DeckManager {
         Arc::new(Self {
             store,
             events,
+            blob,
             deck_root,
             scratch_root,
             host,
@@ -349,47 +365,23 @@ impl DeckManager {
         if live >= MAX_CARDS {
             return Err(DeckError::DeckFull(MAX_CARDS));
         }
-        let bundle = load_bundle(staged_dir)?;
-        let first = self.dry_run(&bundle).await?;
-
+        // Mint the card id BEFORE the gate so a blob the gate's refresh op
+        // produces is stamped `deck:<real-id>` (reclaimable), not a throwaway
+        // gate identity that would leak. See `docs/modules/deck.md` §Blobs.
         let card_id = uuid::Uuid::new_v4().to_string();
-        let dest = self.bundle_dir(&card_id);
-        self.materialize(staged_dir, &card_id, &dest)?;
-        // Reload from the final dir so spec_hash covers the stamped manifest.
-        let installed = load_bundle(&dest)?;
-
-        let position = self
-            .store
-            .list_live()
-            .await?
-            .iter()
-            .map(|c| c.position)
-            .max()
-            .unwrap_or(-1)
-            + 1;
-        let row = DeckCardRow {
-            id: card_id.clone(),
-            title: installed.manifest.title.clone(),
-            position,
-            size: installed.manifest.size,
-            sizes: installed.sizes.clone(),
-            maximize: installed.maximize,
-            enabled: true,
-            quarantined_at: None,
-            deleted_at: None,
-            spec_hash: installed.spec_hash.clone(),
-            last_seq: 0,
-            created_at: Utc::now(),
+        // Gate → materialize → commit the row is the pre-create window: the gate
+        // may stamp `deck:<card_id>` blobs before any row owns them, and purge
+        // only reclaims a live/binned card — so a failure here (bad snapshot,
+        // timeout, fs/db error) would orphan up to 100 MiB per failed attempt.
+        // Reclaim on that path; once the row is committed the card owns the blobs
+        // and purge takes over, so post-row failures below do NOT reclaim.
+        let (installed, first) = match self.install_commit_row(staged_dir, &card_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.reclaim_card_blobs(&card_id).await;
+                return Err(e);
+            }
         };
-        self.store.create(&row).await?;
-        provenance("install", &card_id, &installed.spec_hash);
-        self.commit_bundle(
-            &card_id,
-            &installed.manifest.title,
-            "install",
-            &installed.spec_hash,
-        )
-        .await;
 
         let text = first.to_string();
         let seq = self
@@ -403,6 +395,59 @@ impl DeckManager {
         self.row_view(&card_id).await
     }
 
+    /// The pre-create half of [`Self::install`]: run the dry-run gate,
+    /// materialize the bundle under the deck root, and commit the card row.
+    /// Returns the reloaded bundle + the gate's first snapshot. It fails iff no
+    /// row was committed — the caller reclaims the card's gate-stamped blobs on
+    /// exactly that path.
+    async fn install_commit_row(
+        &self,
+        staged_dir: &Path,
+        card_id: &str,
+    ) -> Result<(DeckBundle, Value)> {
+        let bundle = load_bundle(staged_dir)?;
+        let first = self.dry_run(&bundle, card_id).await?;
+
+        let dest = self.bundle_dir(card_id);
+        self.materialize(staged_dir, card_id, &dest)?;
+        // Reload from the final dir so spec_hash covers the stamped manifest.
+        let installed = load_bundle(&dest)?;
+
+        let position = self
+            .store
+            .list_live()
+            .await?
+            .iter()
+            .map(|c| c.position)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+        let row = DeckCardRow {
+            id: card_id.to_string(),
+            title: installed.manifest.title.clone(),
+            position,
+            size: installed.manifest.size,
+            sizes: installed.sizes.clone(),
+            maximize: installed.maximize,
+            enabled: true,
+            quarantined_at: None,
+            deleted_at: None,
+            spec_hash: installed.spec_hash.clone(),
+            last_seq: 0,
+            created_at: Utc::now(),
+        };
+        self.store.create(&row).await?;
+        provenance("install", card_id, &installed.spec_hash);
+        self.commit_bundle(
+            card_id,
+            &installed.manifest.title,
+            "install",
+            &installed.spec_hash,
+        )
+        .await;
+        Ok((installed, first))
+    }
+
     /// Replace an existing card's bundle. Preserves the row's title /
     /// size / layout (the row is authoritative post-install); only
     /// `spec_hash` moves. The service restarts on the new code iff the
@@ -410,7 +455,7 @@ impl DeckManager {
     pub async fn update(&self, card_id: &str, staged_dir: &Path) -> Result<CardView> {
         let row = self.live_row(card_id).await?;
         let bundle = load_bundle(staged_dir)?;
-        let first = self.dry_run(&bundle).await?;
+        let first = self.dry_run(&bundle, card_id).await?;
 
         self.supervisor().stop(card_id).await;
         let dest = self.bundle_dir(card_id);
@@ -495,7 +540,7 @@ impl DeckManager {
     pub async fn enable(&self, card_id: &str) -> Result<()> {
         let _row = self.live_row(card_id).await?;
         let bundle = load_bundle(&self.bundle_dir(card_id))?;
-        match self.dry_run(&bundle).await {
+        match self.dry_run(&bundle, card_id).await {
             Ok(first) => {
                 self.store.set_enabled(card_id, true).await?;
                 self.store.set_quarantined(card_id, None).await?;
@@ -598,6 +643,10 @@ impl DeckManager {
         // NotFound, so an fs error here must not strand live tmux servers
         // until the next boot's orphan sweep.
         self.reap_card_runtime(card_id).await;
+        // Then reclaim the card's blobs AFTER its snapshots are gone, so its
+        // own (now-deleted) refs can't protect them — only another card's live
+        // reference does. Best-effort, like provenance/git.
+        self.reclaim_card_blobs(card_id).await;
         let dir = self.bundle_dir(card_id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -639,7 +688,7 @@ impl DeckManager {
             };
             let needs_regate = bundle.manifest.sdk != Some(SDK_VERSION);
             if needs_regate {
-                match self.dry_run(&bundle).await {
+                match self.dry_run(&bundle, &row.id).await {
                     Ok(_) => {
                         if let Err(e) = self.stamp_sdk(&dir) {
                             tracing::warn!(card = %row.id, "deck: sdk stamp failed: {e}");
@@ -832,6 +881,29 @@ impl DeckManager {
         Ok(())
     }
 
+    /// Delete a purged card's service-produced blobs (`deck:<card_id>`).
+    /// Best-effort — blob GC is a convenience, never a correctness dependency
+    /// (a leftover is dead-but-harmless bytes); `delete()`'s own
+    /// `any_live_for_path` still spares a content file shared with another live
+    /// blob, so only this card's own rows go. This reclaims BOTH the service's
+    /// own blobs (`ctx.fetchBlob` / `blobPutFile`) and images a user uploaded
+    /// through this card's picker — the gateway stamps both `deck:<card_id>`.
+    async fn reclaim_card_blobs(&self, card_id: &str) {
+        let prefix = baybo_store::blob::deck_uploader_identity(card_id);
+        let ids = match self.blob.list_ids_by_uploader(&prefix, None).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(card = %card_id, "deck: blob list for purge failed: {e}");
+                return;
+            }
+        };
+        for id in ids {
+            if let Err(e) = self.blob.delete(&id).await {
+                tracing::warn!(blob = %id, "deck: blob purge delete failed: {e}");
+            }
+        }
+    }
+
     async fn start_service(&self, card_id: &str, bundle: &DeckBundle) -> Result<()> {
         let sup = self.supervisor();
         sup.start(
@@ -848,15 +920,21 @@ impl DeckManager {
     /// and check the returned snapshot. Kills the throwaway process
     /// before returning. Emits during the dry run are discarded.
     ///
+    /// `uploader_card_id` is the card's EVENTUAL real id (minted before the
+    /// gate on install; the known id on update/enable/boot). The gate's
+    /// process/scratch identity is a throwaway `gate-<uuid>` for isolation,
+    /// but any blob the refresh op stores must carry the real id so purge/GC
+    /// can reclaim it — see the split in [`crate::service::SpawnConfig`].
+    ///
     /// Gates are hermetic: whatever runtime the gate's execs left behind —
     /// its scratch dir AND any tmux server pinned into its gate-scoped
     /// `tmux-socks/gate-<uuid>` dir — is reaped on BOTH outcomes, so a
     /// tmux-driving card's every install/update/enable/boot re-gate can't
     /// accrete one fresh tmux server per run (and a dry run never touches
     /// the resident card's server).
-    async fn dry_run(&self, bundle: &DeckBundle) -> Result<Value> {
+    async fn dry_run(&self, bundle: &DeckBundle, uploader_card_id: &str) -> Result<Value> {
         let gate_id = format!("{GATE_SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
-        let outcome = self.dry_run_exec(bundle, &gate_id).await;
+        let outcome = self.dry_run_exec(bundle, &gate_id, uploader_card_id).await;
         self.reap_card_runtime(&gate_id).await;
         let snapshot = outcome?;
         if snapshot.is_null() {
@@ -867,7 +945,12 @@ impl DeckManager {
         Ok(snapshot)
     }
 
-    async fn dry_run_exec(&self, bundle: &DeckBundle, gate_id: &str) -> Result<Value> {
+    async fn dry_run_exec(
+        &self,
+        bundle: &DeckBundle,
+        gate_id: &str,
+        uploader_card_id: &str,
+    ) -> Result<Value> {
         struct DiscardEmits;
         #[async_trait]
         impl EmitSink for DiscardEmits {
@@ -883,6 +966,7 @@ impl DeckManager {
         let running = spawn_service(
             crate::service::SpawnConfig {
                 card_id: gate_id.to_string(),
+                uploader_card_id: uploader_card_id.to_string(),
                 bundle_dir: bundle.dir.clone(),
                 scratch_dir: self.scratch_root.join(gate_id),
                 emit_interval: Duration::from_secs(bundle.emit_interval_secs()),

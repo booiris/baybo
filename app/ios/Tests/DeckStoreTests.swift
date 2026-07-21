@@ -36,6 +36,68 @@ struct DeckStoreTests {
         )
     }
 
+    @Test func pickRejectsAConcurrentRequestAsBusy() {
+        let store = makeStore(FakeBayboClient())
+        store.requestPick(id: "a", cardId: "c1", accept: nil)
+        #expect(store.pickerActive)
+        // A second pick while one is up is rejected immediately — not queued.
+        store.requestPick(id: "b", cardId: "c1", accept: nil)
+        #expect(store.lastPickResult?.id == "b")
+        #expect(store.lastPickResult?.ok == false)
+        #expect(store.lastPickResult?.error == "busy")
+        // The first pick is untouched — its picker stays up.
+        #expect(store.pickerActive)
+    }
+
+    @Test func pickStaysBusyThroughUploadThenFreesOnSettle() async throws {
+        // FakeBayboClient.deckBlobUploadBytes throws, so finishPick settles failed.
+        let store = makeStore(FakeBayboClient())
+        store.requestPick(id: "a", cardId: "c1", accept: nil)
+        // Photo chosen; upload about to run. consumePick returns (id, cardId).
+        #expect(store.consumePick()?.id == "a")
+        // A concurrent request DURING the upload window is rejected busy — the
+        // slot must stay held until the pick settles, not freed on selection.
+        store.requestPick(id: "b", cardId: "c1", accept: nil)
+        #expect(store.lastPickResult?.id == "b")
+        #expect(store.lastPickResult?.error == "busy")
+        // The upload settles → the slot frees.
+        store.finishPick(id: "a", cardId: "c1", data: Data([1, 2, 3]), mime: "image/png")
+        try await Task.sleep(nanoseconds: 40_000_000)
+        // A new pick is now accepted (presents), not busy-rejected.
+        store.requestPick(id: "d", cardId: "c1", accept: nil)
+        #expect(store.pickerActive)
+        #expect(store.lastPickResult?.id == "a")  // no busy result minted for "d"
+    }
+
+    @Test func pickDismissedWithNoChoiceResolvesCancelledAndFreesTheSlot() async throws {
+        let store = makeStore(FakeBayboClient())
+        store.requestPick(id: "a", cardId: "c1", accept: nil)
+        // The picker dismissed with nothing chosen → the promise rejects.
+        store.pickerActive = false
+        store.pickerDismissed()
+        try await Task.sleep(nanoseconds: 30_000_000)  // let the deferred cancel run
+        #expect(store.lastPickResult?.id == "a")
+        #expect(store.lastPickResult?.error == "cancelled")
+        // The slot is free again — a new pick presents.
+        store.requestPick(id: "b", cardId: "c1", accept: nil)
+        #expect(store.pickerActive)
+        #expect(store.lastPickResult?.id == "a")  // "b" was accepted, not rejected
+    }
+
+    @Test func shareMaterializesTheBlobUnderItsRealName() async throws {
+        let fake = FakeBayboClient()
+        let bytes = Data("hello deck".utf8)
+        let blobId = "sha256:" + String(repeating: "a", count: 64) + ".deadbeef"
+        fake.cachedBlobs[blobId] = bytes
+        let store = makeStore(fake)
+        store.requestShare(blobId: blobId, filename: "note.txt", contentType: "text/plain")
+        try await Task.sleep(nanoseconds: 60_000_000)  // fetch + materialize
+        let url = try #require(store.shareItem?.url)
+        #expect(url.lastPathComponent == "note.txt")
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        #expect((try? Data(contentsOf: url)) == bytes)
+    }
+
     @Test func refreshMapsTheFfiViewAndPersistsTheMirror() async {
         let fake = FakeBayboClient()
         fake.deckView = DeckView(

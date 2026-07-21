@@ -55,9 +55,13 @@ pub(crate) fn bun_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
-/// Host-side capability RPCs served to the child. Implemented by the
-/// manager (fetch with SSRF floor + placeholder reveal; host exec with
-/// wall-clock and output caps).
+/// Host-side capability RPCs served to the child. Implemented by
+/// [`crate::host::DeckHost`] (fetch with SSRF floor + placeholder reveal; host
+/// exec; and the blob plane — `docs/modules/deck.md` §Blobs). The blob-writing
+/// methods take `uploader_card_id` separately from the process `card_id`: the
+/// two are equal for a live service but DIVERGE in the dry-run gate, whose
+/// process id is a throwaway `gate-<uuid>` while its blobs must be stamped with
+/// the eventual real card id so purge/GC can find them.
 #[async_trait]
 pub(crate) trait HostServices: Send + Sync + 'static {
     async fn fetch(
@@ -70,6 +74,23 @@ pub(crate) trait HostServices: Send + Sync + 'static {
         card_id: &str,
         cmd: String,
     ) -> std::result::Result<HostExecResponse, String>;
+    /// Fetch an external URL, streaming the response straight into the blob
+    /// store — the bytes never enter the child. Returns only the capability
+    /// ref.
+    async fn fetch_blob(
+        &self,
+        uploader_card_id: &str,
+        req: HostFetchRequest,
+    ) -> std::result::Result<HostBlobRef, String>;
+    /// Stream a file from disk into the store (an `exec`-produced artifact).
+    /// `card_id` resolves the relative-path base (the process scratch);
+    /// `uploader_card_id` stamps the identity.
+    async fn blob_put_file(
+        &self,
+        card_id: &str,
+        uploader_card_id: &str,
+        req: HostBlobPutFileRequest,
+    ) -> std::result::Result<HostBlobRef, String>;
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -95,6 +116,21 @@ pub(crate) struct HostExecResponse {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// The capability ref a blob-producing RPC returns to the card.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct HostBlobRef {
+    pub blob_id: String,
+    pub content_type: String,
+    pub size: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct HostBlobPutFileRequest {
+    pub path: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 /// Where accepted emits go (the manager: size check → snapshot row →
@@ -202,7 +238,14 @@ pub(crate) struct RunningService {
 }
 
 pub(crate) struct SpawnConfig {
+    /// Process identity: names the scratch cwd, the tracing `card=` field, and
+    /// the `ctx.exec` working dir. For the dry-run gate this is a throwaway
+    /// `gate-<uuid>`.
     pub card_id: String,
+    /// Blob-uploader identity (`deck:<uploader_card_id>`). Equals `card_id` for
+    /// a live service; the gate sets it to the eventual real card id so its
+    /// blobs are reclaimable. See [`HostServices`].
+    pub uploader_card_id: String,
     pub bundle_dir: PathBuf,
     pub scratch_dir: PathBuf,
     /// Effective emit clamp (manifest floor already applied).
@@ -302,6 +345,7 @@ pub(crate) async fn spawn_service(
     // Reader pump: dispatch child → parent messages.
     {
         let card_id = cfg.card_id.clone();
+        let uploader_card_id = cfg.uploader_card_id.clone();
         let pending = pending.clone();
         let writer = writer_tx.clone();
         let ready_tx = ready_tx.clone();
@@ -394,6 +438,45 @@ pub(crate) async fn spawn_service(
                                 .exec(&card, cmd)
                                 .await
                                 .map(|r| serde_json::to_value(r).unwrap_or(Value::Null));
+                            let _ = writer.send(host_result_line(id, outcome)).await;
+                        });
+                    }
+                    Some("fetchBlob") => {
+                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let req = serde_json::from_value::<HostFetchRequest>(msg.clone());
+                        let host = host.clone();
+                        let writer = writer.clone();
+                        let uploader = uploader_card_id.clone();
+                        tokio::spawn(async move {
+                            let outcome = match req {
+                                Ok(req) => host
+                                    .fetch_blob(&uploader, req)
+                                    .await
+                                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                                Err(e) => Err(format!("malformed fetchBlob request: {e}")),
+                            };
+                            let _ = writer.send(host_result_line(id, outcome)).await;
+                        });
+                    }
+                    Some("blobPutFile") => {
+                        let Some(id) = msg.get("id").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let req = serde_json::from_value::<HostBlobPutFileRequest>(msg.clone());
+                        let host = host.clone();
+                        let writer = writer.clone();
+                        let card = card_id.clone();
+                        let uploader = uploader_card_id.clone();
+                        tokio::spawn(async move {
+                            let outcome = match req {
+                                Ok(req) => host
+                                    .blob_put_file(&card, &uploader, req)
+                                    .await
+                                    .map(|r| serde_json::to_value(r).unwrap_or(Value::Null)),
+                                Err(e) => Err(format!("malformed blobPutFile request: {e}")),
+                            };
                             let _ = writer.send(host_result_line(id, outcome)).await;
                         });
                     }

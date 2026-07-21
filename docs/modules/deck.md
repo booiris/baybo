@@ -89,6 +89,7 @@ This section reversed twice during design; the history matters. The first design
 - **`ctx.fetch(url, opts)`** — external HTTP, executed by the Rust parent. The parent applies the SSRF floor — the shared primitive is `baybo_security::is_blocked_ip` (loopback / RFC1918 / link-local / CGNAT / ULA and friends); the URL-validation + safe-resolution pair wrapping it is reimplemented over `is_blocked_ip` in deck's `host.rs` — vet the URL, resolve the host, drop blocked addresses, pin the connection to the vetted ones (`web_fetch.rs`'s own pair stays private to that tool) — then reveals `[{REDACTED_SECRET_…}]` placeholders (note the asymmetric `[{ }]` delimiters: `{{ }}` was explicitly rejected in `placeholder.rs` because every mainstream template engine parses it) from the `SecretVault` into headers at egress, performs TLS, and returns the body. **Secrets remain parent-only** — the `SecretVault` never crosses to the child, so the placeholder reveal stays the *only* path a secret reaches a request, and every such reveal is audited. What the host-run model gives up is enforcement of the SSRF floor for I/O the card initiates *itself*: nothing now stops a card opening its own socket to loopback. The floor still governs `ctx.fetch`; for card-initiated sockets it is advisory, consistent with the trusted-author model below.
 - **`ctx.exec(cmd)`** — `/bin/sh -c <cmd>` run **directly on the host** with the inherited environment (installed CLIs and credential dirs resolve), in a per-card scratch cwd, bounded by a 30s wall clock + stdout/stderr size caps. This is what makes "any card the user can describe" true: `docker ps`, `df`, `git log`, `smartctl`, `nvidia-smi`, `codex …` — anything the operator's own shell could run. On top of the inherited env, `host.rs` injects one var: **`BAYBO_DECK_TMUX_DIR`** = `<workspace>/deck/tmux-socks/<card_id>` (`DECK_TMUX_DIR_ENV`, a per-card subdir), the directory a card that drives an interactive CLI through tmux should pin its socket into (`tmux -S "$BAYBO_DECK_TMUX_DIR/<name>.sock"`). It keeps that agent-driven tmux server off the user's default socket (`/tmp/tmux-<uid>/default` — so out of their `tmux ls`) and out of `/tmp` (so a `/tmp` wipe can't drop it), and the per-card scoping is what lets purge reap exactly the departing card's servers; the runtime exports the path but the card `mkdir -p`s it. The `tmux-socks/` tree is gitignored in the deck root (`repo.rs`).
 - **`ctx.emit(json)`** — a snapshot push (see data plane).
+- **Blob primitives** — `ctx.fetchBlob` (fetch → store) and `ctx.blobPutFile` (an `exec` artifact → store): the file/image plane, ref-first so bytes stay out of the child. See §Blobs.
 
 **Trust model, stated honestly.** There is **no service sandbox** — timeouts and quarantine are *reliability* machinery, not a security boundary against the card author, and the author is the operator's own agent, the same one trusted to run `Bash` on this host. Running the service on the host (full filesystem, host network, host CLIs) is exactly that same trust, made explicit; the removed `crates/sandbox` jail only ever added reliability caps we kept and network isolation the real cards couldn't work under. What makes deck different from chat-driven `Bash` is that services run **unattended, forever**, with no per-call approval gate and no human watching call #4,000; and the author is *steerable* (the agent reads untrusted content, and a prompt-injected card revision is a standing channel rather than a one-shot command). The final design accepts that residual risk explicitly — a prompt-injected card edit can self-grant secret egress with no gate. What still stands: secrets exist only parent-side and reach requests only by placeholder reveal; **every secret-bearing egress is audit-logged with card id + host**; and on the tool path (`DeckCardCreate`/`DeckCardUpdate`) the dry-run gate means new code executes once under the agent's eyes — with its output in the transcript — before it runs unattended. The non-tool dry-runs (post-upgrade boot re-runs, REST/FFI-triggered enable) run the same gate with no transcript; their failures surface as trace events plus the quarantine face, nowhere else. (Restore deliberately does NOT gate — see the recycle-bin section.) (The design's advisory install pre-screen via the skills risk assessor did not land — nothing scans a bundle for exfil shapes.)
 
@@ -106,7 +107,7 @@ Op semantics are **unrestricted on the host** — no read/mutate taxonomy. The c
 
 ## Data plane
 
-Card JS has **zero network access** — no fetch, no XHR, no WebSocket, enforced by CSP and the iframe sandbox (below). This was forced, not chosen: in relay mode the gateway has no reachable URL at all (the phone reaches it only through the Noise tunnel inside the FFI), so a card that literally `fetch()`ed a gateway endpoint could never work for relay users, and no scoped-token story exists for the direct leg (the phone's stored direct-mode credential *is* the admin token). Everything crosses the native bridge.
+Card JS has **no active network** — no fetch, no XHR, no WebSocket, enforced by CSP and the iframe sandbox (below). (The one passive affordance is a read-only `<img>` over the local `baybo-transcript:` blob route — §Blobs — served by the app's own scheme handler, never a real socket.) This was forced, not chosen: in relay mode the gateway has no reachable URL at all (the phone reaches it only through the Noise tunnel inside the FFI), so a card that literally `fetch()`ed a gateway endpoint could never work for relay users, and no scoped-token story exists for the direct leg (the phone's stored direct-mode credential *is* the admin token). Everything crosses the native bridge.
 
 **Push is the primary plane.** A service tick flows:
 
@@ -136,7 +137,7 @@ All under `require_admin_token` on the admin router; the relay API tunnel admits
 | `POST /v1/deck/cards/{uuid}/enable` / `disable` | run-state toggle (disable stops the process) |
 | `DELETE /v1/deck/cards/{uuid}` | soft delete (below) |
 | `POST /v1/deck/cards/{uuid}/restore` | recycle-bin restore |
-| `POST /v1/deck/cards/{uuid}/purge` | hard delete out of the bin (row, snapshots, bundle files, runtime residue) |
+| `POST /v1/deck/cards/{uuid}/purge` | hard delete out of the bin (row, snapshots, bundle files, runtime residue, `deck:*` blobs) |
 | `GET /v1/deck/cards/{uuid}/bundle` | `card.html` (reaches the shell via `deck_fetch_bundle`, below) |
 | `GET /v1/deck/services/{uuid}/openapi.json` | the card's op contract |
 | `POST /v1/deck/services/{uuid}/{op}` | validated on-demand op call |
@@ -154,13 +155,194 @@ Follows the `SessionFolderStore` recipe: `DeckCardStore` trait + row DTOs in `cr
 - **`deck_cards`** — `id` (uuid PK), `title`, `position`, `size` (`small` 1×1 / `wide` 2×1 / `large` 2×2), `sizes` (comma-joined implemented set; empty ⇒ `[size]` for a legacy row), `maximize` (declares a `"max"` layout), `enabled`, `quarantined_at`, `deleted_at`, `spec_hash`, `last_seq` (the per-card monotonic push counter), `created_at`.
 - **`deck_snapshots`** — `card_id`, `seq`, `payload`, `fetched_at`, `error` (latest row per card is the paint source; ephemeral render state, not transcript). Retention is **prune-on-insert in the sqlite impl** — a plain `DELETE` keeping a named-const latest-N per card, as `storage.md` sanctions; the janitor's charter ("no storage compaction") stays untouched and no background sweeper is involved.
 
-**Deletion is a soft-delete recycle bin, mirroring `cron_jobs`** (the one precedent for "user-authored, painful to recreate"): delete stamps `deleted_at`, stops and deregisters the service, hides the card, and keeps `workspace/deck/<uuid>/` intact; listings apply the live-only predicate in SQL. Restore clears the stamp and starts the service **without re-running the dry-run gate** — a deliberate walk-back of the original "every transition into the fleet re-gates" rule. The bundle is byte-identical to when the user deleted it, the user is present and watching (an unbootable restore hits the supervisor's crash→quarantine within seconds, visibly), and the quarantine's Re-enable path IS still gated — `enable` remains the re-admission verdict, refreshing the error face on failure. Gating restore bought little beyond seconds of latency and a redundant op execution per restore. The gate stays where new code enters (install/update), where drift is silent (post-upgrade boot re-gate), and where a health verdict is the point (enable). The restored card lands with its last pre-delete snapshot (soft delete keeps `deck_snapshots`); the resident service's first tick refreshes it. Restore counts against the card cap like an install. Purging from the bin is the hard delete that removes files — the bundle dir plus the card's runtime residue: any tmux server still behind a `*.sock` in the card's `tmux-socks/<card_id>` dir is best-effort `kill-server`ed, then that socket dir and the card's `state/deck-scratch/<card_id>` exec scratch are removed (missing residue is ignored; residue cleanup never fails a purge).
+**Deletion is a soft-delete recycle bin, mirroring `cron_jobs`** (the one precedent for "user-authored, painful to recreate"): delete stamps `deleted_at`, stops and deregisters the service, hides the card, and keeps `workspace/deck/<uuid>/` intact; listings apply the live-only predicate in SQL. Restore clears the stamp and starts the service **without re-running the dry-run gate** — a deliberate walk-back of the original "every transition into the fleet re-gates" rule. The bundle is byte-identical to when the user deleted it, the user is present and watching (an unbootable restore hits the supervisor's crash→quarantine within seconds, visibly), and the quarantine's Re-enable path IS still gated — `enable` remains the re-admission verdict, refreshing the error face on failure. Gating restore bought little beyond seconds of latency and a redundant op execution per restore. The gate stays where new code enters (install/update), where drift is silent (post-upgrade boot re-gate), and where a health verdict is the point (enable). The restored card lands with its last pre-delete snapshot (soft delete keeps `deck_snapshots`); the resident service's first tick refreshes it. Restore counts against the card cap like an install. Purging from the bin is the hard delete that removes files — the bundle dir plus the card's runtime residue: any tmux server still behind a `*.sock` in the card's `tmux-socks/<card_id>` dir is best-effort `kill-server`ed, then that socket dir and the card's `state/deck-scratch/<card_id>` exec scratch are removed (missing residue is ignored; residue cleanup never fails a purge). Purge also reclaims the card's `deck:<card_id>` blobs (§Blobs GC) — the only time deck blobs are swept.
 
 **Scratch lifecycle.** `ctx.exec` runs in a per-card cwd under `state/deck-scratch/<card_id>`, reaped at purge (above) — purge reaps runtime residue *before* the fallible bundle-dir removal, so an fs error can't strand a live tmux server behind an already-purged row. The dry-run gate is hermetic: its throwaway service runs as `gate-<uuid>` with its own scratch dir *and* its own `tmux-socks/gate-<uuid>` socket dir, and when the gate finishes — pass or fail — the same runtime reap purge uses kills any tmux server the gate's execs pinned there and removes both dirs, so a gate's tmux servers and sockets die with the gate and a dry run never touches the resident card's server. Crash residue is caught by `DeckManager::boot`'s orphan sweep: every entry under `tmux-socks/` or the scratch root that is `gate-*` or belongs to no existing card row (live and soft-deleted rows both count — a recycled card keeps its runtime residue for restore) has its `*.sock` servers killed and its dir removed. The sweep only touches entries older than one hour (`boot()` runs in a spawned task racing the live server, so a just-started gate's fresh dirs must survive); the reap skips `.sock` symlinks (a planted link must not aim `kill-server` at the user's own socket) and bounds each `kill-server` at 5s.
 
 **Job/Trace boundary (explicit deviation).** The repo constraint says background execution enters Job and Trace. Deck services are streaming residents, not discrete work items: modelling every 5-minute tick as a Job would flood both stores with noise. The decision: **card provenance and lifecycle transitions** are recorded as trace events — install, update (`spec_hash` before → after), delete, restore, purge, start, stop, crash, quarantine — satisfying the "hot reload and tool updates leave provenance records in Trace" constraint; individual ticks and op calls are not Jobs. Ops appear in the audit log when they egress with secrets.
 
 **Governance boundary (second explicit deviation).** The repo constraint says tool/skill extensions carry source, version, hash, trust level, and capability declarations. A deck card carries `spec_hash` and an implicit source (the operator's own agent wrote it) — no version field, no trust tier, and capability declarations deliberately abolished by the trust decision above; `ExtensionManifest`/`TrustLevel` in `crates/model` go unused here. This is a knowing deviation, accepted with the trust model. If deck cards ever gain third-party provenance (sharing, import), the governance vocabulary must be adopted before that feature ships.
+
+## Blobs: files and images
+
+The rest of the deck protocol is text-only — `ctx.fetch` returns a
+`from_utf8_lossy`'d body and the one byte path into a card is base64 inside a
+≤5 MiB snapshot (before this plane the card CSP also admitted only `data:`
+images). This plane adds binary
+by **reusing the chat blob store wholesale**: `BlobStore` (capability id
+`blob_id = sha256:<64hex>.<32hex read-token>`, file-level dedup), gateway
+`POST/GET /v1/blobs`, the iOS FFI `blob_upload_bytes` / `blob_download_bytes` +
+the content-addressed device cache, and the relay `LegClass::Blob` legs.
+Possession of a `blob_id` is the read capability; a card gets *refs*, never bytes
+over its port, and never a way into chat attachments (nobody hands it those ids).
+The shared machinery is the only thing shared — no cross-visibility, no new ACL
+surface. `MAX_BLOB_BYTES` (100 MiB) lives in `baybo-store::blob` as the single
+shared cap.
+
+A card does four things with blobs: **display** an image, let the user **upload**
+a photo, **share** a produced file back to the user, and — service-side —
+**fetch/store/read** bytes ref-first.
+
+### Service `ctx` — ref-first (bytes stay off bun's stdio where they can)
+
+`DeckHost` holds an `Arc<dyn BlobStore>`. Five NDJSON-RPC primitives, keeping
+bytes off the child's stdio wherever they can:
+
+- **`ctx.fetchBlob(url, opts) → {blobId, contentType, size}`** — fetches an
+  external URL and streams the response **straight into the store**
+  (`put_stream`), so an image of any size never enters bun. Same
+  `[{REDACTED_SECRET_…}]` reveal as `ctx.fetch`. It uses its own client with a
+  connect + idle-read timeout rather than `ctx.fetch`'s 60 s total cap (which
+  would throttle a 100 MiB pull to ~1.7 MiB/s), follows redirects manually
+  (≤5 hops, re-vetting scheme + blocked-IP/DNS per hop — `Policy::none` keeps the
+  address pinning) and **strips credential-bearing headers on a cross-host hop**
+  (`Authorization`/`Cookie`/`Proxy-Authorization` plus any header a secret was
+  revealed into — the manual follow bypasses reqwest's own cross-origin
+  stripping), and stores only a 2xx body. Inside an op it is still bounded by the
+  30 s `CALL_TIMEOUT`; large pulls belong in `start()` / timer contexts.
+- **`ctx.blobPutFile(path, contentType) → ref`** — streams an `exec`-produced
+  file into the store. Relative paths resolve against the card's exec scratch
+  cwd; absolute is allowed (trusted author); a `..` climb out of scratch is
+  rejected as a footgun. This is the only *put* path: a service that generates
+  content writes it to disk in an `exec`, then hands over the file; small
+  display-only content can instead ride a `data:` URI in the snapshot (no blob).
+
+Every service-side put stamps `uploader_identity = "deck:<card_id>"` so GC can
+target deck blobs without ever touching chat data. The identity is threaded
+separately from the process id (`SpawnConfig.uploader_card_id`): the two are
+equal for a live service, but the **dry-run gate** runs under a throwaway
+`gate-<uuid>` process id while its blobs must carry the card's *eventual* real id
+— so `install` mints the card uuid before the gate, and update / enable / boot
+pass the known id.
+
+### Display — the `baybo-transcript:` scheme
+
+The card CSP admits `img-src baybo-transcript:`, and `sdkCard.js` exposes a
+synchronous `deck.blobUrl(ref | id, ct?)` that composes
+`baybo-transcript://localhost/blob/<blob_id>?ct=<mime>` (id raw in the path, mime
+canonically encoded — WebKit keys its memory cache on the full URL). Point an
+`<img>` at it. The app's `TranscriptSchemeHandler` (deck webview only — a
+`blobRouteEnabled` init flag) serves the `/blob/` route ahead of the bundle-file
+fallthrough. The serve logic lives in **one FFI call** —
+`blob_bytes_for_display(blob_id, max_bytes) → BlobServeOutcome` — so the handler
+stays a thin WebKit adapter. The core validates the id shape, reads the
+content-addressed device cache **cache-first** (no network, no binding — a cached
+image renders offline / unbound), downloads leg-bound on a miss, and enforces the
+display cap (an over-cap *cached* blob is refused by its stat, never read; an
+over-cap *downloaded* blob is materialized once, then refused). Swift maps the
+outcome (`Bytes` / `OverCap` / `NotFound` / `BadId`) to the `WKURLSchemeTask`
+response, filling `Content-Type` from `?ct=` and `Content-Length`. That 8 MiB cap
+is a hard **display** ceiling: a service can store up to `MAX_BLOB_BYTES`
+(100 MiB) via `fetchBlob` / `blobPutFile`, but only a blob ≤8 MiB is displayable —
+a larger one stores fine and the `<img>` just fails.
+
+That this WebKit path works at all was not answerable from code — whether a
+sandboxed opaque-origin `srcdoc` iframe's `<img>` subresource reaches the
+*parent* webview's `WKURLSchemeHandler`, and whether a meta-delivered CSP admits
+a custom scheme inside that frame — so it was settled with a throwaway simulator
+probe before the `deck.blobUrl` contract was frozen (both YES; the async
+`deck.blobData`-over-the-port fallback was never needed). The probe is gone —
+every real card image now exercises the same srcdoc → scheme-handler → CSP chain,
+so a future WebKit regression surfaces in normal use.
+
+Two handler invariants. The async FFI-backed serve **tracks live
+`WKURLSchemeTask` identities** and confirms one is still live before every
+`didReceive` / `didFinish` / `didFail` — WebKit tears a task down when the card
+is resized/removed mid-load, and messaging a stopped task crashes. And a failed
+load is terminal for that `<img>` until the tile rebuilds, so a card that must
+recover handles `onerror` by re-setting `src`.
+
+**Accepted limitation — the on-device cache read is digest-keyed, not
+token-gated.** The device cache (shared with chat) is content-addressed by the
+64-hex digest; the `/blob/` route reads it by digest and ignores the read token
+(only the gateway download leg, on a cache miss, checks it). So a card that
+*knows* a digest can display any already-cached blob — a chat attachment,
+another card's — with a fabricated token. This is inert, not a leak: the digest
+is itself a 256-bit unguessable capability a card can't learn (no chat access,
+no enumeration, `default-src 'none'`), and a displayed blob has **no
+exfiltration path** — it renders in the card's opaque-origin, no-network iframe,
+and the only outbound channels (`deck.call` to the card's own service,
+`deck.log`, user-mediated `deck.shareBlob`) can't ship the bytes anywhere
+untrusted. Scoping the handler to deck-delivered ids is the defense-in-depth fix
+if one is ever wanted; making the *cache* honor the full id is the wrong lever
+(it breaks the content-addressed dedup shared with chat).
+
+### Upload — native picker, ref over the port
+
+`deck.pickBlob({accept}) → Promise<{blobId, contentType, size, name?}>` runs
+card → shell → bridge → a native SwiftUI `PhotosPicker` (photo library) →
+`blobUploadBytes` → the ref resolves back. Bytes never cross the port; the card
+passes the `blobId` as a plain string into a following `deck.call` for its
+service to consume, and/or into `deck.blobUrl` to display it. The mime comes from
+`supportedContentTypes.first?.preferredMIMEType`, the byte count is pre-checked
+against the shared 100 MiB cap, and `name` is synthesized from the mime
+(`PhotosPicker` exposes none).
+
+Two contracts the UI enforces. **One pick at a time**: a single `activePick`
+slot, held from selection all the way through the upload — a concurrent
+`pickBlob` gets an immediate typed `busy` (never a queued picker popping up
+seconds later as a ghost dialog), a dismissal with no selection resolves
+`cancelled`, and every request settles exactly once. **The shell's call/pick
+correlation is generation-guarded**: each pending entry pins the `MessagePort`
+it was made on, a result is delivered only to that same tile generation, and an
+iframe reload/removal purges the card's pending entries — otherwise a spec-change
+reload (whose minutes-long `pickBlob` window makes it routine) would resolve the
+wrong promise and then silently eat the new generation's real answer.
+
+A picker upload is stamped `deck:<card_id>`, the same identity a card's service
+produces — so it is **reclaimed at purge** alongside the card's other blobs. The
+device sends the card id on an `x-baybo-deck-card` header (`deck_blob_upload_bytes`
+FFI); the gateway's device-upload arm honors it (`device_upload_identity` in
+`crates/gateway/src/channel/blobs.rs`) in place of the plain `device:<id>` marker.
+The card id is unforgeable by card JS (it comes from the shell's port→card map,
+threaded as `DeckStore.activePick.cardId`); the gateway does not validate the
+card exists, since the identity is a GC/diagnostic marker, never an access gate.
+
+### Share
+
+`deck.shareBlob(ref | id, {filename})` is fire-and-forget: native fetches the
+bytes (cache-first), materializes them on disk under a real filename
+(`<tmp>/baybo-deck-share/<digest>/<name>`), and presents `UIActivityViewController`
+via the `ChatStore.fileShare` / `FilePreview` sheet idiom on `DeckStore` — so
+Save-to-Photos / Files / AirDrop keep the original encoding.
+
+### GC — purge-time reclamation
+
+Deck blobs are reclaimed only when a card is **purged** from the recycle bin.
+Otherwise they persist, like chat attachments — the shared cache "only grows,
+deliberately." Purge deletes the card's `deck:<card_id>` blobs
+(`list_ids_by_uploader`, an indexed range scan on `uploader_identity`, so chat
+blobs are never in range); it runs after the row + snapshots are gone, and
+`delete()`'s own `any_live_for_path` (an indexed PK-range check on the digest,
+not a full-table scan) still spares a content file shared with another live blob.
+This covers both the service's own blobs and images a user uploaded through the
+card's picker — the gateway stamps both `deck:<card_id>` (see §Upload).
+
+There is **no timed sweep**. A machine-paced card that fetches a *new* image
+every tick — rather than reusing the blob id for unchanged content, the SDK's
+reuse rule — accretes blobs until purge; that's accepted, the same only-grows
+posture chat already has. A conservative TTL sweep keyed on snapshot-reference
+liveness was built and removed as disproportionate for a single-operator machine
+(and `last_accessed_at`, the usual LRU signal, is useless here: the
+content-addressed device cache never re-fetches, so a blob a card renders daily
+never bumps the server clock).
+
+### Versioning and deferred
+
+`SDK_VERSION` **stays 1**. The `ctx` blob additions are additive — an old card
+never calls them and runs unchanged against the always-fresh (`include_str!`d)
+preamble — so no fleet re-gate is forced. Bumping it would only force a one-time
+boot re-verification of every card (and risk quarantining a network card on an
+offline boot for no gain); a future *breaking* preamble change is what would
+earn the bump. **No wire-frame changes** — refs ride snapshot / call-result JSON
+opaquely, `SNAPSHOT_MAX_BYTES` is unaffected.
+
+Deferred: in-card video/audio playback (`media-src` + range-request scheme
+serving, which forces chunked `didReceive`); in-card fullscreen preview
+(ImageViewer / QuickLook); a streaming `blob_upload_file(path)` FFI so a large
+pick isn't read into memory before upload; arbitrary-file picking (`fileImporter`,
+not just the photo library); bounding a cache-*miss* display download before it
+materializes; web deck parity for blobs.
 
 ## iOS client
 
@@ -173,12 +355,12 @@ Follows the `SessionFolderStore` recipe: `DeckCardStore` trait + row DTOs in `cr
 The deck is the app's **second** WKWebView (`DeckHost`, mirroring `TranscriptHost`: own scheme-handler instance serving the deck shell bundle, prewarmed once a binding reaches home, kept warm until logout/rebind). The shell — trusted code, a second Vite entry in the existing `app/ios/web` workspace (no shared-package seam; web parity is explicitly deferred, and a future `app/web` deck page is an extraction refactor) — renders the grid and hosts one iframe per card:
 
 - `<iframe sandbox="allow-scripts" srcdoc="…">` — **no `allow-same-origin`**, so each card gets a unique opaque origin: no storage, no cookies, no parent DOM, no access to the shell's native bridge.
-- The shell injects a **CSP meta** into every `srcdoc` (`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:`) because the sandbox attribute alone does **not** block network — an opaque-origin frame can still fire-and-forget a cross-origin POST. CSP closes that.
+- The shell injects a **CSP meta** into every `srcdoc` (`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: baybo-transcript:`) because the sandbox attribute alone does **not** block network — an opaque-origin frame can still fire-and-forget a cross-origin POST. CSP closes that. The one network affordance is `img-src baybo-transcript:`, which admits an `<img>` over the local custom-scheme blob route (§Blobs) — served by the app's own `WKURLSchemeHandler`, never a real socket; `script-src`/`connect-src` gain nothing, so fetch/XHR/WebSocket stay blocked.
 - **Card identity is a per-card `MessagePort`**, minted by the shell and transferred into the iframe once at init. With `srcdoc` sandboxing, every card's `postMessage` arrives with `event.origin === "null"` — identity by claimed uuid would let card A read card B's data. Port identity is bound shell-side — each port's message handler closes over its card's uuid, which the card can neither see nor forge; closing the port mutes a removed card instantly.
 
 This keeps the app's web-content process count at 2 (transcript + deck) regardless of card count, at the cost of web-implemented drag gestures. Those gestures are a **small custom engine with iOS-home-screen mechanics** (SortableJS was tried and removed — its clone-fallback model can never paint an iframe, so the finger dragged a blank box). The engine is built around one constraint: an `<iframe>` reloads whenever its node moves in the DOM, but `transform` and CSS `order` never touch the tree. So the REAL tile lifts (`position: fixed` + translate — its document keeps painting live), a plain-div placeholder holds the slot, neighbors FLIP-slide via WAAPI, tile placement is CSS `order` (tiles are appended once and never reparented), and the drop is pure style — zero reloads at any point. Two WKWebView traps are load-bearing here: the native UIScrollView pan claims the touch ~2 moves in and fires `pointercancel` unless the tile does a **non-passive `touchmove` preventDefault** while editing (`touch-action: none` alone does NOT hold once the mid-gesture `position:fixed` flip triggers re-arbitration), and the drop must re-resolve its slot from the final pointer position because the last move can still be waiting on rAF. Edit mode itself is entered from the native header's Edit pill.
 
-One WebKit runtime behavior needs a day-one simulator probe before the shell design is final: CSP-meta + `srcdoc` semantics inside a custom-scheme-hosted page (`baybo-transcript://`) are not answerable from this repo's code.
+One WebKit runtime behavior was not answerable from this repo's code — CSP-meta + `srcdoc` subresource semantics inside a custom-scheme-hosted page (`baybo-transcript://`) — and was settled by a throwaway simulator probe when the blob display path landed: a sandboxed opaque-origin `srcdoc` iframe's `<img>` subresource DOES reach the parent webview's `WKURLSchemeHandler`, and the meta CSP's `img-src baybo-transcript:` admits it (§Blobs).
 
 ### Layout: ordered flow + size classes
 
@@ -225,33 +407,33 @@ The four tool **descriptions are deliberately terse** — one line each, pointin
 
 ### Availability — the gateway is one shared process
 
-- **Unbounded `ctx.fetch` body → gateway OOM (highest-impact).** `fetch_external` is host-mediated: the *parent* gateway buffers the whole upstream response into an in-memory `Vec<u8>` with **no size cap** (the cap was deleted in `4e8ba066`; `host.rs:156-167`), then copies it again via `from_utf8_lossy` (up to ~3× on binary) and re-serializes it to the child. `FETCH_TIMEOUT` (60s) bounds duration, not bytes — at real bandwidth a card pointed at one large/endless URL pulls multiple GB into gateway RAM and OOM-kills the process that hosts *every* session, channel, and the other 63 cards. Author-trust does not contain this (the remote is not the author), and quarantine never sees a single fatal allocation. `SNAPSHOT_MAX_BYTES` gives false assurance here — it bounds what the child hands back, not the parent's fetch buffer. Cheapest fix: restore a streamed byte cap in `fetch_external`.
-- **Unbounded concurrent host RPCs.** The stdout pump `tokio::spawn`s every child `exec`/`fetch` request line with no semaphore or in-flight budget (`service.rs:361-399`); each `exec` spawns a real `/bin/sh -c` buffering up to 8 MB (4 MB stdout + 4 MB stderr) for 30s. A tight loop is a fork/thread/RAM storm, and quarantine is structurally blind — strikes count only crashes, call-timeouts, and emit floods, never fast-returning execs.
+- **Unbounded `ctx.fetch` body → gateway OOM (highest-impact).** `fetch_external` is host-mediated: the *parent* gateway buffers the whole upstream response into an in-memory `Vec<u8>` with **no size cap** (the cap was deleted in `4e8ba066`; the `resp.chunk()` loop under "No response-body cap by design" in `host.rs`), then copies it again via `from_utf8_lossy` (up to ~3× on binary) and re-serializes it to the child. `FETCH_TIMEOUT` (60s) bounds duration, not bytes — at real bandwidth a card pointed at one large/endless URL pulls multiple GB into gateway RAM and OOM-kills the process that hosts *every* session, channel, and the other 63 cards. Author-trust does not contain this (the remote is not the author), and quarantine never sees a single fatal allocation. `SNAPSHOT_MAX_BYTES` gives false assurance here — it bounds what the child hands back, not the parent's fetch buffer. Cheapest fix: restore a streamed byte cap in `fetch_external`.
+- **Unbounded concurrent host RPCs.** The reader pump in `spawn_service` (`service.rs`) `tokio::spawn`s every child `exec` / `fetch` / blob-RPC request line with no semaphore or in-flight budget; each `exec` spawns a real `/bin/sh -c` buffering up to 8 MB (4 MB stdout + 4 MB stderr) for 30s. A tight loop is a fork/thread/RAM storm, and quarantine is structurally blind — strikes count only crashes, call-timeouts, and emit floods, never fast-returning execs.
 - **No aggregate memory/concurrency budget.** The only fleet-wide bound is `MAX_CARDS` (64); nothing caps resident-service memory, in-flight RPCs, concurrent fetch buffers, or broadcast backlog, so the per-item caps compose with no ceiling. Post-`4e8ba066`: a 5 MB snapshot is **cloned per owner connection** at fanout and each connection's frame queue is 64-deep → up to **64×5 MB = 320 MB backlog per stalled connection** (20× the old 16 MB), fillable ~10× faster at the 1 s floor; `GET /v1/deck` materializes up to ~320 MB of latest snapshots per in-flight request and every `DeckChanged` tells all clients to refetch (thundering herd); `deck_snapshots` holds ~64×3×5 MB ≈ **960 MB** steady-state in the *primary* sqlite DB (≈53× pre-loosening), taxing DB size, page cache, and backups. A card emitting near-cap snapshots at 1 Hz with completing fetches is "well-behaved" by every metric quarantine measures — the per-card egress budget the design **declined** (see below) is materially more consequential now than when it was declined.
 
 ### Backend — no inter-card isolation
 
-The frontend is well-isolated (opaque-origin iframe + per-card MessagePort, §iOS client); the **backend is not**. Every card's bun service runs as the same host user with full filesystem access, so card A's service can read or overwrite card B's bundle (`workspace/deck/<B>/service.js`), B's scratch dir, the `deck_snapshots` DB, and any host credential directory — a compromised/injected card is contained on the phone but not on the host. Two integrity gaps compound it: **`service.js` is not hash-pinned at (re)spawn** (only `openapi.json` drift is caught via `spec_hash`), so a host-side actor — or another unisolated card — that rewrites a resident card's `service.js` changes its behavior with no gate; and **the four required files follow symlinks** (`std::fs::copy`, `manager.rs:742-744`) while `src/` explicitly refuses them (`manager.rs:894-916`), so a staged `service.js` symlinked at a host file lands as real bytes and `DeckCardGet` returns them verbatim into the transcript — a half-enforced anti-smuggle boundary.
+The frontend is well-isolated (opaque-origin iframe + per-card MessagePort, §iOS client); the **backend is not**. Every card's bun service runs as the same host user with full filesystem access, so card A's service can read or overwrite card B's bundle (`workspace/deck/<B>/service.js`), B's scratch dir, the `deck_snapshots` DB, and any host credential directory — a compromised/injected card is contained on the phone but not on the host. Two integrity gaps compound it: **`service.js` is not hash-pinned at (re)spawn** (only `openapi.json` drift is caught via `spec_hash`), so a host-side actor — or another unisolated card — that rewrites a resident card's `service.js` changes its behavior with no gate; and **the four required files follow symlinks** (`std::fs::copy` in `materialize`) while `src/` explicitly refuses them (`copy_src_tree`), so a staged `service.js` symlinked at a host file lands as real bytes and `DeckCardGet` returns them verbatim into the transcript — a half-enforced anti-smuggle boundary.
 
 ### Audit & egress are narrower than they read
 
 The "every secret-bearing egress is audit-logged" guarantee is real but narrow, and the surrounding non-guarantees are unstated:
 
-- **The audit fires only on placeholder reveal** (`host.rs:138-142`) — a `ctx.fetch` carrying no vault placeholder (e.g. `POST` of stolen `~/.codex` creds to `attacker.com`) is never logged, and **`ctx.exec` has no audit hook at all**. The line is host-only, secret-blind, and path-blind, so query-string exfil to a benign-looking host is indistinguishable from legitimate use.
+- **The audit fires only on placeholder reveal** (the `revealed`-gated "secret-bearing egress" `tracing::info!` in `fetch_external`, and the twin in `run_fetch_blob` for `ctx.fetchBlob`) — a `ctx.fetch` / `ctx.fetchBlob` carrying no vault placeholder (e.g. `POST` of stolen `~/.codex` creds to `attacker.com`) is never logged, and **`ctx.exec` has no audit hook at all**. The line is host-only, secret-blind, and path-blind, so query-string exfil to a benign-looking host is indistinguishable from legitimate use. (`ctx.fetchBlob` follows redirects host-side — it strips credential headers on a cross-host hop, but its egress is still only reveal-audited.)
 - **Env secrets bypass the reveal story entirely.** Deck services and `ctx.exec` inherit the gateway's full environment (no `env_clear`), unlike the channel sidecars, which scrub to an allowlist (and carry a regression test calling the inheriting behavior a leak). Any secret the operator exports into the gateway env (LLM keys, cloud creds) is cleartext-readable via `process.env` by every card with zero audit — the "secrets stay parent-only" invariant is scoped to *vault placeholders*, not env vars.
 - **The SSRF floor is not containment.** It governs only the `ctx.fetch` convenience path; a card opens its own socket (`Bun.connect`) or `ctx.exec('curl …')` to reach any address, with no per-card egress policy behind it. (Minor floor nit: `is_blocked_ip`'s v6 path doesn't classify IPv4-compatible `::127.0.0.1` or NAT64 `64:ff9b::/96`.)
 - **Snapshot / op-param redaction at rest is unmapped.** A card can emit host secrets into a ≤5 MB snapshot that is persisted in `deck_snapshots` and broadcast, or into ≤1 MB op params that cross the gateway; whether CLAUDE.md's "logs/traces record only sanitized placeholders" invariant is honored for these sinks is unspecified.
 
 ### The phone runs arbitrary card HTML
 
-`card.html` is agent-written HTML/JS executing in the user's WKWebView. The opaque-origin sandbox + no-network CSP bound the blast radius (§Render host), and two isolation guards close the cross-boundary paths a card could otherwise reach through:
+`card.html` is agent-written HTML/JS executing in the user's WKWebView. The opaque-origin sandbox + the near-no-network CSP (its only affordance is the read-only `img-src baybo-transcript:` blob route, §Render host) bound the blast radius, and two isolation guards close the cross-boundary paths a card could otherwise reach through:
 
 - **The native `deck` bridge rejects non-main-frame messages.** WKWebView injects `window.webkit.messageHandlers.deck` into *every* frame, including the sandboxed card subframe, so `DeckBridge.userContentController` guards `message.frameInfo.isMainFrame` — only the shell (main frame) may drive the native surface. Without it a card's own JS could call `quickSetup` (seeding a fresh chat draft that auto-sends — a **zero-click agent-prompt-injection channel**) or `cardAction`/`layout`/`delete`. Cards reach the shell only over their per-card MessagePort, never this handler.
 - **The card SDK pins its MessagePort to the first `deck_init` from `window.parent`.** Opaque-origin frames all report origin `"null"`, so a sibling card could otherwise `postMessage` a forged `deck_init` bearing its own port to hijack a victim card's channel (read its op params, inject spoofed snapshot/result data). `sdkCard.js` accepts only the *first* init whose `source` is the shell (the card's direct parent) and ignores the rest; the shell sends `deck_init` exactly once per mount, so the once-guard never drops a real init.
 
 One residual is inherent to the model and stays:
 
-- **In-frame DOM injection.** The CSP uses `script-src 'unsafe-inline'` (load-bearing — a card is a self-contained inline `<script>`), so a card that renders attacker-influenced `ctx.fetch`/snapshot content via `innerHTML` executes injected inline handlers (`<img onerror=…>`). With the two guards above it is fully contained — no network, no native bridge, no cross-card reach, opaque origin, so the injected code can only touch the card's own DOM — but the shell does no DOM sanitization; a card that renders untrusted upstream content owns escaping it.
+- **In-frame DOM injection.** The CSP uses `script-src 'unsafe-inline'` (load-bearing — a card is a self-contained inline `<script>`), so a card that renders attacker-influenced `ctx.fetch`/snapshot content via `innerHTML` executes injected inline handlers (`<img onerror=…>`). With the two guards above it is fully contained — no active network (a passive `<img>` blob load renders locally with no exfil path, §Blobs), no native bridge, no cross-card reach, opaque origin, so the injected code can only touch the card's own DOM — but the shell does no DOM sanitization; a card that renders untrusted upstream content owns escaping it.
 
 ### Admission gates code entry, not running integrity
 

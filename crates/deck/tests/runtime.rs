@@ -13,8 +13,8 @@ use serde_json::json;
 
 use baybo_deck::{DeckEvents, DeckManager, DeckManagerConfig};
 use baybo_security::{EncryptionKey, SecretVault};
-use baybo_storage::sqlite::{SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
-use baybo_store::{DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize};
+use baybo_storage::sqlite::{SqliteBlobStore, SqliteDeckCardStore, SqlitePool, SqliteSecretStore};
+use baybo_store::{BlobStore, DeckCardRow, DeckCardStore, DeckLayoutEntry, DeckSize};
 use chrono::Utc;
 
 #[derive(Default)]
@@ -43,6 +43,7 @@ fn bun_usable() -> bool {
 struct Harness {
     manager: Arc<DeckManager>,
     events: Arc<RecordingEvents>,
+    blob: Arc<SqliteBlobStore>,
     store: Arc<SqliteDeckCardStore>,
     root: tempfile::TempDir,
 }
@@ -59,6 +60,11 @@ async fn harness() -> Harness {
     let root = tempfile::tempdir().unwrap();
     let pool = SqlitePool::open_in_memory().await.unwrap();
     let store = Arc::new(SqliteDeckCardStore::new(pool.clone()));
+    let blob = Arc::new(
+        SqliteBlobStore::open(pool.clone(), root.path().join("blobs"))
+            .await
+            .unwrap(),
+    );
     let vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"deck-test-master-key-32-bytes!!!".to_vec()).unwrap(),
         Arc::new(SqliteSecretStore::new(pool)),
@@ -68,12 +74,14 @@ async fn harness() -> Harness {
         store: store.clone(),
         vault,
         events: events.clone(),
+        blob: blob.clone(),
         deck_root: root.path().join("deck"),
         scratch_root: root.path().join("scratch"),
     });
     Harness {
         manager,
         events,
+        blob,
         store,
         root,
     }
@@ -136,6 +144,142 @@ export const ops = {
   add: async ({ a, b }) => ({ sum: a + b }),
 };
 "#;
+
+/// A card whose refresh op exercises the ref-first blob plane: two
+/// `exec`-produced files streamed into the shared store via `blobPutFile`.
+/// Returns the refs so the test can assert they landed.
+const BLOB_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    await ctx.exec("printf 'from-exec' > out.bin");
+    const filed = await ctx.blobPutFile("out.bin", "application/octet-stream");
+    await ctx.exec("printf 'hello deck' > note.txt");
+    const noted = await ctx.blobPutFile("note.txt", "text/plain");
+    return {
+      fileId: filed.blobId, fileSize: filed.size, fileCt: filed.contentType,
+      noteId: noted.blobId, noteSize: noted.size, noteCt: noted.contentType,
+    };
+  },
+};
+"#;
+
+#[tokio::test]
+async fn blob_plane_stores_exec_files() {
+    let Some(h) = harness_or_skip("blob_plane_stores_exec_files").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_SERVICE);
+
+    // Install runs the dry-run gate, which invokes the refresh op once — so the
+    // blobs are produced under the REAL (pre-minted) card id, and the stored
+    // first snapshot carries their refs.
+    let card = h.manager.install(staged.path()).await.unwrap();
+    let view = h.manager.deck_view().await.unwrap();
+    let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
+
+    assert_eq!(snap["fileCt"], "application/octet-stream");
+    assert_eq!(snap["fileSize"], 9); // "from-exec"
+    assert_eq!(snap["noteCt"], "text/plain");
+    assert_eq!(snap["noteSize"], 10); // "hello deck"
+
+    // Both refs resolve to distinct real bytes in the shared blob store.
+    let file_id = snap["fileId"].as_str().unwrap();
+    let note_id = snap["noteId"].as_str().unwrap();
+    assert_ne!(file_id, note_id);
+    assert_eq!(h.blob.get(file_id).await.unwrap(), b"from-exec");
+    assert_eq!(h.blob.get(note_id).await.unwrap(), b"hello deck");
+
+    let _ = card;
+    h.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_reclaims_the_cards_blobs() {
+    let Some(h) = harness_or_skip("purge_reclaims_the_cards_blobs").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_SERVICE);
+    let card = h.manager.install(staged.path()).await.unwrap();
+
+    // The dry-run gate produced two blobs stamped deck:<card_id>.
+    let view = h.manager.deck_view().await.unwrap();
+    let snap: serde_json::Value = serde_json::from_str(&view.snapshots[0].payload).unwrap();
+    let file_id = snap["fileId"].as_str().unwrap().to_string();
+    let note_id = snap["noteId"].as_str().unwrap().to_string();
+    let ident = format!("deck:{}", card.id);
+    assert_eq!(
+        h.blob
+            .list_ids_by_uploader(&ident, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(h.blob.get(&file_id).await.is_ok());
+
+    // Delete → purge → the card's blobs are reclaimed (its own snapshot is
+    // gone, so nothing protects them).
+    h.manager.soft_delete(&card.id).await.unwrap();
+    h.manager.purge(&card.id).await.unwrap();
+    assert!(
+        h.blob
+            .list_ids_by_uploader(&ident, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.blob.get(&file_id).await.is_err());
+    assert!(h.blob.get(&note_id).await.is_err());
+
+    h.manager.shutdown().await;
+}
+
+/// The gate's refresh op stamps a `deck:<card_id>` blob, then returns null so
+/// the gate REJECTS the install. The blob must not orphan — `install` reclaims
+/// it on the pre-create failure path (no row ever owns it, so purge never would).
+const BLOB_THEN_FAIL_SERVICE: &str = r#"
+export const ops = {
+  refresh: async (_p, ctx) => {
+    await ctx.exec("printf 'orphan' > out.bin");
+    await ctx.blobPutFile("out.bin", "application/octet-stream");
+    return null; // null snapshot → the gate fails the install
+  },
+};
+"#;
+
+#[tokio::test]
+async fn failed_install_reclaims_the_gate_blobs() {
+    let Some(h) = harness_or_skip("failed_install_reclaims_the_gate_blobs").await else {
+        return;
+    };
+    let staged = tempfile::tempdir().unwrap();
+    stage_bundle(staged.path(), BLOB_THEN_FAIL_SERVICE);
+
+    let before = h
+        .blob
+        .list_ids_by_uploader("deck:", None)
+        .await
+        .unwrap()
+        .len();
+    let result = h.manager.install(staged.path()).await;
+    assert!(result.is_err(), "a null snapshot must fail the install");
+
+    // No deck blob leaked: the gate's blob was reclaimed on the failure path.
+    let after = h
+        .blob
+        .list_ids_by_uploader("deck:", None)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after, before,
+        "a failed install must not orphan a deck blob"
+    );
+
+    h.manager.shutdown().await;
+}
 
 const TMUX_DIR_SERVICE: &str = r#"
 export const ops = {

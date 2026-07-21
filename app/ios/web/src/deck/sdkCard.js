@@ -51,6 +51,12 @@
       pending.delete(msg.id);
       if (msg.ok) p.resolve(msg.value);
       else p.reject(new Error(msg.error || "call failed"));
+    } else if (msg.type === "pick_result") {
+      const p = pending.get(msg.id);
+      if (!p) return;
+      pending.delete(msg.id);
+      if (msg.ok) p.resolve(msg.ref);
+      else p.reject(new Error(msg.error || "pick failed"));
     } else if (msg.type === "size") {
       if (msg.size && msg.size !== size) {
         size = msg.size;
@@ -119,6 +125,92 @@
         if (port) port.postMessage(msg);
         else queuedCalls.push(msg);
       });
+    },
+    /// Ask the user to pick a photo (docs/modules/deck.md §Blobs). Resolves to
+    /// a blob ref `{blobId, contentType, size, name}` once the native picker
+    /// uploads it — the bytes never cross into the card; pass `blobId` as a
+    /// plain string into a following `deck.call(op, {blobId})` for the service
+    /// to consume, and/or `deck.blobUrl(ref)` to display it. Rejects on cancel
+    /// (`"cancelled"`), on another pick already in progress (`"busy"`), or on
+    /// an upload failure. `opts.accept` is advisory (v1 presents the photo
+    /// library). Every call settles exactly once.
+    pickBlob: function (opts) {
+      return new Promise(function (resolve, reject) {
+        const id = nextId++;
+        pending.set(id, { resolve: resolve, reject: reject });
+        const msg = {
+          type: "pick",
+          id: id,
+          accept: opts && opts.accept ? String(opts.accept) : null,
+        };
+        if (port) port.postMessage(msg);
+        else queuedCalls.push(msg);
+      });
+    },
+    /// Emit a diagnostic line to the host log (shell → native NSLog). The
+    /// card has no console the operator can reach, so this is its only voice
+    /// for debugging. Queued like `call` until the port arrives.
+    log: function (message, level) {
+      const msg = {
+        type: "log",
+        level: level === "error" ? "error" : "info",
+        message: String(message),
+      };
+      if (port) port.postMessage(msg);
+      else queuedCalls.push(msg);
+    },
+    /// Build a displayable URL for a blob the service produced/was handed
+    /// (docs/modules/deck.md §Blobs). Point an `<img src>` at it — the shell's
+    /// custom scheme (allowed by the card CSP's `img-src baybo-transcript:`)
+    /// serves the bytes through the native side, cache-first. Accepts a ref
+    /// object ({blobId|blob_id, contentType|content_type|mime}) or a bare id
+    /// string + optional contentType. The id rides the path RAW and the mime
+    /// rides `?ct=` encoded, so the same (id, mime) always yields a
+    /// byte-identical URL (WebKit keys its memory cache on the full URL).
+    /// A blob that isn't cached and can't be fetched (offline/unbound) fails
+    /// the load — handle `<img onerror>` if the card must recover.
+    blobUrl: function (ref, contentType) {
+      let blobId;
+      let ct;
+      if (ref && typeof ref === "object") {
+        blobId = ref.blobId ?? ref.blob_id;
+        ct = ref.contentType ?? ref.content_type ?? ref.mime ?? ref.ct;
+      } else {
+        blobId = ref;
+        ct = contentType;
+      }
+      if (!blobId) return "";
+      const q = ct ? "?ct=" + encodeURIComponent(String(ct)) : "";
+      return "baybo-transcript://localhost/blob/" + String(blobId) + q;
+    },
+    /// Offer a blob to the user via the native share sheet (save to Photos /
+    /// Files, AirDrop, …). Fire-and-forget — native fetches the bytes
+    /// (cache-first), materializes them under a real filename, and presents the
+    /// sheet. Accepts a ref object or a bare id; `opts.filename` /
+    /// `opts.contentType` override the ref's.
+    shareBlob: function (ref, opts) {
+      opts = opts || {};
+      let blobId;
+      let ct;
+      let name;
+      if (ref && typeof ref === "object") {
+        blobId = ref.blobId ?? ref.blob_id;
+        ct = ref.contentType ?? ref.content_type ?? ref.mime;
+        name = ref.name;
+      } else {
+        blobId = ref;
+      }
+      if (opts.contentType) ct = opts.contentType;
+      if (opts.filename) name = opts.filename;
+      if (!blobId) return;
+      const msg = {
+        type: "share",
+        blobId: String(blobId),
+        filename: name != null ? String(name) : null,
+        contentType: ct != null ? String(ct) : null,
+      };
+      if (port) port.postMessage(msg);
+      else queuedCalls.push(msg);
     },
     get size() {
       return size;

@@ -26,10 +26,17 @@ use tokio_util::io::ReaderStream;
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 
-pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) use baybo_store::blob::MAX_BLOB_BYTES;
+use baybo_store::blob::deck_uploader_identity;
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
 const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";
+/// A companion device uploading a blob a card's picker chose sends this so the
+/// gateway stamps `deck:<card_id>` (not `device:<id>`), letting card purge
+/// reclaim it. Trusted like the token itself: the value comes from the app's
+/// `activePick.cardId` (the shell's port→card map, unforgeable by card JS), and
+/// the identity is a GC/diagnostic marker, never an access-control boundary.
+const HEADER_DECK_CARD: &str = "x-baybo-deck-card";
 
 /// Sidecar-supplied originator identity. The sidecar fills these in
 /// from the inbound platform event so the gateway can run the same
@@ -139,6 +146,22 @@ async fn authorize_upload(
     }
 }
 
+/// The `uploader_identity` a device upload is stamped with. A picker upload for
+/// a deck card carries `x-baybo-deck-card: <card_id>` and is stamped
+/// `deck:<card_id>` so card purge reclaims it (see [`HEADER_DECK_CARD`]); every
+/// other device upload keeps the diagnostic `device:<device_id>` marker.
+fn device_upload_identity(device_id: &str, headers: &HeaderMap) -> String {
+    match headers
+        .get(HEADER_DECK_CARD)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(card_id) => deck_uploader_identity(card_id),
+        None => format!("{DEVICE_UPLOAD_IDENTITY_PREFIX}{device_id}"),
+    }
+}
+
 pub(crate) fn routes() -> Router<WsChannelState> {
     Router::new()
         .route(
@@ -166,9 +189,7 @@ async fn upload(
             bot_id,
             user_id,
         } => Some(format!("{channel_type}:{bot_id}:{user_id}")),
-        UploadAuth::Device { device_id } => {
-            Some(format!("{}{}", DEVICE_UPLOAD_IDENTITY_PREFIX, device_id))
-        }
+        UploadAuth::Device { device_id } => Some(device_upload_identity(&device_id, &headers)),
         UploadAuth::Pending(code) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -464,6 +485,26 @@ mod tests {
             h.insert(*k, HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    #[test]
+    fn device_upload_identity_stamps_deck_card_when_header_present() {
+        // Plain device upload → device:<id>.
+        assert_eq!(
+            device_upload_identity("dev-1", &HeaderMap::new()),
+            "device:dev-1"
+        );
+        // A card picker upload carries x-baybo-deck-card → deck:<card_id> so
+        // card purge reclaims it (same identity a card's service stamps).
+        assert_eq!(
+            device_upload_identity("dev-1", &headers_with(&[(HEADER_DECK_CARD, "card-abc")])),
+            "deck:card-abc"
+        );
+        // A blank header value falls back to the device marker, not `deck:`.
+        assert_eq!(
+            device_upload_identity("dev-1", &headers_with(&[(HEADER_DECK_CARD, "  ")])),
+            "device:dev-1"
+        );
     }
 
     #[tokio::test]

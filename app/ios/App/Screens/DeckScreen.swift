@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// The Deck tab (docs/modules/deck.md): the full-bleed deck-shell webview
@@ -18,6 +19,8 @@ private struct DeckContent: View {
     @ObservedObject var deck: DeckStore
     let host: DeckHost
     @ObservedObject private var lang = Lang.shared
+    /// The photo the `deck.pickBlob` picker returned (nil until chosen).
+    @State private var pickedItem: PhotosPickerItem?
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -52,6 +55,29 @@ private struct DeckContent: View {
             }
         } message: {
             Text(verbatim: lang.t("deck.deleteBody"))
+        }
+        // `deck.pickBlob`: a card asked for a photo. One picker at a time
+        // (DeckStore's `activePick`); selection uploads and resolves the card's
+        // promise, dismissal-with-no-choice cancels it.
+        .photosPicker(isPresented: $deck.pickerActive, selection: $pickedItem, matching: .images)
+        .onChange(of: pickedItem) { _, item in
+            guard let item, let pick = deck.consumePick() else {
+                pickedItem = nil
+                return
+            }
+            pickedItem = nil
+            Task {
+                let mime = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
+                let data = (try? await item.loadTransferable(type: Data.self)) ?? nil
+                deck.finishPick(id: pick.id, cardId: pick.cardId, data: data, mime: mime)
+            }
+        }
+        .onChange(of: deck.pickerActive) { _, active in
+            if !active { deck.pickerDismissed() }
+        }
+        // `deck.shareBlob`: a materialized blob awaiting the system share sheet.
+        .sheet(item: $deck.shareItem) { item in
+            ShareSheet(url: item.url)
         }
     }
 

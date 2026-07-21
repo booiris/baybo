@@ -31,9 +31,9 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, DeckCardInfo,
-    DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink, MessageLookup,
-    PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
+    BlobServeOutcome, ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary,
+    DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink,
+    MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -821,7 +821,24 @@ impl BayboClient {
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             let client = self.gateway_client()?;
-            gateway_api::upload_bytes(&client, bytes, mime_type).await
+            gateway_api::upload_bytes(&client, bytes, mime_type, None).await
+        })
+        .await
+    }
+
+    /// Like [`Self::blob_upload_bytes`], but for an image a user picked inside a
+    /// deck card. The upload carries `card_id` so the gateway stamps the blob
+    /// `deck:<card_id>` instead of `device:<id>` — card purge then reclaims it,
+    /// where a plain device upload lives forever like a chat attachment.
+    pub async fn deck_blob_upload_bytes(
+        self: Arc<Self>,
+        bytes: Vec<u8>,
+        mime_type: String,
+        card_id: String,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::upload_bytes(&client, bytes, mime_type, Some(card_id)).await
         })
         .await
     }
@@ -854,6 +871,53 @@ impl BayboClient {
         .await
     }
 
+    /// One-shot deck-display serve (`baybo-transcript://…/blob/<id>`): validate
+    /// the id shape, then return cache-first bytes under `max_bytes`. Collapses
+    /// the scheme handler's shape check + cache stat + cache read + leg-bound
+    /// download + display-cap decisions into a single call so
+    /// `TranscriptSchemeHandler` stays a thin WebKit adapter. An over-cap CACHED
+    /// blob is refused by its stat (never read); an over-cap DOWNLOADED blob is
+    /// materialized once, then refused. Never throws — every terminal state is a
+    /// [`BlobServeOutcome`] the handler maps to a scheme-task response.
+    pub async fn blob_bytes_for_display(
+        self: Arc<Self>,
+        blob_id: String,
+        max_bytes: u64,
+    ) -> BlobServeOutcome {
+        runtime::run(async move {
+            if !blob_helper::is_valid_blob_id_shape(&blob_id) {
+                return Ok::<_, String>(BlobServeOutcome::BadId);
+            }
+            // Cache-first (no network, no binding): the stat refuses an over-cap
+            // cached blob without reading it; otherwise serve the cached bytes.
+            if let Some(size) = blob_helper::cached_size(&blob_id).await {
+                if size > max_bytes {
+                    return Ok(BlobServeOutcome::OverCap);
+                }
+                if let Some(data) = blob_helper::read_cached_bytes(&blob_id).await {
+                    return Ok(BlobServeOutcome::Bytes { data });
+                }
+            }
+            // Miss → leg-bound download; unbound/offline just can't render yet.
+            let downloaded = match active_leg() {
+                Ok(ActiveLeg::Direct) => {
+                    direct::download_blob_bytes(&self.direct, blob_id, None).await
+                }
+                Ok(ActiveLeg::Relay) => {
+                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id, None).await
+                }
+                Err(_) => return Ok(BlobServeOutcome::NotFound),
+            };
+            Ok(match downloaded {
+                Ok(data) if data.len() as u64 > max_bytes => BlobServeOutcome::OverCap,
+                Ok(data) => BlobServeOutcome::Bytes { data },
+                Err(_) => BlobServeOutcome::NotFound,
+            })
+        })
+        .await
+        .unwrap_or(BlobServeOutcome::NotFound)
+    }
+
     /// Is this blob already in the on-device cache? Never downloads, never
     /// touches the network. The cache lives under the OS temp dir, which iOS
     /// purges under storage pressure — re-ask rather than remembering a `true`.
@@ -863,6 +927,18 @@ impl BayboClient {
         runtime::run(async move { Ok::<_, String>(blob_helper::is_cached(&blob_id).await) })
             .await
             .unwrap_or(false)
+    }
+
+    /// Read a cached blob's bytes with NO network and NO active-binding check.
+    /// The deck display path's fast path (`baybo-transcript://…/blob/<id>`): a
+    /// cached card image renders even while the device is unbound/offline,
+    /// where [`Self::blob_download_bytes`] would fail on the missing leg. `None`
+    /// when the id is malformed or not cached — the caller then falls back to a
+    /// full download.
+    pub async fn blob_read_cached(self: Arc<Self>, blob_id: String) -> Option<Vec<u8>> {
+        runtime::run(async move { Ok::<_, String>(blob_helper::read_cached_bytes(&blob_id).await) })
+            .await
+            .unwrap_or(None)
     }
 }
 

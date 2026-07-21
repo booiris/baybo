@@ -96,6 +96,9 @@ impl DeckSupervisor {
                 }
                 let cfg = SpawnConfig {
                     card_id: card_id.clone(),
+                    // A live service's uploader identity IS its process id;
+                    // only the dry-run gate splits them.
+                    uploader_card_id: card_id.clone(),
                     bundle_dir: bundle_dir.clone(),
                     scratch_dir: scratch_dir.clone(),
                     emit_interval,

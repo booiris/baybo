@@ -287,9 +287,22 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         throw Self.unsupported
     }
 
-    func blobIsCached(blobId: String) async -> Bool { false }
+    func blobIsCached(blobId: String) async -> Bool { cachedBlobs[blobId] != nil }
+
+    /// Seeded cache for tests (`deck.shareBlob` / display fast path).
+    var cachedBlobs: [String: Data] = [:]
+    func blobReadCached(blobId: String) async -> Data? { cachedBlobs[blobId] }
+
+    func blobBytesForDisplay(blobId: String, maxBytes: UInt64) async -> BlobServeOutcome {
+        guard let data = cachedBlobs[blobId] else { return .notFound }
+        return UInt64(data.count) > maxBytes ? .overCap : .bytes(data: data)
+    }
 
     func blobUploadBytes(bytes: Data, mimeType: String) async throws -> String {
+        throw Self.unsupported
+    }
+
+    func deckBlobUploadBytes(bytes: Data, mimeType: String, cardId: String) async throws -> String {
         throw Self.unsupported
     }
 

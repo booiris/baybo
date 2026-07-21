@@ -27,6 +27,9 @@ window.deckShell = {
   callResult(payload) {
     shell.applyCallResult(payload.id, payload.ok, payload.value, payload.error);
   },
+  pickResult(payload) {
+    shell.applyPickResult(payload.id, payload.ok, payload.ref, payload.error);
+  },
   setEditMode(active) {
     shell.setEditMode(active);
   },

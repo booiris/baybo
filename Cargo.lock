@@ -601,12 +601,15 @@ name = "baybo-deck"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "baybo-model",
  "baybo-security",
  "baybo-storage",
  "baybo-store",
  "baybo-tools",
+ "bytes",
  "chrono",
+ "futures",
  "hex",
  "jsonschema",
  "parking_lot",

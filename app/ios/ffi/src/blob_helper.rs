@@ -245,6 +245,46 @@ pub(crate) async fn is_cached(blob_id: &str) -> bool {
     }
 }
 
+/// `sha256:<64 lower-hex digest>.<≥1 lower-hex read token>` — the blob
+/// capability id shape the store mints. Anything else can never resolve, so the
+/// deck display serve rejects it before any cache/network work.
+pub(crate) fn is_valid_blob_id_shape(blob_id: &str) -> bool {
+    let Some(rest) = blob_id.strip_prefix("sha256:") else {
+        return false;
+    };
+    let Some((digest, token)) = rest.split_once('.') else {
+        return false;
+    };
+    let is_lower_hex = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    digest.len() == 64 && is_lower_hex(digest) && is_lower_hex(token)
+}
+
+/// Read a cached blob's bytes with NO network and NO active-binding check —
+/// the deck display path's fast path, so a card image renders even while the
+/// device is unbound/offline. `None` when the id is malformed or not cached.
+pub(crate) async fn read_cached_bytes(blob_id: &str) -> Option<Vec<u8>> {
+    let entry = cache_entry(blob_id).await.ok()?;
+    if !cache_exists(&entry).await {
+        return None;
+    }
+    read_cached(&entry).await.ok()
+}
+
+/// The size of a cached blob without reading it (a `stat`) — lets the deck
+/// display route reject an over-cap blob before materializing it. `None` when
+/// the id is malformed or not cached.
+pub(crate) async fn cached_size(blob_id: &str) -> Option<u64> {
+    let entry = cache_entry(blob_id).await.ok()?;
+    tokio::fs::metadata(entry.path())
+        .await
+        .ok()
+        .map(|m| m.len())
+}
+
 /// A foreign progress observer, absent when the caller doesn't want ticks.
 pub(crate) type ProgressSink = Option<Arc<dyn crate::api::BlobProgress>>;
 
@@ -413,6 +453,26 @@ mod tests {
     fn a_resumed_download_opens_at_its_floor() {
         let (_ticker, sink) = ticker_with(Duration::ZERO, Some(900), 400);
         assert_eq!(sink.ticks.lock().as_slice(), [(400, Some(900))]);
+    }
+
+    #[test]
+    fn blob_id_shape_accepts_capability_ids_and_rejects_the_rest() {
+        let digest = "a".repeat(64);
+        assert!(is_valid_blob_id_shape(&format!("sha256:{digest}.deadbeef")));
+        assert!(is_valid_blob_id_shape(&format!("sha256:{digest}.0")));
+        for bad in [
+            "",
+            "sha256:",
+            "md5:abcdef",
+            "abcdef",
+            "sha256:.tok",                                  // empty digest
+            &format!("sha256:{digest}."),                   // empty token
+            &format!("sha256:{}.deadbeef", "a".repeat(63)), // short digest
+            &format!("sha256:{}.deadbeef", "A".repeat(64)), // upper-hex digest
+            &format!("sha256:{digest}.XYZ"),                // non-hex token
+        ] {
+            assert!(!is_valid_blob_id_shape(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]

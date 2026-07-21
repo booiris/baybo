@@ -156,11 +156,16 @@ export function cycleSize(size: DeckSize, sizes: DeckSize[]): DeckSize {
   return ordered[(i + 1) % ordered.length] ?? ordered[0];
 }
 
-/// The card iframe's CSP: no network of any kind, inline script/style +
-/// data: images only. Belt to the sandbox attribute's braces — the
-/// sandbox alone does NOT block a fire-and-forget fetch.
+/// The card iframe's CSP: no network of any kind EXCEPT opaque blob-capability
+/// image GETs against the user's own gateway (the `baybo-transcript:` custom
+/// scheme, served by the app's own WKURLSchemeHandler — never a real socket).
+/// Inline script/style + `data:`/blob-scheme images only. Belt to the sandbox
+/// attribute's braces — the sandbox alone does NOT block a fire-and-forget
+/// fetch. `img-src` admits `baybo-transcript:` so a card can display a blob it
+/// produced or was handed (docs/modules/deck.md §Blobs); no other directive
+/// gains the scheme, so script/fetch/style still have zero network.
 export const CARD_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;";
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: baybo-transcript:;";
 
 /// Compose a card's srcdoc: CSP first, then the card-side SDK (so the
 /// `deck` global exists before any card inline script runs), then the

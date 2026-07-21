@@ -341,6 +341,23 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// Outcome of [`crate::BayboClient::blob_bytes_for_display`] — the deck scheme
+/// handler maps each case to a `WKURLSchemeTask` response. Collapses the shape
+/// check, the cache-first read, the leg-bound download, and the display-cap
+/// decisions into one call so Swift stays a thin WebKit adapter.
+#[derive(Debug, uniffi::Enum)]
+pub enum BlobServeOutcome {
+    /// The blob's bytes, within the display cap.
+    Bytes { data: Vec<u8> },
+    /// Present but larger than the caller's display cap — the `<img>` should
+    /// fail to render rather than pull it into memory.
+    OverCap,
+    /// Not cached and undownloadable right now (no active leg, or gone).
+    NotFound,
+    /// Not a well-formed `sha256:<digest>.<token>` capability id.
+    BadId,
+}
+
 impl From<ApprovalDecision> for crate::core::WireApprovalDecision {
     fn from(d: ApprovalDecision) -> Self {
         match d {
