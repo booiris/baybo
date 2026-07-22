@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
+  compactionDividerIds,
   foldAdjacentWork,
   foldMidTurnNoticeIn,
   severTerminalNoticeIn,
@@ -557,6 +558,17 @@ describe("foldAdjacentWork — a turn cut by a page boundary is still one turn",
     expect(row).toMatchObject({ id: "w3", startedAt: TURN_START, elapsedMs: FIRST_END - TURN_START });
     expect(row.steps).toHaveLength(1);
   });
+
+  it("does NOT fuse two halves across a compaction boundary (they are distinct turns)", () => {
+    // A mid-turn compaction split w3 | w43 at watermark 20 (server-side). Without
+    // the guard iOS's fold would re-join them into one card and swallow the
+    // divider; with the boundary between their ordinals they stay two cards.
+    const out = foldAdjacentWork([first(), second()], [{ ordinal: 20, at: "t" }]);
+    expect(out).toHaveLength(2);
+    expect((out as WorkRow[]).map((r) => r.id)).toEqual(["w3", "w43"]);
+    // A boundary OUTSIDE the pair (below both) still lets them fuse.
+    expect(foldAdjacentWork([first(), second()], [{ ordinal: 2, at: "t" }])).toHaveLength(1);
+  });
 });
 
 describe("reconcileWork", () => {
@@ -650,5 +662,43 @@ describe("restoreImageDims", () => {
 
   it("tolerates an absent map (a mirror written before imageDims existed)", () => {
     expect(restoreImageDims(undefined).size).toBe(0);
+  });
+});
+
+describe("compactionDividerIds — the pre-compaction seam", () => {
+  const row = (id: string): Row => ({ id }) as Row;
+  // Machinery ordinals (3..6) are hidden server-side, so the thread jumps 2 → 7.
+  const thread = [row("m0"), row("m1"), row("m2"), row("m7"), row("m8")];
+
+  it("marks the first row at/after the watermark, once", () => {
+    const ids = compactionDividerIds(thread, [{ ordinal: 3, at: "2026-07-22T10:00:00Z" }]);
+    expect([...ids.entries()]).toEqual([["m7", "2026-07-22T10:00:00Z"]]);
+  });
+
+  it("draws nothing when the boundary is above every loaded row", () => {
+    const ids = compactionDividerIds([row("m7"), row("m8")], [{ ordinal: 3, at: "t" }]);
+    expect(ids.size).toBe(0);
+  });
+
+  it("is empty when the session was never compacted", () => {
+    expect(compactionDividerIds(thread, []).size).toBe(0);
+  });
+
+  it("handles two compactions at their own seams", () => {
+    const twice = [row("m0"), row("m4"), row("m9")];
+    const ids = compactionDividerIds(twice, [
+      { ordinal: 2, at: "t1" },
+      { ordinal: 6, at: "t2" },
+    ]);
+    expect([...ids.entries()]).toEqual([
+      ["m4", "t1"],
+      ["m9", "t2"],
+    ]);
+  });
+
+  it("ignores rows with no ordinal (interleaved notices / live blocks)", () => {
+    const withNotice = [row("m2"), row("n5"), row("m7")];
+    const ids = compactionDividerIds(withNotice, [{ ordinal: 3, at: "t" }]);
+    expect([...ids.keys()]).toEqual(["m7"]);
   });
 });

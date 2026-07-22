@@ -873,9 +873,15 @@ impl SessionStore for SqliteSessionStore {
                 const COLS_PER_ROW: usize = 7;
                 const ROWS_PER_BATCH: usize = 999 / COLS_PER_ROW;
                 for (chunk_idx, chunk) in prepared.chunks(ROWS_PER_BATCH).enumerate() {
+                    // `compaction_inserted` is a literal `1` on every row this
+                    // writes (reseeded system + summary head + re-injected
+                    // recent turns) — all of it is machinery the chat DISPLAY
+                    // reads hide, so the view renders the real conversation once
+                    // from the still-present superseded originals. It is NOT a
+                    // bound column, so `COLS_PER_ROW` stays the bind count.
                     let mut sql = String::from(
                         "INSERT INTO session_messages \
-                         (session_id, ordinal, role, content, created_at, source, platform_msg_id) VALUES ",
+                         (session_id, ordinal, role, content, created_at, source, platform_msg_id, compaction_inserted) VALUES ",
                     );
                     let mut params: Vec<rusqlite::types::Value> =
                         Vec::with_capacity(chunk.len() * COLS_PER_ROW);
@@ -886,7 +892,7 @@ impl SessionStore for SqliteSessionStore {
                         }
                         let p = i * COLS_PER_ROW;
                         sql.push_str(&format!(
-                            "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                            "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, 1)",
                             p + 1,
                             p + 2,
                             p + 3,
@@ -1051,18 +1057,20 @@ impl SessionStore for SqliteSessionStore {
         let sid = session_id.as_str().to_string();
         // `before_ordinal IS NULL OR ordinal < before_ordinal` so a
         // single SQL string handles both the "fresh tail" and the
-        // scroll-up "next page" calls. The partial active index
-        // (`session_id, ordinal WHERE superseded_by IS NULL`) makes
-        // the DESC+LIMIT a back-of-the-index walk — never reads more
-        // than `limit` row contents off disk even on a million-row
-        // session.
+        // scroll-up "next page" calls. This is a DISPLAY read: it filters
+        // `compaction_inserted = 0` (not `superseded_by IS NULL`) so the
+        // chat view is the real conversation — the still-present superseded
+        // originals render, the re-injected compaction copies are hidden.
+        // The `(session_id, ordinal)` primary key orders the DESC+LIMIT
+        // walk; the handful of hidden machinery rows per compaction are
+        // skipped as they're read, so the LIMIT still bites the tail.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows: Vec<RawMessageRowWithMeta> = self
             .pool
             .interact("sessions.load_active_session_messages_tail", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
-                     WHERE session_id = ?1 AND superseded_by IS NULL \
+                     WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND (?2 IS NULL OR ordinal < ?2) \
                      ORDER BY ordinal DESC \
                      LIMIT ?3",
@@ -1117,17 +1125,19 @@ impl SessionStore for SqliteSessionStore {
         }
         let sid = session_id.as_str().to_string();
         // Forward difference: rows with ordinal strictly greater than the
-        // client's cursor, capped at `limit`. The partial active index
-        // bites the front of the range (`ordinal > N`) so a session
-        // with hundreds of older rows pays nothing for them — only the
-        // difference window is read.
+        // client's cursor, capped at `limit`. DISPLAY read (chat sync +
+        // push preview), so it filters `compaction_inserted = 0` — a live
+        // compaction's summary/re-injected machinery is never delivered to
+        // the thread; only genuine post-compaction turns advance the view.
+        // The `(session_id, ordinal)` key bites the front of the range so
+        // older rows cost nothing.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows: Vec<RawMessageRowWithMeta> = self
             .pool
             .interact("sessions.load_active_session_messages_since", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
-                     WHERE session_id = ?1 AND superseded_by IS NULL \
+                     WHERE session_id = ?1 AND compaction_inserted = 0 \
                        AND ordinal > ?2 \
                      ORDER BY ordinal ASC \
                      LIMIT ?3",
@@ -1165,6 +1175,48 @@ impl SessionStore for SqliteSessionStore {
             ));
         }
         Ok(out)
+    }
+
+    async fn compaction_boundaries(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, DateTime<Utc>)>> {
+        let sid = session_id.as_str().to_string();
+        // Each distinct `superseded_by` value is a compaction watermark;
+        // its value is the ordinal of the summary head that compaction
+        // wrote, so the head row itself carries the compaction time as
+        // its `created_at`. Served by the `idx_session_messages_superseded`
+        // partial index — reading only those head rows keeps this off the
+        // transcript-content path entirely.
+        let raw: Vec<(i64, i64)> = self
+            .pool
+            .interact("sessions.compaction_boundaries", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ordinal, created_at FROM session_messages \
+                     WHERE session_id = ?1 AND ordinal IN ( \
+                         SELECT DISTINCT superseded_by FROM session_messages \
+                         WHERE session_id = ?1 AND superseded_by IS NOT NULL \
+                     ) \
+                     ORDER BY ordinal ASC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(ordinal, created_us)| {
+                let at = super::time::from_us(created_us).ok_or_else(|| {
+                    StorageError::Storage(format!(
+                        "session_messages.created_at out of range: {created_us}"
+                    ))
+                })?;
+                Ok((ordinal, at))
+            })
+            .collect()
     }
 
     async fn find_message_ordinal_by_platform_msg_id(
@@ -1284,7 +1336,7 @@ impl SessionStore for SqliteSessionStore {
                          SELECT session_id, created_at, role, content, source, platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
                          FROM session_messages \
-                         WHERE session_id IN ({placeholders}) AND superseded_by IS NULL \
+                         WHERE session_id IN ({placeholders}) AND compaction_inserted = 0 \
                            AND source IN ({HUMAN_SOURCES_SQL}) \
                      ) WHERE rn = 1"
                 ))?;
@@ -1338,7 +1390,7 @@ impl SessionStore for SqliteSessionStore {
                          SELECT session_id, ordinal, created_at, role, content, source, platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) rn \
                          FROM session_messages \
-                         WHERE session_id IN ({placeholders}) AND superseded_by IS NULL \
+                         WHERE session_id IN ({placeholders}) AND compaction_inserted = 0 \
                      ) WHERE rn <= ? ORDER BY session_id, ordinal"
                 ))?;
                 let params: Vec<rusqlite::types::Value> = keys
@@ -1398,7 +1450,7 @@ impl SessionStore for SqliteSessionStore {
                          SELECT sm.session_id, sm.role, sm.content, sm.source, sm.platform_msg_id, \
                                 ROW_NUMBER() OVER (PARTITION BY sm.session_id ORDER BY sm.ordinal) rn \
                          FROM session_messages sm JOIN sessions s ON s.id = sm.session_id \
-                         WHERE sm.session_id IN ({placeholders}) AND sm.superseded_by IS NULL \
+                         WHERE sm.session_id IN ({placeholders}) AND sm.compaction_inserted = 0 \
                            AND sm.ordinal > COALESCE(s.read_cursor, -1) \
                      ) WHERE rn <= ? ORDER BY session_id"
                 ))?;
@@ -1587,7 +1639,7 @@ impl SqliteSessionStore {
             .pool
             .interact("sessions.load_session_messages_with_supersede", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id \
+                    "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id, compaction_inserted \
                      FROM session_messages \
                      WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal",
                 )?;
@@ -1601,6 +1653,7 @@ impl SqliteSessionStore {
                             row.get::<_, i64>(4)?,
                             row.get::<_, String>(5)?,
                             row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1609,8 +1662,16 @@ impl SqliteSessionStore {
             .await?;
 
         let mut out = Vec::new();
-        for (ordinal, superseded_by, role, content_json, created_us, source_str, platform_msg_id) in
-            rows
+        for (
+            ordinal,
+            superseded_by,
+            role,
+            content_json,
+            created_us,
+            source_str,
+            platform_msg_id,
+            compaction_inserted,
+        ) in rows
         {
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Internal(anyhow::anyhow!(
@@ -1621,6 +1682,7 @@ impl SqliteSessionStore {
                 ordinal,
                 superseded_by,
                 created_at,
+                compaction_inserted: compaction_inserted != 0,
                 message: decode_message_row((role, content_json, source_str, platform_msg_id))?,
             });
         }
@@ -2716,6 +2778,112 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compacted_display_shows_the_real_conversation_once() {
+        // The Philosophy-B contract: after a compaction the DISPLAY reads
+        // (`_tail`, `_since`) return the real conversation — the superseded
+        // pre-compaction originals plus the genuine post-compaction turns —
+        // and hide the machinery `apply_session_compaction` wrote (summary
+        // head + re-injected recent turns). The LLM-context read
+        // (`load_active_session_messages`) is unaffected: it still returns
+        // the active set, machinery included.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let session = make_root_session("compacted-b");
+        store.save(&session).await.unwrap();
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+        let umsg = |t: &str, pmid: &str| {
+            baybo_model::ChatMessage::user(text(t)).with_platform_msg_id(pmid)
+        };
+
+        // Three real pre-compaction user turns (ordinals 0..=2).
+        for (t, id) in [("a", "id-a"), ("b", "id-b"), ("c", "id-c")] {
+            store
+                .append_session_message(&session.id, &umsg(t, id))
+                .await
+                .unwrap();
+        }
+
+        // Compaction: supersede 0..=2, then re-seed [system, summary, and the
+        // recent turns b/c kept verbatim] at ordinals 3..=6. All machinery.
+        let head = store
+            .apply_session_compaction(
+                &session.id,
+                &[
+                    baybo_model::ChatMessage::system(text("sys")),
+                    baybo_model::ChatMessage::assistant(text("summary")),
+                    umsg("b", "id-b"),
+                    umsg("c", "id-c"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(head, 3);
+
+        // One genuine post-compaction user turn (ordinal 7).
+        store
+            .append_session_message(&session.id, &umsg("d", "id-d"))
+            .await
+            .unwrap();
+
+        // DISPLAY tail: the real conversation, each turn once — the
+        // superseded originals a/b/c (ords 0..=2) and the post-compaction d
+        // (ord 7). NONE of the machinery ordinals 3..=6.
+        let tail = store
+            .load_active_session_messages_tail(&session.id, None, 100)
+            .await
+            .unwrap();
+        let tail_ords: Vec<i64> = tail.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(tail_ords, vec![0, 1, 2, 7]);
+
+        // DISPLAY forward-since from before the log: same real conversation,
+        // machinery never advances the thread.
+        let since = store
+            .load_active_session_messages_since(&session.id, -1, 100)
+            .await
+            .unwrap();
+        let since_ords: Vec<i64> = since.iter().map(|(o, _, _)| *o).collect();
+        assert_eq!(since_ords, vec![0, 1, 2, 7]);
+
+        // LLM-CONTEXT read is untouched: the active set is the machinery
+        // head 3..=6 + the post-compaction turn 7 — the model still sees the
+        // summary and the re-injected turns.
+        let active = store
+            .load_active_session_messages(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 5, "system+summary+b+c+d");
+
+        // One compaction → one boundary, anchored at the summary head ordinal.
+        let boundaries = store.compaction_boundaries(&session.id).await.unwrap();
+        let boundary_ords: Vec<i64> = boundaries.iter().map(|(o, _)| *o).collect();
+        assert_eq!(boundary_ords, vec![3]);
+
+        // A never-compacted session reports no boundaries and shows every
+        // appended row (the two predicates coincide when nothing is machinery).
+        let fresh = make_root_session("fresh-b");
+        store.save(&fresh).await.unwrap();
+        store
+            .append_session_message(&fresh.id, &umsg("hi", "id-hi"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_boundaries(&fresh.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let fresh_tail = store
+            .load_active_session_messages_tail(&fresh.id, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(fresh_tail.len(), 1);
     }
 
     #[tokio::test]

@@ -395,6 +395,25 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
+    /// Compaction boundaries — one `(ordinal, created_at)` per distinct
+    /// `superseded_by` watermark, ascending; empty when the session has
+    /// never been compacted. Backs the chat REST detail's
+    /// `compaction_points`, which drives the web's "pre-compaction
+    /// history" divider. `SessionError::NotFound` when the session
+    /// itself does not exist.
+    pub async fn compaction_boundaries(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, DateTime<Utc>)>> {
+        if self.store.get(session_id).await?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        self.store
+            .compaction_boundaries(session_id)
+            .await
+            .map_err(SessionError::from)
+    }
+
     /// Ordinal of the newest persisted row carrying `platform_msg_id`,
     /// or `None`. The durability point lookup behind the chat outbox's
     /// rebase-floor resolution — see

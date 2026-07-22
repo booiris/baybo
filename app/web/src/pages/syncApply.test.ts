@@ -3,6 +3,8 @@ import type { components } from '../api/schema';
 import {
   applySyncMerge,
   applySyncReplace,
+  compactionDividerKeys,
+  shouldAutoLoadOlder,
   transcriptItemToRow,
   type TranscriptRow,
 } from './ChatPage';
@@ -140,5 +142,80 @@ describe('applySyncMerge (difference append + dedup)', () => {
     const commands = out.filter((r) => r.text === '/compact');
     expect(commands).toHaveLength(1); // reconciled, not doubled
     expect(commands[0].pending).toBeFalsy();
+  });
+});
+
+describe('compactionDividerKeys — the pre-compaction seam', () => {
+  const row = (key: string): TranscriptRow => ({ key, role: 'user', text: '' });
+  // Under Philosophy B the machinery ordinals (3..6) are hidden, so the
+  // displayed thread jumps 2 → 7 across the compaction watermark at ordinal 3.
+  const thread = [
+    row('row-s-m0'),
+    row('row-s-m1'),
+    row('row-s-m2'),
+    row('row-s-m7'),
+    row('row-s-m8'),
+  ];
+
+  it('marks the first row at/after the watermark, once', () => {
+    const keys = compactionDividerKeys(thread, [{ ordinal: 3, at: '2026-07-22T10:00:00Z' }]);
+    expect([...keys.entries()]).toEqual([['row-s-m7', '2026-07-22T10:00:00Z']]);
+  });
+
+  it('draws nothing when the boundary is above every loaded row (not paged in yet)', () => {
+    // Only post-compaction rows loaded — the originals below the seam aren't here.
+    const keys = compactionDividerKeys([row('row-s-m7'), row('row-s-m8')], [
+      { ordinal: 3, at: '2026-07-22T10:00:00Z' },
+    ]);
+    expect(keys.size).toBe(0);
+  });
+
+  it('is empty when the session was never compacted', () => {
+    expect(compactionDividerKeys(thread, []).size).toBe(0);
+  });
+
+  it('handles two compactions at their own seams', () => {
+    const twice = [row('row-s-m0'), row('row-s-m4'), row('row-s-m9')];
+    const keys = compactionDividerKeys(twice, [
+      { ordinal: 2, at: 't1' },
+      { ordinal: 6, at: 't2' },
+    ]);
+    expect([...keys.entries()]).toEqual([
+      ['row-s-m4', 't1'],
+      ['row-s-m9', 't2'],
+    ]);
+  });
+
+  it('ignores rows with no message/work ordinal (interleaved notices)', () => {
+    // A notice (`n<seq>`) between the last original and the first post-row must
+    // not swallow or misplace the seam — the divider still lands on m7.
+    const withNotice = [row('row-s-m2'), row('row-s-n5'), row('row-s-m7')];
+    const keys = compactionDividerKeys(withNotice, [{ ordinal: 3, at: 't' }]);
+    expect([...keys.keys()]).toEqual(['row-s-m7']);
+  });
+});
+
+describe('shouldAutoLoadOlder — reach older history when the thread underfills', () => {
+  const base = {
+    hasMore: true,
+    olderLoading: false,
+    historyLoading: false,
+    scrollHeight: 300,
+    clientHeight: 800,
+    slackPx: 4,
+  };
+
+  it('fires when there is more history and no scrollable overflow', () => {
+    // The exact stuck case: a compacted session whose post-compaction tail folds
+    // to a couple of cards, too short to scroll — auto-load must page it back.
+    expect(shouldAutoLoadOlder(base)).toBe(true);
+  });
+  it('does not fire once the content overflows (normal scroll works)', () => {
+    expect(shouldAutoLoadOlder({ ...base, scrollHeight: 1200 })).toBe(false);
+  });
+  it('never fires while in flight, during the initial load, or at the floor', () => {
+    expect(shouldAutoLoadOlder({ ...base, olderLoading: true })).toBe(false);
+    expect(shouldAutoLoadOlder({ ...base, historyLoading: true })).toBe(false);
+    expect(shouldAutoLoadOlder({ ...base, hasMore: false })).toBe(false);
   });
 });

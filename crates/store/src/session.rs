@@ -25,6 +25,12 @@ pub struct StoredMessage {
     /// the row belongs to a different epoch and must not be returned
     /// as that span's input.
     pub created_at: DateTime<Utc>,
+    /// `true` for a row `apply_session_compaction` wrote (summary head +
+    /// re-injected recent turns). Trace hydration ignores it — the
+    /// machinery IS the model's context — but the chat display reads use
+    /// it to render the real conversation once (see
+    /// [`SessionStore::load_active_session_messages_tail`]).
+    pub compaction_inserted: bool,
     pub message: ChatMessage,
 }
 
@@ -427,13 +433,20 @@ pub trait SessionStore: Send + Sync {
         up_to_ordinal: i64,
     ) -> Result<Vec<ChatMessage>>;
 
-    /// Reverse-paginated slice of the active transcript: at most
+    /// Reverse-paginated slice of the transcript for DISPLAY: at most
     /// `limit` rows whose `ordinal` is strictly below `before_ordinal`
-    /// (or the tail of the transcript when `before_ordinal` is `None`),
-    /// returned in **ascending** ordinal order. Each row is paired with
-    /// its absolute ordinal and persisted `created_at` so the caller
-    /// can both request the next-older page and render a per-message
-    /// timestamp without a second lookup.
+    /// (or the tail when `before_ordinal` is `None`), in **ascending**
+    /// ordinal order, each paired with its absolute ordinal and
+    /// persisted `created_at` so the caller can page the next-older
+    /// slice and render a per-message timestamp without a second lookup.
+    ///
+    /// Returns the **real conversation** — rows where
+    /// `compaction_inserted = 0` — NOT the active set. So the superseded
+    /// pre-compaction originals render (each real turn once) and the
+    /// re-injected compaction copies are hidden. This is the display
+    /// counterpart to [`Self::load_active_session_messages`], which
+    /// returns the live LLM context (machinery included) and must never
+    /// share this filter.
     ///
     /// Used by the chat REST surface so a long-running session doesn't
     /// pay an O(transcript-length) round-trip on every initial load;
@@ -445,18 +458,31 @@ pub trait SessionStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>>;
 
-    /// Forward difference slice: the next at most `limit` active rows
-    /// whose `ordinal` is strictly **greater than** `after_ordinal`,
-    /// returned in ascending order alongside each row's absolute
-    /// ordinal and persisted `created_at`. Powers the REST sync
-    /// endpoint's cursor scan — the one forward-recovery pull a chat
-    /// client runs after any gap.
+    /// Forward difference slice for DISPLAY: the next at most `limit`
+    /// real-conversation rows (`compaction_inserted = 0`) whose `ordinal`
+    /// is strictly **greater than** `after_ordinal`, in ascending order
+    /// alongside each row's absolute ordinal and `created_at`. Powers the
+    /// REST sync endpoint's cursor scan (and the push-preview read) — a
+    /// live compaction's machinery never advances the thread; only genuine
+    /// post-compaction turns do.
     async fn load_active_session_messages_since(
         &self,
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
     ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>>;
+
+    /// Compaction boundaries for the session: one `(ordinal, created_at)`
+    /// per distinct `superseded_by` watermark — the summary-head row
+    /// compaction wrote at that ordinal (the watermark value *is* that
+    /// head's ordinal; see `apply_session_compaction`). Ascending by
+    /// ordinal; empty when the session was never compacted. The chat view
+    /// draws a "pre-compaction history" divider before the first displayed
+    /// row at/after each boundary. Reads no transcript content.
+    async fn compaction_boundaries(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, DateTime<Utc>)>>;
 
     /// Ordinal of the newest persisted row carrying this
     /// `platform_msg_id` (the client-generated send idempotency key),
