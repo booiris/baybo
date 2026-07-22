@@ -155,7 +155,16 @@ impl Router {
                 || {
                     let actor_token = parent_token.child_token();
                     let pinned = session.state.last_llm.clone();
-                    actor_spawner(session, pinned, response_tx, actor_token)
+                    let pinned_model = session.state.last_model.clone();
+                    let pinned_effort = session.state.last_effort.clone();
+                    actor_spawner(
+                        session,
+                        pinned,
+                        pinned_model,
+                        pinned_effort,
+                        response_tx,
+                        actor_token,
+                    )
                 },
             )
             .await;
@@ -321,7 +330,16 @@ impl Router {
             .route_or_spawn(session_id, message, || {
                 let actor_token = parent_token.child_token();
                 let pinned = session.state.last_llm.clone();
-                actor_spawner(session, pinned, response_tx, actor_token)
+                let pinned_model = session.state.last_model.clone();
+                let pinned_effort = session.state.last_effort.clone();
+                actor_spawner(
+                    session,
+                    pinned,
+                    pinned_model,
+                    pinned_effort,
+                    response_tx,
+                    actor_token,
+                )
             })
             .await
     }

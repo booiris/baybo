@@ -1250,12 +1250,23 @@ export interface components {
             /** Format: date-time */
             last_active: string;
             /**
+             * @description Per-session reasoning-effort pick (`session.state.last_effort`), or
+             *     `null` for the entry default. Drives the header's thinking-level check.
+             */
+            last_effort?: string | null;
+            /**
              * @description Per-session LLM pin (`session.state.last_llm`): the `baybo.json`
              *     entry name this session's turns resolve against, or `null` to
              *     follow `default-llm`. Drives the chat header model picker's
              *     initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
              */
             last_llm?: string | null;
+            /**
+             * @description Per-session model pick within `last_llm`'s entry
+             *     (`session.state.last_model`), or `null` for the entry's default.
+             *     Drives which model row the header picker checks.
+             */
+            last_model?: string | null;
             /** Format: int64 */
             newest_ordinal?: number | null;
             /**
@@ -1890,7 +1901,19 @@ export interface components {
             /** @description Effective vision flag. */
             effective_supports_vision: boolean;
             is_default: boolean;
+            /**
+             * @description Cheaper/faster model for lightweight auxiliary calls — reserved, no
+             *     runtime path consumes it yet. `None` when unconfigured.
+             */
+            lite_model?: string | null;
             model: string;
+            /**
+             * @description Extra model ids this entry can serve (same provider + credentials).
+             *     A session can be pinned to any of `[model] + model_candidates`; the
+             *     chat header picker lists them under the entry. Empty for an entry
+             *     that offers only its default `model`.
+             */
+            model_candidates?: string[];
             name: string;
             pricing_override?: null | components["schemas"]["LlmPricingOverrideDto"];
             provider: string;
@@ -2179,6 +2202,21 @@ export interface components {
              *     configured entry — see `GET /v1/llm/models` → `items[].name`.
              */
             llm?: string | null;
+            /**
+             * @description The model to pick WITHIN `llm`'s entry — one of that entry's
+             *     `[model] + model_candidates`. `null`/absent uses the entry's default
+             *     model. Ignored (and rejected as a mismatch) when `llm` is `null`,
+             *     since there is no entry to pick a model within.
+             */
+            model?: string | null;
+            /**
+             * @description Per-session reasoning effort
+             *     (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for
+             *     the entry's default. Applies to every turn of THIS session only (not a
+             *     global entry edit); consumed by providers that support it
+             *     (openai-subscription), clamped per model at runtime.
+             */
+            reasoning_effort?: string | null;
         };
         SetSessionModelResponse: {
             /**
@@ -2188,8 +2226,18 @@ export interface components {
              *     message spawns one that reads the pin).
              */
             applied_to_live_actor: boolean;
+            /**
+             * @description The reasoning-effort pick now in effect, or `null` for the entry
+             *     default.
+             */
+            last_effort?: string | null;
             /** @description The pin now in effect: the entry name, or `null` for `default-llm`. */
             last_llm?: string | null;
+            /**
+             * @description The model pick now in effect within the entry, or `null` for the
+             *     entry's default model.
+             */
+            last_model?: string | null;
         };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/pin`. */
         SetSessionPinRequest: {

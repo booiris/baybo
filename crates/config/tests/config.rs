@@ -90,6 +90,8 @@ fn entry(name: &str) -> LlmEntry {
         name: name.into(),
         provider: "openai".into(),
         model: "gpt-4o-mini".into(),
+        model_candidates: Vec::new(),
+        lite_model: None,
         api_key_env: None,
         base_url: None,
         supports_vision: None,

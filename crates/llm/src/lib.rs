@@ -232,6 +232,14 @@ pub struct ChatRequest {
     pub messages: Vec<baybo_model::ChatMessage>,
     pub temperature: Option<f32>,
     pub tools: Vec<ToolDefinitionForLlm>,
+    /// Per-request reasoning-effort override
+    /// (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`). Consumed only by
+    /// the `openai-subscription` provider (others ignore it); `None` falls
+    /// back to the client's construction-time effort. The agent loop sets
+    /// this from the session's `last_model`-adjacent `last_effort` pin so the
+    /// chat header's thinking level is PER-SESSION, not a global entry edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// A tool definition in the format expected by the LLM layer.
@@ -500,9 +508,14 @@ fn repack_completion<R>(
 }
 
 impl AnyCompletionModel {
+    /// `effort` is the per-request reasoning-effort override from
+    /// [`ChatRequest::reasoning_effort`]. Only the `openai-subscription` arm
+    /// consumes it; every other provider ignores it (its effort, if any, is
+    /// baked in at client construction).
     async fn completion(
         &self,
         request: CompletionRequest,
+        effort: Option<&str>,
     ) -> std::result::Result<completion::CompletionResponse<()>, CompletionError> {
         match self {
             Self::OpenAI(m) => {
@@ -568,13 +581,14 @@ impl AnyCompletionModel {
             Self::Llamafile(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Hyperbolic(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::HuggingFace(m) => Ok(repack_completion(m.completion(request).await?)),
-            Self::OpenAiSubscription(m) => m.completion(request).await,
+            Self::OpenAiSubscription(m) => m.completion(request, effort).await,
         }
     }
 
     async fn stream(
         &self,
         request: CompletionRequest,
+        effort: Option<&str>,
     ) -> std::result::Result<LlmStream, CompletionError> {
         match self {
             Self::OpenAI(m) => {
@@ -604,7 +618,7 @@ impl AnyCompletionModel {
             Self::Llamafile(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Hyperbolic(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::HuggingFace(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
-            Self::OpenAiSubscription(m) => m.stream(request).await,
+            Self::OpenAiSubscription(m) => m.stream(request, effort).await,
         }
     }
 }
@@ -687,7 +701,7 @@ impl LlmClient {
 
         let response = self
             .model
-            .completion(rig_request)
+            .completion(rig_request, request.reasoning_effort.as_deref())
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -716,7 +730,7 @@ impl LlmClient {
 
         let stream = self
             .model
-            .stream(rig_request)
+            .stream(rig_request, request.reasoning_effort.as_deref())
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -1082,6 +1096,7 @@ impl LlmClient {
             ])],
             temperature: Some(0.0),
             tools: vec![],
+            reasoning_effort: None,
         };
         let start = std::time::Instant::now();
         let response = self.chat(&req).await?;

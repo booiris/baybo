@@ -82,7 +82,22 @@ final class ChatStore: ObservableObject {
     /// clears this; nil for every normal open. Not `@Published` — it is read
     /// once at mount, never observed.
     var initialDraft: String?
-    @Published private(set) var connState: ConnState
+    @Published private(set) var connState: ConnState {
+        didSet { watchLegDown() }
+    }
+    /// Sustained-disconnect signal behind the header's offline icon. Raw
+    /// `connState` can't drive it: a real outage OSCILLATES `connecting ↔
+    /// offline` through the retry loop — `offline` is only the 2s gap between
+    /// failed dials, and a dead network's dial can hang in `connecting` for
+    /// its whole timeout — so an `offline`-gated indicator barely ever showed.
+    /// This flips true once the leg has been away from `.connected` for
+    /// `legDownDelay` (drafts have no leg to be down), and clears the moment
+    /// a dial lands.
+    @Published private(set) var legDown = false
+    /// A real outage wants seconds of debounce (entry/foreground dials pass
+    /// through `.connecting` on every healthy open); a test wants ms.
+    var legDownDelay: Duration = .seconds(4)
+    private var legDownTask: Task<Void, Never>?
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?
     /// A tapped file attachment, materialised on disk and awaiting presentation.
@@ -107,6 +122,26 @@ final class ChatStore: ObservableObject {
     /// after 5 minutes. The rendering mirror of `approvals`, republished only on
     /// a real edit.
     @Published private(set) var pendingApprovals: [PendingApproval] = []
+    /// The session's model pin (`last_llm`): the LLM entry name its turns
+    /// resolve against, or `nil` to follow the gateway's `default-llm`. Drives
+    /// the header pill + picker checkmarks. Written optimistically by
+    /// `selectModel`, seeded from the session meta by `refreshModelPin`.
+    @Published private(set) var modelPin: String?
+    /// The model chosen WITHIN `modelPin`'s entry (a `model_candidates` id),
+    /// or `nil` for the entry's default model. Paired with `modelPin`
+    /// everywhere; the pill shows this.
+    @Published private(set) var modelPinModel: String?
+    /// The session's reasoning-effort pin (`last_effort`), or `nil` for the
+    /// entry's default effort. Independent of the llm/model pin (applies
+    /// whatever entry runs); drives the header's thinking-level checkmark.
+    @Published private(set) var modelPinEffort: String?
+    /// Whether the pin is trustworthy: a seed fetch succeeded, or the user
+    /// picked locally. Until then the pill shows a neutral placeholder — a
+    /// listed session whose pin read FAILED (offline open) may well be pinned,
+    /// and confidently labelling it with the default entry would misreport
+    /// what the next turn runs. A draft starts resolved: it has no remote row,
+    /// so its nil pin is authoritative.
+    @Published private(set) var modelPinResolved: Bool
 
     /// Increments on every successful dial; the webview uses it to retry
     /// attachments that raced ahead of the leg going live, and — the sync-loop
@@ -127,6 +162,41 @@ final class ChatStore: ObservableObject {
     /// The pending-approval state machine; `pendingApprovals` is its published
     /// mirror.
     private var approvals = ApprovalQueue()
+    /// Monotonic guard for model-pin traffic: a slow `refreshModelPin` fetch or
+    /// an out-of-order PUT failure must never clobber a newer selection.
+    private var modelPinEpoch = 0
+    /// Coalesces the per-open pin reads; deliberately NOT a once-per-store
+    /// latch. This store is cached resident by `AppStore` (LRU), the gateway
+    /// broadcasts no frame when another client re-pins the session, and the
+    /// open-edge read is therefore the ONLY sync point — latching it off left
+    /// the pill stale forever on exactly the most-used sessions.
+    private var modelPinFetchInFlight = false
+    /// A selection made while the session was still a draft (no remote row to
+    /// pin), stamped with the epoch of that pick: a newer selection supersedes
+    /// it and the stale PUT is skipped outright — re-sending it could land
+    /// AFTER the newer pick's PUT (writes have no wire order) and flip the
+    /// gateway back. `entry: nil` means "picked the default back": a draft's
+    /// remote pin doesn't exist yet, so there is nothing to create.
+    private var pendingModelPin: (entry: String?, model: String?, effort: String?, epoch: Int)?
+    /// The last gateway-acknowledged selection (seed fetch or successful PUT)
+    /// — what a failed PUT reverts the pill to. Reverting to the previous
+    /// DISPLAY value would resurrect a selection the gateway never accepted
+    /// (two failures in a row rest on the first failed pick).
+    private var confirmedModelPin: (entry: String?, model: String?, effort: String?) = (
+        nil, nil, nil
+    )
+    /// A draft-time pin PUT failed inside `ensureRemoteSession`; the notice is
+    /// raised by the send path AFTER the send settles, because the dial path
+    /// clears `notice` on its way out (the redial-supersedes-notice contract)
+    /// and would wipe one raised here.
+    private var draftPinFailed = false
+    /// Tail of the serialized pin-PUT chain + how many are queued/in flight.
+    /// Every pin write awaits the one before it: two overlapping PUTs have no
+    /// wire order (pooled direct connections; the relay replays a silently
+    /// failed leg after its first-byte timeout), so the older could land last
+    /// and pin the gateway to a pick the pill no longer shows.
+    private var modelPutTail: Task<Void, Never>?
+    private var modelPutsInFlight = 0
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
     /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
@@ -179,6 +249,7 @@ final class ChatStore: ObservableObject {
         self.listed = listed
         connState = listed ? .connecting : .draft
         remoteSessionEnsured = false
+        modelPinResolved = !listed
     }
 
     // MARK: - Connection lifecycle
@@ -267,6 +338,30 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Arm/clear the sustained-disconnect debounce on every `connState` edge.
+    /// Same-value writes re-enter here (the dial loop re-asserts
+    /// `.connecting`), so the armed timer is kept, not restarted — restarting
+    /// would let a fast retry loop starve the signal forever.
+    private func watchLegDown() {
+        switch connState {
+        case .connected, .draft:
+            legDownTask?.cancel()
+            legDownTask = nil
+            if legDown { legDown = false }
+        case .connecting, .offline:
+            guard legDownTask == nil, !legDown else { return }
+            legDownTask = Task { [weak self] in
+                guard let delay = self?.legDownDelay else { return }
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, let self else { return }
+                self.legDownTask = nil
+                if self.connState != .connected, self.connState != .draft {
+                    self.legDown = true
+                }
+            }
+        }
+    }
+
     /// The pump died on its own (peer closed / liveness lapse / Noise desync).
     private func pumpDisconnected(sessionId: String, generation: Int) {
         guard sessionId == self.sessionId, generation >= self.generation else { return }
@@ -291,6 +386,10 @@ final class ChatStore: ObservableObject {
         issuedGeneration += 1
         generation = issuedGeneration
         connState = remoteSessionEnsured ? .connecting : .draft
+        // The `.connecting` write above just armed the debounce on a store
+        // being torn down — disarm it (nothing will ever dial this store again).
+        legDownTask?.cancel()
+        legDownTask = nil
         await client.chatDisconnect()
     }
 
@@ -312,6 +411,8 @@ final class ChatStore: ObservableObject {
         sendRecoveryTask = nil
         connectTask?.cancel()
         connectTask = nil
+        legDownTask?.cancel()
+        legDownTask = nil
         issuedGeneration += 1
         generation = issuedGeneration
         await client.chatUnsubscribe(sessionId: sessionId)
@@ -484,7 +585,17 @@ final class ChatStore: ObservableObject {
                 NSLog("baybo: send deferred to outbox: %@", bayboErrorText(error))
                 scheduleSendRecovery()
             }
+            surfaceDraftPinFailure()
         }
+    }
+
+    /// Raise the model notice a failed draft-time pin deferred — AFTER the
+    /// send settled, because the dial path clears `notice` as it starts and
+    /// would wipe one raised mid-flight (see `applyPendingModelPin`).
+    private func surfaceDraftPinFailure() {
+        guard draftPinFailed else { return }
+        draftPinFailed = false
+        notice = Lang.shared.t("chat.modelFailed")
     }
 
     private func sendWhenReady(
@@ -562,6 +673,11 @@ final class ChatStore: ObservableObject {
             } catch {
                 NSLog("baybo: resume persisted sends: %@", bayboErrorText(error))
             }
+            // The recovery path is what actually creates the session for an
+            // offline draft send, so a draft-time pin that failed inside its
+            // `ensureRemoteSession` must surface here too — not wait for the
+            // user's next (possibly never) manual send.
+            surfaceDraftPinFailure()
         }
     }
 
@@ -586,16 +702,153 @@ final class ChatStore: ObservableObject {
         let sessionId = sessionId
         let task = Task {
             _ = try await client.chatCreateSession(sessionId: sessionId)
+            // Both INSIDE the coalesced task, so every awaiter — the first
+            // send, the recovery loop, a foreground resume — proceeds only
+            // after the draft-time pin (if any) landed, and the first turn
+            // reads it. Ensured flips BEFORE the pin PUT on purpose: a pick
+            // made during that PUT must take `selectModel`'s direct branch
+            // (onto the same serialized chain), not stash a pending pin that
+            // nothing would ever apply again.
+            remoteSessionEnsured = true
+            await applyPendingModelPin()
         }
         ensureRemoteSessionTask = task
         do {
             try await task.value
-            remoteSessionEnsured = true
             ensureRemoteSessionTask = nil
         } catch {
             ensureRemoteSessionTask = nil
             throw error
         }
+    }
+
+    // MARK: - Model pin
+
+    /// Re-read `last_llm` from the session meta — on EVERY chat open, not once
+    /// per store: this store stays cached resident, the gateway broadcasts no
+    /// frame when another client re-pins the session, so the open-edge read is
+    /// the only sync point. A draft has no remote row to read; its pin starts
+    /// nil (authoritative) and any choice rides `pendingModelPin` instead.
+    func refreshModelPin() {
+        guard listed || remoteSessionEnsured, !modelPinFetchInFlight else { return }
+        modelPinFetchInFlight = true
+        let epoch = modelPinEpoch
+        Task {
+            defer { modelPinFetchInFlight = false }
+            do {
+                let pin = try await client.chatSessionModel(sessionId: sessionId)
+                // Apply only when nothing moved locally since the read left:
+                // a selection bumps the epoch, and a queued/in-flight PUT
+                // means the value just read is already stale — applying it
+                // would clobber the optimistic pill with the pre-PUT state.
+                if modelPinEpoch == epoch, modelPutsInFlight == 0 {
+                    modelPin = pin.llm
+                    modelPinModel = pin.model
+                    modelPinEffort = pin.effort
+                    confirmedModelPin = (pin.llm, pin.model, pin.effort)
+                    modelPinResolved = true
+                }
+            } catch {
+                NSLog("baybo: session model: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Pin the session to LLM entry `entry` + model `model` within it,
+    /// KEEPING the current reasoning effort. (`entry == nil` ⇒ follow
+    /// `default-llm`; `model == nil` ⇒ the entry's default model.)
+    func selectModel(entry: String?, model: String?) {
+        applySelection(entry: entry, model: model, effort: modelPinEffort)
+    }
+
+    /// Pin the session to (entry, model) AND set its reasoning effort — the
+    /// chat header's thinking level, PER-SESSION (no global entry edit). The
+    /// panel calls this with the entry+model the Thinking submenu sits under.
+    func selectEffort(entryName: String, model: String, effort: String, catalog _: ModelCatalog) {
+        applySelection(entry: entryName, model: model, effort: effort)
+    }
+
+    /// The one selection path. Optimistic: the pill flips immediately; a
+    /// failed PUT reverts to the last gateway-acknowledged triple and raises
+    /// the composer notice. Applies from the session's next turn (gateway
+    /// contract). A no-op when the resolved pin already equals the pick.
+    private func applySelection(entry: String?, model: String?, effort: String?) {
+        guard (entry, model, effort) != (modelPin, modelPinModel, modelPinEffort)
+            || !modelPinResolved
+        else { return }
+        modelPinEpoch += 1
+        let epoch = modelPinEpoch
+        modelPin = entry
+        modelPinModel = model
+        modelPinEffort = effort
+        modelPinResolved = true
+        guard listed || remoteSessionEnsured else {
+            pendingModelPin = (entry: entry, model: model, effort: effort, epoch: epoch)
+            return
+        }
+        enqueueModelPut { [weak self] in
+            await self?.putModelPin(
+                entry: entry, model: model, effort: effort, epoch: epoch, deferNotice: false)
+        }
+    }
+
+    /// Deliver a draft-time selection now that the session exists — runs
+    /// inside `ensureRemoteSession`'s coalesced task, BEFORE any awaiting send
+    /// proceeds, so the first turn's actor already reads the pin. A pick that
+    /// was superseded while the draft sat unsent is skipped: the newer
+    /// selection's own PUT covers the wire. A pure-effort pick (no entry) is
+    /// still applied — effort is independent of the llm/model pin. Failure
+    /// degrades to the default: revert the pill and flag `draftPinFailed` for
+    /// the send path to surface, never block the send. (The notice can't be
+    /// raised here: the dial that follows clears `notice` as it starts.)
+    private func applyPendingModelPin() async {
+        guard let pending = pendingModelPin else { return }
+        pendingModelPin = nil
+        guard pending.epoch == modelPinEpoch else { return }
+        guard pending.entry != nil || pending.effort != nil else { return }
+        await enqueueModelPut { [weak self] in
+            await self?.putModelPin(
+                entry: pending.entry, model: pending.model, effort: pending.effort,
+                epoch: pending.epoch, deferNotice: true)
+        }.value
+    }
+
+    /// One serialized pin write. On failure — if no newer selection has moved
+    /// the epoch — the pill reverts to the last gateway-acknowledged triple.
+    private func putModelPin(
+        entry: String?, model: String?, effort: String?, epoch: Int, deferNotice: Bool
+    ) async {
+        do {
+            try await client.chatSetSessionModel(
+                sessionId: sessionId, llm: entry, model: model, effort: effort)
+            if modelPinEpoch == epoch { confirmedModelPin = (entry, model, effort) }
+        } catch {
+            NSLog("baybo: set session model: %@", bayboErrorText(error))
+            guard modelPinEpoch == epoch else { return }
+            modelPin = confirmedModelPin.entry
+            modelPinModel = confirmedModelPin.model
+            modelPinEffort = confirmedModelPin.effort
+            if deferNotice {
+                draftPinFailed = true
+            } else {
+                notice = Lang.shared.t("chat.modelFailed")
+            }
+        }
+    }
+
+    /// Append a pin write to the chain: it runs only after every earlier one
+    /// finished, so writes reach the gateway in pick order.
+    @discardableResult
+    private func enqueueModelPut(_ op: @escaping () async -> Void) -> Task<Void, Never> {
+        modelPutsInFlight += 1
+        let previous = modelPutTail
+        let task = Task {
+            await previous?.value
+            await op()
+            modelPutsInFlight -= 1
+        }
+        modelPutTail = task
+        return task
     }
 
     // MARK: - Bridge callbacks (webview → native)

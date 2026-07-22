@@ -262,6 +262,19 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- save) can't clobber a just-set pin; `get` patches
                     -- `Session.state.last_llm` from this column on read.
                     last_llm              TEXT,
+                    -- Per-session MODEL pin WITHIN `last_llm`'s entry (a
+                    -- `model_candidates` id). Flat column with the same
+                    -- targeted-UPDATE discipline as `last_llm` (owned by
+                    -- `set_last_model`, omitted from `save`'s DO UPDATE),
+                    -- NULL ⇒ the entry's default model; `get` patches
+                    -- `Session.state.last_model` from it on read.
+                    last_model            TEXT,
+                    -- Per-session reasoning-effort pin, sibling of
+                    -- `last_model` with the same targeted-UPDATE discipline
+                    -- (`set_last_effort`, omitted from `save`); NULL ⇒ the
+                    -- entry's default effort; `get` patches
+                    -- `Session.state.last_effort` from it.
+                    last_effort           TEXT,
                     -- User-facing chat-list pin flag, set by
                     -- PUT /v1/chat/sessions/:id/pin. Like `hidden` /
                     -- `last_llm` it is a flat column owned by a targeted
@@ -808,6 +821,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE session_control_events ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE deck_cards ADD COLUMN sizes TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN last_model TEXT",
+        "ALTER TABLE sessions ADD COLUMN last_effort TEXT",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {

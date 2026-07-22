@@ -348,6 +348,7 @@ impl SkillAssessor {
             messages,
             temperature: Some(0.0),
             tools: vec![],
+            reasoning_effort: None,
         };
         let response = self
             .llm

@@ -1377,6 +1377,34 @@ mod tests {
                 None => Ok(false),
             }
         }
+        async fn set_last_model(
+            &self,
+            id: &SessionId,
+            model: Option<&str>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.state.last_model = model.map(str::to_string);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        async fn set_last_effort(
+            &self,
+            id: &SessionId,
+            effort: Option<&str>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.state.last_effort = effort.map(str::to_string);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn set_pinned(
             &self,
             id: &SessionId,

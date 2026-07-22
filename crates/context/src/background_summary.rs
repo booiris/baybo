@@ -642,6 +642,7 @@ iterations without terminating"
             messages: messages.clone(),
             temperature: None,
             tools: tool_defs.clone(),
+            reasoning_effort: None,
         };
         let SummaryChatRun {
             response,

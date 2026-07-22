@@ -609,6 +609,14 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   frames the gateway would, since there is no binding to call
   `chatResolveApproval` on). Screenshot at ~4s for the card + both steps'
   "waiting for approval", then tap Approve/Deny for the verdict labels.
+  `-baybo-demo-models` (DEBUG, with `-baybo-open-chat`) seeds a canned model
+  catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,
+  efforts both set and unset — so the header's model pill + the three-level
+  menu render headlessly (no gateway to `GET /v1/llm/models` from); picking a
+  provider exercises the draft stash path natively (a level pick's effort PUT
+  fails without a gateway — notice + catalog revert, which is itself the
+  failure UI), and `UITests/ModelPickerUITests.swift` drives the picks through
+  the pill's accessibility VALUE (the label is the constant "Model").
   `-baybo-demo-switch` (DEBUG) opens session `demo-a`
   with a session-tagged turn, then switches `chatPath` to `demo-b` at 5s —
   exercising the single reused webview's cross-session remount so a content
@@ -622,6 +630,83 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
   + echo-dedup FIRST, enrols the persisted outbox entry, then enqueues on the
   leg (see "Send outbox" below).
+- **Model picker** (`ChatHeaderView` + `App/Screens/ModelMenuPanel.swift` +
+  `ChatStore.modelPin` + `App/Core/ModelCatalog.swift`): the chat header
+  holds the model capsule on the LEFT (beside the glass back circle; mono(15)
+  label = the effective entry's MODEL id, string-ellipsized — never cap a
+  `Menu`/pill label with `.frame(maxWidth:)`, it renders greedy at the cap).
+  Connectivity shows NOTHING in every healthy state; only a SUSTAINED outage
+  surfaces, as a red `wifi.slash` in a glass circle on the trailing edge,
+  keyed off `ChatStore.legDown` — a DEBOUNCED signal (default 4s away from
+  `.connected`, cleared the moment a dial lands), because raw `connState`
+  oscillates `connecting ↔ offline` through the retry loop on a real outage
+  (`offline` is only the gap between failed dials, and a dead network's dial
+  hangs in `connecting`), so an `offline`-gated indicator almost never
+  showed. The catalog also keeps a **`models.json` mirror** (the `deck.json`
+  idiom, written on fetch + effort edits, deleted on logout/rebind), so a
+  cold offline start still paints the pill and panel; the pill NEVER shows a
+  placeholder — always the best-known model id. The pill toggles
+  `ModelMenuPanel`, a HAND-ROLLED glass panel `ChatScreen` overlays
+  (`modelMenuOpen`) — not a system `Menu`, which cannot do any of: trailing
+  checkmarks (selection and label icons render LEADING on iOS 26), removing
+  a submenu row's `›`, or a live subtitle. Width knob:
+  `ModelMenuPanel.panelWidth` (232). Three levels replace in place,
+  sub-levels headed by a back row: **entries by name** (trailing ✓ on the
+  effective entry, no chevron) → that entry's models (`model` +
+  `model_candidates`, ✓ on the effective model) + (below a hairline) the
+  Thinking row, subtitled with the entry's current level and carrying the
+  panel's one trailing `›` → the levels
+  (`none/minimal/low/medium/high/xhigh`, `crates/llm` registry contract).
+  Panel rows set `accessibilityLabel` = title and `accessibilityValue` =
+  subtitle, so the by-label UI smokes keep working and VoiceOver reads
+  "Thinking, Ultra high".
+  The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to
+  name/provider/model/**model_candidates**/reasoning_effort) is global and
+  cached per app run in `ModelCatalog.shared` + a `models.json` mirror (offline
+  cold-paint; reset on logout/rebind); the pill renders only once it has
+  entries. **The pin is a `(entry, model)` PAIR** (`ChatStore.modelPin` +
+  `modelPinModel`): the entry is `SessionState.last_llm`, the model a
+  `model_candidates` id in `last_model` (`nil` ⇒ entry default). It is re-read
+  on EVERY chat open off the session detail with `limit=1` (FFI
+  `chat_session_model` → `SessionModelPin{llm,model}`) — never latched
+  once-per-store: the store stays cached resident and no frame broadcasts a
+  re-pin made on another client, so the open edge is the only sync point.
+  Writes go over `PUT /v1/chat/sessions/{id}/model` (FFI
+  `chat_set_session_model(llm, model)`, both explicit-nullable —
+  `{"llm":null,"model":null}` = follow `default-llm` + default model),
+  SERIALIZED through `enqueueModelPut` (overlapping PUTs have no wire order),
+  and optimistic: a failed PUT reverts to the last GATEWAY-ACKNOWLEDGED pair
+  (`confirmedModelPin`) — never the previous display value, which would
+  resurrect a pick the gateway refused; a seed read never applies over a
+  bumped epoch or an in-flight PUT. A pick on a DRAFT stashes in
+  `pendingModelPin` (epoch-stamped; a newer pick supersedes it) and is applied
+  INSIDE `ensureRemoteSession`'s coalesced task, between session creation and
+  every awaiter's send, so the first turn already runs on the choice; that
+  failure path defers its notice (`draftPinFailed`, surfaced after the send —
+  including the recovery path — because the dial clears `notice` as it
+  starts). **The pin is a `(entry, model, effort)` TRIPLE**
+  (`modelPin`/`modelPinModel`/`modelPinEffort`) — thinking level is
+  PER-SESSION, not a global entry edit. `ChatStore.selectEffort` pins
+  (entry, its relevant model, effort); `selectModel` keeps the current
+  effort; both funnel through `applySelection` → one PUT. The panel's
+  Thinking checkmark/subtitle read `store.modelPinEffort ?? entry's default`
+  (session value wins, applies whatever entry — effort is INDEPENDENT of the
+  llm/model pin). Pin + level apply from the session's NEXT turn — no
+  confirmation UI. **Server-side seam** (root workspace, NOT on `app/ios`
+  CI): `LlmEntry.model_candidates`/`lite_model` (config); the LLM pool
+  pre-builds a client per candidate model, `resolve(name, model)` picks it;
+  effort is a PER-REQUEST override on `ChatRequest.reasoning_effort` that
+  only `openai-subscription` consumes (`AnyCompletionModel::stream(request,
+  effort)`; other providers ignore it — no `additional_params` pollution);
+  `last_model` + `last_effort` are their own flat SQLite columns
+  (`set_last_model`/`set_last_effort`, additive migrations — keep
+  `last_llm`'s golden JSON); `AgentMessage::SetModel{llm, model, effort}`
+  threads the triple through the spawner (`ActorSpawner`'s `initial_effort`)
+  → `AgentLoop.initial_effort` → every turn's `ChatRequest`;
+  `validate_llm_model` + the `LLM_EFFORT_LEVELS` check reject a model outside
+  the entry's `entry_model_ids` / an unknown effort. `PUT
+  /v1/chat/sessions/{id}/model` carries `{llm, model, reasoning_effort}`; the
+  old global `llm_set_reasoning_effort` FFI was removed (superseded).
 - **Tool approvals** (`App/Core/ChatApprovals.swift` + `ChatStore.approvalObserveFrame`
   / `Screens/ApprovalCardView.swift`): a tool call whose declared resources
   aren't already granted blocks on the gateway's approval gate, which fans out

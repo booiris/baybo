@@ -127,6 +127,8 @@ pub type ActorSpawner = Arc<
     dyn Fn(
             Session,
             /* initial_llm */ Option<LlmEntryName>,
+            /* initial_model */ Option<String>,
+            /* initial_effort */ Option<String>,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
         ) -> MailboxSender<AgentMessage>
@@ -147,10 +149,19 @@ pub(crate) fn build_oneshot_actor(
     parent_token: &CancellationToken,
     session: Session,
     initial_llm: Option<LlmEntryName>,
+    initial_model: Option<String>,
+    initial_effort: Option<String>,
     response_tx: mpsc::Sender<AgentOutput>,
 ) -> (MailboxSender<AgentMessage>, CancellationToken) {
     let actor_token = parent_token.child_token();
-    let mailbox = actor_spawner(session, initial_llm, response_tx, actor_token.clone());
+    let mailbox = actor_spawner(
+        session,
+        initial_llm,
+        initial_model,
+        initial_effort,
+        response_tx,
+        actor_token.clone(),
+    );
     (mailbox, actor_token)
 }
 
@@ -296,6 +307,8 @@ impl Router {
         &self,
         session: Session,
         initial_llm: Option<LlmEntryName>,
+        initial_model: Option<String>,
+        initial_effort: Option<String>,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
     ) -> (MailboxSender<AgentMessage>, CancellationToken) {
@@ -304,6 +317,8 @@ impl Router {
             parent_token,
             session,
             initial_llm,
+            initial_model,
+            initial_effort,
             response_tx,
         )
     }

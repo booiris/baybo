@@ -338,7 +338,7 @@ pub async fn build_managers(
     // Build one client per `config.llm` entry (default failure aborts
     // boot; non-default failures drop with a warn). Shared with the
     // hot-reload path — see `crate::reload::build_pool_clients`.
-    let (pool_clients, _dropped) = crate::reload::build_pool_clients(
+    let built = crate::reload::build_pool_clients(
         &config,
         &provider_registry,
         stores.blob.clone(),
@@ -350,9 +350,11 @@ pub async fn build_managers(
     // (snapshot-derived) pricing, keyed by `model_info.id` to match the
     // cost lookup. The refresh loop (owned by the reloader below)
     // overlays live prices.
-    cost_manager.merge_pricings(crate::reload::pricing_overlay(&pool_clients));
-    let pool = baybo_agent::LlmClientPool::with_tier_map(
-        pool_clients,
+    cost_manager.merge_pricings(crate::reload::pricing_overlay(&built));
+    let pool = baybo_agent::LlmClientPool::with_candidates(
+        built.clients,
+        built.overrides,
+        built.entry_models,
         config.default_llm.clone(),
         config.agent.model_tiers.clone(),
     )
@@ -849,6 +851,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         Arc::new(
             move |session: baybo_model::Session,
                   initial_llm: Option<LlmEntryName>,
+                  initial_model: Option<String>,
+                  initial_effort: Option<String>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
                 // `initial_llm` is `Some` either when the router's
@@ -857,6 +861,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // session carries a per-session pin in
                 // `session.state.last_llm` (the chat model switch) that
                 // `handle_incoming` forwarded here; `None` ⇒ pool default.
+                // `initial_model` is the chat pick WITHIN that entry
+                // (`session.state.last_model`); `None` ⇒ entry default.
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -866,6 +872,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
+                    initial_model,
+                    initial_effort,
                     tool_registry: Arc::clone(&tool_registry),
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {

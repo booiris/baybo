@@ -317,6 +317,11 @@ impl ActorSubagentSpawner {
             &effective_parent_token,
             child_session,
             llm,
+            // Subagents pin an ENTRY (via model_tier); the candidate-model
+            // and reasoning-effort dimensions are chat-only picks, so a
+            // subagent always runs the entry's default model + effort.
+            None,
+            None,
             output_tx,
         );
 

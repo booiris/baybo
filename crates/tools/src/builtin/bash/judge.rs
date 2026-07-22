@@ -182,6 +182,7 @@ async fn run_judge(
         ],
         temperature: Some(0.0),
         tools: vec![],
+        reasoning_effort: None,
     };
     let outcome = {
         let _timer = start_timer(events, action);

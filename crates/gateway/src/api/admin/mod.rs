@@ -56,6 +56,25 @@ pub(crate) fn validate_llm_pin(
     }
 }
 
+/// Validate that `model` is one of `entry`'s pinnable models (its default
+/// `[model] + model_candidates` that actually built a client). Call after
+/// [`validate_llm_pin`] has confirmed the entry. A model outside that set is
+/// a `BadRequest` — the client picked something the entry can't serve.
+pub(crate) fn validate_llm_model(
+    state: &AdminState,
+    entry: &LlmEntryName,
+    model: &str,
+) -> Result<()> {
+    let pool = state.llm_pool.read();
+    match pool.entry_model_ids(entry) {
+        Some(ids) if ids.iter().any(|m| m == model) => Ok(()),
+        _ => Err(GatewayError::BadRequest(format!(
+            "model {model:?} is not a configured model of LLM entry {entry:?}; \
+             see GET /v1/llm/models for its model + model_candidates"
+        ))),
+    }
+}
+
 /// Minimal top-level OpenAPI descriptor. Concrete paths and component
 /// schemas are folded in by merging the `OpenApiRouter` output from
 /// each submodule.

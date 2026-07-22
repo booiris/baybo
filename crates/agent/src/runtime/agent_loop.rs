@@ -463,6 +463,15 @@ pub struct AgentLoop {
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
     /// actors); `Some` ⇒ a subagent's pinned entry name.
     initial_llm: Option<LlmEntryName>,
+    /// The model WITHIN `initial_llm`'s entry (a `model_candidates` id), or
+    /// `None` for the entry's default model. Paired with `initial_llm`
+    /// through every re-resolve so a per-session model pick takes effect.
+    initial_model: Option<String>,
+    /// Per-session reasoning-effort pin, set on every turn's `ChatRequest`
+    /// (`None` ⇒ the entry's construction-time default). Consumed only by
+    /// openai-subscription. This is the chat header's thinking level, kept
+    /// PER-SESSION rather than a global entry edit.
+    initial_effort: Option<String>,
     tool_registry: Arc<ToolRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
@@ -534,6 +543,10 @@ pub struct AgentLoopConfig {
     pub llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
     pub initial_llm: Option<LlmEntryName>,
+    /// Model within `initial_llm`'s entry (`None` ⇒ the entry's default).
+    pub initial_model: Option<String>,
+    /// Per-session reasoning effort (`None` ⇒ entry default).
+    pub initial_effort: Option<String>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
@@ -581,6 +594,8 @@ impl AgentLoop {
         let AgentLoopConfig {
             llm_pool,
             initial_llm,
+            initial_model,
+            initial_effort,
             tool_registry,
             tool_executor,
             context_manager,
@@ -592,7 +607,9 @@ impl AgentLoop {
             task_store,
             title_sink,
         } = config;
-        let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
+        let (llm_client, _effective_name) = llm_pool
+            .read()
+            .resolve(initial_llm.as_ref(), initial_model.as_deref());
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
 
@@ -600,6 +617,8 @@ impl AgentLoop {
             llm_client,
             llm_pool,
             initial_llm,
+            initial_model,
+            initial_effort,
             tool_registry,
             tool_executor,
             context_manager,
@@ -699,7 +718,8 @@ impl AgentLoop {
     /// turns. See `docs/config-hot-reload.md`.
     fn refresh_active_llm(&mut self) {
         let pool = Arc::clone(&self.llm_pool.read());
-        let (client, _name) = pool.resolve(self.initial_llm.as_ref());
+        let (client, _name) =
+            pool.resolve(self.initial_llm.as_ref(), self.initial_model.as_deref());
         // Compare by pointer, not model id: a config reload swaps in a
         // fresh `Arc<BillableLlm>` even when the model id is unchanged
         // (a `base_url`, credential, `reasoning_effort`, or
@@ -725,8 +745,15 @@ impl AgentLoop {
     /// per-session model switch ([`crate::actor::AgentMessage::SetModel`]);
     /// the actor also persists the pin to `session.state.last_llm` so it
     /// survives eviction.
-    pub fn set_initial_llm(&mut self, llm: Option<LlmEntryName>) {
+    pub fn set_initial_llm(
+        &mut self,
+        llm: Option<LlmEntryName>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
         self.initial_llm = llm;
+        self.initial_model = model;
+        self.initial_effort = effort;
         self.refresh_active_llm();
     }
 
@@ -1610,6 +1637,7 @@ impl AgentLoop {
             messages: self.context_manager.messages_for_llm(),
             temperature: None,
             tools: tool_defs,
+            reasoning_effort: self.initial_effort.clone(),
         };
 
         let input_messages = self.context_manager.build_call_input_marker().await;
@@ -2638,6 +2666,7 @@ impl AgentLoop {
             messages,
             temperature: None,
             tools: Vec::new(),
+            reasoning_effort: self.initial_effort.clone(),
         };
 
         // Throttle on attempt, not just success — a failing or empty call

@@ -49,6 +49,9 @@ impl TitleRunner {
             messages: messages.clone(),
             temperature: None,
             tools: Vec::new(),
+            // Title generation runs on the default model, not the session
+            // pin — no per-session effort.
+            reasoning_effort: None,
         };
 
         let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));

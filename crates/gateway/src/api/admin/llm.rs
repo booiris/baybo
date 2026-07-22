@@ -493,6 +493,8 @@ async fn build_model_entry(
         name: entry.name.to_string(),
         provider: entry.provider.clone(),
         model: entry.model.clone(),
+        model_candidates: entry.model_candidates.clone(),
+        lite_model: entry.lite_model.clone(),
         base_url: entry.base_url.clone(),
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,

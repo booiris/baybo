@@ -38,7 +38,7 @@ type RawMessageRow = (String, String, String, String);
 type RawMessageRowWithMeta = (i64, String, String, String, i64, String);
 
 /// Raw `sessions` columns projected by the list/get reads:
-/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title)`.
+/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort)`.
 type RawSessionListRow = (
     String,
     i64,
@@ -47,6 +47,8 @@ type RawSessionListRow = (
     String,
     Option<String>,
     i64,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -102,11 +104,23 @@ fn decode_message_row(row: RawMessageRow) -> Result<ChatMessage> {
 /// columns over the JSON blob. Flat columns are authoritative; targeted setters
 /// leave the JSON blob untouched to avoid load/save races.
 fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
-    let (data, hidden_col, last_llm_col, pinned_col, _id, folder_id_col, archived_col, title_col) =
-        row;
+    let (
+        data,
+        hidden_col,
+        last_llm_col,
+        pinned_col,
+        _id,
+        folder_id_col,
+        archived_col,
+        title_col,
+        last_model_col,
+        last_effort_col,
+    ) = row;
     let mut session: Session = serde_json::from_str(data)?;
     session.hidden = *hidden_col != 0;
     session.state.last_llm = last_llm_col.clone().map(LlmEntryName::from);
+    session.state.last_model = last_model_col.clone();
+    session.state.last_effort = last_effort_col.clone();
     session.pinned = *pinned_col != 0;
     session.folder_id = folder_id_col.clone().map(FolderId::from);
     session.archived = *archived_col != 0;
@@ -124,6 +138,8 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -158,7 +174,7 @@ impl SessionStore for SqliteSessionStore {
             .interact("sessions.get", move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT data, hidden, last_llm, pinned, folder_id, archived, title FROM sessions WHERE id = ?1",
+                        "SELECT data, hidden, last_llm, pinned, folder_id, archived, title, last_model, last_effort FROM sessions WHERE id = ?1",
                         rusqlite::params![sid],
                         |row| {
                             Ok((
@@ -169,6 +185,8 @@ impl SessionStore for SqliteSessionStore {
                                 row.get::<_, Option<String>>(4)?,
                                 row.get::<_, i64>(5)?,
                                 row.get::<_, Option<String>>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, Option<String>>(8)?,
                             ))
                         },
                     )
@@ -184,6 +202,8 @@ impl SessionStore for SqliteSessionStore {
             folder_id_col,
             archived_col,
             title_col,
+            last_model_col,
+            last_effort_col,
         )) = row
         else {
             return Ok(None);
@@ -194,6 +214,8 @@ impl SessionStore for SqliteSessionStore {
         // JSON blob untouched to avoid load/save races.
         session.hidden = hidden_col != 0;
         session.state.last_llm = last_llm_col.map(LlmEntryName::from);
+        session.state.last_model = last_model_col;
+        session.state.last_effort = last_effort_col;
         session.pinned = pinned_col != 0;
         session.folder_id = folder_id_col.map(FolderId::from);
         session.archived = archived_col != 0;
@@ -316,6 +338,43 @@ impl SessionStore for SqliteSessionStore {
             .interact("sessions.set_last_llm", move |conn| {
                 Ok(conn.execute(
                     "UPDATE sessions SET last_llm = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn set_last_model(&self, session_id: &SessionId, model: Option<&str>) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        // Sibling of `set_last_llm`: targeted UPDATE on the flat `last_model`
+        // column only, JSON blob left alone. `get` patches
+        // `Session.state.last_model` from it. `NULL` clears the model pick
+        // back to the entry's default model.
+        let value: Option<String> = model.map(str::to_string);
+        let affected = self
+            .pool
+            .interact("sessions.set_last_model", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET last_model = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn set_last_effort(&self, session_id: &SessionId, effort: Option<&str>) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        // Sibling of `set_last_model`: targeted UPDATE on the flat
+        // `last_effort` column only. `NULL` clears the pick back to the
+        // entry's default effort.
+        let value: Option<String> = effort.map(str::to_string);
+        let affected = self
+            .pool
+            .interact("sessions.set_last_effort", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET last_effort = ?2 WHERE id = ?1",
                     rusqlite::params![sid, value],
                 )?)
             })
@@ -479,7 +538,7 @@ impl SessionStore for SqliteSessionStore {
             .pool
             .interact("sessions.list_all", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
+                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
                      ORDER BY last_active DESC",
                 )?;
                 let rows = stmt
@@ -502,7 +561,7 @@ impl SessionStore for SqliteSessionStore {
             .pool
             .interact("sessions.list_by_channel", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
+                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
                      WHERE channel = ?1 \
                      ORDER BY last_active DESC",
                 )?;

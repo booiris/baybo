@@ -4854,12 +4854,26 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-session reasoning-effort pick (`session.state.last_effort`), or\n`null` for the entry default. Drives the header's thinking-level check."
+          },
           "last_llm": {
             "type": [
               "string",
               "null"
             ],
             "description": "Per-session LLM pin (`session.state.last_llm`): the `baybo.json`\nentry name this session's turns resolve against, or `null` to\nfollow `default-llm`. Drives the chat header model picker's\ninitial selection. Set via `PUT /v1/chat/sessions/{id}/model`."
+          },
+          "last_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-session model pick within `last_llm`'s entry\n(`session.state.last_model`), or `null` for the entry's default.\nDrives which model row the header picker checks."
           },
           "newest_ordinal": {
             "type": [
@@ -5916,8 +5930,22 @@
           "is_default": {
             "type": "boolean"
           },
+          "lite_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cheaper/faster model for lightweight auxiliary calls — reserved, no\nruntime path consumes it yet. `None` when unconfigured."
+          },
           "model": {
             "type": "string"
+          },
+          "model_candidates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra model ids this entry can serve (same provider + credentials).\nA session can be pinned to any of `[model] + model_candidates`; the\nchat header picker lists them under the entry. Empty for an entry\nthat offers only its default `model`."
           },
           "name": {
             "type": "string"
@@ -6526,6 +6554,20 @@
               "null"
             ],
             "description": "`baybo.json` LLM entry name to pin this session to, or `null`\n(absent) to clear the pin and follow `default-llm`. Must match a\nconfigured entry — see `GET /v1/llm/models` → `items[].name`."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model to pick WITHIN `llm`'s entry — one of that entry's\n`[model] + model_candidates`. `null`/absent uses the entry's default\nmodel. Ignored (and rejected as a mismatch) when `llm` is `null`,\nsince there is no entry to pick a model within."
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-session reasoning effort\n(`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for\nthe entry's default. Applies to every turn of THIS session only (not a\nglobal entry edit); consumed by providers that support it\n(openai-subscription), clamped per model at runtime."
           }
         }
       },
@@ -6539,12 +6581,26 @@
             "type": "boolean",
             "description": "`true` when a live actor was re-pinned in place (applies on the\nsession's next turn); `false` when only the persisted state was\nupdated because no actor is currently running (the next user\nmessage spawns one that reads the pin)."
           },
+          "last_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The reasoning-effort pick now in effect, or `null` for the entry\ndefault."
+          },
           "last_llm": {
             "type": [
               "string",
               "null"
             ],
             "description": "The pin now in effect: the entry name, or `null` for `default-llm`."
+          },
+          "last_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model pick now in effect within the entry, or `null` for the\nentry's default model."
           }
         }
       },

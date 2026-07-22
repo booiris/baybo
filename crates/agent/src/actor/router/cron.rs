@@ -147,7 +147,7 @@ impl Router {
             .supervisor
             .route_or_spawn(&session_id, trigger, || {
                 let actor_token = parent_token.child_token();
-                actor_spawner(session, None, response_tx, actor_token)
+                actor_spawner(session, None, None, None, response_tx, actor_token)
             })
             .await;
         if !routed {
@@ -174,8 +174,14 @@ impl Router {
     ) {
         let session_id = session.id.clone();
         let response_tx = self.supervisor.response_tx().clone();
-        let (mailbox, actor_token) =
-            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token);
+        let (mailbox, actor_token) = self.spawn_oneshot_actor(
+            session,
+            None,
+            None,
+            None,
+            response_tx,
+            &self.actor_parent_token,
+        );
 
         match mailbox.send(trigger).await {
             Ok(()) => {
@@ -561,7 +567,16 @@ impl CronResultDelivery {
                 || {
                     let actor_token = parent_token.child_token();
                     let pinned = origin.state.last_llm.clone();
-                    actor_spawner(origin, pinned, response_tx, actor_token)
+                    let pinned_model = origin.state.last_model.clone();
+                    let pinned_effort = origin.state.last_effort.clone();
+                    actor_spawner(
+                        origin,
+                        pinned,
+                        pinned_model,
+                        pinned_effort,
+                        response_tx,
+                        actor_token,
+                    )
                 },
             )
             .await;
@@ -707,8 +722,8 @@ mod tests {
             let spawned_for_closure = Arc::clone(&spawned);
             let drop_mailboxes = Arc::new(AtomicBool::new(false));
             let drop_for_closure = Arc::clone(&drop_mailboxes);
-            let actor_spawner: ActorSpawner =
-                Arc::new(move |session: Session, _llm, _tx, _token| {
+            let actor_spawner: ActorSpawner = Arc::new(
+                move |session: Session, _llm, _model, _effort, _tx, _token| {
                     let (sender, receiver) = mailbox::channel(16);
                     if drop_for_closure.load(Ordering::Relaxed) {
                         drop(receiver);
@@ -716,7 +731,8 @@ mod tests {
                         spawned_for_closure.lock().push((session.id, receiver));
                     }
                     sender
-                });
+                },
+            );
 
             let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
             let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));

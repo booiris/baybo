@@ -109,6 +109,8 @@ fn entry(name: &str, provider: &str, model: &str) -> LlmEntry {
         name: name.into(),
         provider: provider.into(),
         model: model.into(),
+        model_candidates: Vec::new(),
+        lite_model: None,
         api_key_env: None,
         base_url: None,
         supports_vision: None,

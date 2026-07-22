@@ -33,7 +33,8 @@ pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
     BlobServeOutcome, ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary,
     DeckCardInfo, DeckLayoutEntryInput, DeckSink, DeckSnapshotInfo, DeckView, FrameSink,
-    MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
+    LlmModelCatalog, LlmModelInfo, MessageLookup, PairAbortListener, PairChallenge, PairTarget,
+    PairedSummary, SessionListSink, SessionModelPin,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -775,6 +776,50 @@ impl BayboClient {
         runtime::run(async move {
             let client = self.gateway_client()?;
             gateway_api::mark_many_read(&client, session_ids).await
+        })
+        .await
+    }
+
+    /// The gateway's configured LLM entries + the current `default-llm` name —
+    /// the chat header model picker's catalog. Global (not per-session); the
+    /// app caches it per run. Direct reaches it over REST, relay through the
+    /// Noise-protected API tunnel.
+    pub async fn llm_list_models(self: Arc<Self>) -> Result<LlmModelCatalog, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::list_llm_models(&client).await
+        })
+        .await
+    }
+
+    /// The session's model pin: the entry name (`last_llm`) its turns resolve
+    /// against and the chosen model within it (`last_model`), either `None` to
+    /// follow the gateway/entry default. Seeds the chat header picker on open.
+    pub async fn chat_session_model(
+        self: Arc<Self>,
+        session_id: String,
+    ) -> Result<SessionModelPin, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::fetch_session_model(&client, session_id).await
+        })
+        .await
+    }
+
+    /// Pin the session to LLM entry `llm` and model `model` within it — clear
+    /// the entry (`llm = None` → follow `default-llm`) and/or fall back to the
+    /// entry's default model (`model = None`). Persisted gateway-side first,
+    /// then applied to any live actor — takes effect from the next turn.
+    pub async fn chat_set_session_model(
+        self: Arc<Self>,
+        session_id: String,
+        llm: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::set_session_model(&client, session_id, llm, model, effort).await
         })
         .await
     }

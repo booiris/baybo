@@ -175,6 +175,46 @@ pub struct ChatSessionSummary {
     pub cron_group_pinned: bool,
 }
 
+/// One selectable LLM entry for the chat header's model picker — a `baybo.json`
+/// entry, narrowed from the gateway's `LlmModelEntry`. `name` is the entry name
+/// (what a session pin references); the picker lists it by name and offers the
+/// models it can serve (`model` + `model_candidates`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmModelInfo {
+    pub name: String,
+    pub provider: String,
+    /// The entry's default model id.
+    pub model: String,
+    /// Extra model ids this entry can serve (same provider + credentials). A
+    /// session pins any of `[model] + model_candidates`; the picker lists them
+    /// under the entry. Empty for a single-model entry.
+    pub model_candidates: Vec<String>,
+    /// The entry's reasoning-effort override — one of
+    /// `none`/`minimal`/`low`/`medium`/`high`/`xhigh`, or `None` for the
+    /// provider default. Set via [`crate::BayboClient::llm_set_reasoning_effort`].
+    pub reasoning_effort: Option<String>,
+}
+
+/// The gateway's configured LLM entries plus the current `default-llm` name
+/// (`GET /v1/llm/models`, narrowed). A session with no pin resolves against
+/// `default_name`, so the picker shows it as the "default" row's identity.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LlmModelCatalog {
+    pub default_name: String,
+    pub items: Vec<LlmModelInfo>,
+}
+
+/// A session's model pin: the entry name (`last_llm`), the chosen model within
+/// it (`last_model`), and the reasoning-effort pick (`last_effort`) — each
+/// `None`. Returned by [`crate::BayboClient::chat_session_model`] to seed the
+/// header picker.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionModelPin {
+    pub llm: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 /// One RECURRING scheduled job, as the phone's cron list renders it — a
 /// read-only mirror of the gateway's `CronJob` DTO, minus what a list has no use
 /// for.

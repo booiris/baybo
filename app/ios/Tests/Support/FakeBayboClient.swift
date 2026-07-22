@@ -28,6 +28,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         let decision: ApprovalDecision
     }
 
+    struct SetModelCall: Equatable {
+        let sessionId: String
+        let llm: String?
+        let model: String?
+        let effort: String?
+    }
+
     /// Everything the app never calls under test. Distinct prose so an
     /// accidental reliance on it is obvious in the failure.
     private static let unsupported = BayboError.Other(
@@ -44,6 +51,13 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var approvals: [ApprovalCall] = []
     private var marksRead: [Int64] = []
     private var batchMarksRead: [[String]] = []
+    private var modelSets: [SetModelCall] = []
+    private var modelReads: [String] = []
+    /// Coarse cross-method call order ("create" / "setModel" / "send" /
+    /// "sendAfterConnect") — the draft-pin contract is an ORDERING one (the
+    /// pin must land between session creation and the first send), and the
+    /// per-method arrays can't see across each other.
+    private var callOrder: [String] = []
 
     private var apiLegInvalidations = 0
 
@@ -54,6 +68,11 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var lookupResults: [String: MessageLookup] = [:]
     private var lookupError: Error?
     private var approvalError: Error?
+    private var sessionModelPin = SessionModelPin(llm: nil, model: nil, effort: nil)
+    private var sessionModelError: Error?
+    private var sessionModelStallMs: Int = 0
+    private var setModelError: Error?
+    private var llmCatalog: LlmModelCatalog?
 
     /// The baseline answer to a sync: no rows, no cursor. Enough to unwind the
     /// webview's in-flight guard, and it confirms nothing in the outbox.
@@ -74,6 +93,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// One entry per `chatMarkManyRead` call — the cron group's "mark all read"
     /// must be ONE round-trip, not one per fire.
     var batchReadCalls: [[String]] { lock.withLock { batchMarksRead } }
+    var setModelCalls: [SetModelCall] { lock.withLock { modelSets } }
+    var modelReadSessions: [String] { lock.withLock { modelReads } }
+    var callTimeline: [String] { lock.withLock { callOrder } }
     /// How many times the app dropped its warm relay API legs — the `.background`
     /// barrier. iOS suspends without warning and takes the sockets with it, so a
     /// leg that outlives a suspend is a zombie.
@@ -90,6 +112,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     // MARK: - Canned behaviour
 
     func failConnect(with error: Error) { lock.withLock { connectError = error } }
+    /// Clear a prior `failConnect` — the network came back.
+    func succeedConnect() { lock.withLock { connectError = nil } }
     func failSend(with error: Error) { lock.withLock { sendError = error } }
     func failCreateSession(with error: Error) { lock.withLock { createSessionError = error } }
     /// Clear a prior `failCreateSession` — simulates the network coming back so a
@@ -113,6 +137,17 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
 
     func failLookup(with error: Error) { lock.withLock { lookupError = error } }
+
+    /// The session meta's pin answer for `chatSessionModel`.
+    func answerSessionModel(llm: String?, model: String? = nil, effort: String? = nil) {
+        lock.withLock { sessionModelPin = SessionModelPin(llm: llm, model: model, effort: effort) }
+    }
+    func failSessionModel(with error: Error) { lock.withLock { sessionModelError = error } }
+    /// Hold each `chatSessionModel` answer back — for the race tests where a
+    /// pin read must still be in flight when a selection lands.
+    func stallSessionModel(ms: Int) { lock.withLock { sessionModelStallMs = ms } }
+    func failSetModel(with error: Error) { lock.withLock { setModelError = error } }
+    func answerModelCatalog(_ catalog: LlmModelCatalog) { lock.withLock { llmCatalog = catalog } }
 
     /// Push a frame into the session's live sink, exactly as the core's pump
     /// does. The sink hops to the main queue, so the caller must let the actor
@@ -143,6 +178,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             sendAfterConnects.append(
                 SendCall(
                     sessionId: sessionId, text: text, msgId: msgId, attachments: attachments))
+            callOrder.append("sendAfterConnect")
             return nil
         }
         if let error { throw error }
@@ -156,6 +192,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
             sends.append(
                 SendCall(
                     sessionId: sessionId, text: text, msgId: msgId, attachments: attachments))
+            callOrder.append("send")
             return nil
         }
         if let error { throw error }
@@ -164,6 +201,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatCreateSession(sessionId: String) async throws -> String {
         let error: Error? = lock.withLock {
             createdSessions.append(sessionId)
+            if createSessionError == nil { callOrder.append("create") }
             return createSessionError
         }
         if let error { throw error }
@@ -225,6 +263,36 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatSetPinned(sessionId: String, pinned: Bool) async throws { throw Self.unsupported }
 
     func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
+
+    func llmListModels() async throws -> LlmModelCatalog {
+        guard let catalog = lock.withLock({ llmCatalog }) else { throw Self.unsupported }
+        return catalog
+    }
+
+    func chatSessionModel(sessionId: String) async throws -> SessionModelPin {
+        let stall = lock.withLock { sessionModelStallMs }
+        if stall > 0 {
+            try? await Task.sleep(for: .milliseconds(stall))
+        }
+        let outcome: Result<SessionModelPin, Error> = lock.withLock {
+            modelReads.append(sessionId)
+            if let sessionModelError { return .failure(sessionModelError) }
+            return .success(sessionModelPin)
+        }
+        return try outcome.get()
+    }
+
+    func chatSetSessionModel(sessionId: String, llm: String?, model: String?, effort: String?)
+        async throws
+    {
+        let error: Error? = lock.withLock {
+            modelSets.append(
+                SetModelCall(sessionId: sessionId, llm: llm, model: model, effort: effort))
+            if setModelError == nil { callOrder.append("setModel") }
+            return setModelError
+        }
+        if let error { throw error }
+    }
 
     // MARK: deck
 
