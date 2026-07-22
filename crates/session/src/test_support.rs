@@ -166,6 +166,28 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    async fn set_last_model(&self, session_id: &SessionId, model: Option<&str>) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.state.last_model = model.map(str::to_string);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_last_effort(&self, session_id: &SessionId, effort: Option<&str>) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.state.last_effort = effort.map(str::to_string);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
         let mut data = self.data.lock();
         match data.get_mut(session_id) {

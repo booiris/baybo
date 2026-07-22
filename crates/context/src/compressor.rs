@@ -489,6 +489,7 @@ impl ContextManager {
             messages: request_messages,
             temperature: None,
             tools: Vec::new(),
+            reasoning_effort: None,
         };
 
         let truncate_fallback = || {

@@ -12,6 +12,9 @@ struct ChatScreen: View {
     private let host: TranscriptHost
     private let webView: WKWebView
     @Environment(\.dismiss) private var dismiss
+    /// The hand-rolled model menu (`ModelMenuPanel`) — state lives here
+    /// because the panel overlays the TRANSCRIPT, not just the header bar.
+    @State private var modelMenuOpen = false
 
     init(host: TranscriptHost, store: ChatStore) {
         _store = ObservedObject(wrappedValue: store)
@@ -36,8 +39,13 @@ struct ChatScreen: View {
                 .opacity(bridge.contentVisible ? 1 : 0)
                 .animation(.easeOut(duration: 0.15), value: bridge.contentVisible)
 
-            ChatHeaderView(connState: store.connState) {
+            ChatHeaderView(store: store, catalog: .shared, menuOpen: $modelMenuOpen) {
                 dismiss()
+            }
+
+            if modelMenuOpen {
+                ModelMenuPanel(store: store, catalog: .shared, isPresented: $modelMenuOpen)
+                    .zIndex(2)
             }
         }
         // The system nav bar is hidden (custom chrome), which also disables the
@@ -90,6 +98,8 @@ struct ChatScreen: View {
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()
+            ModelCatalog.shared.refreshIfNeeded()
+            store.refreshModelPin()
             SessionIndex.shared.enterSession(store.sessionId)
             #if DEBUG
                 store.startDemoFramesIfRequested()
@@ -123,11 +133,16 @@ struct ChatScreen: View {
 }
 
 /// The paper-veil header: a translucent white gradient holding solid through
-/// the status bar and easing out to clear at the connection-status capsule's
-/// bottom edge, with the centered status capsule flanked by the glass back
-/// button. The veil ignores touches so scrolls beneath it reach the thread.
+/// the status bar and easing out to clear at the bar's bottom edge. On the
+/// ink side: the glass back circle and the model pill on the LEFT (the pill
+/// toggles the hand-rolled `ModelMenuPanel` the screen overlays), and — ONLY
+/// while the leg is offline — a red dot in a glass circle on the trailing
+/// edge; every healthy state shows nothing there. The veil ignores touches so
+/// scrolls beneath it reach the thread.
 struct ChatHeaderView: View {
-    let connState: ChatStore.ConnState
+    @ObservedObject var store: ChatStore
+    @ObservedObject var catalog: ModelCatalog
+    @Binding var menuOpen: Bool
     let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
@@ -136,54 +151,116 @@ struct ChatHeaderView: View {
     /// Solid → clear smoothstep the veil fades through, below its solid
     /// status-bar zone (the composer veil's grammar, mirrored to the top).
     private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
+    /// Cap on the pill's LABEL TEXT so a long model id can't outgrow a narrow
+    /// screen. Applied to the string, not via `.frame(maxWidth:)` — a frame
+    /// cap makes the Menu label greedy (it expands to the cap even for short
+    /// names) where the pill should hug its content; the menu rows still show
+    /// the full name.
+    private static let modelLabelMaxChars = 8
 
     var body: some View {
-        ZStack {
-            // Centered connection status — a liquid-glass capsule.
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(dotFill)
-                    .overlay(
-                        Circle().strokeBorder(
-                            Theme.inkSoft, lineWidth: connState == .connecting ? 1 : 0)
-                    )
-                    .frame(width: 8, height: 8)
-                Text(label)
-                    .font(Theme.mono(13))
-                    .foregroundStyle(connState == .offline ? Theme.err : Theme.inkSoft)
+        HStack(spacing: 12) {
+            // The glass back circle (logout moved to the chat list's header —
+            // leaving the account lives one level up now). Semibold glyph so
+            // the ink reads as solid black over the bright glass.
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 42, height: 42)
             }
-            .padding(.horizontal, 18)
-            .frame(height: 42)
-            .glassEffect(.regular, in: Capsule())
+            .glassEffect(.regular.interactive(), in: .circle)
+            .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.back")))
 
-            // The flanking glass back circle (logout moved to the chat list's
-            // header — leaving the account lives one level up now). Semibold
-            // glyph so the ink reads as solid black over the bright glass.
-            HStack {
-                Button(action: onBack) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(Theme.ink)
-                        .frame(width: 42, height: 42)
-                }
-                .glassEffect(.regular.interactive(), in: .circle)
-                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.back")))
+            // The model pill renders only once the catalog has entries —
+            // before the first successful fetch (and offline) there is
+            // nothing to offer, and an unpinned session runs the default
+            // whether or not the pill says so.
+            if !catalog.models.isEmpty {
+                modelPill
+            }
 
-                Spacer()
+            Spacer()
+
+            // Connectivity keeps NO indicator in every healthy state; only a
+            // SUSTAINED outage surfaces (`legDown` — debounced, because the
+            // raw state oscillates through the retry loop), clearing itself
+            // the moment a dial lands.
+            if store.legDown {
+                offlineIcon
             }
         }
         .padding(.horizontal, 24)
         .frame(height: Self.barHeight)
         .frame(maxWidth: .infinity)
         .background(alignment: .top) { veil }
+        .animation(.easeOut(duration: 0.15), value: store.legDown)
+    }
+
+    /// The model capsule: the effective MODEL id (the pinned entry's, or the
+    /// default entry's when unpinned). Tapping toggles the hand-rolled
+    /// `ModelMenuPanel` (providers → models + thinking level → levels) that
+    /// `ChatScreen` overlays under this pill. A pick applies from the
+    /// session's NEXT turn (gateway contract), so no confirmation step.
+    private var modelPill: some View {
+        Button {
+            Haptics.tap()
+            withAnimation(.easeOut(duration: 0.15)) { menuOpen.toggle() }
+        } label: {
+            Text(verbatim: modelLabel)
+                .font(Theme.mono(15))
+                .foregroundStyle(Theme.ink)
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+                .frame(height: 42)
+        }
+        .glassEffect(.regular.interactive(), in: Capsule())
+        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.model")))
+        // The a11y label hides the pill's visible text, so surface it as the
+        // element's VALUE — the FULL id, not the ellipsized display string:
+        // VoiceOver reads "Model, gpt-5.5" and the UI smoke asserts a pick
+        // landed through it.
+        .accessibilityValue(Text(verbatim: modelName))
+    }
+
+    /// The one state with a header indicator: the leg has been down for a
+    /// sustained stretch. The universal no-network glyph, in the error ink.
+    private var offlineIcon: some View {
+        Image(systemName: "wifi.slash")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(Theme.err)
+            .frame(width: 42, height: 42)
+            .glassEffect(.regular, in: .circle)
+            .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.offline")))
+            .transition(.scale(scale: 0.6).combined(with: .opacity))
+    }
+
+    /// The effective MODEL id the pill names: the pinned model within the
+    /// pinned entry, the effective entry's default model when no model is
+    /// pinned — or the raw pin strings when the catalog no longer has the
+    /// entry (stale but honest). Always the best-known value, never a
+    /// placeholder: an offline open must keep naming the model (mirror-fed),
+    /// even while the pin read hasn't confirmed it yet.
+    private var modelName: String {
+        if let model = store.modelPinModel { return model }
+        return catalog.effectiveEntry(pin: store.modelPin)?.model
+            ?? store.modelPin ?? catalog.defaultName ?? ""
+    }
+
+    /// What the pill reads at rest: `modelName`, ellipsized
+    /// (`modelLabelMaxChars`).
+    private var modelLabel: String {
+        let name = modelName
+        guard name.count > Self.modelLabelMaxChars else { return name }
+        return String(name.prefix(Self.modelLabelMaxChars)) + "…"
     }
 
     /// White paper veil: one fade that floods up over the status bar (so its
     /// coordinate space is status-bar + bar) and holds solid through the
     /// status bar, then smoothsteps to clear at the bar's bottom — i.e. the
-    /// connection-status capsule's bottom edge. Nothing below the bar. The
-    /// gradient fill itself carries `ignoresSafeArea(.top)`; nesting the flood
-    /// inside a `.background` clips it (the parent doesn't ignore the inset).
+    /// model pill's bottom edge. Nothing below the bar. The gradient fill
+    /// itself carries `ignoresSafeArea(.top)`; nesting the flood inside a
+    /// `.background` clips it (the parent doesn't ignore the inset).
     private var veil: some View {
         LinearGradient(stops: Self.veilStops, startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea(edges: .top)
@@ -204,23 +281,5 @@ struct ChatHeaderView: View {
             stops.append(.init(color: Theme.paper.opacity(alpha * veilPeakAlpha), location: frac))
         }
         return stops
-    }
-
-    private var dotFill: Color {
-        switch connState {
-        case .draft: return Theme.ink
-        case .connected: return Theme.ink
-        case .connecting: return .clear
-        case .offline: return Theme.err
-        }
-    }
-
-    private var label: String {
-        switch connState {
-        case .draft: return Lang.shared.t("chat.draft")
-        case .connected: return Lang.shared.t("chat.connected")
-        case .connecting: return Lang.shared.t("chat.connecting")
-        case .offline: return Lang.shared.t("chat.offline")
-        }
     }
 }

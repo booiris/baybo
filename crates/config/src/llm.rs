@@ -14,8 +14,21 @@ pub struct LlmEntry {
     /// Provider id, e.g. `"openai"`, `"anthropic"`, `"gemini"`,
     /// `"minimax"`, `"openai-subscription"`.
     pub provider: String,
-    /// Model id, e.g. `"gpt-4o"`.
+    /// Default model id, e.g. `"gpt-4o"` — the one this entry resolves to
+    /// when a session pins the entry without choosing a specific candidate.
     pub model: String,
+    /// Extra model ids this entry (same provider + credentials) can serve.
+    /// A session can pin any of `[model] + model_candidates`; the chat header
+    /// picker lists them under the entry. Empty (the common case) means the
+    /// entry offers only `model`. Old configs without the key load as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_candidates: Vec<String>,
+    /// A cheaper/faster model for lightweight auxiliary calls (title
+    /// generation, memory extraction, …). Reserved — no runtime path consumes
+    /// it yet; declared here so operators can configure it ahead of the
+    /// feature that will. `None` = no lite model configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lite_model: Option<String>,
     /// Name of an environment variable holding the API key. The config
     /// never holds a literal API key — this field is a **reference**.
     /// `None` means "look up the per-entry vault key, then fall back to

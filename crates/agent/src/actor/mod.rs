@@ -111,7 +111,16 @@ pub enum AgentMessage {
     /// drained sequentially), so it never swaps the model mid-turn —
     /// it takes effect on the next turn. Routed by the gateway's
     /// `PUT /v1/chat/sessions/{id}/model` via [`AgentSupervisor::route`].
-    SetModel { llm: Option<LlmEntryName> },
+    SetModel {
+        llm: Option<LlmEntryName>,
+        /// The model within `llm`'s entry (a `model_candidates` id), or
+        /// `None` for the entry's default. Persisted to
+        /// `session.state.last_model` alongside `last_llm`.
+        model: Option<String>,
+        /// Per-session reasoning effort, or `None` for the entry default.
+        /// Persisted to `session.state.last_effort`.
+        effort: Option<String>,
+    },
     /// Stop this actor. Lowest mailbox priority — every queued
     /// `UserInput` / `BackgroundJobFinished` drains first, then the actor
     /// trips its `actor_token` and exits. (The session row lives on; only
@@ -490,8 +499,8 @@ impl AgentActor {
             AgentMessage::BackgroundJobFinished(pending) => {
                 self.handle_background_finished(*pending).await;
             }
-            AgentMessage::SetModel { llm } => {
-                self.handle_set_model(llm);
+            AgentMessage::SetModel { llm, model, effort } => {
+                self.handle_set_model(llm, model, effort);
             }
             AgentMessage::UserInputBatch(_) => {
                 // The run loop owns `UserInputBatch` (it needs `&mut mailbox` to
@@ -1142,16 +1151,25 @@ impl AgentActor {
     /// mid-turn. The gateway validated `llm` against the pool; even a
     /// stranded name degrades safely (`LlmClientPool::resolve` falls back
     /// to the default).
-    fn handle_set_model(&mut self, llm: Option<LlmEntryName>) {
+    fn handle_set_model(
+        &mut self,
+        llm: Option<LlmEntryName>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
         debug!(
             session_id = %self.durable.session.id,
             llm = ?llm,
+            model = ?model,
+            effort = ?effort,
             "re-pinning session LLM",
         );
-        // Keep the in-memory view consistent (the persisted column is
+        // Keep the in-memory view consistent (the persisted columns are
         // authoritative on the next `get`); then swap the live loop.
         self.durable.session.state.last_llm = llm.clone();
-        self.volatile.agent_loop.set_initial_llm(llm);
+        self.durable.session.state.last_model = model.clone();
+        self.durable.session.state.last_effort = effort.clone();
+        self.volatile.agent_loop.set_initial_llm(llm, model, effort);
     }
 
     /// Persist actor-owned session state and refresh activity so the reaper

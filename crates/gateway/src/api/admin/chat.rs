@@ -683,6 +683,15 @@ pub struct ChatSessionDetail {
     /// initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<String>,
+    /// Per-session model pick within `last_llm`'s entry
+    /// (`session.state.last_model`), or `null` for the entry's default.
+    /// Drives which model row the header picker checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+    /// Per-session reasoning-effort pick (`session.state.last_effort`), or
+    /// `null` for the entry default. Drives the header's thinking-level check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -1155,6 +1164,8 @@ async fn get_session(
         oldest_ordinal: page.oldest_ordinal,
         newest_ordinal: page.newest_ordinal,
         last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+        last_model: session.state.last_model.clone(),
+        last_effort: session.state.last_effort.clone(),
         title: session.title.clone(),
     }))
 }
@@ -1464,6 +1475,19 @@ pub struct SetSessionModelRequest {
     /// configured entry — see `GET /v1/llm/models` → `items[].name`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// The model to pick WITHIN `llm`'s entry — one of that entry's
+    /// `[model] + model_candidates`. `null`/absent uses the entry's default
+    /// model. Ignored (and rejected as a mismatch) when `llm` is `null`,
+    /// since there is no entry to pick a model within.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-session reasoning effort
+    /// (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `null`/absent for
+    /// the entry's default. Applies to every turn of THIS session only (not a
+    /// global entry edit); consumed by providers that support it
+    /// (openai-subscription), clamped per model at runtime.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1471,6 +1495,14 @@ pub struct SetSessionModelResponse {
     /// The pin now in effect: the entry name, or `null` for `default-llm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<String>,
+    /// The model pick now in effect within the entry, or `null` for the
+    /// entry's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+    /// The reasoning-effort pick now in effect, or `null` for the entry
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
     /// `true` when a live actor was re-pinned in place (applies on the
     /// session's next turn); `false` when only the persisted state was
     /// updated because no actor is currently running (the next user
@@ -1506,19 +1538,60 @@ async fn set_session_model(
 
     let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
 
-    // Persist the pin durably FIRST, via a targeted flat-column write
-    // (`set_last_llm`). Unlike a full-session `save`, this can't be
-    // clobbered by a concurrent `touch` (load + full blob save fired on
-    // every inbound message) — the same flat-column discipline the
-    // `hidden` flag uses. It is synchronous, so a storage failure
-    // surfaces as an error here instead of a false 200, and it is
-    // authoritative for any actor spawned later (the spawner reads
-    // `session.state.last_llm`, which `get` patches from this column).
+    // A model pick only means something within an entry. Reject
+    // `{llm: null, model: "x"}` rather than silently dropping it; clear the
+    // model when no entry is pinned. Otherwise validate the model belongs to
+    // the entry's `[model] + model_candidates` (rejects a stranded pick up
+    // front instead of letting it degrade to the entry default at run time).
+    let model_pick: Option<String> = match (&pin, req.model.as_deref()) {
+        (_, None) => None,
+        (None, Some(_)) => {
+            return Err(GatewayError::BadRequest(
+                "model pick requires an llm entry; send llm together with model".to_string(),
+            ));
+        }
+        (Some(entry), Some(model)) => {
+            super::validate_llm_model(&state, entry, model)?;
+            Some(model.to_string())
+        }
+    };
+
+    // Reasoning effort is a free per-session knob (the runtime clamps it per
+    // model), but reject a value outside the known ladder so a typo surfaces
+    // as a 400 rather than silently degrading to the default every turn.
+    let effort_pick: Option<String> = match req.reasoning_effort.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(level) if LLM_EFFORT_LEVELS.contains(&level) => Some(level.to_string()),
+        Some(other) => {
+            return Err(GatewayError::BadRequest(format!(
+                "unknown reasoning_effort {other:?}; expected one of {LLM_EFFORT_LEVELS:?}"
+            )));
+        }
+    };
+
+    // Persist the pin durably FIRST, via targeted flat-column writes
+    // (`set_last_llm` / `set_last_model`). Unlike a full-session `save`,
+    // these can't be clobbered by a concurrent `touch` (load + full blob
+    // save fired on every inbound message) — the same flat-column discipline
+    // the `hidden` flag uses. Synchronous, so a storage failure surfaces as
+    // an error here instead of a false 200, and authoritative for any actor
+    // spawned later (the spawner reads `session.state.last_llm` /
+    // `last_model`, which `get` patches from these columns).
     state
         .session_manager
         .set_last_llm(&sid, pin.as_ref())
         .await
         .map_err(|e| GatewayError::Internal(format!("persist session model pin: {e}")))?;
+    state
+        .session_manager
+        .set_last_model(&sid, model_pick.as_deref())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("persist session model pick: {e}")))?;
+    state
+        .session_manager
+        .set_last_effort(&sid, effort_pick.as_deref())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("persist session effort pick: {e}")))?;
 
     // Then re-pin any *live* actor in memory so the switch takes effect
     // on its next turn without waiting for eviction + rehydration.
@@ -1529,14 +1602,27 @@ async fn set_session_model(
     // store stays correct, so it self-heals on the next eviction.)
     let applied_to_live_actor = state
         .supervisor
-        .route(&sid, AgentMessage::SetModel { llm: pin.clone() })
+        .route(
+            &sid,
+            AgentMessage::SetModel {
+                llm: pin.clone(),
+                model: model_pick.clone(),
+                effort: effort_pick.clone(),
+            },
+        )
         .await;
 
     Ok(Json(SetSessionModelResponse {
         last_llm: pin.map(|n| n.to_string()),
+        last_model: model_pick,
+        last_effort: effort_pick,
         applied_to_live_actor,
     }))
 }
+
+/// The reasoning-effort ladder the per-session pin accepts (mirrors the
+/// `crates/llm` registry contract). A value outside this set is a 400.
+const LLM_EFFORT_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
 #[derive(Debug, Deserialize, ToSchema)]

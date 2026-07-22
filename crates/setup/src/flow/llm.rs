@@ -115,6 +115,8 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: String::from("(unset)"),
+        model_candidates: Vec::new(),
+        lite_model: None,
         api_key_env: api_key_env.clone(),
         base_url: base_url.clone(),
         supports_vision: None,
@@ -170,6 +172,10 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: model.clone(),
+        // The wizard configures one model at a time; operators add candidates
+        // by editing baybo.json (`model_candidates`) directly.
+        model_candidates: Vec::new(),
+        lite_model: None,
         api_key_env,
         base_url,
         supports_vision: None,

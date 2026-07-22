@@ -1127,6 +1127,9 @@ final class AppStore: ObservableObject {
         _deckHost?.teardown()
         _deckHost = nil
         DeckStore.removeMirror()
+        // As does the model catalog — a rebind must not offer the departed
+        // gateway's LLM entries.
+        ModelCatalog.shared.reset()
         for store in stores {
             await store.disconnect()
         }

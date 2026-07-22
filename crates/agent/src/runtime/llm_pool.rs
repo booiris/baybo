@@ -28,7 +28,14 @@ use tracing::warn;
 pub type LlmPoolHandle = Arc<parking_lot::RwLock<Arc<LlmClientPool>>>;
 
 pub struct LlmClientPool {
+    /// Entry → its DEFAULT-model client.
     clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
+    /// (entry, candidate model id) → client, for models other than the
+    /// entry's default. Pre-built at boot/reload from `model_candidates`.
+    overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
+    /// Entry → every model id it can serve (`[default] + candidates` that
+    /// actually built a client). The pinnable set for validation.
+    entry_models: HashMap<LlmEntryName, Vec<String>>,
     default_name: LlmEntryName,
     default_client: Arc<BillableLlm>,
     tier_map: HashMap<ModelTier, LlmEntryName>,
@@ -42,12 +49,36 @@ impl LlmClientPool {
         Self::with_tier_map(clients, default_name, HashMap::new())
     }
 
-    /// Construct a pool with a tier→entry-name lookup. Each value in
-    /// `tier_map` must already exist in `clients` — a stranded
-    /// reference would surface as a default-fallback every spawn,
-    /// which is hard to diagnose at runtime, so we reject it at boot.
+    /// Construct a pool with a tier→entry-name lookup but NO candidate
+    /// models — each entry serves only its default model. `entry_models` is
+    /// derived from each client's own `model_info().id`.
     pub fn with_tier_map(
         clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
+        default_name: LlmEntryName,
+        tier_map: HashMap<ModelTier, LlmEntryName>,
+    ) -> Result<Self, String> {
+        let entry_models = clients
+            .iter()
+            .map(|(name, client)| (name.clone(), vec![client.model_info().id.clone()]))
+            .collect();
+        Self::with_candidates(
+            clients,
+            HashMap::new(),
+            entry_models,
+            default_name,
+            tier_map,
+        )
+    }
+
+    /// The full constructor: default-model clients plus candidate-model
+    /// `overrides` and the per-entry pinnable-model list. Each value in
+    /// `tier_map` must already exist in `clients` — a stranded reference
+    /// would surface as a default-fallback every spawn, which is hard to
+    /// diagnose at runtime, so we reject it at boot.
+    pub fn with_candidates(
+        clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
+        overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
+        entry_models: HashMap<LlmEntryName, Vec<String>>,
         default_name: LlmEntryName,
         tier_map: HashMap<ModelTier, LlmEntryName>,
     ) -> Result<Self, String> {
@@ -67,6 +98,8 @@ impl LlmClientPool {
         }
         Ok(Self {
             clients,
+            overrides,
+            entry_models,
             default_name,
             default_client,
             tier_map,
@@ -88,8 +121,26 @@ impl LlmClientPool {
         self.clients.keys().cloned().collect()
     }
 
-    pub(crate) fn resolve(&self, name: Option<&LlmEntryName>) -> (Arc<BillableLlm>, LlmEntryName) {
-        match name {
+    /// The model ids entry `name` can be pinned to (`[default] + candidates`
+    /// that built a client), or `None` if the entry isn't in the pool. Used
+    /// by the gateway to validate a `(entry, model)` session pin.
+    pub fn entry_model_ids(&self, name: &LlmEntryName) -> Option<&[String]> {
+        self.entry_models.get(name).map(Vec::as_slice)
+    }
+
+    /// Resolve a session's pin to a client. `name` picks the entry (`None` =
+    /// default-llm, stranded name → default with a warn). `model` picks the
+    /// model WITHIN that entry: `None` or the entry's default model returns
+    /// the entry's default client; a configured candidate returns its
+    /// pre-built client; a stranded model degrades to the entry default with
+    /// a warn. The returned name is always the ENTRY name (the pin's
+    /// identity), never the model.
+    pub(crate) fn resolve(
+        &self,
+        name: Option<&LlmEntryName>,
+        model: Option<&str>,
+    ) -> (Arc<BillableLlm>, LlmEntryName) {
+        let (base, entry_name) = match name {
             None => (self.default_client(), self.default_name.clone()),
             Some(requested) => match self.clients.get(requested) {
                 Some(client) => (client.clone(), requested.clone()),
@@ -102,6 +153,24 @@ impl LlmClientPool {
                     (self.default_client(), self.default_name.clone())
                 }
             },
+        };
+        let Some(model) = model else {
+            return (base, entry_name);
+        };
+        // The entry's default model resolves to the base client already.
+        if base.model_info().id == model {
+            return (base, entry_name);
+        }
+        match self.overrides.get(&(entry_name.clone(), model.to_string())) {
+            Some(client) => (client.clone(), entry_name),
+            None => {
+                warn!(
+                    entry = %entry_name,
+                    model = %model,
+                    "pinned model is not a configured candidate of the entry, falling back to the entry's default model"
+                );
+                (base, entry_name)
+            }
         }
     }
 }
@@ -151,10 +220,35 @@ mod tests {
         }
     }
 
+    /// A pool with one entry `primary` (default model `model-primary`) that
+    /// also offers a candidate model `model-alt`.
+    fn candidate_fixture() -> LlmClientPool {
+        let mut clients = HashMap::new();
+        clients.insert(LlmEntryName::from("primary"), stub_with_id("model-primary"));
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            (LlmEntryName::from("primary"), "model-alt".to_string()),
+            stub_with_id("model-alt"),
+        );
+        let mut entry_models = HashMap::new();
+        entry_models.insert(
+            LlmEntryName::from("primary"),
+            vec!["model-primary".to_string(), "model-alt".to_string()],
+        );
+        LlmClientPool::with_candidates(
+            clients,
+            overrides,
+            entry_models,
+            LlmEntryName::from("primary"),
+            HashMap::new(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn resolve_none_returns_default() {
         let pool = fixture();
-        let (client, name) = pool.resolve(None);
+        let (client, name) = pool.resolve(None, None);
         assert_eq!(name, "primary");
         assert_eq!(client.model_info().id, "model-primary");
     }
@@ -162,7 +256,7 @@ mod tests {
     #[test]
     fn resolve_known_returns_match() {
         let pool = fixture();
-        let (client, name) = pool.resolve(Some(&LlmEntryName::from("fast")));
+        let (client, name) = pool.resolve(Some(&LlmEntryName::from("fast")), None);
         assert_eq!(name, "fast");
         assert_eq!(client.model_info().id, "model-fast");
     }
@@ -170,16 +264,52 @@ mod tests {
     #[test]
     fn resolve_unknown_falls_back_to_default() {
         let pool = fixture();
-        let (client, name) = pool.resolve(Some(&LlmEntryName::from("ghost")));
+        let (client, name) = pool.resolve(Some(&LlmEntryName::from("ghost")), None);
         assert_eq!(name, "primary");
         assert_eq!(client.model_info().id, "model-primary");
+    }
+
+    #[test]
+    fn resolve_candidate_model_returns_override_client() {
+        let pool = candidate_fixture();
+        let (client, name) = pool.resolve(Some(&LlmEntryName::from("primary")), Some("model-alt"));
+        assert_eq!(name, "primary", "the pin identity stays the entry name");
+        assert_eq!(client.model_info().id, "model-alt");
+    }
+
+    #[test]
+    fn resolve_default_model_by_name_returns_base_client() {
+        let pool = candidate_fixture();
+        // Explicitly asking for the entry's default model is the base client,
+        // not an override lookup.
+        let (client, _) = pool.resolve(Some(&LlmEntryName::from("primary")), Some("model-primary"));
+        assert_eq!(client.model_info().id, "model-primary");
+    }
+
+    #[test]
+    fn resolve_stranded_model_falls_back_to_entry_default() {
+        let pool = candidate_fixture();
+        let (client, name) =
+            pool.resolve(Some(&LlmEntryName::from("primary")), Some("ghost-model"));
+        assert_eq!(name, "primary");
+        assert_eq!(client.model_info().id, "model-primary");
+    }
+
+    #[test]
+    fn entry_model_ids_lists_default_plus_candidates() {
+        let pool = candidate_fixture();
+        let ids = pool
+            .entry_model_ids(&LlmEntryName::from("primary"))
+            .unwrap();
+        assert_eq!(ids, ["model-primary", "model-alt"]);
+        assert!(pool.entry_model_ids(&LlmEntryName::from("ghost")).is_none());
     }
 
     #[test]
     fn default_client_matches_resolve_none() {
         let pool = fixture();
         let direct = pool.default_client();
-        let (resolved, _) = pool.resolve(None);
+        let (resolved, _) = pool.resolve(None, None);
         assert!(Arc::ptr_eq(&direct, &resolved));
     }
 
@@ -191,11 +321,11 @@ mod tests {
         // rebind. A pool swap produces fresh `Arc`s, which is what makes
         // the pointer-identity check fire.
         let pool = fixture();
-        let (a, _) = pool.resolve(None);
-        let (b, _) = pool.resolve(None);
+        let (a, _) = pool.resolve(None, None);
+        let (b, _) = pool.resolve(None, None);
         assert!(Arc::ptr_eq(&a, &b));
-        let (c, _) = pool.resolve(Some(&LlmEntryName::from("fast")));
-        let (d, _) = pool.resolve(Some(&LlmEntryName::from("fast")));
+        let (c, _) = pool.resolve(Some(&LlmEntryName::from("fast")), None);
+        let (d, _) = pool.resolve(Some(&LlmEntryName::from("fast")), None);
         assert!(Arc::ptr_eq(&c, &d));
     }
 

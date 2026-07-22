@@ -708,6 +708,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Set (or clear, with `None`) the session's per-session MODEL pick
+    /// within the pinned entry. Targeted flat-column write; see
+    /// [`baybo_store::SessionStore::set_last_model`]. Returns
+    /// `Err(NotFound)` when the session id is unknown.
+    pub async fn set_last_model(&self, session_id: &SessionId, model: Option<&str>) -> Result<()> {
+        let updated = self.store.set_last_model(session_id, model).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, model = ?model, "set session model pick");
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the session's per-session reasoning-effort
+    /// pin. Targeted flat-column write; see
+    /// [`baybo_store::SessionStore::set_last_effort`].
+    pub async fn set_last_effort(
+        &self,
+        session_id: &SessionId,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        let updated = self.store.set_last_effort(session_id, effort).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, effort = ?effort, "set session effort pick");
+        Ok(())
+    }
+
     /// Flip the session's chat-list `pinned` flag — the sidebar "pin to
     /// top" affordance. Targeted flat-column write that survives a
     /// concurrent `touch`; see [`baybo_store::SessionStore::set_pinned`].

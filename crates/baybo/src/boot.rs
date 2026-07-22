@@ -131,6 +131,31 @@ pub async fn build_llm_client_for_entry(
     billing: CostHooks,
     proxy: Option<baybo_security::http::ProxySettings>,
 ) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
+    build_llm_client_for_entry_model(
+        entry,
+        &entry.model,
+        registry,
+        blob_store,
+        vault,
+        billing,
+        proxy,
+    )
+    .await
+}
+
+/// [`build_llm_client_for_entry`] with an explicit model id — the entry's
+/// provider/credentials/overrides, but a different model. Backs the pool's
+/// per-candidate clients (`model_candidates`): same seam, only `model`
+/// differs. Passing `&entry.model` is exactly the default path.
+pub async fn build_llm_client_for_entry_model(
+    entry: &LlmEntry,
+    model: &str,
+    registry: &LlmProviderRegistry,
+    blob_store: Option<std::sync::Arc<dyn baybo_store::BlobStore>>,
+    vault: Option<std::sync::Arc<baybo_security::SecretVault>>,
+    billing: CostHooks,
+    proxy: Option<baybo_security::http::ProxySettings>,
+) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let api_key = resolve_api_key(
         entry.name.as_str(),
         &entry.provider,
@@ -149,7 +174,7 @@ pub async fn build_llm_client_for_entry(
                 provider: entry.provider.clone(),
                 api_key,
                 base_url: entry.base_url.clone(),
-                model: entry.model.clone(),
+                model: model.to_string(),
                 supports_vision: entry.supports_vision,
                 context_window: entry.context_window,
                 pricing: entry.pricing,

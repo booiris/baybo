@@ -132,8 +132,9 @@ impl OpenAiSubscriptionCompletionModel {
     pub async fn completion(
         &self,
         request: CompletionRequest,
+        effort: Option<&str>,
     ) -> Result<completion::CompletionResponse<()>, CompletionError> {
-        let stream = self.stream(request).await?;
+        let stream = self.stream(request, effort).await?;
         let mut text_buf = String::new();
         let mut reasoning_buf = String::new();
         let mut thinking_blocks: Vec<baybo_model::ContentBlock> = Vec::new();
@@ -200,9 +201,21 @@ impl OpenAiSubscriptionCompletionModel {
 
     /// Open a streaming connection to `<base_url>/codex/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
-    pub async fn stream(&self, request: CompletionRequest) -> Result<LlmStream, CompletionError> {
+    pub async fn stream(
+        &self,
+        request: CompletionRequest,
+        effort: Option<&str>,
+    ) -> Result<LlmStream, CompletionError> {
+        // A per-request effort (the session's thinking-level pin) overrides
+        // the client's construction-time entry default, clamped to what this
+        // model allows; `None` keeps the entry default. This is what makes the
+        // chat header's thinking picker per-SESSION rather than a global edit.
+        let effective_effort = match effort {
+            Some(requested) => super::reasoning::resolve_effort(&self.model, Some(requested)),
+            None => self.reasoning_effort,
+        };
         let body =
-            build_responses_body(&self.model, self.reasoning_effort, &request).map_err(|msg| {
+            build_responses_body(&self.model, effective_effort, &request).map_err(|msg| {
                 let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
                 CompletionError::RequestError(err)
             })?;

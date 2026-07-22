@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{
     ChatSessionSummary, CronJobStatus, CronJobSummary, DeckCardInfo, DeckLayoutEntryInput,
-    DeckSnapshotInfo, DeckView,
+    DeckSnapshotInfo, DeckView, LlmModelCatalog, LlmModelInfo, SessionModelPin,
 };
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_CRON: &str = "/v1/cron";
+const PATH_LLM_MODELS: &str = "/v1/llm/models";
 const PATH_DECK: &str = "/v1/deck";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
@@ -368,6 +369,49 @@ pub(crate) struct ChatMessageLookupResponse {
     pub(crate) found: bool,
     #[serde(default)]
     pub(crate) ordinal: Option<i64>,
+}
+
+/// `GET /v1/llm/models`, narrowed to the picker's fields. The gateway row
+/// carries a full dashboard's worth of config/pricing detail — serde drops it.
+#[derive(Deserialize)]
+struct LlmModelsList {
+    default_name: String,
+    items: Vec<WireLlmModel>,
+}
+
+#[derive(Deserialize)]
+struct WireLlmModel {
+    name: String,
+    provider: String,
+    model: String,
+    #[serde(default)]
+    model_candidates: Vec<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+/// `GET /v1/chat/sessions/{id}?limit=1` read for the session meta only — the
+/// transcript page rides along and is dropped; `limit=1` keeps it one row.
+#[derive(Deserialize)]
+struct SessionModelMeta {
+    #[serde(default)]
+    last_llm: Option<String>,
+    #[serde(default)]
+    last_model: Option<String>,
+    #[serde(default)]
+    last_effort: Option<String>,
+}
+
+/// `PUT /v1/chat/sessions/{id}/model` body. `None`s must serialize as EXPLICIT
+/// nulls — `{"llm":null}` is the "clear the pin, follow `default-llm`" request
+/// and `{"model":null}` the "use the entry's default model" request; omitting
+/// a field means the same today only because the gateway defaults it, and this
+/// side should not lean on that.
+#[derive(Serialize)]
+struct SetSessionModelRequest<'a> {
+    llm: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -805,6 +849,73 @@ fn percent_encode_query(value: &str) -> String {
         }
     }
     out
+}
+
+/// The gateway's configured LLM entries + the current `default-llm` name
+/// (`GET /v1/llm/models`) — the chat header model picker's catalog. Global,
+/// not per-session; the client caches it per app run.
+pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<LlmModelCatalog, String> {
+    let list: LlmModelsList = client.get_json(PATH_LLM_MODELS).await?;
+    Ok(LlmModelCatalog {
+        default_name: list.default_name,
+        items: list
+            .items
+            .into_iter()
+            .map(|m| LlmModelInfo {
+                name: m.name,
+                provider: m.provider,
+                model: m.model,
+                model_candidates: m.model_candidates,
+                reasoning_effort: m.reasoning_effort,
+            })
+            .collect(),
+    })
+}
+
+/// The session's model pin: the `baybo.json` entry name (`last_llm`) its turns
+/// resolve against and the chosen model within it (`last_model`), either
+/// `None`. Read off the session detail with `limit=1` — the pin rides the same
+/// DTO as the transcript page, and one throwaway row is the smallest page the
+/// route serves.
+pub(crate) async fn fetch_session_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+) -> Result<SessionModelPin, String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let meta: SessionModelMeta = client
+        .get_json(&format!("{PATH_CHAT_SESSIONS}/{session_id}?limit=1"))
+        .await?;
+    Ok(SessionModelPin {
+        llm: meta.last_llm,
+        model: meta.last_model,
+        effort: meta.last_effort,
+    })
+}
+
+/// Pin the session to LLM entry `llm` and model `model` within it — clear the
+/// entry (`llm = None` → follow `default-llm`) and/or fall back to the entry's
+/// default model (`model = None`). `PUT /v1/chat/sessions/{id}/model`; the
+/// gateway persists the pin first and re-pins any live actor, so it applies
+/// from the session's next turn. The response body (the echoed pin) is
+/// deliberately discarded — the route validates the pin, so a 200 means it took.
+pub(crate) async fn set_session_model<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    llm: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let body = serde_json::to_vec(&SetSessionModelRequest {
+        llm: llm.as_deref(),
+        model: model.as_deref(),
+        reasoning_effort: effort.as_deref(),
+    })
+    .map_err(|e| format!("encode set session model request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/model");
+    client.put_empty(&path, body).await
 }
 
 pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(
@@ -1494,6 +1605,119 @@ mod tests {
         let client = RecordingClient::empty();
         hide_many(&client, Vec::new()).await.expect("no-op");
         assert!(client.calls.lock().is_empty());
+    }
+
+    /// The picker reads three fields off a row that carries a dashboard's worth
+    /// of config/pricing detail — the extras must be dropped, not a decode error.
+    #[tokio::test]
+    async fn list_llm_models_narrows_the_dashboard_rows() {
+        let client = RecordingClient::new(
+            r#"{"default_name":"fast","items":[
+                {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_candidates":["gpt-5.5","o3"],"reasoning_effort":"xhigh","api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
+            ]}"#,
+        );
+        let catalog = list_llm_models(&client).await.expect("models");
+
+        assert_eq!(client.only_call().path, "/v1/llm/models");
+        assert_eq!(catalog.default_name, "fast");
+        assert_eq!(catalog.items.len(), 2);
+        assert_eq!(catalog.items[0].name, "fast");
+        assert_eq!(catalog.items[0].provider, "anthropic");
+        assert_eq!(catalog.items[0].model, "claude-haiku-4-5");
+        // No override on the row → provider default, not a decode error.
+        assert_eq!(catalog.items[0].reasoning_effort, None);
+        // Absent candidate list decodes to empty, not an error.
+        assert!(catalog.items[0].model_candidates.is_empty());
+        assert_eq!(catalog.items[1].name, "5.5-max");
+        assert_eq!(catalog.items[1].reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(catalog.items[1].model_candidates, ["gpt-5.5", "o3"]);
+    }
+
+    /// The pin read rides the session detail with `limit=1` — the smallest page
+    /// the route serves; the transcript row along for the ride is dropped. Both
+    /// the entry and the model-within-it come back.
+    #[tokio::test]
+    async fn fetch_session_model_reads_the_pin_off_a_one_row_detail() {
+        let client = RecordingClient::new(
+            r#"{"session_id":"s1","transcript":[{"id":"r9"}],"has_more":true,"last_llm":"5.5-max","last_model":"o3","last_effort":"high"}"#,
+        );
+        let pin = fetch_session_model(&client, "s1".to_string())
+            .await
+            .expect("pin");
+
+        assert_eq!(pin.llm.as_deref(), Some("5.5-max"));
+        assert_eq!(pin.model.as_deref(), Some("o3"));
+        assert_eq!(pin.effort.as_deref(), Some("high"));
+        assert_eq!(client.only_call().path, "/v1/chat/sessions/s1?limit=1");
+    }
+
+    /// An unpinned session's detail SKIPS the pin fields server-side
+    /// (`skip_serializing_if`) — absence must read as "follow the default".
+    #[tokio::test]
+    async fn fetch_session_model_reads_an_absent_pin_as_none() {
+        let client =
+            RecordingClient::new(r#"{"session_id":"s1","transcript":[],"has_more":false}"#);
+        let pin = fetch_session_model(&client, "s1".to_string())
+            .await
+            .expect("pin");
+        assert_eq!(pin.llm, None);
+        assert_eq!(pin.model, None);
+        assert_eq!(pin.effort, None);
+    }
+
+    #[tokio::test]
+    async fn set_session_model_puts_the_pin_on_the_model_path() {
+        let client = RecordingClient::empty();
+        set_session_model(
+            &client,
+            "s1".to_string(),
+            Some("5.5-max".to_string()),
+            Some("o3".to_string()),
+            Some("high".to_string()),
+        )
+        .await
+        .expect("pin");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "PUT",
+                path: "/v1/chat/sessions/s1/model".to_string(),
+                body: r#"{"llm":"5.5-max","model":"o3","reasoning_effort":"high"}"#.to_string(),
+            }
+        );
+    }
+
+    /// THE pin: clearing must send EXPLICIT nulls — the route's "follow
+    /// `default-llm`, default model + effort" request — never an empty object.
+    #[tokio::test]
+    async fn clearing_the_session_model_sends_explicit_nulls() {
+        let client = RecordingClient::empty();
+        set_session_model(&client, "s1".to_string(), None, None, None)
+            .await
+            .expect("clear");
+        assert_eq!(
+            client.only_call().body,
+            r#"{"llm":null,"model":null,"reasoning_effort":null}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn session_model_calls_reject_a_path_escaping_session_id() {
+        for bad in ["a/b", "a?b", ""] {
+            let client = RecordingClient::empty();
+            assert!(
+                fetch_session_model(&client, bad.to_string()).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(
+                set_session_model(&client, bad.to_string(), None, None, None)
+                    .await
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(client.calls.lock().is_empty());
+        }
     }
 
     /// The gateway's `DeckResponse` shape, verbatim — including the fields the

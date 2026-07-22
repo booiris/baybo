@@ -233,6 +233,16 @@ pub struct LlmModelEntry {
     pub name: String,
     pub provider: String,
     pub model: String,
+    /// Extra model ids this entry can serve (same provider + credentials).
+    /// A session can be pinned to any of `[model] + model_candidates`; the
+    /// chat header picker lists them under the entry. Empty for an entry
+    /// that offers only its default `model`.
+    #[serde(default)]
+    pub model_candidates: Vec<String>,
+    /// Cheaper/faster model for lightweight auxiliary calls — reserved, no
+    /// runtime path consumes it yet. `None` when unconfigured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lite_model: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     /// `true` when an API key is currently resolvable for this entry

@@ -153,6 +153,8 @@ mod tests {
                 name: LlmEntryName::from("primary"),
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                model_candidates: Vec::new(),
+                lite_model: None,
                 api_key_env: None,
                 base_url: None,
                 supports_vision: None,

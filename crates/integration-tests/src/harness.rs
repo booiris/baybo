@@ -506,6 +506,8 @@ impl AgentTestHarnessBuilder {
         let agent_loop = AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
             llm_pool,
             initial_llm: None,
+            initial_model: None,
+            initial_effort: None,
             tool_registry: tool_registry.clone(),
             tool_executor: tool_executor.clone(),
             context_manager,

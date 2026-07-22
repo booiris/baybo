@@ -90,6 +90,21 @@ pub trait SessionStore: Send + Sync {
         llm: Option<&LlmEntryName>,
     ) -> Result<bool>;
 
+    /// Set (or clear, with `None`) the session's per-session MODEL pick
+    /// within [`Self::set_last_llm`]'s entry — a `model_candidates` id.
+    /// Same flat-column discipline as [`Self::set_last_llm`]: writes only
+    /// the `last_model` column, leaving the JSON `data` blob alone. `get`
+    /// patches `Session.state.last_model` from the column at read time.
+    /// `None` clears the pick back to the entry's default model.
+    async fn set_last_model(&self, session_id: &SessionId, model: Option<&str>) -> Result<bool>;
+
+    /// Set (or clear, with `None`) the session's per-session reasoning-effort
+    /// pin. Same flat-column discipline as [`Self::set_last_model`]: writes
+    /// only the `last_effort` column. `get` patches
+    /// `Session.state.last_effort` at read time; `None` clears it to the
+    /// entry's default effort.
+    async fn set_last_effort(&self, session_id: &SessionId, effort: Option<&str>) -> Result<bool>;
+
     /// Set (or clear, with `false`) the session's chat-list pin flag —
     /// the sidebar "pin to top" affordance (`PUT /v1/chat/sessions/:id/pin`).
     /// Returns `Ok(true)` when the row existed and was updated, `Ok(false)`

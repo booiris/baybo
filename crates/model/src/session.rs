@@ -379,6 +379,25 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<LlmEntryName>,
 
+    /// Per-session MODEL pin WITHIN [`Self::last_llm`]'s entry: a specific id
+    /// from that entry's `[model] + model_candidates`. `None` (the default)
+    /// means "use the entry's default `model`", so an entry that offers only
+    /// one model never needs this set. Sibling to `last_llm` rather than a
+    /// change to it: the resolution stays entry-first, and old sessions (no
+    /// key) keep resolving to the entry default. Set alongside `last_llm` via
+    /// `PUT /v1/chat/sessions/{id}/model`; a stranded model (not among the
+    /// entry's candidates) degrades to the entry default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+
+    /// Per-session reasoning-effort pin
+    /// (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`), or `None` to use the
+    /// entry's configured default. Sibling to `last_llm`/`last_model`; the
+    /// agent loop carries it onto every `ChatRequest` so the chat header's
+    /// thinking level is per-session. Consumed only by openai-subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,

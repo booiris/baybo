@@ -66,6 +66,22 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
                 "must be non-empty",
             ));
         }
+        for (j, candidate) in entry.model_candidates.iter().enumerate() {
+            if candidate.trim().is_empty() {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.model_candidates[{j}]"),
+                    "must be non-empty",
+                ));
+            }
+        }
+        if let Some(lite) = &entry.lite_model
+            && lite.trim().is_empty()
+        {
+            errors.push(ValidationError::new(
+                format!("{prefix}.lite_model"),
+                "must be non-empty when set (omit the field to leave it unset)",
+            ));
+        }
         if let Some(url) = &entry.base_url
             && !is_http_url(url)
         {

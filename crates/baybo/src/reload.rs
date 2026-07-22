@@ -29,27 +29,74 @@ use tracing::{info, warn};
 
 use crate::boot;
 
-/// Build one `Arc<BillableLlm>` per `config.llm` entry, concurrently.
-/// Mirrors boot's failure policy exactly: a **default** entry that
-/// fails to build is a hard error (the pool would be unusable); a
-/// non-default failure is dropped with a `warn!` and its name returned
-/// in the second tuple element.
+/// The built LLM clients for a config: one default-model client per entry,
+/// plus a client per `model_candidates` model, plus the per-entry pinnable
+/// model list — everything [`baybo_agent::LlmClientPool::with_candidates`]
+/// needs. `dropped` names entries whose DEFAULT client failed to build.
+pub(crate) struct BuiltPoolClients {
+    pub clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
+    pub overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
+    pub entry_models: HashMap<LlmEntryName, Vec<String>>,
+    pub dropped: Vec<LlmEntryName>,
+}
+
+/// Build every LLM client a config implies, concurrently: each entry's
+/// default model AND each of its `model_candidates`. Failure policy: a
+/// **default** entry whose default model fails to build is a hard error (the
+/// pool would be unusable); any other build failure (a non-default entry, or
+/// any candidate) is dropped with a `warn!`. Only models that actually built
+/// a client are pinnable, so `entry_models` lists just those.
 pub(crate) async fn build_pool_clients(
     config: &BayboConfig,
     registry: &LlmProviderRegistry,
     blob: Arc<dyn BlobStore>,
     vault: Arc<SecretVault>,
     cost_manager: &Arc<CostManager>,
-) -> anyhow::Result<(HashMap<LlmEntryName, Arc<BillableLlm>>, Vec<LlmEntryName>)> {
+) -> anyhow::Result<BuiltPoolClients> {
     let proxy = boot::proxy_settings(config);
-    let results = futures::future::join_all(config.llm.iter().map(|entry| {
+
+    // One build job per (entry, model). `is_default` marks the entry's
+    // primary model (goes into `clients`); the rest are candidates
+    // (`overrides`). Candidates equal to the default model are skipped —
+    // the default client already covers them.
+    struct Job<'a> {
+        entry: &'a baybo_config::LlmEntry,
+        model: String,
+        is_default: bool,
+    }
+    let jobs: Vec<Job<'_>> = config
+        .llm
+        .iter()
+        .flat_map(|entry| {
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(entry.model.clone());
+            let default = Job {
+                entry,
+                model: entry.model.clone(),
+                is_default: true,
+            };
+            let candidates = entry
+                .model_candidates
+                .iter()
+                .filter(move |m| seen.insert((*m).clone()))
+                .map(move |m| Job {
+                    entry,
+                    model: m.clone(),
+                    is_default: false,
+                });
+            std::iter::once(default).chain(candidates)
+        })
+        .collect();
+
+    let results = futures::future::join_all(jobs.into_iter().map(|job| {
         let blob = blob.clone();
         let vault = Arc::clone(&vault);
         let billing = cost_hooks(cost_manager);
         let proxy = proxy.clone();
         async move {
-            let r = boot::build_llm_client_for_entry(
-                entry,
+            let r = boot::build_llm_client_for_entry_model(
+                job.entry,
+                &job.model,
                 registry,
                 Some(blob),
                 Some(vault),
@@ -57,19 +104,25 @@ pub(crate) async fn build_pool_clients(
                 proxy,
             )
             .await;
-            (entry.name.clone(), r)
+            (job.entry.name.clone(), job.model, job.is_default, r)
         }
     }))
     .await;
 
     let mut clients = HashMap::new();
+    let mut overrides = HashMap::new();
+    let mut candidate_ok: Vec<(LlmEntryName, String)> = Vec::new();
     let mut dropped = Vec::new();
-    for (name, result) in results {
-        match result {
-            Ok(client) => {
+    for (name, model, is_default, result) in results {
+        match (result, is_default) {
+            (Ok(client), true) => {
                 clients.insert(name, client);
             }
-            Err(e) => {
+            (Ok(client), false) => {
+                overrides.insert((name.clone(), model.clone()), client);
+                candidate_ok.push((name, model));
+            }
+            (Err(e), true) => {
                 if name == config.default_llm {
                     return Err(e);
                 }
@@ -80,19 +133,56 @@ pub(crate) async fn build_pool_clients(
                 );
                 dropped.push(name);
             }
+            (Err(e), false) => {
+                warn!(
+                    entry = %name,
+                    model = %model,
+                    error = %e,
+                    "failed to build LLM client for candidate model; it is unpickable until resolved"
+                );
+            }
         }
     }
-    Ok((clients, dropped))
+
+    // A candidate is only pinnable if its entry's default client also built.
+    // `entry_models[name] = [default] + surviving candidates`, in config order.
+    let mut entry_models: HashMap<LlmEntryName, Vec<String>> = HashMap::new();
+    for entry in &config.llm {
+        if let Some(client) = clients.get(&entry.name) {
+            let mut models = vec![client.model_info().id.clone()];
+            for candidate in &entry.model_candidates {
+                if candidate != &entry.model
+                    && candidate_ok
+                        .iter()
+                        .any(|(n, m)| n == &entry.name && m == candidate)
+                {
+                    models.push(candidate.clone());
+                }
+            }
+            entry_models.insert(entry.name.clone(), models);
+        } else {
+            // Entry's default failed → drop any candidates that built for it.
+            overrides.retain(|(n, _), _| n != &entry.name);
+        }
+    }
+
+    Ok(BuiltPoolClients {
+        clients,
+        overrides,
+        entry_models,
+        dropped,
+    })
 }
 
-/// Pricing overlay (`model id → pricing`) harvested from built clients,
-/// keyed by `model_info.id` to match the cost lookup in
-/// `baybo_agent`'s `billed_chat`.
-pub(crate) fn pricing_overlay(
-    clients: &HashMap<LlmEntryName, Arc<BillableLlm>>,
-) -> HashMap<String, ModelPricing> {
-    clients
+/// Pricing overlay (`model id → pricing`) harvested from every built client
+/// — default AND candidate — keyed by `model_info.id` to match the cost
+/// lookup in `baybo_agent`'s `billed_chat`, so a pinned candidate model bills
+/// correctly too.
+pub(crate) fn pricing_overlay(built: &BuiltPoolClients) -> HashMap<String, ModelPricing> {
+    built
+        .clients
         .values()
+        .chain(built.overrides.values())
         .map(|c| {
             let info = c.model_info();
             (info.id.clone(), info.pricing)
@@ -205,7 +295,7 @@ impl LlmReloader {
     /// reload if the default entry fails to build.
     async fn prepare(&self, new: &BayboConfig) -> Result<PreparedLlm, String> {
         let registry = LlmProviderRegistry::with_default_providers();
-        let (clients, dropped) = build_pool_clients(
+        let built = build_pool_clients(
             new,
             &registry,
             Arc::clone(&self.blob),
@@ -214,9 +304,12 @@ impl LlmReloader {
         )
         .await
         .map_err(|e| e.to_string())?;
-        let overlay = pricing_overlay(&clients);
-        let pool = LlmClientPool::with_tier_map(
-            clients,
+        let overlay = pricing_overlay(&built);
+        let dropped = built.dropped.clone();
+        let pool = LlmClientPool::with_candidates(
+            built.clients,
+            built.overrides,
+            built.entry_models,
             new.default_llm.clone(),
             new.agent.model_tiers.clone(),
         )?;
