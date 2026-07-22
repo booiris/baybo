@@ -550,7 +550,27 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   per-turn collapsible work block ("思考中" card → "思考了 Xs ›"); answer text
   interrupted by more work settles into the block as a prose step. Markdown
   links post `openUrl` to native (system browser) — an in-webview navigation
-  would replace the thread.
+  would replace the thread. **LaTeX math** renders via `remark-math` +
+  `rehype-katex` + `katex` (CSS/fonts bundled by Vite, served by the transcript
+  scheme handler — no CDN), preprocessed by `normalizeMath`
+  (`web/src/mathDelimiters.ts`): `\(..\)`/`\[..\]` are rewritten to dollars in
+  the raw source (CommonMark eats the backslashes before any remark plugin
+  runs); a whole-line column-0 `$$..$$` is promoted to its own lines so it
+  renders as a centered DISPLAY block (NOT via `\n\n` injection — that fractures
+  a list/table/blockquote holding display math), while an embedded `$$` stays
+  inline; and `guardDollars` (a linear pandoc-style pairing scanner) escapes any
+  `$` that is not part of a valid inline math span — a `$...$` is math only if a
+  valid CLOSER exists (not after whitespace, not before a digit), which is the
+  "Balanced" `$` policy: `$x$`, `$3.14$`, `$2 + 2 = 4$` render, but prose money
+  "$5 and $3" / "$12.50" stays literal (a local `$`+digit heuristic was tried and
+  rejected — it destroyed decimal/arithmetic math). Code is masked by a linear
+  line scanner (no ReDoS; any-indent fences so a list-nested fence is caught; an
+  unclosed fence — the mid-stream state — masks to end-of-input). Display math
+  centers when it fits and left-scrolls when it doesn't
+  (`.katex-display > .katex { width: fit-content; margin-inline: auto }`, not
+  `text-align: center` — a centered wide equation clips its own unreachable left
+  edge under `overflow-x`), and `.md { overflow-x: clip }` keeps a wide inline
+  expression from scrolling the whole transcript sideways.
 - **Headless UI verification**: `-baybo-open-home` (DEBUG) lands on the tabbed
   home shell WITHOUT pushing a conversation (seeds a few demo list rows), so
   the menu bar / header / sections screenshot headlessly; add `-baybo-home-tab

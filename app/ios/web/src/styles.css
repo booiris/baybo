@@ -337,6 +337,14 @@ button {
 
 /* Markdown body — monochrome soft-line rendering of the web chat's element
    set (GFM: code, tables, quotes, lists, links). */
+/* Inline math is an atomic, unbreakable box (KaTeX sets `white-space: nowrap` on
+   `.katex .base`), immune to the prose's `overflow-wrap: anywhere`. A long
+   inline expression would otherwise widen the message and scroll the whole
+   transcript sideways (the one hard layout rule). Clip horizontal overflow at
+   the reading edge — such math belongs in a `$$` display block, which has its
+   own scroller. `clip` keeps vertical overflow visible and creates no scroll
+   container, so short inline math (the norm) is untouched. */
+.md { overflow-x: clip; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
 .md p, .md ul, .md ol, .md pre, .md blockquote, .md-table-wrap { margin: var(--md-block-gap) 0; }
@@ -477,6 +485,34 @@ button {
   border-radius: var(--radius-pill);
   background: var(--color-line-strong);
 }
+
+/* Math (remark-math + rehype-katex -> KaTeX). KaTeX draws in `currentColor`, so
+   it inherits the ink for free (no dark-mode fork; this app is light-only). It
+   sets `white-space: nowrap` on `.katex .base`, so the prose's
+   `overflow-wrap: anywhere` can't shatter an expression mid-token. Nudge the
+   size down a hair from KaTeX's 1.21em default — that reads oversized against
+   the narrow phone reading band. */
+.md .katex { font-size: 1.05em; }
+/* A display equation can be wider than the reading band, so it gets its own
+   horizontal scroller (scrolls in place instead of pushing the page). Centering
+   is via `fit-content` + `auto` inline margins, NOT `text-align: center`: a
+   centered nowrap equation wider than its container spills past BOTH edges, and
+   WebKit's scrollLeft can't go negative, so its left half would be clipped and
+   unreachable. With `fit-content`, a narrow equation shrinks to its content and
+   the auto margins center it; a wide one exceeds the container so the auto
+   margins collapse to 0, pinning its start edge at scrollLeft 0 (left reachable)
+   while it scrolls to the right. Center when it fits, left-scroll when it doesn't. */
+.md .katex-display {
+  margin: var(--md-block-gap) 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+.md .katex-display > .katex {
+  width: fit-content;
+  margin-inline: auto;
+}
+.md .katex-display::-webkit-scrollbar { display: none; }
 
 /* The turn's work block (thinking trace + tool progress). Active: a soft card
    with a spinner header; closed: a dim tappable "Worked Xs ›" summary.

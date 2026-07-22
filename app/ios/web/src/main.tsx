@@ -8,6 +8,11 @@ import "@fontsource/space-mono/latin-ext-400.css";
 import "@fontsource/space-mono/latin-700.css";
 import "@fontsource/space-mono/latin-ext-700.css";
 import "@fontsource-variable/inter";
+// KaTeX math styling + its self-hosted math fonts. Vite emits the referenced
+// woff2 into the bundle and the transcript scheme handler serves them like every
+// other asset — no CDN, so math renders offline. Imported before styles.css so
+// our `.md .katex-*` overrides win the cascade.
+import "katex/dist/katex.min.css";
 import i18n from "./i18n";
 import "./styles.css";
 import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady } from "./bridge";

@@ -148,6 +148,10 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         case "css": return "text/css"
         case "woff2": return "font/woff2"
         case "woff": return "font/woff"
+        // KaTeX ships woff2/woff/ttf per face; iOS always wins on woff2, but a
+        // served .ttf/.otf still deserves a real font MIME, not octet-stream.
+        case "ttf": return "font/ttf"
+        case "otf": return "font/otf"
         case "svg": return "image/svg+xml"
         case "png": return "image/png"
         case "jpg", "jpeg": return "image/jpeg"

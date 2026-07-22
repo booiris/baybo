@@ -1,11 +1,21 @@
 import { memo, useCallback, useEffect, useRef, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import { openUrl } from "./bridge";
+import { normalizeMath } from "./mathDelimiters";
 
-// GFM only (tables, strikethrough, autolinks) — same plugin set as the web
-// chat. No raw-HTML rendering (react-markdown default), so no sanitizer needed.
-const REMARK_PLUGINS = [remarkGfm];
+// GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
+// `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
+// rewritten to dollars in `normalizeMathDelimiters` before parse. The source is
+// never raw HTML (react-markdown default), so no sanitizer is needed.
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+// `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
+// `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
+// expression, renders the offending source in place rather than throwing — a
+// bad `$...$` must never blank the whole message.
+const REHYPE_PLUGINS = [rehypeKatex];
 
 // Floor on the indicator thumb so a very wide table (its window a tiny fraction
 // of the content) still shows a grabbable-looking bar rather than an invisible
@@ -121,8 +131,12 @@ const COMPONENTS: Components = {
 export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   return (
     <div className="md">
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
-        {text}
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={COMPONENTS}
+      >
+        {normalizeMath(text)}
       </ReactMarkdown>
     </div>
   );

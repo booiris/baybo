@@ -475,6 +475,29 @@
                     | Coverage | 87% |
 
                     See the [module index](https://example.com/docs).
+
+                    ## Math rendering
+
+                    Inline math like \\(E = mc^2\\) and $a^2 + b^2 = c^2$ sit in the
+                    prose, while a display block stands on its own:
+
+                    $$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$$
+
+                    A narrow equation centers; a very wide one scrolls in place (left edge reachable) instead of the page:
+
+                    $$e^{i\\pi} + 1 = 0$$
+
+                    $$\\hat{H}\\psi = \\left(-\\frac{\\hbar^2}{2m}\\nabla^2 + V(\\mathbf{r})\\right)\\psi = \\sum_{n=0}^{\\infty} c_n \\phi_n e^{-iE_n t/\\hbar} = i\\hbar\\frac{\\partial \\psi}{\\partial t} = E\\psi \\quad\\text{for all}\\quad \\psi \\in \\mathcal{H}$$
+
+                    Numbered steps keep their structure around display math:
+
+                    1. Start from \\(a^2 + b^2 = c^2\\).
+                    2. The closed form is $$c = \\sqrt{a^2 + b^2}$$
+                    3. Done.
+
+                    Arithmetic like $2 + 2 = 4$ and a decimal $3.14$ still render as
+                    math, while prose money stays literal — it costs $5 today, was
+                    $12.50 last week. A dollar sign in `code like $PATH` stays literal too.
                     """
                 for chunk in Self.chunked(answer, size: 14) {
                     pushDemo(["kind": "answer_delta", "text": chunk])
