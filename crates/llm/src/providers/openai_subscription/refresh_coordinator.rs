@@ -50,9 +50,10 @@ const CACHE_VAULT_REVALIDATE_INTERVAL_SECS: i64 = 60;
 const REFRESH_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 const REFRESH_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Whether to spawn the periodic background-refresh task on construction.
-/// Production wiring uses `Enabled`; unit tests use `Disabled` so the
-/// suite doesn't leak spawned tasks.
+/// Whether this client is long-lived enough to justify a periodic
+/// background-refresh task. `create()` builds long-lived pool clients
+/// (`Enabled`); one-shot users — `live_models()`'s throwaway probe, and
+/// unit tests — pass `Disabled` so no task outlives the call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundRefresh {
     Enabled,
