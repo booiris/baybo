@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
-use baybo_store::secret::{Result, SecretStore};
+use baybo_store::secret::{Result, SecretStore, StoreIdentity};
 
 pub struct SqliteSecretStore {
     pool: SqlitePool,
@@ -68,6 +68,10 @@ impl SecretStore for SqliteSecretStore {
                 Ok(())
             })
             .await
+    }
+
+    fn identity(&self) -> StoreIdentity {
+        self.pool.identity()
     }
 }
 

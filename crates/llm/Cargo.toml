@@ -21,6 +21,7 @@ test-support = []
 [dependencies]
 baybo-model = { workspace = true }
 baybo-security = { workspace = true }
+baybo-store = { workspace = true }
 parking_lot = { workspace = true }
 rig = { workspace = true }
 async-trait = { workspace = true }
@@ -42,5 +43,5 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 baybo-security = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
 baybo-storage = { workspace = true, features = ["test-support"] }
-baybo-store = { workspace = true }

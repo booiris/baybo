@@ -2,7 +2,7 @@
 
 use super::{
     OpenAiSubscriptionCompletionModel, PROVIDER_NAME, VaultTokenStore,
-    completion_model::BackgroundRefresh,
+    refresh_coordinator::BackgroundRefresh,
 };
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo, ModelPricing};

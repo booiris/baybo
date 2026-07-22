@@ -3,10 +3,52 @@
 use std::sync::Arc;
 
 use baybo_security::SecretVault;
+use baybo_store::StoreIdentity;
 
 use super::VAULT_KEY_TOKENS;
 use super::token_bundle::OAuthTokenBundle;
 use crate::{LlmError, Result};
+
+/// Identity of the credential a [`VaultTokenStore`] reads and writes: which
+/// secret store, which entry inside it. Two stores with equal keys are two
+/// handles on ONE OAuth bundle and so MUST share refresh state — that is
+/// what makes the spec's process-wide single-flight guarantee hold across
+/// every client built from the same credential.
+///
+/// Keyed on the STORE, not on the vault handle: two `SecretVault` instances
+/// over one database are two views of the same credential, and keying on
+/// the handle would hand them separate coordinators — reinstating the race
+/// this type exists to prevent. It also gives cross-process coordination a
+/// filesystem anchor (see `StoreIdentity::file_path`).
+///
+/// `vault_key` is [`VAULT_KEY_TOKENS`] for every store today (single profile
+/// per process). It is a field rather than an implied constant so the
+/// deferred multi-profile work shards the coordinator map by construction
+/// instead of needing a redesign.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct CredentialKey {
+    store: StoreIdentity,
+    vault_key: &'static str,
+}
+
+impl CredentialKey {
+    /// Filesystem anchor for cross-process locking, when the credential has
+    /// one. In-memory stores return `None` — nothing outside this process
+    /// can reach them.
+    pub(super) fn lock_path(&self) -> Option<std::path::PathBuf> {
+        let store = self.store.file_path()?;
+        // Resolve here rather than trusting the identity: it may have been
+        // minted before the store file existed (so only its parent could be
+        // canonicalized), and two processes that reached the same store
+        // through different symlinks must still name ONE lock file.
+        let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_path_buf());
+        let mut name = store.file_name().unwrap_or_default().to_os_string();
+        name.push(".");
+        name.push(self.vault_key);
+        name.push(".refresh.lock");
+        Some(store.with_file_name(name))
+    }
+}
 
 #[derive(Clone)]
 pub struct VaultTokenStore {
@@ -16,6 +58,13 @@ pub struct VaultTokenStore {
 impl VaultTokenStore {
     pub fn new(vault: Arc<SecretVault>) -> Self {
         Self { vault }
+    }
+
+    pub(super) fn credential_key(&self) -> CredentialKey {
+        CredentialKey {
+            store: self.vault.store_identity(),
+            vault_key: VAULT_KEY_TOKENS,
+        }
     }
 
     pub async fn load(&self) -> Result<Option<OAuthTokenBundle>> {

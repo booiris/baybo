@@ -14,10 +14,10 @@ use rig::completion::message::{
 use rig::completion::{self, CompletionError, CompletionRequest};
 use rig::message::Message;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::oauth::{ORIGINATOR, RefreshError, refresh};
+use super::oauth::ORIGINATOR;
+use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
 use super::token_bundle::OAuthTokenBundle;
 use super::token_store::VaultTokenStore;
 use crate::tool_name::{sanitize_tool_name, unsanitize_tool_name};
@@ -25,50 +25,6 @@ use crate::{LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/codex/responses";
-
-/// Just-in-time refresh skew. Safety net for the window where the
-/// background loop hasn't ticked yet.
-const REFRESH_SKEW_SECS: i64 = 60;
-/// Background refresh cadence — long enough to avoid spinning the
-/// refresh-token rotation counter, short enough to keep the cache warm.
-const BACKGROUND_REFRESH_INTERVAL_SECS: u64 = 3600;
-/// Wider margin for the background loop so it acts before the JIT path
-/// has to.
-const BACKGROUND_REFRESH_MARGIN_SECS: i64 = 300;
-
-/// A rotated refresh_token must hit the disk; if it doesn't, a process
-/// restart reads the burned old token and forces re-login. Retry hard
-/// before falling back to the in-memory dirty state.
-const VAULT_SAVE_RETRY_ATTEMPTS: usize = 3;
-const VAULT_SAVE_RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
-
-/// Cache-hit path re-validates the vault every N seconds so a
-/// cross-process logout is honoured within that window. Within the
-/// window, hot-path requests skip the vault read entirely.
-const CACHE_VAULT_REVALIDATE_INTERVAL_SECS: i64 = 60;
-
-/// Whether to spawn the periodic background-refresh task on construction.
-/// Production wiring uses `Enabled`; unit tests use `Disabled` so the
-/// suite doesn't leak spawned tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundRefresh {
-    Enabled,
-    Disabled,
-}
-
-#[derive(Clone, Debug)]
-struct CachedBundle {
-    /// Wrapped in Arc so the hot-path read returns a refcount bump
-    /// instead of cloning ~2 KiB of JWT material per chat request.
-    bundle: Arc<OAuthTokenBundle>,
-    /// `false` = a prior vault save failed; the next refresh-path entry
-    /// retries the save before doing anything else.
-    persisted: bool,
-    /// Last time we re-read the vault. `0` = never. Folded in here (not
-    /// a separate atomic) so cache state and revalidation timestamp
-    /// can't disagree.
-    last_vault_check: i64,
-}
 
 #[derive(Clone)]
 pub struct OpenAiSubscriptionCompletionModel {
@@ -78,14 +34,15 @@ pub struct OpenAiSubscriptionCompletionModel {
     /// model accepts. `None` = reasoning off. Resolved once at
     /// construction time so every request body shares the same value.
     reasoning_effort: Option<&'static str>,
+    /// Request transport for `<base_url>/codex/*`. NOT the refresh client —
+    /// refresh lives on the coordinator and targets the OAuth issuer.
     http: reqwest::Client,
-    token_store: VaultTokenStore,
-    cache: Arc<Mutex<Option<CachedBundle>>>,
-    /// Single-flight gate for refresh ops. Without it, two concurrent
-    /// callers would both call `refresh()` with the same refresh_token
-    /// and one would hit `refresh_token_reused` → vault cleared → user
-    /// logged out under nothing but normal load.
-    refresh_flight: Arc<Mutex<()>>,
+    /// Shared per-credential refresh state. Every client built from the
+    /// same vault credential — the entry's default model, each
+    /// `model_candidates` model, every hot-reload generation, every admin
+    /// probe — resolves to the SAME coordinator, which is what makes the
+    /// single-flight gate process-wide as the spec requires.
+    refresh: Arc<RefreshCoordinator>,
 }
 
 impl OpenAiSubscriptionCompletionModel {
@@ -99,24 +56,13 @@ impl OpenAiSubscriptionCompletionModel {
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let reasoning_effort = super::reasoning::resolve_effort(&model, reasoning_effort);
-        let model = Self {
+        Self {
             model,
             base_url,
             reasoning_effort,
-            http: http.clone(),
-            token_store: token_store.clone(),
-            cache: Arc::new(Mutex::new(None)),
-            refresh_flight: Arc::new(Mutex::new(())),
-        };
-        if background == BackgroundRefresh::Enabled {
-            spawn_background_refresh_loop(
-                token_store,
-                Arc::clone(&model.cache),
-                Arc::clone(&model.refresh_flight),
-                http,
-            );
+            refresh: RefreshCoordinator::shared(token_store, http.clone(), background),
+            http,
         }
-        model
     }
 
     pub fn base_url_is_default(&self) -> bool {
@@ -220,6 +166,7 @@ impl OpenAiSubscriptionCompletionModel {
                 CompletionError::RequestError(err)
             })?;
         let bundle = self
+            .refresh
             .ensure_fresh_bundle()
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
@@ -233,6 +180,7 @@ impl OpenAiSubscriptionCompletionModel {
                 "Codex returned 401 — refreshing token and retrying once"
             );
             let refreshed = self
+                .refresh
                 .force_refresh(&bundle)
                 .await
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
@@ -254,58 +202,6 @@ impl OpenAiSubscriptionCompletionModel {
         Ok(self.adapt_response(response))
     }
 
-    async fn ensure_fresh_bundle(&self) -> crate::Result<Arc<OAuthTokenBundle>> {
-        let now = chrono::Utc::now().timestamp();
-        // Hot path: cache hit, fresh, and we read the vault recently.
-        if let Some(cached) = self.cache.lock().await.as_ref()
-            && !cached.bundle.is_near_expiry(REFRESH_SKEW_SECS)
-            && now - cached.last_vault_check < CACHE_VAULT_REVALIDATE_INTERVAL_SECS
-        {
-            return Ok(Arc::clone(&cached.bundle));
-        }
-
-        // Past the revalidate window OR cache miss OR near-expiry: read
-        // the vault. Covers cross-process logout, cross-process refresh,
-        // and fresh process startup uniformly.
-        let from_vault = self.token_store.load().await?;
-        let candidate = match from_vault {
-            Some(b) => b,
-            None => {
-                let had_cache = self.cache.lock().await.take().is_some();
-                if had_cache {
-                    tracing::info!(
-                        event = "openai_subscription_cache_invalidated",
-                        outcome = "vault_empty",
-                        "vault entry disappeared (cross-process logout?); dropped in-memory bundle"
-                    );
-                }
-                return Err(LlmError::Config(
-                    "openai-subscription: not signed in — add an entry via \
-                     `baybo llm add` (pick the openai-subscription provider) or \
-                     re-authenticate an existing entry via `baybo llm edit`"
-                        .into(),
-                ));
-            }
-        };
-        if !candidate.is_near_expiry(REFRESH_SKEW_SECS) {
-            let bundle = Arc::new(candidate);
-            *self.cache.lock().await = Some(CachedBundle {
-                bundle: Arc::clone(&bundle),
-                persisted: true,
-                last_vault_check: now,
-            });
-            return Ok(bundle);
-        }
-        do_single_flight_refresh(
-            &self.refresh_flight,
-            &self.cache,
-            &self.token_store,
-            &candidate.refresh_token,
-            &self.http,
-        )
-        .await
-    }
-
     /// Live model discovery against `<base>/codex/models`.
     pub async fn list_remote_models(&self) -> crate::Result<Vec<crate::LiveModelInfo>> {
         let url = format!(
@@ -313,10 +209,10 @@ impl OpenAiSubscriptionCompletionModel {
             self.base_url,
             env!("CARGO_PKG_VERSION")
         );
-        let bundle = self.ensure_fresh_bundle().await?;
+        let bundle = self.refresh.ensure_fresh_bundle().await?;
         let resp = self.send_models_get(&url, &bundle).await?;
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let refreshed = self.force_refresh(&bundle).await?;
+            let refreshed = self.refresh.force_refresh(&bundle).await?;
             self.send_models_get(&url, &refreshed).await?
         } else {
             resp
@@ -341,20 +237,6 @@ impl OpenAiSubscriptionCompletionModel {
             .send()
             .await
             .map_err(|e| crate::reqwest_to_error(e, "openai-subscription: GET /codex/models"))
-    }
-
-    async fn force_refresh(
-        &self,
-        current: &OAuthTokenBundle,
-    ) -> crate::Result<Arc<OAuthTokenBundle>> {
-        do_single_flight_refresh(
-            &self.refresh_flight,
-            &self.cache,
-            &self.token_store,
-            &current.refresh_token,
-            &self.http,
-        )
-        .await
     }
 
     /// Apply the bearer + originator + (optional) account-id headers
@@ -1040,246 +922,6 @@ fn emit_function_call(
     })));
 }
 
-/// Pure refresh-policy function — unit-testable without a tokio runtime.
-/// `Refresh(bundle)` carries the bundle so callers don't need a separate
-/// `.expect("decision implies Some")` after matching.
-#[derive(Debug, PartialEq, Eq)]
-enum RefreshDecision {
-    Skip,
-    Refresh(OAuthTokenBundle),
-    NotSignedIn,
-}
-
-fn decide_refresh(bundle: Option<OAuthTokenBundle>, margin_secs: i64) -> RefreshDecision {
-    match bundle {
-        None => RefreshDecision::NotSignedIn,
-        Some(b) if b.is_near_expiry(margin_secs) => RefreshDecision::Refresh(b),
-        Some(_) => RefreshDecision::Skip,
-    }
-}
-
-/// Single-flight refresh. Every refresh path (JIT, reactive 401,
-/// background) funnels through here.
-///
-/// 1. Take the flight mutex (serialises refreshes).
-/// 2. Self-heal a previously-dirty vault save. If we can't, refuse to
-///    rotate again — chained unsaved bundles all evaporate on restart.
-/// 3. Dedup: if the cache has rotated under us, reuse it.
-/// 4. `refresh()` the token, persist with retries; on persist failure
-///    keep usable in-memory but flag dirty for self-heal next time.
-/// 5. Permanent refresh failures clear the vault entry and surface as
-///    `LlmError::Config` so the caller's error reads "re-login required".
-async fn do_single_flight_refresh(
-    refresh_flight: &Mutex<()>,
-    cache: &Mutex<Option<CachedBundle>>,
-    token_store: &VaultTokenStore,
-    expected_refresh_token: &str,
-    http: &reqwest::Client,
-) -> crate::Result<Arc<OAuthTokenBundle>> {
-    let _flight_guard = refresh_flight.lock().await;
-    let now = chrono::Utc::now().timestamp();
-
-    // Self-heal pass.
-    {
-        let mut guard = cache.lock().await;
-        if let Some(cached) = guard.as_mut()
-            && !cached.persisted
-        {
-            match save_with_retries(token_store, &cached.bundle).await {
-                Ok(()) => {
-                    cached.persisted = true;
-                    tracing::info!(
-                        event = "openai_subscription_refresh",
-                        outcome = "dirty_save_recovered",
-                        "previously-failed vault save succeeded on retry"
-                    );
-                }
-                Err(e) => {
-                    return Err(LlmError::Internal(anyhow::anyhow!(
-                        "openai-subscription: vault save still failing for previously \
-                         rotated token; refusing to rotate again until disk recovers ({e})"
-                    )));
-                }
-            }
-        }
-    }
-
-    // Dedup re-check.
-    if let Some(cached) = cache.lock().await.as_ref()
-        && cached.bundle.refresh_token != expected_refresh_token
-    {
-        tracing::debug!(
-            event = "openai_subscription_refresh",
-            outcome = "deduped",
-            "refresh: another caller already rotated the token; reusing"
-        );
-        return Ok(Arc::clone(&cached.bundle));
-    }
-
-    let refreshed = match refresh(expected_refresh_token, http).await {
-        Ok(b) => b,
-        Err(RefreshError::Permanent(msg)) => {
-            token_store.clear().await.ok();
-            *cache.lock().await = None;
-            return Err(LlmError::Config(format!(
-                "openai-subscription: refresh token expired/revoked — re-login required ({msg})"
-            )));
-        }
-        Err(RefreshError::Transient(msg)) => {
-            return Err(LlmError::Transient(format!(
-                "openai-subscription: token refresh transient: {msg}"
-            )));
-        }
-    };
-    let persisted = match save_with_retries(token_store, &refreshed).await {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::error!(
-                event = "openai_subscription_refresh",
-                outcome = "persistence_degraded",
-                error = %e,
-                "rotated token couldn't be persisted after {VAULT_SAVE_RETRY_ATTEMPTS} retries; \
-                 in-memory cache is the only copy. Process restart before recovery forces re-login."
-            );
-            false
-        }
-    };
-    let bundle = Arc::new(refreshed);
-    *cache.lock().await = Some(CachedBundle {
-        bundle: Arc::clone(&bundle),
-        persisted,
-        last_vault_check: now,
-    });
-    Ok(bundle)
-}
-
-/// Retry vault save with bounded exponential backoff. The backoff
-/// schedule is small ({100ms, 500ms, 2s}) — vault writes hit local
-/// sqlite, so any failure is either "disk is genuinely broken" (retry
-/// won't help much) or "transient FS glitch" (retry will succeed
-/// quickly). Three attempts is the sweet spot.
-async fn save_with_retries(
-    token_store: &VaultTokenStore,
-    bundle: &OAuthTokenBundle,
-) -> crate::Result<()> {
-    let mut last_err = None;
-    for (attempt, backoff_ms) in VAULT_SAVE_RETRY_BACKOFF_MS
-        .iter()
-        .copied()
-        .enumerate()
-        .take(VAULT_SAVE_RETRY_ATTEMPTS)
-    {
-        match token_store.save(bundle).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    event = "openai_subscription_vault_save",
-                    outcome = "retry",
-                    attempt = attempt + 1,
-                    of = VAULT_SAVE_RETRY_ATTEMPTS,
-                    error = %e,
-                    "vault save failed; will retry in {backoff_ms}ms"
-                );
-                last_err = Some(e);
-                if attempt + 1 < VAULT_SAVE_RETRY_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                }
-            }
-        }
-    }
-    Err(last_err
-        .unwrap_or_else(|| LlmError::Internal(anyhow::anyhow!("vault save: no attempt was made"))))
-}
-
-/// One task per provider instance — clones share the same cache. Exits
-/// quietly on logout or permanent refresh failure; transient errors
-/// just log and retry next tick.
-fn spawn_background_refresh_loop(
-    token_store: VaultTokenStore,
-    cache: Arc<Mutex<Option<CachedBundle>>>,
-    refresh_flight: Arc<Mutex<()>>,
-    http: reqwest::Client,
-) {
-    use std::time::Duration;
-
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(BACKGROUND_REFRESH_INTERVAL_SECS);
-        loop {
-            // Snapshot bundle from cache, falling back to vault when the
-            // cache is empty (covers the case where CLI login populated
-            // vault after we spawned but no chat request has run yet).
-            let snapshot = { cache.lock().await.as_ref().map(|c| (*c.bundle).clone()) };
-            let bundle = match snapshot {
-                Some(b) => Some(b),
-                None => match token_store.load().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "openai_subscription_background_refresh",
-                            outcome = "vault_load_error",
-                            error = %e,
-                            "background refresh: vault load failed; will retry next interval"
-                        );
-                        tokio::time::sleep(interval).await;
-                        continue;
-                    }
-                },
-            };
-
-            match decide_refresh(bundle, BACKGROUND_REFRESH_MARGIN_SECS) {
-                RefreshDecision::Skip => {}
-                RefreshDecision::NotSignedIn => {
-                    tracing::info!(
-                        event = "openai_subscription_background_refresh",
-                        outcome = "exit_not_signed_in",
-                        "background refresh: no token in vault; exiting loop"
-                    );
-                    return;
-                }
-                RefreshDecision::Refresh(b) => {
-                    match do_single_flight_refresh(
-                        &refresh_flight,
-                        &cache,
-                        &token_store,
-                        &b.refresh_token,
-                        &http,
-                    )
-                    .await
-                    {
-                        Ok(_) => tracing::debug!(
-                            event = "openai_subscription_background_refresh",
-                            outcome = "success",
-                            "background refresh: token rotated (or reused after concurrent \
-                             refresh)"
-                        ),
-                        Err(LlmError::Config(msg)) => {
-                            // Permanent: single_flight_refresh already cleared the
-                            // vault and surfaced as Config. Exit; next sign-in
-                            // spawns a fresh loop.
-                            tracing::warn!(
-                                event = "openai_subscription_background_refresh",
-                                outcome = "permanent_failure_exit",
-                                error = %msg,
-                                "background refresh: permanently failed; exiting loop"
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                event = "openai_subscription_background_refresh",
-                                outcome = "transient_failure",
-                                error = %e,
-                                "background refresh: transient failure; will retry next interval"
-                            );
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(interval).await;
-        }
-    });
-}
-
 impl LlmStream {
     pub(crate) fn from_inner(
         inner: Pin<Box<dyn Stream<Item = crate::Result<StreamEvent>> + Send>>,
@@ -1583,322 +1225,6 @@ mod tests {
             }
             other => panic!("expected Usage, got {other:?}"),
         }
-    }
-
-    fn sample_bundle(now: i64, expires_at: i64) -> OAuthTokenBundle {
-        OAuthTokenBundle {
-            access_token: "a".into(),
-            refresh_token: "r".into(),
-            id_token: "i".into(),
-            account_id: None,
-            expires_at,
-            obtained_at: now,
-        }
-    }
-
-    #[test]
-    fn decide_refresh_skips_when_bundle_is_fresh() {
-        let now = chrono::Utc::now().timestamp();
-        let bundle = sample_bundle(now, now + 7200); // 2h out
-        assert_eq!(
-            decide_refresh(Some(bundle), BACKGROUND_REFRESH_MARGIN_SECS),
-            RefreshDecision::Skip
-        );
-    }
-
-    #[test]
-    fn decide_refresh_triggers_inside_margin() {
-        let now = chrono::Utc::now().timestamp();
-        let bundle = sample_bundle(now, now + 120); // 2 min out, inside 5 min margin
-        let expected = bundle.clone();
-        assert_eq!(
-            decide_refresh(Some(bundle), BACKGROUND_REFRESH_MARGIN_SECS),
-            RefreshDecision::Refresh(expected)
-        );
-    }
-
-    #[test]
-    fn decide_refresh_treats_missing_bundle_as_not_signed_in() {
-        assert_eq!(
-            decide_refresh(None, BACKGROUND_REFRESH_MARGIN_SECS),
-            RefreshDecision::NotSignedIn
-        );
-    }
-
-    /// SecretStore adapter that fails the first N stores, then succeeds.
-    /// Drives the "vault is broken right now" branch of the durable-save path.
-    struct FailingStoreNTimes {
-        inner: baybo_security::test_support::MemorySecretStore,
-        fails_remaining: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl baybo_store::SecretStore for FailingStoreNTimes {
-        async fn store(
-            &self,
-            name: &str,
-            encrypted_value: &[u8],
-        ) -> std::result::Result<(), baybo_store::StorageError> {
-            if self
-                .fails_remaining
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-                > 0
-            {
-                return Err(baybo_store::StorageError::Storage(
-                    "simulated vault failure".into(),
-                ));
-            }
-            self.inner.store(name, encrypted_value).await
-        }
-        async fn retrieve(
-            &self,
-            name: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, baybo_store::StorageError> {
-            self.inner.retrieve(name).await
-        }
-        async fn delete(&self, name: &str) -> std::result::Result<(), baybo_store::StorageError> {
-            self.inner.delete(name).await
-        }
-        async fn list(&self) -> std::result::Result<Vec<String>, baybo_store::StorageError> {
-            self.inner.list().await
-        }
-    }
-
-    fn vault_with_failing_store(
-        initial_fails: usize,
-    ) -> (VaultTokenStore, std::sync::Arc<FailingStoreNTimes>) {
-        use baybo_security::{EncryptionKey, SecretVault};
-        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
-        let store = std::sync::Arc::new(FailingStoreNTimes {
-            inner: baybo_security::test_support::MemorySecretStore::new(),
-            fails_remaining: std::sync::atomic::AtomicUsize::new(initial_fails),
-        });
-        let vault = std::sync::Arc::new(SecretVault::new(key, store.clone()));
-        (VaultTokenStore::new(vault), store)
-    }
-
-    /// Test helper: build a CachedBundle wrapping the given OAuth bundle.
-    fn cached(bundle: OAuthTokenBundle, persisted: bool) -> CachedBundle {
-        CachedBundle {
-            bundle: Arc::new(bundle),
-            persisted,
-            last_vault_check: chrono::Utc::now().timestamp(),
-        }
-    }
-
-    #[tokio::test]
-    async fn save_with_retries_recovers_within_budget() {
-        let (store, _) = vault_with_failing_store(2); // first 2 fail, 3rd succeeds
-        let bundle = sample_bundle(0, 0);
-        save_with_retries(&store, &bundle)
-            .await
-            .expect("3rd attempt should succeed");
-        assert_eq!(store.load().await.unwrap(), Some(bundle));
-    }
-
-    #[tokio::test]
-    async fn save_with_retries_gives_up_after_budget() {
-        let (store, _) = vault_with_failing_store(usize::MAX); // never succeeds
-        let bundle = sample_bundle(0, 0);
-        let err = save_with_retries(&store, &bundle).await.unwrap_err();
-        assert!(format!("{err}").contains("simulated vault failure"));
-        assert!(store.load().await.unwrap().is_none());
-    }
-
-    /// Pre-fill cache with a dirty bundle whose refresh_token differs
-    /// from what the caller will request — the gate's dedup re-check
-    /// then bails out without touching the network, but only after the
-    /// self-heal step has run. That lets us assert `persisted` flips
-    /// back to true without an HTTP mock.
-    #[tokio::test]
-    async fn single_flight_refresh_self_heals_dirty_save() {
-        let (store, _) = vault_with_failing_store(VAULT_SAVE_RETRY_ATTEMPTS - 1);
-        let now = chrono::Utc::now().timestamp();
-        let bundle = OAuthTokenBundle {
-            access_token: "stale-at".into(),
-            refresh_token: "rotated-rt".into(),
-            id_token: "id".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
-        let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle.clone(), false)));
-        let refresh_flight: Mutex<()> = Mutex::new(());
-        let result = do_single_flight_refresh(
-            &refresh_flight,
-            &cache,
-            &store,
-            "different-rt-from-caller",
-            &reqwest::Client::new(),
-        )
-        .await
-        .expect("self-heal then dedup must succeed");
-        assert_eq!(result.refresh_token, "rotated-rt");
-        let final_state = cache.lock().await.clone().unwrap();
-        assert!(final_state.persisted);
-        assert_eq!(store.load().await.unwrap(), Some(bundle));
-    }
-
-    /// Cache-hit path revalidates the vault every CACHE_VAULT_REVALIDATE_INTERVAL_SECS.
-    /// Past the window, a missing vault entry invalidates the cached bundle
-    /// so a cross-process `baybo llm remove` (which clears the vault entry) is honoured.
-    #[tokio::test]
-    async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
-        use baybo_security::test_support::MemorySecretStore;
-        use baybo_security::{EncryptionKey, SecretVault};
-
-        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
-        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
-        let token_store = VaultTokenStore::new(vault);
-
-        let now = chrono::Utc::now().timestamp();
-        let bundle = OAuthTokenBundle {
-            access_token: "at".into(),
-            refresh_token: "rt".into(),
-            id_token: "it".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
-        token_store.save(&bundle).await.unwrap();
-        let model = OpenAiSubscriptionCompletionModel::new(
-            "gpt-5".into(),
-            None,
-            None,
-            token_store.clone(),
-            reqwest::Client::new(),
-            BackgroundRefresh::Disabled,
-        );
-
-        // Warm cache, then backdate last_vault_check so the next call
-        // crosses the revalidation boundary.
-        let first = model.ensure_fresh_bundle().await.unwrap();
-        assert_eq!(*first, bundle);
-        token_store.clear().await.unwrap();
-        if let Some(c) = model.cache.lock().await.as_mut() {
-            c.last_vault_check = 0;
-        }
-
-        let err = model
-            .ensure_fresh_bundle()
-            .await
-            .expect_err("vault is empty — must surface not-signed-in");
-        match err {
-            LlmError::Config(msg) => assert!(msg.contains("not signed in")),
-            other => panic!("expected Config, got {other:?}"),
-        }
-        assert!(model.cache.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn ensure_fresh_bundle_skips_vault_within_revalidate_interval() {
-        use baybo_security::test_support::MemorySecretStore;
-        use baybo_security::{EncryptionKey, SecretVault};
-
-        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
-        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
-        let token_store = VaultTokenStore::new(vault);
-
-        let now = chrono::Utc::now().timestamp();
-        let bundle = OAuthTokenBundle {
-            access_token: "at".into(),
-            refresh_token: "rt".into(),
-            id_token: "it".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
-        token_store.save(&bundle).await.unwrap();
-        let model = OpenAiSubscriptionCompletionModel::new(
-            "gpt-5".into(),
-            None,
-            None,
-            token_store.clone(),
-            reqwest::Client::new(),
-            BackgroundRefresh::Disabled,
-        );
-        let _ = model.ensure_fresh_bundle().await.unwrap();
-        // Within the window the cache wins; an emptied vault does not
-        // immediately invalidate.
-        token_store.clear().await.unwrap();
-        let second = model.ensure_fresh_bundle().await.unwrap();
-        assert_eq!(*second, bundle);
-    }
-
-    /// Two consecutive dirty-save failures must NOT chain rotations —
-    /// chained unsaved bundles all evaporate on process restart, much
-    /// worse than waiting for the disk to recover.
-    #[tokio::test]
-    async fn single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing() {
-        let (store, _) = vault_with_failing_store(usize::MAX);
-        let now = chrono::Utc::now().timestamp();
-        let bundle = OAuthTokenBundle {
-            access_token: "stale-at".into(),
-            refresh_token: "rotated-rt".into(),
-            id_token: "id".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
-        let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle, false)));
-        let refresh_flight: Mutex<()> = Mutex::new(());
-        let err = do_single_flight_refresh(
-            &refresh_flight,
-            &cache,
-            &store,
-            "different-rt-from-caller",
-            &reqwest::Client::new(),
-        )
-        .await
-        .expect_err("should refuse to rotate while disk is broken");
-        match err {
-            LlmError::Internal(e) => assert!(e.to_string().contains("vault save still failing")),
-            other => panic!("expected Internal, got {other:?}"),
-        }
-    }
-
-    /// Concurrent rotation race: two callers reach the gate with the
-    /// same refresh_token, server rotates it for the first arriver, the
-    /// second would hit `refresh_token_reused` if it called `refresh()`.
-    /// The dedup re-check makes the second caller a no-op instead.
-    /// Tested by pre-filling the cache with the "already-rotated" state
-    /// — the re-check fires before any network call.
-    #[tokio::test]
-    async fn single_flight_refresh_dedups_after_concurrent_rotation() {
-        use baybo_security::test_support::MemorySecretStore;
-        use baybo_security::{EncryptionKey, SecretVault};
-
-        let now = chrono::Utc::now().timestamp();
-        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
-        let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
-        let token_store = VaultTokenStore::new(vault);
-
-        let refresh_flight: Mutex<()> = Mutex::new(());
-        let already_rotated = OAuthTokenBundle {
-            access_token: "new-at".into(),
-            refresh_token: "new-rt".into(),
-            id_token: "new-id".into(),
-            account_id: None,
-            expires_at: now + 7200,
-            obtained_at: now,
-        };
-        let cache: Mutex<Option<CachedBundle>> =
-            Mutex::new(Some(cached(already_rotated.clone(), true)));
-
-        let result = do_single_flight_refresh(
-            &refresh_flight,
-            &cache,
-            &token_store,
-            "old-rt",
-            &reqwest::Client::new(),
-        )
-        .await
-        .expect("dedup path must succeed without a network call");
-        assert_eq!(result.refresh_token, "new-rt");
-        assert_eq!(result.access_token, "new-at");
-        let still_cached = cache.lock().await.clone().unwrap();
-        assert_eq!(*still_cached.bundle, already_rotated);
-        assert!(still_cached.persisted);
     }
 
     #[test]

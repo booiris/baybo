@@ -39,7 +39,7 @@ pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, SessionJobStats};
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
-pub use secret::SecretStore;
+pub use secret::{SecretStore, StoreIdentity};
 pub use session::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
 pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use session_summary::{SessionSummaryRow, SessionSummaryStore};

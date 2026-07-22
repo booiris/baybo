@@ -260,7 +260,20 @@ pub async fn refresh(
     refresh_token: &str,
     client: &reqwest::Client,
 ) -> std::result::Result<OAuthTokenBundle, RefreshError> {
-    let endpoint = format!("{ISSUER}/oauth/token");
+    refresh_at(ISSUER, refresh_token, client).await
+}
+
+/// [`refresh`] against an explicit issuer origin. Production always uses
+/// [`ISSUER`]; the parameter exists so the refresh paths — including the
+/// vault-clearing `Permanent` branch — are reachable from tests pointed at
+/// a local stub. Nothing outside this module should pass a non-`ISSUER`
+/// origin: it is where the ChatGPT refresh token is sent.
+pub(super) async fn refresh_at(
+    issuer: &str,
+    refresh_token: &str,
+    client: &reqwest::Client,
+) -> std::result::Result<OAuthTokenBundle, RefreshError> {
+    let endpoint = format!("{issuer}/oauth/token");
     let body = form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
         .append_pair("grant_type", "refresh_token")
