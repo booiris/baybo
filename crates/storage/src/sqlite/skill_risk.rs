@@ -283,7 +283,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_get_roundtrips() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         let v = make_verdict("deploy", "abc123", RiskLevel::Suspicious);
@@ -297,7 +300,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_misses_when_hash_differs() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         store
@@ -309,7 +315,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_replaces_same_key() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         store
@@ -327,7 +336,10 @@ mod tests {
 
     #[tokio::test]
     async fn forget_removes_verdicts_and_jobs() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         store
@@ -353,7 +365,10 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_job_is_idempotent() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         let mut job = make_job("deploy", "hash-1", AssessmentJobStatus::Pending);
@@ -373,7 +388,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_job_status_updates_row() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         store
@@ -391,7 +409,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_job_removes_only_that_row() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         store
@@ -412,7 +433,10 @@ mod tests {
 
     #[tokio::test]
     async fn load_pending_jobs_orders_by_created_at() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSkillRiskStore::new(pool);
 
         let mut a = make_job("a", "h", AssessmentJobStatus::Pending);

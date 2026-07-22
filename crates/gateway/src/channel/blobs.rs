@@ -465,7 +465,10 @@ mod tests {
     use std::sync::Arc;
 
     async fn fresh_pairing() -> (Arc<dyn ChannelPairingStore>, Arc<PairingService>) {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store: Arc<dyn ChannelPairingStore> = Arc::new(SqliteChannelPairingStore::new(pool));
         let svc = Arc::new(PairingService::new(store.clone()));
         (store, svc)

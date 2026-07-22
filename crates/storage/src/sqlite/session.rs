@@ -1682,7 +1682,10 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_session() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let s = make_root_session("cli-1");
         store.save(&s).await.unwrap();
@@ -1699,7 +1702,10 @@ mod tests {
     async fn control_events_round_trip_seq_kind_and_micros() {
         use baybo_model::ControlEventKind;
 
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let s = make_root_session("ctl-1");
         store.save(&s).await.unwrap();
@@ -1759,7 +1765,10 @@ mod tests {
         // `list_all` must skip that one row (log + continue) and still
         // return every good session, rather than erroring the whole listing
         // and 500-ing the CLI picker / web UI.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let good = make_root_session("good-1");
@@ -1809,7 +1818,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_expired_filters_by_last_active() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let mut old = make_root_session("old");
         old.last_active = Utc::now() - chrono::Duration::hours(2);
@@ -1829,7 +1841,10 @@ mod tests {
         // telegram rows out of the sqlite round-trip entirely so a
         // gateway hosting thousands of bot sessions doesn't pay an
         // O(all-sessions) cost on every chat-list refresh.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut http_a = make_root_session("http-a");
@@ -1870,7 +1885,10 @@ mod tests {
         // column without rewriting the JSON `data` blob, so trusting
         // the deserialised `Session.hidden` alone would read stale
         // values.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("hide-me");
@@ -1885,7 +1903,10 @@ mod tests {
 
     #[tokio::test]
     async fn touch_last_active_keeps_column_and_blob_coherent() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool.clone());
         let s = make_root_session("touch-me");
         store.save(&s).await.unwrap();
@@ -1929,7 +1950,10 @@ mod tests {
         // `Session` (hidden=false) AFTER the user hid the conversation
         // via `set_hidden`. `save` must not rewrite the flat `hidden`
         // column, or it would silently un-hide the row.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("hide-then-save");
@@ -1953,7 +1977,10 @@ mod tests {
         // stale in-memory `Session` with last_llm=None — must NOT wipe a
         // pin set via the targeted `set_last_llm`. Same flat-column guard
         // as `hidden`.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("pin-then-save");
@@ -1991,7 +2018,10 @@ mod tests {
         // boot path a new binary takes. Without the ALTER migration the
         // store's `SELECT … pinned` would fail with "no such column"; with
         // it the column comes back and the old row defaults to unpinned.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         exec(&pool, "ALTER TABLE sessions DROP COLUMN pinned", Vec::new()).await;
         let data = serde_json::to_string(&make_root_session("legacy-1")).unwrap();
         exec(
@@ -2023,7 +2053,10 @@ mod tests {
 
     #[tokio::test]
     async fn message_platform_msg_id_round_trips_and_legacy_defaults_empty() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool.clone());
         let session = make_root_session("platform-msg-id");
         store.save(&session).await.unwrap();
@@ -2079,7 +2112,10 @@ mod tests {
 
     #[tokio::test]
     async fn source_event_append_is_idempotent_across_compaction() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("source-event");
         store.save(&session).await.unwrap();
@@ -2135,7 +2171,10 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_session_messages_table_gains_source_event_id() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         exec(
             &pool,
             "DROP INDEX idx_session_messages_source_event",
@@ -2179,7 +2218,10 @@ mod tests {
         // concurrent full-blob `save` (a `touch` on the next inbound
         // message, carrying a stale in-memory `Session` with pinned=false)
         // must NOT wipe a pin set via the targeted `set_pinned`.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("pin-then-save");
@@ -2206,7 +2248,10 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `pinned`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative flag rather than the (stale) blob value.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
@@ -2227,7 +2272,10 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `last_llm`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative pin rather than the (stale) blob value.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
@@ -2256,7 +2304,10 @@ mod tests {
         // message, carrying a stale in-memory `Session` with
         // archived=false) must NOT wipe a flag set via the targeted
         // `set_archived`.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("archive-then-save");
@@ -2291,7 +2342,10 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `archived`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative flag rather than the (stale) blob value.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("archive-list");
@@ -2317,7 +2371,10 @@ mod tests {
         // The "DB created before `archived` existed" case the migration
         // list (sqlite/mod.rs) handles — same shape as the `pinned`
         // migration test above.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         exec(
             &pool,
             "ALTER TABLE sessions DROP COLUMN archived",
@@ -2357,7 +2414,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_folder_round_trips_and_clears() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let s = make_root_session("fld-1");
         store.save(&s).await.unwrap();
@@ -2388,7 +2448,10 @@ mod tests {
         // concurrent full-blob `save` carrying a stale in-memory `Session`
         // (folder_id = None) must NOT wipe an assignment set via the
         // targeted `set_folder`.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("fld-then-save");
@@ -2408,7 +2471,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_channel_reflects_folder_id_column() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("fld-list");
@@ -2432,7 +2498,10 @@ mod tests {
         // the fresh `init_db` created, write a row the old way, then re-run
         // `init_db` (the boot path) — the idempotent ALTER re-adds it and
         // the old row defaults to uncategorized.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         // SQLite refuses to drop an indexed column, so drop the index first
         // — this also recreates the genuine pre-folder_id schema (no column,
         // no index), the exact state `init_db`'s migration must recover from.
@@ -2480,7 +2549,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_title_round_trips_and_clears() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let s = make_root_session("title-1");
         store.save(&s).await.unwrap();
@@ -2509,7 +2581,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_does_not_clobber_title_set_by_set_title() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("title-then-save");
@@ -2527,7 +2602,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_channel_reflects_title_column() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("title-list");
@@ -2546,7 +2624,10 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sessions_table_without_title_is_migrated() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         exec(&pool, "ALTER TABLE sessions DROP COLUMN title", Vec::new()).await;
         let data = serde_json::to_string(&make_root_session("legacy-title")).unwrap();
         exec(
@@ -2586,7 +2667,10 @@ mod tests {
         // tail loader is the path the chat REST surface uses to ship
         // a long-running session's transcript a page at a time
         // without fetching the whole row stream up-front.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("paginate-me");
         store.save(&session).await.unwrap();
@@ -2636,7 +2720,10 @@ mod tests {
 
     #[tokio::test]
     async fn chat_list_batch_queries_group_per_session() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
 
@@ -2696,7 +2783,10 @@ mod tests {
 
     #[tokio::test]
     async fn last_user_messages_finds_freshest_human_turn_past_tool_churn() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("preview-me");
         store.save(&session).await.unwrap();
@@ -2759,7 +2849,10 @@ mod tests {
 
     #[tokio::test]
     async fn last_user_messages_counts_interjections_not_agent_user_rows() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("interjection-me");
         store.save(&session).await.unwrap();
@@ -2805,7 +2898,10 @@ mod tests {
         // Same 7-row fixture as the `_tail` test, but exercising the
         // forward difference scan the REST sync endpoint uses to
         // deliver missed rows to a client presenting its cursor.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionStore::new(pool);
         let session = make_root_session("catch-up-me");
         store.save(&session).await.unwrap();

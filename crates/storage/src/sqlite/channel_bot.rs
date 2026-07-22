@@ -117,7 +117,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_empty_by_default() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelBotStore::new(pool);
         assert!(
             store
@@ -130,7 +133,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_list_and_get() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelBotStore::new(pool);
         store.put(&ChannelType::telegram(), "alpha").await.unwrap();
         store.put(&ChannelType::telegram(), "beta").await.unwrap();
@@ -154,7 +160,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_hides_then_put_revives() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelBotStore::new(pool);
         store.put(&ChannelType::telegram(), "alpha").await.unwrap();
         store
@@ -180,7 +189,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_on_live_row_is_noop() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelBotStore::new(pool);
         store.put(&ChannelType::telegram(), "alpha").await.unwrap();
         let first = store
@@ -200,7 +212,10 @@ mod tests {
 
     #[tokio::test]
     async fn channel_types_are_isolated() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelBotStore::new(pool);
         store.put(&ChannelType::telegram(), "x").await.unwrap();
         store.put(&ChannelType::discord(), "x").await.unwrap();

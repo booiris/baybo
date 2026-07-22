@@ -293,7 +293,10 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_then_get() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         let row = store
             .upsert_pending(&ch(), BOT, UID, "AB1234", 100, 1000)
@@ -312,7 +315,10 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_on_live_fresh_row_preserves_code() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, UID, "AAAAAA", 100, 1000)
@@ -328,7 +334,10 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_overwrites_expired_pending() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, UID, "OLDCOD", 100, 200)
@@ -346,7 +355,10 @@ mod tests {
 
     #[tokio::test]
     async fn approve_flips_status_and_clears_expiry() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, UID, "CODECD", 100, 1000)
@@ -364,7 +376,10 @@ mod tests {
 
     #[tokio::test]
     async fn approve_rejects_expired_code() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, UID, "EXPCOD", 100, 200)
@@ -376,7 +391,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_filters_by_status() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, "u1", "CODE01", 100, 1000)
@@ -399,7 +417,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_hides_then_upsert_revives() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), BOT, UID, "FIRSTC", 100, 1000)
@@ -419,7 +440,10 @@ mod tests {
 
     #[tokio::test]
     async fn different_bot_ids_do_not_collide() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelPairingStore::new(pool);
         store
             .upsert_pending(&ch(), "bot-a", UID, "AAAAAA", 100, 1000)

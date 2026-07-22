@@ -5,6 +5,7 @@ mod completion_model;
 mod factory;
 mod oauth;
 mod reasoning;
+mod refresh_coordinator;
 mod token_bundle;
 mod token_store;
 

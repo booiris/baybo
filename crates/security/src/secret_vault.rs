@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::crypto::{self, EncryptionKey};
 use crate::secret_value::SecretValue;
 use crate::{Result, SecurityError};
-use baybo_store::SecretStore;
+use baybo_store::{SecretStore, StoreIdentity};
 
 pub struct SecretVault {
     master_key: EncryptionKey,
@@ -17,6 +17,14 @@ pub struct SecretVault {
 impl SecretVault {
     pub fn new(master_key: EncryptionKey, store: Arc<dyn SecretStore>) -> Self {
         Self { master_key, store }
+    }
+
+    /// Which credential set this vault addresses. Subsystems that keep
+    /// per-credential coordination state key it on this rather than on the
+    /// vault handle — two vaults over one store are one credential, and
+    /// treating them as two is what lets two coordinators race a refresh.
+    pub fn store_identity(&self) -> StoreIdentity {
+        self.store.identity()
     }
 
     /// Access the master encryption key. Intended for subsystems (like

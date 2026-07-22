@@ -359,7 +359,10 @@ mod tests {
 
     #[tokio::test]
     async fn step_round_trip() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let s = make_step(JobId::new());
         store.save_step(&s.to_row().unwrap()).await.unwrap();
@@ -369,7 +372,10 @@ mod tests {
 
     #[tokio::test]
     async fn span_round_trip_and_list_by_step() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let job_id = JobId::new();
         let step = make_step(job_id);
@@ -391,7 +397,10 @@ mod tests {
         // round-trip/load tests don't touch. Guards against a schema
         // path typo or a rename of `Step::job_id` silently dropping
         // every step out of the by-job query.
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let job_a = JobId::new();
         let job_b = JobId::new();
@@ -413,7 +422,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_spans_by_job_joins_through_steps() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let job_a = JobId::new();
         let job_b = JobId::new();
@@ -445,7 +457,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_span_events_for_spans_batches_and_keeps_seq_order() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let span_a = SpanId::new();
         let span_b = SpanId::new();
@@ -489,7 +504,10 @@ mod tests {
 
     #[tokio::test]
     async fn trace_counts_by_job_counts_across_steps_without_loading() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let job_a = JobId::new();
         let job_b = JobId::new();
@@ -520,7 +538,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_unfinished_steps_finds_open_steps_and_open_child_spans() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
 
         let open_step = make_step(JobId::new());
@@ -575,7 +596,10 @@ mod tests {
 
     #[tokio::test]
     async fn span_event_round_trip() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteTraceStore::new(pool);
         let span_id = SpanId::new();
         let event = SpanEvent::new(

@@ -386,7 +386,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_and_query() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         store.record(&test_record("u1", usd(0.05))).await.unwrap();
         let records = store.query_user("u1", wide_range()).await.unwrap();
@@ -396,7 +399,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_global_summary() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         store.record(&test_record("u1", usd(0.10))).await.unwrap();
         store.record(&test_record("u2", usd(0.20))).await.unwrap();
@@ -407,7 +413,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_user_summary_aggregates_in_sql() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         store.record(&test_record("u1", usd(0.10))).await.unwrap();
         store.record(&test_record("u1", usd(0.20))).await.unwrap();
@@ -420,7 +429,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_range_grouped_by_day_model_and_reason() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         let mut a = test_record("u1", usd(0.10));
         a.model = "m-a".into();
@@ -459,7 +471,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_session_by_job_groups_per_job() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         let job_a = JobId::new();
         let job_b = JobId::new();
@@ -487,7 +502,10 @@ mod tests {
 
     #[tokio::test]
     async fn reason_round_trips() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         let mut rec = test_record("u1", usd(0.05));
         rec.reason = CallReason::ProgressObserver;
@@ -501,7 +519,10 @@ mod tests {
     /// round-trip through the column, name intact.
     #[tokio::test]
     async fn tool_reason_round_trips_with_name() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCostStore::new(pool);
         let mut rec = test_record("u2", usd(0.05));
         rec.reason = CallReason::Tool("WebFetch".to_string());

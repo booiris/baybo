@@ -37,9 +37,7 @@ pub use skill_risk::SqliteSkillRiskStore;
 pub use task::SqliteTaskStore;
 pub use trace::SqliteTraceStore;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use baybo_store::StorageError;
+use baybo_store::{StorageError, StoreIdentity};
 use deadpool_sqlite::{Config, Runtime};
 
 /// Connections kept open by the pool. Readers never block each other under
@@ -88,6 +86,10 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Clone)]
 pub struct SqlitePool {
     pool: deadpool_sqlite::Pool,
+    /// What this pool addresses. Carried so stores built on it can report a
+    /// [`StoreIdentity`] — two pools over one file are one credential set,
+    /// and subsystems that coordinate per credential need to see that.
+    identity: StoreIdentity,
 }
 
 impl SqlitePool {
@@ -101,24 +103,33 @@ impl SqlitePool {
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
         }
-        Self::build(Config::new(path), path.display().to_string()).await
+        // Canonicalize so two handles reached by different relative paths
+        // still compare equal. The file may not exist yet on first open, so
+        // fall back to the parent (which `create_dir_all` just ensured).
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                    std::fs::canonicalize(parent)
+                        .map(|p| p.join(name))
+                        .unwrap_or_else(|_| path.to_path_buf())
+                }
+                _ => path.to_path_buf(),
+            }
+        });
+        Self::build(
+            Config::new(path),
+            path.display().to_string(),
+            StoreIdentity::File(canonical),
+        )
+        .await
     }
 
-    /// Open a private in-memory database (tests).
-    ///
-    /// A bare `:memory:` would hand every pooled connection its own empty
-    /// database. The shared-cache URI makes the pool's connections address one
-    /// database, and the unique name keeps concurrent tests isolated from each
-    /// other. Such a database lives only while a connection to it is open, so
-    /// the pool must never reap idle connections — deadpool doesn't by default.
-    pub async fn open_in_memory() -> anyhow::Result<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let uri = format!("file:baybo-test-{id}?mode=memory&cache=shared");
-        Self::build(Config::new(&uri), uri.clone()).await
+    /// What this pool's data is, for per-credential coordination.
+    pub(crate) fn identity(&self) -> StoreIdentity {
+        self.identity.clone()
     }
 
-    async fn build(cfg: Config, what: String) -> anyhow::Result<Self> {
+    async fn build(cfg: Config, what: String, identity: StoreIdentity) -> anyhow::Result<Self> {
         let pool = cfg
             .builder(Runtime::Tokio1)
             .map_err(|e| anyhow::anyhow!("failed to configure sqlite pool for {what}: {e}"))?
@@ -146,7 +157,7 @@ impl SqlitePool {
             }))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build sqlite pool for {what}: {e}"))?;
-        let pool = Self { pool };
+        let pool = Self { pool, identity };
         pool.interact("sqlite.init_db", init_db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
@@ -936,7 +947,10 @@ mod tests {
     /// a fresh, empty database.
     #[tokio::test]
     async fn in_memory_database_survives_between_checkouts() {
-        let pool = SqlitePool::open_in_memory().await.expect("open");
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
         pool.interact("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
@@ -963,7 +977,10 @@ mod tests {
     /// they don't.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn in_memory_pool_tolerates_concurrent_writers() {
-        let pool = SqlitePool::open_in_memory().await.expect("open");
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .expect("open");
         let mut tasks = Vec::new();
         for w in 0..8 {
             let pool = pool.clone();
@@ -1023,12 +1040,18 @@ mod tests {
         assert_eq!(status.available, POOL_SIZE, "and all of them idle");
     }
 
-    /// Two pools must not see each other's data, or tests running in parallel
-    /// would interfere through the shared cache.
+    /// Two pools over two files must not see each other's data, or tests
+    /// running in parallel would interfere.
     #[tokio::test]
-    async fn in_memory_databases_are_isolated_from_each_other() {
-        let a = SqlitePool::open_in_memory().await.expect("open a");
-        let b = SqlitePool::open_in_memory().await.expect("open b");
+    async fn separate_databases_are_isolated_from_each_other() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = SqlitePool::open(dir_a.path().join("test.db"))
+            .await
+            .expect("open a");
+        let b = SqlitePool::open(dir_b.path().join("test.db"))
+            .await
+            .expect("open b");
         a.interact("test.write", |conn| {
             conn.execute(
                 "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",

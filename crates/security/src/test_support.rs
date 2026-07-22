@@ -10,15 +10,27 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use baybo_store::secret::{Result, SecretStore};
+use baybo_store::secret::{Result, SecretStore, StoreIdentity};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
 /// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes
 /// are whatever the caller hands in (typically already AES-GCM ciphertext
 /// from `SecretVault`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemorySecretStore {
     data: Mutex<HashMap<String, Vec<u8>>>,
+    /// Fresh per instance, so per-credential process state built on top of
+    /// a test store is isolated to that test.
+    identity: StoreIdentity,
+}
+
+impl Default for MemorySecretStore {
+    fn default() -> Self {
+        Self {
+            data: Mutex::new(HashMap::new()),
+            identity: StoreIdentity::ephemeral(),
+        }
+    }
 }
 
 impl MemorySecretStore {
@@ -57,5 +69,9 @@ impl SecretStore for MemorySecretStore {
     async fn delete(&self, name: &str) -> Result<()> {
         self.data.lock().remove(name);
         Ok(())
+    }
+
+    fn identity(&self) -> StoreIdentity {
+        self.identity.clone()
     }
 }

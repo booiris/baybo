@@ -462,7 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_get_list_roundtrip() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteDeckCardStore::new(pool);
         store.create(&card("a", 1)).await.unwrap();
         store.create(&card("b", 0)).await.unwrap();
@@ -488,7 +491,10 @@ mod tests {
     /// single-size, never-adapted legacy card — not error or empty-list.
     #[tokio::test]
     async fn legacy_row_without_sizes_falls_back_to_single_size() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteDeckCardStore::new(pool.clone());
         // Insert bypassing `create` to leave `sizes` at the column default.
         let now_us = super::super::time::to_us(chrono::Utc::now());
@@ -511,7 +517,10 @@ mod tests {
 
     #[tokio::test]
     async fn layout_enable_quarantine_installed() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteDeckCardStore::new(pool);
         store.create(&card("a", 0)).await.unwrap();
         store.create(&card("b", 1)).await.unwrap();
@@ -604,7 +613,10 @@ mod tests {
 
     #[tokio::test]
     async fn soft_delete_restore_purge() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteDeckCardStore::new(pool);
         store.create(&card("a", 0)).await.unwrap();
 
@@ -626,7 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_snapshot_bumps_seq_and_prunes() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteDeckCardStore::new(pool);
         store.create(&card("a", 0)).await.unwrap();
 

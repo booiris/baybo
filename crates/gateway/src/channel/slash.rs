@@ -170,7 +170,10 @@ mod tests {
     use super::*;
 
     async fn build() -> ChannelSessionResolver {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let session_store = Arc::new(SqliteSessionStore::new(pool.clone()));
         let summary_store = Arc::new(baybo_storage::sqlite::SqliteSessionSummaryStore::new(
             pool.clone(),

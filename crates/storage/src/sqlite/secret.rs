@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
-use baybo_store::secret::{Result, SecretStore};
+use baybo_store::secret::{Result, SecretStore, StoreIdentity};
 
 pub struct SqliteSecretStore {
     pool: SqlitePool,
@@ -69,6 +69,10 @@ impl SecretStore for SqliteSecretStore {
             })
             .await
     }
+
+    fn identity(&self) -> StoreIdentity {
+        self.pool.identity()
+    }
 }
 
 #[cfg(test)]
@@ -77,7 +81,10 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_retrieve() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSecretStore::new(pool);
         store.store("api-key", b"encrypted-data").await.unwrap();
         let result = store.retrieve("api-key").await.unwrap();
@@ -86,14 +93,20 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_missing() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSecretStore::new(pool);
         assert!(store.retrieve("nonexistent").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn list_secrets() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSecretStore::new(pool);
         store.store("a", b"1").await.unwrap();
         store.store("b", b"2").await.unwrap();
