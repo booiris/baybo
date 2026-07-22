@@ -506,6 +506,16 @@ pub struct ChatSyncResponse {
     /// Whether older history exists below `oldest_ordinal` (REPLACE
     /// responses only; always `false` on a difference response).
     pub has_more_older: bool,
+    /// Compaction boundaries for this session — same value as
+    /// [`ChatSessionDetail::compaction_points`], carried on the sync
+    /// response so a client that loads its transcript through the sync
+    /// loop (the iOS bundle) gets the pre-compaction divider without a
+    /// separate meta fetch. Present on EVERY sync (baseline and
+    /// difference), not just the baseline: a client that persists its
+    /// cursor re-opens with a difference sync, so gating this to the
+    /// baseline would strand the divider on every warm re-entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_points: Vec<CompactionPoint>,
 }
 
 /// Response from `GET /v1/chat/sessions/{session_id}/messages` — the
@@ -695,6 +705,27 @@ pub struct ChatSessionDetail {
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Compaction boundaries for this session — one entry per context
+    /// compaction, ascending by ordinal, empty when the session has never
+    /// been compacted. Each marks where a compaction rewrote the LLM
+    /// context; the transcript itself still shows the real pre-compaction
+    /// messages (their superseded originals), and the web draws a
+    /// "pre-compaction history" divider before the first displayed row at
+    /// or after each `ordinal`. Session-level metadata, independent of the
+    /// returned page slice, so it is stable across scroll-up pagination and
+    /// carried only on the baseline/meta fetch (`before_ordinal` absent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_points: Vec<CompactionPoint>,
+}
+
+/// One context-compaction boundary: the summary head compaction wrote at
+/// `ordinal`, stamped with the compaction time (`at`, the head row's
+/// `created_at`). The transcript still renders the real messages below it;
+/// this only tells the client where to draw the boundary divider.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CompactionPoint {
+    pub ordinal: i64,
+    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1154,6 +1185,27 @@ async fn get_session(
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
     let page = build_history_page(&state, &sid, &session, query.before_ordinal, limit).await?;
+    // Session-level divider metadata, consumed only off the baseline/meta
+    // fetch (`before_ordinal` absent) — the limit-1 open where the client
+    // decides where to draw its pre-compaction dividers. Scroll-up backfill
+    // pages discard it, so skip the lookup there rather than recomputing it
+    // per page. Best-effort — a lookup failure just omits the dividers
+    // rather than failing the load.
+    let compaction_points = if query.before_ordinal.is_none() {
+        state
+            .session_manager
+            .compaction_boundaries(&sid)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session_id = %sid, error = %e, "chat: compaction boundaries lookup failed");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(ordinal, at)| CompactionPoint { ordinal, at })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -1167,6 +1219,7 @@ async fn get_session(
         last_model: session.state.last_model.clone(),
         last_effort: session.state.last_effort.clone(),
         title: session.title.clone(),
+        compaction_points,
     }))
 }
 
@@ -1272,6 +1325,7 @@ async fn build_history_page(
         active_turn_started,
         in_flight_steps,
         &attachment_map,
+        &compaction_watermarks(state, sid).await,
     );
     Ok(HistoryPage {
         transcript,
@@ -1331,7 +1385,39 @@ async fn sync_session(
         rebased,
         oldest_ordinal: page.oldest_ordinal,
         has_more_older: page.has_more,
+        compaction_points: sync_compaction_points(&state, &sid).await,
     }))
+}
+
+/// Compaction boundaries as `CompactionPoint`s for the sync response —
+/// best-effort (a lookup failure omits the divider rather than failing the
+/// sync). Carried on EVERY sync so a cursor-persisting client (iOS) gets the
+/// pre-compaction divider on warm re-entry too, not only its first baseline.
+async fn sync_compaction_points(state: &AdminState, sid: &SessionId) -> Vec<CompactionPoint> {
+    state
+        .session_manager
+        .compaction_boundaries(sid)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(session_id = %sid, error = %e, "chat: sync compaction boundaries lookup failed");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|(ordinal, at)| CompactionPoint { ordinal, at })
+        .collect()
+}
+
+/// Compaction watermark ordinals (summary-head ordinals) for this session,
+/// best-effort — `reconstruct_transcript` breaks a work block across each so a
+/// mid-turn compaction's pre-/post halves never fold into one card that would
+/// swallow the divider. A lookup failure just leaves the block unsplit.
+async fn compaction_watermarks(state: &AdminState, sid: &SessionId) -> Vec<i64> {
+    state
+        .session_manager
+        .compaction_boundaries(sid)
+        .await
+        .map(|b| b.into_iter().map(|(ordinal, _)| ordinal).collect())
+        .unwrap_or_default()
 }
 
 /// Build the difference response for `sync(since)`, or `None` when the
@@ -1412,6 +1498,7 @@ async fn sync_difference(
         active_turn_started,
         Vec::new(),
         &attachment_map,
+        &compaction_watermarks(state, sid).await,
     );
     if transcript.len() > limit {
         return Ok(None);
@@ -1424,6 +1511,7 @@ async fn sync_difference(
         // client keeps its own backfill floor.
         oldest_ordinal: None,
         has_more_older: false,
+        compaction_points: sync_compaction_points(state, sid).await,
     }))
 }
 
@@ -2749,6 +2837,7 @@ fn reconstruct_transcript(
         active_turn_started,
         in_flight_steps,
         &attachments_by_ordinal,
+        &[],
     )
 }
 
@@ -2758,6 +2847,12 @@ fn reconstruct_transcript_with_attachments(
     active_turn_started: Option<DateTime<Utc>>,
     in_flight_steps: Vec<ChatWorkStep>,
     attachments_by_ordinal: &HashMap<i64, Vec<ChatAttachment>>,
+    // Compaction watermarks (summary-head ordinals) whose machinery is hidden
+    // from this display. A work block must never fold ACROSS one: a mid-turn
+    // compaction leaves the pre- and post-compaction halves of a turn adjacent
+    // (the machinery between them is elided), so without a forced break here
+    // they'd render as one card that swallows the pre-compaction divider.
+    compaction_watermarks: &[i64],
 ) -> Vec<ChatTranscriptItem> {
     // Merge message rows and out-of-band control events into one ordinal-ordered
     // stream: a control event with `after_ordinal = N` sorts right after the row
@@ -2859,6 +2954,20 @@ fn reconstruct_transcript_with_attachments(
             }
             Entry::Row(ordinal, created_at, msg) => (ordinal, created_at, msg),
         };
+        // Close the open work block at a compaction watermark it straddles —
+        // `complete = true` so the client keeps it distinct from the
+        // post-compaction half (never fuses across the seam). The next row then
+        // opens a fresh block, and the pre-compaction divider lands between the
+        // two. Reset `turn_started` so the continuation times from its own
+        // resume, not across the elided machinery.
+        if let Some(block_start) = work.ordinal
+            && compaction_watermarks
+                .iter()
+                .any(|&w| block_start < w && w <= ordinal)
+        {
+            work.flush(&mut items, None, true);
+            turn_started = None;
+        }
         match msg.role {
             Role::User if msg.from_user() => {
                 work.flush(&mut items, None, true);
@@ -3365,6 +3474,90 @@ mod tests {
                 .any(|i| matches!(i.kind, TranscriptItemKind::Notice)),
             "a progress control event must not surface as a notice row"
         );
+    }
+
+    #[test]
+    fn reconstruct_splits_a_work_block_across_a_compaction_watermark() {
+        // A MID-TURN compaction: the agent's turn ran intermediate rows 1..=2,
+        // then compaction fired (watermark 3, its machinery 3..=9 hidden from
+        // the display), then the SAME turn resumed at 10..=11 and answered at
+        // 12. The displayed rows straddle the watermark with NO user/answer row
+        // between — the exact case that folds into one card and swallows the
+        // pre-compaction divider.
+        let tail = vec![
+            (0, ts(0), ChatMessage::user(vec![text("go")])),
+            (
+                1,
+                ts(1),
+                ChatMessage::assistant(vec![
+                    thinking("plan"),
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                ]),
+            ),
+            (
+                2,
+                ts(2),
+                ChatMessage::tool_result("c1".to_owned(), "ok".to_owned()),
+            ),
+            // ── compaction watermark 3; machinery 3..=9 elided from display ──
+            (
+                10,
+                ts(10),
+                ChatMessage::assistant(vec![
+                    thinking("resume"),
+                    tool_use("c2", "Bash", serde_json::json!({"command": "pwd"})),
+                ]),
+            ),
+            (
+                11,
+                ts(11),
+                ChatMessage::tool_result("c2".to_owned(), "ok".to_owned()),
+            ),
+            (12, ts(12), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let attachments = HashMap::new();
+
+        // Without the watermark the two halves fold into ONE spanning card.
+        let fused = reconstruct_transcript_with_attachments(
+            tail.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            &attachments,
+            &[],
+        );
+        let fused_work = fused
+            .iter()
+            .filter(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .count();
+        assert_eq!(fused_work, 1, "no watermark ⇒ one spanning card: {fused:?}");
+
+        // With the watermark, the block breaks at the seam into two cards; the
+        // pre-compaction half is `turn_complete` so the client never re-fuses
+        // it, and the divider lands between w1 and w10.
+        let split = reconstruct_transcript_with_attachments(
+            tail,
+            Vec::new(),
+            None,
+            Vec::new(),
+            &attachments,
+            &[3],
+        );
+        let work: Vec<&ChatTranscriptItem> = split
+            .iter()
+            .filter(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .collect();
+        assert_eq!(work.len(), 2, "watermark ⇒ split into two: {split:?}");
+        assert_eq!(
+            work[0].id, "w1",
+            "pre-compaction half keyed by its first row"
+        );
+        assert_eq!(
+            work[0].turn_complete,
+            Some(true),
+            "closed at the seam, not cut by a page edge"
+        );
+        assert_eq!(work[1].id, "w10", "post-compaction half opens fresh");
     }
 
     #[test]

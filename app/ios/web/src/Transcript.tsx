@@ -1,5 +1,6 @@
 import {
   createContext,
+  Fragment,
   memo,
   useCallback,
   useContext,
@@ -49,6 +50,7 @@ import {
   blobContentDigest,
   uid,
   type ChatMsg,
+  type CompactionPoint,
   type PersistedState,
   type Row,
   type TranscriptRowItem,
@@ -247,6 +249,34 @@ export function rowOrdinal(id: string): number | null {
   if (!match) return null;
   const n = Number(match[1]);
   return Number.isSafeInteger(n) ? n : null;
+}
+
+/// Ids of the rows that get a `CompactionDivider` rendered *before* them: the
+/// first displayed row whose ordinal lands at/after a compaction boundary — the
+/// seam where a compaction rewrote the LLM context. The messages above still
+/// render (their pre-compaction originals); the model just no longer sees them.
+/// Both sides must be loaded: a boundary above every loaded row draws nothing
+/// until scroll-up pages the originals in. Notice / live rows (no `m`/`w`
+/// ordinal) are skipped so an interleaved notice can't misplace the seam. Maps
+/// to the newest crossed boundary's time. Mirrors app/web's `compactionDividerKeys`.
+export function compactionDividerIds(
+  rows: Row[],
+  points: CompactionPoint[],
+): Map<string, string> {
+  const out = new Map<string, string>();
+  if (points.length === 0) return out;
+  let prevOrdinal: number | null = null;
+  for (const r of rows) {
+    const ordinal = rowOrdinal(r.id);
+    if (ordinal === null) continue;
+    if (prevOrdinal !== null) {
+      const lower = prevOrdinal;
+      const crossed = points.filter((p) => p.ordinal > lower && p.ordinal <= ordinal);
+      if (crossed.length > 0) out.set(r.id, crossed[crossed.length - 1].at);
+    }
+    prevOrdinal = ordinal;
+  }
+  return out;
 }
 
 /// Identity of a work step for dedup when folding two representations of the
@@ -448,14 +478,34 @@ export function foldWork(prev: WorkRow, next: WorkRow): WorkRow {
     : reconcileWork(prev, next);
 }
 
+/// Whether a compaction boundary sits between two work blocks' ordinals — the
+/// server already breaks a work block at a watermark, so the two halves are
+/// DIFFERENT turns (compaction is a turn boundary) and must not be re-fused: a
+/// fused card would swallow the seam the `CompactionDivider` keys off. Both
+/// halves must carry a durable `w<ordinal>` id; a live block (no ordinal) never
+/// straddles a boundary.
+function crossesCompaction(prev: WorkRow, next: WorkRow, points: CompactionPoint[]): boolean {
+  const a = rowOrdinal(prev.id);
+  const b = rowOrdinal(next.id);
+  if (a === null || b === null) return false;
+  return points.some((p) => a < p.ordinal && p.ordinal <= b);
+}
+
 /// Collapse every adjacent work pair in an assembled row list. Idempotent — a
 /// healthy list has no adjacency — so it is safe to run at each seam where rows
-/// are joined (a prepended history page, a rebuilt sync page).
-export function foldAdjacentWork(rows: Row[]): Row[] {
+/// are joined (a prepended history page, a rebuilt sync page). Two work blocks
+/// straddling a `compactionPoints` boundary are NEVER fused — a mid-turn
+/// compaction's pre-/post halves are distinct turns with the divider between.
+export function foldAdjacentWork(rows: Row[], compactionPoints: CompactionPoint[] = []): Row[] {
   const out: Row[] = [];
   for (const r of rows) {
     const prev = out[out.length - 1];
-    if (r.role === "work" && prev && prev.role === "work") {
+    if (
+      r.role === "work" &&
+      prev &&
+      prev.role === "work" &&
+      !crossesCompaction(prev, r, compactionPoints)
+    ) {
       out[out.length - 1] = foldWork(prev, r);
       continue;
     }
@@ -966,6 +1016,22 @@ export function formatTime(totalSeconds: number): string {
   const m = Math.floor((s % 3600) / 60);
   const sec = String(s % 60).padStart(2, "0");
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+/// Compaction time for the pre-compaction divider: `HH:MM` same-day, prefixed
+/// `MM-DD` on an earlier day. Mirrors app/web's `formatTimestampShort` so the
+/// two clients read the same. Empty for an unparseable timestamp.
+export function formatCompactionTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number) => String(n).padStart(2, "0");
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay ? hm : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
 }
 
 /// One file attachment's on-device lifecycle. Native owns the truth (the blob
@@ -1512,6 +1578,18 @@ function useSharePress(onShare: () => boolean): {
   };
 }
 
+/// Seam marking where a context compaction rewrote the LLM context. The
+/// messages above it still render (their pre-compaction originals); the model no
+/// longer sees them — it sees a summary in their place. A hairline + label.
+function CompactionDivider({ label, at }: { label: string; at?: string }) {
+  const time = at != null ? formatCompactionTime(at) : "";
+  return (
+    <div className="compaction-divider" role="separator">
+      <span>{time ? `${label} ${time}` : label}</span>
+    </div>
+  );
+}
+
 /// One finalized transcript row, rendered as a GROUP of stacked bubbles: each
 /// image / file attachment is its OWN bubble, separate from the text bubble —
 /// never merged into one. User attachments + text stack right-aligned; assistant
@@ -1747,6 +1825,18 @@ export function Transcript({
   const oldestOrdinal = useRef<number | null>(restored?.oldestOrdinal ?? null);
   const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restored?.hasMoreOlder ?? false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  // Compaction boundaries (`{ ordinal, at }[]`), the authoritative set carried
+  // on every `sync_page`. Seeds the pre-compaction divider; restored from the
+  // mirror so a cold open paints it before the mount sync refreshes it.
+  const [compactionPoints, setCompactionPoints] = useState<CompactionPoint[]>(
+    () => restored?.compactionPoints ?? [],
+  );
+  // Latest boundaries for the fold guard on the history-prepend seam (that path
+  // carries no frame of its own; `applySyncPage` uses the frame's set directly).
+  const compactionPointsRef = useRef<CompactionPoint[]>(compactionPoints);
+  useEffect(() => {
+    compactionPointsRef.current = compactionPoints;
+  }, [compactionPoints]);
   // Tags the in-flight backward-history (scroll-up) request so its pushed
   // `history_page` reply is matched: the epoch captured at request time lets a
   // reply that arrives under a superseded connection epoch be dropped as stale.
@@ -1843,10 +1933,11 @@ export function Transcript({
         oldestOrdinal: oldestOrdinal.current,
         hasMoreOlder,
         imageDims: Object.fromEntries(imageDims),
+        compactionPoints,
       });
     };
     persistLatest.current();
-  }, [messages, hasMoreOlder, imageDims]);
+  }, [messages, hasMoreOlder, imageDims, compactionPoints]);
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
@@ -2248,8 +2339,10 @@ export function Transcript({
       const fresh = older.filter((x) => !seen.has(x.id));
       // Fold at the seam: a turn longer than a page has a work block on BOTH
       // sides of it (each page folds its own half), and they meet here with no
-      // message row between — one turn must stay one card.
-      return foldAdjacentWork([...fresh, ...m]);
+      // message row between — one turn must stay one card. But NOT across a
+      // compaction boundary (`compactionPointsRef`): a mid-turn compaction's
+      // halves are distinct turns, kept apart so the divider lands between them.
+      return foldAdjacentWork([...fresh, ...m], compactionPointsRef.current);
     });
     // Only advance the cursor on a non-empty page; an empty page leaves it put.
     if (newOldest !== null) oldestOrdinal.current = newOldest;
@@ -2333,6 +2426,10 @@ export function Transcript({
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
       setSyncInFlight(false);
+      // Every sync carries the authoritative boundary set (empty ⇒ never
+      // compacted), so a warm re-entry's difference sync refreshes the divider
+      // just like a baseline REPLACE does.
+      setCompactionPoints(frame.compaction_points ?? []);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
         .map(transcriptItemToRow)
@@ -2346,8 +2443,9 @@ export function Transcript({
       }
       if (replace) {
         // A page can hold BOTH halves of a turn it is wide enough to span, or
-        // one half beside a turn it cut — fold before anything else reads them.
-        const folded = foldAdjacentWork(pageRows);
+        // one half beside a turn it cut — fold before anything else reads them,
+        // but never across this frame's compaction boundaries.
+        const folded = foldAdjacentWork(pageRows, frame.compaction_points ?? []);
         const pageIds = new Set(folded.map((r) => r.id));
         setMessages((prev) => {
           // Keep the in-flight turn's open work block and any optimistic user
@@ -2963,6 +3061,8 @@ export function Transcript({
     const prev = messages[i - 1];
     return !(prev && prev.role === "notice" && prev.stopped);
   });
+  // Row ids that get a pre-compaction divider rendered before them.
+  const dividerBeforeId = compactionDividerIds(renderRows, compactionPoints);
 
   return (
     <ImageDimsContext.Provider value={imageDimsStore}>
@@ -2975,13 +3075,22 @@ export function Transcript({
             {t("chat.loadOlder")}
           </button>
         )}
-        {renderRows.map((m) =>
-          m.role === "work" ? (
-            <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
-          ) : (
-            <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
-          ),
-        )}
+        {renderRows.map((m) => {
+          const row =
+            m.role === "work" ? (
+              <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
+            ) : (
+              <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
+            );
+          const seamAt = dividerBeforeId.get(m.id);
+          if (seamAt === undefined) return row;
+          return (
+            <Fragment key={`${m.id}-seam`}>
+              <CompactionDivider label={t("chat.preCompaction")} at={seamAt} />
+              {row}
+            </Fragment>
+          );
+        })}
         {streaming && (
           <div className="msg assistant streaming">
             <MarkdownBody text={streaming} />

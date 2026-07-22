@@ -26,6 +26,7 @@ import {
   RiDeleteBin6Line,
   RiErrorWarningLine,
   RiFileLine,
+  RiHistoryLine,
   RiInformation2Line,
   RiLoader4Line,
   RiSendPlane2Line,
@@ -246,6 +247,15 @@ export interface SessionView {
    *  connection: nothing that depends on knowing (the Cancelled
    *  indicator) may render. */
   turn: { active: boolean; startedAt: number | null } | null;
+  /** Context-compaction boundaries (`ChatSessionDetail.compaction_points`),
+   *  ascending by ordinal, seeded from the meta fetch and refreshed on a live
+   *  `status: compacted` frame. Each `ordinal` is a summary-head watermark:
+   *  the transcript still shows the real pre-compaction messages (their
+   *  superseded originals page in on scroll-up like any history), and a
+   *  `CompactionDivider` renders before the first displayed row at/after the
+   *  boundary. Empty ⇒ never compacted. Session-level, stable across
+   *  scroll-up pagination. */
+  compactionPoints: { ordinal: number; at: string }[];
 }
 
 export const EMPTY_VIEW: SessionView = {
@@ -260,7 +270,13 @@ export const EMPTY_VIEW: SessionView = {
   model: null,
   tasks: [],
   turn: null,
+  compactionPoints: [],
 };
+
+/** Slack (px) under which the transcript is treated as not overflowing its
+ *  viewport, so scroll can never fire and the older-page load must be kicked
+ *  off programmatically. See the underfill fallback effect. */
+const UNDERFILL_SLACK_PX = 4;
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
  *  bucket (by frame recency) is evicted: transcript + pendingApproval
@@ -457,6 +473,12 @@ export function ChatPage() {
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
+  // Row keys that get a `CompactionDivider` rendered *before* them (see
+  // `compactionDividerKeys`), recomputed when the thread or its boundaries move.
+  const compactionDividerBeforeKey = useMemo(
+    () => compactionDividerKeys(currentView.transcript, currentView.compactionPoints),
+    [currentView.transcript, currentView.compactionPoints],
+  );
   const activeTitle = sessionId
     ? sessions.find((s) => s.session_id === sessionId)?.title
     : undefined;
@@ -527,6 +549,12 @@ export function ChatPage() {
   // to the bottom edge. Kept in a ref so the auto-scroll effect can
   // consult it without re-firing on scroll alone.
   const pinnedToBottomRef = useRef(true);
+  // Synchronous re-entry guard for `loadOlder`. The `olderLoading` state flag
+  // commits a render late, so the scroll handler and the underfill effect can
+  // both fire a second `loadOlder` in the same tick before it takes — the
+  // duplicate fetch (and its rival scroll-anchor rAF) is the scroll jitter.
+  // This ref is set synchronously so only one page loads at a time.
+  const loadingOlderRef = useRef(false);
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
   // react-router v7's `useNavigate` (non-data routes) returns a fresh
@@ -1098,6 +1126,34 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, folderStore]); // intentionally NOT depending on sessionId — bootstrap is one-shot
 
+  /** Re-read a session's compaction boundaries (the light `?limit=1` meta
+   *  fetch, whose transcript slice is ignored). Fired when a live `compacted`
+   *  status frame lands: the forward sync response carries no
+   *  `compaction_points`, and a compaction that happens while the tab is open
+   *  supersedes rows in place — so without this the boundary divider would not
+   *  appear until a reload. */
+  const refreshCompactionPoints = useCallback(
+    async (sid: string) => {
+      try {
+        const { data } = await client.GET('/v1/chat/sessions/{session_id}', {
+          params: { path: { session_id: sid }, query: { limit: 1 } },
+        });
+        if (!data) return;
+        setViews((prev) =>
+          mergeView(prev, sid, {
+            compactionPoints: (data.compaction_points ?? []).map((p) => ({
+              ordinal: p.ordinal,
+              at: p.at,
+            })),
+          }),
+        );
+      } catch (e) {
+        console.warn('chat refresh compaction points failed', sid, e);
+      }
+    },
+    [client],
+  );
+
   // ── WS lifecycle: tied to adminToken, not to sessionId ──────────────
   // Opens once we have the admin token, lives until the component unmounts
   // (i.e. the user navigates away from /chat). Reconnect is internal
@@ -1350,6 +1406,12 @@ export function ChatPage() {
             markSendRow(frame.session_id, frame.platform_msg_id, { failed: false });
           }
         }
+        // A live compaction rewrote the LLM context server-side — refresh this
+        // session's compaction boundaries so the pre-compaction divider appears
+        // without a reload (sync carries no compaction_points).
+        if (frame.kind === 'status' && frame.phase === 'compacted') {
+          void refreshCompactionPoints(frame.session_id);
+        }
         routeInboundFrame(frame, setViews, setSessions);
         // Interjection queue: auto-fire the next parked item on a live normal
         // completion, and pause the pipeline on a /stop-cancel or error notice.
@@ -1374,6 +1436,7 @@ export function ChatPage() {
     recordEndedTurn,
     runSyncSession,
     refetchSessionsAndFolders,
+    refreshCompactionPoints,
   ]);
 
   // ── Active session: subscribe + sync ────────────────────────────────
@@ -1405,7 +1468,15 @@ export function ChatPage() {
       })
       .then(({ data }) => {
         if (!data) return;
-        setViews((prev) => mergeView(prev, sessionId, { model: data.last_llm ?? null }));
+        setViews((prev) =>
+          mergeView(prev, sessionId, {
+            model: data.last_llm ?? null,
+            compactionPoints: (data.compaction_points ?? []).map((p) => ({
+              ordinal: p.ordinal,
+              at: p.at,
+            })),
+          }),
+        );
         // Seed the conversation title from the detail response so the header's
         // `activeTitle` and the sidebar row converge even when the list fetch
         // predated the title (or this tab was disconnected and missed the WS
@@ -1595,12 +1666,19 @@ export function ChatPage() {
   // viewport out from under the user.
   const loadOlder = useCallback(async () => {
     if (!sessionId) return;
+    if (loadingOlderRef.current) return;
     const view = views[sessionId];
     if (!view || !view.hasMore || view.olderLoading || view.oldestOrdinal === null) return;
+    loadingOlderRef.current = true;
     const scroller = transcriptScrollRef.current;
-    const anchorFromBottom = scroller
-      ? scroller.scrollHeight - scroller.scrollTop
-      : null;
+    // Only preserve the scroll offset when the user is reading scroll-back.
+    // When pinned to the bottom (fresh open / underfill auto-load), the
+    // auto-scroll-to-bottom effect re-pins after the prepend; a rival anchor
+    // restore here would fight it and produce jitter, so skip it.
+    const anchorFromBottom =
+      scroller && !pinnedToBottomRef.current
+        ? scroller.scrollHeight - scroller.scrollTop
+        : null;
     setViews((prev) => mergeView(prev, sessionId, { olderLoading: true }));
     try {
       const { data, error } = await client.GET('/v1/chat/sessions/{session_id}', {
@@ -1648,6 +1726,8 @@ export function ChatPage() {
     } catch (e) {
       console.warn('chat history older-page load threw', sessionId, e);
       setViews((prev) => mergeView(prev, sessionId, { olderLoading: false }));
+    } finally {
+      loadingOlderRef.current = false;
     }
   }, [client, sessionId, views, confirmDurableFromItems]);
 
@@ -1667,6 +1747,35 @@ export function ChatPage() {
       void loadOlder();
     }
   }, [loadOlder]);
+
+  // Underfill fallback: when the loaded page doesn't overflow the viewport
+  // (a short post-compaction tail, or a session that folds to a couple of
+  // "Worked" cards) no scroll is possible, so the scroll-up trigger can never
+  // fire. Auto-load older pages until the thread fills or the first message is
+  // reached — otherwise the user can't scroll up to the compaction seam at all.
+  useLayoutEffect(() => {
+    const scroller = transcriptScrollRef.current;
+    if (!scroller) return;
+    if (
+      shouldAutoLoadOlder({
+        hasMore: currentView.hasMore,
+        olderLoading: currentView.olderLoading,
+        historyLoading: currentView.historyLoading,
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+        slackPx: UNDERFILL_SLACK_PX,
+      })
+    ) {
+      void loadOlder();
+    }
+  }, [
+    currentView.transcript,
+    currentView.hasMore,
+    currentView.olderLoading,
+    currentView.historyLoading,
+    sessionId,
+    loadOlder,
+  ]);
 
   const jumpToLatest = useCallback(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -2763,8 +2872,33 @@ export function ChatPage() {
                 </div>
               ) : null}
               {currentView.transcript.flatMap((row, i, arr) => {
+                const nodes: React.ReactNode[] = [];
+                // Boundary divider at the pre-compaction→post-compaction seam.
+                const dividerAt = compactionDividerBeforeKey.get(row.key);
+                if (dividerAt !== undefined) {
+                  nodes.push(
+                    <CompactionDivider key={`${row.key}-compaction`} at={dividerAt} />,
+                  );
+                }
+                // `/stop`, aligned with iOS: the command echo is never painted,
+                // and its acknowledgement collapses to a compact "Stopped"
+                // indicator (adjacent ones — a live mark and its re-delivered
+                // durable notice — merge into one) rather than a verbose bar. The
+                // rows stay in the array so dedup / cancel-marking are unaffected.
+                const stopKind = stopRowKind(row);
+                if (stopKind === 'echo') return nodes;
+                if (stopKind === 'ack') {
+                  // Collapse a run of adjacent acks to one indicator (a live mark
+                  // and its re-delivered durable notice). `i > 0` guards the
+                  // index; `arr` is non-empty here.
+                  const prevIsAck = i > 0 && stopRowKind(arr[i - 1]) === 'ack';
+                  if (!prevIsAck) {
+                    nodes.push(<StoppedIndicator key={`${row.key}-stopped`} />);
+                  }
+                  return nodes;
+                }
                 const retryId = row.failed ? row.clientMsgId : undefined;
-                const nodes: React.ReactNode[] = [
+                nodes.push(
                   <MessageBubble
                     key={row.key}
                     row={row}
@@ -2776,7 +2910,7 @@ export function ChatPage() {
                         : undefined
                     }
                   />,
-                ];
+                );
                 if (isCancelledWorkAt(arr, i, currentView.turn)) {
                   nodes.push(
                     <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
@@ -4103,6 +4237,31 @@ const STOP_CANCELLED_NOTICE_MARKER = 'Cancelled the in-progress reply';
 export function isStopCancellationNotice(text: string): boolean {
   return text.includes(STOP_CANCELLED_NOTICE_MARKER);
 }
+
+/** Whether a notice is a `/stop` ACKNOWLEDGEMENT — the multi-line "Stopped.\n-
+ *  …" a real cancel emits, OR the no-op "Nothing in progress to stop." The web
+ *  paints these as a compact centered "Stopped" indicator instead of a verbose
+ *  notice bar (and drops the `/stop` command echo entirely), matching the iOS
+ *  transcript's `isStopAckNotice` — the raw multi-line text read oddly as a
+ *  chat bubble, worst when a thinking-only turn is stopped and it was the only
+ *  thing on screen. */
+export function isStopAckNotice(text: string): boolean {
+  const t = text.trim();
+  return t.startsWith('Stopped.') || t === 'Nothing in progress to stop.';
+}
+
+/** A transcript row the web renders specially for `/stop`, matching iOS:
+ *  the command echo (a `user` bubble whose text is `/stop`) is NOT painted at
+ *  all, and its acknowledgement notice becomes a compact "Stopped" indicator
+ *  rather than a notice bar. The row stays IN the transcript array (dedup,
+ *  cancel-marking and the compaction seam all read the full array) — only its
+ *  rendering changes. Returns which treatment applies, or `null` for an
+ *  ordinary row. */
+export function stopRowKind(row: TranscriptRow): 'echo' | 'ack' | null {
+  if (row.notice) return isStopAckNotice(row.notice.text) ? 'ack' : null;
+  if (row.role === 'user' && isStopCommand(row.text)) return 'echo';
+  return null;
+}
 /** Mark the turn-just-stopped's work block cancelled. The block is the last
  *  row, or sits just above a salvaged trailing reply bubble (a /stop'd partial
  *  answer kept as its own bubble). Only that one block is touched and only an
@@ -4434,6 +4593,61 @@ function foldWork(prev: TranscriptRow, next: TranscriptRow): TranscriptRow {
 function sameContinuingTurn(prev: TranscriptRow): boolean {
   if (workRowOrdinal(prev.key) === null) return true;
   return prev.workComplete === false;
+}
+
+/** Whether the older-page load must be kicked off programmatically because the
+ *  loaded transcript doesn't overflow its scroll viewport (so no `onScroll`
+ *  event — the scroll-up trigger — can ever fire). True only when there is more
+ *  history to page (`hasMore`), nothing is in flight, the initial load has
+ *  settled, and the content height is within `slackPx` of the viewport. Keeps
+ *  loading (a short post-compaction tail, a session that folds to a couple of
+ *  "Worked" cards) reachable — otherwise the user can't scroll up to the seam. */
+export function shouldAutoLoadOlder(args: {
+  hasMore: boolean;
+  olderLoading: boolean;
+  historyLoading: boolean;
+  scrollHeight: number;
+  clientHeight: number;
+  slackPx: number;
+}): boolean {
+  return (
+    args.hasMore &&
+    !args.olderLoading &&
+    !args.historyLoading &&
+    args.scrollHeight <= args.clientHeight + args.slackPx
+  );
+}
+
+/** Map a displayed thread to the row keys that get a `CompactionDivider`
+ *  rendered *before* them: the first row whose ordinal lands at/after a
+ *  compaction watermark (`ordinal`), i.e. the seam where a compaction rewrote
+ *  the LLM context. The pre-compaction messages above it still render (their
+ *  superseded originals) — the divider only marks that the model no longer sees
+ *  them. Both sides must be loaded: a watermark above every loaded row draws no
+ *  divider until scroll-up pages the pre-compaction originals in. Rows with no
+ *  message/work ordinal (notices, optimistic sends) are skipped, so an
+ *  interleaved notice can't misplace the seam. Each key maps to the newest
+ *  crossed boundary's time (`at`). */
+export function compactionDividerKeys(
+  transcript: TranscriptRow[],
+  compactionPoints: { ordinal: number; at: string }[],
+): Map<string, string> {
+  const out = new Map<string, string>();
+  if (compactionPoints.length === 0) return out;
+  let prevOrdinal: number | null = null;
+  for (const row of transcript) {
+    const ordinal = workRowOrdinal(row.key);
+    if (ordinal === null) continue;
+    if (prevOrdinal !== null) {
+      const lower = prevOrdinal;
+      const crossed = compactionPoints
+        .filter((p) => p.ordinal > lower && p.ordinal <= ordinal)
+        .at(-1);
+      if (crossed) out.set(row.key, crossed.at);
+    }
+    prevOrdinal = ordinal;
+  }
+  return out;
 }
 
 /** Collapse each adjacent same-turn work pair in an assembled row list.
@@ -5540,6 +5754,53 @@ function CancelledTurnIndicator() {
         <RiCloseLine className="text-xs shrink-0" />
         Cancelled
       </span>
+    </div>
+  );
+}
+
+/** Compact centered "Stopped" marker painted in place of a `/stop`
+ *  acknowledgement notice (a hairline flanking a small square + "Stopped"),
+ *  matching the iOS transcript. The verbose "Stopped.\n- Cancelled…" text and
+ *  the `/stop` command echo are not shown — the turn's work block already reads
+ *  "Cancelled". */
+function StoppedIndicator() {
+  return (
+    <div className="flex items-center gap-3 py-0.5 select-none" role="status">
+      <div className="flex-1 border-t border-black/15" />
+      <span className="flex items-center gap-1.5 font-mono text-[0.65rem] uppercase tracking-wider text-ink-soft">
+        <span className="w-1.5 h-1.5 bg-ink-soft shrink-0" aria-hidden />
+        Stopped
+      </span>
+      <div className="flex-1 border-t border-black/15" />
+    </div>
+  );
+}
+
+/** Seam marking where a context compaction rewrote the LLM context. The
+ *  messages above it still render normally (their pre-compaction originals),
+ *  but the model no longer sees them — it sees the summary compaction wrote in
+ *  their place. Placed before the first displayed row at/after the boundary
+ *  ordinal; `at` is the newest boundary's compaction time. */
+function CompactionDivider({ at }: { at?: string }) {
+  return (
+    <div
+      className="flex items-center gap-3 py-1 select-none"
+      title="Everything above this line was compacted away. The model sees a summary of it, not these original messages."
+    >
+      <div className="flex-1 border-t border-dashed border-black/25" />
+      <span className="flex items-center gap-1.5 font-mono text-[0.65rem] uppercase tracking-wider text-ink-soft">
+        <RiHistoryLine className="text-sm shrink-0" aria-hidden />
+        compacted
+        {at != null ? (
+          <span
+            className="tabular-nums normal-case tracking-normal opacity-80"
+            title={formatTimestampTooltip(at)}
+          >
+            {formatTimestampShort(at)}
+          </span>
+        ) : null}
+      </span>
+      <div className="flex-1 border-t border-dashed border-black/25" />
     </div>
   );
 }

@@ -1518,6 +1518,7 @@ mod tests {
                 ordinal,
                 superseded_by: None,
                 created_at: chrono::Utc::now(),
+                compaction_inserted: false,
                 message: message.clone(),
             });
             Ok(ordinal)
@@ -1600,6 +1601,7 @@ mod tests {
                     ordinal: next_ordinal + offset as i64,
                     superseded_by: None,
                     created_at: stamp,
+                    compaction_inserted: true,
                     message: msg.clone(),
                 });
             }
@@ -1690,7 +1692,7 @@ mod tests {
                 .filter_map(|id| {
                     msgs.get(id).and_then(|rows| {
                         rows.iter()
-                            .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                            .filter(|m| !m.compaction_inserted && m.message.from_user())
                             .max_by_key(|m| m.ordinal)
                             .map(|m| (id.clone(), m.created_at, m.message.clone()))
                     })
@@ -1710,7 +1712,7 @@ mod tests {
             for id in session_ids {
                 if let Some(rows) = msgs.get(id) {
                     let mut active: Vec<_> =
-                        rows.iter().filter(|m| m.superseded_by.is_none()).collect();
+                        rows.iter().filter(|m| !m.compaction_inserted).collect();
                     active.sort_by_key(|m| m.ordinal);
                     let start = active.len().saturating_sub(limit);
                     out.extend(
@@ -1738,7 +1740,7 @@ mod tests {
                 if let Some(rows) = msgs.get(id) {
                     let mut active: Vec<_> = rows
                         .iter()
-                        .filter(|m| m.superseded_by.is_none() && m.ordinal > cursor)
+                        .filter(|m| !m.compaction_inserted && m.ordinal > cursor)
                         .collect();
                     active.sort_by_key(|m| m.ordinal);
                     out.extend(
@@ -1852,8 +1854,7 @@ mod tests {
                     let active: Vec<&StoredMessage> = log
                         .iter()
                         .filter(|m| {
-                            m.superseded_by.is_none()
-                                && before_ordinal.is_none_or(|b| m.ordinal < b)
+                            !m.compaction_inserted && before_ordinal.is_none_or(|b| m.ordinal < b)
                         })
                         .collect();
                     let skip = active.len().saturating_sub(limit);
@@ -1883,9 +1884,32 @@ mod tests {
                 .get(id)
                 .map(|log| {
                     log.iter()
-                        .filter(|m| m.superseded_by.is_none() && m.ordinal > after_ordinal)
+                        .filter(|m| !m.compaction_inserted && m.ordinal > after_ordinal)
                         .take(limit)
                         .map(|m| (m.ordinal, m.created_at, m.message.clone()))
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+        async fn compaction_boundaries(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<Vec<(i64, chrono::DateTime<chrono::Utc>)>, baybo_store::StorageError>
+        {
+            Ok(self
+                .messages
+                .lock()
+                .get(id)
+                .map(|log| {
+                    let watermarks: std::collections::BTreeSet<i64> =
+                        log.iter().filter_map(|m| m.superseded_by).collect();
+                    watermarks
+                        .into_iter()
+                        .filter_map(|w| {
+                            log.iter()
+                                .find(|m| m.ordinal == w)
+                                .map(|m| (w, m.created_at))
+                        })
                         .collect()
                 })
                 .unwrap_or_default())

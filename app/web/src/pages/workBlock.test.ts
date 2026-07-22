@@ -10,6 +10,8 @@ import {
   finalizeTrailingAnswer,
   isStopCommand,
   isStopCancellationNotice,
+  isStopAckNotice,
+  stopRowKind,
   markLastWorkCancelled,
   pushToolStartedStep,
   applyToolCompletedStep,
@@ -604,5 +606,35 @@ describe('foldAdjacentWork — a turn cut by a page boundary is still one turn',
   it('declines to fuse when completeness is unknown (older server) — degrades to two blocks', () => {
     const unknownHead: TranscriptRow = { ...first(), workComplete: undefined };
     expect(foldAdjacentWork([unknownHead, second()])).toHaveLength(2);
+  });
+});
+
+describe('stopRowKind — /stop echo hidden, ack rendered as a compact indicator (iOS parity)', () => {
+  const row = (r: Partial<TranscriptRow>): TranscriptRow => ({ key: 'k', role: 'system', text: '', ...r });
+
+  it('flags the /stop command echo (a user bubble) as an echo to hide', () => {
+    expect(stopRowKind(row({ role: 'user', text: '/stop' }))).toBe('echo');
+    expect(stopRowKind(row({ role: 'user', text: '/stop@bot' }))).toBe('echo');
+  });
+
+  it('flags a "Stopped." acknowledgement (and the no-op variant) as an ack', () => {
+    expect(
+      stopRowKind(row({ notice: { level: 'info', text: 'Stopped.\n- Cancelled the in-progress reply.' } })),
+    ).toBe('ack');
+    expect(stopRowKind(row({ notice: { level: 'info', text: 'Nothing in progress to stop.' } }))).toBe('ack');
+  });
+
+  it('leaves ordinary rows (a real user message, a reply, an unrelated notice) alone', () => {
+    expect(stopRowKind(row({ role: 'user', text: 'please stop being slow' }))).toBeNull();
+    expect(stopRowKind(row({ role: 'assistant', text: 'done' }))).toBeNull();
+    expect(stopRowKind(row({ notice: { level: 'error', text: 'Turn failed.' } }))).toBeNull();
+  });
+
+  it('isStopAckNotice matches iOS (startsWith "Stopped." or the no-op line)', () => {
+    expect(isStopAckNotice('Stopped.\n- Cancelled the in-progress reply.')).toBe(true);
+    expect(isStopAckNotice('Nothing in progress to stop.')).toBe(true);
+    expect(isStopAckNotice('Context compacted.')).toBe(false);
+    // The real-cancel predicate is a stricter subset used for turn-state logic.
+    expect(isStopCancellationNotice('Nothing in progress to stop.')).toBe(false);
   });
 });

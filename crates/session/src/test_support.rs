@@ -30,6 +30,10 @@ struct StoredMessageRow {
     superseded_by: Option<u64>,
     created_at: DateTime<Utc>,
     source_event_id: Option<String>,
+    /// `true` for a row `apply_session_compaction` wrote (summary head +
+    /// re-injected recent turns). The display reads hide these; mirrors the
+    /// sqlite `session_messages.compaction_inserted` column.
+    compaction_inserted: bool,
 }
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage
@@ -254,6 +258,7 @@ impl SessionStore for MemorySessionStore {
             superseded_by: None,
             created_at: Utc::now(),
             source_event_id: None,
+            compaction_inserted: false,
         });
         i64::try_from(ordinal).map_err(|_| {
             StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
@@ -302,6 +307,7 @@ impl SessionStore for MemorySessionStore {
             superseded_by: None,
             created_at: Utc::now(),
             source_event_id: Some(source_event_id.to_string()),
+            compaction_inserted: false,
         });
         Ok(SessionMessageAppendOutcome::Inserted {
             ordinal: stored_ordinal,
@@ -403,6 +409,7 @@ impl SessionStore for MemorySessionStore {
                 superseded_by: None,
                 created_at: stamp,
                 source_event_id: None,
+                compaction_inserted: true,
             });
         }
         Ok(next_ordinal as i64)
@@ -458,6 +465,7 @@ impl SessionStore for MemorySessionStore {
                         ordinal: m.ordinal as i64,
                         superseded_by: m.superseded_by.map(|v| v as i64),
                         created_at: m.created_at,
+                        compaction_inserted: m.compaction_inserted,
                         message: m.message.clone(),
                     })
                     .collect();
@@ -500,7 +508,7 @@ impl SessionStore for MemorySessionStore {
             .filter_map(|id| {
                 transcripts.get(id).and_then(|log| {
                     log.iter()
-                        .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                        .filter(|m| !m.compaction_inserted && m.message.from_user())
                         .max_by_key(|m| m.ordinal)
                         .map(|m| (id.clone(), m.created_at, m.message.clone()))
                 })
@@ -517,7 +525,7 @@ impl SessionStore for MemorySessionStore {
         let mut out = Vec::new();
         for id in session_ids {
             if let Some(log) = transcripts.get(id) {
-                let mut active: Vec<_> = log.iter().filter(|m| m.superseded_by.is_none()).collect();
+                let mut active: Vec<_> = log.iter().filter(|m| !m.compaction_inserted).collect();
                 active.sort_by_key(|m| m.ordinal);
                 let start = active.len().saturating_sub(limit);
                 out.extend(active[start..].iter().map(|m| {
@@ -546,7 +554,7 @@ impl SessionStore for MemorySessionStore {
             if let Some(log) = transcripts.get(id) {
                 let mut active: Vec<_> = log
                     .iter()
-                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) > cursor)
+                    .filter(|m| !m.compaction_inserted && (m.ordinal as i64) > cursor)
                     .collect();
                 active.sort_by_key(|m| m.ordinal);
                 out.extend(
@@ -659,7 +667,7 @@ impl SessionStore for MemorySessionStore {
                 let mut active: Vec<&StoredMessageRow> = log
                     .iter()
                     .filter(|m| {
-                        m.superseded_by.is_none()
+                        !m.compaction_inserted
                             && before_ordinal.is_none_or(|b| (m.ordinal as i64) < b)
                     })
                     .collect();
@@ -690,13 +698,36 @@ impl SessionStore for MemorySessionStore {
             .map(|log| {
                 let mut active: Vec<&StoredMessageRow> = log
                     .iter()
-                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) > after_ordinal)
+                    .filter(|m| !m.compaction_inserted && (m.ordinal as i64) > after_ordinal)
                     .collect();
                 active.sort_by_key(|m| m.ordinal);
                 active
                     .into_iter()
                     .take(limit)
                     .map(|m| (m.ordinal as i64, m.created_at, m.message.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn compaction_boundaries(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(i64, DateTime<Utc>)>> {
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let watermarks: std::collections::BTreeSet<u64> =
+                    log.iter().filter_map(|m| m.superseded_by).collect();
+                watermarks
+                    .into_iter()
+                    .filter_map(|w| {
+                        log.iter()
+                            .find(|m| m.ordinal == w)
+                            .map(|m| (w as i64, m.created_at))
+                    })
                     .collect()
             })
             .unwrap_or_default())

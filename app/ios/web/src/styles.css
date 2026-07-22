@@ -262,6 +262,27 @@ button {
 .send-failed:active { opacity: 0.6; }
 .bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+/* Pre-compaction seam: a centered uppercase label flanked by hairlines. Marks
+   where a compaction rewrote the model's context — the messages above still
+   render, the model just no longer sees them. */
+.compaction-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.25rem 0;
+  color: var(--color-ink-soft);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  user-select: none;
+}
+.compaction-divider::before,
+.compaction-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-line);
+}
 /* Older-page paging: a small monochrome ring centered at the top of the log
    while the fetch is in flight — the send/work-spinner idiom, not a stray
    assistant bubble with a static ellipsis. */

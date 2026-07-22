@@ -241,6 +241,19 @@ same `TranscriptRow` DTO and **must not be filtered client-side** (the iOS FFI
 `kind == "message"` filter is deleted; negative-ordinal control rows get their
 own row keys instead of polluting the ordinal dedup space).
 
+**Every transcript read serves the real conversation, not the active set.** Both
+planes — forward `sync` (`load_active_session_messages_since`) and backward
+paging (`load_active_session_messages_tail`) — filter `compaction_inserted = 0`,
+NOT `superseded_by IS NULL`. So a compacted session shows each genuine turn once:
+the superseded pre-compaction originals page in on scroll-up like any history,
+while the summary head and the recent turns compaction re-injected verbatim (the
+machinery, `compaction_inserted = 1`) are hidden — there is no client-side dedup
+to get right, and both the web and iOS bundles render the same clean stream. The
+LLM-context reads (`load_active_session_messages`) still return the active set,
+machinery included; the display filter never touches them.
+`ChatSessionDetail.compaction_points` (on the baseline/meta fetch only) marks
+where each compaction cut so the client can draw a boundary divider.
+
 ### State plane: subscribe returns a bundle, not a history
 
 `Subscribe` loses its replay half entirely. `since_ordinal` is removed from

@@ -333,6 +333,16 @@ struct HistoryPageFrame {
     has_more: bool,
 }
 
+/// One context-compaction boundary (`ChatSessionDetail.compaction_points` /
+/// `ChatSyncResponse.compaction_points`): the summary-head `ordinal` and the
+/// compaction time `at`. Passed verbatim to the webview, which draws a
+/// pre-compaction divider before the first row at/after `ordinal`.
+#[derive(Deserialize, Serialize)]
+struct CompactionPoint {
+    ordinal: i64,
+    at: String,
+}
+
 /// `GET /v1/chat/sessions/{id}/sync` — the one forward-recovery pull.
 #[derive(Deserialize)]
 struct ChatSyncResponse {
@@ -343,6 +353,10 @@ struct ChatSyncResponse {
     #[serde(default)]
     oldest_ordinal: Option<i64>,
     has_more_older: bool,
+    /// Compaction boundaries, carried on every sync so the webview can draw
+    /// the pre-compaction divider without a separate meta fetch.
+    #[serde(default)]
+    compaction_points: Vec<CompactionPoint>,
 }
 
 /// Native-synthesized frame for the web transcript bridge: one sync page.
@@ -359,6 +373,10 @@ struct SyncPageFrame {
     rebased: bool,
     oldest_ordinal: Option<i64>,
     has_more_older: bool,
+    /// Omitted (not `[]`) for a never-compacted session, so the common frame
+    /// shape is unchanged; the webview reads it as an optional field.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compaction_points: Vec<CompactionPoint>,
 }
 
 /// `GET /v1/chat/sessions/{id}/messages?platform_msg_id=…` — the per-send
@@ -813,6 +831,7 @@ pub(crate) async fn fetch_sync<C: GatewayJsonClient + Sync>(
         rebased: response.rebased,
         oldest_ordinal: response.oldest_ordinal,
         has_more_older: response.has_more_older,
+        compaction_points: response.compaction_points,
     };
     serde_json::to_string(&frame).map_err(|e| format!("encode sync page: {e}"))
 }
@@ -1118,6 +1137,28 @@ mod tests {
             frame.contains(r#""since_ordinal":null"#),
             "the baseline marker must survive as a literal null: {frame}"
         );
+        // A never-compacted session omits the field entirely (not `[]`), so the
+        // common frame shape is unchanged.
+        assert!(
+            !frame.contains("compaction_points"),
+            "no boundaries ⇒ no field: {frame}"
+        );
+    }
+
+    /// A compacted session's sync carries its boundaries through to the webview
+    /// verbatim, so the pre-compaction divider survives a warm re-entry's
+    /// difference sync (not just a baseline).
+    #[tokio::test]
+    async fn a_sync_page_carries_compaction_points_verbatim() {
+        let client = RecordingClient::new(
+            r#"{"rows":[{"id":"m7"}],"next_cursor":7,"rebased":false,"oldest_ordinal":0,"has_more_older":false,"compaction_points":[{"ordinal":3,"at":"2026-07-22T10:00:00Z"}]}"#,
+        );
+        let frame = fetch_sync(&client, "s1".to_string(), Some(2), 50)
+            .await
+            .expect("sync");
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("parse");
+        assert_eq!(json["compaction_points"][0]["ordinal"], 3);
+        assert_eq!(json["compaction_points"][0]["at"], "2026-07-22T10:00:00Z");
     }
 
     #[tokio::test]
