@@ -277,7 +277,10 @@ mod tests {
     }
 
     async fn store_with_session(id: &str) -> (SqliteTaskStore, SessionId) {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session(id)).await.unwrap();
         (SqliteTaskStore::new(pool), SessionId::from(id))
@@ -353,7 +356,10 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_cascade_delete_with_session() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = SqliteSessionStore::new(pool.clone());
         let s = make_session("s-cascade");
         sessions.save(&s).await.unwrap();

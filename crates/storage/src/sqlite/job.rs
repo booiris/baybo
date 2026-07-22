@@ -353,7 +353,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         let j = test_job();
         create(&store, &j).await;
@@ -362,7 +365,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_updates_status() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         let mut j = test_job();
         create(&store, &j).await;
@@ -375,7 +381,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_nonexistent_returns_not_found() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         let j = test_job();
         let err = store.save(&j.to_row().unwrap()).await.unwrap_err();
@@ -384,7 +393,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_session_filters() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         create(&store, &test_job()).await;
         create(&store, &test_job()).await;
@@ -397,7 +409,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_recoverable_includes_pending_in_progress_stuck() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         create(&store, &test_job()).await;
 
@@ -429,7 +444,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_by_session_scopes_and_filters_status() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         let sess_a = SessionId::from("sess-a");
         let sess_b = SessionId::from("sess-b");
@@ -475,7 +493,10 @@ mod tests {
     async fn session_job_stats_groups_and_picks_latest_status() {
         use std::collections::HashMap;
 
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteJobStore::new(pool);
         let sess_a = SessionId::from("sess-a");
         let sess_b = SessionId::from("sess-b");

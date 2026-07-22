@@ -302,7 +302,10 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     async fn open_store() -> SqliteAgentProfileStore {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         SqliteAgentProfileStore::open(pool).await.unwrap()
     }
 
@@ -354,7 +357,10 @@ mod tests {
 
     #[tokio::test]
     async fn reseed_preserves_builtin_avatar() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteAgentProfileStore::open(pool.clone()).await.unwrap();
         let builtin = AgentProfileId::builtin();
         assert!(

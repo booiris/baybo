@@ -248,13 +248,19 @@ mod tests {
         }
     }
 
-    async fn fresh_pool() -> SqlitePool {
-        SqlitePool::open_in_memory().await.unwrap()
+    /// Hands back the `TempDir` too: dropping it deletes the database file
+    /// and its `-wal`/`-shm` siblings out from under the live connections.
+    async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        (tmpdir, pool)
     }
 
     #[tokio::test]
     async fn upsert_then_get_round_trips() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s1")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -278,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_increments_pass_count_and_accumulates_cost() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s2")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -306,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn repoint_cursor_moves_cursor_without_touching_telemetry() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s-repoint")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -329,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn repoint_cursor_never_inserts_a_missing_row() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s-absent")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -342,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn bump_error_count_creates_row_when_missing_and_increments_on_conflict() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s3")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -370,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_after_error_resets_error_count() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s4")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -398,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_is_idempotent() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s5")).await.unwrap();
         let store = SqliteSessionSummaryStore::new(pool);
@@ -415,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_session_ids_returns_sorted_set() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         for id in ["b", "a", "c"] {
             sessions.save(&make_session(id)).await.unwrap();
@@ -441,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn cascade_delete_when_parent_session_removed() {
-        let pool = fresh_pool().await;
+        let (_tmpdir, pool) = fresh_pool().await;
         let sessions = SqliteSessionStore::new(pool.clone());
         let s = make_session("s-cascade");
         sessions.save(&s).await.unwrap();

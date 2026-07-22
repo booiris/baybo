@@ -396,13 +396,19 @@ mod tests {
         }
     }
 
-    async fn store() -> SqliteDeviceStore {
-        SqliteDeviceStore::new(SqlitePool::open_in_memory().await.unwrap())
+    /// Hands back the `TempDir` too: dropping it deletes the database file
+    /// and its `-wal`/`-shm` siblings out from under the live connections.
+    async fn store() -> (tempfile::TempDir, SqliteDeviceStore) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        (tmpdir, SqliteDeviceStore::new(pool))
     }
 
     #[tokio::test]
     async fn create_then_get_round_trips_blob() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "tok1", "ABC123")).await.unwrap();
         let got = s.get("d1").await.unwrap().unwrap();
         assert_eq!(got.device_id, "d1");
@@ -413,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_auth_token_conflicts() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "shared", "C1")).await.unwrap();
         let err = s
             .create(&device_row("d2", "shared", "C2"))
@@ -424,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_token_authenticates_until_revoked() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "tok1", "CODE12")).await.unwrap();
         // A freshly-paired row exists only post-confirm, so it authenticates now.
         let resolved = s
@@ -446,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_by_pubkey_matches_only_approved() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "tok1", "C1")).await.unwrap(); // device_pubkey = [7u8; 32]
         let got = s
             .lookup_approved_by_pubkey(&[7u8; 32])
@@ -473,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_keeps_row_but_kills_auth() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "tok1", "CODE12")).await.unwrap();
         assert!(s.revoke("d1").await.unwrap());
 
@@ -494,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_filters_by_status() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "t1", "C1")).await.unwrap();
         // Replacing keeps the one-approved invariant: d1 → revoked, d2 →
         // approved. (A bare second `create` would trip the index.)
@@ -516,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_replacing_approved_supersedes_prior_device() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         // First pairing: nothing to replace.
         let replaced = s
             .create_replacing_approved(&device_row("d1", "tok1", "C1"))
@@ -560,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_replacing_approved_repairs_same_device_id_in_place() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         // First pairing of device d1.
         s.create_replacing_approved(&device_row("d1", "tok1", "C1"))
             .await
@@ -604,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_approved_index_blocks_a_second_approved_insert() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "tok1", "C1")).await.unwrap();
         // A bare `create` of a second approved row trips the partial unique
         // index — the backstop behind `create_replacing_approved`.
@@ -614,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn touch_last_seen_updates() {
-        let s = store().await;
+        let (_tmpdir, s) = store().await;
         s.create(&device_row("d1", "t1", "C1")).await.unwrap();
         s.touch_last_seen("d1", 555).await.unwrap();
         assert_eq!(s.get("d1").await.unwrap().unwrap().last_seen_at, Some(555));

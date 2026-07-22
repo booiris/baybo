@@ -817,7 +817,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-1", "u1", CronStatus::Enabled))
@@ -835,7 +838,10 @@ mod tests {
     /// `pinned`, the pin would be reverted by the job's next tick.
     #[tokio::test]
     async fn a_fire_and_a_save_cannot_unpin_the_group() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-1", "u1", CronStatus::Enabled))
@@ -879,7 +885,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_pinned_round_trips_and_reports_a_missing_job() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-1", "u1", CronStatus::Enabled))
@@ -908,7 +917,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_updates_row() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-2", "u1", CronStatus::Enabled);
         store.create(&job).await.unwrap();
@@ -922,7 +934,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_nonexistent_returns_not_found() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let err = store
             .save(&test_job("nonexistent", "u1", CronStatus::Enabled))
@@ -935,7 +950,10 @@ mod tests {
     /// resolvable by id, keeping its status untouched.
     #[tokio::test]
     async fn delete_hides_the_job_from_every_listing_but_keeps_the_row() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-3", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -970,7 +988,10 @@ mod tests {
 
     #[tokio::test]
     async fn restore_brings_the_job_back_into_the_listings() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-restore", "u1", CronStatus::Enabled))
@@ -989,7 +1010,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let err = store.delete("nonexistent").await.unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)));
@@ -997,7 +1021,10 @@ mod tests {
 
     #[tokio::test]
     async fn restore_nonexistent_returns_not_found() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let err = store.restore("nonexistent").await.unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)));
@@ -1018,7 +1045,10 @@ mod tests {
     /// snapshot and keep firing, with the user's stop control silently lost.
     #[tokio::test]
     async fn the_post_fire_write_back_is_dropped_when_the_job_was_paused_or_deleted() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-pause", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -1063,7 +1093,10 @@ mod tests {
     /// the snapshot it was handed before the fire.
     #[tokio::test]
     async fn a_fires_write_back_keeps_an_edit_that_landed_mid_fire() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-edit", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -1103,7 +1136,10 @@ mod tests {
     /// overwrite the fire time they chose. The row moved, so the write is dropped.
     #[tokio::test]
     async fn a_fires_write_back_is_dropped_when_the_job_was_rescheduled_mid_fire() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-resched", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -1138,7 +1174,10 @@ mod tests {
     /// its `last_triggered_at` forgotten.
     #[tokio::test]
     async fn a_save_is_refused_once_the_row_has_moved_or_gone() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-cas", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -1192,7 +1231,10 @@ mod tests {
     /// first, and the caller re-applies it to the row as it now stands.
     #[tokio::test]
     async fn a_write_that_moved_only_the_blob_is_still_seen_by_the_next_one() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-blob-cas", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(future_dt());
@@ -1238,7 +1280,10 @@ mod tests {
     /// a paused job would lose a race it was never in.
     #[tokio::test]
     async fn a_job_holding_no_slot_is_still_editable() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         for (id, status) in [
@@ -1272,7 +1317,10 @@ mod tests {
     /// slot the fire left behind.
     #[tokio::test]
     async fn a_fired_one_shot_is_re_armed_by_an_edit() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-once", "u1", CronStatus::Enabled);
         job.schedule = CronSchedule::at(past_dt());
@@ -1333,7 +1381,10 @@ mod tests {
     /// reverted by a blob re-serialized from the pre-fire snapshot.
     #[tokio::test]
     async fn deleting_a_job_does_not_revert_a_fires_write_back() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let job = test_job("cj-blob", "u1", CronStatus::Enabled);
         store.create(&job).await.unwrap();
@@ -1363,7 +1414,10 @@ mod tests {
     /// user deleted comes back to life and keeps firing.
     #[tokio::test]
     async fn a_save_carrying_a_stale_live_snapshot_does_not_resurrect_a_deleted_job() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-race", "u1", CronStatus::Enabled);
         job.next_trigger_at = Some(past_dt());
@@ -1398,7 +1452,10 @@ mod tests {
     /// just now" because a retry or a double-click sent the delete again.
     #[tokio::test]
     async fn deleting_an_already_deleted_job_keeps_the_first_deletion_time() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-twice", "u1", CronStatus::Enabled))
@@ -1430,7 +1487,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_deleted_orders_most_recently_deleted_first() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         for id in ["cj-old", "cj-mid", "cj-new"] {
             store
@@ -1452,7 +1512,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_user_filters_correctly() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-4", "u1", CronStatus::Enabled))
@@ -1473,7 +1536,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_enabled_filters_disabled() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-7", "u1", CronStatus::Enabled))
@@ -1491,7 +1557,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_due_returns_only_past_due() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         let mut past_due = test_job("cj-9", "u1", CronStatus::Enabled);
@@ -1520,7 +1589,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_execution_dedup_returns_already_dispatched() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         let mut exec = test_execution("ce-dup-a", "cj-dup", "u1");
@@ -1545,7 +1617,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_and_list_executions_by_job() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         store
@@ -1567,7 +1642,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_executions_by_user() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         store
@@ -1589,7 +1667,10 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_ledger_round_trips_and_drives_the_awaiting_scan() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         store
@@ -1758,7 +1839,10 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_writes_reject_unknown_execution() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
         let err = store
             .mark_execution_notified("ghost", future_dt())
@@ -1771,7 +1855,10 @@ mod tests {
     /// resolves — the provenance a fire's conversation is named from.
     #[tokio::test]
     async fn execution_records_of_a_deleted_job_still_name_a_real_job() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteCronStore::new(pool);
 
         store

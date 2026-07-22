@@ -695,7 +695,10 @@ mod tests {
     use super::*;
 
     async fn build() -> (SqliteBlobStore, tempfile::TempDir) {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteBlobStore::open(pool, dir.path().join("blobs"))
             .await
@@ -913,7 +916,10 @@ mod tests {
         // explicitly rather than relying on umask.
         unsafe { libc::umask(0o022) };
 
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let blob_root = dir.path().join("blobs");
         let store = SqliteBlobStore::open(pool, &blob_root).await.unwrap();
@@ -1106,7 +1112,10 @@ mod tests {
         .unwrap();
         drop(file);
 
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let _store = SqliteBlobStore::open(pool, &root).await.unwrap();
 
         assert!(!stale.exists(), "stale inflight tmp reaped at construction");

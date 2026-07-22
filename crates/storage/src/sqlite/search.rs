@@ -448,7 +448,10 @@ mod tests {
     /// `busy_timeout`/`journal_mode`/`synchronous`), and the search path never
     /// joins `sessions`.
     async fn search_store(messages: &[ChatMessage]) -> SqliteMessageSearchStore {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         let sid = SessionId::from(TEST_SESSION.to_string());
         for message in messages {
@@ -663,7 +666,10 @@ mod tests {
     async fn channel_scopes_search_across_sessions() {
         use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
 
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
 
         let mk = |id: &str, channel: &str| {
@@ -737,7 +743,10 @@ mod tests {
     /// others rather than overriding them.
     #[tokio::test]
     async fn session_scopes_search_to_one_conversation() {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         for (id, text) in [("a", "第一个会话里的检索"), ("b", "第二个会话里的检索")]
         {
@@ -785,7 +794,10 @@ mod tests {
     async fn hiding_a_session_removes_it_from_search_without_reindexing() {
         use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
 
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         let sid = SessionId::from(TEST_SESSION.to_string());
         let ch = ChannelType::from("owner");
@@ -877,7 +889,10 @@ mod tests {
     /// The hit reports the supersede pointer so the caller can resolve it.
     #[tokio::test]
     async fn superseded_originals_stay_indexed_and_report_their_pointer() {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         let sid = SessionId::from(TEST_SESSION.to_string());
         sessions
@@ -934,7 +949,10 @@ mod tests {
     /// alphabet than the queries and nothing says so.
     #[tokio::test]
     async fn a_changed_fingerprint_rebuilds_the_whole_index() {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         let sid = SessionId::from(TEST_SESSION.to_string());
         for text in ["第一条消息", "第二条消息"] {
@@ -1024,7 +1042,10 @@ mod tests {
     /// and therefore cannot see this.
     #[tokio::test]
     async fn an_index_from_an_older_schema_is_migrated_not_fatal() {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         sessions
             .append_session_message(
@@ -1068,7 +1089,10 @@ mod tests {
     /// re-scan every row on every open.
     #[tokio::test]
     async fn a_matching_fingerprint_is_a_no_op() {
-        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let sessions = super::super::SqliteSessionStore::new(pool.clone());
         sessions
             .append_session_message(

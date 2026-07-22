@@ -58,7 +58,10 @@ impl Harness {
 /// actually spawns (install / boot with enabled rows).
 async fn harness() -> Harness {
     let root = tempfile::tempdir().unwrap();
-    let pool = SqlitePool::open_in_memory().await.unwrap();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+        .await
+        .unwrap();
     let store = Arc::new(SqliteDeckCardStore::new(pool.clone()));
     let blob = Arc::new(
         SqliteBlobStore::open(pool.clone(), root.path().join("blobs"))

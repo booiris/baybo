@@ -196,7 +196,7 @@ rows themselves carry no unread/acknowledged state.
 
 ### Single backend: sqlite
 
-All store implementations use sqlite (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed sqlite database (creating parent directories if missing); `SqlitePool::open_in_memory()` is still available for tests. `SqlitePool` wraps a shared `sqlite::Connection` behind `Arc` for cheap cloning across async tasks.
+All store implementations use sqlite (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed sqlite database (creating parent directories if missing). There is **one** way to open a pool and tests use it too — a temp-dir path — rather than a test-only in-memory mode: a store with no on-disk home reports `StoreIdentity::Ephemeral`, which tells cross-process coordination there is no peer to synchronise with, and that is a silent footgun to leave reachable from production code. `SqlitePool` wraps a shared `sqlite::Connection` behind `Arc` for cheap cloning across async tasks.
 
 The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/state/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 

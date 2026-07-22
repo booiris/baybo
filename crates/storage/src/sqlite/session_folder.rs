@@ -266,7 +266,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_list_rename() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionFolderStore::new(pool);
         store.create(&folder_row("a", None, "A", 0)).await.unwrap();
         store.create(&folder_row("b", None, "B", 1)).await.unwrap();
@@ -288,7 +291,10 @@ mod tests {
 
     #[tokio::test]
     async fn reorder_renumbers_sibling_group() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteSessionFolderStore::new(pool);
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
             store
@@ -318,7 +324,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_dissolves_without_removing_sessions() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let folders = SqliteSessionFolderStore::new(pool.clone());
         let sessions = SqliteSessionStore::new(pool);
 

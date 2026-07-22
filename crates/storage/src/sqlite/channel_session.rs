@@ -86,7 +86,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_none_for_missing_mapping() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelSessionStore::new(pool);
         let out = store.get(&ChannelType::telegram(), "tg_42").await.unwrap();
         assert!(out.is_none());
@@ -94,7 +97,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_get_round_trips() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-abc"))
@@ -106,7 +112,10 @@ mod tests {
 
     #[tokio::test]
     async fn put_on_conflict_keeps_existing_session_id() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-first"))
@@ -122,7 +131,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_put_creates_fresh_mapping() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-a"))
@@ -153,7 +165,10 @@ mod tests {
 
     #[tokio::test]
     async fn different_channel_types_do_not_collide() {
-        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
         let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-tg"))

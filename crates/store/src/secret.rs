@@ -20,8 +20,10 @@ pub enum StoreIdentity {
     /// this process AND in any other, so this is also the anchor for
     /// cross-process locks.
     File(PathBuf),
-    /// Process-local with no on-disk identity (in-memory test stores).
-    /// Unique per store, so tests never share coordination state.
+    /// No on-disk home, so no peer process can address this store and there
+    /// is nothing to coordinate with across processes. Unique per store.
+    /// In-memory stores are the only ones today — which is also what gives
+    /// each test its own coordination state.
     Ephemeral(u64),
 }
 
