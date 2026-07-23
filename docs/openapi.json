@@ -4839,6 +4839,13 @@
           "has_more"
         ],
         "properties": {
+          "compaction_points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompactionPoint"
+            },
+            "description": "Compaction boundaries for this session — one entry per context\ncompaction, ascending by ordinal, empty when the session has never\nbeen compacted. Each marks where a compaction rewrote the LLM\ncontext; the transcript itself still shows the real pre-compaction\nmessages (their superseded originals), and the web draws a\n\"pre-compaction history\" divider before the first displayed row at\nor after each `ordinal`. Session-level metadata, independent of the\nreturned page slice, so it is stable across scroll-up pagination and\ncarried only on the baseline/meta fetch (`before_ordinal` absent)."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -5019,6 +5026,13 @@
           "has_more_older"
         ],
         "properties": {
+          "compaction_points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompactionPoint"
+            },
+            "description": "Compaction boundaries for this session — same value as\n[`ChatSessionDetail::compaction_points`], carried on the sync\nresponse so a client that loads its transcript through the sync\nloop (the iOS bundle) gets the pre-compaction divider without a\nseparate meta fetch. Present on EVERY sync (baseline and\ndifference), not just the baseline: a client that persists its\ncursor re-opens with a difference sync, so gating this to the\nbaseline would strand the divider on every warm re-entry."
+          },
           "has_more_older": {
             "type": "boolean",
             "description": "Whether older history exists below `oldest_ordinal` (REPLACE\nresponses only; always `false` on a difference response)."
@@ -5205,6 +5219,24 @@
               "null"
             ],
             "description": "One-line summary re-derived from the persisted tool result. `None`\nwhen the result for this call didn't land in the fetched window.\n\nDeliberately a snippet of the actual result, not a content-light\ncount: this surface is the bearer-gated, operator-only chat reload\n(never the live multi-channel fan-out), so it favors debugging\nusefulness. Unlike the live `ToolCompleted.summary` it is NOT run\nthrough `sanitize_stream_fragment`, so it can show raw tool output\nthe live UI withheld — acceptable for the operator's own view."
+          }
+        }
+      },
+      "CompactionPoint": {
+        "type": "object",
+        "description": "One context-compaction boundary: the summary head compaction wrote at\n`ordinal`, stamped with the compaction time (`at`, the head row's\n`created_at`). The transcript still renders the real messages below it;\nthis only tells the client where to draw the boundary divider.",
+        "required": [
+          "ordinal",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

@@ -105,6 +105,15 @@ export type TranscriptRowItem = {
   notice_level?: string;
 };
 
+/// One context-compaction boundary (`ChatSessionDetail.compaction_points`,
+/// carried on the `sync_page` frame): the summary-head `ordinal` and the
+/// compaction time `at`. A `CompactionDivider` renders before the first
+/// displayed row at/after `ordinal`.
+export type CompactionPoint = {
+  ordinal: number;
+  at: string;
+};
+
 /// One pending approval prompt inside a `subscribe_state` bundle — the wire
 /// mirror of the Rust `wire::ApprovalCard`. The transcript uses only
 /// `tool_call_id` (which work step is waiting); the rest drives the native card.
@@ -213,6 +222,10 @@ export type WireFrame =
       rebased: boolean;
       oldest_ordinal: number | null;
       has_more_older: boolean;
+      // Compaction boundaries (one `{ ordinal, at }` per compaction), carried on
+      // every sync so the divider survives a warm re-entry's difference sync.
+      // Absent on a never-compacted session (serde skips an empty vec).
+      compaction_points?: CompactionPoint[];
     }
   // Synthesized NATIVE-side (not a wire frame): a chatFetchSync API call
   // failed, so the in-flight sync guard must unwind (the next trigger retries).
@@ -300,6 +313,11 @@ export type PersistedState = {
   /// each image's exact box before its bytes arrive, so the transcript doesn't
   /// resize under the reader. Absent on a mirror written before this existed.
   imageDims?: Record<string, [number, number]>;
+  /// Compaction boundaries last seen for this session, so the pre-compaction
+  /// divider paints on the mirror's cold open without waiting for the mount
+  /// sync (which then refreshes it). Absent on a mirror written before this
+  /// existed, or on a never-compacted session.
+  compactionPoints?: CompactionPoint[];
 };
 
 let uidCounter = 0;

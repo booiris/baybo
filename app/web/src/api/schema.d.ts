@@ -1238,6 +1238,18 @@ export interface components {
             session_id: string;
         };
         ChatSessionDetail: {
+            /**
+             * @description Compaction boundaries for this session — one entry per context
+             *     compaction, ascending by ordinal, empty when the session has never
+             *     been compacted. Each marks where a compaction rewrote the LLM
+             *     context; the transcript itself still shows the real pre-compaction
+             *     messages (their superseded originals), and the web draws a
+             *     "pre-compaction history" divider before the first displayed row at
+             *     or after each `ordinal`. Session-level metadata, independent of the
+             *     returned page slice, so it is stable across scroll-up pagination and
+             *     carried only on the baseline/meta fetch (`before_ordinal` absent).
+             */
+            compaction_points?: components["schemas"]["CompactionPoint"][];
             /** Format: date-time */
             created_at: string;
             /**
@@ -1391,6 +1403,17 @@ export interface components {
          *     blocks and notices exactly like the history surface.
          */
         ChatSyncResponse: {
+            /**
+             * @description Compaction boundaries for this session — same value as
+             *     [`ChatSessionDetail::compaction_points`], carried on the sync
+             *     response so a client that loads its transcript through the sync
+             *     loop (the iOS bundle) gets the pre-compaction divider without a
+             *     separate meta fetch. Present on EVERY sync (baseline and
+             *     difference), not just the baseline: a client that persists its
+             *     cursor re-opens with a difference sync, so gating this to the
+             *     baseline would strand the divider on every warm re-entry.
+             */
+            compaction_points?: components["schemas"]["CompactionPoint"][];
             /**
              * @description Whether older history exists below `oldest_ordinal` (REPLACE
              *     responses only; always `false` on a difference response).
@@ -1595,6 +1618,18 @@ export interface components {
              *     the live UI withheld — acceptable for the operator's own view.
              */
             tool_summary?: string | null;
+        };
+        /**
+         * @description One context-compaction boundary: the summary head compaction wrote at
+         *     `ordinal`, stamped with the compaction time (`at`, the head row's
+         *     `created_at`). The transcript still renders the real messages below it;
+         *     this only tells the client where to draw the boundary divider.
+         */
+        CompactionPoint: {
+            /** Format: date-time */
+            at: string;
+            /** Format: int64 */
+            ordinal: number;
         };
         /**
          * @description Request body for `POST /v1/agents`. Absent nullable fields mean

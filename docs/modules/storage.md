@@ -113,17 +113,35 @@ instead of copying message content:
 summarisation both go through `apply_session_compaction(session, new_active)`,
 which in one transaction (a) bulk-marks every currently-active row
 `superseded_by = <first new ordinal>`, then (b) appends `new_active` at the next
-contiguous ordinals. The pre-compaction rows stay in the table forever (the full
-transcript is always recoverable); only their `superseded_by` flips from NULL to
-the summary's ordinal.
+contiguous ordinals, **each stamped `compaction_inserted = 1`**. `new_active` is
+the reseeded system prompt + the summary head + the recent turns kept verbatim
+and re-injected — all machinery the model needs but the chat view must not show
+twice. The pre-compaction rows stay in the table forever (the full transcript is
+always recoverable); only their `superseded_by` flips from NULL to the summary's
+ordinal.
 
-**Two derived views over the one log:**
+**Three derived views over the one log:**
 
 - **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
-  the live LLM context. Served by `load_active_session_messages`; a partial index
+  the live LLM context (machinery included). Served by
+  `load_active_session_messages` / `_up_to`; a partial index
   `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
-  NULL` makes it a back-of-index walk, never a full scan.
-- **Full history** — every row ever appended, ignoring `superseded_by`.
+  NULL` makes it a back-of-index walk, never a full scan. **The context reads
+  never filter `compaction_inserted`** — the re-injected turns ARE what the model
+  sees.
+- **Real conversation (display)** — rows where `compaction_inserted = 0`,
+  ordered by `ordinal`: every genuine transcript turn once, machinery elided.
+  This is what the chat surfaces render — `load_active_session_messages_tail`
+  (scroll-up), `_since` (sync + push preview), and the list previews
+  (`last_user_messages` / `active_tails` / `unread_scan`) all carry the
+  `compaction_inserted = 0` filter. After a compaction the superseded
+  pre-compaction originals stay in this view (so the real turn renders from its
+  original, not its re-injected copy); a divider is drawn at each boundary from
+  `compaction_boundaries` (the distinct `superseded_by` watermarks, served by the
+  partial index `idx_session_messages_superseded`). For a session that never
+  compacted, `compaction_inserted = 0` and `superseded_by IS NULL` select the
+  same rows, so this is a no-op there.
+- **Full history** — every row ever appended, ignoring both columns.
 
 **"Active as of ordinal N"** is the reconstruction that lets a stored ordinal
 recover the exact active slice that *was* live when `N` was the head, even after

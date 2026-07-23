@@ -389,11 +389,32 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- a background-notification batch operation). NULL for
                     -- ordinary transcript rows.
                     source_event_id TEXT,
+                    -- 1 for a row `apply_session_compaction` wrote (the reseeded
+                    -- system prompt, the summary head, and the recent turns kept
+                    -- verbatim + re-injected into the new active set); 0 for a
+                    -- genuine appended transcript turn. The chat DISPLAY reads
+                    -- (`_tail`, `_since`, `last_user_messages`) filter
+                    -- `compaction_inserted = 0` so the view is the real
+                    -- conversation once — the re-injected copies are hidden and
+                    -- their still-present superseded originals render instead.
+                    -- The LLM-context reads (`load_active_session_messages`,
+                    -- `_up_to`) and trace reads MUST ignore this column: the
+                    -- machinery rows ARE the model's context.
+                    compaction_inserted INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
                     ON session_messages(session_id, ordinal)
                     WHERE superseded_by IS NULL;
+                -- Distinct compaction watermarks (`superseded_by IS NOT NULL`)
+                -- for `compaction_boundaries` — the summary-head ordinals the
+                -- chat view draws its pre-compaction dividers at. A covering
+                -- partial index so that lookup never scans the full per-session
+                -- log; the active index's `WHERE superseded_by IS NULL` cannot
+                -- serve the opposite predicate.
+                CREATE INDEX IF NOT EXISTS idx_session_messages_superseded
+                    ON session_messages(session_id, superseded_by)
+                    WHERE superseded_by IS NOT NULL;
 
                 -- Identity of the pipeline that produced `message_fts`, so a
                 -- changed segmenter rebuilds instead of leaving half the index
@@ -834,6 +855,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN last_model TEXT",
         "ALTER TABLE sessions ADD COLUMN last_effort TEXT",
+        "ALTER TABLE session_messages ADD COLUMN compaction_inserted INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {

@@ -226,8 +226,6 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 ## Out-of-scope follow-ups (filed for later, not part of B)
 
 1. Multi-profile (e.g. one personal + one workspace account) — vault key would shard to `llm.openai-subscription.profiles.<id>`. `CredentialKey.vault_key` exists for exactly this: populate it from the real key or two profiles collide on one coordinator.
-1. **One-shot clients still arm a background loop.** `create()` (`factory.rs`) is unconditionally `BackgroundRefresh::Enabled`, so `baybo llm probe` parks an hourly task in a process that exits seconds later. Harmless since the cross-process lock landed (the loop can no longer double-spend the token), so this is tidiness, not correctness. Fixing it wants a client-lifetime hint on `LlmProviderConfig`, which has 23 struct-literal construction sites and no `Default`.
-1. **A crashed holder's stale lock file.** `flock` is released by the kernel when the fd closes, including on crash, so the lock itself self-heals — but the empty lock file stays on disk next to the store. Cosmetic.
 2. Wiring the same `OAuthTokenBundle` into image-generation tool calls
 3. Cost tracking — Codex Responses doesn't bill per-token to the user; treat as $0 in `cost` records and document
 4. C track: native Codex app-server harness (sidecar)
