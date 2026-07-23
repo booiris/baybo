@@ -81,6 +81,11 @@ export interface SessionPatch {
   /** Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
    *  into the sidebar's pinned block; `false` moves it back. */
   pinned?: boolean;
+  /** Flipped by `PUT /v1/chat/sessions/:id/archive` (an iOS affordance —
+   *  the web client only honours it). `true` takes the row out of the
+   *  chat list; `false` puts it back. The patch the archive endpoint
+   *  broadcasts carries this field alone. */
+  archived?: boolean;
   /** Changed by `PUT /v1/chat/sessions/:id/folder` and on folder delete.
    *  Present means the assignment changed to this value; absent means no
    *  change. `{ set: { id } }` files under a folder; `'uncategorized'`

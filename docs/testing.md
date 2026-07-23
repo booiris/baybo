@@ -5,8 +5,9 @@ workspace. Read this before adding new tests, especially when the work
 crosses crate boundaries.
 
 This document covers the **Rust** workspace. The `app/web` dashboard's
-TypeScript/vitest suite has its own conventions — pure-logic reducers, no
-rendering — documented in
+TypeScript/vitest suite has its own conventions — mostly pure-logic reducers,
+plus a thin React Testing Library layer for the surfaces whose wiring a reducer
+test cannot reach — documented in
 [`todo/web-unit-tests.md`](todo/web-unit-tests.md).
 
 ## Three-layer pyramid

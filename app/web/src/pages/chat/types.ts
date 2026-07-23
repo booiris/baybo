@@ -10,6 +10,14 @@ export interface SessionSummary {
    *  currently viewing because activity for foreground sessions
    *  doesn't bump. */
   unread: number;
+  /** Whether the user archived this conversation. Archived rows are kept in
+   *  this list — they are the server's truth and an unarchive patch carries
+   *  nothing but the flag — but they are filtered out at render
+   *  (`withoutArchived`), so the sidebar never shows one. Server-authoritative
+   *  (the list endpoint's `archived`); flipped from the iOS app via
+   *  `PUT /v1/chat/sessions/:id/archive` and converged here by
+   *  `Frame::SessionUpdated` patches. */
+  archived: boolean;
   /** Whether the user pinned this session to the top of the chat list.
    *  Pinned rows render in their own block above the regular list.
    *  Server-authoritative (the list endpoint's `pinned` field); toggled
