@@ -72,7 +72,7 @@ struct CronJobsScreen: View {
                             .foregroundStyle(Theme.ink)
                             .frame(width: 42, height: 42)
                     }
-                    .glassEffect(.regular.interactive(), in: .circle)
+                    .glassSurface(interactive: true, in: .circle)
                     .accessibilityLabel(Text(verbatim: lang.t("chat.back")))
 
                     Spacer()

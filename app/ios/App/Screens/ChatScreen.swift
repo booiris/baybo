@@ -62,7 +62,7 @@ struct ChatScreen: View {
                             .foregroundStyle(Theme.ink)
                             .frame(width: 44, height: 44)
                     }
-                    .glassEffect(.regular.interactive(), in: .circle)
+                    .glassSurface(interactive: true, in: .circle)
                     .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
                     .transition(.scale(scale: 0.7).combined(with: .opacity))
                 }
@@ -169,7 +169,7 @@ struct ChatHeaderView: View {
                     .foregroundStyle(Theme.ink)
                     .frame(width: 42, height: 42)
             }
-            .glassEffect(.regular.interactive(), in: .circle)
+            .glassSurface(interactive: true, in: .circle)
             .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.back")))
 
             // The model pill renders only once the catalog has entries —
@@ -214,7 +214,7 @@ struct ChatHeaderView: View {
                 .padding(.horizontal, 16)
                 .frame(height: 42)
         }
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .glassSurface(interactive: true, in: Capsule())
         .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.model")))
         // The a11y label hides the pill's visible text, so surface it as the
         // element's VALUE — the FULL id, not the ellipsized display string:
@@ -230,7 +230,7 @@ struct ChatHeaderView: View {
             .font(.system(size: 15, weight: .semibold))
             .foregroundStyle(Theme.err)
             .frame(width: 42, height: 42)
-            .glassEffect(.regular, in: .circle)
+            .glassSurface(in: .circle)
             .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.offline")))
             .transition(.scale(scale: 0.6).combined(with: .opacity))
     }

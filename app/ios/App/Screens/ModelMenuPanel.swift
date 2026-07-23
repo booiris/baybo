@@ -56,7 +56,9 @@ struct ModelMenuPanel: View {
             }
         }
         .frame(width: Self.panelWidth)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: Theme.radiusModal))
+        .glassSurface(
+            in: RoundedRectangle(cornerRadius: Theme.radiusModal),
+            fallback: .regularMaterial, fallbackShadow: true)
     }
 
     // MARK: - Levels

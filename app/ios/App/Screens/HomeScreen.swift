@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// The bound app's home: a NATIVE iOS 26 `TabView` (Liquid Glass tab bar) over
+/// The bound app's home: a NATIVE `TabView` (Liquid Glass bar on iOS 26+, the
+/// classic system bar on 18–25) over
 /// four sections — Agents · Projects · Chats · Settings. Only Chats and Settings
 /// have real screens; Agents/Projects are placeholders. The chat push lives on the
 /// OUTER `NavigationStack` in `RootView` that WRAPS this TabView, so a pushed
@@ -154,7 +155,7 @@ struct HomeHeaderView: View {
                                 .foregroundStyle(Theme.ink)
                                 .frame(width: 45, height: 45)
                         }
-                        .glassEffect(.regular.interactive(), in: .circle)
+                        .glassSurface(interactive: true, in: .circle)
                         .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
                         Spacer()
                     }
@@ -169,7 +170,7 @@ struct HomeHeaderView: View {
                                 .foregroundStyle(Theme.ink)
                                 .frame(width: 45, height: 45)
                         }
-                        .glassEffect(.regular.interactive(), in: .circle)
+                        .glassSurface(interactive: true, in: .circle)
                         .accessibilityLabel(Text(verbatim: Lang.shared.t("list.newChat")))
                     }
                 }
