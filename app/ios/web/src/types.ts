@@ -242,6 +242,12 @@ export type ChatMsg = {
   role: "user" | "assistant" | "notice";
   content: string;
   attachments?: WireAttachment[];
+  // When the row was said, as an ISO timestamp — the clock under the bubble.
+  // Reconstructed rows carry the server's `created_at`; a live `Frame::Message`
+  // has no time field on the wire, so those (and an optimistic send) are stamped
+  // on arrival. Absent on a mirror written before this existed, and on notices —
+  // those render as centered marks with no clock.
+  createdAt?: string;
   // Delivery state of an optimistic user send. "sending" (native minted the
   // bubble, awaiting the server echo) drives the spinner; "failed" (native
   // reported the send errored) drives the red retry dot. Cleared (undefined)

@@ -26,6 +26,10 @@
      reservation exists to remove. */
   --attachment-max-h: 16rem;
   --chat-row-gap: 1.5rem;
+  /* How far a user message's timestamp is pulled in from the bubble's right
+     edge. Its own knob, NOT the bubble's padding: tying the two together means
+     re-aiming the clock silently re-pads every bubble. */
+  --msg-time-inset: 0.5rem;
   --md-block-gap: 0.75rem;
   /* How wide a code block may grow before it soft-wraps (see `.md pre code`) —
      a MULTIPLE OF THE READING BAND, so the cap is really a bound on how far the
@@ -740,6 +744,24 @@ button {
 }
 .msg-group.user { align-items: flex-end; }
 .msg-group.assistant { align-items: flex-start; }
+/* The message's clock, tucked under its last bubble — the group's align-items
+   sides it (agent bottom-left, user bottom-right). Mono + tabular so a column of
+   times doesn't jitter, and pulled up tight against the bubble: the group gap is
+   sized for stacked attachment bubbles, which is too airy for a caption. Inert
+   to touch so it can't eat a long-press meant for the bubble above it. */
+.msg-time {
+  margin-top: -0.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink-soft);
+  pointer-events: none;
+}
+/* Pull the user's clock in from the bubble's right edge rather than leaving it
+   hanging on the corner. The agent's reply is bubble-less prose already flush at
+   the band's left edge, so its clock needs no inset. */
+.msg-group.user .msg-time { margin-right: var(--msg-time-inset); }
 /* Each attachment stands on its own bubble: the image tile / file chip alone,
    no text-bubble background. */
 .attachment-bubble { max-width: 100%; min-width: 0; }

@@ -145,6 +145,7 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
     role,
     content: item.text ?? "",
     attachments: item.attachments,
+    createdAt: item.created_at,
   };
 }
 
@@ -1018,10 +1019,11 @@ export function formatTime(totalSeconds: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
-/// Compaction time for the pre-compaction divider: `HH:MM` same-day, prefixed
-/// `MM-DD` on an earlier day. Mirrors app/web's `formatTimestampShort` so the
-/// two clients read the same. Empty for an unparseable timestamp.
-export function formatCompactionTime(iso: string): string {
+/// Wall clock for a message's timestamp and the pre-compaction divider: `HH:MM`
+/// same-day, prefixed `MM-DD` on an earlier day. Same name and rule as app/web's
+/// `formatTimestampShort` so the two clients read the same. Empty for an
+/// unparseable timestamp.
+export function formatTimestampShort(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const p = (n: number) => String(n).padStart(2, "0");
@@ -1582,7 +1584,7 @@ function useSharePress(onShare: () => boolean): {
 /// messages above it still render (their pre-compaction originals); the model no
 /// longer sees them — it sees a summary in their place. A hairline + label.
 function CompactionDivider({ label, at }: { label: string; at?: string }) {
-  const time = at != null ? formatCompactionTime(at) : "";
+  const time = at != null ? formatTimestampShort(at) : "";
   return (
     <div className="compaction-divider" role="separator">
       <span>{time ? `${label} ${time}` : label}</span>
@@ -1648,6 +1650,16 @@ const MessageRow = memo(function MessageRow({
   }
 
   const attachments = m.attachments ?? [];
+  // The group's `align-items` already sides it: the agent's clock lands at the
+  // reply's bottom-left, the user's at the bubble's bottom-right. A row restored
+  // from a pre-timestamp mirror simply has none.
+  const time = m.createdAt !== undefined ? formatTimestampShort(m.createdAt) : "";
+  const timeEl =
+    time !== "" ? (
+      <time className="msg-time" dateTime={m.createdAt}>
+        {time}
+      </time>
+    ) : null;
 
   if (m.role === "assistant") {
     return (
@@ -1660,6 +1672,7 @@ const MessageRow = memo(function MessageRow({
             <MarkdownBody text={m.content} />
           </div>
         )}
+        {timeEl}
       </div>
     );
   }
@@ -1716,6 +1729,7 @@ const MessageRow = memo(function MessageRow({
           )}
         </div>
       )}
+      {timeEl}
     </div>
   );
 });
@@ -2509,13 +2523,21 @@ export function Transcript({
             const existingIdx = byId.get(row.id);
             if (existingIdx !== undefined) {
               const existing = next[existingIdx];
-              // A redelivery of a row already on screen: reconcile an optimistic
-              // send's chrome (drop the spinner), or fold a same-id work block's
-              // newer server steps + timing into what's rendered (else a no-op).
-              if (existing.role === "user" && existing.sendState !== undefined) {
-                next[existingIdx] = { ...existing, sendState: undefined };
-              } else if (existing.role === "work" && row.role === "work") {
-                next[existingIdx] = reconcileWork(existing, row);
+              // A redelivery of a row already on screen: fold a same-id work
+              // block's newer server steps + timing into what's rendered, or
+              // reconcile a message row — drop an optimistic send's chrome, and
+              // adopt the server's clock over the arrival stamp a live frame /
+              // optimistic send left behind, so the time under the bubble is the
+              // one a cold open will show. Otherwise a no-op.
+              if (existing.role === "work" || row.role === "work") {
+                if (existing.role === "work" && row.role === "work") {
+                  next[existingIdx] = reconcileWork(existing, row);
+                }
+              } else {
+                const createdAt = row.createdAt ?? existing.createdAt;
+                if (existing.sendState !== undefined || createdAt !== existing.createdAt) {
+                  next[existingIdx] = { ...existing, sendState: undefined, createdAt };
+                }
               }
               continue;
             }
@@ -2626,6 +2648,10 @@ export function Transcript({
             role,
             content: frame.content,
             attachments: frame.attachments,
+            // The wire `Message` frame carries no time field, so arrival is the
+            // best clock we have; a later reconstruction overwrites it with the
+            // server's `created_at`.
+            createdAt: new Date().toISOString(),
           },
         ]);
         break;
@@ -2832,6 +2858,7 @@ export function Transcript({
         content: payload.text,
         attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
         sendState: "sending",
+        createdAt: new Date().toISOString(),
       },
     ]);
   };

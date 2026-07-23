@@ -5387,7 +5387,14 @@ function MessageBubble({
           ) : null}
         </div>
         {row.createdAt || (!isUser && !row.streaming && body) ? (
-          <div className="mt-1 flex items-center gap-1.5 self-start">
+          // The agent's clock sits at its reply's bottom-left, the user's at its
+          // bubble's bottom-right — each on the side its message is aligned to.
+          // The user's is pulled in from the bubble's right edge rather than left
+          // hanging on the corner; the agent's reply is borderless prose already
+          // flush at the band's left, so it needs no inset.
+          <div
+            className={`mt-1 flex items-center gap-1.5 ${isUser ? 'self-end mr-2' : 'self-start'}`}
+          >
             {row.createdAt ? (
               <span
                 className="font-mono text-[0.65rem] text-ink-soft tabular-nums"

@@ -159,6 +159,18 @@ describe("transcriptItemToRow — three wire shapes, one Row", () => {
     expect(transcriptItemToRow(item)).toEqual({ id: "m5", role: "assistant", content: "there", attachments });
   });
 
+  it("carries the server's created_at — the clock under a reconstructed bubble", () => {
+    const item: TranscriptRowItem = {
+      id: "m9",
+      ordinal: 9,
+      kind: "message",
+      role: "assistant",
+      text: "there",
+      created_at: "2026-07-23T10:00:00.000Z",
+    };
+    expect(transcriptItemToRow(item)).toMatchObject({ createdAt: "2026-07-23T10:00:00.000Z" });
+  });
+
   it("DROPS a persisted /stop — the button issues it, it is never a chat bubble", () => {
     const item: TranscriptRowItem = { id: "m6", kind: "message", role: "user", text: "/stop" };
     expect(transcriptItemToRow(item)).toBeNull();

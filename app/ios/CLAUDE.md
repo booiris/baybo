@@ -554,7 +554,16 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   (rAF-coalesced; the web app only applies markdown on finalize). `reasoning`
   / `tool_started` / `tool_completed` / transient-notice frames fold into a
   per-turn collapsible work block ("思考中" card → "思考了 Xs ›"); answer text
-  interrupted by more work settles into the block as a prose step. Markdown
+  interrupted by more work settles into the block as a prose step. Every
+  message row carries a **timestamp under its last bubble** (`.msg-time`),
+  sided by the group's `align-items` — the agent's at the reply's bottom-LEFT,
+  the user's at the bubble's bottom-RIGHT (web-chat parity; notices, which are
+  centered marks, get none). `ChatMsg.createdAt` is the server's `created_at`
+  on a reconstructed row; the wire `Frame::Message` has **no time field**, so a
+  live reply and an optimistic send are stamped on arrival and a later sync
+  redelivery adopts the server's clock over that stamp (else the time under a
+  bubble would shift between the live session and the next cold open). Rows in
+  a mirror written before this existed simply have none. Markdown
   links post `openUrl` to native (system browser) — an in-webview navigation
   would replace the thread. **LaTeX math** renders via `remark-math` +
   `rehype-katex` + `katex` (CSS/fonts bundled by Vite, served by the transcript
