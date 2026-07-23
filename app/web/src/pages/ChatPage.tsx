@@ -43,13 +43,11 @@ import {
   type Frame,
   type ResourceAccess,
   type SessionPatch,
-  type TaskView,
   type WireApprovalCard,
   type WireAttachment,
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
-import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
@@ -240,10 +238,6 @@ export interface SessionView {
    *  detail's `last_llm` on history load and updated on a successful
    *  `PUT …/model`. */
   model?: string | null;
-  /** The session's planning checklist, replaced wholesale by each
-   *  `Frame::TaskList` snapshot (it's idempotent, not a delta). Empty
-   *  when the agent has no active plan — the checklist panel hides. */
-  tasks: TaskView[];
   /** Server-authoritative "is a turn in flight, since when (epoch ms)".
    *  Fed by `Frame::TurnState` — broadcast at every turn start/end and
    *  snapshotted to this connection on every Subscribe — so a tab that
@@ -273,7 +267,6 @@ export const EMPTY_VIEW: SessionView = {
   hasMore: false,
   awaitingReply: false,
   model: null,
-  tasks: [],
   turn: null,
   compactionPoints: [],
 };
@@ -1300,7 +1293,6 @@ export function ChatPage() {
           case 'message':
           case 'notice':
           case 'approval_requested':
-          case 'task_list':
           case 'turn_state':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
@@ -2872,7 +2864,6 @@ export function ChatPage() {
           onScroll={handleTranscriptScroll}
           className="chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
-          <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
               <RiLoader4Line className="text-3xl animate-spin" />
@@ -3386,14 +3377,6 @@ export function routeInboundFrame(
           },
         };
       });
-      return;
-    }
-    case 'task_list': {
-      // Idempotent snapshot — REPLACE the session's checklist wholesale
-      // (not a delta). An empty array means the plan is currently empty
-      // and the checklist panel hides.
-      const sid = frame.session_id;
-      setViews((prev) => mergeView(prev, sid, { tasks: frame.tasks }));
       return;
     }
     case 'turn_state': {
@@ -4876,9 +4859,9 @@ function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): Transcr
 }
 
 /** Apply one `subscribe_state` bundle to a session view: REPLACE the
- *  task list and the pending-approval card set wholesale (they are
- *  latest-wins — live frames arriving after the snapshot win by normal
- *  frame order), and apply the turn/work halves unless the caller
+ *  pending-approval card set wholesale (it is latest-wins — live frames
+ *  arriving after the snapshot win by normal frame order), and apply the
+ *  turn/work halves unless the caller
  *  determined they are stale by turn identity (`turnEnded`: this client
  *  already holds a turn-end signal for the SAME turn, matched by
  *  `started_at` — never by ordinal arithmetic, since the coverage
@@ -4891,7 +4874,6 @@ export function applySubscribeState(
   const cards = frame.pending_approvals ?? [];
   let next: SessionView = {
     ...view,
-    tasks: frame.tasks ?? [],
     // The view renders one card at a time; the queue's head is the call
     // the turn is blocked on.
     pendingApproval: cards.length > 0 ? approvalFromCard(frame.session_id, cards[0]) : null,
