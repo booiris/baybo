@@ -215,7 +215,11 @@ button {
 .bubble.sending,
 .bubble.failed { position: relative; }
 /* "sending": a black ring with a rotating gap, spinning until the server echoes
-   the message back. */
+   the message back. The 400ms `delayed-in` keeps it INVISIBLE through a healthy
+   send — the echo usually lands well inside the delay and unmounts the ring
+   before it ever paints, so a normal send shows nothing (a ring flashing in and
+   out on every message read as jitter). Only a send that genuinely waits — slow
+   leg, offline queue — fades it in. */
 .send-spinner {
   position: absolute;
   left: -1.25rem;
@@ -226,7 +230,9 @@ button {
   border-radius: 50%;
   border: 1.5px solid var(--color-ink-soft);
   border-top-color: transparent;
-  animation: send-spin 0.7s linear infinite;
+  animation:
+    send-spin 0.7s linear infinite,
+    delayed-in 160ms ease-out 400ms both;
   pointer-events: none;
 }
 @keyframes send-spin { to { transform: rotate(360deg); } }
@@ -294,7 +300,7 @@ button {
   font-size: 0.75rem;
   color: var(--color-ink-soft);
   pointer-events: none;
-  animation: thread-loading-in 160ms ease-out 400ms both;
+  animation: delayed-in 160ms ease-out 400ms both;
 }
 .thread-loading::before {
   content: "";
@@ -305,7 +311,10 @@ button {
   border-top-color: transparent;
   animation: send-spin 0.7s linear infinite;
 }
-@keyframes thread-loading-in {
+/* Shared "appear only if you're still here at 400ms" ramp (thread-loading, the
+   send spinner): `both` holds opacity 0 through the delay, so anything that
+   unmounts inside it was never seen. */
+@keyframes delayed-in {
   from { opacity: 0; }
   to { opacity: 1; }
 }
