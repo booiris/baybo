@@ -66,7 +66,10 @@ self-limiting and shrinks to zero.
 
 - **Pinned** → escapes to the main list's pinned block. This matches web, where `s.pinned`
   short-circuits before any folder grouping (`SessionSidebar.tsx`).
-- **Archived** → escapes to the archived view.
+- **Archived** → escapes to the archived view on iOS; on web there is no such view, so the fire is
+  simply not drawn (`withoutArchived` runs ahead of the bucketer — see
+  [`web-chat.md`](web-chat.md) → *Archived conversations never render*). Either way it leaves the
+  group, and a job whose every listed fire is archived emits no group header at all.
 - **Hidden** (the soft delete) → gone.
 - **`folder_id` is ignored** for a cron conversation. Web hides "Move to folder" on cron rows so a
   fire cannot be in a group and a user folder at once.

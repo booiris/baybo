@@ -19,6 +19,7 @@
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@msgpack/msgpack": "^3.0.0-beta2",
+    "katex": "^0.16.47",
     "openapi-fetch": "^0.13.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -26,7 +27,9 @@
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.15.0",
     "recharts": "^2.15.0",
-    "remark-gfm": "^4.0.1"
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
