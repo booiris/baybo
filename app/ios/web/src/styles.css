@@ -407,8 +407,36 @@ button {
   font-style: italic;
 }
 .md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
-.md ul, .md ol { padding-left: 1.25rem; }
-.md li { margin: 0.15rem 0; }
+/* Lists: fixed-slot markers (the web chat's `.md-list` mechanism, done in pure
+   CSS). Native `list-style: outside` right-aligns the marker against the text,
+   hanging it INTO the list padding — 1.25rem fit "7." but not "10.", whose
+   first digit crossed the `.md` box edge and was eaten by `overflow-x: clip`
+   ("8." lost its left arc and read as "3."). A counter marker absolutely
+   positioned at the li's own left edge lives inside the content box, so no
+   digit count can overflow the page; ordered items get a wider slot to seat
+   two digits plus the dot. */
+.md ul, .md ol {
+  list-style: none;
+  padding-left: 0;
+}
+.md li {
+  margin: 0.15rem 0;
+  position: relative;
+  padding-left: 1.5rem;
+}
+.md ol > li { padding-left: 1.9rem; }
+.md li::before {
+  position: absolute;
+  left: 0;
+  line-height: inherit;
+}
+.md ul > li::before { content: "•"; }
+/* Nested bullets keep the UA's hollow-circle second level. */
+.md ul ul > li::before { content: "◦"; }
+/* The implicit `list-item` counter (not a hand-rolled one): it respects
+   `<ol start="7">` / `<li value>`, which a list interrupted by a paragraph
+   emits — a manual counter would silently renumber it from 1. */
+.md ol > li::before { content: counter(list-item) "."; }
 .md img { max-width: 100%; border-radius: 10px; }
 /* Tables: no fills — a light hairline under each row is the only structure.
    Each column is capped (max-width) so one long cell can't dominate: content
