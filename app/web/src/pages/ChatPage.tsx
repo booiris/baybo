@@ -271,6 +271,27 @@ export const EMPTY_VIEW: SessionView = {
   compactionPoints: [],
 };
 
+/** Identity of everything drawn at the BOTTOM of the thread. Two equal
+ *  signatures mean nothing arrived below the user's viewport, however much the
+ *  transcript array changed above it — which is exactly the scroll-up
+ *  pagination case: `loadOlder` prepends a page and hands back a fresh array
+ *  whose tail is byte-identical. Streaming counts as movement (the last row's
+ *  text grows), as does a new step landing in a live work block. */
+export function transcriptTailSignature(
+  transcript: TranscriptRow[],
+  below: { awaitingReply: boolean; pendingApproval: boolean; deferred: number },
+): string {
+  const last = transcript.length > 0 ? transcript[transcript.length - 1] : null;
+  return [
+    last ? last.key : '',
+    last ? last.text.length : 0,
+    last?.steps?.length ?? 0,
+    below.awaitingReply ? '1' : '0',
+    below.pendingApproval ? '1' : '0',
+    below.deferred,
+  ].join('|');
+}
+
 /** Slack (px) under which the transcript is treated as not overflowing its
  *  viewport, so scroll can never fire and the older-page load must be kicked
  *  off programmatically. See the underfill fallback effect. */
@@ -557,6 +578,9 @@ export function ChatPage() {
   // duplicate fetch (and its rival scroll-anchor rAF) is the scroll jitter.
   // This ref is set synchronously so only one page loads at a time.
   const loadingOlderRef = useRef(false);
+  // Last seen `transcriptTailSignature`, so the auto-scroll effect can tell a
+  // genuine append at the bottom from a scroll-up prepend.
+  const tailSignatureRef = useRef('');
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
   // react-router v7's `useNavigate` (non-data routes) returns a fresh
@@ -1502,8 +1526,10 @@ export function ChatPage() {
 
   // Auto-scroll on transcript append — but only if the user is already
   // parked at the bottom. Otherwise raise the "new messages" pill so
-  // they can opt back in. useLayoutEffect runs before paint so we read
-  // fresh scrollHeight.
+  // they can opt back in — and only when the TAIL actually moved:
+  // scroll-up pagination hands back a new transcript array whose tail is
+  // untouched, and that backfill must not masquerade as new content below.
+  // useLayoutEffect runs before paint so we read fresh scrollHeight.
   //
   // `instant` (the default behavior) not `smooth` — when first landing
   // on a session, the history fetch resolves and React commits the
@@ -1514,12 +1540,19 @@ export function ChatPage() {
   // the bubble grows. The user-initiated `jumpToLatest` (below) keeps
   // smooth — that one IS a discrete "take me there" gesture.
   useLayoutEffect(() => {
+    const signature = transcriptTailSignature(currentView.transcript, {
+      awaitingReply: currentView.awaitingReply,
+      pendingApproval: currentView.pendingApproval !== null,
+      deferred: queue.deferred.length,
+    });
+    const tailMoved = signature !== tailSignatureRef.current;
+    tailSignatureRef.current = signature;
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
     if (pinnedToBottomRef.current) {
       scroller.scrollTop = scroller.scrollHeight;
       setHasNewBelow(false);
-    } else {
+    } else if (tailMoved) {
       setHasNewBelow(true);
     }
   }, [
@@ -2988,10 +3021,14 @@ export function ChatPage() {
                 Scoped to the form (the band width) rather than the full thread,
                 so it tints only the column the bubbles occupy; `-bottom-6`
                 reaches the viewport edge under the pill and `-top-20` lifts the
-                fade-in into the thread. */}
+                fade-in into the thread. `-inset-x-2` overhangs the band by 8px
+                because a user bubble is right-aligned to the band edge and its
+                `shadow-brutal-sm` (3px) and pending/failed badge (`-right-1.5`)
+                hang PAST that edge — flush at `inset-x-0` they escape the fade
+                and streak out beside the composer. */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
+              className="pointer-events-none absolute -inset-x-2 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
             />
             {sessionId ? (
               <QueuePanel
