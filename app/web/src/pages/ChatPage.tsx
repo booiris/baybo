@@ -5169,8 +5169,14 @@ const MARKDOWN_COMPONENTS: Components = {
   ul: ({ children }) => (
     <ul className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ul>
   ),
-  ol: ({ children }) => (
-    <ol className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ol>
+  // `start` has to be forwarded: CommonMark opens a fresh `<ol start="3">`
+  // whenever a paragraph interrupts a list, and the marker counter reads it off
+  // the element (see `.md-list` in index.css). Dropping it renumbers the rest of
+  // the answer from 1.
+  ol: ({ children, start }) => (
+    <ol start={start} className="md-list my-2 first:mt-0 last:mb-0 space-y-1">
+      {children}
+    </ol>
   ),
   // `leading-relaxed` (not snug) so a tight list's text line-height matches the
   // loose list's paragraph and the `.md-list` marker (which inherits it), keeping

@@ -101,6 +101,25 @@ describe('MarkdownBody math', () => {
     expect(indexAt).toBeGreaterThan(katexAt);
   });
 
+  // The `.md-list` markers are CSS `::before` counters, so jsdom (which
+  // computes no counters) cannot see a number. What it *can* pin is the input
+  // the CSS depends on: a list a paragraph interrupts resumes as its own
+  // `<ol start>`, which `counter(list-item)` reads and a hand-rolled counter
+  // would ignore — renumbering the tail of every such answer from 1.
+  it('carries the ordered-list start attribute through a paragraph break', () => {
+    const { container } = render(
+      <MarkdownBody text={'1. First\n2. Second\n\nProse between.\n\n3. Third\n4. Fourth'} />,
+    );
+    const lists = [...container.querySelectorAll('ol')];
+    expect(lists).toHaveLength(2);
+    expect(lists[1].getAttribute('start')).toBe('3');
+  });
+
+  it('carries a start attribute for a list that does not begin at 1', () => {
+    const { container } = render(<MarkdownBody text={'5. five\n6. six'} />);
+    expect(container.querySelector('ol')?.getAttribute('start')).toBe('5');
+  });
+
   it('emits the hidden MathML tree the stylesheet is there to hide', () => {
     const { container } = render(<MarkdownBody text={'$E = mc^2$'} />);
     expect(container.querySelector('.katex-mathml')).not.toBeNull();
