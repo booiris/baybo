@@ -101,7 +101,7 @@ private struct DeckContent: View {
                             .foregroundStyle(Theme.ink)
                             .frame(width: 45, height: 45)
                     }
-                    .glassEffect(.regular.interactive(), in: .circle)
+                    .glassSurface(interactive: true, in: .circle)
                     .accessibilityLabel(Text(verbatim: lang.t("list.menu")))
                     .padding(.leading, 20)
                 }
@@ -122,7 +122,7 @@ private struct DeckContent: View {
                     .foregroundStyle(Theme.ink)
                     .frame(width: 45, height: 45)
             }
-            .glassEffect(.regular.interactive(), in: .circle)
+            .glassSurface(interactive: true, in: .circle)
             .padding(.trailing, 20)
             .accessibilityLabel(Text(verbatim: lang.t("deck.editDone")))
             .transition(.opacity)
@@ -136,7 +136,7 @@ private struct DeckContent: View {
                     .padding(.horizontal, 14)
                     .frame(height: 34)
             }
-            .glassEffect(.regular.interactive(), in: .capsule)
+            .glassSurface(interactive: true, in: .capsule)
             .padding(.trailing, 20)
             .transition(.opacity)
         }

@@ -31,7 +31,7 @@ done
 
 : "${BAYBO_IOS_TEAM_ID:=KLK5BP5YS6}"
 # Match the app's deployment target so ld doesn't warn about newer objects.
-export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-26.0}"
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 export BAYBO_IOS_KEYCHAIN_ACCESS_GROUP="${BAYBO_IOS_KEYCHAIN_ACCESS_GROUP:-$BAYBO_IOS_TEAM_ID.com.baybo.app}"
 echo "keychain access group: $BAYBO_IOS_KEYCHAIN_ACCESS_GROUP"
 

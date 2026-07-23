@@ -110,6 +110,40 @@ struct LinkButtonStyle: ButtonStyle {
 }
 
 extension View {
+    /// Liquid Glass with a pre-26 fallback (deployment target is iOS 18): on
+    /// 26+ the real `glassEffect`; below, the same shape filled with a
+    /// material plus the tint as a wash over it. Deliberately strokeless —
+    /// the composer pill is borderless by design (its ink shadow carries the
+    /// boundary) and the glass circles read as bare frosted discs.
+    /// `.interactive()`'s shimmer has no pre-26 equivalent and is dropped.
+    /// The two `fallback*` knobs exist for panel-scale surfaces
+    /// (`ModelMenuPanel`): `.ultraThinMaterial` lets a black bubble bleed
+    /// through as a grey wash where real glass reads near-white, and real
+    /// glass draws its own soft elevation shadow — both only visible at
+    /// panel size, so the discs keep the bare defaults.
+    @ViewBuilder
+    func glassSurface<S: Shape>(
+        tint: Color? = nil, interactive: Bool = false, in shape: S,
+        fallback: Material = .ultraThinMaterial, fallbackShadow: Bool = false
+    ) -> some View {
+        if #available(iOS 26.0, *) {
+            let base: Glass = tint.map { Glass.regular.tint($0) } ?? .regular
+            glassEffect(interactive ? base.interactive() : base, in: shape)
+        } else {
+            background {
+                shape.fill(fallback)
+                    .overlay {
+                        if let tint {
+                            shape.fill(tint)
+                        }
+                    }
+                    .shadow(
+                        color: fallbackShadow ? Theme.ink.opacity(0.10) : .clear,
+                        radius: 20, y: 8)
+            }
+        }
+    }
+
     /// Web-page parity: tapping empty space blurs the focused field and drops
     /// the keyboard (a WKWebView resigns its input on outside taps; native
     /// SwiftUI does not). A plain tap gesture, so child buttons/fields keep

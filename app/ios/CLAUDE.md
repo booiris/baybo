@@ -138,7 +138,9 @@ shell fails with `errSecInternalComponent` / "User interaction is not allowed."
 unsigned bundle, and the next Xcode device Run fails with exactly the two
 errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 `--skip-rust`; after a full run does clobber it, restore with
-`scripts/build-core.sh` (no flags).
+`scripts/build-core.sh` (no flags). Check the result with `codesign --verify`
+— a failed headless sign (`errSecInternalComponent`) still leaves a fresh
+`_CodeSignature/` dir in the bundle, so its presence proves nothing.
 
 ## Continuity contract (do not change — existing installs depend on it)
 
@@ -165,7 +167,8 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 ## Architecture notes
 
 - **Navigation**: the home shell (`AppStore.Route.home`) is `HomeTabView`, a
-  NATIVE iOS 26 `TabView(selection: $homeTab)` (Liquid Glass tab bar) with four
+  NATIVE `TabView(selection: $homeTab)` (Liquid Glass bar on iOS 26+, the
+  classic system bar on 18–25 — system chrome, degrades on its own) with four
   sections (Deck · Projects · Chats · Settings, `AppStore.HomeTab`). `deck`
   (`DeckScreen` — the board of agent-authored live cards, see the Deck bullet
   below and `docs/modules/deck.md`), `chats` (`ChatListScreen`) and `settings`
@@ -193,7 +196,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   clamps `velocityInView:` (dynamic subclass, `PopVelocityClamp`) so iOS 26's
   fluid pop can't inherit a fast flick's velocity and overshoot the revealed
   list (the "list slides right then rubber-bands" glitch; stock Settings
-  does the same, it just hides it better).
+  does the same, it just hides it better). The clamp install is
+  `#available(iOS 26, *)`-gated: pre-26 pops don't overshoot, and UIKit's
+  finish/completion math reads the same velocity — capping it there would
+  only make fast flicks feel laggy.
 - **Deck** (`docs/modules/deck.md` — the design doc is the source of truth):
   the Deck tab renders the app's SECOND webview (`DeckHost`, kept warm like
   `TranscriptHost`, torn down with the binding), loading `deck.html` — a
@@ -582,7 +588,8 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   cannot reproduce anything about how a pin FEELS; drive
   `.swipeActions` from XCUITest for that. `-baybo-demo-tabs`
   cycles the tab selection on a timer so the native Liquid Glass tab morph is
-  recordable (`simctl io recordVideo` + ffmpeg montage). Launch with
+  recordable (`simctl io recordVideo` + ffmpeg montage; the glass morph needs
+  a 26+ sim — an 18.x sim records the classic bar). Launch with
   `-baybo-open-chat -baybo-demo-frames` (DEBUG) to feed one canned turn
   (thinking → tool → streamed markdown → finalize) through the real bridge —
   screenshot the sim at ~3s/~6s/~12s. `-baybo-open-chat -baybo-demo-attachments`
@@ -768,7 +775,19 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   re-labels the same step (`ChatWorkStep.approval` on REST rows,
   `WireWorkStep.approval` in the `subscribe_state` snapshot). A `deny` also
   still reads red via the existing `denied` tool status.
-- **Liquid Glass (iOS 26)**: the bottom tab bar is the NATIVE `TabView` Liquid
+- **Liquid Glass (iOS 26+; deployment target is 18.0)**: every CUSTOM glass
+  surface goes through `Theme.swift`'s `glassSurface(tint:interactive:in:)` —
+  the real `.glassEffect` on 26+, an `.ultraThinMaterial` fill in the same
+  shape below (strokeless on purpose: the composer pill is borderless and the
+  jump button is bare). Never call `.glassEffect` raw — it is 26-only and an
+  unguarded call breaks the 18.0 target. The one other 26-only API,
+  `interactiveContentPopGestureRecognizer`, is `#available`-guarded in
+  `PopGesture.swift` (pre-26 the edge recognizer alone carries the feature).
+  Building still REQUIRES Xcode 26 / the iOS 26 SDK at any deployment
+  target — `#available` gates runtime, not compilation, and the guarded
+  branches reference 26-SDK-only symbols (`Glass`, the content-pop
+  recognizer).
+  The bottom tab bar is the NATIVE `TabView` Liquid
   Glass bar — its selection-capsule morph (the glass that slides + stretches
   between tabs) is the SYSTEM's, and getting that authentic morph is exactly why
   the custom bar was dropped. Kept monochrome via `.tint(Theme.ink)` (ink

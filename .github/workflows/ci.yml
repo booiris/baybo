@@ -247,11 +247,14 @@ jobs:
     name: iOS app (build + unit tests; UI smokes non-gating)
     needs: changes
     # NOT macos-latest — that label still maps to macos-15, whose simulator set
-    # is iOS 18.x + a churning 26.0/26.1, and the app's deployment target is
-    # 26.0. NOT an -intel/-large runner either: project.yml pins ARCHS arm64 and
-    # excludes x86_64 for the simulator SDK, so an x64 host cannot run the build
-    # it produces. macos-26 (arm64) ships Xcode 26.5 with iOS 26.2/26.4/26.5
-    # simulator runtimes preinstalled — no -downloadPlatform needed.
+    # is iOS 18.x + a churning 26.0/26.1; the deployment target is 18.0 now, but
+    # the app must keep building against the CURRENT SDK (glassSurface's iOS 26
+    # branch) and testing on a stable 26.x runtime. NOT an -intel/-large runner
+    # either: project.yml pins ARCHS arm64 and excludes x86_64 for the simulator
+    # SDK, so an x64 host cannot run the build it produces. macos-26 (arm64)
+    # ships Xcode 26.5 with iOS 26.2/26.4/26.5 simulator runtimes preinstalled —
+    # no -downloadPlatform needed. (Coverage of the actual 18.x floor would need
+    # an older runtime download — not done here.)
     runs-on: macos-26
     # TEMPORARILY DISABLED — this is the one that actually hurt: a macOS runner is
     # billed at 10x Linux minutes (40-minute timeout), and `ios_native` fires on
