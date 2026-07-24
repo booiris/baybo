@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
   compactionDividerIds,
+  flattenGloss,
   foldAdjacentWork,
   foldMidTurnNoticeIn,
   severTerminalNoticeIn,
@@ -11,6 +12,7 @@ import {
   isStopCommand,
   mergeWorkSteps,
   openWorkIn,
+  outlineEntries,
   reconcileWork,
   restStepToWork,
   restoreImageDims,
@@ -19,7 +21,7 @@ import {
   transcriptItemToRow,
   wireStepToWork,
 } from "../Transcript";
-import type { Row, TranscriptRowItem, WorkRow, WorkStep } from "../types";
+import type { ChatMsg, Row, TranscriptRowItem, WorkRow, WorkStep } from "../types";
 
 const NOW = 1_700_000_000_000;
 
@@ -712,5 +714,156 @@ describe("compactionDividerIds — the pre-compaction seam", () => {
     const withNotice = [row("m2"), row("n5"), row("m7")];
     const ids = compactionDividerIds(withNotice, [{ ordinal: 3, at: "t" }]);
     expect([...ids.keys()]).toEqual(["m7"]);
+  });
+});
+
+describe("outlineEntries — the message index's model", () => {
+  const said = (id: string, content: string, over: Partial<ChatMsg> = {}): ChatMsg => ({
+    id,
+    role: "user",
+    content,
+    ...over,
+  });
+  const replied = (id: string, content: string): ChatMsg => ({ id, role: "assistant", content });
+  const notice = (id: string, content: string): ChatMsg => ({ id, role: "notice", content });
+
+  it("glosses a prompt with its answer, scanning PAST the turn's work and notice rows", () => {
+    const rows: Row[] = [
+      said("p1", "ship it"),
+      work({ id: "w1", steps: [tool()] }),
+      notice("n1", "skill degraded"),
+      replied("m2", "**Shipped.**"),
+    ];
+    expect(outlineEntries(rows)).toEqual([
+      { id: "p1", text: "ship it", gloss: "Shipped.", at: "", dayKey: "", attachments: 0, state: undefined },
+    ]);
+  });
+
+  it("STOPS at the next user row — a prompt must never borrow the following turn's answer", () => {
+    const rows: Row[] = [said("p1", "first"), said("p2", "second"), replied("m3", "answering the second")];
+    expect(outlineEntries(rows).map((e) => e.gloss)).toEqual(["", "answering the second"]);
+  });
+
+  it("leaves the gloss empty for a still-running turn (nothing has been said back yet)", () => {
+    const rows: Row[] = [said("p1", "go"), work({ id: "w1", active: true, steps: [tool()] })];
+    expect(outlineEntries(rows)[0].gloss).toBe("");
+  });
+
+  it("leaves the gloss empty for a STOPPED turn — the mark is not an answer", () => {
+    const rows: Row[] = [
+      said("p1", "go"),
+      work({ id: "w1", steps: [tool()] }),
+      { id: "n1", role: "notice", content: "", stopped: true },
+    ];
+    expect(outlineEntries(rows)[0].gloss).toBe("");
+  });
+
+  it("lists nothing for a `/stop` — the command never reaches `messages`, so the sheet cannot offer it", () => {
+    // Exactly what the thread holds after the echo drop: two real sends, no
+    // `/stop` row between them.
+    const rows: Row[] = [said("p1", "run it"), work({ id: "w1" }), said("p2", "again")];
+    expect(outlineEntries(rows).map((e) => e.id)).toEqual(["p1", "p2"]);
+  });
+
+  it("carries an attachment-only send by its COUNT — its text is empty and the gloss identifies it", () => {
+    const rows: Row[] = [
+      said("p1", "", {
+        attachments: [
+          { kind: "image", blob_id: "sha256:a.tok", mime_type: "image/png", size: 1 },
+          { kind: "file", blob_id: "sha256:b.tok", mime_type: "text/plain", size: 2 },
+        ],
+      }),
+      replied("m2", "Two files, both fine."),
+    ];
+    expect(outlineEntries(rows)[0]).toMatchObject({
+      text: "",
+      attachments: 2,
+      gloss: "Two files, both fine.",
+    });
+  });
+
+  it("passes an unconfirmed send's state through — the sheet greys it the way the bubble does", () => {
+    const rows: Row[] = [said("p1", "a", { sendState: "sending" }), said("p2", "b", { sendState: "failed" })];
+    expect(outlineEntries(rows).map((e) => e.state)).toEqual(["sending", "failed"]);
+  });
+
+  it("collapses whitespace and caps text AND gloss at the transport limit", () => {
+    const rows: Row[] = [said("p1", `x${"y".repeat(400)}`), replied("m2", "z".repeat(400))];
+    const [entry] = outlineEntries(rows);
+    expect(entry.text).toHaveLength(160);
+    expect(entry.gloss).toHaveLength(160);
+    expect(outlineEntries([said("p2", "  two\n\n  lines  ")])[0].text).toBe("two lines");
+  });
+
+  // A `.slice` cap cuts UTF-16 units, so a non-BMP character straddling the cap
+  // leaves a lone surrogate — and native re-serializes this payload with
+  // JSONSerialization, which THROWS on one, blanking the whole index for the
+  // conversation on every repost. Cutting by code point makes that impossible.
+  it("never cuts a surrogate pair in half, however the cap falls", () => {
+    for (let lead = 155; lead <= 165; lead++) {
+      const text = `${"a".repeat(lead)}🎉 tail`;
+      const [entry] = outlineEntries([said("p1", text), replied("m2", text)]);
+      for (const field of [entry.text, entry.gloss]) {
+        expect(Array.from(field).length).toBeLessThanOrEqual(160);
+        // Throws `URIError` on a lone surrogate — the same "can this become
+        // UTF-8" question native's JSONSerialization asks.
+        expect(() => encodeURIComponent(field)).not.toThrow();
+      }
+    }
+  });
+
+  it("leaves `at` and `dayKey` empty when the row carries no createdAt (a pre-timestamp mirror)", () => {
+    const [entry] = outlineEntries([said("p1", "hi")]);
+    expect(entry.at).toBe("");
+    expect(entry.dayKey).toBe("");
+  });
+
+  it("keys the day in DEVICE-LOCAL time — toISOString would file an evening message under tomorrow", () => {
+    vi.stubEnv("TZ", "Asia/Tokyo");
+    try {
+      const iso = "2026-07-22T23:30:00Z"; // 2026-07-23 08:30 in Tokyo
+      const [entry] = outlineEntries([said("p1", "hi", { createdAt: iso })]);
+      expect(entry.dayKey).toBe("2026-07-23");
+      expect(entry.at).not.toBe("");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe("flattenGloss — markdown onto one line", () => {
+  it("drops a fenced block whole — a gloss must not read as source", () => {
+    expect(flattenGloss("before\n```js\nconst x = 1;\n```\nafter")).toBe("before after");
+  });
+
+  it("drops an UNCLOSED fence to end of input (the mid-stream state)", () => {
+    expect(flattenGloss("before\n~~~\nstill streaming")).toBe("before");
+  });
+
+  it("strips heading, bullet and emphasis marks, keeping `_` (it is snake_case far more often)", () => {
+    expect(flattenGloss("# Title\n- **bold** and `code`\n- a_b")).toBe("Title bold and code a_b");
+  });
+
+  // `~` only marks up when doubled, and this codebase's replies are full of
+  // `~/paths` and `~50ms` approximations that a blanket strip would corrupt.
+  it("strips `~~strikethrough~~` but leaves a lone tilde alone", () => {
+    expect(flattenGloss("wrote it to ~/bin/deploy.sh in ~50ms")).toBe(
+      "wrote it to ~/bin/deploy.sh in ~50ms",
+    );
+    expect(flattenGloss("~~dropped~~ kept")).toBe("dropped kept");
+  });
+
+  it("keeps a link's TEXT and drops its target", () => {
+    expect(flattenGloss("see [the docs](https://x.dev/guide) now")).toBe("see the docs now");
+    expect(flattenGloss("see [the docs][ref] now")).toBe("see the docs now");
+    expect(flattenGloss("![a screenshot](x.png)")).toBe("a screenshot");
+  });
+
+  it("stays linear on a 40KB paste — a backtracking pattern here would hang the transcript", () => {
+    const huge = `${"[unclosed *emphasis* ".repeat(2_000)}\n\`\`\`\n${"code ".repeat(2_000)}`;
+    expect(huge.length).toBeGreaterThan(40_000);
+    const started = Date.now();
+    expect(flattenGloss(huge).length).toBeGreaterThan(0);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

@@ -3,7 +3,7 @@
 // back through `window.webkit.messageHandlers.baybo.postMessage`. In a plain
 // dev browser (no window.webkit) outbound posts degrade to console.log stubs.
 
-import type { PersistedState, WireAttachment } from "./types";
+import type { OutlineEntry, PersistedState, WireAttachment } from "./types";
 
 export type InitPayload = {
   language: string;
@@ -82,6 +82,16 @@ type BayboGlobal = {
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
+  /// A row of the native message-index sheet was tapped — park that user
+  /// message under the header veil. `rowId` is an `OutlineEntry.id`.
+  jumpToMessage(rowId: string): void;
+  /// The sheet's "load earlier" row — runs the transcript's own backward
+  /// paging, which grows the outline when the prepend lands.
+  outlineLoadOlder(): void;
+  /// The sheet is opening: scan for the user message currently at the top of
+  /// the viewport and answer with `{type:"outlineHere"}`. Pulled rather than
+  /// pushed — a live scan would force a layout per scroll tick.
+  requestOutlineHere(): void;
   /// Native asks the transcript to run the sync loop with its current cursor
   /// (offscreen buffer overflow re-attach; any native-side "go sync" edge).
   /// The web side answers by posting `{type:"sync"}` back with the cursor.
@@ -169,6 +179,72 @@ export function postMarkRead(ordinal: number): void {
 // the `jumpToLatest` transcript event.
 export function postJumpVisible(visible: boolean): void {
   postSafe({ type: "jumpVisible", visible });
+}
+
+/// The message-index sheet is native, but only the web tree knows which of the
+/// user's sends are in it (the optimistic bubble exists here before any echo,
+/// `/stop` echoes are filtered here, and the loaded window is this tree's).
+/// So the transcript owns the list and mirrors it over.
+export type OutlinePost = {
+  entries: OutlineEntry[];
+  /// Older pages remain on the server — the sheet says `24+`, not `24`.
+  hasMoreOlder: boolean;
+  loadingOlder: boolean;
+  /// Whether the affordance is worth showing at all. The web decides, because
+  /// it is the only layer that can count.
+  available: boolean;
+};
+
+const OUTLINE_DEBOUNCE_MS = 250;
+
+let outlineTimer: ReturnType<typeof setTimeout> | undefined;
+// The last payload actually posted, as JSON. Exact identity rather than a
+// cheap signature: a `sendState` flip to undefined, or `createdAt` adopting the
+// server clock, changes nothing a length/last-id signature would catch. We must
+// stringify to post anyway, so the comparison is free.
+let outlineLastJson = "";
+let outlinePending: OutlinePost | null = null;
+// The first post after init goes out immediately, so the header button is live
+// as the screen slides on; every later one is trailing-debounced.
+let outlinePosted = false;
+
+function flushOutline(): void {
+  clearTimeout(outlineTimer);
+  outlineTimer = undefined;
+  if (outlinePending === null) return;
+  const state = outlinePending;
+  outlinePending = null;
+  outlinePosted = true;
+  postSafe({ type: "outline", ...state });
+}
+
+export function postOutline(state: OutlinePost): void {
+  const json = JSON.stringify(state);
+  if (json === outlineLastJson) return;
+  outlineLastJson = json;
+  outlinePending = state;
+  if (!outlinePosted) {
+    flushOutline();
+    return;
+  }
+  clearTimeout(outlineTimer);
+  outlineTimer = setTimeout(flushOutline, OUTLINE_DEBOUNCE_MS);
+}
+
+/// Re-post even when the payload is byte-identical — the self-heal path, taken
+/// when native asks to jump to a row this tree no longer holds. The identity
+/// guard exists to suppress redundant posts, and here the redundant post IS the
+/// point: native is holding a list we have to overwrite.
+export function resendOutline(state: OutlinePost): void {
+  outlineLastJson = JSON.stringify(state);
+  outlinePending = state;
+  flushOutline();
+}
+
+/// Answer to `requestOutlineHere`: which listed message the reader is parked
+/// on, so the sheet opens scrolled to it. `null` when nothing is above the fold.
+export function postOutlineHere(rowId: string | null): void {
+  postSafe({ type: "outlineHere", rowId });
 }
 
 /// The composer's send button is native and flips to a stop affordance while a
@@ -456,6 +532,12 @@ export type TranscriptEvents = {
   jumpToLatest(): void;
   /// Native asked for a sync run (buffer-overflow re-attach etc.).
   syncRequested(): void;
+  /// A message-index row was tapped — park that user message under the veil.
+  jumpToMessage(rowId: string): void;
+  /// The index sheet's "load earlier" row — page the thread backwards.
+  outlineLoadOlder(): void;
+  /// The index sheet is opening — answer with the reader's current position.
+  outlineHereRequested(): void;
 };
 
 type Buffered =
@@ -465,7 +547,10 @@ type Buffered =
   | { kind: "sendFailed"; msgId: string }
   | { kind: "bottomInset"; px: number }
   | { kind: "jumpToLatest" }
-  | { kind: "syncRequested" };
+  | { kind: "syncRequested" }
+  | { kind: "jumpToMessage"; rowId: string }
+  | { kind: "outlineLoadOlder" }
+  | { kind: "outlineHereRequested" };
 
 let initPayload: InitPayload | null = null;
 let onInitCb: ((payload: InitPayload) => void) | null = null;
@@ -507,6 +592,13 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
   else if (item.kind === "syncRequested") e.syncRequested();
+  // Every kind needs its own branch ABOVE the terminal else: that else is a
+  // bare fall-through to `jumpToLatest`, so a missing branch silently turns the
+  // new command into "scroll to the bottom" — and the type checker cannot see
+  // it. `bridge.test.ts` pins this.
+  else if (item.kind === "jumpToMessage") e.jumpToMessage(item.rowId);
+  else if (item.kind === "outlineLoadOlder") e.outlineLoadOlder();
+  else if (item.kind === "outlineHereRequested") e.outlineHereRequested();
   else e.jumpToLatest();
 }
 
@@ -527,6 +619,15 @@ window.baybo = {
     clearTimeout(persistTimer);
     persistTimer = undefined;
     pendingPersist = null;
+    // Per-session caches, same reason as the buffer above: the new tree's first
+    // outline must post even if it happens to be byte-identical to the outgoing
+    // session's, and it must post IMMEDIATELY so the header button is right as
+    // the screen slides on.
+    clearTimeout(outlineTimer);
+    outlineTimer = undefined;
+    outlinePending = null;
+    outlineLastJson = "";
+    outlinePosted = false;
     connEpoch = payload.connEpoch;
     initPayload = payload;
     onInitCb?.(payload);
@@ -568,6 +669,15 @@ window.baybo = {
   },
   jumpToLatest() {
     dispatch({ kind: "jumpToLatest" });
+  },
+  jumpToMessage(rowId) {
+    dispatch({ kind: "jumpToMessage", rowId });
+  },
+  outlineLoadOlder() {
+    dispatch({ kind: "outlineLoadOlder" });
+  },
+  requestOutlineHere() {
+    dispatch({ kind: "outlineHereRequested" });
   },
   requestSync() {
     dispatch({ kind: "syncRequested" });

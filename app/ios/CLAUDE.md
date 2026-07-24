@@ -326,9 +326,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/sendFailed/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/requestSync/flushPersist`;
+  `init/pushFrame/setConnEpoch/userSent/sendFailed/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/jumpToMessage/outlineLoadOlder/requestOutlineHere/requestSync/flushPersist`;
   web→native
-  `ready/shown/sync/mark_read/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/retry/openUrl/copy/log/jumpVisible/runState`.
+  `ready/shown/sync/mark_read/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/retry/openUrl/copy/log/jumpVisible/runState/outline/outlineHere`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
   live gesture.) Tool approvals deliberately add NO bridge message in either
@@ -634,6 +634,13 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   they must be equal.
   `-baybo-demo-jump` scrolls the log off the newest edge at
   4s (native glass jump button pops) and runs the native jump path at 7s.
+  `-baybo-demo-index` pushes ONE synthesized `sync_page` carrying six of the
+  user's own sends (one attachment-only, one past the row's text cap) with their
+  replies, split across yesterday and today — the header's message-index button,
+  its sheet's day headers, the gloss line and the "load earlier" row all render
+  headlessly. A `sync_page` rather than live `message` frames on purpose: the
+  wire's `Frame::Message` has no time field, so the sheet's clock and day key
+  only exist on the reconstructed-row path.
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
   the software keyboard only appears with Simulator.app running and hardware
@@ -743,6 +750,36 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   the entry's `entry_model_ids` / an unknown effort. `PUT
   /v1/chat/sessions/{id}/model` carries `{llm, model, reasoning_effort}`; the
   old global `llm_set_reasoning_effort` FFI was removed (superseded).
+- **Message index** (`App/Screens/MessageIndexSheet.swift` + `App/Core/MessageOutline.swift`
+  ⇄ `Transcript.tsx`'s `outlineEntries`): the chat header's trailing glass
+  circle (`text.alignright`) opens a sheet listing the user's OWN sends, each
+  glossed with the agent's answer; a tap parks the transcript on that message.
+  **The WEB layer owns the list** and native only renders it — `ChatStore.send`
+  seeds the optimistic bubble over the bridge and never routes through
+  `pushFrame`, so anything derived from the native frame stream would not see
+  this device's own message until the server echoed it back, and an offline send
+  would never appear at all (the web tree also filters `/stop` echoes and holds
+  the loaded window). Deriving from the same `messages` array the transcript
+  renders is what guarantees every listed row has a `data-row-id` anchor — the
+  sheet can never offer a jump it cannot reach. It is therefore a WINDOW over
+  the loaded thread, surfaced honestly as `24+` plus a "load earlier" row that
+  runs the transcript's own backward paging.
+  The jump is web-side: clear `followRef` SYNCHRONOUSLY before the scroll write
+  (five writers slam `scrollTop` to the bottom while it is set), never touch
+  never SET `glidingRef` (its only self-clear is entering the bottom follow
+  band, which an upward jump never reaches — clearing a stale one is fine, and
+  the jump does), and let `onScroll` own `showJump` — which is also
+  how "back to the newest edge" comes free, as the existing jump-to-latest
+  circle. Landing clearance is `.msg-group.user`'s `scroll-margin-top`, not
+  arithmetic at the call site. The arrival ring mounts inside `.bubble.user` (or
+  the last `.attachment-bubble`) because `.msg-group` is unpositioned, and
+  replays off a NONCE — a boolean would `Object.is`-bail a repeat jump to the
+  same row.
+  Two traps: the five `@Published` outline mirrors reset in BOTH `retarget(to:)`
+  and `case "ready"` (one webview, every conversation), and `deliver()` in
+  `bridge.ts` ends in a bare `else e.jumpToLatest()`, so every new `Buffered`
+  variant needs its own `else if` ABOVE it or the command silently becomes
+  "scroll to the bottom" — TypeScript cannot see it; `bridge.test.ts` pins it.
 - **Tool approvals** (`App/Core/ChatApprovals.swift` + `ChatStore.approvalObserveFrame`
   / `Screens/ApprovalCardView.swift`): a tool call whose declared resources
   aren't already granted blocks on the gateway's approval gate, which fans out

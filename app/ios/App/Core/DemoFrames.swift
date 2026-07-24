@@ -13,13 +13,15 @@
         private static let demoAttachmentsArg = "-baybo-demo-attachments"
         private static let demoDownloadArg = "-baybo-demo-download"
         private static let demoImagesArg = "-baybo-demo-images"
+        private static let demoIndexArg = "-baybo-demo-index"
         static let demoApprovalArg = "-baybo-demo-approval"
         static let demoSwitchArg = "-baybo-demo-switch"
 
         /// Flags that push a canned TURN — rows that look durable but are backed
         /// by no gateway — into a session that is only ever a local draft.
         private static let cannedTurnArgs = [
-            demoFramesArg, demoAttachmentsArg, demoImagesArg, demoApprovalArg, demoSwitchArg,
+            demoFramesArg, demoAttachmentsArg, demoImagesArg, demoIndexArg, demoApprovalArg,
+            demoSwitchArg,
         ]
 
         /// True while such a fixture is driving. `ChatStore.requestSync` reads it:
@@ -98,6 +100,121 @@
                 pushDemo(["kind": "turn_state", "active": false])
             }
         }
+
+        /// One canned turn of the index demo: the user's send and the agent's
+        /// answer to it, placed at a wall-clock moment relative to the run.
+        private static let demoIndexTurns:
+            [(
+                prompt: String, reply: String, daysBack: Int, hour: Int, minute: Int,
+                attachment: Bool
+            )] = [
+                (
+                    "Summarize what landed in the release last night",
+                    "Nine merges: the sync cursor rewrite, two crash fixes, and the new deck card sizes.",
+                    1, 9, 15, false
+                ),
+                (
+                    "Which crates changed the wire format?",
+                    "**wire** and **device-proto**. `Frame::Message` gained nothing; the change is all on `SubscribeState`.",
+                    1, 14, 40, false
+                ),
+                (
+                    "Walk me through why the transcript webview is shared across every conversation instead of one per session, and what that costs us",
+                    "One WKWebView means one web-content process and one bundle parse for the app's whole bound lifetime — opening a chat never boots a runtime. The cost is that every piece of per-session state has to be reset on retarget.",
+                    1, 21, 5, false
+                ),
+                (
+                    "Any regressions from that merge?",
+                    "None on the phone. The tmux render job flaked twice, which it does under load.",
+                    0, 8, 30, false
+                ),
+                // An attachment-only send: no prompt text at all, which is the
+                // row the index has to describe without any words of its own.
+                ("", "That's the character card — I've folded it into the deck bundle.", 0, 10, 12, true),
+                (
+                    "Draft the PR body for it",
+                    "Done — three paragraphs, with the manual verification steps under their own heading since CI never sees this path.",
+                    0, 11, 47, false
+                ),
+            ]
+
+        /// Ordinals start well above zero so `has_more_older` below is TRUE
+        /// rather than a lie — the sheet's "load earlier" row only exists when
+        /// the thread genuinely has more behind it.
+        private static let demoIndexFirstOrdinal = 101
+
+        /// `-baybo-demo-index` (DEBUG, with `-baybo-open-chat`): a thread long
+        /// enough to open the header's message index — six of the user's own
+        /// sends (one attachment-only, one far past the row's text cap) with the
+        /// agent's replies, split across yesterday and today so the sheet's day
+        /// headers render. `-baybo-demo-frames` pushes a single send, which is
+        /// below the index button's own gate.
+        ///
+        /// Rides ONE synthesized `sync_page` — the frame the gateway path
+        /// produces — because the index's clock and day key come from each row's
+        /// `created_at`, and a live `message` frame has no time field at all.
+        func startDemoIndexIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoIndexArg) else { return }
+            // A canned page REPLACES the thread and is persisted into that
+            // session's mirror, so pointing this at a real conversation
+            // (`-baybo-open-session`) would overwrite one.
+            guard sessionId == AppStore.debugSessionId else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                let rows = Self.demoIndexRows()
+                pushDemo([
+                    "kind": "sync_page",
+                    "rows": rows,
+                    "since_ordinal": NSNull(),
+                    "next_cursor": Self.demoIndexFirstOrdinal + rows.count - 1,
+                    "rebased": false,
+                    "oldest_ordinal": Self.demoIndexFirstOrdinal,
+                    "has_more_older": true,
+                ])
+            }
+        }
+
+        private static func demoIndexRows() -> [[String: Any]] {
+            var rows: [[String: Any]] = []
+            var ordinal = demoIndexFirstOrdinal
+            for turn in demoIndexTurns {
+                guard
+                    let asked = demoIndexDate(
+                        daysBack: turn.daysBack, hour: turn.hour, minute: turn.minute)
+                else { continue }
+                var asks: [String: Any] = [
+                    "id": "m\(ordinal)", "ordinal": ordinal, "kind": "message", "role": "user",
+                    "text": turn.prompt,
+                    "platform_msg_id": "demo-index-u\(ordinal)",
+                    "created_at": demoIndexStamp.string(from: asked),
+                ]
+                if turn.attachment {
+                    asks["attachments"] = [demoFileAttachments[1]]
+                }
+                rows.append(asks)
+                ordinal += 1
+                rows.append([
+                    "id": "m\(ordinal)", "ordinal": ordinal, "kind": "message",
+                    "role": "assistant", "text": turn.reply,
+                    "created_at": demoIndexStamp.string(from: asked.addingTimeInterval(45)),
+                ])
+                ordinal += 1
+            }
+            return rows
+        }
+
+        /// A time set on a calendar DAY, never an offset from now: a fixture that
+        /// backed up "26 hours" would put both of its days on the same date when
+        /// it ran in the evening, and the day headers are the point here.
+        private static func demoIndexDate(daysBack: Int, hour: Int, minute: Int) -> Date? {
+            let calendar = Calendar.current
+            guard let day = calendar.date(byAdding: .day, value: -daysBack, to: Date()) else {
+                return nil
+            }
+            return calendar.date(bySettingHour: hour, minute: minute, second: 0, of: day)
+        }
+
+        private static let demoIndexStamp = ISO8601DateFormatter()
 
         /// Serve a demo image's bytes with no gateway and no blob leg: a flat PNG
         /// at the declared pixel size, behind a delay long enough to screenshot
