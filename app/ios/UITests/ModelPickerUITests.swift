@@ -99,15 +99,6 @@ final class ModelPickerUITests: BayboUITestCase {
             "picking a level must pin the entry it was picked under (its default model)")
     }
 
-    /// A transient panel can't be screenshot from outside the test runner —
-    /// attach it to the xcresult (export with `xcresulttool export attachments`).
-    private func attachScreenshot(_ app: XCUIApplication, name: String) {
-        let shot = XCTAttachment(screenshot: app.screenshot())
-        shot.name = name
-        shot.lifetime = .keepAlways
-        add(shot)
-    }
-
     /// The pill publishes its selection as the element VALUE (the a11y label is
     /// the constant "Model"), and XCUIElement.value has no waitFor — poll it.
     private func waitUntilValue(

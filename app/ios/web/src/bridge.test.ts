@@ -59,6 +59,9 @@ function recorder(): { log: string[]; events: TranscriptEvents } {
       bottomInset: (px) => log.push(`inset:${px}`),
       jumpToLatest: () => log.push("jump"),
       syncRequested: () => log.push("sync"),
+      jumpToMessage: (rowId) => log.push(`jumpToMessage:${rowId}`),
+      outlineLoadOlder: () => log.push("outlineLoadOlder"),
+      outlineHereRequested: () => log.push("outlineHere"),
     },
   };
 }
@@ -173,6 +176,90 @@ describe("persistState — the cross-session mirror guard", () => {
   });
 });
 
+describe("postOutline — the message index mirror", () => {
+  function outline(text: string): Parameters<Bridge["postOutline"]>[0] {
+    return {
+      entries: [
+        { id: "pm-1", text, gloss: "done", at: "09:12", dayKey: "2026-07-23", attachments: 0 },
+      ],
+      hasMoreOlder: true,
+      loadingOlder: false,
+      available: true,
+    };
+  }
+
+  function outlinePosts(): Record<string, unknown>[] {
+    return posted.filter((m) => m.type === "outline");
+  }
+
+  // The header button's presence is driven by this payload, so the FIRST one
+  // must not wait out a debounce — the control would flicker in a beat after
+  // the screen settles.
+  it("posts the first outline immediately, flat, in the shape native parses", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postOutline(outline("hi"));
+    expect(outlinePosts()).toEqual([
+      {
+        type: "outline",
+        entries: [
+          { id: "pm-1", text: "hi", gloss: "done", at: "09:12", dayKey: "2026-07-23", attachments: 0 },
+        ],
+        hasMoreOlder: true,
+        loadingOlder: false,
+        available: true,
+      },
+    ]);
+  });
+
+  it("drops a byte-identical repost — the transcript re-derives on every commit", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postOutline(outline("hi"));
+    bridge.postOutline(outline("hi"));
+    vi.advanceTimersByTime(1000);
+    expect(outlinePosts()).toHaveLength(1);
+  });
+
+  it("trailing-debounces every post after the first, keeping the LAST state", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postOutline(outline("first"));
+    bridge.postOutline(outline("second"));
+    bridge.postOutline(outline("third"));
+    expect(outlinePosts()).toHaveLength(1);
+
+    vi.advanceTimersByTime(250);
+    const posts = outlinePosts();
+    expect(posts).toHaveLength(2);
+    expect((posts[1].entries as { text: string }[])[0].text).toBe("third");
+  });
+
+  // One WKWebView serves every conversation: without the reset, session B's
+  // first outline is compared against session A's and — if the two happen to
+  // match — never posts at all, leaving native holding A's rows.
+  it("re-posts immediately after init even when the payload is identical", async () => {
+    const bridge = await loadBridge();
+    window.baybo.init(initPayload(SESSION_A));
+    bridge.postOutline(outline("same"));
+    expect(outlinePosts()).toHaveLength(1);
+
+    window.baybo.init(initPayload(SESSION_B));
+    bridge.postOutline(outline("same"));
+    expect(outlinePosts()).toHaveLength(2);
+  });
+
+  it("posts the reader's position as an uncorrelated answer, null when nothing is above the fold", async () => {
+    const bridge = await loadBridge();
+    bridge.postOutlineHere("pm-9");
+    bridge.postOutlineHere(null);
+    expect(posted.filter((m) => m.type === "outlineHere")).toEqual([
+      { type: "outlineHere", rowId: "pm-9" },
+      { type: "outlineHere", rowId: null },
+    ]);
+  });
+});
+
 describe("the pre-subscribe buffer", () => {
   it("replays everything native pushed before the transcript subscribed, in ARRIVAL ORDER", async () => {
     const bridge = await loadBridge();
@@ -227,6 +314,23 @@ describe("the pre-subscribe buffer", () => {
     const { log, events } = recorder();
     bridge.subscribeTranscript(events);
     expect(log).toEqual([]);
+  });
+
+  // `deliver()` ends in a BARE `else e.jumpToLatest()`, so a command whose
+  // `Buffered` variant has no explicit branch silently becomes "scroll to the
+  // bottom" — and TypeScript cannot catch it (the union is exhausted by the
+  // else). This is the one guard against shipping the index's commands as a
+  // jump-to-latest.
+  it("replays each index command as ITSELF, never as the jumpToLatest fall-through", async () => {
+    const bridge = await loadBridge();
+    window.baybo.jumpToMessage("m42");
+    window.baybo.outlineLoadOlder();
+    window.baybo.requestOutlineHere();
+
+    const { log, events } = recorder();
+    bridge.subscribeTranscript(events);
+    expect(log).toEqual(["jumpToMessage:m42", "outlineLoadOlder", "outlineHere"]);
+    expect(log).not.toContain("jump");
   });
 
   it("re-buffers after unsubscribe, so a detached window loses nothing", async () => {

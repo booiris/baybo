@@ -213,6 +213,28 @@ button {
   78% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
   100% { opacity: 0; transform: translateX(-50%) translateY(-5px) scale(0.98); }
 }
+/* Landing mark for a message-index jump: an ink ring that blooms around the
+   arrived bubble and fades. Holds a 4px channel of paper OUTSIDE the bubble
+   (inset -4) — against a solid-ink user bubble a hugging border would just read
+   as a thicker bubble, not a mark. No colour: --color-err is reserved for
+   destructive state. Mounted inside .bubble.user (or the last .attachment-bubble
+   for an attachment-only send) — the only positioned hosts in the row; .msg-group
+   and .chat-log are both unpositioned, so a ring parented there would escape to
+   the initial containing block and paint a full-viewport rectangle. */
+.jump-ring {
+  position: absolute;
+  inset: -4px;
+  border: 1.5px solid var(--color-ink);
+  border-radius: calc(var(--radius) + 4px);
+  pointer-events: none;
+  animation: jump-ring 820ms cubic-bezier(0.33, 1, 0.68, 1) forwards;
+}
+@keyframes jump-ring {
+  0% { opacity: 0; transform: scale(1.05); }
+  16% { opacity: 1; transform: scale(1); }
+  55% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
 /* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
    bubble, vertically centered. Centered via top + negative margin (NOT
    translateY) so the spinner's transform stays free for its rotation. */
@@ -742,7 +764,14 @@ button {
   gap: 0.35rem;
   min-width: 0;
 }
-.msg-group.user { align-items: flex-end; }
+.msg-group.user {
+  align-items: flex-end;
+  /* Where a message-index jump parks its target: clear of the native header veil
+     (--thread-top-inset is .chat-log's own padding-top) plus the same 12px of air
+     the veil's fade ends on. Declared here rather than computed at the scroll
+     call site so the clearance has ONE source of truth. */
+  scroll-margin-top: calc(var(--thread-top-inset) + 12px);
+}
 .msg-group.assistant { align-items: flex-start; }
 /* The message's clock, tucked under its last bubble — the group's align-items
    sides it (agent bottom-left, user bottom-right). Mono + tabular so a column of
@@ -764,9 +793,10 @@ button {
 .msg-group.user .msg-time { margin-right: var(--msg-time-inset); }
 /* Each attachment stands on its own bubble: the image tile / file chip alone,
    no text-bubble background. */
-.attachment-bubble { max-width: 100%; min-width: 0; }
-.attachment-bubble.sending,
-.attachment-bubble.failed { position: relative; }
+/* Positioned unconditionally: it hosts the send chrome (sending/failed) AND the
+   jump ring, and an attachment-only send that has already landed carries no
+   status class — leaving the ring with no positioned ancestor at all. */
+.attachment-bubble { max-width: 100%; min-width: 0; position: relative; }
 .attachment-img {
   display: block;
   max-width: 100%;

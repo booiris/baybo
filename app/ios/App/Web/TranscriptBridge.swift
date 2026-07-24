@@ -23,6 +23,19 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// Mirror of the web transcript's `showJump` state — drives the native
     /// glass jump-to-latest button above the composer.
     @Published private(set) var jumpVisible = false
+    /// The header's message index, mirrored from the transcript's `outline`
+    /// post — the user's own sends, each with the agent's reply as a gloss. The
+    /// web side owns the derivation (it alone sees this device's optimistic and
+    /// offline bubbles); this side only renders and jumps.
+    @Published private(set) var outline: [OutlineEntry] = []
+    @Published private(set) var outlineHasMoreOlder = false
+    @Published private(set) var outlineLoadingOlder = false
+    /// `false` until the transcript has enough of a thread to index — the header
+    /// button is absent, not disabled, below that gate.
+    @Published private(set) var outlineAvailable = false
+    /// The entry the transcript is currently parked on, so the sheet can mark
+    /// where the reader already is.
+    @Published private(set) var outlineHereId: String?
     /// `false` until the transcript has painted its first frame (`shown`), so
     /// the webview can fade in rather than pop its content in as the chat
     /// screen slides on. Re-armed on every fresh page load (`ready`).
@@ -39,6 +52,12 @@ final class TranscriptBridge: NSObject, ObservableObject {
             newStore.attachBridge(self)
             return
         }
+        // A DIFFERENT store for the same conversation (the LRU evicted this
+        // session's store and re-opening minted a fresh one) keeps the very
+        // same React tree — `<Transcript>` is keyed on `sessionId`, so `init`
+        // re-renders nothing and the outline effect never re-fires. Clearing
+        // the index there would blank it with nothing left to re-post it.
+        let sameSession = store?.sessionId == newStore.sessionId
         if let old = store {
             call("flushPersist", "")
             old.detachBridge(self)
@@ -51,6 +70,19 @@ final class TranscriptBridge: NSObject, ObservableObject {
         lastBottomInset = Int.min
         pushBottomInset()
         jumpVisible = false
+        if !sameSession { resetOutline() }
+    }
+
+    /// ONE webview serves every conversation, so an index left behind renders
+    /// over the next session's header — and its rows jump into a thread that no
+    /// longer holds them. Safe to call on a page reload too: that remounts the
+    /// React tree, whose mount effect posts a fresh outline.
+    private func resetOutline() {
+        outline = []
+        outlineHasMoreOlder = false
+        outlineLoadingOlder = false
+        outlineAvailable = false
+        outlineHereId = nil
     }
 
     func detachCurrent(_ leaving: ChatStore) {
@@ -188,6 +220,28 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("jumpToLatest", "")
     }
 
+    /// Park the transcript on one of the user's own messages (an index row tap).
+    /// The web side owns the scroll and the ring bloom, as with `jumpToLatest`.
+    func jumpToMessage(_ rowId: String) {
+        call("jumpToMessage", jsonLiteral(rowId))
+    }
+
+    /// Page one more screen of older rows into the thread, so the index can
+    /// reach further back than the thread currently holds.
+    func outlineLoadOlder() {
+        call("outlineLoadOlder", "")
+    }
+
+    /// Ask which entry the reader is parked on right now — answered by an
+    /// `outlineHere` post. The previous answer is dropped up front: the reply is
+    /// a round trip through the web-content process, so a sheet that read the
+    /// value as it presented would otherwise scroll to the LAST visit's
+    /// position and never correct itself.
+    func requestOutlineHere() {
+        outlineHereId = nil
+        call("requestOutlineHere", "")
+    }
+
     #if DEBUG
         /// `-baybo-demo-jump`: 4s in, shove the document off the newest edge from
         /// inside the page — the REAL window scroll → showJump → `jumpVisible`
@@ -309,6 +363,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             lastBottomInset = Int.min
             pushBottomInset()
             jumpVisible = false
+            resetOutline()
             contentVisible = store?.listed == false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
@@ -426,6 +481,26 @@ extension TranscriptBridge: WKScriptMessageHandler {
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
+        case "outline":
+            outlineHasMoreOlder = (body["hasMoreOlder"] as? Bool) ?? false
+            outlineLoadingOlder = (body["loadingOlder"] as? Bool) ?? false
+            outlineAvailable = (body["available"] as? Bool) ?? false
+            if let entries = body["entries"],
+                let data = try? JSONSerialization.data(withJSONObject: entries),
+                let decoded = try? JSONDecoder().decode([OutlineEntry].self, from: data)
+            {
+                outline = decoded
+            } else {
+                // Keeping the previous rows would leave the sheet offering jumps
+                // into a thread that has moved on — an empty index is honest.
+                // `available` goes with them: a lit button that opens an empty
+                // sheet is worse than no button.
+                NSLog("baybo: outline decode failed")
+                outline = []
+                outlineAvailable = false
+            }
+        case "outlineHere":
+            outlineHereId = body["rowId"] as? String
         case "runState":
             // The transcript's turn is/ isn't in flight — drives the composer's
             // send↔stop button on the store this webview currently targets.

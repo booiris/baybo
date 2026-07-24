@@ -326,6 +326,38 @@ export type PersistedState = {
   compactionPoints?: CompactionPoint[];
 };
 
+/// One row of the message index — the header sheet listing the user's own sends
+/// so a long thread can be navigated without scrolling. Derived from the SAME
+/// `Row[]` the transcript renders, which is the whole point: every entry has a
+/// DOM anchor by construction, so the sheet can never offer a row the jump
+/// cannot reach.
+export type OutlineEntry = {
+  /// `Row.id` — the jump handle, matched against `data-row-id`. A
+  /// `platform_msg_id` for anything this device sent, else the server row id.
+  /// Never an ordinal: `ordinalFromMessageId` returns null for exactly the rows
+  /// this phone sent.
+  id: string;
+  /// The prompt, whitespace-collapsed and capped at `OUTLINE_TEXT_CAP`. Empty
+  /// for an attachment-only send.
+  text: string;
+  /// The agent's answer to this prompt, markdown flattened to one line and
+  /// capped. Empty when the turn is still running, was stopped, or produced no
+  /// prose. For an attachment-only send this is the only identifying content.
+  gloss: string;
+  /// Pre-formatted by `formatTimestampShort` — the same call that stamps the
+  /// bubble's own clock, so the list and the transcript can never disagree and
+  /// native writes no date parsing. Empty when the row carries no `createdAt`.
+  at: string;
+  /// `YYYY-MM-DD` in device-local time. The one field native formats (into the
+  /// day-header label). Empty when the row carries no `createdAt`.
+  dayKey: string;
+  /// How many attachments rode with the send — an attachment-only row is
+  /// labelled by this count.
+  attachments: number;
+  /// Only set while the send is unconfirmed.
+  state?: "sending" | "failed";
+};
+
 let uidCounter = 0;
 
 /// Local id mint for React keys. crypto.randomUUID is unavailable under file://

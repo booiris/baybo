@@ -15,6 +15,13 @@ struct ChatScreen: View {
     /// The hand-rolled model menu (`ModelMenuPanel`) — state lives here
     /// because the panel overlays the TRANSCRIPT, not just the header bar.
     @State private var modelMenuOpen = false
+    /// The header's message index (`MessageIndexSheet`).
+    @State private var messageIndexOpen = false
+    /// The row a sheet tap picked. The jump runs from the sheet content's
+    /// `.onDisappear`, not from the tap: that is deterministic against the
+    /// dismissal where a guessed delay is not, so the ring blooms on a clear
+    /// screen instead of behind the sliding sheet.
+    @State private var pendingJump: String?
 
     init(host: TranscriptHost, store: ChatStore) {
         _store = ObservedObject(wrappedValue: store)
@@ -39,7 +46,10 @@ struct ChatScreen: View {
                 .opacity(bridge.contentVisible ? 1 : 0)
                 .animation(.easeOut(duration: 0.15), value: bridge.contentVisible)
 
-            ChatHeaderView(store: store, catalog: .shared, menuOpen: $modelMenuOpen) {
+            ChatHeaderView(
+                store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
+                indexOpen: $messageIndexOpen
+            ) {
                 dismiss()
             }
 
@@ -95,6 +105,21 @@ struct ChatScreen: View {
         .fullScreenCover(item: $store.videoPlayback) { playback in
             VideoPlayerScreen(url: playback.url)
         }
+        .sheet(isPresented: $messageIndexOpen) {
+            MessageIndexSheet(bridge: bridge) { rowId in
+                pendingJump = rowId
+                messageIndexOpen = false
+            }
+            .presentationDetents([.fraction(0.55), .large])
+            .presentationDragIndicator(.hidden)
+            .presentationBackground(Theme.paper)
+            .presentationCornerRadius(Theme.radiusModal)
+            .onDisappear {
+                guard let rowId = pendingJump else { return }
+                pendingJump = nil
+                bridge.jumpToMessage(rowId)
+            }
+        }
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()
@@ -107,6 +132,7 @@ struct ChatScreen: View {
                 store.startDemoImagesIfRequested()
                 store.startDemoApprovalIfRequested()
                 store.startDemoSwitchIfRequested()
+                store.startDemoIndexIfRequested()
                 bridge.startDemoJumpIfRequested()
                 startDemoBackIfRequested()
             #endif
@@ -135,14 +161,17 @@ struct ChatScreen: View {
 /// The paper-veil header: a translucent white gradient holding solid through
 /// the status bar and easing out to clear at the bar's bottom edge. On the
 /// ink side: the glass back circle and the model pill on the LEFT (the pill
-/// toggles the hand-rolled `ModelMenuPanel` the screen overlays), and — ONLY
-/// while the leg is offline — a red dot in a glass circle on the trailing
-/// edge; every healthy state shows nothing there. The veil ignores touches so
-/// scrolls beneath it reach the thread.
+/// toggles the hand-rolled `ModelMenuPanel` the screen overlays); on the
+/// trailing edge the message-index circle (opening `MessageIndexSheet`), and —
+/// ONLY while the leg is offline — a red `wifi.slash` in a glass circle
+/// immediately to ITS left; every healthy state shows nothing there. The veil
+/// ignores touches so scrolls beneath it reach the thread.
 struct ChatHeaderView: View {
     @ObservedObject var store: ChatStore
+    @ObservedObject var bridge: TranscriptBridge
     @ObservedObject var catalog: ModelCatalog
     @Binding var menuOpen: Bool
+    @Binding var indexOpen: Bool
     let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
@@ -189,12 +218,25 @@ struct ChatHeaderView: View {
             if store.legDown {
                 offlineIcon
             }
+
+            // LAST, always. `Spacer()` absorbs every width change, so only the
+            // trailing-most element holds still; inboard of the outage disc
+            // this would slide 54pt under the blanket `legDown` animation every
+            // time the network drops. A persistent control must not move — the
+            // transient alarm inserts to its left.
+            if bridge.outlineAvailable {
+                indexButton
+            }
         }
         .padding(.horizontal, 24)
         .frame(height: Self.barHeight)
         .frame(maxWidth: .infinity)
         .background(alignment: .top) { veil }
         .animation(.easeOut(duration: 0.15), value: store.legDown)
+        // On the STACK, not on the button: an `.animation(_:value:)` inside the
+        // view being inserted has no previous value to compare, so it would pop
+        // in — and under the blanket animation above, on the wrong beat.
+        .animation(.easeOut(duration: 0.16), value: bridge.outlineAvailable)
     }
 
     /// The model capsule: the effective MODEL id (the pinned entry's, or the
@@ -233,6 +275,36 @@ struct ChatHeaderView: View {
             .glassSurface(in: .circle)
             .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.offline")))
             .transition(.scale(scale: 0.6).combined(with: .opacity))
+    }
+
+    /// Opens the message index over the transcript. Deliberately BADGELESS: an
+    /// ink capsule carrying a number already means "unread" one screen up, so
+    /// the count ships as the element's VALUE against a constant label — the
+    /// model pill's split, which is what the UI smokes drive.
+    private var indexButton: some View {
+        Button {
+            Haptics.tap()
+            // The model menu is a bare Bool with no mutual exclusion; left
+            // open it strands its scrim behind the sheet.
+            if menuOpen {
+                withAnimation(.easeOut(duration: 0.15)) { menuOpen = false }
+            }
+            bridge.requestOutlineHere()
+            indexOpen = true
+        } label: {
+            Image(systemName: "text.alignright")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 42, height: 42)
+        }
+        .glassSurface(interactive: true, in: .circle)
+        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.messageIndex")))
+        .accessibilityValue(
+            Text(
+                verbatim: MessageIndexSheet.countLabel(
+                    bridge.outline.count, hasMore: bridge.outlineHasMoreOlder))
+        )
+        .transition(.scale(scale: 0.7).combined(with: .opacity))
     }
 
     /// The effective MODEL id the pill names: the pinned model within the
