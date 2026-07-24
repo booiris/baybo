@@ -104,9 +104,10 @@ export type ActivityKind = 'user' | 'assistant';
 
 /** One entry in a session's planning checklist — mirror of Rust
  *  `TaskView`. `subject` is the title; `status` is one of `pending` /
- *  `in_progress` / `completed` (kept as a `string` to match the wire,
- *  narrowed at the render site). `depends_on` lists the ids of tasks
- *  this one waits on; absent when it has no prerequisites. */
+ *  `in_progress` / `completed` (kept as a `string` to match the wire).
+ *  `depends_on` lists the ids of tasks this one waits on; absent when it
+ *  has no prerequisites. Carried by the mirror so the drift sentinel
+ *  keeps pinning the frame — the page renders no checklist. */
 export interface TaskView {
   id: string;
   subject: string;

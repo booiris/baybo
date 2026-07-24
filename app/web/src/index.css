@@ -171,7 +171,9 @@
    so a two-glyph `1.` hangs further left than a single `•` — which reads as
    inconsistent left padding between a numbered and a bulleted answer. The
    marker sits at the list's left edge (flush with surrounding paragraph
-   text); the item text is indented past it. */
+   text); the item text is indented past it. Keeping the marker inside the
+   item's own box is also what makes it survive `.chat-prose`'s
+   `overflow-x: clip`, which would otherwise amputate a hanging one. */
 .md-list {
   list-style: none;
   padding-left: 0;
@@ -180,6 +182,11 @@
 .md-list > li {
   position: relative;
   padding-left: 1.5rem;
+}
+
+/* A wider slot for numbers: two digits plus the dot don't fit a bullet's. */
+ol.md-list > li {
+  padding-left: 1.9rem;
 }
 
 .md-list > li::before {
@@ -196,14 +203,17 @@ ul.md-list > li::before {
   content: "•";
 }
 
-ol.md-list {
-  counter-reset: md-ol;
+/* Nested bullets take the hollow second level, as a UA list would. */
+ul.md-list ul.md-list > li::before {
+  content: "◦";
 }
 
-ol.md-list > li {
-  counter-increment: md-ol;
-}
-
+/* The UA's implicit `list-item` counter, never a hand-rolled one: `<ol start>`
+   sets exactly this counter, and CommonMark emits `start` whenever a paragraph
+   interrupts a list (`3.` after prose opens a fresh `<ol start="3">`) or the
+   list simply doesn't begin at 1. A manual counter has no connection to the
+   attribute, so it renumbers every such list from 1 while the DOM says
+   otherwise. */
 ol.md-list > li::before {
-  content: counter(md-ol) ".";
+  content: counter(list-item) ".";
 }

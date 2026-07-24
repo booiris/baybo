@@ -43,13 +43,11 @@ import {
   type Frame,
   type ResourceAccess,
   type SessionPatch,
-  type TaskView,
   type WireApprovalCard,
   type WireAttachment,
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
-import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
@@ -240,10 +238,6 @@ export interface SessionView {
    *  detail's `last_llm` on history load and updated on a successful
    *  `PUT …/model`. */
   model?: string | null;
-  /** The session's planning checklist, replaced wholesale by each
-   *  `Frame::TaskList` snapshot (it's idempotent, not a delta). Empty
-   *  when the agent has no active plan — the checklist panel hides. */
-  tasks: TaskView[];
   /** Server-authoritative "is a turn in flight, since when (epoch ms)".
    *  Fed by `Frame::TurnState` — broadcast at every turn start/end and
    *  snapshotted to this connection on every Subscribe — so a tab that
@@ -273,10 +267,30 @@ export const EMPTY_VIEW: SessionView = {
   hasMore: false,
   awaitingReply: false,
   model: null,
-  tasks: [],
   turn: null,
   compactionPoints: [],
 };
+
+/** Identity of everything drawn at the BOTTOM of the thread. Two equal
+ *  signatures mean nothing arrived below the user's viewport, however much the
+ *  transcript array changed above it — which is exactly the scroll-up
+ *  pagination case: `loadOlder` prepends a page and hands back a fresh array
+ *  whose tail is byte-identical. Streaming counts as movement (the last row's
+ *  text grows), as does a new step landing in a live work block. */
+export function transcriptTailSignature(
+  transcript: TranscriptRow[],
+  below: { awaitingReply: boolean; pendingApproval: boolean; deferred: number },
+): string {
+  const last = transcript.length > 0 ? transcript[transcript.length - 1] : null;
+  return [
+    last ? last.key : '',
+    last ? last.text.length : 0,
+    last?.steps?.length ?? 0,
+    below.awaitingReply ? '1' : '0',
+    below.pendingApproval ? '1' : '0',
+    below.deferred,
+  ].join('|');
+}
 
 /** Slack (px) under which the transcript is treated as not overflowing its
  *  viewport, so scroll can never fire and the older-page load must be kicked
@@ -564,6 +578,9 @@ export function ChatPage() {
   // duplicate fetch (and its rival scroll-anchor rAF) is the scroll jitter.
   // This ref is set synchronously so only one page loads at a time.
   const loadingOlderRef = useRef(false);
+  // Last seen `transcriptTailSignature`, so the auto-scroll effect can tell a
+  // genuine append at the bottom from a scroll-up prepend.
+  const tailSignatureRef = useRef('');
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
   // react-router v7's `useNavigate` (non-data routes) returns a fresh
@@ -1300,7 +1317,6 @@ export function ChatPage() {
           case 'message':
           case 'notice':
           case 'approval_requested':
-          case 'task_list':
           case 'turn_state':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
@@ -1510,8 +1526,10 @@ export function ChatPage() {
 
   // Auto-scroll on transcript append — but only if the user is already
   // parked at the bottom. Otherwise raise the "new messages" pill so
-  // they can opt back in. useLayoutEffect runs before paint so we read
-  // fresh scrollHeight.
+  // they can opt back in — and only when the TAIL actually moved:
+  // scroll-up pagination hands back a new transcript array whose tail is
+  // untouched, and that backfill must not masquerade as new content below.
+  // useLayoutEffect runs before paint so we read fresh scrollHeight.
   //
   // `instant` (the default behavior) not `smooth` — when first landing
   // on a session, the history fetch resolves and React commits the
@@ -1522,12 +1540,19 @@ export function ChatPage() {
   // the bubble grows. The user-initiated `jumpToLatest` (below) keeps
   // smooth — that one IS a discrete "take me there" gesture.
   useLayoutEffect(() => {
+    const signature = transcriptTailSignature(currentView.transcript, {
+      awaitingReply: currentView.awaitingReply,
+      pendingApproval: currentView.pendingApproval !== null,
+      deferred: queue.deferred.length,
+    });
+    const tailMoved = signature !== tailSignatureRef.current;
+    tailSignatureRef.current = signature;
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
     if (pinnedToBottomRef.current) {
       scroller.scrollTop = scroller.scrollHeight;
       setHasNewBelow(false);
-    } else {
+    } else if (tailMoved) {
       setHasNewBelow(true);
     }
   }, [
@@ -2872,7 +2897,6 @@ export function ChatPage() {
           onScroll={handleTranscriptScroll}
           className="chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
-          <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
               <RiLoader4Line className="text-3xl animate-spin" />
@@ -2997,10 +3021,14 @@ export function ChatPage() {
                 Scoped to the form (the band width) rather than the full thread,
                 so it tints only the column the bubbles occupy; `-bottom-6`
                 reaches the viewport edge under the pill and `-top-20` lifts the
-                fade-in into the thread. */}
+                fade-in into the thread. `-inset-x-2` overhangs the band by 8px
+                because a user bubble is right-aligned to the band edge and its
+                `shadow-brutal-sm` (3px) and pending/failed badge (`-right-1.5`)
+                hang PAST that edge — flush at `inset-x-0` they escape the fade
+                and streak out beside the composer. */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
+              className="pointer-events-none absolute -inset-x-2 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
             />
             {sessionId ? (
               <QueuePanel
@@ -3386,14 +3414,6 @@ export function routeInboundFrame(
           },
         };
       });
-      return;
-    }
-    case 'task_list': {
-      // Idempotent snapshot — REPLACE the session's checklist wholesale
-      // (not a delta). An empty array means the plan is currently empty
-      // and the checklist panel hides.
-      const sid = frame.session_id;
-      setViews((prev) => mergeView(prev, sid, { tasks: frame.tasks }));
       return;
     }
     case 'turn_state': {
@@ -4876,9 +4896,9 @@ function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): Transcr
 }
 
 /** Apply one `subscribe_state` bundle to a session view: REPLACE the
- *  task list and the pending-approval card set wholesale (they are
- *  latest-wins — live frames arriving after the snapshot win by normal
- *  frame order), and apply the turn/work halves unless the caller
+ *  pending-approval card set wholesale (it is latest-wins — live frames
+ *  arriving after the snapshot win by normal frame order), and apply the
+ *  turn/work halves unless the caller
  *  determined they are stale by turn identity (`turnEnded`: this client
  *  already holds a turn-end signal for the SAME turn, matched by
  *  `started_at` — never by ordinal arithmetic, since the coverage
@@ -4891,7 +4911,6 @@ export function applySubscribeState(
   const cards = frame.pending_approvals ?? [];
   let next: SessionView = {
     ...view,
-    tasks: frame.tasks ?? [],
     // The view renders one card at a time; the queue's head is the call
     // the turn is blocked on.
     pendingApproval: cards.length > 0 ? approvalFromCard(frame.session_id, cards[0]) : null,
@@ -5169,8 +5188,14 @@ const MARKDOWN_COMPONENTS: Components = {
   ul: ({ children }) => (
     <ul className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ul>
   ),
-  ol: ({ children }) => (
-    <ol className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ol>
+  // `start` has to be forwarded: CommonMark opens a fresh `<ol start="3">`
+  // whenever a paragraph interrupts a list, and the marker counter reads it off
+  // the element (see `.md-list` in index.css). Dropping it renumbers the rest of
+  // the answer from 1.
+  ol: ({ children, start }) => (
+    <ol start={start} className="md-list my-2 first:mt-0 last:mb-0 space-y-1">
+      {children}
+    </ol>
   ),
   // `leading-relaxed` (not snug) so a tight list's text line-height matches the
   // loose list's paragraph and the `.md-list` marker (which inherits it), keeping

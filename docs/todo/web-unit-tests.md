@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **20 files, 291 tests** — and the conventions that
+The dashboard's vitest suite — **20 files, 293 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -172,7 +172,7 @@ says `pass`, not `skipping`, before trusting it.
 | `types/trace.test.ts` (3) | `types/trace.ts` — `resolveToolCallOutput` | Resolve a tool-call's output from the persisted result row by `tool_use_id`. |
 | `pages/chat/queueStore.test.tsx` (9) · **render** | `queueStore.tsx` — `QueueProvider`, `useSessionQueue`, `useQueueStore` | `renderHook` over the store: FIFO append, synchronous `clearPause`→`popTop` compose, `normalize` pause-collapse, reorder, defer/restore, localStorage round-trip, cross-tab `storage` ingest. |
 | `pages/chat/QueuePanel.test.tsx` (8) · **render** | `QueuePanel.tsx` | `render` + `user-event`: empty-queue renders null, rows in order, send/delete callbacks, inline edit (save on Enter / revert on Esc), cancelled vs error pause banner + "Send remaining". |
-| `pages/chatMarkdown.test.tsx` (12) · **render** | `ChatPage.tsx` — `MarkdownBody` | The math pipeline end to end (normalize → remark-math → rehype-katex → KaTeX): inline vs display, both delimiter styles, money left literal, a malformed formula colored from the palette instead of throwing, list/table structure intact, and the `katex.min.css` import itself. |
+| `pages/chatMarkdown.test.tsx` (14) · **render** | `ChatPage.tsx` — `MarkdownBody` | The math pipeline end to end (normalize → remark-math → rehype-katex → KaTeX): inline vs display, both delimiter styles, money left literal, a malformed formula colored from the palette instead of throwing, list/table structure intact, and the `katex.min.css` import itself. Also that `<ol start>` survives the component overrides — the marker counter reads it off the element, and jsdom computes no counters, so the attribute is the only half of that the suite can see. |
 
 ## Adding a test — the recipe
 
