@@ -29,6 +29,8 @@ The Baybo Dashboard follows a **warm** "Neo-Brutalist" design language character
 | **Warning**     | `#dd6b20` | Warning logs                                   |
 | **Info**        | `#3182ce` | Informational logs                             |
 | **OK**          | `#2f855a` | Success states                                 |
+| **Violet**      | `#6b46c1` | Categorical only (trace step kinds) — never a status colour |
+| **Magenta**     | `#b83280` | Categorical only (trace step kinds) — never a status colour |
 
 > The gold brand is light, so **dark `text-ink` on `bg-brand`** is the readable pairing (white-on-gold fails contrast). `black`/`white` are revalued in the `@theme` block of `index.css`, so the pervasive `border-black` / `bg-white` utilities warm automatically.
 
