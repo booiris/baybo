@@ -1324,6 +1324,19 @@ export function TraceSessionPage() {
     (jobId: string) => updateUrl({ job: jobId, step: null, span: null }),
     [updateUrl],
   );
+  // A job anchor is a "take me to this job" action, so it must clear an active
+  // filter — otherwise the filter can hide the very job it just selected and the
+  // tree shows nothing while the detail panel switches.
+  const handleJumpToJob = useCallback(
+    (jobId: string) => {
+      setFailuresOnly(false);
+      setFilterRaw('');
+      setFilter('');
+      handleSelectJob(jobId);
+    },
+    [handleSelectJob],
+  );
+
   const handleSelectStep = useCallback(
     (jobId: string, stepId: string) => updateUrl({ job: jobId, step: stepId, span: null }),
     [updateUrl],
@@ -1465,7 +1478,7 @@ export function TraceSessionPage() {
           overview={overview}
           jobTraces={jobTraces}
           activeJobId={activeJobId}
-          onSelectJob={handleSelectJob}
+          onSelectJob={handleJumpToJob}
         />
         <TraceTree
           overview={overview}

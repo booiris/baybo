@@ -176,8 +176,12 @@ function LatencyBar({ ms, maxMs, outcome }: { ms: number | null; maxMs: number; 
 
 // Sibling-relative heat tint (Langfuse "%"): the slowest branch in each group
 // glows red, the next tier amber. Only applied to unselected rows.
-function heatTint(ms: number | null, maxMs: number): string {
-  if (ms == null || maxMs <= 0) return '';
+//
+// `siblings` gates it: with a single child there is nothing to compare against —
+// that row is trivially 100% of its group's max and would always glow red, which
+// tints most of the tree and destroys the signal. Needs at least two siblings.
+function heatTint(ms: number | null, maxMs: number, siblings: number): string {
+  if (ms == null || maxMs <= 0 || siblings < 2) return '';
   const r = ms / maxMs;
   if (r >= 0.75) return 'bg-err/10';
   if (r >= 0.5) return 'bg-warn/10';
@@ -220,6 +224,7 @@ function SpanRow({
   selected,
   interjected,
   maxMs,
+  siblings,
   heat,
   onSelect,
 }: {
@@ -227,6 +232,7 @@ function SpanRow({
   selected: boolean;
   interjected: boolean;
   maxMs: number;
+  siblings: number;
   heat: boolean;
   onSelect: () => void;
 }) {
@@ -255,7 +261,7 @@ function SpanRow({
     subtitle = 'wait window';
   }
 
-  const tint = heat && !selected ? heatTint(ms, maxMs) : '';
+  const tint = heat && !selected ? heatTint(ms, maxMs, siblings) : '';
 
   return (
     <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint)} style={{ paddingLeft: INDENT_SPAN }}>
@@ -296,6 +302,7 @@ function StepRow({
   open,
   hasSpans,
   maxMs,
+  siblings,
   heat,
   onToggle,
   onSelect,
@@ -305,6 +312,7 @@ function StepRow({
   open: boolean;
   hasSpans: boolean;
   maxMs: number;
+  siblings: number;
   heat: boolean;
   onToggle: () => void;
   onSelect: () => void;
@@ -313,7 +321,7 @@ function StepRow({
   const summary = stepSummaryText(rs.step, rs.spans);
   const ms = durationMs(rs.step);
   const tokens = sumLlmTokens(rs.spans);
-  const tint = heat && !selected ? heatTint(ms, maxMs) : '';
+  const tint = heat && !selected ? heatTint(ms, maxMs, siblings) : '';
 
   return (
     <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint)} style={{ paddingLeft: INDENT_STEP }}>
@@ -555,6 +563,7 @@ export function TraceTree(props: TraceTreeProps) {
                             open={stepOpen}
                             hasSpans={hasSpans}
                             maxMs={maxStepMs}
+                            siblings={trace.steps.length}
                             heat={heat}
                             onToggle={() => onToggle(rs.step.id, stepOpen)}
                             onSelect={onStepClick}
@@ -570,6 +579,7 @@ export function TraceTree(props: TraceTreeProps) {
                                     selected={selectedSpanId === span.id}
                                     interjected={interjectionSpanIds.has(span.id)}
                                     maxMs={maxSpanMs}
+                                    siblings={rs.spans.length}
                                     heat={heat}
                                     onSelect={() => onSelectSpan(job.job_id, span.id)}
                                   />
