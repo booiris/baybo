@@ -172,7 +172,10 @@ function LatencyBar({ ms, maxMs, outcome }: { ms: number | null; maxMs: number; 
         ? 'bg-info/60'
         : 'bg-ink/25';
   return (
-    <span className="hidden md:block w-16 h-1.5 rounded-full bg-black/10 relative shrink-0" title={formatDuration(ms)}>
+    <span
+      className="hidden md:block w-20 lg:w-32 xl:w-48 h-1.5 rounded-full bg-black/10 relative shrink-0"
+      title={formatDuration(ms)}
+    >
       <span className={`absolute left-0 top-0 h-full rounded-full ${color}`} style={{ width: `${pct}%` }} />
     </span>
   );

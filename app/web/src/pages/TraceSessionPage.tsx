@@ -1482,6 +1482,7 @@ export function TraceSessionPage() {
         <JobAnchors
           overview={overview}
           jobTraces={jobTraces}
+          messageLog={messageLog}
           activeJobId={activeJobId}
           onSelectJob={handleJumpToJob}
         />

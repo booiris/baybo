@@ -178,9 +178,10 @@ highlights that group across both the minimap and the tree by dimming everything
 else, so "where did it fail" or "where are the tool calls" reads at a glance. Kind colours are one distinct hue per group —
 **LLM = green, Tool = orange, Memory = blue, Subagent = gold, Aux = gray**, with a red
 failure overlay — shared across the glyph, left stripe, and minimap cell (`TRACE_LEGEND`
-is the key). Plus a slim left **job-anchor rail** (`JobAnchors`) — a document-
-outline TOC of job numbers that select + scroll the tree to a job (`data-job-id`), red dot
-for failing jobs, hidden for single-job traces. Still not ported: per-step **ordinals** and
+is the key). Plus a left **job column** (`JobAnchors`) — a document-outline
+list that selects + scrolls the tree to a job (`data-job-id`), previewing the **user input**
+that started each job (so jobs are told apart by what was asked, not by number) along with
+its tokens, duration, and a red dot when it holds a failure. Hidden for single-job traces. Still not ported: per-step **ordinals** and
 FlowRail's flat chronological model.
 
 Roadmap (deferred): **P1** = a Timeline/waterfall *view* toggle (bars on a shared time
