@@ -86,7 +86,7 @@ const EDIT_TOOL_NAME: &str = "Edit";
 /// headers + italic descriptors to fill in. The italic descriptors are
 /// preserved verbatim across passes (see the `STRUCTURE PRESERVATION
 /// REMINDER` block of the prompt).
-const DEFAULT_NOTES_TEMPLATE: &str = "# Session Title
+pub(crate) const DEFAULT_NOTES_TEMPLATE: &str = "# Session Title
 _A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_
 
 # Current State
@@ -116,6 +116,28 @@ _If the user asked a specific output such as an answer to a question, a table, o
 # Worklog
 _Step by step, what was attempted, done? Very terse summary for each step_
 ";
+
+/// Whether `notes` carries anything beyond the untouched
+/// [`DEFAULT_NOTES_TEMPLATE`] scaffold.
+///
+/// A pass that lands no `Edit` leaves `summary.md` byte-identical to the
+/// seeded scaffold: real headers, real italic descriptors, zero content.
+/// Handing that to the compressor's fast path would tell the model "the
+/// summary below covers the earlier portion of the conversation" while
+/// covering nothing, so the consuming side has to be able to recognize it.
+///
+/// Boilerplate is matched **line-by-line against the scaffold** rather than
+/// by stripping `#` / `_…_` markup: a model that writes its content inside
+/// the italic descriptors instead of below them (observed in the wild) still
+/// counts as content, because those lines no longer match the scaffold's.
+pub(crate) fn summary_has_content(notes: &str) -> bool {
+    notes.lines().map(str::trim).any(|line| {
+        !line.is_empty()
+            && !DEFAULT_NOTES_TEMPLATE
+                .lines()
+                .any(|seed| seed.trim() == line)
+    })
+}
 
 /// Result of one chat call inside the background-summary flow. Wraps
 /// the sanitized [`LlmResponse`] with the trace span id + post-pricing
@@ -705,12 +727,24 @@ iterations without terminating"
         }
     }
 
+    // A pass that landed no `Edit` left `summary.md` byte-identical to what
+    // it found, so the file still covers only what the *previous* cursor
+    // covered. Advancing to `up_to_ordinal` here would claim coverage the
+    // file does not have, and the fast path would later swap that summary in
+    // for the transcript and silently drop every message in the gap.
     if !applied_any_edit {
-        debug!(
+        let _ = sessions
+            .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
+            .await;
+        warn!(
             session_id = %session_id,
             iterations,
-            "background summary: pass produced no Edit calls — notes left unchanged"
+            cost_micros,
+            "background summary: pass landed no Edit — cursor left at its prior position"
         );
+        return Err(ContextError::UnproductiveSummary(format!(
+            "no Edit applied across {iterations} iterations"
+        )));
     }
 
     // On metadata failure the file lands but the row doesn't —
@@ -831,6 +865,39 @@ mod tests {
         assert!(!prompt.contains(
             "IMPORTANT: The following sections exceed the per-section limit and MUST be condensed:"
         ));
+    }
+
+    #[test]
+    fn untouched_scaffold_counts_as_contentless() {
+        assert!(!summary_has_content(DEFAULT_NOTES_TEMPLATE));
+        // Trailing whitespace / CRLF drift must not read as content.
+        assert!(!summary_has_content(
+            &DEFAULT_NOTES_TEMPLATE.replace('\n', "  \n")
+        ));
+        assert!(!summary_has_content(""));
+        assert!(!summary_has_content("   \n\n  "));
+    }
+
+    #[test]
+    fn body_under_a_section_counts_as_content() {
+        let notes = DEFAULT_NOTES_TEMPLATE.replace(
+            "# Session Title\n",
+            "# Session Title\nPorting the compaction cursor guard\n",
+        );
+        assert!(summary_has_content(&notes));
+    }
+
+    /// A model that rewrites the italic descriptor itself instead of writing
+    /// below it still produced real content — seen in the wild on
+    /// `subagent-3f57c66c`. Matching against the scaffold line-by-line (rather
+    /// than stripping `_…_` markup) is what keeps this from reading as empty.
+    #[test]
+    fn content_written_inside_the_italic_descriptor_counts_as_content() {
+        let notes = DEFAULT_NOTES_TEMPLATE.replace(
+            "_A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_",
+            "_Research July 2026 AI intelligence candidates_",
+        );
+        assert!(summary_has_content(&notes));
     }
 
     #[test]

@@ -27,7 +27,8 @@ use std::time::Duration;
 use baybo_agent::SessionManager;
 use baybo_agent::compression::reap_orphan_summaries;
 use baybo_context::{
-    BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
+    BackgroundSummaryConfig, ContextError, SummaryChatRun, TiktokenTokenizer,
+    run_background_summary,
 };
 use baybo_integration_tests::AgentTestHarness;
 use baybo_job::{Job, JobStore};
@@ -327,6 +328,107 @@ fn fake_edit_then_thrash(
             })
         })
     })
+}
+
+/// A model whose every `Edit` fails: no round ever lands a change, so
+/// `summary.md` is still the untouched scaffold when the pass gives up.
+fn fake_always_failing_edit(
+    notes_path: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> baybo_context::BackgroundSummaryCallback {
+    use std::sync::atomic::Ordering;
+    Box::new(move |_req, _marker| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let notes_path = notes_path.clone();
+        Box::pin(async move {
+            let response = LlmResponse {
+                content: String::new(),
+                content_blocks: vec![],
+                tool_calls: vec![ToolCallInfo {
+                    id: format!("edit-{n}"),
+                    name: "Edit".into(),
+                    arguments: serde_json::json!({
+                        "file_path": notes_path.display().to_string(),
+                        "old_string": "text that is not anywhere in the notes file",
+                        "new_string": "never lands",
+                    }),
+                    signature: None,
+                }],
+                usage: TokenUsage::default(),
+                thinking: None,
+            };
+            Ok(SummaryChatRun {
+                response,
+                span_id: format!("span-{n}"),
+                cost_micros: 100,
+            })
+        })
+    })
+}
+
+/// A pass that lands NO `Edit` must NOT advance the cursor. The notes file is
+/// byte-identical to what the pass found, so it still covers only what the
+/// previous pass covered; recording success here would let the compressor's
+/// fast path later swap a content-free scaffold in for the transcript and
+/// silently drop every message in the gap. Observed in production on
+/// `a4e1ebf3` (2026-07-22): four consecutive no-edit passes walked the cursor
+/// 187 → 223, then a compaction replaced 234 messages with the empty scaffold.
+#[tokio::test]
+async fn background_pass_that_lands_no_edit_does_not_advance_the_cursor() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-no-edit");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    ));
+
+    let up_to_ordinal = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::user(vec![ContentBlock::Text("summarize this".into())]),
+        )
+        .await
+        .unwrap();
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let err = run_background_summary(
+        config,
+        fake_always_failing_edit(notes_path.clone(), Arc::clone(&calls)),
+    )
+    .await
+    .expect_err("a pass that wrote nothing must not report success");
+
+    assert!(
+        matches!(err, ContextError::UnproductiveSummary(_)),
+        "the caller backs off on this variant specifically, got: {err:?}"
+    );
+
+    // Still bails on MAX_UNPRODUCTIVE_SUMMARY_ROUNDS rather than the hard cap.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    let meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(
+        meta.cursor, 0,
+        "cursor must stay put — summary.md covers nothing"
+    );
+    assert_eq!(meta.pass_count, 0, "no pass succeeded");
+    assert_eq!(meta.error_count, 1, "the wasted pass must be visible");
 }
 
 /// A model that keeps calling tools but stops making progress must NOT burn

@@ -28,6 +28,7 @@ use baybo_model::{ChatMessage, ContentBlock};
 use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
+use crate::background_summary::summary_has_content;
 use crate::error::ContextError;
 use crate::prompts::compression::{CONTINUATION_FOOTER, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION};
 use crate::{
@@ -315,6 +316,21 @@ impl ContextManager {
                 return None;
             }
         };
+
+        // Independent of whatever the metadata row claims: a summary with no
+        // content is not coverage. The only other budget check below is an
+        // *upper* bound, so an empty summary is the cheapest thing that could
+        // possibly be swapped in — exactly backwards. Stage 2 spends one LLM
+        // call and produces a real summary instead.
+        if !summary_has_content(&summary_content) {
+            warn!(
+                session_id = %self.session_id,
+                cursor = metadata.cursor,
+                summary_bytes = summary_content.len(),
+                "fast-path: summary.md holds no content beyond the scaffold; falling through"
+            );
+            return None;
+        }
 
         // Map `metadata.cursor` (a `session_messages.ordinal`) back to
         // an in-memory index so the recent slice can't be cut past

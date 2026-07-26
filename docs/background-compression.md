@@ -163,7 +163,9 @@ Key properties:
 4. Append the session-notes prompt after the transcript (`build_summary_prompt`: `PROMPT_TEMPLATE` with `{{notesPath}}` / `{{currentNotes}}` substituted, plus the size-budget appendices — see Appendix A).
 5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. A **failed `Edit`** carries `FAILED_EDIT_RETRY_GUIDANCE`, which tells the model to `Read` the notes file and re-`Edit`: the prompt embeds the file once, and once an earlier `Edit` lands that snapshot is stale, so a model that dribbles edits across turns keeps missing on `old_string not found`. The prompt embeds the notes and asks for parallel `Edit`s; `Read` stays available for exactly this recovery. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session.
 
-   The loop terminates on the **first** of three conditions: (a) the model responds without tool calls (the happy path — the prompt asks for parallel edits in one message then stop); (b) **converge-or-stop** — `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS` = 3 consecutive rounds issue tool calls but land no successful `Edit` (only `Read`s, or `Edit`s that all errored), meaning the model is thrashing and re-sending the whole transcript for nothing; both (a) and (b) fall through to `record_summary_success` (the edits that landed are kept, cursor advances); (c) the hard cap `MAX_BACKGROUND_SUMMARY_ITERATIONS`, which is pathological non-termination and instead `record_summary_failure`s. A "productive" round is detected by reading the `ERROR:`-prefix convention back off the `Edit` tool_result. The tolerance of 3 covers the intended recovery — a failed `Edit`, then a `Read` to refresh, then a corrected `Edit` — which spends two no-progress rounds before landing. Without (b), a model that never emits an empty-tool-call turn burns all 10 iterations — each re-sending the full (~100K+ token) transcript — before failing.
+   The loop terminates on the **first** of three conditions: (a) the model responds without tool calls (the happy path — the prompt asks for parallel edits in one message then stop); (b) **converge-or-stop** — `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS` = 3 consecutive rounds issue tool calls but land no successful `Edit` (only `Read`s, or `Edit`s that all errored), meaning the model is thrashing and re-sending the whole transcript for nothing; (c) the hard cap `MAX_BACKGROUND_SUMMARY_ITERATIONS`, which is pathological non-termination and `record_summary_failure`s.
+
+   Whichever way the loop exits, the pass is a **success only if at least one `Edit` landed** (`applied_any_edit`). Exits (a) and (b) with no `Edit` applied left `summary.md` byte-identical to what the pass found, so the file still covers only what the *previous* cursor covered: advancing to `up_to_ordinal` there would claim coverage the file does not have, and stage 1 would later swap that summary in and silently drop every message in the gap. Such a pass instead `record_summary_failure`s (cursor untouched) and returns `ContextError::UnproductiveSummary`, on which the agent loop holds off for `BG_SUMMARY_UNPRODUCTIVE_BACKOFF` — without that backoff the un-advanced cursor leaves the anchor-relative diff gate satisfied and the pass re-fires on the very next boundary. A "productive" round is detected by reading the `ERROR:`-prefix convention back off the `Edit` tool_result. The tolerance of 3 covers the intended recovery — a failed `Edit`, then a `Read` to refresh, then a corrected `Edit` — which spends two no-progress rounds before landing. Without (b), a model that never emits an empty-tool-call turn burns all 10 iterations — each re-sending the full (~100K+ token) transcript — before failing.
 6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
    ```sql
    INSERT INTO session_summaries
@@ -186,7 +188,7 @@ The trade-off is that a process shutdown does not actively cancel an in-flight p
 ### Failure handling (linear retry, no backoff)
 
 - LLM call fails → `record_summary_failure` bumps metadata `error_count`; `summary.md` may already carry the seeded scaffold and any earlier iterations' `Edit`s; next trigger fires fresh.
-- A single `Edit` / `Read` fails → **not** a pass failure: the error returns to the model as an `ERROR:`-prefixed `tool_result` for retry. A pass that applies no `Edit` at all still records success (logged at `debug`).
+- A single `Edit` / `Read` fails → **not** a pass failure: the error returns to the model as an `ERROR:`-prefixed `tool_result` for retry. A pass that applies **no** `Edit` at all *is* a failure — `record_summary_failure`, cursor untouched, `ContextError::UnproductiveSummary` (logged at `warn`), and the agent loop backs off before retrying.
 - Seeding `summary.md` fails → logged at `warn` only; the default template is inlined into the prompt and the pass continues.
 - Metadata update fails → file orphan; the startup FS reaper deletes orphan summary dirs whose `session_id` has no metadata row.
 
@@ -201,11 +203,12 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
 The fast-path **never waits** for an in-flight background pass — it reads whatever cursor + `summary.md` is currently on file and tolerates being stale-by-one. A refresh that lands just after this read simply applies on the next turn.
 
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
-2. **Cursor mapping**: resolve `metadata.cursor` to its index among the session's active rows via `SessionManager::active_index_of_ordinal` (the supersede filter is pushed into SQL, not walked client-side); that index is the cursor's position in the in-memory `messages` (full frame, including system), cross-checked against `SessionManager::count_active_messages`. Fall through if:
+2. **Content check**: fall through unless `summary.md` holds something beyond the untouched `DEFAULT_NOTES_TEMPLATE` scaffold (`summary_has_content`). Independent of what the metadata row claims — step 4 is an *upper* bound, so a content-free summary is the cheapest thing that could possibly be swapped in, exactly backwards. Boilerplate is recognized by matching each line against the scaffold rather than by stripping `#` / `_…_` markup, so a model that writes into the italic descriptors instead of below them still counts as content.
+3. **Cursor mapping**: resolve `metadata.cursor` to its index among the session's active rows via `SessionManager::active_index_of_ordinal` (the supersede filter is pushed into SQL, not walked client-side); that index is the cursor's position in the in-memory `messages` (full frame, including system), cross-checked against `SessionManager::count_active_messages`. Fall through if:
    - The active row count doesn't equal `messages.len()` (snapshot drift, an unpersisted system prompt, compaction in flight).
    - The cursor ordinal isn't present in the active log (compression has rewritten it).
    - The cursor maps inside the system block.
-3. **Recent slice selection** (atomic-pair backward walk):
+4. **Recent slice selection** (atomic-pair backward walk):
    ```
    walk backward from non_system.len() in atomic units
        (single message OR tool_use+tool_result pair):
@@ -213,9 +216,9 @@ The fast-path **never waits** for an in-flight background pass — it reads what
      soft stop:    tokens ≥ 10K AND text_block_msg_count ≥ 5
    ```
    Then **clamp** the cut to be no later than the index *one past* the cursor's index in the `non_system` frame: `cut = pair_preserving_cut(non_system, min(walk_cut, cursor_idx_in_non_system + 1))`. Every message *strictly after* the cursor is unsummarized — it must remain in the recent slice — and `pair_preserving_cut` guarantees the slice never starts mid-tool-pair (so a cursor that lands on a tool_use or tool_result, e.g. an iteration-boundary trigger right after a tool exchange, doesn't produce an orphan tool_result blob). `RECENT_SLICE_MAX_TOKENS` is a *forward-extension* ceiling for the walk, not a license to drop post-cursor content.
-4. **Pre-assembly threshold check** (recent slice **included**):
+5. **Pre-assembly threshold check** (recent slice **included**):
    - `tokens(summary) + tokens(skill_trailer) + tokens(recent_slice) > 0.6 × max_tokens` → fall through to inner. Including the recent slice catches stale-cursor scenarios where the post-cursor span alone overruns the budget.
-5. **Assemble**:
+6. **Assemble**:
    ```
    [system messages (all)]
    [user(continuation-summary message: intro + summary.md body +

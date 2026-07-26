@@ -2635,6 +2635,88 @@ mod tests {
         );
     }
 
+    /// A `summary.md` that is still the untouched scaffold covers nothing, so
+    /// the fast path must refuse it and fall through to the LLM stage — even
+    /// though the metadata row claims coverage and the assembly is *well*
+    /// under the fall-through budget (an empty summary is the cheapest thing
+    /// that could be swapped in, which is exactly why size alone can't gate
+    /// this). Regression guard for the 2026-07-22 `a4e1ebf3` incident, where
+    /// 234 messages were replaced by the bare scaffold.
+    #[tokio::test]
+    async fn fast_path_refuses_a_contentless_summary_file() {
+        let workspace_root = tempfile::tempdir().expect("tempdir");
+        let sessions = test_sessions();
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
+                workspace_root.path().to_path_buf(),
+            )),
+            keep_recent: 2,
+            compression_threshold: 0.2,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: Arc::clone(&sessions),
+            subagent_profile: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        let big = "x".repeat(8_000);
+        let mut cursor_seed = 0;
+        for i in 0..14 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let ordinal = ctx
+                .append(&make_msg(role, &format!("m{i} {big}")))
+                .await
+                .expect("persisted append");
+            if i == 9 {
+                cursor_seed = ordinal;
+            }
+        }
+
+        let summary_path = ctx.workspace.session_summary_file(ctx.session_id.as_str());
+        tokio::fs::create_dir_all(summary_path.parent().expect("dir"))
+            .await
+            .expect("summary dir");
+        tokio::fs::write(
+            &summary_path,
+            crate::background_summary::DEFAULT_NOTES_TEMPLATE,
+        )
+        .await
+        .expect("write summary.md");
+        sessions
+            .record_summary_success(
+                &ctx.session_id,
+                cursor_seed,
+                0,
+                "m",
+                "s",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        // `err_chat` proves stage 2 was actually reached: had the fast path
+        // served the scaffold, no chat call would fire at all.
+        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        let scaffold_marker = "_What is actively being worked on right now?";
+        assert!(
+            !ctx.messages().iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(scaffold_marker)))),
+            "the empty scaffold must never reach the transcript"
+        );
+    }
+
     #[tokio::test]
     async fn stage2_apply_does_not_repoint_summary_cursor() {
         // Metadata exists (cursor=1) but summary.md is absent (the test

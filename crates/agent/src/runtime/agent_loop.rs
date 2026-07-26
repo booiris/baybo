@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
-use baybo_context::ContextManager;
+use baybo_context::{ContextError, ContextManager};
 use baybo_job::{JobInput, JobLifecycle, JobOutput};
 use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
@@ -61,6 +62,15 @@ const MAX_LLM_IMAGES_PER_ITERATION: usize = 8;
 /// throttles subagent fan-out. Like the per-tool timeout ceiling, the
 /// cap lives in code rather than `baybo.json`.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
+
+/// How long [`AgentLoop::maybe_run_background_compression`] holds off after a
+/// pass that landed no `Edit`. Such a pass leaves the summary cursor where it
+/// was, so the anchor-relative diff gate stays satisfied and would otherwise
+/// re-fire immediately — spending another full-transcript round-trip on a
+/// model that just declined to write anything. Long enough that the retry
+/// carries genuinely new material, short enough that a session actively
+/// producing work still gets a summary within one compaction cycle.
+const BG_SUMMARY_UNPRODUCTIVE_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Trim and length-cap a single-line summary string. Char-based so a
 /// multibyte boundary is never split.
@@ -518,6 +528,14 @@ pub struct AgentLoop {
     /// token can't kill an in-flight pass — mirrors
     /// [`Self::spawn_session_end_write`].
     bg_compression: Option<tokio::task::JoinHandle<()>>,
+    /// Deadline before which [`Self::maybe_run_background_compression`]
+    /// refuses to spawn another pass. Set by the detached pass itself when it
+    /// finishes having landed no `Edit` — hence the shared cell, and hence
+    /// stamped at *completion* rather than at spawn, so a long unproductive
+    /// pass doesn't have its own backoff already expired by the time it ends.
+    /// A productive pass never writes here: it advances the cursor, which
+    /// re-anchors the diff gate on its own.
+    bg_compression_backoff: Arc<parking_lot::Mutex<Option<Instant>>>,
     /// Once-per-actor title-generation guard. Durable `Session.title`
     /// prevents repeats after rehydration.
     title_generation: Option<tokio::task::JoinHandle<()>>,
@@ -633,6 +651,7 @@ impl AgentLoop {
             last_task_management_turn: 0,
             last_reminder_turn: 0,
             bg_compression: None,
+            bg_compression_backoff: Arc::new(parking_lot::Mutex::new(None)),
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
@@ -2877,6 +2896,16 @@ impl AgentLoop {
             return;
         }
 
+        // A pass that landed no `Edit` leaves the cursor where it was, so the
+        // anchor-relative diff gate below stays satisfied and would re-fire on
+        // the very next boundary — re-sending the whole transcript to a model
+        // that just declined to write anything. Back off instead.
+        if let Some(until) = *self.bg_compression_backoff.lock()
+            && Instant::now() < until
+        {
+            return;
+        }
+
         let Some(payload) = self
             .context_manager
             .maybe_request_background_summary(job_done)
@@ -2910,6 +2939,7 @@ impl AgentLoop {
         // it would let a reap mid-pass tear the summary down. Mirrors
         // `spawn_session_end_write`.
         let cancel_token = CancellationToken::new();
+        let backoff = Arc::clone(&self.bg_compression_backoff);
 
         let handle = tokio::spawn(async move {
             let runner = crate::runtime::compression::BackgroundCompressionRunner {
@@ -2926,6 +2956,9 @@ impl AgentLoop {
                 cancel_token,
             };
             if let Err(e) = runner.run(payload).await {
+                if matches!(e, ContextError::UnproductiveSummary(_)) {
+                    *backoff.lock() = Some(Instant::now() + BG_SUMMARY_UNPRODUCTIVE_BACKOFF);
+                }
                 warn!(error = %e, "background summary pass failed");
             }
         });
