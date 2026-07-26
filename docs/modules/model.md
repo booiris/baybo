@@ -26,6 +26,18 @@ Contents:
 
 ## Design Decisions
 
+### The `<tool_output>` envelope lives here
+
+`wrap_tool_output` sits beside the `TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX` constants
+it keys off, so the wrapper and the literals cannot drift apart, and so every
+crate that feeds untrusted text to a model can reach it: `baybo-context` for the
+main transcript, `baybo-tools` for the out-of-band bash risk-judge prompts.
+`baybo-context` already depends on `baybo-tools`, so the reverse would be a
+cycle — this crate is the only common ancestor. Detection and secret
+sanitization stay in `baybo-security`; only the format lives here, which is why
+injection-marker rule names arrive as plain strings rather than as a
+`baybo-security` type.
+
 ### Minimal scope
 
 `model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `baybo-session` re-uses them via `baybo_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `BAYBO_CONFIG_PATH`) live in `baybo-workspace::paths`, not here — they are workspace-shaped data, not content primitives.

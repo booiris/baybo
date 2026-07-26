@@ -36,7 +36,9 @@ The design protects:
 - The pairing secret, the 256-bit QR `s=` value used as the XXpsk0 PSK.
 - A and P Noise static private keys.
 - The post-pairing `push_key`.
-- The gateway-side device `auth_token` and local `SecretVault` contents.
+- The device's `auth_token` and the local `SecretVault` contents. The gateway
+  stores only `sha256:<hex>` of that token, so the bearer itself exists on the
+  device and nowhere else once pairing completes.
 - Push preview plaintext, meaning the `title` and `body` that the lock screen
   shows after NSE decryption.
 

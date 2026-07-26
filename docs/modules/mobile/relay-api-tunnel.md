@@ -43,7 +43,7 @@ The gateway side (`crates/gateway/src/channel/api_tunnel.rs`) mirrors the
 one-shot shape: `run_tunnel_session` does the responder handshake, reads
 **exactly one** request head under `TUNNEL_IDLE_TIMEOUT = 20s` (`:79-84`),
 forwards it into `tunnel_http::router` (which injects
-`Authorization: Bearer <device.auth_token>` + `x-baybo-device-id`, `:314-319`),
+`Authorization: Bearer <the gateway's own admin token>` + `x-baybo-device-id`),
 sends the response, and **returns** — the socket is dropped.
 
 ## Design

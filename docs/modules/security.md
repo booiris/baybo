@@ -91,11 +91,12 @@ Any future HTTP-emitting builtin must apply the same two layers (`validate_url_w
 Secrets are encrypted with AES-256-GCM. `SecretValue` should not support plaintext `Debug`.
 
 **Record format.** `nonce(12) || ciphertext || tag(16)`, with a fresh random
-nonce per encryption and the **entry name passed as associated data**. The AAD binding is the point: one master key encrypts every
-row, so without it any ciphertext decrypts correctly under any name, and an
-attacker who can write the store can move `llm.entry.cheap.api_key`'s ciphertext
-onto `gateway.admin_token` and have it open cleanly. With it, a record is only
-valid where it was written.
+nonce per encryption and the **entry name passed as associated data**. The AAD
+binding is the point: one master key encrypts every row, so without it any
+ciphertext decrypts correctly under any name, and an attacker who can write the
+store can move `llm.entry.cheap.api_key`'s ciphertext onto
+`gateway.admin_token` and have it open cleanly. With it, a record is only valid
+where it was written.
 
 Deliberately unversioned. A leading marker would discriminate nothing — one
 format exists — and could not disambiguate anything anyway, since the first byte
@@ -114,60 +115,58 @@ does not decrypt at all.** There is no conversion path in the tree — a workspa
 in that state is re-provisioned (`baybo setup`, re-pair devices, re-enter
 `user_env.*` and provider keys), not migrated.
 
-**Key rotation.** `baybo vault rotate` mints a new master key, re-encrypts
-every entry under it, and replaces the key file.
+**Key rotation.** `baybo vault rotate` mints a new master key, re-encrypts every
+entry under it, and replaces the key file. Shell-only.
 
-Two gates precede it. The operator must **type the outgoing key** (masked) — a
-`[y/N]` proves only that someone pressed a key, whereas producing the key proves
-they hold it somewhere other than this disk, which is precisely what rotation is
-about to invalidate. And a backup is written first, containing the outgoing key
-plus the current `secrets` rows as a restorable `.sql` transaction. That pair is
-jointly sufficient and individually useless; it is deliberately **not** a copy of
-the database, since rotation touches one table and copying transcripts and
-traces would cost hundreds of megabytes for no recovery value. Restore is
-`cp <backup>/encryption.key <key path>` plus
-`sqlite3 <db> < <backup>/secrets.sql` — no bespoke command to maintain.
+Three things gate it, and each is enforced where it cannot be skipped rather
+than asked of the caller:
 
-Shell-only, and it **holds**
-the workspace singleton lock for the whole operation rather than checking it
-first: a gateway that starts midway would write an entry under the outgoing
-key, outside the snapshot being re-encrypted, and that entry becomes unreadable
-the moment the new key is promoted. Checking and releasing would leave exactly
-that window open, so the lock is a mutex here, not a precondition. Rotation
-fails cleanly if the workspace is in use — nothing is written.
+- **The workspace singleton lock is held for the whole run**, not checked and
+  released. A gateway that started midway would write an entry under the
+  outgoing key — outside the snapshot being re-encrypted — and that entry
+  becomes unreadable the moment the new key is promoted. `key_file::rotate`
+  takes a `&WorkspaceLock`, so it cannot be called without one.
+- **The operator types the outgoing key**, masked. A `[y/N]` proves someone
+  pressed a key; producing the key proves they hold it somewhere other than this
+  disk, which is exactly what rotation is about to invalidate.
+- **A backup is written first**, inside `rotate` itself: the outgoing key plus
+  the current `secrets` rows as a restorable SQL transaction, in one `0700`
+  directory. Deliberately *not* a copy of the database — rotation touches one
+  table, so copying transcripts and traces would cost hundreds of megabytes for
+  no recovery value. The two files are jointly sufficient and individually
+  useless. Restore is `cp <backup>/encryption.key <key path>` plus
+  `sqlite3 <db> < <backup>/secrets.sql`; no bespoke command to maintain.
 
-Rotation changes two things that cannot be committed together: the key file and
-every ciphertext in sqlite. The ordering is what makes the gap survivable —
-write the new key to `<live key path>.pending`, re-encrypt in one transaction,
-then `rename` pending over the live key. A crash before the commit leaves
-ciphertext under the old key, which the live file still holds; a crash after it
-leaves ciphertext under the pending key. Exactly one of the two files opens the
-vault, and `key_file::resolve_pending` determines which by decrypting a real
-entry rather than by inspecting on-disk bookkeeping. Neither working is a hard
-error, not a silent start.
+**Surviving a crash.** Rotation changes two things that cannot be committed
+together: the key file and every ciphertext in sqlite. Ordering is what makes
+the gap survivable — write the new key to `<live key path>.pending`, re-encrypt
+in one transaction, then `rename` pending over the live key. A crash before the
+commit leaves ciphertext under the old key, which the live file still holds; a
+crash after it leaves ciphertext under the pending key. Exactly one of the two
+opens the vault, and `key_file::resolve_pending` determines which by decrypting
+a real entry rather than by inspecting on-disk bookkeeping. Neither working is a
+hard error, not a silent start.
 
 The pending path is **derived** from the live one rather than resolved
-separately. `security.encryption_key_file` is operator-configurable, so a
+separately: `security.encryption_key_file` is operator-configurable, so a
 pending path computed from the workspace default would have rotation promote a
 key the boot path never reads.
 
-`key_file::resolve_pending` — not a bare read — is what every vault-opening path
-must call. `boot::load_encryption_key` does, which is why it takes the secret
-store: "which key is live" is a question about the vault, not about the
+`key_file::resolve_pending` — not a bare read — is what **every** vault-opening
+path must call. `boot::load_encryption_key` does, which is why it takes the
+secret store: "which key is live" is a question about the vault, not the
 filesystem. A path that skipped it would come up with the pre-rotation key and
 fail every decrypt.
 
-Two consequences worth stating plainly:
-
-- The old key stops working the moment rotation completes. Anything holding a
-  copy — a backup of `.key/encryption.key`, another machine restored from the
-  same snapshot — can no longer read this vault. That is the point, but it also
-  means rotation is not reversible without the old key *and* the old ciphertext.
-- `PlaceholderMinter` derives its HMAC subkey from the master key, so a secret
-  encountered after rotation mints a *different* placeholder than it did before.
-  Existing placeholder entries are re-encrypted and keep resolving, so historic
-  transcripts are unaffected; the vault just accumulates a second entry for a
-  value that reappears.
+**Two consequences.** The old key stops working the moment rotation completes,
+so any copy of it — a backup, another machine restored from the same snapshot —
+can no longer read this vault; that is the point, but it also means rotation is
+irreversible without the old key *and* the old ciphertext, which is what the
+backup preserves. And `PlaceholderMinter` derives its HMAC subkey from the
+master key, so a secret encountered after rotation mints a *different*
+placeholder than before. Existing placeholder entries are re-encrypted and keep
+resolving, so historic transcripts are unaffected; the vault just accumulates a
+second entry for a value that reappears.
 
 ### Known vault entries
 

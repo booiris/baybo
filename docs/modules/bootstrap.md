@@ -49,7 +49,7 @@ Larger domain objects (`AgentLoop`, `ContextManager`, `Router`) are no longer bu
 | `resolve_config_path` | Same precedence as `load_config`, returning the path that was used (or `None` for a pure-default boot). | Used by mutation endpoints that need to write `baybo.json` back. |
 | `build_llm_client` | `default-llm` entry of `BayboConfig`, plus `LlmProviderRegistry`, optional `BlobStore`, optional `SecretVault`, and `CostHooks` (the `LlmCallGuard` admission gate bundled with the post-call `LlmCostRecorder`; `CostHooks::passthrough()` for unbilled one-shots) | Delegates credential resolution to `baybo_llm::credentials::resolve_api_key`. Returns an `Arc<BillableLlm>` so every consumer shares the same budget gate. |
 | `build_llm_client_for_entry` | Same wiring pinned to a specific non-default `LlmEntry`. | Used by `baybo llm probe` / live-model listing. |
-| `load_encryption_key` | `security.encryption_key_file` (hex, required) | Rejects non-hex input and any length ≠ 32 bytes. No dev-key fallback — a missing or unreadable file aborts startup rather than silently encrypting secrets with a publicly-known constant. |
+| `load_encryption_key` | `security.encryption_key_file` (hex, required) **and the secret store** | Rejects non-hex input and any length ≠ 32 bytes. No dev-key fallback — a missing or unreadable file aborts startup rather than silently encrypting secrets with a publicly-known constant. Takes the store because it delegates to `baybo_security::key_file::resolve_pending`, which completes or discards an interrupted key rotation; deciding which key is live means trying to decrypt a real vault entry, not reading on-disk bookkeeping. Every path that builds a `SecretVault` must go through here — one that read the file directly would come up with the pre-rotation key and fail every decrypt. |
 
 Loaders return `anyhow::Result` because they surface I/O and format errors that `ConfigError` deliberately does not model.
 
@@ -108,7 +108,7 @@ The actor-spawner closure handed to `Router::from_config` via `RouterConfig::act
 | `BAYBO_CONFIG_PATH` set but file missing | `bail!` — startup aborts. |
 | `<default_workspace_root>/config/baybo.json` missing with no env | `info!` + `BayboConfig::default()`. |
 | `load_from_file` parse/validate error | `bail!` with full `ConfigError::Validation` list. |
-| `boot::load_encryption_key` failure | `bail!` — a missing, unreadable, or malformed `security.encryption_key_file` aborts startup. No fallback: silently encrypting secrets with a constant would be worse than a clear error. |
+| `boot::load_encryption_key` failure | `bail!` — a missing, unreadable, or malformed `security.encryption_key_file` aborts startup. No fallback: silently encrypting secrets with a constant would be worse than a clear error. Also fails when neither the live nor a leftover pending key opens the vault, which means an interrupted rotation lost both halves — starting anyway would give a process that decrypts nothing. |
 | `build_llm_client` failure on a chat-loop boot path | `bail!` — unrecoverable, there's no sensible default. Argv mode only builds the client for commands whose handlers read `ctx.llm` (`doctor`, `status` — see `needs_llm`), and those downgrade the failure to a `warn!`; everything else (`channel add`, `config get`, …) skips the build entirely. |
 | Any other `?` at boot | Propagates up, process exits non-zero. |
 

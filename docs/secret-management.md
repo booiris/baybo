@@ -208,11 +208,14 @@ tool-argument reveal boundary (`security.md` §"Tool-argument reveal boundary"):
 
 ## Security notes
 
-- **Persistence depends on the master keyfile.** The master key is minted once to
-  `paths.encryption_key_file()` (`crates/setup/src/bootstrap.rs`,
-  0600-validated) and reloaded every boot — so user secrets survive restart like
-  MCP creds. Confidentiality of *all* vault contents rests on that file's
-  protection; this feature adds no new key material.
+- **Persistence depends on the master keyfile.** The master key is minted to
+  `paths.encryption_key_file()` (`crates/setup/src/bootstrap.rs`, 0600) and
+  reloaded every boot via `baybo_security::key_file::resolve_pending` — so user
+  secrets survive restart like MCP creds. Confidentiality of *all* vault
+  contents rests on that file's protection; this feature adds no new key
+  material. `baybo vault rotate` replaces the key and re-encrypts every entry,
+  including `user_env.*`, which is transparent to this feature but does mean a
+  copy of the old key stops working (see `modules/security.md`).
 - Reveal is vault-global (`security.md` §"Reveal API"); `user_env.*` values
   stored as placeholder→value by `redact` are revealable like any other.
 

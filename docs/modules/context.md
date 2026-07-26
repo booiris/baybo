@@ -62,7 +62,7 @@ ContextManager (struct)
     ├── tasks.rs           — render_task_list (transient checklist reminder)
     ├── title.rs           — build_title_prompt (conversation-title pass)
     ├── cancelled_turn.rs  — /stop salvage marker (SUFFIX + strip_marker)
-    ├── tool_output.rs     — wrap_tool_output / cap_tool_output / spill (+ MAX cap)
+    ├── tool_output.rs     — cap_tool_output / spill (+ MAX cap)
     └── compression.rs     — SUMMARIZE_INSTRUCTION + CONTINUATION_INTRO/FOOTER
 ```
 
@@ -72,9 +72,12 @@ the LLM transcript. The pure builders are unit-testable on their own; both
 `cap_tool_output`, `reseed_system_row`) and the agent-loop seam
 (`append_cron_fire`, `append_background_completion_reply_once`,
 `append_background_notification_prompt_once`) call into them. The
-injection *detection* for tool output stays in `baybo-security`; only the
-`<tool_output>` envelope formatting lives here (the shared delimiter is
-`baybo_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).
+injection *detection* for tool output stays in `baybo-security`, and the
+`<tool_output>` envelope itself is `baybo_model::wrap_tool_output` — it sits
+beside the `TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX` delimiters it keys off, and out of
+this crate because `baybo-tools` needs the same framing for its bash risk-judge
+prompts and cannot depend on `baybo-context` (which depends on it). What stays
+here is the byte-budget cap and the content-addressed spill.
 
 **Key design choice**: `ContextManager` is a **concrete struct** with a **concrete compression flow**. Both the management logic (append, budget check) and the compression algorithm are invariant — no swappable strategy, no extension trait. Per-session paths flow through one shared `WorkspacePaths` handle.
 

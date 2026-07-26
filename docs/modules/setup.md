@@ -22,7 +22,9 @@ a wizard, an operator's first run goes:
 - bootstraps the workspace skeleton (`config/`, `profile/`, `skills/`,
   `agents/`, `.key/`, `state/`, `work/`, `logs/`),
 - mints the master encryption key at `<root>/.key/encryption.key`
-  with mode 0600,
+  with mode 0600 — **minting only**: loading, rotating and recovering that key
+  belong to `baybo_security::key_file`, because the gateway boot path needs all
+  three and never runs this wizard,
 - writes a default `baybo.json` pinned to that key,
 - opens sqlite storage and the secret vault,
 - walks an LLM-provider step (Quick + Full both run it), an optional

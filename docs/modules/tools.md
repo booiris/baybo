@@ -69,9 +69,9 @@ ready without having to invent the tool name/schema at that point.
 User-managed secrets (env-var-style tokens) reach tools through
 `ToolContext::secrets: Option<Arc<dyn SecretAccess>>`, bound by the agent layer
 like `ToolContext::llm` (gateway/runtime binds `Some`, argv-mode leaves `None`;
-consumers fail closed). The concrete impl is `SecurityGateway`, so `resolve_env`
-and `redact` reuse the same deterministic mint + vault pipeline as input
-sanitization, while `add`/`list`/`exists` delegate to
+consumers fail closed). The concrete impl is `SecurityGateway`, so `resolve_env`,
+`redact` and `sanitize` reuse the same deterministic mint + vault pipeline as
+input sanitization, while `add`/`list`/`exists` delegate to
 `baybo_security::UserSecretManager` (the `user_env.<NAME>` namespace). Tools see
 only the trait.
 
@@ -253,7 +253,21 @@ Cross-host redirects are still rejected inside the redirect policy (with a "re-i
 
 ### Bash permission policy
 
-`permission`: `auto` (default), `manual`, or `free`. `auto` judges destructive commands before the active execution route and judges sandbox failures before automatic unsandboxed retry; if the judge does not approve automatic escape, Baybo asks for approval. `manual` asks before every Bash command, then runs in the sandbox when one is available; if the sandboxed run fails, it asks again before retrying unsandboxed. If Baybo detects an outer container/sandbox, Bash silently skips the inner OS sandbox under the same approval policy; if no sandbox backend is available on a non-container host, Bash emits a notice before running without it. `free` runs directly without Bash approval or OS sandboxing. Legacy values `open` and `none` are accepted as aliases for `free`.
+`permission`: `auto` (default), `manual`, or `free`. `auto` judges destructive commands before the active execution route and judges sandbox failures before automatic unsandboxed retry; if the judge does not approve automatic escape, Baybo asks for approval.
+
+The post-failure judge is a **prompt-injection surface**, because a `safe`
+verdict re-runs the command on the host with no approval gate and its input is
+whatever the failed command printed — a dependency's build script, a test
+fixture, a downloaded file. Its `stdout`/`stderr` tails therefore get the same
+framing as tool output entering the main transcript: `<tool_output>` envelope
+(`baybo_model::wrap_tool_output`), forged-delimiter escaping, and a banner when
+`InjectionDetector` fires; the system prompt states that envelope contents are
+data, that text claiming to be a policy update or a prior verdict is itself
+grounds for `risky`, and that a command whose behaviour is decided by content
+the judge cannot see is not safe. Both tails also run through
+`SecretAccess::sanitize` unconditionally — `redact` alone only covers values
+this run injected as env vars, which would leave an ordinary command's capture
+unredacted. `manual` asks before every Bash command, then runs in the sandbox when one is available; if the sandboxed run fails, it asks again before retrying unsandboxed. If Baybo detects an outer container/sandbox, Bash silently skips the inner OS sandbox under the same approval policy; if no sandbox backend is available on a non-container host, Bash emits a notice before running without it. `free` runs directly without Bash approval or OS sandboxing. Legacy values `open` and `none` are accepted as aliases for `free`.
 
 The permission is a shared, **hot-reloadable** `LivePermissionMode` handle: a `permission` config reload swaps it live, and `BashTool::description` is rendered per permission so the prompt the LLM sees matches the active isolation and approval policy.
 
