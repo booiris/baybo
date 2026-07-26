@@ -30,7 +30,6 @@ use baybo_gateway::{
 
 use crate::boot;
 use crate::runtime;
-use crate::singleton;
 use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Entry point — routes the parsed subcommand to the right handler.
@@ -228,7 +227,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     baybo_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
         .ensure_layout()
         .await?;
-    let _workspace_lock = singleton::acquire(workspace_paths.root())?;
+    let _workspace_lock = baybo_workspace::acquire_workspace_lock(workspace_paths.root())?;
 
     // Register SIGHUP **before** the long boot work below (manager build,
     // sidecar install, router wiring). Until a signal stream exists SIGHUP

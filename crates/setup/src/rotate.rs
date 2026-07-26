@@ -25,6 +25,7 @@ use baybo_workspace::WorkspacePaths;
 use crate::error::{Result, SetupError};
 
 /// Outcome of a completed rotation.
+#[derive(Debug)]
 pub struct Rotated {
     pub entries: usize,
 }
@@ -133,10 +134,19 @@ pub async fn resolve_pending_key(
 
 /// Re-encrypt the whole vault under a freshly minted master key.
 ///
-/// `vault` must be the only handle in play — a concurrent writer's entry would
-/// be written under the old key, outside the snapshot this re-encrypts, and be
-/// unreadable afterwards. Callers gate on the workspace singleton lock.
+/// Holds the workspace singleton lock for the whole operation, so a gateway can
+/// neither be running nor start midway. A mutex rather than a precondition on
+/// purpose: a caller that merely checked the lock first would leave a window in
+/// which a gateway starts and writes an entry under the outgoing key, outside
+/// the snapshot being re-encrypted, making it unreadable the moment the new key
+/// is promoted.
 pub async fn rotate_master_key(paths: &WorkspacePaths, vault: &SecretVault) -> Result<Rotated> {
+    let _lock = baybo_workspace::acquire_workspace_lock(paths.root()).map_err(|e| {
+        SetupError::Vault(format!(
+            "cannot rotate while this workspace is in use — stop the gateway first ({e})"
+        ))
+    })?;
+
     let live_path = paths.encryption_key_file();
     let pending_path = paths.pending_encryption_key_file();
 

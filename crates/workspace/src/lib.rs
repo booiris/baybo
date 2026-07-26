@@ -12,6 +12,11 @@ pub mod identity;
 pub use identity::{IdentityFiles, load_identity_files, write_identity_file};
 
 #[cfg(feature = "io")]
+pub mod singleton;
+#[cfg(feature = "io")]
+pub use singleton::{WorkspaceLock, acquire_workspace_lock};
+
+#[cfg(feature = "io")]
 mod manager;
 #[cfg(feature = "io")]
 pub use manager::WorkspaceManager;

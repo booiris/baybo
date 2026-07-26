@@ -14,7 +14,7 @@ use std::fs::{OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::Path;
 
-use baybo_workspace::WorkspacePaths;
+use crate::WorkspacePaths;
 
 /// RAII guard that holds the workspace lock for its lifetime.
 pub struct WorkspaceLock {
@@ -24,7 +24,7 @@ pub struct WorkspaceLock {
 
 /// Try to acquire the workspace singleton lock. Returns an error if another
 /// baybo process already holds it, or if the lock file cannot be opened.
-pub fn acquire(workspace_root: &Path) -> anyhow::Result<WorkspaceLock> {
+pub fn acquire_workspace_lock(workspace_root: &Path) -> anyhow::Result<WorkspaceLock> {
     let path = WorkspacePaths::new(workspace_root.to_path_buf()).singleton_lock();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -77,8 +77,8 @@ mod tests {
     #[test]
     fn acquire_then_second_attempt_fails() {
         let dir = tempdir();
-        let first = acquire(&dir).expect("first acquire");
-        let err = match acquire(&dir) {
+        let first = acquire_workspace_lock(&dir).expect("first acquire");
+        let err = match acquire_workspace_lock(&dir) {
             Ok(_) => panic!("second acquire must fail"),
             Err(e) => e,
         };
@@ -89,13 +89,13 @@ mod tests {
         );
         drop(first);
         // Once dropped, acquisition succeeds again.
-        acquire(&dir).expect("re-acquire after drop");
+        acquire_workspace_lock(&dir).expect("re-acquire after drop");
     }
 
     #[test]
     fn lock_file_contains_pid() {
         let dir = tempdir();
-        let _lock = acquire(&dir).expect("acquire");
+        let _lock = acquire_workspace_lock(&dir).expect("acquire");
         let lock_path = WorkspacePaths::new(dir.clone()).singleton_lock();
         let contents = std::fs::read_to_string(&lock_path).expect("read lock file");
         let pid: u32 = contents.trim().parse().expect("pid should parse");

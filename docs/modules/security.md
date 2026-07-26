@@ -110,10 +110,13 @@ in that state is re-provisioned (`baybo setup`, re-pair devices, re-enter
 `user_env.*` and provider keys), not migrated.
 
 **Key rotation.** `baybo vault rotate` mints a new master key, re-encrypts
-every entry under it, and replaces the key file. Shell-only and gated on the
-workspace singleton lock — a gateway writing mid-rotation would land an entry
-under the old key, outside the snapshot being re-encrypted, and it would be
-unreadable afterwards.
+every entry under it, and replaces the key file. Shell-only, and it **holds**
+the workspace singleton lock for the whole operation rather than checking it
+first: a gateway that starts midway would write an entry under the outgoing
+key, outside the snapshot being re-encrypted, and that entry becomes unreadable
+the moment the new key is promoted. Checking and releasing would leave exactly
+that window open, so the lock is a mutex here, not a precondition. Rotation
+fails cleanly if the workspace is in use — nothing is written.
 
 Rotation changes two things that cannot be committed together: the key file and
 every ciphertext in sqlite. The ordering is what makes the gap survivable —

@@ -128,7 +128,7 @@ pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> 
     // uses (`gateway_cmd::start`) so the flock actually collides.
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
-    let result = match crate::singleton::acquire(workspace_paths.root()) {
+    let result = match baybo_workspace::acquire_workspace_lock(workspace_paths.root()) {
         Ok(lock) => {
             info!("no running gateway; serving the prompt in-process");
             run_in_process(config, opts, lock, session_id.clone()).await
@@ -232,7 +232,7 @@ async fn run_in_process(
     opts: Options,
     // Held for the whole turn so no gateway / another `baybo prompt` can
     // race the workspace. Dropped on return, releasing the flock.
-    _lock: crate::singleton::WorkspaceLock,
+    _lock: baybo_workspace::WorkspaceLock,
     session_id: SessionId,
 ) -> anyhow::Result<()> {
     let shutdown = ShutdownSignal::new();

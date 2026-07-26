@@ -6,7 +6,6 @@ mod reload;
 mod runtime;
 mod sandbox_boot;
 mod setup_cmd;
-mod singleton;
 mod tracing_init;
 mod tui_cmd;
 mod tui_log;

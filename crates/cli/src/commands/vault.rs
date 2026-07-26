@@ -1,10 +1,8 @@
 //! `baybo vault rotate` — re-key the secret vault.
 //!
-//! Terminal-only. Rotation rewrites every ciphertext and replaces the key file;
-//! a gateway running against the same workspace would write entries under the
-//! old key, outside the snapshot being re-encrypted, and they would be
-//! unreadable once the key is promoted. The workspace singleton lock is what
-//! tells us whether that is the case.
+//! Terminal-only. The gateway-must-be-stopped requirement is enforced inside
+//! `rotate_master_key`, which holds the workspace singleton lock for the whole
+//! operation rather than checking it here and hoping.
 
 use baybo_workspace::WorkspacePaths;
 use serde_json::json;
@@ -21,19 +19,6 @@ pub async fn handle(ctx: &CommandContext, cmd: VaultCmd) -> Result<CommandOutput
     }
 }
 
-/// Is another process holding the workspace? Acquiring the advisory lock and
-/// immediately dropping it is the same probe the llm command uses.
-fn gateway_is_running(paths: &WorkspacePaths) -> bool {
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(paths.singleton_lock())
-    else {
-        return false;
-    };
-    file.try_lock().is_err()
-}
-
 async fn rotate(ctx: &CommandContext, yes: bool) -> Result<CommandOutput> {
     if ctx.invocation != Invocation::Argv {
         return Err(CliError::Config(
@@ -47,14 +32,6 @@ async fn rotate(ctx: &CommandContext, yes: bool) -> Result<CommandOutput> {
         )
     })?;
     let paths = WorkspacePaths::new(ctx.workspace.root.clone());
-
-    if gateway_is_running(&paths) {
-        return Err(CliError::Config(
-            "a baybo process is holding this workspace — stop the gateway before rotating, or \
-             entries it writes mid-rotation become unreadable"
-                .into(),
-        ));
-    }
 
     let count = vault
         .list_names()

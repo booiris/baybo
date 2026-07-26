@@ -16,7 +16,7 @@ baybo-model = { workspace = true }
 baybo-security = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-store = { workspace = true }
-baybo-workspace = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
 
 anyhow = { workspace = true }
 hex = { workspace = true }

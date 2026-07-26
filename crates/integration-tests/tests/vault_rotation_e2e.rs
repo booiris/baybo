@@ -108,3 +108,50 @@ async fn interrupted_rotation_recovers_on_next_open() {
         );
     }
 }
+
+/// The gateway-stopped requirement is a mutex, not a precondition: rotation
+/// holds the workspace lock for its whole run, so a gateway can neither be
+/// running nor start midway and write an entry under the outgoing key.
+#[tokio::test]
+async fn rotation_refuses_while_the_workspace_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, stores, key) = seed(dir.path()).await;
+    let vault = SecretVault::new(key.clone(), stores.secret.clone());
+
+    let ciphertext_before = |name: &str| {
+        let s = stores.secret.clone();
+        let name = name.to_string();
+        async move { s.retrieve(&name).await.unwrap().unwrap() }
+    };
+    let admin_before = ciphertext_before("gateway.admin_token").await;
+
+    let held = baybo_workspace::acquire_workspace_lock(paths.root()).expect("hold the lock");
+    let err = rotate_master_key(&paths, &vault)
+        .await
+        .expect_err("must refuse while another process holds the workspace");
+    assert!(
+        err.to_string().contains("stop the gateway"),
+        "error should name the remedy, got: {err}"
+    );
+
+    // Nothing moved: neither the key file nor any ciphertext.
+    assert_eq!(
+        std::fs::read_to_string(paths.encryption_key_file())
+            .unwrap()
+            .trim(),
+        hex::encode(key.as_bytes())
+    );
+    assert!(!paths.pending_encryption_key_file().exists());
+    assert_eq!(ciphertext_before("gateway.admin_token").await, admin_before);
+
+    // Once the holder goes away, the same call succeeds — the lock is released
+    // on drop rather than leaked by the failed attempt.
+    drop(held);
+    rotate_master_key(&paths, &vault)
+        .await
+        .expect("rotate after release");
+    assert!(
+        baybo_workspace::acquire_workspace_lock(paths.root()).is_ok(),
+        "rotation must not leave the workspace locked"
+    );
+}
