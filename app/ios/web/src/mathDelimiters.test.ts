@@ -84,6 +84,18 @@ describe("normalizeMath", () => {
     expect(normalizeMath("price is $5 with no")).toBe("price is \\$5 with no");
   });
 
+  it("leaves a source-borne mask sentinel alone (no 'undefined' splice)", () => {
+    // The masking pass brackets its placeholder indices with NUL/SOH on the
+    // assumption they cannot occur in transcript text. A message that carries
+    // them anyway used to unmask an index nobody minted and splice the string
+    // "undefined" over the author's characters.
+    const nul = String.fromCharCode(0);
+    const soh = String.fromCharCode(1);
+    expect(normalizeMath(`cost $5 and ${nul}0${soh} tail`)).toBe(
+      `cost \\$5 and ${nul}0${soh} tail`,
+    );
+  });
+
   it("does not hang on adversarial input (no super-linear time)", () => {
     // These run ~1-30ms when linear; a quadratic regression blows to seconds.
     // The bound is generous so CI/JIT noise can't flake it while still catching

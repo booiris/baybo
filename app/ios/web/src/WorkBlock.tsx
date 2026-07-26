@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { MarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
@@ -64,16 +64,58 @@ export function approvalLabel(t: TFunction, step: WorkStep): string | null {
   }
 }
 
+/// How often a still-growing reasoning trace is re-parsed. ~7 updates a second
+/// still reads as live in a dim subordinate panel; see `useSampledText`.
+const REASONING_SAMPLE_MS = 150;
+
+/// The latest `text`, but re-published at most once per `REASONING_SAMPLE_MS`.
+///
+/// A live reasoning step merges each `reasoning` frame into ONE trailing step
+/// (see `Transcript.tsx`), so its text grows monotonically and `MarkdownBody`'s
+/// memo misses on every frame — the whole accumulated trace is re-parsed per
+/// frame, making a turn's markdown cost quadratic in its length (measured in
+/// jsdom, one frame per 8 chars: 4k chars ≈ 1.0s, 8k ≈ 3.8s, 16k ≈ 15.7s of
+/// synchronous main-thread work, and this runs on a phone's WKWebView). Nothing
+/// upstream paces it: a provider reasoning delta is one wire frame is one push,
+/// and unlike `appendStreaming` — which is rAF-coalesced — this path had no
+/// limiter at all. The trailing timer guarantees the final text lands once the
+/// step stops growing, so no trace is left truncated.
+function useSampledText(text: string): string {
+  const [shown, setShown] = useState(text);
+  const shownAtRef = useRef(0);
+  useEffect(() => {
+    const due = shownAtRef.current + REASONING_SAMPLE_MS - Date.now();
+    if (due <= 0) {
+      shownAtRef.current = Date.now();
+      setShown(text);
+      return;
+    }
+    const id = setTimeout(() => {
+      shownAtRef.current = Date.now();
+      setShown(text);
+    }, due);
+    return () => clearTimeout(id);
+  }, [text]);
+  return shown;
+}
+
+/// Reasoning is the model's own markdown, rendered as prose beside the ✻ marker
+/// — as raw text a `**要点：**` reached the reader as literal asterisks.
+function ReasoningStepView({ text }: { text: string }) {
+  const shown = useSampledText(text);
+  return (
+    <div className="step reasoning">
+      <span className="step-glyph">✻</span>
+      <MarkdownBody text={shown} breaks />
+    </div>
+  );
+}
+
 function WorkStepView({ step }: { step: WorkStep }) {
   const { t } = useTranslation();
   switch (step.kind) {
     case "reasoning":
-      return (
-        <div className="step reasoning">
-          <span className="step-glyph">✻</span>
-          <MarkdownBody text={step.text} />
-        </div>
-      );
+      return <ReasoningStepView text={step.text} />;
     case "prose":
       return (
         <div className="step prose">

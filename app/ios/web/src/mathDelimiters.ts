@@ -213,5 +213,8 @@ export function normalizeMath(src: string): string {
   if (work.includes("\\)")) work = work.replace(INLINE_PAREN, (_m, body: string) => `$${body}$`);
   work = work.replace(DISPLAY_LINE, (_m, body: string) => `$$\n${body.trim()}\n$$`);
 
-  return work.replace(UNMASK, (_m, i: string) => masked[Number(i)]);
+  // A digit run bracketed by literal NUL/SOH in the SOURCE looks exactly like a
+  // placeholder we minted, and an out-of-range index would otherwise splice the
+  // string "undefined" over the author's characters. Hand back the match.
+  return work.replace(UNMASK, (m, i: string) => masked[Number(i)] ?? m);
 }
