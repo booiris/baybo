@@ -241,6 +241,26 @@ You ONLY update the actual content that comes AFTER these two preserved lines. T
 
 REMEMBER: Use the Edit tool in parallel and stop. Do not continue after the edits. Only include insights from the actual user conversation, never from these note-taking instructions. Do not delete or change section headers or italic _section descriptions_."#;
 
+/// Replaces the transcript + original prompt on retry rounds once the model
+/// has already attempted an `Edit`.
+///
+/// The transcript is the entire cost of this pass (~145K tokens, re-sent
+/// verbatim every iteration), and a retry round doesn't need it: the content
+/// the model wants to write is already composed in its own previous turn,
+/// which stays in the suffix. What it needs is the file's *current* bytes,
+/// which only a `Read` can give it — the embedded snapshot is what went stale
+/// in the first place. Rounds where the model has only `Read` so far keep the
+/// full transcript, since it hasn't composed anything yet.
+///
+/// `{{notesPath}}` is substituted via `String::replace`.
+const RETRY_PROMPT_TEMPLATE: &str = r#"You are still updating the session notes file {{notesPath}}.
+
+The conversation transcript and the original instructions were provided earlier in this pass and are omitted here — everything you need to finish is in your own messages above.
+
+At least one of your Edit calls did not apply. Use the Read tool on {{notesPath}} to get its current contents, then issue corrected Edit calls for the changes that have not landed yet. Do not re-apply changes that are already present. When every intended edit is in the file, make no further tool calls and stop.
+
+Keep the file's structure intact: never modify or delete the '#' section headers or the italic _section description_ lines."#;
+
 /// `tool_result` body handed back when an `Edit` fails. The `old_string`
 /// almost always went stale against the snapshot embedded once in
 /// [`PROMPT_TEMPLATE`] — an earlier `Edit` already rewrote that text, so the
@@ -642,6 +662,11 @@ pub async fn run_background_summary(
     let mut cost_micros: i64 = 0;
     let mut iterations: usize = 0;
     let mut applied_any_edit = false;
+    // Whether any `Edit` has been *issued* (landed or not). Gates the
+    // transcript elision: an attempted edit means the model has already
+    // composed what it wants to write, so later rounds can work from the
+    // suffix alone.
+    let mut attempted_any_edit = false;
     let mut unproductive_rounds: usize = 0;
     loop {
         if iterations >= MAX_BACKGROUND_SUMMARY_ITERATIONS {
@@ -655,13 +680,34 @@ iterations without terminating"
         }
         iterations += 1;
 
-        let input_marker = LlmCallInputs::Persisted {
-            last_ordinal: up_to_ordinal,
-            prefix_len: transcript_len,
-            suffix: messages[transcript_len..].to_vec(),
+        // Elide the transcript once the model has composed its edits: from
+        // there on the round is recovery, and re-sending ~145K tokens buys
+        // nothing the suffix doesn't already carry. `messages` itself keeps
+        // the full history — only what goes on the wire is trimmed.
+        let elide_transcript = attempted_any_edit;
+        let (request_messages, input_marker) = if elide_transcript {
+            let mut trimmed = Vec::with_capacity(messages.len() - transcript_len);
+            trimmed.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+                RETRY_PROMPT_TEMPLATE.replace("{{notesPath}}", &notes_path.display().to_string()),
+            )]));
+            // Skip the original prompt at `transcript_len`; the retry prompt
+            // above replaces it. Everything after is the tool-round history,
+            // whose tool_use / tool_result pairing stays intact.
+            trimmed.extend_from_slice(&messages[transcript_len + 1..]);
+            let marker = LlmCallInputs::Inline(trimmed.clone());
+            (trimmed, marker)
+        } else {
+            (
+                messages.clone(),
+                LlmCallInputs::Persisted {
+                    last_ordinal: up_to_ordinal,
+                    prefix_len: transcript_len,
+                    suffix: messages[transcript_len..].to_vec(),
+                },
+            )
         };
         let request = ChatRequest {
-            messages: messages.clone(),
+            messages: request_messages,
             temperature: None,
             tools: tool_defs.clone(),
             reasoning_effort: None,
@@ -695,15 +741,41 @@ iterations without terminating"
 
         let mut tool_results: Vec<ContentBlock> = Vec::with_capacity(response.tool_calls.len());
         let mut round_applied_edit = false;
+        let mut round_was_all_clean_edits = true;
         for call in &response.tool_calls {
             let result = execute_tool_call(&notes_path, call, &tool_ctx).await;
-            if call.name == EDIT_TOOL_NAME && !tool_result_is_error(&result) {
+            if call.name == EDIT_TOOL_NAME {
+                attempted_any_edit = true;
+            }
+            let clean_edit = call.name == EDIT_TOOL_NAME && !tool_result_is_error(&result);
+            if clean_edit {
                 applied_any_edit = true;
                 round_applied_edit = true;
+            } else {
+                round_was_all_clean_edits = false;
             }
             tool_results.push(result);
         }
         messages.push(ChatMessage::agent_context(tool_results));
+
+        // The prompt asks for every edit in one parallel message, then stop.
+        // When a round is exactly that — every call an `Edit`, every one
+        // applied — the model has done what it was told, and the only thing
+        // another turn can produce is the empty tool-call reply that would
+        // break the loop anyway. Taking the model at its word here is the
+        // difference between one round-trip and two: the confirmation turn
+        // costs a full transcript re-send to receive ~500 output tokens.
+        // A round that mixed in a `Read`, or whose `Edit` errored, is still
+        // mid-recovery and gets its next turn.
+        if round_was_all_clean_edits {
+            debug!(
+                session_id = %session_id,
+                iterations,
+                edits = response.tool_calls.len(),
+                "background summary: every edit in the round applied — stopping without a confirmation turn"
+            );
+            break;
+        }
 
         // Converge-or-stop. A round that changed nothing (only `Read`s, or
         // `Edit`s that all errored) is non-progress; bail after a couple in a

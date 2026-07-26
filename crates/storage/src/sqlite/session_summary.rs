@@ -106,12 +106,24 @@ impl SessionSummaryStore for SqliteSessionSummaryStore {
                 // Single-statement upsert: INSERT … ON CONFLICT DO UPDATE so
                 // pass_count and cost_micros increment atomically and
                 // error_count resets to zero on success.
+                //
+                // `cursor` is MAX()'d, never overwritten: a pass pins
+                // `up_to_ordinal` at trigger time but lands its row seconds to
+                // minutes later, and a compaction in that window supersedes
+                // every row it covered and `repoint_cursor`s onto the freshly
+                // inserted continuation-summary row. A plain assignment would
+                // drag the cursor back onto a superseded ordinal, which
+                // `lookup_anchor_index_for_cursor` can't resolve — so
+                // `tokens_since_anchor()` reads the whole transcript, the diff
+                // gate is satisfied forever, and the fast path stays dead
+                // until the next pass lands. Ordinals are append-only, so the
+                // later pointer is always the live one.
                 conn.execute(
                     "INSERT INTO session_summaries \
                          (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
                      VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0) \
                      ON CONFLICT(session_id) DO UPDATE SET \
-                         cursor          = excluded.cursor, \
+                         cursor          = MAX(session_summaries.cursor, excluded.cursor), \
                          pass_count      = session_summaries.pass_count + 1, \
                          updated_at      = excluded.updated_at, \
                          cost_micros     = session_summaries.cost_micros + excluded.cost_micros, \
