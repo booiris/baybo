@@ -108,7 +108,7 @@ impl SlashHandler for CliSlashHandler {
             // this is the cosmetic mirror so the menu stays coherent.
             if matches!(
                 name,
-                "help" | "completion" | "setup" | "tui" | "gateway" | "memory" | "device"
+                "help" | "completion" | "setup" | "tui" | "gateway" | "memory" | "device" | "vault"
             ) {
                 continue;
             }
@@ -302,6 +302,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Mcp {
             cmd: McpCmd::List { .. } | McpCmd::Get { .. } | McpCmd::Remove { .. },
         } => Ok(()),
+        // Re-keys the whole vault and replaces a file on disk with the
+        // gateway stopped — none of which a slash dispatch inside a live
+        // process can do.
+        Commands::Vault { .. } => {
+            Err("`vault rotate` re-keys the vault with the gateway stopped; run it from a shell")
+        }
         Commands::Secret { cmd } => match cmd {
             // `add` reads a masked value from the TTY; list shows masked
             // previews and delete self-guards with --yes (+ a NAME in slash).

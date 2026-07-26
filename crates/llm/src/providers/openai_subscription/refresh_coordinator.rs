@@ -735,6 +735,12 @@ mod tests {
         async fn list(&self) -> std::result::Result<Vec<String>, baybo_store::StorageError> {
             self.inner.list().await
         }
+        async fn rewrite_all(
+            &self,
+            entries: &[(String, Vec<u8>)],
+        ) -> std::result::Result<(), baybo_store::StorageError> {
+            self.inner.rewrite_all(entries).await
+        }
         fn identity(&self) -> baybo_store::StoreIdentity {
             self.inner.identity()
         }

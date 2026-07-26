@@ -57,6 +57,7 @@ tracing-subscriber = { workspace = true }
 baybo-cli = { workspace = true, features = ["test-support"] }
 baybo-gateway = { workspace = true }
 baybo-setup = { workspace = true }
+hex = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }

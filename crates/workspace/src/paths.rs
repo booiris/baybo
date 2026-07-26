@@ -94,6 +94,14 @@ pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
 /// Stored at `<root>/.key/encryption.key`.
 pub const ENCRYPTION_KEY_FILE: &str = "encryption.key";
 
+/// Incoming master key during rotation, at `<root>/.key/encryption.key.pending`.
+///
+/// Rotation changes two things that cannot be committed together — the key file
+/// and every ciphertext in sqlite. Writing the new key here *before* the
+/// database is re-encrypted makes the crash window recoverable from either
+/// side: whichever key opens the vault is the real one.
+pub const PENDING_ENCRYPTION_KEY_FILE: &str = "encryption.key.pending";
+
 // ---------------------------------------------------------------------------
 // Files inside `state/` (not version-controlled)
 // ---------------------------------------------------------------------------
@@ -439,6 +447,11 @@ impl WorkspacePaths {
 
     pub fn encryption_key_file(&self) -> PathBuf {
         self.key_dir().join(ENCRYPTION_KEY_FILE)
+    }
+
+    /// See [`PENDING_ENCRYPTION_KEY_FILE`].
+    pub fn pending_encryption_key_file(&self) -> PathBuf {
+        self.key_dir().join(PENDING_ENCRYPTION_KEY_FILE)
     }
 
     // -- state/ contents --

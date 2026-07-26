@@ -34,5 +34,6 @@ test-support = []
 
 [dev-dependencies]
 baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-security = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

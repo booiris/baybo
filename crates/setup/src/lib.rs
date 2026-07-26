@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod error;
 pub mod flow;
 pub mod prompt;
+pub mod rotate;
 pub mod runner;
 mod tty;
 

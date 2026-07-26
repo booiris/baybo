@@ -109,20 +109,33 @@ does not decrypt at all.** There is no conversion path in the tree — a workspa
 in that state is re-provisioned (`baybo setup`, re-pair devices, re-enter
 `user_env.*` and provider keys), not migrated.
 
-**Not yet solved: key rotation.** There is no path to re-key the vault — no
-`rotate` command, no re-encrypt pass, no old-key archive. A compromised master
-key today means hand-editing the store. The versioned envelope above is the
-groundwork (a record can now say which scheme wrote it); the rotation flow
-itself is still to build. Do not describe the vault as rotatable until it is.
+**Key rotation.** `baybo vault rotate` mints a new master key, re-encrypts
+every entry under it, and replaces the key file. Shell-only and gated on the
+workspace singleton lock — a gateway writing mid-rotation would land an entry
+under the old key, outside the snapshot being re-encrypted, and it would be
+unreadable afterwards.
 
-The master key is **persisted**, not memory-only. `baybo setup` mints it on
-first run and writes it hex-encoded to `<workspace>/.key/encryption.key` at
-mode `0o600` (`mint_encryption_key`); the path is overridable via
-`security.encryption_key_file`. Every later boot reads it back into an
-in-memory `EncryptionKey`. So the vault's confidentiality rests on that file's
-mode plus the mode of the sqlite database holding the ciphertext — not on the
-key being ephemeral. Anything reasoning about "the key never touches disk" is
-reasoning from a premise that has never been true.
+Rotation changes two things that cannot be committed together: the key file and
+every ciphertext in sqlite. The ordering is what makes the gap survivable —
+write the new key to `<workspace>/.key/encryption.key.pending`, re-encrypt in
+one transaction, then `rename` pending over the live key. A crash before the
+commit leaves ciphertext under the old key, which the live file still holds; a
+crash after it leaves ciphertext under the pending key. Exactly one of the two
+files opens the vault, and `resolve_pending_key` (called on every boot)
+determines which by decrypting a real entry rather than by inspecting on-disk
+bookkeeping. Neither working is a hard error, not a silent start.
+
+Two consequences worth stating plainly:
+
+- The old key stops working the moment rotation completes. Anything holding a
+  copy — a backup of `.key/encryption.key`, another machine restored from the
+  same snapshot — can no longer read this vault. That is the point, but it also
+  means rotation is not reversible without the old key *and* the old ciphertext.
+- `PlaceholderMinter` derives its HMAC subkey from the master key, so a secret
+  encountered after rotation mints a *different* placeholder than it did before.
+  Existing placeholder entries are re-encrypted and keep resolving, so historic
+  transcripts are unaffected; the vault just accumulates a second entry for a
+  value that reappears.
 
 ### Known vault entries
 

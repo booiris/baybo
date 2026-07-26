@@ -12,6 +12,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Channel { cmd } => commands::channel::handle(ctx, cmd).await,
         Commands::Mcp { cmd } => commands::mcp::handle(ctx, cmd).await,
         Commands::Secret { cmd } => commands::secret::handle(ctx, cmd).await,
+        Commands::Vault { cmd } => commands::vault::handle(ctx, cmd).await,
         Commands::Pair { cmd } => commands::pair::handle(ctx, cmd).await,
         Commands::Device { cmd } => commands::device::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,

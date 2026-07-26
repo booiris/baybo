@@ -67,11 +67,13 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
         })?;
     }
 
-    let key = load_encryption_key(&key_file)?;
-
     let stores = Store::open(paths.storage_db())
         .await
         .map_err(|e| SetupError::Storage(format!("open sqlite: {e}")))?;
+
+    // After the store exists, because deciding which key is live means asking
+    // whether it decrypts a real entry.
+    let key = crate::rotate::resolve_pending_key(&paths, &stores.secret).await?;
 
     let vault = Arc::new(SecretVault::new(key, stores.secret.clone()));
 
@@ -110,20 +112,6 @@ fn mint_encryption_key(path: &Path) -> Result<()> {
     file.write_all(b"\n")
         .map_err(|e| SetupError::io(path.to_path_buf(), format!("write key newline: {e}")))?;
     Ok(())
-}
-
-fn load_encryption_key(path: &Path) -> Result<EncryptionKey> {
-    let hex_data = std::fs::read_to_string(path)
-        .map_err(|e| SetupError::io(path.to_path_buf(), format!("read key file: {e}")))?;
-    let bytes = hex::decode(hex_data.trim())
-        .map_err(|e| SetupError::Vault(format!("encryption key not valid hex: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(SetupError::Vault(format!(
-            "encryption key must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    EncryptionKey::new(bytes).map_err(|e| SetupError::Vault(format!("invalid encryption key: {e}")))
 }
 
 #[cfg(test)]

@@ -101,6 +101,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Manage the master encryption key that protects the secret vault.
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
     /// Manage per-user channel pairings (the approval gate that lets
     /// a new sender talk to the agent): `list` (pending/approved),
     /// `approve <code>`, `revoke <channel> <bot> <user>`.
@@ -374,6 +379,17 @@ pub enum ChannelCmd {
     /// running gateway's reconciler pushes a `StopBot` to the sidecar
     /// on the next tick.
     Remove,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VaultCmd {
+    /// Re-encrypt every vault entry under a freshly minted master key and
+    /// replace the key file. The gateway must be stopped: a concurrent write
+    /// would land under the old key and be unreadable afterwards.
+    Rotate {
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

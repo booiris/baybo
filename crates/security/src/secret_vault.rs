@@ -59,6 +59,44 @@ impl SecretVault {
         }
     }
 
+    /// Re-encrypt every entry under `new_key`, atomically, and report how many
+    /// moved.
+    ///
+    /// The caller owns the key file: this touches only the store, so on success
+    /// the ciphertext is under `new_key` while the key on disk is still the old
+    /// one. Promoting the key file is the caller's next step, and the ordering
+    /// matters — see `baybo-setup`'s rotation, which writes the new key to a
+    /// pending path *before* calling this so an interrupted rotation is
+    /// recoverable from either side.
+    ///
+    /// Nothing else may hold this vault while it runs. A concurrent writer's
+    /// entry is encrypted under the old key and is not in the snapshot this
+    /// re-encrypts, so it would be silently unreadable afterwards.
+    pub async fn rotate_master_key(&self, new_key: &EncryptionKey) -> Result<usize> {
+        let names = self.list_names().await?;
+        let mut rewritten = Vec::with_capacity(names.len());
+        for name in &names {
+            let encrypted = self
+                .store
+                .retrieve(name)
+                .await
+                .map_err(|e| SecurityError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    SecurityError::Storage(format!("entry {name} vanished mid-rotation"))
+                })?;
+            let plaintext = crypto::decrypt(&encrypted, &self.master_key, name.as_bytes())?;
+            rewritten.push((
+                name.clone(),
+                crypto::encrypt(&plaintext, new_key, name.as_bytes())?,
+            ));
+        }
+        self.store
+            .rewrite_all(&rewritten)
+            .await
+            .map_err(|e| SecurityError::Storage(e.to_string()))?;
+        Ok(rewritten.len())
+    }
+
     pub async fn delete_secret(&self, name: &str) -> Result<()> {
         self.store
             .delete(name)

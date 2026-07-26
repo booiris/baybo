@@ -23,3 +23,5 @@ mod token_calibration_e2e;
 mod tool_boundary;
 #[path = "tool_concurrency.rs"]
 mod tool_concurrency;
+#[path = "vault_rotation_e2e.rs"]
+mod vault_rotation_e2e;

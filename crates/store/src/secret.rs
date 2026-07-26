@@ -60,6 +60,13 @@ pub trait SecretStore: Send + Sync {
     /// Hard-delete the secret. Later `store` calls with the same name
     /// re-create it. Idempotent on missing names.
     async fn delete(&self, name: &str) -> Result<()>;
+    /// Overwrite the ciphertext of many entries in one transaction.
+    ///
+    /// Exists for master-key rotation, where a partial write is unrecoverable:
+    /// entries left under the old key cannot be read once the key file is
+    /// swapped, and there is no way to tell which those are. Names absent from
+    /// `entries` are untouched; unknown names are inserted.
+    async fn rewrite_all(&self, entries: &[(String, Vec<u8>)]) -> Result<()>;
     /// Which credential set this store addresses. MUST be stable for the
     /// life of the store and equal across every handle on the same backing
     /// data — callers use it to decide whether two stores need to share

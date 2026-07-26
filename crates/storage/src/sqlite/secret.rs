@@ -70,6 +70,26 @@ impl SecretStore for SqliteSecretStore {
             .await
     }
 
+    async fn rewrite_all(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let entries = entries.to_vec();
+        self.pool
+            .interact("secrets.rewrite_all", move |conn| {
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT INTO secrets (name, encrypted_value) VALUES (?1, ?2)
+                         ON CONFLICT(name) DO UPDATE SET encrypted_value = excluded.encrypted_value",
+                    )?;
+                    for (name, value) in &entries {
+                        stmt.execute(rusqlite::params![name, value])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
     fn identity(&self) -> StoreIdentity {
         self.pool.identity()
     }

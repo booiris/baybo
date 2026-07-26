@@ -71,6 +71,14 @@ impl SecretStore for MemorySecretStore {
         Ok(())
     }
 
+    async fn rewrite_all(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let mut g = self.data.lock();
+        for (name, value) in entries {
+            g.insert(name.clone(), value.clone());
+        }
+        Ok(())
+    }
+
     fn identity(&self) -> StoreIdentity {
         self.identity.clone()
     }
