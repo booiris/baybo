@@ -50,6 +50,29 @@ variant. That is a string-scrape of the same file the test already reads.
 `crates/trace/src/span.rs:446` and `:454` describe `SpanEnd` in terms of `SubagentStub`
 spans, a variant that does not exist. Whatever they were documenting has been removed.
 
+### 5. `Compression` does not say which compression it was
+
+Two different things record the same `StepKind::Compression`, with nothing on the step to
+tell them apart:
+
+- **Inline / send-time** — `ContextManager::maybe_compress`, run at the top of an iteration
+  when the context about to be sent would overflow. This one is on the critical path: the
+  turn waits for it, and it changes what the very next LLM call sees.
+- **Background** — the detached pass spawned at iteration boundaries
+  (`maybe_request_background_summary`), attributed to the same session. It is off the
+  critical path and the user never waits on it.
+
+Both funnel through `CompressionRunner::run` (`crates/agent/src/runtime/compression.rs:108`),
+which brackets one `StepKind::Compression` step + `LlmCall` span for either caller. So a
+trace reader cannot answer "was the context compacted *at send time*, and when" — which is
+the operationally interesting one, since that is the compaction that reshapes the prompt the
+model is about to answer.
+
+Fix: carry the trigger on the step, e.g. `Compression { trigger: Inline | Background }`
+(value-bearing, like the web mirror already does for other kinds) or two step kinds. Either
+way the sync test and `trace.ts` follow. Until then the viewer deliberately shows no
+send-time-compaction indicator, because it would be indistinguishable from background work.
+
 ## The question underneath
 
 Should spawning a subagent, and selecting a skill, be first-class steps?

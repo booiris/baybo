@@ -11,9 +11,7 @@ import { RiArrowDownSLine, RiArrowRightSLine } from 'react-icons/ri';
 import type { JobTrace, LifecycleState, TraceJobSummary, TraceOverview } from '../../types/trace';
 import type { TraceGroup } from './traceFormat';
 import {
-  compressionTokens,
   formatDuration,
-  formatTime,
   formatTok,
   nodeGroup,
   spanToolName,
@@ -40,23 +38,11 @@ interface Cell {
   label: string;
 }
 
-/** A context compaction: when it ran and what it did to the transcript. The
- *  compression step brackets a real LLM call, so its span carries the token
- *  figures — input = the context fed in, output = the summary that replaced it. */
-interface Compaction {
-  stepId: string;
-  jobId: string;
-  at: string;
-  inTok: number;
-  outTok: number;
-}
-
 interface Aggregate {
   cells: Cell[];
   stepCount: number;
   spanCount: number;
   toolCounts: [string, number][];
-  compactions: Compaction[];
 }
 
 function isFail(outcome: LifecycleState['outcome']): boolean {
@@ -66,7 +52,6 @@ function isFail(outcome: LifecycleState['outcome']): boolean {
 function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace>): Aggregate {
   const cells: Cell[] = [];
   const tools = new Map<string, number>();
-  const compactions: Compaction[] = [];
   let stepCount = 0;
   let spanCount = 0;
 
@@ -99,17 +84,6 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
         }
       } else {
         spanCount += rs.spans.length;
-        if (rs.step.kind.kind === 'compression') {
-          const llm = rs.spans.find((sp) => sp.kind.kind === 'llm_call');
-          const result = llm?.kind.kind === 'llm_call' ? llm.kind.result : null;
-          compactions.push({
-            stepId: rs.step.id,
-            jobId: job.job_id,
-            at: rs.step.started_at,
-            inTok: result ? compressionTokens(result).input : 0,
-            outTok: result ? compressionTokens(result).output : 0,
-          });
-        }
         const v = stepVisual(rs.step.kind.kind);
         // Fail if the step OR any nested span failed — matches the tree's
         // roll-up (traceTreeModel.failureCount) so the overview's dots agree.
@@ -134,7 +108,7 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
   }
 
   const toolCounts = [...tools.entries()].sort((a, b) => (b[1] - a[1] !== 0 ? b[1] - a[1] : a[0].localeCompare(b[0])));
-  return { cells, stepCount, spanCount, toolCounts, compactions };
+  return { cells, stepCount, spanCount, toolCounts };
 }
 
 // Wall-clock across the session: earliest start → latest end, using `now` as the
@@ -189,7 +163,7 @@ export function TraceOverviewBar({
 }) {
   const [open, setOpen] = useState(true);
 
-  const { cells, stepCount, spanCount, toolCounts, compactions } = useMemo(
+  const { cells, stepCount, spanCount, toolCounts } = useMemo(
     () => buildAggregate(overview, jobTraces),
     [overview, jobTraces],
   );
@@ -272,40 +246,6 @@ export function TraceOverviewBar({
               {failCells.length} fail →
             </button>
           )}
-        </div>
-      )}
-
-      {open && compactions.length > 0 && (
-        <div className="mt-1.5 flex items-start gap-2 flex-wrap">
-          <span
-            className="text-[0.6rem] font-bold uppercase tracking-wider text-violet shrink-0 pt-0.5 w-14"
-            title="The context was compacted here — the transcript above each point was replaced by a summary"
-          >
-            context
-          </span>
-          <div className="flex flex-wrap gap-1">
-            {compactions.map((c, i) => (
-              <button
-                key={c.stepId}
-                type="button"
-                onClick={() => {
-                  onSelectStep(c.jobId, c.stepId);
-                  scrollToAnchor(`[data-step-id="${c.stepId}"]`, 'center');
-                }}
-                title={`Compaction ${i + 1} at ${formatTime(c.at)} — ${c.inTok.toLocaleString()} tokens of context replaced by a ${c.outTok.toLocaleString()}-token summary`}
-                className={`inline-flex items-center gap-1 border rounded px-1 py-px text-[0.65rem] font-mono cursor-pointer transition-colors ${
-                  selectedStepId === c.stepId
-                    ? 'border-violet bg-violet text-canvas'
-                    : 'border-violet/50 bg-violet/10 text-ink hover:bg-violet/20'
-                }`}
-              >
-                <span className="font-bold">{formatTime(c.at)}</span>
-                <span className={selectedStepId === c.stepId ? 'text-canvas/80' : 'text-ink-soft'}>
-                  {formatTok(c.inTok)}→{formatTok(c.outTok)}
-                </span>
-              </button>
-            ))}
-          </div>
         </div>
       )}
 
