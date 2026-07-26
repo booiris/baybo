@@ -25,7 +25,7 @@ use baybo_channels::{AgentEvent, AgentOutput, TurnStatus};
 use baybo_integration_tests::AgentTestHarness;
 use baybo_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use baybo_model::MicroUsd;
-use baybo_trace::{SpanKind, StepKind, TraceStore};
+use baybo_trace::{CompressionTrigger, SpanKind, StepKind, TraceStore};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 
@@ -121,7 +121,16 @@ async fn compression_call_records_cost_with_matching_span_id() {
         compression_steps.extend(
             steps
                 .into_iter()
-                .filter(|s| matches!(s.kind, StepKind::Compression)),
+                // The inline (send-time) path is what this suite drives, so
+                // assert that trigger rather than any compaction.
+                .filter(|s| {
+                    matches!(
+                        s.kind,
+                        StepKind::Compression {
+                            trigger: Some(CompressionTrigger::Inline)
+                        }
+                    )
+                }),
         );
     }
     assert_eq!(

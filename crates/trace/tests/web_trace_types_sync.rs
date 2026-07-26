@@ -42,7 +42,7 @@ fn web_trace_types_cover_every_step_kind() {
     let ts = web_trace_types();
     let kinds = [
         StepKind::LlmIteration,
-        StepKind::Compression,
+        StepKind::inline_compression(),
         StepKind::MemoryRecall,
         StepKind::MemoryWrite,
         StepKind::SkillSelection,
@@ -56,7 +56,7 @@ fn web_trace_types_cover_every_step_kind() {
         // production `StepKind::tag()`, so it can't typo out of sync.
         match k {
             StepKind::LlmIteration
-            | StepKind::Compression
+            | StepKind::Compression { .. }
             | StepKind::MemoryRecall
             | StepKind::MemoryWrite
             | StepKind::SkillSelection
@@ -86,4 +86,66 @@ fn span_kind_exhaustiveness(k: &SpanKind) {
     match k {
         SpanKind::LlmCall { .. } | SpanKind::ToolCall { .. } => {}
     }
+}
+
+/// Every `kind: '…'` tag the TS unions declare must exist in Rust.
+///
+/// The two tests above guard the other direction — Rust gained a variant, the
+/// frontend forgot. Nothing guarded this one, which is how `subagent` and
+/// `subagent_stub` lived in the frontend union for a long time with no Rust
+/// counterpart and no possible producer: the trace viewer carried render
+/// branches, an icon and a legend entry for kinds that could never arrive.
+#[test]
+fn web_trace_types_declare_no_kinds_rust_lacks() {
+    let ts = web_trace_types();
+
+    let step_tags = [
+        StepKind::LlmIteration,
+        StepKind::inline_compression(),
+        StepKind::MemoryRecall,
+        StepKind::MemoryWrite,
+        StepKind::SkillSelection,
+        StepKind::ProgressObserver,
+        StepKind::TitleGeneration,
+    ]
+    .map(|k| k.tag());
+    let span_tags = ["llm_call", "tool_call"];
+
+    for (ty, known) in [
+        ("StepKind", step_tags.as_slice()),
+        ("SpanKind", span_tags.as_slice()),
+    ] {
+        for tag in declared_tags(&ts, ty) {
+            assert!(
+                known.contains(&tag.as_str()),
+                "app/web/src/types/trace.ts declares `{ty}` variant `{tag}`, which no \
+                 Rust variant produces. Either it was removed here and the mirror \
+                 kept it, or it was never real — delete it from the union (and the \
+                 viewer branches keyed on it), or add the Rust variant."
+            );
+        }
+    }
+}
+
+/// The `kind: '…'` tags inside one exported TS union, e.g. everything between
+/// `export type StepKind =` and the terminating `;`.
+fn declared_tags(ts: &str, ty: &str) -> Vec<String> {
+    let header = format!("export type {ty} =");
+    let Some(start) = ts.find(&header) else {
+        panic!("app/web/src/types/trace.ts has no `{header}` — did the mirror move?")
+    };
+    let body = &ts[start + header.len()..];
+    let body = &body[..body.find(";\n").unwrap_or(body.len())];
+
+    let mut out = Vec::new();
+    let needle = "kind: '";
+    let mut rest = body;
+    while let Some(i) = rest.find(needle) {
+        rest = &rest[i + needle.len()..];
+        if let Some(end) = rest.find('\'') {
+            out.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+    }
+    out
 }

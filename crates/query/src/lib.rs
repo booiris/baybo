@@ -2279,7 +2279,7 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::inline_compression(),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
@@ -2523,7 +2523,7 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::inline_compression(),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
@@ -2647,7 +2647,7 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::inline_compression(),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,

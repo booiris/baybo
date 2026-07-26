@@ -31,7 +31,9 @@ use baybo_context::{
 use baybo_llm::{Attribution, BillableLlm, ModelInfo};
 use baybo_model::{BackgroundCompressionPayload, JobId, SessionId};
 use baybo_session::SessionManager;
-use baybo_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
+use baybo_trace::{
+    CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind,
+};
 use baybo_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -56,6 +58,10 @@ pub(crate) struct CompressionRunner {
     pub(crate) session_id: SessionId,
     pub(crate) model_info: ModelInfo,
     pub(crate) cancel_token: CancellationToken,
+    /// Which path is running this compaction. Recorded on the step so a
+    /// trace can tell a send-time compaction — which the turn blocks on and
+    /// which reshapes the next prompt — from a detached background pass.
+    pub(crate) trigger: CompressionTrigger,
 }
 
 impl CompressionRunner {
@@ -84,6 +90,7 @@ impl CompressionRunner {
             session_id,
             model_info,
             cancel_token,
+            trigger,
         } = self;
 
         let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
@@ -105,7 +112,9 @@ impl CompressionRunner {
         crate::runtime::scope::with_step(
             recorder.as_ref(),
             job_id,
-            StepKind::Compression,
+            StepKind::Compression {
+                trigger: Some(trigger),
+            },
             cancel_ctx,
             |step| async move {
                 let result = crate::runtime::scope::with_llm_span(
@@ -265,6 +274,7 @@ impl BackgroundCompressionRunner {
                 session_id: session_id.clone(),
                 model_info: model_info.clone(),
                 cancel_token: cancel_token.clone(),
+                trigger: CompressionTrigger::Background,
             };
             Box::pin(async move { runner.run(req, marker).await })
         });

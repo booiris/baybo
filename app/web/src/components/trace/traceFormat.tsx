@@ -71,13 +71,11 @@ export const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
   skill_selection: { group: 'meta', icon: RiBookmark3Line, glyph: 'S', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Skill selection' },
   progress_observer: { group: 'meta', icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
   title_generation: { group: 'meta', icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
-  subagent: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent' },
 };
 
 export const SPAN_VISUALS: Record<SpanKindTag, KindVisual> = {
   llm_call: { group: 'llm', icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM call' },
   tool_call: { group: 'tool', icon: RiToolsLine, glyph: 't', accent: 'text-warn', bg: 'bg-warn/10', stripe: 'border-l-warn', cell: 'bg-warn', label: 'Tool call' },
-  subagent_stub: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent stub' },
 };
 
 // Colour key for the overview minimap + tree glyphs/stripes. One entry per hue
@@ -134,6 +132,20 @@ export function spanVisual(kind: SpanKindTag): KindVisual {
   return known ?? { ...FALLBACK_VISUAL, label: kind };
 }
 
+/** Subagent is not a `StepKind`/`SpanKind` — it is the identity of a
+ *  `spawn_subagent` tool call, so it carries its own visual rather than
+ *  borrowing a variant's. */
+const SUBAGENT_VISUAL: KindVisual = {
+  group: 'subagent',
+  icon: RiTeamLine,
+  glyph: 'A',
+  accent: 'text-brand',
+  bg: 'bg-brand/10',
+  stripe: 'border-l-brand',
+  cell: 'bg-brand',
+  label: 'Subagent',
+};
+
 /** The tool name a span calls, when it is a tool call. */
 export function spanToolName(span: Span): string | undefined {
   return span.kind.kind === 'tool_call' ? span.kind.begin.tool_name : undefined;
@@ -143,7 +155,7 @@ export function spanToolName(span: Span): string | undefined {
  *  identity — that call is the subagent, so it should not read as a plain tool. */
 export function spanVisualOf(span: Span): KindVisual {
   if (spanToolName(span) === SPAWN_SUBAGENT_TOOL) {
-    return { ...SPAN_VISUALS.subagent_stub, label: 'Subagent' };
+    return SUBAGENT_VISUAL;
   }
   return spanVisual(span.kind.kind);
 }
@@ -270,7 +282,12 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
         // `input_tokens` under-reports it and disagrees with the token
         // totals everywhere else (`summaryTokens`/`traceTokens.inputTotal`).
         const { input, output } = compressionTokens(llm.kind.result);
-        return `${input.toLocaleString()} → ${output.toLocaleString()} tokens`;
+        // The trigger leads: inline/forced compactions rewrote the transcript
+        // the NEXT llm call reads, so this row is the moment the model's input
+        // context changed. A background pass did not touch the next prompt.
+        const trigger = step.kind.trigger;
+        const lead = trigger != null ? `${trigger} · ` : '';
+        return `${lead}${input.toLocaleString()} → ${output.toLocaleString()} tokens`;
       }
       return 'compression';
     }
@@ -301,8 +318,6 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       if (out != null && out !== '') return out.slice(0, 80);
       return 'conversation title';
     }
-    case 'subagent':
-      return `child ${step.kind.child_session_id}`;
   }
 }
 

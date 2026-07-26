@@ -346,7 +346,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   // wire defines but no production path records).
   const compStarted = new Date(t0);
   const compEnded = new Date(t0 + 80);
-  const compStep = step(job1, { kind: 'compression' }, compStarted, compEnded);
+  const compStep = step(job1, { kind: 'compression', trigger: 'inline' }, compStarted, compEnded);
   const compLlm = llmSpan(
     compStep.id,
     'claude-sonnet-4-6',

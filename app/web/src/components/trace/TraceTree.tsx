@@ -86,8 +86,7 @@ export interface TraceTreeProps {
 function spanText(span: Span): string {
   const v = spanVisualOf(span).label;
   if (span.kind.kind === 'llm_call') return `${v} ${span.kind.begin.model_id}`;
-  if (span.kind.kind === 'tool_call') return `${v} ${span.kind.begin.tool_name}`;
-  return `${v} ${span.kind.child_session_id}`;
+  return `${v} ${span.kind.begin.tool_name}`;
 }
 
 function stepText(rs: ReplayStep): string {
@@ -109,19 +108,16 @@ function spanPreview(span: Span, messageLog: SessionMessageRow[]): string | null
     if (r?.tool_calls && r.tool_calls.length > 0) return '→ ' + r.tool_calls.map((t) => `${t.name}(…)`).join(', ');
     return null;
   }
-  if (span.kind.kind === 'tool_call') {
-    const r = span.kind.result;
-    if (r) {
-      const out = resolveToolCallOutput(r.output, messageLog, span.started_at);
-      return typeof out === 'string' ? out : JSON.stringify(out);
-    }
-    try {
-      return JSON.stringify(span.kind.begin.params);
-    } catch {
-      return null;
-    }
+  const r = span.kind.result;
+  if (r) {
+    const out = resolveToolCallOutput(r.output, messageLog, span.started_at);
+    return typeof out === 'string' ? out : JSON.stringify(out);
   }
-  return null;
+  try {
+    return JSON.stringify(span.kind.begin.params);
+  } catch {
+    return null;
+  }
 }
 
 // ── Small building blocks ────────────────────────────────────────────
@@ -261,14 +257,11 @@ function SpanRow({
     } else {
       subtitle = 'in flight';
     }
-  } else if (span.kind.kind === 'tool_call') {
+  } else {
     title = span.kind.begin.tool_name;
     if (!span.kind.result) subtitle = 'in flight';
     else if (span.kind.result.success) subtitle = 'success';
     else subtitle = span.outcome.outcome === 'failed' && span.outcome.reason ? `failed: ${span.outcome.reason}` : 'failed';
-  } else {
-    title = `subagent → ${span.kind.child_session_id}`;
-    subtitle = 'wait window';
   }
 
   const tint = heat && !selected ? heatTint(ms, maxMs, siblings) : '';

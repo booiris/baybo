@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
 use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
+    CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
+    StepKind,
 };
 use tracing::{debug, info, warn};
 
@@ -2538,7 +2539,13 @@ impl AgentLoop {
         cancel_token: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<()> {
-        let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
+        let runner = self.build_compression_runner(
+            session,
+            span_recorder,
+            job_id,
+            cancel_token,
+            CompressionTrigger::Inline,
+        );
         let model_id = runner.model_info.id.clone();
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run; the `Compacted`
@@ -2569,6 +2576,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         cancel_token: &CancellationToken,
+        trigger: CompressionTrigger,
     ) -> CompressionRunner {
         let model_info = self.llm_client.model_info().clone();
         CompressionRunner {
@@ -2580,6 +2588,7 @@ impl AgentLoop {
             session_id: session.id.clone(),
             model_info,
             cancel_token: cancel_token.clone(),
+            trigger,
         }
     }
 
@@ -2799,8 +2808,13 @@ impl AgentLoop {
             cancel_token.clone(),
             spec,
             |job_id| async move {
-                let runner =
-                    self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
+                let runner = self.build_compression_runner(
+                    session,
+                    span_recorder,
+                    job_id,
+                    &cancel_token,
+                    CompressionTrigger::Forced,
+                );
                 let model_id = runner.model_info.id.clone();
                 let outcome = self
                     .context_manager

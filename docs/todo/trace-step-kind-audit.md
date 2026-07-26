@@ -1,5 +1,9 @@
 # Trace `StepKind` / `SpanKind` — audit the enum against what is actually recorded
 
+> **Status:** items 2, 3 and 5 are done (phantom variants deleted, the sync test now guards
+> both directions, `Compression` carries its trigger). Items 1 and 4, and the design
+> question at the end, are still open.
+
 Found while rebuilding the trace viewer (`docs/todo/trace-tree-redesign.md`). The viewer
 renders one icon/colour/label per kind, which made it obvious that some kinds can never
 appear — and that the frontend union declares kinds the backend does not have.

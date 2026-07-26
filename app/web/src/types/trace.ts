@@ -38,15 +38,28 @@ export function isTerminal(state: LifecycleState): boolean {
 
 // ── Step ──────────────────────────────────────────────────────────────
 
+/**
+ * Which path ran a compaction (mirrors `baybo_trace::CompressionTrigger`).
+ * `inline` / `forced` rewrote the transcript the NEXT llm_call reads — those are
+ * the moments the model's input context actually changed. `background` is a
+ * detached pass nobody waits on. Absent on rows written before the trigger was
+ * recorded.
+ */
+export type CompressionTrigger = 'inline' | 'forced' | 'background';
+
+/** Whether a compaction changed what the next LLM call was sent. */
+export function changesNextInput(trigger: CompressionTrigger | null | undefined): boolean {
+  return trigger === 'inline' || trigger === 'forced';
+}
+
 export type StepKind =
   | { kind: 'llm_iteration' }
-  | { kind: 'compression' }
+  | { kind: 'compression'; trigger?: CompressionTrigger | null }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }
   | { kind: 'skill_selection' }
   | { kind: 'progress_observer' }
-  | { kind: 'title_generation' }
-  | { kind: 'subagent'; child_session_id: string };
+  | { kind: 'title_generation' };
 
 export type StepKindTag = StepKind['kind'];
 
@@ -201,8 +214,7 @@ export interface ToolCallResult {
 
 export type SpanKind =
   | { kind: 'llm_call'; begin: LlmCallBegin; result?: LlmCallResult | null }
-  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null }
-  | { kind: 'subagent_stub'; child_session_id: string };
+  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null };
 
 export type SpanKindTag = SpanKind['kind'];
 

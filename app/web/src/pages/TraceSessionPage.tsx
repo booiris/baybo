@@ -44,7 +44,9 @@ import {
   jobOutputText,
   jobQueuedMs,
   OutcomeBadge,
+  SPAWN_SUBAGENT_TOOL,
   spanVisual,
+  spanVisualOf,
   stepSummaryText,
   stepVisual,
   summaryTokens,
@@ -145,10 +147,12 @@ function ToolCallDetail({
   span,
   messageLog,
   onJumpToLlm,
+  onDrillIn,
 }: {
   span: Span;
   messageLog: SessionMessageRow[];
   onJumpToLlm: (llmSpanId: string) => void;
+  onDrillIn: (sessionId: string) => void;
 }) {
   if (span.kind.kind !== 'tool_call') return null;
   const { begin, result } = span.kind;
@@ -157,9 +161,12 @@ function ToolCallDetail({
   // A larger output rides as a transcript pointer keyed by `tool_use_id` —
   // resolve it before rendering or the panel shows the raw `$baybo_ref` object.
   const output = result ? resolveToolCallOutput(result.output, messageLog, span.started_at) : null;
+  const childId =
+    begin.tool_name === SPAWN_SUBAGENT_TOOL && output != null ? childSessionOf(output) : null;
 
   return (
     <div className="space-y-6">
+      {childId != null && <SubagentLink childId={childId} onDrillIn={onDrillIn} />}
       <section>
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Tool</h4>
         <div className="font-mono text-[0.95rem] font-bold">{begin.tool_name}</div>
@@ -216,19 +223,29 @@ function ToolCallDetail({
   );
 }
 
-function SubagentStubDetail({ span, onDrillIn }: { span: Span; onDrillIn: (sessionId: string) => void }) {
-  if (span.kind.kind !== 'subagent_stub') return null;
-  const childId = span.kind.child_session_id;
+/** The child session a `spawn_subagent` call produced, read off its result —
+ *  the only place the link survives now that `SubagentStub` spans are gone. */
+function childSessionOf(output: unknown): string | null {
+  if (output != null && typeof output === 'object') {
+    const id = (output as Record<string, unknown>).child_session_id;
+    if (typeof id === 'string' && id !== '') return id;
+  }
+  return null;
+}
+
+function SubagentLink({ childId, onDrillIn }: { childId: string; onDrillIn: (id: string) => void }) {
   return (
-    <div className="space-y-4">
-      <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Subagent</h4>
-      <p className="text-[0.85rem] text-ink-soft">
-        This stub bounds the parent's wait window. The actual work runs in the child session.
+    <section>
+      <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+        Subagent
+      </h4>
+      <p className="text-[0.85rem] text-ink-soft mb-2">
+        This call spawned a child session; the work itself runs there.
       </p>
       <Button variant="primary" onClick={() => onDrillIn(childId)} className="!py-2 !px-4 !text-[0.85rem] gap-2">
         Open child session <RiArrowRightLine />
       </Button>
-    </div>
+    </section>
   );
 }
 
@@ -283,8 +300,6 @@ function MetaTab({ span }: { span: Span }) {
         </code>,
       ]);
     }
-  } else if (span.kind.kind === 'subagent_stub') {
-    baseRows.push(['Child session', <code className="break-all">{span.kind.child_session_id}</code>]);
   }
   return (
     <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 font-mono text-[0.85rem]">
@@ -503,10 +518,13 @@ function SpanDetailPanel({
         {tab === 'io' &&
           (span.kind.kind === 'llm_call' ? (
             <LlmCallDetail span={span} messageLog={messageLog} />
-          ) : span.kind.kind === 'tool_call' ? (
-            <ToolCallDetail span={span} messageLog={messageLog} onJumpToLlm={onJumpToLlm} />
           ) : (
-            <SubagentStubDetail span={span} onDrillIn={onDrillIn} />
+            <ToolCallDetail
+              span={span}
+              messageLog={messageLog}
+              onJumpToLlm={onJumpToLlm}
+              onDrillIn={onDrillIn}
+            />
           ))}
         {tab === 'meta' && <MetaTab span={span} />}
         {tab === 'events' && <EventsTab events={events} />}
@@ -521,12 +539,10 @@ function StepDetail({
   rs,
   jobId,
   onSelectSpan,
-  onDrillIn,
 }: {
   rs: ReplayStep;
   jobId: string;
   onSelectSpan: (jobId: string, spanId: string) => void;
-  onDrillIn: (sessionId: string) => void;
 }) {
   const { step, spans } = rs;
   const visual = stepVisual(step.kind.kind);
@@ -570,21 +586,6 @@ function StepDetail({
           </section>
         )}
 
-        {step.kind.kind === 'subagent' && (
-          <section>
-            <p className="text-[0.85rem] text-ink-soft mb-2">
-              The actual work runs in the child session spawned by this step.
-            </p>
-            <Button
-              variant="primary"
-              onClick={() => onDrillIn(step.kind.kind === 'subagent' ? step.kind.child_session_id : '')}
-              className="!py-2 !px-4 !text-[0.85rem] gap-2"
-            >
-              Open child session <RiArrowRightLine />
-            </Button>
-          </section>
-        )}
-
         {spans.length > 0 && (
           <section>
             <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
@@ -592,14 +593,9 @@ function StepDetail({
             </h4>
             <div className="space-y-2">
               {spans.map((s) => {
-                const sv = spanVisual(s.kind.kind);
+                const sv = spanVisualOf(s);
                 const SvIcon = sv.icon;
-                const title =
-                  s.kind.kind === 'llm_call'
-                    ? s.kind.begin.model_id
-                    : s.kind.kind === 'tool_call'
-                      ? s.kind.begin.tool_name
-                      : `subagent → ${s.kind.child_session_id}`;
+                const title = s.kind.kind === 'llm_call' ? s.kind.begin.model_id : s.kind.begin.tool_name;
                 return (
                   <button
                     key={s.id}
@@ -1521,12 +1517,7 @@ export function TraceSessionPage() {
               onDrillIn={handleDrillIntoChild}
             />
           ) : selectedStepRs ? (
-            <StepDetail
-              rs={selectedStepRs}
-              jobId={activeJobId}
-              onSelectSpan={handleSelectSpan}
-              onDrillIn={handleDrillIntoChild}
-            />
+            <StepDetail rs={selectedStepRs} jobId={activeJobId} onSelectSpan={handleSelectSpan} />
           ) : externalAgent ? (
             <TranscriptPanel messageLog={messageLog} />
           ) : (

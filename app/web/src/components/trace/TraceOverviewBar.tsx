@@ -66,8 +66,9 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
           const v = spanVisualOf(span);
           const failed = isFail(span.outcome.outcome);
           let label = v.label;
-          if (span.kind.kind === 'llm_call') label = span.kind.begin.model_id;
-          else if (span.kind.kind === 'tool_call') {
+          if (span.kind.kind === 'llm_call') {
+            label = span.kind.begin.model_id;
+          } else {
             label = span.kind.begin.tool_name;
             tools.set(label, (tools.get(label) ?? 0) + 1);
           }

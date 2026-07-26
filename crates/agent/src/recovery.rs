@@ -850,7 +850,7 @@ mod tests {
         let step = Step {
             id: StepId::new(),
             job_id: job.id,
-            kind: StepKind::Compression,
+            kind: StepKind::inline_compression(),
             started_at: t0 + Duration::seconds(20),
             ended_at: None,
             outcome: LifecycleState::Pending,

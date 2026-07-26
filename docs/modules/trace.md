@@ -51,6 +51,7 @@ pub enum SpanKind {
 - Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: ParallelGroup`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
 - `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection`, `ProgressObserver`, and `TitleGeneration` are first-class Step kinds, not events on an LLM step.
+- `Compression` carries a `CompressionTrigger` (`Inline` / `Forced` / `Background`). Inline and forced compactions rewrite the transcript the **next** `LlmCall` reads — they are the moments the model's input context changed — while the background pass is detached and does not touch the next prompt. `None` only on rows written before the trigger existed.
 
 ### Provenance lives on Span variants, not on Step
 

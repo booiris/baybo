@@ -65,7 +65,16 @@ pub enum StepKind {
     /// step *may* have zero only when the trace-store write of the
     /// first `begin_span` itself errored.
     LlmIteration,
-    Compression,
+    /// A context compaction: an LLM call that replaces the transcript so
+    /// far with a summary. `trigger` says which path ran it — they are
+    /// operationally different (see [`CompressionTrigger`]) and were
+    /// indistinguishable in a trace before it existed.
+    Compression {
+        /// `None` on rows written before the trigger was recorded. Not a
+        /// default: a legacy row genuinely does not say which path ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<CompressionTrigger>,
+    },
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
@@ -77,11 +86,64 @@ pub enum StepKind {
     TitleGeneration,
 }
 
+/// Which path ran a compaction. The difference matters when reading a trace:
+/// `Inline` and `Forced` rewrite the transcript the next LLM call reads — they
+/// are the moments the model's input context actually changed — while
+/// `Background` is a detached pass nobody waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionTrigger {
+    /// `ContextManager::maybe_compress`, run at the top of an iteration when
+    /// the context about to be sent would overflow. The turn blocks on it and
+    /// the next LLM call sees the rewritten transcript.
+    Inline,
+    /// An on-demand pass the user asked for (`/compact`). Like `Inline` it
+    /// rewrites the transcript the next call will see; unlike it, nothing was
+    /// overflowing — the user just asked.
+    Forced,
+    /// The detached pass spawned at an iteration boundary once tokens and
+    /// activity cross their thresholds. Nobody waits on it.
+    Background,
+}
+
+impl CompressionTrigger {
+    /// Whether this compaction rewrote the transcript the next LLM call reads.
+    /// The background pass produces a summary out of band; the other two change
+    /// what the model is about to be sent.
+    pub fn changes_next_input(&self) -> bool {
+        matches!(
+            self,
+            CompressionTrigger::Inline | CompressionTrigger::Forced
+        )
+    }
+}
+
 impl StepKind {
+    /// A compaction run on the critical path, before a send.
+    pub fn inline_compression() -> Self {
+        StepKind::Compression {
+            trigger: Some(CompressionTrigger::Inline),
+        }
+    }
+
+    /// A compaction the user asked for on demand.
+    pub fn forced_compression() -> Self {
+        StepKind::Compression {
+            trigger: Some(CompressionTrigger::Forced),
+        }
+    }
+
+    /// A compaction run by the detached background pass.
+    pub fn background_compression() -> Self {
+        StepKind::Compression {
+            trigger: Some(CompressionTrigger::Background),
+        }
+    }
+
     pub fn tag(&self) -> &'static str {
         match self {
             StepKind::LlmIteration => "llm_iteration",
-            StepKind::Compression => "compression",
+            StepKind::Compression { .. } => "compression",
             StepKind::MemoryRecall => "memory_recall",
             StepKind::MemoryWrite => "memory_write",
             StepKind::SkillSelection => "skill_selection",
@@ -139,7 +201,7 @@ mod tests {
 
     #[test]
     fn compression_round_trips() {
-        let s = fresh_step(StepKind::Compression);
+        let s = fresh_step(StepKind::inline_compression());
         let json = serde_json::to_string(&s).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);

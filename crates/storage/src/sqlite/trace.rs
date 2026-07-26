@@ -550,7 +550,7 @@ mod tests {
         let step_with_open_span = Step {
             id: StepId::new(),
             job_id: JobId::new(),
-            kind: StepKind::Compression,
+            kind: StepKind::inline_compression(),
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
             outcome: LifecycleState::Done(LifecycleOutcome::Ok),
