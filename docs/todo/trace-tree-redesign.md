@@ -194,9 +194,10 @@ summarization (render only errors + long spans → relieves the trace-size bloat
 
 ### What a subagent actually looks like
 
-`StepKind::Subagent` and `SpanKind::SubagentStub` exist on the wire but **no production
-path records them** — the same is true of `StepKind::SkillSelection`. A subagent shows up
-as a `spawn_subagent` **tool call**, and a skill as a `Skill` tool call. So the viewer keys
+`StepKind::SkillSelection` exists in Rust but **no production path constructs it**, and
+`subagent` / `subagent_stub` exist **only in the hand-maintained TS mirror** — Rust has no
+such variants at all. A subagent shows up as a `spawn_subagent` **tool call**, and a skill
+as a `Skill` tool call. See [`trace-step-kind-audit.md`](trace-step-kind-audit.md). So the viewer keys
 the Subagent group off the tool name (`SPAWN_SUBAGENT_TOOL`), promoting that call out of
 the generic Tool group and giving it the Subagent glyph/colour; there is no Skill group,
 because nothing would ever land in it. PR2's nesting must hang off the same tool call.
