@@ -176,7 +176,9 @@ failures, click→select + scroll), token totals, wall-clock, counts, and **per-
 chips, and a **clickable legend** (collapsible) — selecting a legend entry
 highlights that group across both the minimap and the tree by dimming everything
 else, so "where did it fail" or "where are the tool calls" reads at a glance. Kind colours are one distinct hue per group —
-**LLM = green, Tool = orange, Memory = blue, Subagent = gold, Aux = gray**, with a red
+**LLM = green, Tool = orange, Memory = blue, Subagent = gold, Skill = magenta,
+Compression = violet, Meta = gray** (progress-observer + title-generation: side-channel
+LLM work that never touches the main loop), with a red
 failure overlay — shared across the glyph, left stripe, and minimap cell (`TRACE_LEGEND`
 is the key). Plus a left **job column** (`JobAnchors`) — a document-outline
 list that selects + scrolls the tree to a job (`data-job-id`), previewing the **user input**
