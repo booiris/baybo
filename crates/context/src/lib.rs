@@ -3993,6 +3993,46 @@ mod tests {
         );
     }
 
+    /// An unproductive pass re-arms the diff gate by anchoring on the ordinal
+    /// it *attempted*, even though the summary cursor stays put. Without this
+    /// the pass advances neither cursor nor anchor, so
+    /// `tokens_since_anchor` keeps reading the whole transcript and clause (b)
+    /// of the trigger is satisfied on the very next boundary — a tight retry
+    /// loop re-sending ~145K tokens to a model that just declined to write.
+    /// This is what replaced the wall-clock backoff: the debounce rides the
+    /// same work-proportional measure a successful pass leaves behind.
+    #[tokio::test]
+    async fn anchoring_on_an_unproductive_pass_rearms_the_diff_gate() {
+        // 200K window → 20K diff threshold; four ~10K-token messages clear it.
+        let mut ctx = make_ctx(5, 200_000, 0.75);
+        for i in 0..4 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(40_000)),
+            ))
+            .await;
+        }
+        let attempted = 3;
+
+        // Before: no anchor, so the gate sees the entire transcript and a
+        // retry would fire immediately.
+        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
+
+        // The pass came back empty — the cursor must NOT move, but the work
+        // mark must, because the pass was paid for.
+        ctx.sync_anchor_to_cursor(attempted).await;
+        assert_eq!(
+            ctx.tokens_since_anchor(),
+            0,
+            "material the failed pass already read must not re-admit a retry"
+        );
+
+        // Only genuinely new material past the attempted ordinal re-opens it.
+        ctx.append(&make_msg(Role::User, &"y".repeat(120_000)))
+            .await;
+        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
+    }
+
     /// Sync is monotonic — it never moves the anchor backward, so a
     /// late-arriving notification from an earlier pass cannot undo a
     /// fresher inline compression apply.

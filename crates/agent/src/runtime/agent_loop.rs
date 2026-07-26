@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
 use baybo_context::{ContextError, ContextManager};
@@ -62,23 +61,6 @@ const MAX_LLM_IMAGES_PER_ITERATION: usize = 8;
 /// throttles subagent fan-out. Like the per-tool timeout ceiling, the
 /// cap lives in code rather than `baybo.json`.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
-
-/// Minimum wall-clock gap between background-summary passes on one session.
-///
-/// The token gates alone don't bound frequency: each pass re-sends the whole
-/// transcript, so a session generating heavy tool output clears any diff
-/// threshold in seconds and the pass re-fires at the next boundary. Only one
-/// fresh `summary.md` is needed per compaction cycle, and a cycle spans
-/// 0.5×max → 0.65×max of context, so a few minutes of hold-off costs nothing
-/// in freshness. Mirrors the progress observer's `MIN_OBSERVER_INTERVAL`,
-/// which throttles a call an order of magnitude cheaper than this one.
-const BG_SUMMARY_MIN_INTERVAL: Duration = Duration::from_secs(300);
-
-/// Longer hold-off after a pass that landed no `Edit`. Such a pass leaves the
-/// summary cursor where it was, so the anchor-relative diff gate stays
-/// satisfied and would otherwise re-fire immediately — spending another
-/// full-transcript round-trip on a model that just declined to write anything.
-const BG_SUMMARY_UNPRODUCTIVE_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Trim and length-cap a single-line summary string. Char-based so a
 /// multibyte boundary is never split.
@@ -536,17 +518,19 @@ pub struct AgentLoop {
     /// token can't kill an in-flight pass — mirrors
     /// [`Self::spawn_session_end_write`].
     bg_compression: Option<tokio::task::JoinHandle<()>>,
-    /// Deadline before which [`Self::maybe_run_background_compression`]
-    /// refuses to spawn another pass — [`BG_SUMMARY_MIN_INTERVAL`] after a
-    /// normal pass, [`BG_SUMMARY_UNPRODUCTIVE_BACKOFF`] after one that landed
-    /// no `Edit`. Written by the detached pass itself (hence the shared cell)
-    /// at *completion* rather than at spawn, so a pass that runs for minutes
-    /// can't have its own hold-off already expired by the time it ends.
+    /// `up_to_ordinal` of the last pass that landed no `Edit`, published by
+    /// the detached pass itself (hence the shared cell).
     ///
-    /// Volatile like [`Self::bg_compression`]: an idle reap drops it. Harmless
-    /// — reaping needs 30 min of silence, well past either deadline, and a
-    /// silent session isn't triggering passes anyway.
-    bg_compression_next_allowed: Arc<parking_lot::Mutex<Option<Instant>>>,
+    /// The summary *cursor* records what `summary.md` covers, so an
+    /// unproductive pass must not advance it. But the in-memory *anchor*
+    /// records how much new material has piled up since we last spent a pass
+    /// on this session, and we did spend one — it just came back empty.
+    /// Because the anchor is otherwise only ever synced from the cursor, an
+    /// unproductive pass advanced neither, leaving the diff gate satisfied and
+    /// the pass re-firing at the very next boundary. Syncing the anchor to the
+    /// attempted ordinal re-arms that gate on the same work-proportional terms
+    /// as a successful pass, with no wall-clock component.
+    bg_compression_unproductive_at: Arc<parking_lot::Mutex<Option<i64>>>,
     /// Once-per-actor title-generation guard. Durable `Session.title`
     /// prevents repeats after rehydration.
     title_generation: Option<tokio::task::JoinHandle<()>>,
@@ -662,7 +646,7 @@ impl AgentLoop {
             last_task_management_turn: 0,
             last_reminder_turn: 0,
             bg_compression: None,
-            bg_compression_next_allowed: Arc::new(parking_lot::Mutex::new(None)),
+            bg_compression_unproductive_at: Arc::new(parking_lot::Mutex::new(None)),
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
@@ -2907,14 +2891,14 @@ impl AgentLoop {
             return;
         }
 
-        // Wall-clock hold-off since the last pass finished. The token gates
-        // below measure how much accumulated, not how recently we last paid
-        // to look at it; without this a heavy-tool-output session re-fires a
-        // full-transcript pass every boundary.
-        if let Some(until) = *self.bg_compression_next_allowed.lock()
-            && Instant::now() < until
-        {
-            return;
+        // Charge the last unproductive pass to the diff gate before measuring
+        // it: that pass read the transcript up to this ordinal and produced
+        // nothing, so the material below it has already been paid for once.
+        // `sync_anchor_to_cursor` is monotonic and no-ops on an ordinal the
+        // transcript no longer carries.
+        let unproductive_at = self.bg_compression_unproductive_at.lock().take();
+        if let Some(ordinal) = unproductive_at {
+            self.context_manager.sync_anchor_to_cursor(ordinal).await;
         }
 
         let Some(payload) = self
@@ -2950,7 +2934,8 @@ impl AgentLoop {
         // it would let a reap mid-pass tear the summary down. Mirrors
         // `spawn_session_end_write`.
         let cancel_token = CancellationToken::new();
-        let next_allowed = Arc::clone(&self.bg_compression_next_allowed);
+        let unproductive_at = Arc::clone(&self.bg_compression_unproductive_at);
+        let attempted_ordinal = payload.up_to_ordinal;
 
         let handle = tokio::spawn(async move {
             let runner = crate::runtime::compression::BackgroundCompressionRunner {
@@ -2966,15 +2951,13 @@ impl AgentLoop {
                 job_id: current_job_id,
                 cancel_token,
             };
-            let outcome = runner.run(payload).await;
-            // Stamped at completion, covering every exit: a pass that failed
-            // still spent the transcript, so it earns the same hold-off.
-            let hold_off = match &outcome {
-                Err(ContextError::UnproductiveSummary(_)) => BG_SUMMARY_UNPRODUCTIVE_BACKOFF,
-                _ => BG_SUMMARY_MIN_INTERVAL,
-            };
-            *next_allowed.lock() = Some(Instant::now() + hold_off);
-            if let Err(e) = outcome {
+            // A transient LLM failure is deliberately NOT charged here: it
+            // produced no work and the documented behaviour is to retry it
+            // freely on the next boundary.
+            if let Err(e) = runner.run(payload).await {
+                if matches!(e, ContextError::UnproductiveSummary(_)) {
+                    *unproductive_at.lock() = Some(attempted_ordinal);
+                }
                 warn!(error = %e, "background summary pass failed");
             }
         });
