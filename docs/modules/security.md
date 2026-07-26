@@ -90,19 +90,24 @@ Any future HTTP-emitting builtin must apply the same two layers (`validate_url_w
 
 Secrets are encrypted with AES-256-GCM. `SecretValue` should not support plaintext `Debug`.
 
-**Record format.** Current records are `0x02 || nonce(12) || ciphertext || tag(16)`,
-with a fresh random nonce per encryption and the **entry name passed as
-associated data**. The AAD binding is the point: one master key encrypts every
+**Record format.** `nonce(12) || ciphertext || tag(16)`, with a fresh random
+nonce per encryption and the **entry name passed as associated data**. The AAD binding is the point: one master key encrypts every
 row, so without it any ciphertext decrypts correctly under any name, and an
 attacker who can write the store can move `llm.entry.cheap.api_key`'s ciphertext
 onto `gateway.admin_token` and have it open cleanly. With it, a record is only
 valid where it was written.
 
-`decrypt` accepts nothing else — in particular not a bare
-`nonce || ct || tag` record with the marker stripped. Such a record carries no
-binding and therefore opens under any entry name, so a reader that falls back to
-it would hand back exactly the property the AAD removes, to anyone who can write
-the store.
+Deliberately unversioned. A leading marker would discriminate nothing — one
+format exists — and could not disambiguate anything anyway, since the first byte
+of a random nonce collides with any marker once in 256. If the format ever does
+change, the discriminator has to come from outside the record (a column, a
+per-store flag), never from a prefix.
+
+An **empty** `aad` is rejected by both `encrypt` and `decrypt`. AES-GCM treats
+"no associated data" and "empty associated data" as the same input, so records
+written that way would be interchangeable with each other — the property the
+binding exists to remove. Refusing the argument makes an unbound record
+unrepresentable rather than merely unusual.
 
 The practical consequence: **a vault written by a build predating this format
 does not decrypt at all.** There is no conversion path in the tree — a workspace

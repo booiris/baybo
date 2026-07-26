@@ -14,19 +14,6 @@ const NONCE_LEN: usize = 12;
 /// `aes-gcm` crate.
 const TAG_LEN: usize = 16;
 
-/// Leading byte of every record: `0x02 || nonce || ct || tag`.
-///
-/// Discriminates nothing — one format exists, and rotation re-keys every record
-/// in one transaction rather than tagging each with the key that wrote it, so
-/// nothing reads this to make a decision.
-///
-/// It stays because removing it costs more than keeping it. Every record on disk
-/// begins with this byte, so dropping it is a full re-encryption pass over the
-/// vault — the same migration the tree deliberately keeps no tooling for. And
-/// the bounds check it anchors in [`decrypt`] is load-bearing on its own: `open`
-/// splits at [`NONCE_LEN`] and would panic on a shorter input.
-const FORMAT_V2: u8 = 0x02;
-
 /// Encryption key wrapper holding raw key bytes suitable for AES-256-GCM.
 #[derive(Clone)]
 pub struct EncryptionKey {
@@ -55,7 +42,13 @@ impl EncryptionKey {
 
 /// Encrypt `plaintext` using AES-256-GCM, binding it to `aad`.
 ///
-/// Output format: `0x02 || nonce(12 bytes) || ciphertext || tag(16 bytes)`.
+/// Output format: `nonce(12 bytes) || ciphertext || tag(16 bytes)`.
+///
+/// Unversioned on purpose. A leading marker would discriminate nothing — one
+/// format exists — and a record's own bytes cannot disambiguate it anyway: the
+/// first byte of a random nonce collides with any marker once in 256. If the
+/// format ever does change, the discriminator has to come from outside the
+/// record (a column, a per-store flag), not from a prefix.
 ///
 /// `aad` is authenticated but **not** stored, so it must be something the
 /// decrypting side already knows — the vault passes the entry name. Without
@@ -63,6 +56,7 @@ impl EncryptionKey {
 /// to write the store can move a low-value entry's ciphertext onto a
 /// high-value one and have it decrypt cleanly.
 pub fn encrypt(plaintext: &[u8], key: &EncryptionKey, aad: &[u8]) -> crate::Result<Vec<u8>> {
+    reject_empty_aad(aad)?;
     let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|e| {
         crate::SecurityError::Encryption(format!("failed to create AES-256-GCM cipher: {e}"))
     })?;
@@ -83,8 +77,7 @@ pub fn encrypt(plaintext: &[u8], key: &EncryptionKey, aad: &[u8]) -> crate::Resu
             crate::SecurityError::Encryption(format!("AES-256-GCM encryption failed: {e}"))
         })?;
 
-    let mut output = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
-    output.push(FORMAT_V2);
+    let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     output.extend_from_slice(&nonce_bytes);
     output.extend_from_slice(&ciphertext);
     Ok(output)
@@ -93,14 +86,16 @@ pub fn encrypt(plaintext: &[u8], key: &EncryptionKey, aad: &[u8]) -> crate::Resu
 /// Decrypt data produced by [`encrypt`], under the same `aad` it was written
 /// with.
 ///
-/// Anything else is rejected, including a record with the marker stripped: an
-/// unmarked `nonce || ct || tag` record carries no binding and so opens under
-/// any identity. Falling back to it would hand that property back to anyone who
-/// can write the store.
+/// A record written under different associated data does not open, which is the
+/// whole point of `aad` — one key encrypts every record, so without the binding
+/// they would all be interchangeable.
 pub fn decrypt(data: &[u8], key: &EncryptionKey, aad: &[u8]) -> crate::Result<Vec<u8>> {
-    if data.first() != Some(&FORMAT_V2) || data.len() < 1 + NONCE_LEN + TAG_LEN {
+    reject_empty_aad(aad)?;
+    // Not merely a tidy early return: `open` splits at NONCE_LEN and panics on
+    // anything shorter.
+    if data.len() < NONCE_LEN + TAG_LEN {
         return Err(crate::SecurityError::Encryption(
-            "not a v2 encrypted record".into(),
+            "too short to be an encrypted record".into(),
         ));
     }
 
@@ -108,8 +103,22 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey, aad: &[u8]) -> crate::Result<Ve
         crate::SecurityError::Encryption(format!("failed to create AES-256-GCM cipher: {e}"))
     })?;
 
-    open(&cipher, &data[1..], aad)
+    open(&cipher, data, aad)
         .map_err(|_| crate::SecurityError::Encryption("AES-256-GCM decryption failed".to_string()))
+}
+
+/// An empty `aad` is not a binding: AES-GCM treats "no associated data" and
+/// "empty associated data" as the same input, so every record written that way
+/// is interchangeable with every other — the exact property `aad` exists to
+/// remove. Refusing it here makes an unbound record unrepresentable through this
+/// module rather than merely unusual.
+fn reject_empty_aad(aad: &[u8]) -> crate::Result<()> {
+    if aad.is_empty() {
+        return Err(crate::SecurityError::Encryption(
+            "associated data must not be empty — a record has to be bound to an identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Split `nonce || ct || tag` and open it under `aad`.
@@ -145,11 +154,9 @@ mod tests {
         let plaintext = b"hello, world! this is a secret.";
 
         let encrypted = encrypt(plaintext, &key, b"entry-name").unwrap();
-        // Version (1) + nonce (12) + ciphertext (same len as plaintext) + tag (16)
-        assert_eq!(encrypted.len(), 1 + NONCE_LEN + plaintext.len() + TAG_LEN);
-        assert_eq!(encrypted[0], FORMAT_V2);
-        // Ciphertext portion should differ from plaintext.
-        assert_ne!(&encrypted[1 + NONCE_LEN..], plaintext.as_slice());
+        // nonce (12) + ciphertext (same len as plaintext) + tag (16)
+        assert_eq!(encrypted.len(), NONCE_LEN + plaintext.len() + TAG_LEN);
+        assert_ne!(&encrypted[NONCE_LEN..], plaintext.as_slice());
 
         let decrypted = decrypt(&encrypted, &key, b"entry-name").unwrap();
         assert_eq!(decrypted, plaintext);
@@ -225,8 +232,10 @@ mod tests {
         );
     }
 
-    /// An unmarked record is valid under every identity, so accepting one would
-    /// return the interchangeability the binding removes.
+    /// A record encrypted with no associated data is identical in shape to a
+    /// bound one, and AES-GCM cannot tell "absent" from "empty" — so an empty
+    /// aad would open it and hand back the interchangeability. The API refuses
+    /// that argument outright.
     #[test]
     fn unbound_records_are_rejected() {
         let key = EncryptionKey::generate();
@@ -248,16 +257,5 @@ mod tests {
             decrypt(&unbound, &key, b"").is_err(),
             "an empty aad must not be a backdoor into the unbound layout"
         );
-    }
-
-    /// The downgrade attempt in its most direct form.
-    #[test]
-    fn stripping_the_version_byte_does_not_downgrade_a_record() {
-        let key = EncryptionKey::generate();
-        let bound = encrypt(b"v", &key, b"gateway.admin_token").unwrap();
-
-        let stripped = &bound[1..];
-        assert!(decrypt(stripped, &key, b"gateway.admin_token").is_err());
-        assert!(decrypt(stripped, &key, b"").is_err());
     }
 }
