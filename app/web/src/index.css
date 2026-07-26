@@ -101,6 +101,62 @@
   margin-bottom: 0;
 }
 
+/* The raw source, shown when the markdown pipeline threw (see `MarkdownFallback`
+   in ChatPage.tsx). Newlines are all the structure that is left, so keep them.
+   Same class name as the iOS transcript's rule, so the two degrade identically. */
+.md-failed {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A work block's reasoning step is the model's OWN markdown, so it renders
+   through `MarkdownBody` like any other prose (the iOS transcript already does
+   — otherwise a `**要点：**` shows its asterisks). Same prose face as an answer
+   at the step list's small, dim scale; it must sit AFTER `.chat-prose` here,
+   which sets an explicit 15px the step would otherwise inherit. Deliberately
+   NOT italic, unlike the raw-text version this replaced: an italic container
+   renders `<em>` indistinguishable from its surroundings, so markdown emphasis
+   would vanish exactly where it started being parsed.
+
+   `overflow-wrap` is what iOS puts on `.work` for exactly this content: the
+   step inherits `.chat-prose`'s `overflow-x: clip`, so an unbreakable token —
+   a crate path, a URL, a sha, all of which a trace is full of — would be cut
+   at the step's edge with no scroller to reach the rest (the raw-text version
+   this replaced overflowed into the panel's own horizontal scroll instead).
+   `break-word`, NOT the bubble's `anywhere`: `anywhere` also shrinks the
+   min-content width, which collapses a wide table's `overflow-x-auto` wrapper
+   into shattered cells. `<pre>` is unaffected either way — `white-space: pre`
+   permits no wrap, so it keeps its own bounded scroller. */
+.work-reasoning {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+/* `MARKDOWN_COMPONENTS` puts `leading-relaxed` on every `p` and `li`, and a
+   declaration on the element beats the inherited value no matter the
+   specificity — so the 1.5 above would only ever reach the blocks that carry no
+   leading utility (blockquote, hr), leaving the trace's actual text at 1.625
+   and its ✻ visibly off the first line of a neighbouring 1-line step. Unlayered
+   here on purpose: that is what outranks Tailwind's `@layer utilities`. */
+.work-reasoning :is(p, li) {
+  line-height: 1.5;
+}
+
+/* `MARKDOWN_COMPONENTS` sizes headings for the answer's reading size (`text-base`
+   / `text-sm`, absolute), so inside a 12px trace a `## Plan` renders LARGER than
+   the prose it heads. Re-scale em-relative to the step; at this size only two
+   ranks stay legible, so h3 and below sit at the body size and read as headings
+   through their weight alone. Unlayered, like the rule above, to outrank the
+   utilities the component map puts on the element. */
+.work-reasoning :is(h1, h2) {
+  font-size: 1.1em;
+}
+
+.work-reasoning :is(h3, h4, h5, h6) {
+  font-size: 1em;
+}
+
 @layer base {
 
 

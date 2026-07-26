@@ -1,4 +1,5 @@
 import {
+  Component,
   memo,
   useCallback,
   useEffect,
@@ -10,12 +11,16 @@ import {
   type FormEvent,
   type KeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { uuid } from '../uuid';
 import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
+import remarkBreaks from 'remark-breaks';
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly';
+import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough/parseOnly';
 import rehypeKatex from 'rehype-katex';
 import {
   RiAlertLine,
@@ -5218,11 +5223,13 @@ const MARKDOWN_COMPONENTS: Components = {
       {children}
     </blockquote>
   ),
-  hr: () => <hr className="my-3 border-t-2 border-black" />,
+  hr: () => <hr className="my-3 first:mt-0 last:mb-0 border-t-2 border-black" />,
   // `inline` is false for fenced code blocks; ReactMarkdown wraps those
   // in `<pre><code>…</code></pre>`, so the inline branch handles the
   // `\`foo\`` case and the block branch is rendered via `pre`.
-  code: ({ className, children, ...rest }) => {
+  // `node` is react-markdown's hast node, not a DOM attribute — spreading it
+  // through stamps `node="[object Object]"` on every code element.
+  code: ({ className, children, node: _node, ...rest }) => {
     const isInline = !/^language-/.test(className ?? '');
     if (isInline) {
       return (
@@ -5263,7 +5270,37 @@ const MARKDOWN_COMPONENTS: Components = {
 // `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
 // rewritten to dollars by `normalizeMath` before parse. The source is never raw
 // HTML (react-markdown default), so no sanitizer is needed.
-const REMARK_PLUGINS = [remarkGfm, remarkMath];
+//
+// The two `cjk-friendly` extensions relax CommonMark's flanking rule, which
+// otherwise refuses `**标题：**内容` — punctuation INSIDE the closing `**`, a CJK
+// letter immediately outside it, makes the run neither left- nor right-flanking,
+// so the delimiters render as literal asterisks. Chinese prose has no space to
+// separate them with, and `**要点：**说明` is the single most common shape an
+// assistant emits, so without this a large share of CJK bold silently degrades
+// to raw `**`. They implement the CommonMark CJK-friendly-emphasis proposal.
+// ORDER IS LOAD-BEARING: the strikethrough one REPLACES `remark-gfm`'s `~`
+// construct rather than layering over it, so ahead of `remarkGfm` it is
+// silently overwritten and only CJK `~~` stops pairing. Nor are they purely
+// additive — an astral emoji immediately inside a delimiter now classifies as
+// punctuation (the spec-correct read), so `**done 😀**text` no longer bolds.
+// The CJK suite in `chatMarkdown.test.tsx` pins both. `/parseOnly` because the
+// default entry also ships the mdast serializer half, which nothing here runs.
+const REMARK_PLUGINS = [
+  remarkGfm,
+  remarkMath,
+  remarkCjkFriendly,
+  remarkCjkFriendlyGfmStrikethrough,
+];
+// `breaks` opts a caller into `remark-breaks`, which turns every soft line break
+// into a hard one. CommonMark folds a single newline into a space, which is right
+// for an answer written in paragraphs but destroys a reasoning trace: the model
+// writes it as short newline-separated lines, and they ran together into one
+// block the moment the step started being parsed as markdown (it used to be
+// `whitespace-pre-wrap` raw text). Unlike the plugins above it installs no
+// micromark extension — it is a transformer over the parsed mdast — so its
+// position in the array carries no constraint. Deliberately NOT extended to the
+// answer: `prose` steps are the answer's own bytes (see `WorkStepView`).
+const REMARK_PLUGINS_BREAKS = [...REMARK_PLUGINS, remarkBreaks];
 // `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
 // `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
 // expression, renders the offending source in place rather than throwing — a
@@ -5274,18 +5311,75 @@ const REHYPE_PLUGINS: Options['rehypePlugins'] = [
   [rehypeKatex, { errorColor: 'var(--color-err)' }],
 ];
 
-/** Assistant prose. Memoized because a streaming turn re-renders its parent per
- *  frame, and without it every finalized message in the thread would re-parse
- *  its markdown — and re-run the math normalizer — on each tick. */
-export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+/** react-markdown runs the whole parse inside `render`, so anything the pipeline
+ *  throws propagates to the React root and unmounts the ENTIRE dashboard — a
+ *  blank page, not a broken message. KaTeX really does throw: a lone low
+ *  surrogate inside a `$…$` span raises `RangeError: Invalid code point`, and a
+ *  slice at a UTF-16 code-unit boundary is exactly how one appears in transcript
+ *  text. Falling back to the raw source keeps the message readable.
+ *
+ *  `text` doubles as the reset key: the next chunk of a stream re-enters the
+ *  pipeline, so a transiently-malformed prefix recovers on its own rather than
+ *  pinning the row to plain text for the rest of the session. */
+class MarkdownFallback extends Component<
+  { text: string; children: ReactNode },
+  { failed: boolean; forText: string }
+> {
+  state = { failed: false, forText: this.props.text };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  static getDerivedStateFromProps(
+    props: { text: string },
+    state: { forText: string },
+  ): { failed: boolean; forText: string } | null {
+    return props.text === state.forText ? null : { failed: false, forText: props.text };
+  }
+
+  componentDidCatch(error: unknown): void {
+    console.error('markdown render failed', error);
+  }
+
+  render(): ReactNode {
+    if (this.state.failed) {
+      return <div className="md-failed">{this.props.text}</div>;
+    }
+    return this.props.children;
+  }
+}
+
+/** Its own component so `normalizeMath` runs as a DESCENDANT of the boundary: a
+ *  boundary catches what its children throw, and a call left in `MarkdownBody`'s
+ *  own render would sit in the boundary's PARENT — outside it — while walking
+ *  the same slice-damaged text KaTeX chokes on. */
+function MarkdownPipeline({ text, breaks }: { text: string; breaks: boolean }) {
   return (
     <ReactMarkdown
       components={MARKDOWN_COMPONENTS}
-      remarkPlugins={REMARK_PLUGINS}
+      remarkPlugins={breaks ? REMARK_PLUGINS_BREAKS : REMARK_PLUGINS}
       rehypePlugins={REHYPE_PLUGINS}
     >
       {normalizeMath(text)}
     </ReactMarkdown>
+  );
+}
+
+/** Assistant prose. Memoized because a streaming turn re-renders its parent per
+ *  frame, and without it every finalized message in the thread would re-parse
+ *  its markdown — and re-run the math normalizer — on each tick. */
+export const MarkdownBody = memo(function MarkdownBody({
+  text,
+  breaks = false,
+}: {
+  text: string;
+  breaks?: boolean;
+}) {
+  return (
+    <MarkdownFallback text={text}>
+      <MarkdownPipeline text={text} breaks={breaks} />
+    </MarkdownFallback>
   );
 });
 
@@ -5486,18 +5580,65 @@ function MessageBubble({
   );
 }
 
+// How often a still-growing reasoning trace is re-parsed. ~7 updates a second
+// still reads as live in a dim subordinate panel; see `useSampledText`.
+const REASONING_SAMPLE_MS = 150;
+
+/** The latest `text`, but re-published at most once per `REASONING_SAMPLE_MS`.
+ *
+ *  A live reasoning step merges each `reasoning` frame into ONE trailing step
+ *  (`appendReasoningStep`), so its text grows monotonically and `MarkdownBody`'s
+ *  memo misses on every frame — the whole accumulated trace is re-parsed per
+ *  frame, making a turn's markdown cost quadratic in its length (measured in
+ *  jsdom, one frame per 8 chars: 4k chars ≈ 1.0s, 8k ≈ 3.8s, 16k ≈ 15.7s of
+ *  synchronous main-thread work). Nothing upstream paces it: a provider
+ *  reasoning delta is one wire frame is one WebSocket message, and unlike the
+ *  answer bubble — whose rAF pacer caps it at one parse per paint — this path
+ *  had no limiter at all. Sampling decouples the parse rate from the token
+ *  rate; the trailing timer guarantees the final text lands once the step stops
+ *  growing, so no trace is left truncated. */
+function useSampledText(text: string): string {
+  const [shown, setShown] = useState(text);
+  const shownAtRef = useRef(0);
+  useEffect(() => {
+    const due = shownAtRef.current + REASONING_SAMPLE_MS - Date.now();
+    if (due <= 0) {
+      shownAtRef.current = Date.now();
+      setShown(text);
+      return;
+    }
+    const id = setTimeout(() => {
+      shownAtRef.current = Date.now();
+      setShown(text);
+    }, due);
+    return () => clearTimeout(id);
+  }, [text]);
+  return shown;
+}
+
+// Rendered markdown, not raw text — the model writes its trace in the same
+// markdown as its answer, and as plain text a `**要点：**` reached the reader as
+// literal asterisks. `min-w-0` lets a wide table or code block inside shrink
+// instead of stretching the step row (see `.work-reasoning`).
+function ReasoningStepView({ text }: { text: string }) {
+  const shown = useSampledText(text);
+  return (
+    <div className="flex items-start gap-2 font-mono text-xs text-ink-soft">
+      <span className="select-none">✻</span>
+      <div className="chat-prose work-reasoning min-w-0 flex-1">
+        <MarkdownBody text={shown} breaks />
+      </div>
+    </div>
+  );
+}
+
 // One rendered step inside a work block — mirrors the old inline
 // reasoning / tool / status visuals, plus `prose` for folded mid-turn
 // answer text. Reused by both the live (active) panel and the expanded
 // collapsed view.
-function WorkStepView({ step }: { step: WorkStep }) {
+export function WorkStepView({ step }: { step: WorkStep }) {
   if (step.kind === 'reasoning') {
-    return (
-      <div className="flex items-start gap-2 font-mono text-xs text-ink-soft whitespace-pre-wrap">
-        <span className="select-none">✻</span>
-        <span className="italic">{step.text}</span>
-      </div>
-    );
+    return <ReasoningStepView text={step.text ?? ''} />;
   }
   if (step.kind === 'status') {
     return (

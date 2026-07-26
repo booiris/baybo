@@ -403,6 +403,9 @@ button {
 .md { overflow-x: clip; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
+/* The raw source, shown when the markdown pipeline threw (see `MarkdownFallback`
+   in Markdown.tsx). Newlines are all the structure that is left, so keep them. */
+.md-failed { white-space: pre-wrap; word-break: break-word; }
 .md p, .md ul, .md ol, .md pre, .md blockquote, .md-table-wrap { margin: var(--md-block-gap) 0; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.9rem 0 0.4rem; line-height: 1.3; }
 .md h1 { font-size: 1.25rem; }
@@ -671,6 +674,12 @@ button {
 /* Reasoning is the model's own markdown; render it as a soft prose trace beside
    the ✻ marker (sans, dim), distinct from the answer prose below. */
 .step.reasoning .md { flex: 1; min-width: 0; font-family: var(--font-sans); }
+/* `.md`'s heading sizes are absolute rem, tuned for the answer's reading size —
+   inside a 0.75rem trace a `## Plan` renders LARGER than the prose it heads.
+   Re-scale em-relative to the step; at this size only two ranks are legible. */
+.step.reasoning .md :is(h1, h2) { font-size: 1.1em; }
+.step.reasoning .md :is(h3, h4, h5, h6) { font-size: 1em; }
+.step.reasoning .md :is(h1, h2, h3, h4, h5, h6) { margin: 0.5rem 0 0.2rem; }
 .step.tool { color: var(--color-ink); }
 .step.tool.failed { color: var(--color-err); }
 .work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }

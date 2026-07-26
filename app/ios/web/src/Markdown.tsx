@@ -1,16 +1,49 @@
-import { memo, useCallback, useEffect, useRef, type ReactNode } from "react";
+import { Component, memo, useCallback, useEffect, useRef, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import remarkBreaks from "remark-breaks";
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
+import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/parseOnly";
 import rehypeKatex from "rehype-katex";
 import { openUrl } from "./bridge";
 import { normalizeMath } from "./mathDelimiters";
 
 // GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
 // `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
-// rewritten to dollars in `normalizeMathDelimiters` before parse. The source is
-// never raw HTML (react-markdown default), so no sanitizer is needed.
-const REMARK_PLUGINS = [remarkGfm, remarkMath];
+// rewritten to dollars in `normalizeMath` before parse. The source is never raw
+// HTML (react-markdown default), so no sanitizer is needed.
+//
+// The two `cjk-friendly` extensions relax CommonMark's flanking rule, which
+// otherwise refuses `**标题：**内容` — punctuation INSIDE the closing `**`, a CJK
+// letter immediately outside it, makes the run neither left- nor right-flanking,
+// so the delimiters render as literal asterisks. Chinese prose has no space to
+// separate them with, and `**要点：**说明` is the single most common shape an
+// assistant emits, so without this a large share of CJK bold silently degrades
+// to raw `**`. They implement the CommonMark CJK-friendly-emphasis proposal.
+// ORDER IS LOAD-BEARING: the strikethrough one REPLACES `remark-gfm`'s `~`
+// construct rather than layering over it, so ahead of `remarkGfm` it is
+// silently overwritten and only CJK `~~` stops pairing. Nor are they purely
+// additive — an astral emoji immediately inside a delimiter now classifies as
+// punctuation (the spec-correct read), so `**done 😀**text` no longer bolds.
+// The CJK suite in `Markdown.test.tsx` pins both. `/parseOnly` because the
+// default entry also ships the mdast serializer half, which nothing here runs.
+const REMARK_PLUGINS = [
+  remarkGfm,
+  remarkMath,
+  remarkCjkFriendly,
+  remarkCjkFriendlyGfmStrikethrough,
+];
+// `breaks` opts a caller into `remark-breaks`, which turns every soft line break
+// into a hard one. CommonMark folds a single newline into a space, which is
+// right for an answer written in paragraphs but destroys a reasoning trace: the
+// model writes it as short newline-separated lines, and they ran together into
+// one block the moment the step started being parsed as markdown (it used to be
+// `white-space: pre-wrap` raw text). Unlike the plugins above it installs no
+// micromark extension — it is a transformer over the parsed mdast — so its
+// position in the array carries no constraint. Deliberately NOT extended to the
+// answer: `prose` steps are the answer's own bytes (see `WorkStepView`).
+const REMARK_PLUGINS_BREAKS = [...REMARK_PLUGINS, remarkBreaks];
 // `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
 // `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
 // expression, renders the offending source in place rather than throwing — a
@@ -121,6 +154,59 @@ const COMPONENTS: Components = {
   },
 };
 
+/// react-markdown runs the whole parse inside `render`, so anything the pipeline
+/// throws propagates to the React root and unmounts the ENTIRE transcript — a
+/// blank chat, not a broken message. KaTeX really does throw: a lone low
+/// surrogate inside a `$…$` span raises `RangeError: Invalid code point`, and a
+/// slice at a UTF-16 code-unit boundary is exactly how one appears in transcript
+/// text. Falling back to the raw source keeps the message readable.
+///
+/// `text` doubles as the reset key: the next chunk of a stream re-enters the
+/// pipeline, so a transiently-malformed prefix recovers on its own rather than
+/// pinning the row to plain text for the rest of the session.
+class MarkdownFallback extends Component<
+  { text: string; children: ReactNode },
+  { failed: boolean; forText: string }
+> {
+  state = { failed: false, forText: this.props.text };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  static getDerivedStateFromProps(
+    props: { text: string },
+    state: { forText: string },
+  ): { failed: boolean; forText: string } | null {
+    return props.text === state.forText ? null : { failed: false, forText: props.text };
+  }
+
+  componentDidCatch(error: unknown): void {
+    console.error("markdown render failed", error);
+  }
+
+  render(): ReactNode {
+    if (this.state.failed) return <div className="md-failed">{this.props.text}</div>;
+    return this.props.children;
+  }
+}
+
+/// Its own component so `normalizeMath` runs as a DESCENDANT of the boundary: a
+/// boundary catches what its children throw, and a call left in `MarkdownBody`'s
+/// own render would sit in the boundary's PARENT — outside it — while walking
+/// the same slice-damaged text KaTeX chokes on.
+function MarkdownPipeline({ text, breaks }: { text: string; breaks: boolean }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={breaks ? REMARK_PLUGINS_BREAKS : REMARK_PLUGINS}
+      rehypePlugins={REHYPE_PLUGINS}
+      components={COMPONENTS}
+    >
+      {normalizeMath(text)}
+    </ReactMarkdown>
+  );
+}
+
 /// The assistant-prose renderer. Memoized: during a stream the parent
 /// re-renders per animation frame, and without this every finalized message in
 /// the log would re-parse its markdown on each tick. Statically imported (not
@@ -128,16 +214,18 @@ const COMPONENTS: Components = {
 /// markdown source until the chunk loaded, then reflowed to formatted prose —
 /// a visible flash. Bundling it into the entry means the first paint is already
 /// rendered.
-export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+export const MarkdownBody = memo(function MarkdownBody({
+  text,
+  breaks = false,
+}: {
+  text: string;
+  breaks?: boolean;
+}) {
   return (
     <div className="md">
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        components={COMPONENTS}
-      >
-        {normalizeMath(text)}
-      </ReactMarkdown>
+      <MarkdownFallback text={text}>
+        <MarkdownPipeline text={text} breaks={breaks} />
+      </MarkdownFallback>
     </div>
   );
 });
