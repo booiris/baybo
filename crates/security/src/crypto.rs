@@ -16,11 +16,15 @@ const TAG_LEN: usize = 16;
 
 /// Leading byte of every record: `0x02 || nonce || ct || tag`.
 ///
-/// Discriminates nothing today — one format exists. It earns its byte on the
-/// *next* change (key rotation, where a record must say which key wrote it):
-/// adding a marker only once records are already on disk leaves those records
-/// unmarked, so a reader has to guess whether a leading byte is a marker or the
-/// first byte of a nonce, which is ambiguous once in 256.
+/// Discriminates nothing — one format exists, and rotation re-keys every record
+/// in one transaction rather than tagging each with the key that wrote it, so
+/// nothing reads this to make a decision.
+///
+/// It stays because removing it costs more than keeping it. Every record on disk
+/// begins with this byte, so dropping it is a full re-encryption pass over the
+/// vault — the same migration the tree deliberately keeps no tooling for. And
+/// the bounds check it anchors in [`decrypt`] is load-bearing on its own: `open`
+/// splits at [`NONCE_LEN`] and would panic on a shorter input.
 const FORMAT_V2: u8 = 0x02;
 
 /// Encryption key wrapper holding raw key bytes suitable for AES-256-GCM.
