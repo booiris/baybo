@@ -35,7 +35,15 @@ import { resolveInputMessages } from '../../types/trace';
 
 /** The colour groups the legend is keyed on — one per hue, plus the failure
  *  overlay. Clicking a legend entry highlights the nodes in that group. */
-export type TraceGroup = 'llm' | 'tool' | 'memory' | 'subagent' | 'aux' | 'failed';
+export type TraceGroup =
+  | 'llm'
+  | 'tool'
+  | 'memory'
+  | 'subagent'
+  | 'skill'
+  | 'compression'
+  | 'meta'
+  | 'failed';
 
 export interface KindVisual {
   icon: IconType; // used by the right-hand detail-panel headers
@@ -59,12 +67,12 @@ export interface KindVisual {
 // and minimap cell of a kind all share its hue so the legend reads across the UI.
 export const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
   llm_iteration: { group: 'llm', icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM iteration' },
-  compression: { group: 'aux', icon: RiArchiveLine, glyph: 'C', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Compression' },
+  compression: { group: 'compression', icon: RiArchiveLine, glyph: 'C', accent: 'text-violet', bg: 'bg-violet/10', stripe: 'border-l-violet', cell: 'bg-violet', label: 'Compression' },
   memory_recall: { group: 'memory', icon: RiSearchEyeLine, glyph: 'M', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory recall' },
   memory_write: { group: 'memory', icon: RiSave3Line, glyph: 'W', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory write' },
-  skill_selection: { group: 'aux', icon: RiBookmark3Line, glyph: 'S', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Skill selection' },
-  progress_observer: { group: 'aux', icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
-  title_generation: { group: 'aux', icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
+  skill_selection: { group: 'skill', icon: RiBookmark3Line, glyph: 'S', accent: 'text-magenta', bg: 'bg-magenta/10', stripe: 'border-l-magenta', cell: 'bg-magenta', label: 'Skill selection' },
+  progress_observer: { group: 'meta', icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
+  title_generation: { group: 'meta', icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
   subagent: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent' },
 };
 
@@ -81,7 +89,9 @@ export const TRACE_LEGEND: { group: TraceGroup; label: string; cell: string }[] 
   { group: 'tool', label: 'Tool', cell: 'bg-warn' },
   { group: 'memory', label: 'Memory', cell: 'bg-info' },
   { group: 'subagent', label: 'Subagent', cell: 'bg-brand' },
-  { group: 'aux', label: 'Aux', cell: 'bg-ink-soft' },
+  { group: 'skill', label: 'Skill', cell: 'bg-magenta' },
+  { group: 'compression', label: 'Compression', cell: 'bg-violet' },
+  { group: 'meta', label: 'Meta', cell: 'bg-ink-soft' },
   { group: 'failed', label: 'Failed', cell: 'bg-err' },
 ];
 
@@ -97,7 +107,7 @@ export function nodeGroup(visual: KindVisual, outcome: LifecycleState): TraceGro
 // `STEP_VISUALS[kind].icon` on `undefined` throw and white-screen the whole
 // trace view. The raw tag becomes the label so it's still legible.
 const FALLBACK_VISUAL: KindVisual = {
-  group: 'aux',
+  group: 'meta',
   icon: RiCpuLine,
   glyph: '·',
   accent: 'text-ink-soft',

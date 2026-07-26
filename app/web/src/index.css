@@ -21,6 +21,12 @@
   --color-warn: #dd6b20;
   --color-info: #3182ce;
   --color-ok: #2f855a;
+  /* Two extra hues for categorical coding (the trace viewer's step kinds),
+     picked to sit far from the semantic four above so adjacent swatches stay
+     tellable apart at a 10px legend chip. Not status colours — don't use them
+     to mean good/bad. */
+  --color-violet: #6b46c1;
+  --color-magenta: #b83280;
 
   --color-black: #2a2520;
   --color-white: #fffdf7;
