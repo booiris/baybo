@@ -3,9 +3,11 @@ import type { components } from './schema';
 import type {
   ChatMessage,
   JobTrace,
+  LifecycleState,
   Span,
   Step,
   StepKind,
+  TraceJobSummary,
   TraceOverview,
 } from '../types/trace';
 
@@ -217,14 +219,20 @@ function mid(prefix: string): string {
   return `${prefix}-${mockIdCounter.toString(36).padStart(6, '0')}`;
 }
 
-function step(jobId: string, kind: StepKind, started: Date, ended: Date | null): Step {
+function step(
+  jobId: string,
+  kind: StepKind,
+  started: Date,
+  ended: Date | null,
+  outcome?: LifecycleState,
+): Step {
   return {
     id: mid('step'),
     job_id: jobId,
     kind,
     started_at: started.toISOString(),
     ended_at: ended?.toISOString() ?? null,
-    outcome: ended ? { outcome: 'ok' } : { outcome: 'pending' },
+    outcome: outcome ?? (ended ? { outcome: 'ok' } : { outcome: 'pending' }),
   };
 }
 
@@ -238,6 +246,7 @@ function llmSpan(
   outTok: number,
   startedAt: Date,
   endedAt: Date,
+  outcome: LifecycleState = { outcome: 'ok' },
 ): Span {
   return {
     id: mid('span'),
@@ -264,7 +273,7 @@ function llmSpan(
     parallel_group: null,
     started_at: startedAt.toISOString(),
     ended_at: endedAt.toISOString(),
-    outcome: { outcome: 'ok' },
+    outcome,
     events: [],
   };
 }
@@ -279,6 +288,7 @@ function toolSpan(
   startedAt: Date,
   endedAt: Date,
   parallelGroup: string | null = null,
+  outcome: LifecycleState = { outcome: 'ok' },
 ): Span {
   return {
     id: mid('span'),
@@ -291,12 +301,12 @@ function toolSpan(
         triggered_by: { llm_span_id: llmSpanId, tool_use_id: toolUseId },
         params,
       },
-      result: { output, success: true },
+      result: { output, success: outcome.outcome === 'ok' },
     },
     parallel_group: parallelGroup,
     started_at: startedAt.toISOString(),
     ended_at: endedAt.toISOString(),
-    outcome: { outcome: 'ok' },
+    outcome,
     events: [],
   };
 }
@@ -319,7 +329,7 @@ function interjectMsg(text: string): ChatMessage {
 // session id so successive calls return stable ids (the page issues
 // overview + job fetches separately).
 interface MockSessionFixture {
-  job: JobTrace;
+  jobs: JobTrace[];
   overview: TraceOverview;
 }
 const mockFixtures = new Map<string, MockSessionFixture>();
@@ -447,7 +457,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   const startedAt = new Date(t0).toISOString();
   const endedAt = new Date(t0 + 2400).toISOString();
 
-  const job: JobTrace = {
+  const job1Trace: JobTrace = {
     job_id: job1,
     session_id: sessionId,
     job_status_kind: 'completed',
@@ -461,11 +471,104 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     ],
   };
 
+  const job1Summary: TraceJobSummary = {
+    job_id: job1,
+    session_id: sessionId,
+    job_status_kind: 'completed',
+    created_at: createdAt,
+    started_at: startedAt,
+    ended_at: endedAt,
+    input_tokens: 380,
+    output_tokens: 96,
+    cached_input_tokens: 228,
+    cache_creation_input_tokens: 38,
+  };
+
+  // Second job: a FAILED turn — a single-span memory-recall step (deep-links
+  // straight to its span) followed by an LLM iteration whose `run_bash` tool
+  // call fails, failing the step and the job. Exercises the failure-path
+  // auto-expand, the red roll-up badge, and the Step detail panel.
+  const job2 = mid('job');
+  const t1 = t0 + 60_000;
+  const j2Created = new Date(t1 - 200).toISOString();
+  const j2Started = new Date(t1).toISOString();
+  const j2Ended = new Date(t1 + 1400).toISOString();
+
+  const recallStart = new Date(t1);
+  const recallEnd = new Date(t1 + 120);
+  const recallStep = step(job2, { kind: 'memory_recall' }, recallStart, recallEnd);
+  const recallTool = toolSpan(
+    recallStep.id,
+    'recall_memory',
+    '',
+    '',
+    { query: 'prior context about the package' },
+    { hits: 2, memories: ['pkg is baybo', 'tests live under app/web'] },
+    recallStart,
+    recallEnd,
+  );
+
+  const it3Start = new Date(t1 + 150);
+  const it3End = new Date(t1 + 1400);
+  const it3Step = step(job2, { kind: 'llm_iteration' }, it3Start, it3End, {
+    outcome: 'failed',
+    reason: 'tool run_bash failed',
+  });
+  const it3Llm = llmSpan(
+    it3Step.id,
+    'claude-sonnet-4-6',
+    [systemMsg('You are a helpful assistant.'), userMsg('Run the tests.')],
+    '',
+    [{ id: 'tu_b1', name: 'run_bash', arguments: { cmd: 'pytest -q' } }],
+    300,
+    40,
+    it3Start,
+    new Date(t1 + 700),
+  );
+  const failTool = toolSpan(
+    it3Step.id,
+    'run_bash',
+    it3Llm.id,
+    'tu_b1',
+    { cmd: 'pytest -q' },
+    'E   assert 1 == 2\n1 failed, 0 passed',
+    new Date(t1 + 720),
+    new Date(t1 + 1350),
+    null,
+    { outcome: 'failed', reason: 'bash exited with code 1' },
+  );
+
+  const job2Trace: JobTrace = {
+    job_id: job2,
+    session_id: sessionId,
+    job_status_kind: 'failed',
+    created_at: j2Created,
+    started_at: j2Started,
+    ended_at: j2Ended,
+    steps: [
+      { step: recallStep, spans: [recallTool] },
+      { step: it3Step, spans: [it3Llm, failTool] },
+    ],
+  };
+
+  const job2Summary: TraceJobSummary = {
+    job_id: job2,
+    session_id: sessionId,
+    job_status_kind: 'failed',
+    created_at: j2Created,
+    started_at: j2Started,
+    ended_at: j2Ended,
+    input_tokens: 300,
+    output_tokens: 40,
+    cached_input_tokens: 180,
+    cache_creation_input_tokens: 30,
+  };
+
   const overview: TraceOverview = {
     session_id: sessionId,
     // Mock spans use `LlmCallInputs::Inline`, so the transcript log isn't
     // needed for message rendering. We seed one mid-turn interjection row
-    // (created between iteration 1 and the final response, inside the job
+    // (created between iteration 1 and the final response, inside job 1's
     // window) so the sidebar / job-summary interjection markers light up.
     session_messages: [
       {
@@ -475,24 +578,11 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         message: interjectMsg('Actually, also tell me the package name.'),
       },
     ],
-    jobs: [
-      {
-        job_id: job1,
-        session_id: sessionId,
-        job_status_kind: 'completed',
-        created_at: createdAt,
-        started_at: startedAt,
-        ended_at: endedAt,
-        input_tokens: 380,
-        output_tokens: 96,
-        cached_input_tokens: 228,
-        cache_creation_input_tokens: 38,
-      },
-    ],
+    jobs: [job1Summary, job2Summary],
     supersede_watermark: null,
   };
 
-  const fixture = { job, overview };
+  const fixture: MockSessionFixture = { jobs: [job1Trace, job2Trace], overview };
   mockFixtures.set(sessionId, fixture);
   return fixture;
 }
@@ -503,7 +593,7 @@ export function getMockTraceOverview(sessionId: string): TraceOverview {
 
 export function getMockJobTrace(sessionId: string, jobId: string): JobTrace | null {
   const fx = buildMockSession(sessionId);
-  return fx.job.job_id === jobId ? fx.job : null;
+  return fx.jobs.find((j) => j.job_id === jobId) ?? null;
 }
 
 
