@@ -1881,14 +1881,21 @@ impl BashTool {
             ));
         };
 
+        // Two passes, neither subsuming the other: `redact` removes the values
+        // this run injected as env vars (which the detector has no pattern
+        // for), `sanitize` runs the detector over whatever else was printed.
+        // Gating the second on `extra_env` would ship an ordinary command's
+        // capture to the judge verbatim.
         let mut stdout_s = stdout.to_string();
         let mut stderr_s = stderr.to_string();
-        if !extra_env.is_empty()
-            && let Some(handle) = ctx.secrets.as_deref()
-        {
-            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-            stdout_s = handle.redact(&stdout_s, &values).await?;
-            stderr_s = handle.redact(&stderr_s, &values).await?;
+        if let Some(handle) = ctx.secrets.as_deref() {
+            if !extra_env.is_empty() {
+                let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
+                stdout_s = handle.redact(&stdout_s, &values).await?;
+                stderr_s = handle.redact(&stderr_s, &values).await?;
+            }
+            stdout_s = handle.sanitize(&stdout_s).await?;
+            stderr_s = handle.sanitize(&stderr_s).await?;
         }
 
         match judge_post_fail(
@@ -3618,6 +3625,54 @@ mod tests {
         );
     }
 
+    /// `extra_env` empty is the common case, and the one where a gated
+    /// sanitizer would ship the raw capture to the provider.
+    #[tokio::test]
+    async fn judge_input_is_sanitized_even_without_injected_secret_env() {
+        let tool = BashTool::for_test().with_permission(auto_permission());
+        let events = Arc::new(RecordingEventSink::default());
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(V_UNRELATED));
+        ctx.secrets = Some(Arc::new(StubSecrets) as Arc<dyn crate::SecretAccess>);
+        ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
+
+        let leaky = crate::SandboxedOutput {
+            exit_code: 1,
+            stdout: format!("token={STUB_DETECTED_SECRET}\n").into_bytes(),
+            stderr: Vec::new(),
+            timed_out: false,
+        };
+
+        tool.escalate_if_failed(
+            "curl https://example.com",
+            None,
+            leaky,
+            &[], // no injected secrets — the path that skipped redaction entirely
+            Duration::from_secs(5),
+            &ctx,
+            SandboxEscapePolicy::AutoJudge,
+        )
+        .await
+        .expect("escalation decision");
+
+        let recorded = events.entries.lock();
+        let judge_input = recorded
+            .iter()
+            .find_map(|(a, p)| match p {
+                ToolEventPayload::LlmCall { input, .. } if a == "unsandbox_judge" => Some(input),
+                _ => None,
+            })
+            .expect("judge llm_call recorded");
+        assert!(
+            !judge_input.contains(STUB_DETECTED_SECRET),
+            "raw secret reached the judge prompt: {judge_input}"
+        );
+        assert!(
+            judge_input.contains("[SANITIZED]"),
+            "detector pass did not run: {judge_input}"
+        );
+    }
+
     #[tokio::test]
     async fn unparsable_command_records_parse_failure_event() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
@@ -3947,8 +4002,13 @@ mod tests {
     }
 
     /// Minimal `SecretAccess` for bash tests: resolves each name to
-    /// `VAL_<name>` and redacts those known values to `[REDACTED]`.
+    /// `VAL_<name>`, redacts those known values to `[REDACTED]`, and stands in
+    /// for the leak detector by rewriting a single sentinel token.
     struct StubSecrets;
+
+    /// What [`StubSecrets::sanitize`] treats as a detector hit, so tests can
+    /// prove the detector pass runs without depending on real rule patterns.
+    const STUB_DETECTED_SECRET: &str = "SENTINEL_LEAKED_SECRET";
 
     #[async_trait::async_trait]
     impl crate::SecretAccess for StubSecrets {
@@ -3964,6 +4024,9 @@ mod tests {
                 out = out.replace(v, "[REDACTED]");
             }
             Ok(out)
+        }
+        async fn sanitize(&self, text: &str) -> crate::Result<String> {
+            Ok(text.replace(STUB_DETECTED_SECRET, "[SANITIZED]"))
         }
         async fn add(
             &self,

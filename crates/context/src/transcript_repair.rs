@@ -62,7 +62,7 @@ fn result_ids(msg: &ChatMessage) -> Vec<&str> {
 fn synthetic_fill(id: &str, tool_name: &str) -> ChatMessage {
     ChatMessage::tool_result_with_meta(
         id.to_string(),
-        crate::prompts::tool_output::wrap_tool_output(tool_name, INTERRUPTED_TOOL_RESULT_BODY, &[]),
+        baybo_model::wrap_tool_output(tool_name, INTERRUPTED_TOOL_RESULT_BODY, &[]),
         None,
     )
 }

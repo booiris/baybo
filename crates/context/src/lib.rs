@@ -873,7 +873,7 @@ impl ContextManager {
     /// location from the manager's own workspace handle. Injection scanning
     /// and the `<tool_output>` wrap stay separate — the caller runs the
     /// `baybo-security` scan and calls
-    /// [`crate::prompts::tool_output::wrap_tool_output`] with the capped text.
+    /// [`baybo_model::wrap_tool_output`] with the capped text.
     pub async fn cap_tool_output(&self, content: String) -> String {
         use crate::prompts::tool_output;
         if content.len() <= tool_output::MAX_TOOL_OUTPUT_BYTES {

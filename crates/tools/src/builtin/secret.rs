@@ -181,6 +181,10 @@ mod tests {
                 .collect()
         }
 
+        async fn sanitize(&self, text: &str) -> crate::Result<String> {
+            Ok(text.to_string())
+        }
+
         async fn redact(&self, text: &str, values: &[String]) -> crate::Result<String> {
             let mut out = text.to_string();
             for v in values {

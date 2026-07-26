@@ -755,6 +755,19 @@ impl baybo_tools::SecretAccess for SecurityGateway {
         Ok(out)
     }
 
+    async fn sanitize(&self, text: &str) -> baybo_tools::Result<String> {
+        let mut out = text.to_string();
+        let mut mints = Vec::new();
+        sanitize_string(&mut out, &self.leak_detector, &self.minter, &mut mints);
+        for mint in &mints {
+            self.secret_vault
+                .store_secret(&mint.placeholder, mint.original.as_bytes())
+                .await
+                .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))?;
+        }
+        Ok(out)
+    }
+
     async fn add(
         &self,
         name: &str,

@@ -17,6 +17,7 @@ mod security_types;
 mod session;
 pub mod spawn_protocol;
 mod task;
+mod tool_output;
 
 pub use agent_profile::{
     AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, MAX_AGENT_PROFILE_NAME_CHARS,
@@ -60,3 +61,4 @@ pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,
     TASK_UPDATE_TOOL_NAME, Task, TaskStatus,
 };
+pub use tool_output::wrap_tool_output;

@@ -1456,11 +1456,7 @@ impl AgentLoop {
             let capped = self.context_manager.cap_tool_output(raw_result_text).await;
             let warnings = self.security_gateway.detect_injection(&capped);
             let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
-            let wrapped = baybo_context::prompts::tool_output::wrap_tool_output(
-                &tool_call.name,
-                &capped,
-                &warning_rules,
-            );
+            let wrapped = baybo_model::wrap_tool_output(&tool_call.name, &capped, &warning_rules);
 
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls. The

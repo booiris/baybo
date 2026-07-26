@@ -775,6 +775,15 @@ pub trait SecretAccess: Send + Sync {
     /// Values too short to redact safely are skipped by the implementation.
     async fn redact(&self, text: &str, values: &[String]) -> crate::Result<String>;
 
+    /// Mint and vault a placeholder for every secret the leak detector finds in
+    /// `text`, returning the sanitized copy.
+    ///
+    /// Unlike [`Self::redact`] the caller supplies no candidate values, so this
+    /// covers text whose secrets it cannot enumerate — raw captured output
+    /// reaching an LLM outside the agent transcript, i.e. the bash risk
+    /// judges.
+    async fn sanitize(&self, text: &str) -> crate::Result<String>;
+
     /// Store a user secret. Returns whether it was newly created or replaced.
     async fn add(
         &self,
