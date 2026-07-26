@@ -33,8 +33,11 @@ impl SecretVault {
         &self.master_key
     }
 
+    /// The entry name is the associated data, so a record only decrypts under
+    /// the name it was written for. Moving `llm.entry.cheap.api_key`'s
+    /// ciphertext onto `gateway.admin_token` no longer yields a usable value.
     pub async fn store_secret(&self, name: &str, value: &[u8]) -> Result<()> {
-        let encrypted = crypto::encrypt(value, &self.master_key)?;
+        let encrypted = crypto::encrypt(value, &self.master_key, name.as_bytes())?;
         self.store
             .store(name, &encrypted)
             .await
@@ -49,7 +52,7 @@ impl SecretVault {
             .map_err(|e| SecurityError::Storage(e.to_string()))?;
         match encrypted {
             Some(data) => {
-                let plaintext = crypto::decrypt(&data, &self.master_key)?;
+                let plaintext = crypto::decrypt(&data, &self.master_key, name.as_bytes())?;
                 Ok(Some(SecretValue::new(plaintext)))
             }
             None => Ok(None),

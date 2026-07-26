@@ -17,16 +17,16 @@ fuzz_target!(|data: &[u8]| {
 
     if mode & 1 == 0 {
         // Roundtrip: encrypt then decrypt must recover the payload byte-for-byte.
-        let ciphertext = encrypt(payload, &key).expect("encrypt of arbitrary bytes succeeds");
+        let ciphertext = encrypt(payload, &key, b"fuzz.entry").expect("encrypt of arbitrary bytes succeeds");
         assert!(
             ciphertext.len() >= 12 + 16 + payload.len(),
             "ciphertext shorter than nonce+tag+payload"
         );
-        let plaintext = decrypt(&ciphertext, &key).expect("decrypt of own ciphertext succeeds");
+        let plaintext = decrypt(&ciphertext, &key, b"fuzz.entry").expect("decrypt of own ciphertext succeeds");
         assert_eq!(plaintext, payload);
     } else {
         // Decrypt-only: feeding arbitrary bytes as ciphertext must never
         // panic. Authentication failure is the expected happy path.
-        let _ = decrypt(payload, &key);
+        let _ = decrypt(payload, &key, b"fuzz.entry");
     }
 });

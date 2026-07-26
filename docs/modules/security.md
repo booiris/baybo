@@ -88,7 +88,41 @@ Any future HTTP-emitting builtin must apply the same two layers (`validate_url_w
 
 ### SecretVault encryption
 
-Secrets are encrypted with AES-256-GCM (random nonce + ciphertext + tag). The master key exists only in process memory and is never persisted. `SecretValue` should not support plaintext `Debug`.
+Secrets are encrypted with AES-256-GCM. `SecretValue` should not support plaintext `Debug`.
+
+**Record format.** Current records are `0x02 || nonce(12) || ciphertext || tag(16)`,
+with a fresh random nonce per encryption and the **entry name passed as
+associated data**. The AAD binding is the point: one master key encrypts every
+row, so without it any ciphertext decrypts correctly under any name, and an
+attacker who can write the store can move `llm.entry.cheap.api_key`'s ciphertext
+onto `gateway.admin_token` and have it open cleanly. With it, a record is only
+valid where it was written.
+
+`decrypt` accepts nothing else — in particular not a bare
+`nonce || ct || tag` record with the marker stripped. Such a record carries no
+binding and therefore opens under any entry name, so a reader that falls back to
+it would hand back exactly the property the AAD removes, to anyone who can write
+the store.
+
+The practical consequence: **a vault written by a build predating this format
+does not decrypt at all.** There is no conversion path in the tree — a workspace
+in that state is re-provisioned (`baybo setup`, re-pair devices, re-enter
+`user_env.*` and provider keys), not migrated.
+
+**Not yet solved: key rotation.** There is no path to re-key the vault — no
+`rotate` command, no re-encrypt pass, no old-key archive. A compromised master
+key today means hand-editing the store. The versioned envelope above is the
+groundwork (a record can now say which scheme wrote it); the rotation flow
+itself is still to build. Do not describe the vault as rotatable until it is.
+
+The master key is **persisted**, not memory-only. `baybo setup` mints it on
+first run and writes it hex-encoded to `<workspace>/.key/encryption.key` at
+mode `0o600` (`mint_encryption_key`); the path is overridable via
+`security.encryption_key_file`. Every later boot reads it back into an
+in-memory `EncryptionKey`. So the vault's confidentiality rests on that file's
+mode plus the mode of the sqlite database holding the ciphertext — not on the
+key being ephemeral. Anything reasoning about "the key never touches disk" is
+reasoning from a premise that has never been true.
 
 ### Known vault entries
 
