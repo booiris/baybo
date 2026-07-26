@@ -24,10 +24,14 @@
 //! the child drops.
 //!
 //! Transport isolation: the channel listener binds `127.0.0.1` only
-//! (see [`crate::channel_listener`]). The vault file and the channel
-//! port-file are both `0o600`, so a different UID can't read either —
-//! the "same-UID attacker has already won" threat model is the boundary;
-//! we don't need kernel-level peer-credential checks on top.
+//! (see [`crate::channel_listener`]). Skipping kernel-level
+//! peer-credential checks rests on a different UID being unable to read
+//! either the channel port-file (written `0o600` by
+//! [`crate::channel_listener`]) or the sqlite database backing the vault
+//! (kept owner-only by `baybo-storage`'s `DB_FILE_MODE`, asserted by its
+//! `open_leaves_database_and_sidecars_owner_only` test). Both are load
+//! bearing here: if either file widens, this argument stops holding and
+//! the "same-UID attacker has already won" boundary moves.
 
 use std::sync::Arc;
 

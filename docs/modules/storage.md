@@ -218,6 +218,24 @@ All store implementations use sqlite (async-native, SQLite-compatible). There is
 
 The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/state/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 
+### The database file is owner-only, and that is load-bearing
+
+`SqlitePool::open` creates the database at `0o600` and re-asserts that mode on
+the file **and its `-wal` / `-shm` sidecars** on every open (`DB_FILE_MODE`).
+The sidecars matter as much as the main file: they carry the same rows, and
+sqlite creates them itself with whatever mode the main file has.
+
+This is not hygiene. One database holds every conversation transcript, the
+encrypted secret vault (`secrets`), plaintext device bearer tokens
+(`devices.auth_token`), blob read tokens and channel pairing codes. Threat-model
+notes in other modules — see `baybo-gateway`'s channel auth, which skips
+kernel-level peer-credential checks — argue explicitly from "another UID cannot
+read this file". Left to the umask it would be `0644` on a default system, and
+those arguments would silently stop holding. Re-asserting on open (rather than
+only at creation) is what repairs databases that predate the rule.
+
+Anything that opens a second sqlite file in the workspace must do the same.
+
 ### One struct per trait
 
 Each domain has an independent Store implementation (`SqliteSessionStore`, `SqliteCostStore`, etc.). All share one `SqlitePool` while preserving domain isolation. No giant struct implementing every interface.

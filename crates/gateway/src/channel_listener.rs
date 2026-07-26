@@ -15,7 +15,8 @@
 //! secret vault under `gateway.tui_token`, and read back by the TUI
 //! before it dials. Same-UID containment comes from the fact that both
 //! delivery channels are owned by the gateway UID (child env vars and
-//! the `0o600` sqlite vault file), so port-level exposure on loopback
+//! the sqlite database holding the vault, kept owner-only by
+//! `baybo-storage`'s `DB_FILE_MODE`), so port-level exposure on loopback
 //! is not itself a threat — an attacker with the local UID has already
 //! won.
 //!

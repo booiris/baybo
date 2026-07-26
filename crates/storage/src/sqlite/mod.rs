@@ -69,6 +69,63 @@ const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 /// against a running gateway) and is handled by [`crate::retry`].
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Owner-only. Sqlite would otherwise create the file at whatever the umask
+/// allows — world-readable on a default `022` — and this one holds every
+/// transcript, the encrypted vault, blob read tokens and pairing codes.
+/// Threat-model notes elsewhere (`baybo-gateway`'s channel auth) argue from
+/// "a different UID can't read this file"; this is what makes that true.
+const DB_FILE_MODE: u32 = 0o600;
+
+/// Sidecars sqlite creates next to the database, inheriting its mode.
+const DB_SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
+
+/// Create `path` at [`DB_FILE_MODE`] so it is never briefly world-readable
+/// between sqlite's `creat()` and [`restrict_db_permissions`].
+fn precreate_private(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(DB_FILE_MODE)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to create {} with mode {DB_FILE_MODE:o}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Force the database and its WAL/SHM sidecars to [`DB_FILE_MODE`].
+///
+/// Best-effort: a filesystem without Unix modes must not stop the process from
+/// starting, so failures are logged rather than propagated.
+fn restrict_db_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut targets = vec![path.to_path_buf()];
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        targets.extend(
+            DB_SIDECAR_SUFFIXES
+                .iter()
+                .map(|suffix| path.with_file_name(format!("{name}{suffix}"))),
+        );
+    }
+    for target in targets {
+        match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(DB_FILE_MODE)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                target: "baybo::storage",
+                path = %target.display(),
+                error = %e,
+                "failed to restrict database file permissions"
+            ),
+        }
+    }
+}
+
 /// Pool of sqlite connections.
 ///
 /// Cheap to clone (the inner `deadpool` pool is an `Arc`) and shared by every
@@ -116,12 +173,23 @@ impl SqlitePool {
                 _ => path.to_path_buf(),
             }
         });
-        Self::build(
+        // Pre-create at 0600 so a fresh database is never world-readable, not
+        // even for the instant between sqlite's `creat()` and the chmod below.
+        // A zero-length file is a valid empty database, so handing sqlite one
+        // we made ourselves costs nothing.
+        precreate_private(path)?;
+        let pool = Self::build(
             Config::new(path),
             path.display().to_string(),
             StoreIdentity::File(canonical),
         )
-        .await
+        .await?;
+        // `build` ran `init_db`, so the WAL and shared-memory sidecars exist by
+        // now — sqlite creates them with the main file's mode, which on a
+        // database that predates `precreate_private` is whatever the umask gave
+        // it. Re-assert on all three so existing deployments get fixed too.
+        restrict_db_permissions(path);
+        Ok(pool)
     }
 
     /// What this pool's data is, for per-credential coordination.
@@ -1060,6 +1128,60 @@ mod tests {
             "every connection must be open before the pool is handed out",
         );
         assert_eq!(status.available, POOL_SIZE, "and all of them idle");
+    }
+
+    /// The mode is load-bearing rather than hygiene — other crates' threat
+    /// models argue from "another UID can't read this file". Asserted on the
+    /// sidecars too: they carry the same rows and sqlite creates them itself.
+    #[tokio::test]
+    async fn open_leaves_database_and_sidecars_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        let pool = SqlitePool::open(&path).await.expect("open");
+        // Force a WAL write so the sidecars exist for the assertion below.
+        pool.interact("test.write", |conn| {
+            Ok(conn.execute(
+                "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'00')",
+                [],
+            )?)
+        })
+        .await
+        .expect("write");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let target = dir.path().join(format!("t.db{suffix}"));
+            let mode = std::fs::metadata(&target)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", target.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                DB_FILE_MODE,
+                "{} must be owner-only, got {mode:o}",
+                target.display()
+            );
+        }
+    }
+
+    /// Databases created before this rule existed are world-readable on disk,
+    /// so reopening has to re-tighten rather than only setting the mode at
+    /// creation.
+    #[tokio::test]
+    async fn open_tightens_a_preexisting_world_readable_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        SqlitePool::open(&path).await.expect("first open");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        SqlitePool::open(&path).await.expect("reopen");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, DB_FILE_MODE, "reopen must re-tighten, got {mode:o}");
     }
 
     /// Two pools over two files must not see each other's data, or tests
