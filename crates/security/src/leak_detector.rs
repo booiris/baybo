@@ -333,12 +333,12 @@ impl LeakDetector {
                 .unwrap(),
                 action: LeakAction::Replace,
             },
-            // High-entropy 64-char hex
-            LeakDetectionRule {
-                name: "high_entropy_hex".to_owned(),
-                pattern: Regex::new(r"\b[a-fA-F0-9]{64}\b").unwrap(),
-                action: LeakAction::Replace,
-            },
+            // Deliberately absent: a bare `\b[a-fA-F0-9]{64}\b` rule. That is
+            // the shape of a SHA-256 digest, not of a credential — on one real
+            // workspace it matched 1165 of 1253 vaulted values (git ids,
+            // lockfile checksums, docker digests, baybo's own blob ids). Real
+            // 64-hex credentials carry a distinguishing prefix and match their
+            // own rules, e.g. `openrouter_api_key` above.
         ];
 
         for rule in rules {
@@ -600,12 +600,41 @@ mod tests {
         assert!(r.matches.iter().any(|m| m.rule_name == "auth_header"));
     }
 
+    /// Re-adding a bare 64-hex rule would silently break `git log`, `cargo`
+    /// output, and any request for a checksum.
     #[test]
-    fn detect_high_entropy_hex() {
+    fn bare_sha256_digests_are_not_secrets() {
         let detector = LeakDetector::with_default_rules();
-        let r = detector.scan_text(
-            "hash: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef end",
+        let digests = [
+            // git commit id
+            "commit 0123456789abcdef0123456789abcdef01234567",
+            // sha256 in a lockfile
+            "checksum = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"",
+            // docker image digest
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ];
+        for text in digests {
+            let r = detector.scan_text(text);
+            assert!(
+                r.matches.is_empty(),
+                "digest must not be flagged as a secret: {text} -> {:?}",
+                r.matches
+            );
+        }
+    }
+
+    /// Real 64-hex credentials carry a prefix and must still match on it.
+    #[test]
+    fn prefixed_64_hex_keys_are_still_caught() {
+        let detector = LeakDetector::with_default_rules();
+        let key = format!("sk-or-v1-{}", "a".repeat(64));
+        let r = detector.scan_text(&format!("key: {key}"));
+        assert!(
+            r.matches
+                .iter()
+                .any(|m| m.rule_name == "openrouter_api_key"),
+            "prefixed key must still be detected, got {:?}",
+            r.matches
         );
-        assert!(r.matches.iter().any(|m| m.rule_name == "high_entropy_hex"));
     }
 }

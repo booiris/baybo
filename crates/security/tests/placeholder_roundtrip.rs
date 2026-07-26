@@ -173,7 +173,6 @@ fn corpus_covers_every_replace_rule() {
         "bearer_token",
         "auth_header",
         "password_assignment",
-        "high_entropy_hex",
     ]
     .into_iter()
     .collect();
