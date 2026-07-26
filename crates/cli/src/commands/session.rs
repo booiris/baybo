@@ -108,7 +108,6 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "last_active": session.last_active.to_rfc3339(),
         "messages": messages.len(),
         "called_skills": baybo_context::scan_skill_calls(&messages),
-        "compression_count": session.state.compression_count,
     });
     if let Some((jobs, steps, spans)) = trace_counts
         && let Value::Object(ref mut map) = value
@@ -131,7 +130,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     };
 
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\ncalled_skills:  {}\ncompressions:   {}{}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\ncalled_skills:  {}{}",
         session.id,
         session.user.id,
         session.channel,
@@ -139,7 +138,6 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         session.last_active.to_rfc3339(),
         messages.len(),
         called_skills_human,
-        session.state.compression_count,
         trace_human,
     );
 

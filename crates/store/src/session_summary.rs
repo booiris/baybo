@@ -74,9 +74,16 @@ pub trait SessionSummaryStore: Send + Sync {
     /// that have never produced a successful summary should be able
     /// to surface failure telemetry. `model_id` / `span_id` track the
     /// last-attempted call so operators can find the failing trace.
+    ///
+    /// `cost_micros_delta` accumulates exactly as it does on success. A
+    /// failed pass still spent every LLM call it made up to the point it
+    /// gave up, and the expensive failures are precisely the ones that
+    /// iterated hardest before dying — dropping their spend made
+    /// `cost_micros` under-report worst where it mattered most.
     async fn bump_error_count(
         &self,
         session_id: &SessionId,
+        cost_micros_delta: i64,
         model_id: &str,
         span_id: &str,
         updated_at: DateTime<Utc>,

@@ -143,19 +143,22 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Record a failed summary attempt: bumps `error_count`. Inserts
-    /// a row with cursor=0 / pass_count=0 if absent so failure
-    /// telemetry surfaces even on sessions that have never had a
-    /// successful pass.
+    /// Record a failed summary attempt: bumps `error_count` and
+    /// accumulates `cost_micros_delta`. Inserts a row with cursor=0 /
+    /// pass_count=0 if absent so failure telemetry surfaces even on
+    /// sessions that have never had a successful pass. The spend is
+    /// recorded because a failed pass still paid for every LLM call it
+    /// made before giving up.
     pub async fn record_summary_failure(
         &self,
         session_id: &SessionId,
+        cost_micros_delta: i64,
         model_id: &str,
         span_id: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()> {
         self.summary_store
-            .bump_error_count(session_id, model_id, span_id, updated_at)
+            .bump_error_count(session_id, cost_micros_delta, model_id, span_id, updated_at)
             .await
             .map_err(SessionError::from)
     }

@@ -328,12 +328,6 @@ impl Session {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
-    /// Number of context compressions performed in this session.
-    /// Incremented after each compression pass; useful for monitoring
-    /// or switching compression strategies.
-    #[serde(default)]
-    pub compression_count: u32,
-
     /// Tool resources the user has granted permanent approval for in this
     /// session. Populated on each `ApproveAlways` decision by the approval
     /// gate; persisted with the session so restored sessions remember the

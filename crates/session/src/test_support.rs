@@ -827,6 +827,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
     async fn bump_error_count(
         &self,
         session_id: &SessionId,
+        cost_micros_delta: i64,
         model_id: &str,
         span_id: &str,
         updated_at: DateTime<Utc>,
@@ -845,6 +846,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 error_count: 0,
             });
         entry.error_count += 1;
+        entry.cost_micros += cost_micros_delta;
         entry.model_id = model_id.to_string();
         entry.span_id = span_id.to_string();
         entry.updated_at = updated_at;

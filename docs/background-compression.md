@@ -202,6 +202,8 @@ The trade-off is that a process shutdown does not actively cancel an in-flight p
 
 `error_count` is **telemetry only** — it does not gate future triggers. Acceptable cost: a persistent failure burns one LLM call per trigger event until conditions self-resolve.
 
+**Every failure path records what it spent.** `record_summary_failure` accumulates `cost_micros` exactly as the success path does. A pass that dies at the iteration cap or after eight thrashing rounds still paid for every call it made, and those are precisely the most expensive passes — dropping their spend made `cost_micros` under-report worst where it mattered most, while the doc points at that column as the per-session cost query. Only the transcript-load failure records zero, because it happens upstream of the first LLM call.
+
 ## Compressor stage 1 (summary.md fast-path)
 
 The fast-path lives as a private `try_summary_fast_path` method on `ContextManager` (see `crates/context/src/compressor.rs`). It uses the manager's existing fields — `summary_loader: FsSummaryLoader`, `sessions: Arc<SessionManager>`, `skill_registry: Arc<SkillRegistry>`, `session_id: SessionId`, `tokenizer: Arc<dyn Tokenizer>`, plus `budget.max_tokens()` for the fall-through threshold.
