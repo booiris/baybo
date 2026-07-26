@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use baybo_agent::state::DurableActorState;
-use baybo_model::{ChannelType, SessionId, User};
+use baybo_model::{ApprovedResource, ChannelType, SessionId, User};
 use baybo_session::SessionManager;
 use baybo_session::SessionStore;
 use baybo_session::test_support::{
@@ -44,7 +44,9 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         created_at: chrono::Utc::now(),
         last_active: chrono::Utc::now(),
         state: baybo_model::SessionState {
-            compression_count: 7,
+            approved_resources: vec![ApprovedResource::ExecCommand {
+                command: "cargo".to_string(),
+            }],
             ..Default::default()
         },
         root_session_id: SessionId::from("session-rt"),
@@ -63,7 +65,10 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         serde_json::from_str(&json).expect("durable state must deserialize");
 
     assert_eq!(restored.session.id, original.session.id);
-    assert_eq!(restored.session.state.compression_count, 7);
+    assert_eq!(
+        restored.session.state.approved_resources,
+        original.session.state.approved_resources
+    );
     assert_eq!(restored.session.trigger, original.session.trigger);
 }
 
@@ -80,13 +85,18 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
     let sessions = SessionManager::new(session_store.clone(), summary_store, folder_store);
 
     // First actor: create session, mutate observable session state
-    // (skills + compression count), persist.
+    // (a permanent approval grant — what `ApproveAlways` writes), persist.
     let mut session = sessions
         .create_session(test_user(), ChannelType::tui())
         .await
         .expect("create session");
     let session_id = session.id.clone();
-    session.state.compression_count = 3;
+    session
+        .state
+        .approved_resources
+        .push(ApprovedResource::ExecCommand {
+            command: "rg".to_string(),
+        });
     session_store
         .save(&session)
         .await
@@ -110,8 +120,11 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 
     assert_eq!(durable_post.session.id, session_id);
     assert_eq!(
-        durable_post.session.state.compression_count, 3,
-        "compression_count must survive idle eviction → rehydrate",
+        durable_post.session.state.approved_resources,
+        vec![ApprovedResource::ExecCommand {
+            command: "rg".to_string()
+        }],
+        "approval grants must survive idle eviction → rehydrate",
     );
 }
 

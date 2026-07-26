@@ -115,14 +115,19 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     assert_eq!(row.span_id, "span-1");
     assert_eq!(row.error_count, 0);
 
-    // Failure bumps error_count without touching cursor / pass_count.
-    mgr.record_summary_failure(&session.id, "model", "span-err", Utc::now())
+    // Failure bumps error_count and accumulates spend, without touching
+    // cursor / pass_count.
+    mgr.record_summary_failure(&session.id, 55, "model", "span-err", Utc::now())
         .await
         .unwrap();
     let row = mgr.summary_metadata(&session.id).await.unwrap().unwrap();
     assert_eq!(row.error_count, 1);
     assert_eq!(row.cursor, 42);
     assert_eq!(row.pass_count, 1);
+    assert_eq!(
+        row.cost_micros, 12_400,
+        "a failed attempt still bills what it spent"
+    );
 
     // Successful pass resets error_count.
     mgr.record_summary_success(&session.id, 60, 1, "model", "span-2", Utc::now())
@@ -132,7 +137,7 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     assert_eq!(row.error_count, 0);
     assert_eq!(row.cursor, 60);
     assert_eq!(row.pass_count, 2);
-    assert_eq!(row.cost_micros, 12_346);
+    assert_eq!(row.cost_micros, 12_401, "12_345 + 55 failed + 1");
 }
 
 /// `cursor` advances monotonically. A pass pins `up_to_ordinal` at trigger
@@ -712,10 +717,23 @@ async fn agent_background_pass_records_compression_step_on_parent_job() {
             cache_creation_input_tokens: 0,
         })),
     ]);
+    // The pass drives summary.md entirely through tool calls and typically
+    // returns no prose, so an Edit here is the realistic shape — and the only
+    // way the span has anything to record.
+    let notes_path = workspace.session_summary_file(harness.session.id.as_str());
     harness.stub_llm.push_response(LlmResponse {
-        content: "notes are current".into(),
-        content_blocks: vec![ContentBlock::Text("notes are current".into())],
-        tool_calls: vec![],
+        content: String::new(),
+        content_blocks: vec![],
+        tool_calls: vec![ToolCallInfo {
+            id: "edit-span-1".into(),
+            name: "Edit".into(),
+            arguments: serde_json::json!({
+                "file_path": notes_path.display().to_string(),
+                "old_string": SEEDED_WORKLOG_MARKER,
+                "new_string": PASS_SUMMARY_TEXT,
+            }),
+            signature: None,
+        }],
         usage: TokenUsage {
             input_tokens: 500,
             output_tokens: 20,
@@ -776,6 +794,30 @@ async fn agent_background_pass_records_compression_step_on_parent_job() {
         compression_steps.len(),
         1,
         "background compression should render as one Compression step under the parent job; steps: {steps:#?}"
+    );
+
+    // The pass is nothing but tool calls, so a span that drops them leaves the
+    // trace blank for the most expensive thing the session does off the hot
+    // path — a pass could burn ten 130K-token iterations and show nothing.
+    let spans: Vec<baybo_trace::Span> = harness
+        .trace_store
+        .list_spans_by_step(&compression_steps[0].id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| baybo_trace::Span::from_row(row).unwrap())
+        .collect();
+    let recorded: Vec<_> = spans
+        .iter()
+        .filter_map(|span| match &span.kind {
+            baybo_trace::SpanKind::LlmCall { result, .. } => result.as_ref(),
+            _ => None,
+        })
+        .flat_map(|result| result.tool_calls.iter())
+        .collect();
+    assert!(
+        recorded.iter().any(|tc| tc.name == "Edit"),
+        "the Edit the pass issued must reach its span; spans: {spans:#?}"
     );
 
     harness.shutdown().await;

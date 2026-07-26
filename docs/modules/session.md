@@ -59,7 +59,6 @@ One `AgentActor` per session. All messages targeting the same session (user inpu
 
 ### `SessionState` fields
 
-- `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
 - `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
 - `background_notifications`: one durable aggregate for background-job notification delivery. `groups` holds barrier cohorts, `buffered_results` holds terminal results not yet committed to the transcript, and `active_delivery` is the retry ledger for the one transcript-backed batch currently being reported. The buffer and active delivery may coexist when fresh jobs finish during an older batch's retry. The aggregate is serde-flattened onto the historical JSON keys, so existing session rows need no migration. See [`background-notifications.md`](../background-notifications.md).
 - `subagent_backend`: which backend created this subagent session, plus (for External) the agent's `workspace_dir` and `resume_key`. `None` for non-subagent sessions.

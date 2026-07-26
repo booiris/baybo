@@ -272,22 +272,50 @@ const FAILED_EDIT_RETRY_GUIDANCE: &str = r#"ERROR: {{err}}
 
 Your old_string no longer matches the file — most often because an earlier Edit in this pass already changed it, so the copy shown in the instructions above is stale. Do NOT retry the same old_string. Use the Read tool on the notes file to get its current content, then issue a corrected Edit (or, if your change is already present, make no further edits and stop)."#;
 
+/// Whether `header` names one of the sections [`DEFAULT_NOTES_TEMPLATE`]
+/// defines. Read off the template rather than duplicated into a list, so the
+/// two can't drift.
+fn is_notes_section_header(header: &str) -> bool {
+    DEFAULT_NOTES_TEMPLATE
+        .lines()
+        .filter_map(|line| line.strip_prefix("# "))
+        .any(|section| section.trim() == header)
+}
+
 /// Walk `notes` and return `(section_header, token_count)` for each
-/// `# Header`-rooted section. The count covers the header line + body
-/// up to (excluding) the next header. Tokens are measured with the
-/// caller's tokenizer so this matches the rest of the system's
-/// accounting (no chars-per-token heuristic drift).
+/// section. The count covers the header line + body up to (excluding) the
+/// next header. Tokens are measured with the caller's tokenizer so this
+/// matches the rest of the system's accounting (no chars-per-token
+/// heuristic drift).
+///
+/// Only [`DEFAULT_NOTES_TEMPLATE`]'s own headers count, and only outside fenced code
+/// blocks. Splitting on any `# ` line is wrong twice over, and both misfires
+/// are live on disk today: the prompt tells the model to paste the user's
+/// exact requested output into "Key results", so a pasted report's own
+/// `# Heading` opened a phantom section; and `# ` inside a ```bash fence is a
+/// shell comment, which silently truncated the real section's count at the
+/// first one. Either way `build_summary_prompt` would name a section that
+/// does not exist when it asks the model to condense — while the prompt
+/// simultaneously forbids touching headers.
 fn section_token_counts(notes: &str, tokenizer: &dyn Tokenizer) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = Vec::new();
     let mut current_header: Option<String> = None;
     let mut current_buf = String::new();
+    let mut in_fence = false;
     for line in notes.lines() {
-        if let Some(rest) = line.strip_prefix("# ") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !in_fence
+            && let Some(rest) = line.strip_prefix("# ")
+            && is_notes_section_header(rest.trim())
+        {
             if let Some(prev) = current_header.take() {
                 out.push((prev, tokenizer.count_text(&current_buf)));
                 current_buf.clear();
             }
-            current_header = Some(rest.to_string());
+            current_header = Some(rest.trim().to_string());
         }
         current_buf.push_str(line);
         current_buf.push('\n');
@@ -602,8 +630,10 @@ pub async fn run_background_summary(
         match load_session_transcript_up_to(&sessions, &session_id, up_to_ordinal).await {
             Ok(m) => m,
             Err(e) => {
+                // Nothing has been billed yet — the failure is upstream of the
+                // first LLM call.
                 let _ = sessions
-                    .record_summary_failure(&session_id, &model_id, "", Utc::now())
+                    .record_summary_failure(&session_id, 0, &model_id, "", Utc::now())
                     .await;
                 return Err(e);
             }
@@ -671,7 +701,7 @@ pub async fn run_background_summary(
     loop {
         if iterations >= MAX_BACKGROUND_SUMMARY_ITERATIONS {
             let _ = sessions
-                .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
+                .record_summary_failure(&session_id, cost_micros, &model_id, &span_id, Utc::now())
                 .await;
             return Err(ContextError::Compression(format!(
                 "background summary loop exceeded {MAX_BACKGROUND_SUMMARY_ITERATIONS} \
@@ -720,7 +750,13 @@ iterations without terminating"
             Ok(run) => run,
             Err(e) => {
                 let _ = sessions
-                    .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
+                    .record_summary_failure(
+                        &session_id,
+                        cost_micros,
+                        &model_id,
+                        &span_id,
+                        Utc::now(),
+                    )
                     .await;
                 return Err(e);
             }
@@ -806,7 +842,7 @@ iterations without terminating"
     // for the transcript and silently drop every message in the gap.
     if !applied_any_edit {
         let _ = sessions
-            .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
+            .record_summary_failure(&session_id, cost_micros, &model_id, &span_id, Utc::now())
             .await;
         warn!(
             session_id = %session_id,
@@ -903,13 +939,13 @@ mod tests {
         let path = Path::new("/x");
         // SimpleTokenizer: chars/4+1, so ~2010 tokens needs ~8040 chars.
         let big_body = "x".repeat(MAX_SECTION_LENGTH * 4 + 40);
-        let notes = format!("# Big\n_desc_\n{big_body}");
+        let notes = format!("# Worklog\n_desc_\n{big_body}");
         let prompt = build_summary_prompt(path, &notes, &tk());
-        assert!(prompt.contains("# Big"));
+        assert!(prompt.contains("# Worklog"));
         assert!(prompt.contains(
             "IMPORTANT: The following sections exceed the per-section limit and MUST be condensed:"
         ));
-        assert!(prompt.contains("\"# Big\""));
+        assert!(prompt.contains("\"# Worklog\""));
         assert!(!prompt.contains("CRITICAL: The session memory"));
     }
 
@@ -929,7 +965,7 @@ mod tests {
         let path = Path::new("/x");
         // A single huge section trips both gates.
         let huge_body = "y".repeat(MAX_TOTAL_SESSION_MEMORY_TOKENS * 4 + 100);
-        let notes = format!("# Huge\n_d_\n{huge_body}");
+        let notes = format!("# Worklog\n_d_\n{huge_body}");
         let prompt = build_summary_prompt(path, &notes, &tk());
         assert!(prompt.contains("CRITICAL: The session memory"));
         assert!(prompt.contains("Oversized sections to condense:"));
@@ -974,12 +1010,57 @@ mod tests {
 
     #[test]
     fn section_token_counts_splits_by_h1_headers() {
-        let notes = "# A\nbody-a\n# B\nbody-b body-b body-b\n";
+        let notes = "# Workflow\nbody-a\n# Learnings\nbody-b body-b body-b\n";
         let counts = section_token_counts(notes, &tk());
         assert_eq!(counts.len(), 2);
-        assert_eq!(counts[0].0, "A");
-        assert_eq!(counts[1].0, "B");
+        assert_eq!(counts[0].0, "Workflow");
+        assert_eq!(counts[1].0, "Learnings");
         assert!(counts[1].1 >= counts[0].1);
+    }
+
+    /// The prompt tells the model to paste the user's exact requested output
+    /// into "Key results", so a pasted report brings its own `# Heading`. That
+    /// must not open a section: `build_summary_prompt` would then order the
+    /// model to condense a section that does not exist, while the same prompt
+    /// forbids touching headers. Live on disk in `cron-b24a279b` and
+    /// `cron-88ee6936`.
+    #[test]
+    fn pasted_content_headings_do_not_open_a_section() {
+        let notes = "# Key results\n_d_\n# 🤖 AI 每日情报｜2026-07-16\nrow one\nrow two\n";
+        let counts = section_token_counts(notes, &tk());
+        assert_eq!(counts.len(), 1, "got {counts:?}");
+        assert_eq!(counts[0].0, "Key results");
+        assert!(
+            counts[0].1 >= tk().count_text("row one\nrow two\n"),
+            "the pasted body must be charged to Key results, not split off"
+        );
+    }
+
+    /// `# ` inside a fenced block is a shell comment, not a header. Splitting
+    /// on it truncated the real section's count at the first comment — live in
+    /// `b430d388`, whose `# Workflow` count stopped at a ```bash block.
+    #[test]
+    fn shell_comments_inside_a_fence_do_not_open_a_section() {
+        let notes = "# Workflow\n_d_\n```bash\n# 研究后写 inbox.json\nbaybo run\n```\ntail line\n";
+        let counts = section_token_counts(notes, &tk());
+        assert_eq!(counts.len(), 1, "got {counts:?}");
+        assert_eq!(counts[0].0, "Workflow");
+        assert!(
+            counts[0].1 >= tk().count_text("tail line\n"),
+            "content after the fence still belongs to the section"
+        );
+    }
+
+    #[test]
+    fn every_scaffold_header_is_recognized() {
+        let counts = section_token_counts(DEFAULT_NOTES_TEMPLATE, &tk());
+        assert_eq!(
+            counts.len(),
+            DEFAULT_NOTES_TEMPLATE
+                .lines()
+                .filter(|l| l.starts_with("# "))
+                .count()
+        );
     }
 
     fn write_notes(dir: &tempfile::TempDir, body: &str) -> PathBuf {

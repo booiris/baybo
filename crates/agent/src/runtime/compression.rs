@@ -137,10 +137,25 @@ impl CompressionRunner {
                                 {
                                     warn!(error = %e, "compression: sanitize_llm_response failed");
                                 }
+                                // The background pass drives `summary.md`
+                                // entirely through `Edit` / `Read` calls and
+                                // usually returns no prose at all, so dropping
+                                // these left its spans blank — a pass could
+                                // burn ten 130K-token iterations and leave
+                                // nothing in the trace to explain what it did.
+                                let tool_calls = response
+                                    .tool_calls
+                                    .iter()
+                                    .map(|tc| baybo_trace::LlmToolCallRecord {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        arguments: tc.arguments.clone(),
+                                    })
+                                    .collect();
                                 let call_result = LlmCallResult {
                                     output_content: response.content.clone(),
                                     thinking: response.thinking.clone(),
-                                    tool_calls: vec![],
+                                    tool_calls,
                                     input_tokens: response.usage.input_tokens,
                                     output_tokens: response.usage.output_tokens,
                                     cached_input_tokens: response.usage.cached_input_tokens,

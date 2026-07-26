@@ -170,6 +170,7 @@ impl SessionSummaryStore for SqliteSessionSummaryStore {
     async fn bump_error_count(
         &self,
         session_id: &SessionId,
+        cost_micros_delta: i64,
         model_id: &str,
         span_id: &str,
         updated_at: DateTime<Utc>,
@@ -184,16 +185,19 @@ impl SessionSummaryStore for SqliteSessionSummaryStore {
                 // sessions that have never produced a successful summary can
                 // surface failure telemetry. On conflict, increments error_count
                 // and refreshes the model_id / span_id / updated_at trio.
+                // `cost_micros` accumulates on this path too — a failed pass
+                // still paid for every call it made.
                 conn.execute(
                     "INSERT INTO session_summaries \
                          (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
-                     VALUES (?1, 0, 0, ?2, 0, ?3, ?4, 1) \
+                     VALUES (?1, 0, 0, ?2, ?5, ?3, ?4, 1) \
                      ON CONFLICT(session_id) DO UPDATE SET \
                          error_count     = session_summaries.error_count + 1, \
+                         cost_micros     = session_summaries.cost_micros + excluded.cost_micros, \
                          model_id        = excluded.model_id, \
                          span_id         = excluded.span_id, \
                          updated_at      = excluded.updated_at",
-                    rusqlite::params![sid, updated_at_us, model_id, span_id],
+                    rusqlite::params![sid, updated_at_us, model_id, span_id, cost_micros_delta],
                 )?;
                 Ok(())
             })
@@ -368,22 +372,24 @@ mod tests {
 
         // No prior row → bump creates one with error_count = 1.
         store
-            .bump_error_count(&id, "m", "span-err-1", Utc::now())
+            .bump_error_count(&id, 40, "m", "span-err-1", Utc::now())
             .await
             .unwrap();
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row.error_count, 1);
         assert_eq!(row.cursor, 0);
         assert_eq!(row.pass_count, 0);
+        assert_eq!(row.cost_micros, 40, "the failed pass still spent this");
 
-        // Second bump increments.
+        // Second bump increments and accumulates spend.
         store
-            .bump_error_count(&id, "m", "span-err-2", Utc::now())
+            .bump_error_count(&id, 60, "m", "span-err-2", Utc::now())
             .await
             .unwrap();
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row.error_count, 2);
         assert_eq!(row.span_id, "span-err-2");
+        assert_eq!(row.cost_micros, 100);
     }
 
     #[tokio::test]
@@ -395,11 +401,11 @@ mod tests {
         let id = SessionId::from("s4");
 
         store
-            .bump_error_count(&id, "m", "span-1", Utc::now())
+            .bump_error_count(&id, 7, "m", "span-1", Utc::now())
             .await
             .unwrap();
         store
-            .bump_error_count(&id, "m", "span-2", Utc::now())
+            .bump_error_count(&id, 7, "m", "span-2", Utc::now())
             .await
             .unwrap();
 
@@ -411,7 +417,10 @@ mod tests {
         let row = store.get(&id).await.unwrap().unwrap();
         assert_eq!(row.error_count, 0);
         assert_eq!(row.pass_count, 1);
-        assert_eq!(row.cost_micros, 100);
+        // 7 + 7 from the failed attempts, 100 from the successful one. A
+        // success clears the error *count* but must not erase what the
+        // failures spent getting there.
+        assert_eq!(row.cost_micros, 114);
     }
 
     #[tokio::test]
