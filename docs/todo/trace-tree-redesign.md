@@ -176,9 +176,8 @@ failures, click→select + scroll), token totals, wall-clock, counts, and **per-
 chips, and a **clickable legend** (collapsible) — selecting a legend entry
 highlights that group across both the minimap and the tree by dimming everything
 else, so "where did it fail" or "where are the tool calls" reads at a glance. Kind colours are one distinct hue per group —
-**LLM = green, Tool = orange, Memory = blue, Subagent = gold, Skill = magenta,
-Compression = violet, Meta = gray** (progress-observer + title-generation: side-channel
-LLM work that never touches the main loop), with a red
+**LLM = green, Tool = orange, Memory = blue, Subagent = gold,
+Compression = violet, Meta = gray** (skill-selection + progress-observer + title-generation), with a red
 failure overlay — shared across the glyph, left stripe, and minimap cell (`TRACE_LEGEND`
 is the key). Plus a left **job column** (`JobAnchors`) — a document-outline
 list that selects + scrolls the tree to a job (`data-job-id`), previewing the **user input**
@@ -192,6 +191,24 @@ virtualization + sticky Step headers. **P2** = inline **cost** badges (cost is i
 micro-USD in the cost store, NOT on the trace wire — needs a join into the trace +
 `/lineage` endpoints) + Datadog-style "focus on subtree" (pairs with PR2) + large-trace
 summarization (render only errors + long spans → relieves the trace-size bloat).
+
+### What a subagent actually looks like
+
+`StepKind::Subagent` and `SpanKind::SubagentStub` exist on the wire but **no production
+path records them** — the same is true of `StepKind::SkillSelection`. A subagent shows up
+as a `spawn_subagent` **tool call**, and a skill as a `Skill` tool call. So the viewer keys
+the Subagent group off the tool name (`SPAWN_SUBAGENT_TOOL`), promoting that call out of
+the generic Tool group and giving it the Subagent glyph/colour; there is no Skill group,
+because nothing would ever land in it. PR2's nesting must hang off the same tool call.
+
+### Context compaction
+
+Compression **is** recorded, and it is the one step that silently rewrites history, so the
+overview carries a dedicated **CONTEXT** row: one chip per compaction with its wall-clock
+time and `before→after` tokens, clickable to jump to that step. The token figures come from
+`compressionTokens`, shared with the step summary so the two can't disagree — it counts
+cache reads and cache writes as context, because they occupied the window that got
+compacted.
 
 ## PR2 — subagent lineage nesting
 

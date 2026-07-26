@@ -341,20 +341,22 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   const t0 = Date.now() - 5 * 60 * 1000;
   const job1 = mid('job');
 
-  // Step 1: skill selection
-  const skillStarted = new Date(t0);
-  const skillEnded = new Date(t0 + 80);
-  const skillStep = step(job1, { kind: 'skill_selection' }, skillStarted, skillEnded);
-  const skillLlm = llmSpan(
-    skillStep.id,
+  // Step 1: a context compaction — the transcript so far is replaced by a
+  // summary. This is a real emitted StepKind (unlike skill_selection, which the
+  // wire defines but no production path records).
+  const compStarted = new Date(t0);
+  const compEnded = new Date(t0 + 80);
+  const compStep = step(job1, { kind: 'compression' }, compStarted, compEnded);
+  const compLlm = llmSpan(
+    compStep.id,
     'claude-sonnet-4-6',
-    [systemMsg('Pick a skill.'), userMsg('Help me list files.')],
-    JSON.stringify({ skill: 'codebase_investigator' }),
+    [systemMsg('Summarize the conversation so far.'), userMsg('Help me list files.')],
+    'Earlier: the user asked to list files and read README.md.',
     [],
-    40,
-    8,
-    skillStarted,
-    skillEnded,
+    12_400,
+    260,
+    compStarted,
+    compEnded,
   );
 
   // Step 2: LLM iteration with parallel tool calls
@@ -465,7 +467,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     started_at: startedAt,
     ended_at: endedAt,
     steps: [
-      { step: skillStep, spans: [skillLlm] },
+      { step: compStep, spans: [compLlm] },
       { step: it1Step, spans: [it1Llm, tool1, tool2] },
       { step: it2Step, spans: [it2Llm] },
     ],
@@ -538,6 +540,19 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     { outcome: 'failed', reason: 'bash exited with code 1' },
   );
 
+  const spawnStart = new Date(t1 + 200);
+  const spawnEnd = new Date(t1 + 690);
+  const spawnSpan = toolSpan(
+    it3Step.id,
+    'spawn_subagent',
+    it3Llm.id,
+    'tu_sa1',
+    { profile: 'explorer', task: 'Find where the test fixtures live' },
+    { child_session_id: 'sess-child-explorer', final_text: 'Fixtures live under app/web/src/test.' },
+    spawnStart,
+    spawnEnd,
+  );
+
   const job2Trace: JobTrace = {
     job_id: job2,
     session_id: sessionId,
@@ -547,7 +562,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     ended_at: j2Ended,
     steps: [
       { step: recallStep, spans: [recallTool] },
-      { step: it3Step, spans: [it3Llm, failTool] },
+      { step: it3Step, spans: [it3Llm, spawnSpan, failTool] },
     ],
   };
 

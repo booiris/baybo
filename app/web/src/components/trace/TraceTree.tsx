@@ -36,7 +36,6 @@ import {
   formatTok,
   jobDurationMs,
   OutcomeBadge,
-  spanVisual,
   stepSummaryText,
   stepVisual,
   stripeClass,
@@ -45,7 +44,7 @@ import {
   traceTokens,
 } from './traceFormat';
 import type { TraceGroup } from './traceFormat';
-import { nodeGroup } from './traceFormat';
+import { nodeGroup, spanToolName, spanVisualOf } from './traceFormat';
 import type { JobRollup } from './traceTreeModel';
 import { attention, isExternalAgentJob, isJobLive, jobRollup, resolveExpanded } from './traceTreeModel';
 
@@ -85,7 +84,7 @@ export interface TraceTreeProps {
 // ── Text projections used for the text filter ────────────────────────
 
 function spanText(span: Span): string {
-  const v = spanVisual(span.kind.kind).label;
+  const v = spanVisualOf(span).label;
   if (span.kind.kind === 'llm_call') return `${v} ${span.kind.begin.model_id}`;
   if (span.kind.kind === 'tool_call') return `${v} ${span.kind.begin.tool_name}`;
   return `${v} ${span.kind.child_session_id}`;
@@ -247,7 +246,7 @@ function SpanRow({
   heat: boolean;
   onSelect: () => void;
 }) {
-  const visual = spanVisual(span.kind.kind);
+  const visual = spanVisualOf(span);
   const ms = durationMs(span);
 
   let title = '';
@@ -596,7 +595,10 @@ export function TraceTree(props: TraceTreeProps) {
                                     maxMs={maxSpanMs}
                                     siblings={rs.spans.length}
                                     heat={heat}
-                                    dim={highlight != null && nodeGroup(spanVisual(span.kind.kind), span.outcome) !== highlight}
+                                    dim={
+                                      highlight != null &&
+                                      nodeGroup(spanVisualOf(span), span.outcome, spanToolName(span)) !== highlight
+                                    }
                                     onSelect={() => onSelectSpan(job.job_id, span.id)}
                                   />
                                   {pv != null && pv !== '' && (

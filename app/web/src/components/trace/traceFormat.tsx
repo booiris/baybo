@@ -22,6 +22,7 @@ import type {
   ContentBlock,
   JobTrace,
   LifecycleState,
+  LlmCallResult,
   SessionMessageRow,
   Span,
   SpanKindTag,
@@ -35,15 +36,12 @@ import { resolveInputMessages } from '../../types/trace';
 
 /** The colour groups the legend is keyed on — one per hue, plus the failure
  *  overlay. Clicking a legend entry highlights the nodes in that group. */
-export type TraceGroup =
-  | 'llm'
-  | 'tool'
-  | 'memory'
-  | 'subagent'
-  | 'skill'
-  | 'compression'
-  | 'meta'
-  | 'failed';
+export type TraceGroup = 'llm' | 'tool' | 'memory' | 'subagent' | 'compression' | 'meta' | 'failed';
+
+/** The tool whose call spawns a subagent. A `spawn_subagent` tool_call is what a
+ *  subagent actually looks like in a trace — `StepKind::Subagent` /
+ *  `SpanKind::SubagentStub` exist on the wire but nothing records them. */
+export const SPAWN_SUBAGENT_TOOL = 'spawn_subagent';
 
 export interface KindVisual {
   icon: IconType; // used by the right-hand detail-panel headers
@@ -70,7 +68,7 @@ export const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
   compression: { group: 'compression', icon: RiArchiveLine, glyph: 'C', accent: 'text-violet', bg: 'bg-violet/10', stripe: 'border-l-violet', cell: 'bg-violet', label: 'Compression' },
   memory_recall: { group: 'memory', icon: RiSearchEyeLine, glyph: 'M', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory recall' },
   memory_write: { group: 'memory', icon: RiSave3Line, glyph: 'W', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory write' },
-  skill_selection: { group: 'skill', icon: RiBookmark3Line, glyph: 'S', accent: 'text-magenta', bg: 'bg-magenta/10', stripe: 'border-l-magenta', cell: 'bg-magenta', label: 'Skill selection' },
+  skill_selection: { group: 'meta', icon: RiBookmark3Line, glyph: 'S', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Skill selection' },
   progress_observer: { group: 'meta', icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
   title_generation: { group: 'meta', icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
   subagent: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent' },
@@ -89,16 +87,22 @@ export const TRACE_LEGEND: { group: TraceGroup; label: string; cell: string }[] 
   { group: 'tool', label: 'Tool', cell: 'bg-warn' },
   { group: 'memory', label: 'Memory', cell: 'bg-info' },
   { group: 'subagent', label: 'Subagent', cell: 'bg-brand' },
-  { group: 'skill', label: 'Skill', cell: 'bg-magenta' },
   { group: 'compression', label: 'Compression', cell: 'bg-violet' },
   { group: 'meta', label: 'Meta', cell: 'bg-ink-soft' },
   { group: 'failed', label: 'Failed', cell: 'bg-err' },
 ];
 
 /** A node's legend group. A failed/cancelled outcome wins over its kind, matching
- *  how the minimap paints failures red regardless of kind. */
-export function nodeGroup(visual: KindVisual, outcome: LifecycleState): TraceGroup {
+ *  how the minimap paints failures red regardless of kind. `toolName` promotes a
+ *  `spawn_subagent` call out of the generic Tool group — that call IS the
+ *  subagent, and it is the only form a subagent takes in a real trace. */
+export function nodeGroup(
+  visual: KindVisual,
+  outcome: LifecycleState,
+  toolName?: string,
+): TraceGroup {
   if (outcome.outcome === 'failed' || outcome.outcome === 'cancelled') return 'failed';
+  if (toolName === SPAWN_SUBAGENT_TOOL) return 'subagent';
   return visual.group;
 }
 
@@ -130,6 +134,20 @@ export function spanVisual(kind: SpanKindTag): KindVisual {
   return known ?? { ...FALLBACK_VISUAL, label: kind };
 }
 
+/** The tool name a span calls, when it is a tool call. */
+export function spanToolName(span: Span): string | undefined {
+  return span.kind.kind === 'tool_call' ? span.kind.begin.tool_name : undefined;
+}
+
+/** Visual for a span, promoting a `spawn_subagent` tool call to the Subagent
+ *  identity — that call is the subagent, so it should not read as a plain tool. */
+export function spanVisualOf(span: Span): KindVisual {
+  if (spanToolName(span) === SPAWN_SUBAGENT_TOOL) {
+    return { ...SPAN_VISUALS.subagent_stub, label: 'Subagent' };
+  }
+  return spanVisual(span.kind.kind);
+}
+
 // The kind's left-edge stripe class (a literal so Tailwind generates it).
 export function stripeClass(v: KindVisual): string {
   return v.stripe;
@@ -150,6 +168,20 @@ export function sumLlmTokens(spans: Span[]): { input: number; output: number } {
     }
   }
   return { input, output };
+}
+
+/** Tokens a compaction consumed and produced. Input counts cache reads and cache
+ *  writes too: they occupied the context window that was compacted. The step
+ *  summary and the overview's CONTEXT chips both read this, so the two figures
+ *  cannot drift apart. */
+export function compressionTokens(result: LlmCallResult): { input: number; output: number } {
+  return {
+    input:
+      (result.input_tokens ?? 0) +
+      (result.cached_input_tokens ?? 0) +
+      (result.cache_creation_input_tokens ?? 0),
+    output: result.output_tokens ?? 0,
+  };
 }
 
 // ── Time / duration ──────────────────────────────────────────────────
@@ -233,9 +265,12 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
     case 'compression': {
       const llm = spans.find((s) => s.kind.kind === 'llm_call');
       if (llm && llm.kind.kind === 'llm_call' && llm.kind.result) {
-        const inT = llm.kind.result.input_tokens ?? 0;
-        const outT = llm.kind.result.output_tokens ?? 0;
-        return `${inT.toLocaleString()} → ${outT.toLocaleString()} tokens`;
+        // The compacted context is the WHOLE input, cache reads included —
+        // a cached token still occupied the window. Counting only
+        // `input_tokens` under-reports it and disagrees with the token
+        // totals everywhere else (`summaryTokens`/`traceTokens.inputTotal`).
+        const { input, output } = compressionTokens(llm.kind.result);
+        return `${input.toLocaleString()} → ${output.toLocaleString()} tokens`;
       }
       return 'compression';
     }
