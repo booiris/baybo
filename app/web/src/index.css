@@ -42,6 +42,63 @@
   font-family: var(--font-sans);
   font-size: 15px;
   line-height: 1.7;
+  /* Inline math is an atomic, unbreakable box (KaTeX sets `white-space: nowrap`
+     on `.katex .base`), immune to the bubble's `overflow-wrap: anywhere`. A long
+     inline expression would otherwise widen the bubble past the reading band.
+     Clip at the bubble's edge — such math belongs in a `$$` display block, which
+     gets its own scroller below. `clip` keeps vertical overflow visible and
+     creates no scroll container, so short inline math (the norm) is untouched. */
+  overflow-x: clip;
+}
+
+/* Math (remark-math + rehype-katex -> KaTeX). KaTeX draws in `currentColor`, so
+   it inherits the bubble's ink for free. Nudge the size down from KaTeX's
+   1.21em default, which reads oversized against 15px Inter prose. */
+.chat-prose .katex {
+  font-size: 1.05em;
+}
+
+/* A display equation can be wider than the reading band, so it gets its own
+   horizontal scroller (scrolls in place instead of widening the thread).
+   Centering is via `fit-content` + `auto` inline margins, NOT `text-align:
+   center`: a centered nowrap equation wider than its container spills past BOTH
+   edges, and the overflowing start is then unreachable — scrolling only reveals
+   the end. With `fit-content` the equation's box is its own width, so once it
+   exceeds the container the auto margins collapse to 0, pinning its start edge
+   at scrollLeft 0 while it scrolls to the right. Center when it fits,
+   left-scroll when it doesn't. Vertical margins match the `my-2` rhythm the
+   markdown component map gives every other block. */
+.chat-prose .katex-display {
+  margin: 0.5rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* …with no scrollbar drawn, unlike every other scroll area in the app. An
+   assistant bubble is `w-fit`, so when the equation is its widest child the
+   bubble's width IS the equation's — rounded to a whole pixel, which leaves a
+   sub-pixel remainder that `overflow-x: auto` reports as a 1px overflow. The
+   global bar would then sit under nearly every equation that fits perfectly
+   well. A genuinely wide one still scrolls (trackpad, shift+wheel, drag). */
+.chat-prose .katex-display {
+  scrollbar-width: none;
+}
+
+.chat-prose .katex-display::-webkit-scrollbar {
+  display: none;
+}
+
+.chat-prose .katex-display > .katex {
+  width: fit-content;
+  margin-inline: auto;
+}
+
+.chat-prose .katex-display:first-child {
+  margin-top: 0;
+}
+
+.chat-prose .katex-display:last-child {
+  margin-bottom: 0;
 }
 
 @layer base {
@@ -114,7 +171,9 @@
    so a two-glyph `1.` hangs further left than a single `•` — which reads as
    inconsistent left padding between a numbered and a bulleted answer. The
    marker sits at the list's left edge (flush with surrounding paragraph
-   text); the item text is indented past it. */
+   text); the item text is indented past it. Keeping the marker inside the
+   item's own box is also what makes it survive `.chat-prose`'s
+   `overflow-x: clip`, which would otherwise amputate a hanging one. */
 .md-list {
   list-style: none;
   padding-left: 0;
@@ -123,6 +182,11 @@
 .md-list > li {
   position: relative;
   padding-left: 1.5rem;
+}
+
+/* A wider slot for numbers: two digits plus the dot don't fit a bullet's. */
+ol.md-list > li {
+  padding-left: 1.9rem;
 }
 
 .md-list > li::before {
@@ -139,14 +203,17 @@ ul.md-list > li::before {
   content: "•";
 }
 
-ol.md-list {
-  counter-reset: md-ol;
+/* Nested bullets take the hollow second level, as a UA list would. */
+ul.md-list ul.md-list > li::before {
+  content: "◦";
 }
 
-ol.md-list > li {
-  counter-increment: md-ol;
-}
-
+/* The UA's implicit `list-item` counter, never a hand-rolled one: `<ol start>`
+   sets exactly this counter, and CommonMark emits `start` whenever a paragraph
+   interrupts a list (`3.` after prose opens a fresh `<ol start="3">`) or the
+   list simply doesn't begin at 1. A manual counter has no connection to the
+   attribute, so it renumbers every such list from 1 while the DOM says
+   otherwise. */
 ol.md-list > li::before {
-  content: counter(md-ol) ".";
+  content: counter(list-item) ".";
 }

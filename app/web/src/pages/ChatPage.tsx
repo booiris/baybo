@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -12,8 +13,10 @@ import {
 } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { uuid } from '../uuid';
-import ReactMarkdown, { type Components } from 'react-markdown';
+import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import {
   RiAlertLine,
   RiArrowDownLine,
@@ -40,13 +43,11 @@ import {
   type Frame,
   type ResourceAccess,
   type SessionPatch,
-  type TaskView,
   type WireApprovalCard,
   type WireAttachment,
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
-import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
@@ -66,6 +67,8 @@ import {
 import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
 import { useFolderStore } from './chat/folderStore';
 import { useInputHistory } from './chat/inputHistory';
+import { normalizeMath } from './chat/mathDelimiters';
+import { withoutArchived } from './chat/sessionBuckets';
 import type { SessionSummary } from './chat/types';
 
 type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
@@ -235,10 +238,6 @@ export interface SessionView {
    *  detail's `last_llm` on history load and updated on a successful
    *  `PUT …/model`. */
   model?: string | null;
-  /** The session's planning checklist, replaced wholesale by each
-   *  `Frame::TaskList` snapshot (it's idempotent, not a delta). Empty
-   *  when the agent has no active plan — the checklist panel hides. */
-  tasks: TaskView[];
   /** Server-authoritative "is a turn in flight, since when (epoch ms)".
    *  Fed by `Frame::TurnState` — broadcast at every turn start/end and
    *  snapshotted to this connection on every Subscribe — so a tab that
@@ -268,10 +267,30 @@ export const EMPTY_VIEW: SessionView = {
   hasMore: false,
   awaitingReply: false,
   model: null,
-  tasks: [],
   turn: null,
   compactionPoints: [],
 };
+
+/** Identity of everything drawn at the BOTTOM of the thread. Two equal
+ *  signatures mean nothing arrived below the user's viewport, however much the
+ *  transcript array changed above it — which is exactly the scroll-up
+ *  pagination case: `loadOlder` prepends a page and hands back a fresh array
+ *  whose tail is byte-identical. Streaming counts as movement (the last row's
+ *  text grows), as does a new step landing in a live work block. */
+export function transcriptTailSignature(
+  transcript: TranscriptRow[],
+  below: { awaitingReply: boolean; pendingApproval: boolean; deferred: number },
+): string {
+  const last = transcript.length > 0 ? transcript[transcript.length - 1] : null;
+  return [
+    last ? last.key : '',
+    last ? last.text.length : 0,
+    last?.steps?.length ?? 0,
+    below.awaitingReply ? '1' : '0',
+    below.pendingApproval ? '1' : '0',
+    below.deferred,
+  ].join('|');
+}
 
 /** Slack (px) under which the transcript is treated as not overflowing its
  *  viewport, so scroll can never fire and the older-page load must be kicked
@@ -454,6 +473,10 @@ export function ChatPage() {
   const queue = useSessionQueue(sessionId);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  // What the chat list is allowed to draw and to auto-open. `sessions` stays
+  // the server's full truth (see `withoutArchived`); an archived conversation
+  // is still reachable by its `/chat/<id>` URL, it just has no row.
+  const visibleSessions = useMemo(() => withoutArchived(sessions), [sessions]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [slashCommands, setSlashCommands] = useState<{ command: string; description: string }[]>([]);
@@ -555,6 +578,9 @@ export function ChatPage() {
   // duplicate fetch (and its rival scroll-anchor rAF) is the scroll jitter.
   // This ref is set synchronously so only one page loads at a time.
   const loadingOlderRef = useRef(false);
+  // Last seen `transcriptTailSignature`, so the auto-scroll effect can tell a
+  // genuine append at the bottom from a scroll-up prepend.
+  const tailSignatureRef = useRef('');
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
   // react-router v7's `useNavigate` (non-data routes) returns a fresh
@@ -956,12 +982,14 @@ export function ChatPage() {
           created_at: s.created_at,
           last_active: s.last_active,
           unread: s.unread_count ?? 0,
+          archived: s.archived,
           pinned: s.pinned,
           last_user_text: s.last_user_text ?? undefined,
           folder_id: s.folder_id ?? undefined,
           title: s.title ?? undefined,
           cron_job_id: s.cron_job_id ?? undefined,
           cron_job_title: s.cron_job_title ?? undefined,
+          cron_group_pinned: s.cron_group_pinned ?? false,
         }));
       });
     }
@@ -1062,12 +1090,14 @@ export function ChatPage() {
         created_at: s.created_at,
         last_active: s.last_active,
         unread: s.unread_count ?? 0,
+        archived: s.archived,
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
         title: s.title ?? undefined,
         cron_job_id: s.cron_job_id ?? undefined,
         cron_job_title: s.cron_job_title ?? undefined,
+        cron_group_pinned: s.cron_group_pinned ?? false,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -1076,11 +1106,13 @@ export function ChatPage() {
       // Prefer the URL's session if it exists in the list — keeps
       // bookmark / copy-link semantics intact and avoids the
       // "every tab mints against existing[0]" thrash that revokes
-      // sibling tabs' tokens.
+      // sibling tabs' tokens. A named archived session still opens
+      // (the link is the way in); only the *fallback* skips them, so
+      // a cold start can't land on a conversation with no row.
       const preferred =
         sessionId && existing.some((s) => s.session_id === sessionId)
           ? sessionId
-          : existing[0]?.session_id;
+          : withoutArchived(existing)[0]?.session_id;
 
       if (preferred) {
         anchorSessionIdRef.current = preferred;
@@ -1112,6 +1144,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  archived: false,
                   pinned: false,
                 },
                 ...prev,
@@ -1284,7 +1317,6 @@ export function ChatPage() {
           case 'message':
           case 'notice':
           case 'approval_requested':
-          case 'task_list':
           case 'turn_state':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
@@ -1494,8 +1526,10 @@ export function ChatPage() {
 
   // Auto-scroll on transcript append — but only if the user is already
   // parked at the bottom. Otherwise raise the "new messages" pill so
-  // they can opt back in. useLayoutEffect runs before paint so we read
-  // fresh scrollHeight.
+  // they can opt back in — and only when the TAIL actually moved:
+  // scroll-up pagination hands back a new transcript array whose tail is
+  // untouched, and that backfill must not masquerade as new content below.
+  // useLayoutEffect runs before paint so we read fresh scrollHeight.
   //
   // `instant` (the default behavior) not `smooth` — when first landing
   // on a session, the history fetch resolves and React commits the
@@ -1506,12 +1540,19 @@ export function ChatPage() {
   // the bubble grows. The user-initiated `jumpToLatest` (below) keeps
   // smooth — that one IS a discrete "take me there" gesture.
   useLayoutEffect(() => {
+    const signature = transcriptTailSignature(currentView.transcript, {
+      awaitingReply: currentView.awaitingReply,
+      pendingApproval: currentView.pendingApproval !== null,
+      deferred: queue.deferred.length,
+    });
+    const tailMoved = signature !== tailSignatureRef.current;
+    tailSignatureRef.current = signature;
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
     if (pinnedToBottomRef.current) {
       scroller.scrollTop = scroller.scrollHeight;
       setHasNewBelow(false);
-    } else {
+    } else if (tailMoved) {
       setHasNewBelow(true);
     }
   }, [
@@ -2635,6 +2676,7 @@ export function ChatPage() {
                     created_at: new Date().toISOString(),
                     last_active: new Date().toISOString(),
                     unread: 0,
+                    archived: false,
                     pinned: false,
                     folder_id: folderId,
                   },
@@ -2680,7 +2722,7 @@ export function ChatPage() {
     releaseSessionView(id);
     if (sessionId === id) {
       const fallback =
-        sessions.find((s) => s.session_id !== id)?.session_id ??
+        visibleSessions.find((s) => s.session_id !== id)?.session_id ??
         (anchorSessionIdRef.current && anchorSessionIdRef.current !== id
           ? anchorSessionIdRef.current
           : null);
@@ -2692,7 +2734,7 @@ export function ChatPage() {
     }
     setHideSubmitting(false);
     setHidePrompt(null);
-  }, [client, hidePrompt, releaseSessionView, sessionId, sessions]);
+  }, [client, hidePrompt, releaseSessionView, sessionId, visibleSessions]);
 
   // Re-pin the active session's model. The PUT is authoritative — its
   // `last_llm` echo drives the local update, and a live actor (if any)
@@ -2769,6 +2811,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  archived: false,
                   pinned: false,
                 },
                 ...prev,
@@ -2795,7 +2838,7 @@ export function ChatPage() {
     <div className="flex flex-1 overflow-hidden bg-surface min-h-0">
       {/* Session list sidebar (zone 2; the global icon rail is zone 1) */}
       <SessionSidebar
-        sessions={sessions}
+        sessions={visibleSessions}
         activeSessionId={sessionId}
         pendingIds={pendingApprovalIds}
         creating={creating}
@@ -2846,14 +2889,14 @@ export function ChatPage() {
           </div>
         </header>
 
-        <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
+        {/* Positioning context for the floating composer, which is absolute. */}
+        <div className="flex-1 flex flex-col overflow-hidden relative">
         <div className="flex-1 flex justify-center min-h-0 relative">
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
           className="chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
-          <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
               <RiLoader4Line className="text-3xl animate-spin" />
@@ -2966,7 +3009,7 @@ export function ChatPage() {
 
         {/* Floating composer pill (app/mac-style): hovers over the thread
             bottom, centered on the reading column. */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-6 pb-6 xl:pr-[284px]">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-6 pb-6">
           <form
             onSubmit={handleSend}
             className="pointer-events-auto relative w-full max-w-4xl"
@@ -2975,12 +3018,17 @@ export function ChatPage() {
                 gradient (transparent at the top → opaque canvas) makes bubbles
                 fade out as they slide into the composer — fully gone by roughly
                 the pill's middle — while keeping the area below the input clear.
-                Scoped to the form (the band width) so it never paints over the
-                right-hand panel/divider; `-bottom-6` reaches the viewport edge
-                under the pill and `-top-20` lifts the fade-in into the thread. */}
+                Scoped to the form (the band width) rather than the full thread,
+                so it tints only the column the bubbles occupy; `-bottom-6`
+                reaches the viewport edge under the pill and `-top-20` lifts the
+                fade-in into the thread. `-inset-x-2` overhangs the band by 8px
+                because a user bubble is right-aligned to the band edge and its
+                `shadow-brutal-sm` (3px) and pending/failed badge (`-right-1.5`)
+                hang PAST that edge — flush at `inset-x-0` they escape the fade
+                and streak out beside the composer. */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
+              className="pointer-events-none absolute -inset-x-2 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
             />
             {sessionId ? (
               <QueuePanel
@@ -3366,14 +3414,6 @@ export function routeInboundFrame(
           },
         };
       });
-      return;
-    }
-    case 'task_list': {
-      // Idempotent snapshot — REPLACE the session's checklist wholesale
-      // (not a delta). An empty array means the plan is currently empty
-      // and the checklist panel hides.
-      const sid = frame.session_id;
-      setViews((prev) => mergeView(prev, sid, { tasks: frame.tasks }));
       return;
     }
     case 'turn_state': {
@@ -4856,9 +4896,9 @@ function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): Transcr
 }
 
 /** Apply one `subscribe_state` bundle to a session view: REPLACE the
- *  task list and the pending-approval card set wholesale (they are
- *  latest-wins — live frames arriving after the snapshot win by normal
- *  frame order), and apply the turn/work halves unless the caller
+ *  pending-approval card set wholesale (it is latest-wins — live frames
+ *  arriving after the snapshot win by normal frame order), and apply the
+ *  turn/work halves unless the caller
  *  determined they are stale by turn identity (`turnEnded`: this client
  *  already holds a turn-end signal for the SAME turn, matched by
  *  `started_at` — never by ordinal arithmetic, since the coverage
@@ -4871,7 +4911,6 @@ export function applySubscribeState(
   const cards = frame.pending_approvals ?? [];
   let next: SessionView = {
     ...view,
-    tasks: frame.tasks ?? [],
     // The view renders one card at a time; the queue's head is the call
     // the turn is blocked on.
     pendingApproval: cards.length > 0 ? approvalFromCard(frame.session_id, cards[0]) : null,
@@ -4930,6 +4969,11 @@ function formatHttpError(err: unknown): string {
  *
  *  Rules:
  *  * `hidden: true` removes the row (sidebar never shows hidden);
+ *  * `archived` merges like any other field — the row stays in the list
+ *    and `withoutArchived` decides whether it draws. Dropping the row
+ *    instead would leave the sparse unarchive patch (it carries the flag
+ *    and nothing else) with nothing to land on, so a conversation
+ *    unarchived from iOS would not come back until the next refetch;
  *  * a patch for an unknown session_id constructs a row iff it
  *    carries enough fields (currently `created_at` + `last_active`);
  *    a sparse `last_active`-only patch for an unknown session is
@@ -4941,7 +4985,7 @@ function formatHttpError(err: unknown): string {
  *  (a session bumping its activity) cannot reposition the row. This is
  *  deliberate — concurrent replies must not reshuffle the list under the
  *  user. A genuinely new session is prepended (newest first). */
-function applySessionPatch(
+export function applySessionPatch(
   prev: SessionSummary[],
   sessionId: string,
   patch: SessionPatch,
@@ -4970,6 +5014,7 @@ function applySessionPatch(
         created_at: patch.created_at,
         last_active: patch.last_active,
         unread: 0,
+        archived: patch.archived ?? false,
         pinned: patch.pinned ?? false,
         folder_id: patchedFolder,
         title: patch.title,
@@ -4985,19 +5030,23 @@ function applySessionPatch(
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
     unread: current.unread,
+    archived: patch.archived ?? current.archived,
     pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
     folder_id: nextFolderId,
     title: patch.title ?? current.title,
-    // Cron grouping is read off the session's trigger and never changes, so no
-    // patch carries it — but it must survive the merge, or a title/pin patch
-    // would silently drop the row out of its cron group.
+    // No `SessionPatch` carries the cron fields — grouping is read off the
+    // session's trigger, and the group's pin lives on the job — but they must
+    // survive the merge, or a title/pin patch would silently drop the row out
+    // of its cron group, or unpin the group under the user.
     cron_job_id: current.cron_job_id,
     cron_job_title: current.cron_job_title,
+    cron_group_pinned: current.cron_group_pinned,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
+    merged.archived === current.archived &&
     merged.pinned === current.pinned &&
     merged.folder_id === current.folder_id &&
     merged.title === current.title
@@ -5139,8 +5188,14 @@ const MARKDOWN_COMPONENTS: Components = {
   ul: ({ children }) => (
     <ul className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ul>
   ),
-  ol: ({ children }) => (
-    <ol className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ol>
+  // `start` has to be forwarded: CommonMark opens a fresh `<ol start="3">`
+  // whenever a paragraph interrupts a list, and the marker counter reads it off
+  // the element (see `.md-list` in index.css). Dropping it renumbers the rest of
+  // the answer from 1.
+  ol: ({ children, start }) => (
+    <ol start={start} className="md-list my-2 first:mt-0 last:mb-0 space-y-1">
+      {children}
+    </ol>
   ),
   // `leading-relaxed` (not snug) so a tight list's text line-height matches the
   // loose list's paragraph and the `.md-list` marker (which inherits it), keeping
@@ -5204,15 +5259,35 @@ const MARKDOWN_COMPONENTS: Components = {
   td: ({ children }) => <td className="border border-black px-2 py-1">{children}</td>,
 };
 
-const REMARK_PLUGINS = [remarkGfm];
+// GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
+// `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
+// rewritten to dollars by `normalizeMath` before parse. The source is never raw
+// HTML (react-markdown default), so no sanitizer is needed.
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+// `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
+// `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
+// expression, renders the offending source in place rather than throwing — a
+// bad `$...$` must never blank the whole message. That source is colored by an
+// inline style, so the palette token has to be handed in here; the default is a
+// hard-coded red that lands off-palette on the warm canvas.
+const REHYPE_PLUGINS: Options['rehypePlugins'] = [
+  [rehypeKatex, { errorColor: 'var(--color-err)' }],
+];
 
-function MarkdownBody({ text }: { text: string }) {
+/** Assistant prose. Memoized because a streaming turn re-renders its parent per
+ *  frame, and without it every finalized message in the thread would re-parse
+ *  its markdown — and re-run the math normalizer — on each tick. */
+export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   return (
-    <ReactMarkdown components={MARKDOWN_COMPONENTS} remarkPlugins={REMARK_PLUGINS}>
-      {text}
+    <ReactMarkdown
+      components={MARKDOWN_COMPONENTS}
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={REHYPE_PLUGINS}
+    >
+      {normalizeMath(text)}
     </ReactMarkdown>
   );
-}
+});
 
 function AttachmentList({
   attachments,
@@ -5387,7 +5462,14 @@ function MessageBubble({
           ) : null}
         </div>
         {row.createdAt || (!isUser && !row.streaming && body) ? (
-          <div className="mt-1 flex items-center gap-1.5 self-start">
+          // The agent's clock sits at its reply's bottom-left, the user's at its
+          // bubble's bottom-right — each on the side its message is aligned to.
+          // The user's is pulled in from the bubble's right edge rather than left
+          // hanging on the corner; the agent's reply is borderless prose already
+          // flush at the band's left, so it needs no inset.
+          <div
+            className={`mt-1 flex items-center gap-1.5 ${isUser ? 'self-end mr-2' : 'self-start'}`}
+          >
             {row.createdAt ? (
               <span
                 className="font-mono text-[0.65rem] text-ink-soft tabular-nums"

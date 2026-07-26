@@ -127,9 +127,7 @@ struct ComposerView: View {
             // Borderless pill (ChatGPT-style): over the thread's blank white
             // at-rest strip the untinted glass is nearly invisible, so a soft
             // ambient shadow carries the boundary instead of a hairline.
-            .glassEffect(
-                .regular.tint(Theme.paper.opacity(0.25)), in: .rect(cornerRadius: 24)
-            )
+            .glassSurface(tint: Theme.paper.opacity(0.25), in: .rect(cornerRadius: 24))
             .shadow(color: Theme.ink.opacity(0.08), radius: 14, y: 4)
             // At rest the pill holds a moderate width; focus stretches it out
             // toward the screen edges — a small gutter stays — on the

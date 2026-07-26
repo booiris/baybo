@@ -25,7 +25,8 @@
 use std::sync::Arc;
 
 use baybo_context::{
-    BackgroundSummaryConfig, BackgroundSummaryOutcome, Tokenizer, run_background_summary,
+    BackgroundSummaryConfig, BackgroundSummaryOutcome, ContextError, Tokenizer,
+    run_background_summary,
 };
 use baybo_llm::{Attribution, BillableLlm, ModelInfo};
 use baybo_model::{BackgroundCompressionPayload, JobId, SessionId};
@@ -199,10 +200,15 @@ impl BackgroundCompressionRunner {
     /// Execute one background-summary pass. Adapts the agent-layer
     /// `CompressionRunner` to the context callback shape and delegates
     /// the rest of the flow to [`baybo_context::run_background_summary`].
+    ///
+    /// The error stays a typed [`ContextError`] rather than collapsing into
+    /// `anyhow`: the caller distinguishes
+    /// [`ContextError::UnproductiveSummary`] (back off — the model declined
+    /// to write) from a transient LLM failure (retry freely).
     pub async fn run(
         self,
         payload: BackgroundCompressionPayload,
-    ) -> anyhow::Result<BackgroundSummaryOutcome> {
+    ) -> Result<BackgroundSummaryOutcome, ContextError> {
         let BackgroundCompressionRunner {
             llm_client,
             security_gateway,
@@ -257,9 +263,7 @@ impl BackgroundCompressionRunner {
             model_id,
             cancel_token: tool_cancel,
         };
-        run_background_summary(config, chat)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
+        run_background_summary(config, chat).await
     }
 }
 

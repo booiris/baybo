@@ -794,7 +794,10 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
                 span_id: String::new(),
                 error_count: 0,
             });
-        entry.cursor = cursor;
+        // Monotonic, matching the sqlite store's `MAX(...)`: a late-landing
+        // pass must not drag the cursor back onto an ordinal a compaction
+        // already superseded.
+        entry.cursor = entry.cursor.max(cursor);
         entry.pass_count += 1;
         entry.cost_micros += cost_micros_delta;
         entry.model_id = model_id.to_string();

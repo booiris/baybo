@@ -27,7 +27,8 @@ use std::time::Duration;
 use baybo_agent::SessionManager;
 use baybo_agent::compression::reap_orphan_summaries;
 use baybo_context::{
-    BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
+    BackgroundSummaryConfig, ContextError, SummaryChatRun, TiktokenTokenizer,
+    run_background_summary,
 };
 use baybo_integration_tests::AgentTestHarness;
 use baybo_job::{Job, JobStore};
@@ -132,6 +133,48 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     assert_eq!(row.cursor, 60);
     assert_eq!(row.pass_count, 2);
     assert_eq!(row.cost_micros, 12_346);
+}
+
+/// `cursor` advances monotonically. A pass pins `up_to_ordinal` at trigger
+/// time but lands its row seconds to minutes later; a compaction inside that
+/// window supersedes every row the pass covered and re-points the cursor onto
+/// the freshly inserted continuation-summary row. A plain assignment would
+/// then drag the cursor *back* onto a superseded ordinal, which
+/// `lookup_anchor_index_for_cursor` cannot resolve — so `tokens_since_anchor`
+/// reads the whole transcript, the diff gate is satisfied forever, and the
+/// fast path stays dead. 16 of 30 rows in the live install are in exactly
+/// that state.
+#[tokio::test]
+async fn summary_cursor_never_moves_backwards() {
+    let (store, _dir) = fresh_store_and_paths().await;
+    let session = root_session("user-monotonic");
+    store.session.save(&session).await.unwrap();
+
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    );
+
+    // A compaction re-pointed the cursor forward onto the new summary row...
+    mgr.record_summary_success(&session.id, 240, 10, "m", "span-repoint", Utc::now())
+        .await
+        .unwrap();
+
+    // ...and only now does the pass that pinned ordinal 233 finish.
+    mgr.record_summary_success(&session.id, 233, 10, "m", "span-late", Utc::now())
+        .await
+        .unwrap();
+
+    let row = mgr.summary_metadata(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        row.cursor, 240,
+        "the late pass must not walk the cursor back"
+    );
+    // Everything else still records the late pass.
+    assert_eq!(row.pass_count, 2);
+    assert_eq!(row.cost_micros, 20);
+    assert_eq!(row.span_id, "span-late");
 }
 
 /// Build a deterministic background-summary chat callback that, on its
@@ -304,6 +347,57 @@ fn fake_edit_then_thrash(
             } else {
                 "irrelevant"
             };
+            let mut tool_calls = vec![ToolCallInfo {
+                id: format!("edit-{n}"),
+                name: "Edit".into(),
+                arguments: serde_json::json!({
+                    "file_path": notes_path.display().to_string(),
+                    "old_string": SEEDED_WORKLOG_MARKER,
+                    "new_string": new_string,
+                }),
+                signature: None,
+            }];
+            if n == 0 {
+                // Pair the landing edit with a Read so the round isn't
+                // "every call a clean Edit" — otherwise the converge
+                // short-circuit ends the pass here and the thrash rounds this
+                // test exists to exercise never run.
+                tool_calls.push(ToolCallInfo {
+                    id: "read-0".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({
+                        "file_path": notes_path.display().to_string(),
+                    }),
+                    signature: None,
+                });
+            }
+            let response = LlmResponse {
+                content: String::new(),
+                content_blocks: vec![],
+                tool_calls,
+                usage: TokenUsage::default(),
+                thinking: None,
+            };
+            Ok(SummaryChatRun {
+                response,
+                span_id: format!("span-{n}"),
+                cost_micros: 100,
+            })
+        })
+    })
+}
+
+/// A model whose every `Edit` fails: no round ever lands a change, so
+/// `summary.md` is still the untouched scaffold when the pass gives up.
+fn fake_always_failing_edit(
+    notes_path: std::path::PathBuf,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> baybo_context::BackgroundSummaryCallback {
+    use std::sync::atomic::Ordering;
+    Box::new(move |_req, _marker| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let notes_path = notes_path.clone();
+        Box::pin(async move {
             let response = LlmResponse {
                 content: String::new(),
                 content_blocks: vec![],
@@ -312,8 +406,8 @@ fn fake_edit_then_thrash(
                     name: "Edit".into(),
                     arguments: serde_json::json!({
                         "file_path": notes_path.display().to_string(),
-                        "old_string": SEEDED_WORKLOG_MARKER,
-                        "new_string": new_string,
+                        "old_string": "text that is not anywhere in the notes file",
+                        "new_string": "never lands",
                     }),
                     signature: None,
                 }],
@@ -327,6 +421,204 @@ fn fake_edit_then_thrash(
             })
         })
     })
+}
+
+/// A round where every call was an `Edit` and every one applied ends the pass
+/// immediately. The prompt asks for exactly that shape ("make all Edit tool
+/// calls in parallel in a single message", "stop"), and the only thing another
+/// turn can return is the empty tool-call reply that would break the loop —
+/// which costs a full ~145K-token transcript re-send to receive ~500 output
+/// tokens. Across the live install that confirmation turn was 33% of all
+/// background-summary input for 8% of the output.
+#[tokio::test]
+async fn background_pass_stops_without_a_confirmation_turn_when_every_edit_lands() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-clean-edits");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    ));
+
+    let up_to_ordinal = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::user(vec![ContentBlock::Text("summarize this".into())]),
+        )
+        .await
+        .unwrap();
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+
+    // `fake_edit_then_stop` would happily serve a second turn; the pass must
+    // not ask for one.
+    let outcome = run_background_summary(config, fake_edit_then_stop(notes_path.clone()))
+        .await
+        .expect("a landed edit is a successful pass");
+
+    assert_eq!(outcome.cursor, up_to_ordinal);
+    let body = tokio::fs::read_to_string(&notes_path).await.unwrap();
+    assert!(
+        body.contains(PASS_SUMMARY_TEXT),
+        "the edit must have landed"
+    );
+    let meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(meta.pass_count, 1);
+    assert_eq!(
+        outcome.cost_micros, 100,
+        "exactly one billed call — a second would double this"
+    );
+}
+
+/// Once the model has attempted an `Edit` it has already composed what it
+/// wants to write, so retry rounds drop the transcript from the wire: the
+/// content lives in the model's own prior turn, and the file's current bytes
+/// can only come from a fresh `Read` anyway. The pinned transcript is the
+/// entire cost of the pass, and it was being re-sent verbatim every iteration.
+#[tokio::test]
+async fn retry_rounds_do_not_resend_the_transcript() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-elide");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    ));
+
+    let marker = "UNIQUE-TRANSCRIPT-MARKER-9f3a";
+    let mut up_to_ordinal = 0;
+    for i in 0..3 {
+        up_to_ordinal = mgr
+            .append_session_message(
+                &parent.id,
+                &ChatMessage::user(vec![ContentBlock::Text(format!("{marker} turn {i}"))]),
+            )
+            .await
+            .unwrap();
+    }
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+
+    // Record, per call, whether the transcript marker was on the wire.
+    let saw_marker: Arc<parking_lot::Mutex<Vec<bool>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&saw_marker);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = fake_always_failing_edit(notes_path.clone(), Arc::clone(&calls));
+    let mut inner = inner;
+    let probing: baybo_context::BackgroundSummaryCallback = Box::new(move |req, m| {
+        let present = req.messages.iter().any(|msg| {
+            msg.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(marker)))
+        });
+        recorder.lock().push(present);
+        inner(req, m)
+    });
+
+    let _ = run_background_summary(config, probing).await;
+
+    let seen = saw_marker.lock().clone();
+    assert_eq!(seen.len(), 3, "three rounds: one full, two retries");
+    assert!(
+        seen[0],
+        "the first call must carry the transcript — it is the source material"
+    );
+    assert!(
+        !seen[1] && !seen[2],
+        "retry rounds must not re-send it, got {seen:?}"
+    );
+}
+
+/// A pass that lands NO `Edit` must NOT advance the cursor. The notes file is
+/// byte-identical to what the pass found, so it still covers only what the
+/// previous pass covered; recording success here would let the compressor's
+/// fast path later swap a content-free scaffold in for the transcript and
+/// silently drop every message in the gap. Observed in production on
+/// `a4e1ebf3` (2026-07-22): four consecutive no-edit passes walked the cursor
+/// 187 → 223, then a compaction replaced 234 messages with the empty scaffold.
+#[tokio::test]
+async fn background_pass_that_lands_no_edit_does_not_advance_the_cursor() {
+    let (store, dir) = fresh_store_and_paths().await;
+    let parent = root_session("parent-no-edit");
+    store.session.save(&parent).await.unwrap();
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    ));
+
+    let up_to_ordinal = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::user(vec![ContentBlock::Text("summarize this".into())]),
+        )
+        .await
+        .unwrap();
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let err = run_background_summary(
+        config,
+        fake_always_failing_edit(notes_path.clone(), Arc::clone(&calls)),
+    )
+    .await
+    .expect_err("a pass that wrote nothing must not report success");
+
+    assert!(
+        matches!(err, ContextError::UnproductiveSummary(_)),
+        "the caller backs off on this variant specifically, got: {err:?}"
+    );
+
+    // Still bails on MAX_UNPRODUCTIVE_SUMMARY_ROUNDS rather than the hard cap.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    let meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(
+        meta.cursor, 0,
+        "cursor must stay put — summary.md covers nothing"
+    );
+    assert_eq!(meta.pass_count, 0, "no pass succeeded");
+    assert_eq!(meta.error_count, 1, "the wasted pass must be visible");
 }
 
 /// A model that keeps calling tools but stops making progress must NOT burn

@@ -1,9 +1,10 @@
 import type { TFunction } from "i18next";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clampVideoRatio,
   formatBytes,
   formatTime,
+  formatTimestampShort,
   isVideoAttachment,
   ordinalFromMessageId,
   rowOrdinal,
@@ -52,6 +53,36 @@ describe("formatTime", () => {
     [-5, "0:00"],
   ])("%i s → %s", (seconds, expected) => {
     expect(formatTime(seconds)).toBe(expected);
+  });
+});
+
+/// Built from LOCAL date parts, since the formatter reads the local clock — a
+/// UTC literal would drift into the previous/next day on a runner east or west
+/// of the fixture's assumption.
+function localIso(y: number, mo: number, d: number, h: number, mi: number): string {
+  return new Date(y, mo - 1, d, h, mi).toISOString();
+}
+
+describe("formatTimestampShort", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("shows only HH:MM for a message from today — the date would be noise under every bubble", () => {
+    vi.useFakeTimers().setSystemTime(new Date(2026, 6, 23, 18, 30));
+    expect(formatTimestampShort(localIso(2026, 7, 23, 9, 5))).toBe("09:05");
+  });
+
+  it("prefixes MM-DD once the row is from another day, so a long thread stays readable", () => {
+    vi.useFakeTimers().setSystemTime(new Date(2026, 6, 23, 0, 30));
+    expect(formatTimestampShort(localIso(2026, 7, 22, 23, 59))).toBe("07-22 23:59");
+  });
+
+  it("is not fooled by the same day-of-month a year earlier", () => {
+    vi.useFakeTimers().setSystemTime(new Date(2026, 6, 23, 12, 0));
+    expect(formatTimestampShort(localIso(2025, 7, 23, 12, 0))).toBe("07-23 12:00");
+  });
+
+  it("renders nothing for an unparseable stamp rather than 'Invalid Date'", () => {
+    expect(formatTimestampShort("not a time")).toBe("");
   });
 });
 

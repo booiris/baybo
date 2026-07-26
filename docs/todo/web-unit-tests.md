@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **15 files, 194 tests** — and the conventions that
+The dashboard's vitest suite — **20 files, 293 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -19,12 +19,21 @@ decision out of the component (see the extraction pattern below) and test it as
 data. `vitest.config.ts` runs under `jsdom` so a module under test can transitively
 import JSX without a transform error.
 
-A **small React Testing Library layer** covers the two queue surfaces whose
-behaviour lives in the wiring/DOM — `pages/chat/queueStore.test.tsx` (`renderHook`
-over the store) and `pages/chat/QueuePanel.test.tsx` (`render` + `user-event`).
+A **small React Testing Library layer** covers the surfaces whose behaviour lives
+in the wiring/DOM — `pages/chat/queueStore.test.tsx` (`renderHook` over the store),
+`pages/chat/QueuePanel.test.tsx` (`render` + `user-event`), and
+`pages/chatMarkdown.test.tsx` (`render` over `MarkdownBody`: no pure-function test
+can prove the remark/rehype plugins are actually attached to `<ReactMarkdown>`).
 Reach for it only when the behaviour cannot be reduced to a pure function: a render
 test carries a mock surface, `localStorage`, and per-test cleanup, and is slower
 than a reducer test.
+
+Two files assert on **source text** rather than behaviour, because nothing else can
+see the invariant: `pages/chatMarkdown.test.tsx` pins the `katex.min.css` import in
+`main.tsx` (drop it and every equation silently renders twice — jsdom applies no
+stylesheets), and `pages/chat/mathDelimiters.port.test.ts` pins the math normalizer
+byte-identical to its `app/ios/web` original, which no CI job runs. Use the shape
+sparingly; it is for invariants that live between files, not inside one.
 
 Why the split matters: the pure layer alone cannot see a **wiring** bug — a
 conditional that never fires, `{count && <Badge/>}` printing a literal `0`, a
@@ -149,7 +158,10 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/chat/outboxStore.test.ts` (6) | `outboxStore.ts` — `OutboxStore`, `dueForBlindResend`, `resendExhausted` | Two-stage confirm (echo→sent→durable-release), blind-resend window + cap, rebase-unknown park/resume, sticky-failed + manual retry, reload persistence. |
 | `pages/chat/searchSnippet.test.ts` (12) | `searchSnippet.ts` — `queryChunks`, `snippet` | Transcript-search excerpt: AND-tokenize the query the way the server does, build the highlighted segment run. |
 | `pages/chat/syncCursor.test.ts` (5) | `syncCursor.ts` — `advanceFromSync`, `advanceFromLive`, `INITIAL_CURSOR` | Cursor is max-wins (never regresses) with a rebase-dirty flag. |
-| `pages/chat/sessionBuckets.test.ts` (15) | `sessionBuckets.ts` — `bucketSessions`, `resolveCollapsed`, `cronCollapseKey`, `cronGroupUnread`, `collapsedByDefault` | Sidebar folder/cron grouping, collapse defaults + override, per-group unread rollup. |
+| `pages/chat/sessionBuckets.test.ts` (20) | `sessionBuckets.ts` — `bucketSessions`, `withoutArchived`, `resolveCollapsed`, `cronCollapseKey`, `cronGroupUnread`, `collapsedByDefault` | Sidebar folder/cron grouping, collapse defaults + override, per-group unread rollup, and archived rows dropped ahead of every other rule (fed raw, so the bucketer itself is the guard). |
+| `pages/chat/mathDelimiters.test.ts` (14) | `mathDelimiters.ts` — `normalizeMath` | Assistant LaTeX normalized for `remark-math`: prose money stays literal, AMS `\(…\)`/`\[…\]` rewritten, own-line `$$` promoted (never inside a list/table), code masked, no super-linear time. Ported verbatim from `app/ios/web`. |
+| `pages/chat/mathDelimiters.port.test.ts` (2) | the two `mathDelimiters` copies | The web copy stays byte-identical to its `app/ios/web` original past the header — the only gate on a module duplicated across two pnpm projects. |
+| `pages/sessionPatch.test.ts` (6) | `ChatPage.tsx` — `applySessionPatch` | Archive merges in place (the row stays in state so a sparse unarchive patch has something to land on) while `hidden` still removes the row; cron grouping + group pin survive an unrelated patch. |
 | `pages/composerSend.test.ts` (6) | `ChatPage.tsx` — `decideComposerAction` | send / park / stop / noop rule; a non-empty queue never stalls an idle submit (the regression). |
 | `pages/slashCompletion.test.ts` (8) | `ChatPage.tsx` — `applySlashCompletion`, `caretOnSlashToken` | Slash Tab-completion replaces the command token, lands the caret past the trailing space, preserves args. |
 | `pages/syncApply.test.ts` (6) | `ChatPage.tsx` — `transcriptItemToRow`, `applySyncMerge`, `applySyncReplace` | Row keying by server id; REPLACE re-overlays an unconfirmed optimistic send; MERGE appends + reconciles by `platform_msg_id`, no dup bubbles. |
@@ -160,6 +172,7 @@ says `pass`, not `skipping`, before trusting it.
 | `types/trace.test.ts` (3) | `types/trace.ts` — `resolveToolCallOutput` | Resolve a tool-call's output from the persisted result row by `tool_use_id`. |
 | `pages/chat/queueStore.test.tsx` (9) · **render** | `queueStore.tsx` — `QueueProvider`, `useSessionQueue`, `useQueueStore` | `renderHook` over the store: FIFO append, synchronous `clearPause`→`popTop` compose, `normalize` pause-collapse, reorder, defer/restore, localStorage round-trip, cross-tab `storage` ingest. |
 | `pages/chat/QueuePanel.test.tsx` (8) · **render** | `QueuePanel.tsx` | `render` + `user-event`: empty-queue renders null, rows in order, send/delete callbacks, inline edit (save on Enter / revert on Esc), cancelled vs error pause banner + "Send remaining". |
+| `pages/chatMarkdown.test.tsx` (14) · **render** | `ChatPage.tsx` — `MarkdownBody` | The math pipeline end to end (normalize → remark-math → rehype-katex → KaTeX): inline vs display, both delimiter styles, money left literal, a malformed formula colored from the palette instead of throwing, list/table structure intact, and the `katex.min.css` import itself. Also that `<ol start>` survives the component overrides — the marker counter reads it off the element, and jsdom computes no counters, so the attribute is the only half of that the suite can see. |
 
 ## Adding a test — the recipe
 

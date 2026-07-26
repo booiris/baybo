@@ -34,11 +34,30 @@ pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 /// by the time compression hits the fast-path swap-in.
 pub const SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO: f64 = 0.5;
 
-/// Minimum new tokens (`tokens_since_anchor`) since the last summary
-/// pass before the trigger gate fires. Quality-first design tolerates
-/// frequent passes; this gate just suppresses spurious refreshes
-/// after barely-anything has changed.
-pub const SUMMARY_DIFF_TOKEN_THRESHOLD: usize = 5_000;
+/// Floor for the minimum new tokens (`tokens_since_anchor`) since the last
+/// summary pass before the trigger gate fires. The effective threshold is
+/// `max(this, SUMMARY_DIFF_CONTEXT_RATIO × max_tokens)` — see
+/// [`summary_diff_threshold`]; this floor only binds on small context
+/// windows.
+pub const SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR: usize = 5_000;
+
+/// Fraction of the active context window that must accumulate since the last
+/// pass before another one is worth its cost.
+///
+/// An absolute floor doesn't scale: the pass re-sends the whole transcript, so
+/// its cost grows with the window while the admission price stays fixed. On a
+/// 272K window the background trigger opens at 136K (0.5×) and compression
+/// only fires at ~177K (0.65×), leaving a ~41K band that a 5K threshold lets a
+/// session cross in up to eight passes — each one re-sending ~145K tokens to
+/// absorb ~30 new messages. Tying admission to the window keeps the ratio of
+/// "new material" to "tokens spent looking at it" constant.
+pub const SUMMARY_DIFF_CONTEXT_RATIO: f64 = 0.1;
+
+/// Effective diff threshold for the background-summary trigger's clause (b).
+pub fn summary_diff_threshold(max_tokens: usize) -> usize {
+    SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
+        .max((max_tokens as f64 * SUMMARY_DIFF_CONTEXT_RATIO) as usize)
+}
 
 /// Disjunctive clause's tool-call half: how many tool_use blocks
 /// past the anchor before the end-of-iteration trigger fires
@@ -1212,8 +1231,8 @@ impl ContextManager {
     /// `cursor`. That's the right anchor for `tokens_since_anchor`
     /// because `cursor` is the highest ordinal already covered by
     /// the summary; counting it as "new growth" would let a single
-    /// heavy tool_result message immediately blow past
-    /// `SUMMARY_DIFF_TOKEN_THRESHOLD` and retrigger a fresh pass
+    /// heavy tool_result message immediately blow past the
+    /// [`summary_diff_threshold`] gate and retrigger a fresh pass
     /// after a successful one just landed. Returns `None` when the
     /// cursor's ordinal isn't in the active set (compression has
     /// rewritten that message away) or the lookup fails.
@@ -1360,7 +1379,7 @@ impl ContextManager {
         }
 
         let tokens_since = self.tokens_since_anchor();
-        if tokens_since <= SUMMARY_DIFF_TOKEN_THRESHOLD {
+        if tokens_since <= summary_diff_threshold(max_tokens) {
             return None;
         }
 
@@ -1861,6 +1880,46 @@ mod frame_recalled_memories_tests {
             matches!(&out[0].content[0], ContentBlock::Text(t) if t.contains("snippet about X"))
         );
         assert_eq!(out[0].content[1], img);
+    }
+}
+
+#[cfg(test)]
+mod summary_diff_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn scales_with_the_context_window() {
+        // 272K window (gpt-5.x): a pass costs ~145K tokens to run, so
+        // admitting one for 5K of new material was the frequency bug.
+        assert_eq!(summary_diff_threshold(272_000), 27_200);
+        assert_eq!(summary_diff_threshold(1_000_000), 100_000);
+    }
+
+    #[test]
+    fn floor_binds_on_small_windows() {
+        assert_eq!(
+            summary_diff_threshold(8_000),
+            SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
+        );
+        assert_eq!(
+            summary_diff_threshold(0),
+            SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
+        );
+    }
+
+    /// The gate must stay reachable: the band between the background trigger
+    /// (0.5×) and compression (0.65×) has to fit at least one pass, or
+    /// `summary.md` would never refresh before the compaction that consumes it.
+    #[test]
+    fn threshold_fits_inside_the_trigger_to_compaction_band() {
+        let max = 272_000;
+        let band = (max as f64 * 0.65) as usize
+            - (max as f64 * SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
+        assert!(
+            summary_diff_threshold(max) < band,
+            "threshold {} must fit in the {band}-token band",
+            summary_diff_threshold(max)
+        );
     }
 }
 
@@ -2632,6 +2691,88 @@ mod tests {
             ),
             "cursor must land on the continuation-summary row, got {:?}",
             ctx.messages()[idx].content
+        );
+    }
+
+    /// A `summary.md` that is still the untouched scaffold covers nothing, so
+    /// the fast path must refuse it and fall through to the LLM stage — even
+    /// though the metadata row claims coverage and the assembly is *well*
+    /// under the fall-through budget (an empty summary is the cheapest thing
+    /// that could be swapped in, which is exactly why size alone can't gate
+    /// this). Regression guard for the 2026-07-22 `a4e1ebf3` incident, where
+    /// 234 messages were replaced by the bare scaffold.
+    #[tokio::test]
+    async fn fast_path_refuses_a_contentless_summary_file() {
+        let workspace_root = tempfile::tempdir().expect("tempdir");
+        let sessions = test_sessions();
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
+                workspace_root.path().to_path_buf(),
+            )),
+            keep_recent: 2,
+            compression_threshold: 0.2,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: Arc::clone(&sessions),
+            subagent_profile: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        let big = "x".repeat(8_000);
+        let mut cursor_seed = 0;
+        for i in 0..14 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let ordinal = ctx
+                .append(&make_msg(role, &format!("m{i} {big}")))
+                .await
+                .expect("persisted append");
+            if i == 9 {
+                cursor_seed = ordinal;
+            }
+        }
+
+        let summary_path = ctx.workspace.session_summary_file(ctx.session_id.as_str());
+        tokio::fs::create_dir_all(summary_path.parent().expect("dir"))
+            .await
+            .expect("summary dir");
+        tokio::fs::write(
+            &summary_path,
+            crate::background_summary::DEFAULT_NOTES_TEMPLATE,
+        )
+        .await
+        .expect("write summary.md");
+        sessions
+            .record_summary_success(
+                &ctx.session_id,
+                cursor_seed,
+                0,
+                "m",
+                "s",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        // `err_chat` proves stage 2 was actually reached: had the fast path
+        // served the scaffold, no chat call would fire at all.
+        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        let scaffold_marker = "_What is actively being worked on right now?";
+        assert!(
+            !ctx.messages().iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(scaffold_marker)))),
+            "the empty scaffold must never reach the transcript"
         );
     }
 
@@ -3802,7 +3943,7 @@ mod tests {
     }
 
     /// A heavy cursor message must not, by itself, push
-    /// `tokens_since_anchor` past `SUMMARY_DIFF_TOKEN_THRESHOLD`. The
+    /// `tokens_since_anchor` past [`summary_diff_threshold`]. The
     /// cursor message is already covered by the summary, so right
     /// after a successful background pass the diff measure should be
     /// 0 — otherwise a single big tool_result re-fires the gate even
@@ -3850,6 +3991,46 @@ mod tests {
             Some(pre_len),
             "anchor must not move when cursor is unmapped"
         );
+    }
+
+    /// An unproductive pass re-arms the diff gate by anchoring on the ordinal
+    /// it *attempted*, even though the summary cursor stays put. Without this
+    /// the pass advances neither cursor nor anchor, so
+    /// `tokens_since_anchor` keeps reading the whole transcript and clause (b)
+    /// of the trigger is satisfied on the very next boundary — a tight retry
+    /// loop re-sending ~145K tokens to a model that just declined to write.
+    /// This is what replaced the wall-clock backoff: the debounce rides the
+    /// same work-proportional measure a successful pass leaves behind.
+    #[tokio::test]
+    async fn anchoring_on_an_unproductive_pass_rearms_the_diff_gate() {
+        // 200K window → 20K diff threshold; four ~10K-token messages clear it.
+        let mut ctx = make_ctx(5, 200_000, 0.75);
+        for i in 0..4 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(40_000)),
+            ))
+            .await;
+        }
+        let attempted = 3;
+
+        // Before: no anchor, so the gate sees the entire transcript and a
+        // retry would fire immediately.
+        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
+
+        // The pass came back empty — the cursor must NOT move, but the work
+        // mark must, because the pass was paid for.
+        ctx.sync_anchor_to_cursor(attempted).await;
+        assert_eq!(
+            ctx.tokens_since_anchor(),
+            0,
+            "material the failed pass already read must not re-admit a retry"
+        );
+
+        // Only genuinely new material past the attempted ordinal re-opens it.
+        ctx.append(&make_msg(Role::User, &"y".repeat(120_000)))
+            .await;
+        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
     }
 
     /// Sync is monotonic — it never moves the anchor backward, so a

@@ -75,8 +75,8 @@ DBs created before the 2026-07 unused-column audit may additionally carry two or
 Two checkpoints in the session's `AgentLoop`, both gated by a 3-way conjunction:
 
 ```
-fire_summary = tokens_now > 0.5 × max_tokens                  (a)
-            && tokens_since_anchor > 5_000                     (b)
+fire_summary = tokens_now > 0.5 × max_tokens                   (a)
+            && tokens_since_anchor > summary_diff_threshold()  (b)
             && (tool_calls_since_anchor > 3 || job_done)       (c+d)
 ```
 
@@ -92,6 +92,12 @@ The threshold evaluation itself lives in `ContextManager::maybe_request_backgrou
 **Subagent lineage skip.** Before either gate is measured, `maybe_run_background_compression` returns early for `is_subagent(session)` (`LineageKind::Subagent`). A subagent runs one spawned task to completion and is never resumed, so a precomputed `summary.md` — which only ever feeds a *future* inline compaction of the *same* session — can't pay off; the pass would spend an agentic Read/Edit loop (a runaway one when the model won't converge on the empty-tool-call turn) writing a summary nothing reads. Root `User`/`Cron` sessions still run it.
 
 `up_to_ordinal` is pinned at trigger time to the **latest** `session_messages.ordinal` (`SessionManager::latest_session_ordinal`) so concurrent appends made while the pass runs don't bleed into its input window. The pass loads only the active rows at or below that ordinal.
+
+**Anchor vs cursor.** These are deliberately different things, and conflating them is what made an unproductive pass re-fire immediately. `session_summaries.cursor` is a *coverage claim* — the newest ordinal `summary.md` actually describes — so a pass that landed no `Edit` must not advance it. `last_summary_anchor` is a *work mark* — how much new material has piled up since we last spent a pass on this session — and an unproductive pass did spend one; it just came back empty. Because the anchor was only ever synced from the cursor, such a pass advanced neither, leaving clause (b) permanently satisfied.
+
+So an unproductive pass publishes its attempted `up_to_ordinal` to the `AgentLoop`, which `sync_anchor_to_cursor`s the anchor onto it before the next gate evaluation. The retry then has to clear the same work-proportional bar a successful pass leaves behind. There is no wall-clock component anywhere in the trigger: frequency is bounded by how much the session produced, not by how long it took to produce it, which is the only dimension that scales with what a pass costs. A transient LLM failure is deliberately *not* charged this way — it produced no work, and the documented behaviour is to retry it freely.
+
+**Diff threshold (clause b)** is `max(SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR, SUMMARY_DIFF_CONTEXT_RATIO × max_tokens)` (`summary_diff_threshold`). A fixed absolute floor doesn't scale: the pass re-sends the whole transcript, so its cost grows with the window while the admission price stays put. On a 272K window the 5K floor let a session cross the 41K band between the background trigger and compaction in up to eight passes, each re-sending ~145K tokens to absorb ~30 new messages.
 
 Before measuring the anchor-relative clauses (b) and (c), the gate reads `session_summaries.cursor` and calls `sync_anchor_to_cursor(meta.cursor)` to pull the in-memory anchor forward to the last successful pass. Without this, a session that crossed the 50% mark once would re-fire the background path on every later job until inline compression eventually reset the anchor. `sync_anchor_to_cursor` is monotonic (never retreats) and a no-op when the cursor isn't in the current active set.
 
@@ -163,18 +169,22 @@ Key properties:
 4. Append the session-notes prompt after the transcript (`build_summary_prompt`: `PROMPT_TEMPLATE` with `{{notesPath}}` / `{{currentNotes}}` substituted, plus the size-budget appendices — see Appendix A).
 5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. A **failed `Edit`** carries `FAILED_EDIT_RETRY_GUIDANCE`, which tells the model to `Read` the notes file and re-`Edit`: the prompt embeds the file once, and once an earlier `Edit` lands that snapshot is stale, so a model that dribbles edits across turns keeps missing on `old_string not found`. The prompt embeds the notes and asks for parallel `Edit`s; `Read` stays available for exactly this recovery. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session.
 
-   The loop terminates on the **first** of three conditions: (a) the model responds without tool calls (the happy path — the prompt asks for parallel edits in one message then stop); (b) **converge-or-stop** — `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS` = 3 consecutive rounds issue tool calls but land no successful `Edit` (only `Read`s, or `Edit`s that all errored), meaning the model is thrashing and re-sending the whole transcript for nothing; both (a) and (b) fall through to `record_summary_success` (the edits that landed are kept, cursor advances); (c) the hard cap `MAX_BACKGROUND_SUMMARY_ITERATIONS`, which is pathological non-termination and instead `record_summary_failure`s. A "productive" round is detected by reading the `ERROR:`-prefix convention back off the `Edit` tool_result. The tolerance of 3 covers the intended recovery — a failed `Edit`, then a `Read` to refresh, then a corrected `Edit` — which spends two no-progress rounds before landing. Without (b), a model that never emits an empty-tool-call turn burns all 10 iterations — each re-sending the full (~100K+ token) transcript — before failing.
-6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
+   The loop terminates on the **first** of four conditions: (a) the model responds without tool calls; (a′) **converge short-circuit** — every call in the round was an `Edit` and every one applied, which is exactly the shape the prompt asks for ("all Edit tool calls in parallel in a single message", then stop). Taking the model at its word there is what makes (a) rare: the confirmation turn it replaces costs a full transcript re-send to receive ~500 output tokens, and measured 33% of all background-summary input for 8% of the output. A round that mixed in a `Read`, or whose `Edit` errored, is still mid-recovery and gets its next turn; (b) **converge-or-stop** — `MAX_UNPRODUCTIVE_SUMMARY_ROUNDS` = 3 consecutive rounds issue tool calls but land no successful `Edit` (only `Read`s, or `Edit`s that all errored), meaning the model is thrashing and re-sending the whole transcript for nothing; (c) the hard cap `MAX_BACKGROUND_SUMMARY_ITERATIONS`, which is pathological non-termination and `record_summary_failure`s.
+
+   Whichever way the loop exits, the pass is a **success only if at least one `Edit` landed** (`applied_any_edit`). Exits (a) and (b) with no `Edit` applied left `summary.md` byte-identical to what the pass found, so the file still covers only what the *previous* cursor covered: advancing to `up_to_ordinal` there would claim coverage the file does not have, and stage 1 would later swap that summary in and silently drop every message in the gap. Such a pass instead `record_summary_failure`s (cursor untouched) and returns `ContextError::UnproductiveSummary`, on which the agent loop advances the in-memory anchor to the attempted ordinal (see **Anchor vs cursor** above) — without that, the un-advanced cursor leaves the diff gate satisfied and the pass re-fires on the very next boundary. A "productive" round is detected by reading the `ERROR:`-prefix convention back off the `Edit` tool_result. The tolerance of 3 covers the intended recovery — a failed `Edit`, then a `Read` to refresh, then a corrected `Edit` — which spends two no-progress rounds before landing. Without (b), a model that never emits an empty-tool-call turn burns all 10 iterations — each re-sending the full (~100K+ token) transcript — before failing.
+6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper). `cursor` is `MAX()`'d rather than assigned: the pass pinned `up_to_ordinal` at trigger time but lands this row seconds to minutes later, and a compaction in that window supersedes every row it covered and `repoint_cursor`s onto the new continuation-summary row. A plain assignment drags the cursor back onto a superseded ordinal, which `lookup_anchor_index_for_cursor` can't resolve — so `tokens_since_anchor` reads the whole transcript, clause (b) is satisfied forever, and the fast path stays dead until the next pass lands. Ordinals are append-only, so the later pointer is always the live one; the condition self-heals on the next successful pass:
    ```sql
    INSERT INTO session_summaries
        (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count)
    VALUES (?, ?, 1, ?, ?, ?, ?, 0)
    ON CONFLICT(session_id) DO UPDATE SET
-       cursor = excluded.cursor,
+       cursor = MAX(session_summaries.cursor, excluded.cursor),
        pass_count = session_summaries.pass_count + 1,
        cost_micros = session_summaries.cost_micros + excluded.cost_micros,
        error_count = 0, …;
    ```
+   **Transcript elision on retry rounds.** The pinned transcript is essentially the whole cost of a pass (~145K tokens) and was re-sent verbatim on every iteration — a 2.96× amplification across the live install. Once the model has *attempted* an `Edit` (landed or not) it has already composed what it wants to write, and that text is in its own prior turn in the suffix; what it lacks is the file's current bytes, which only a fresh `Read` can supply — the embedded snapshot is exactly what went stale. So from that point the request carries `[RETRY_PROMPT_TEMPLATE, …tool-round history]` with the transcript and the original prompt dropped, and its span records `LlmCallInputs::Inline` rather than a `Persisted` reference that would no longer describe what was sent. Rounds where the model has only `Read` so far keep the full transcript: it hasn't composed anything yet, so it still needs the source material. `messages` retains the full history throughout; only the wire payload is trimmed.
+
 7. Return a `BackgroundSummaryOutcome` (the *last* iteration's `span_id`, the summed `cost_micros`), which the spawned task logs on failure/success boundaries; the durable summary metadata remains the source of truth.
 
 ### Cancellation
@@ -186,7 +196,7 @@ The trade-off is that a process shutdown does not actively cancel an in-flight p
 ### Failure handling (linear retry, no backoff)
 
 - LLM call fails → `record_summary_failure` bumps metadata `error_count`; `summary.md` may already carry the seeded scaffold and any earlier iterations' `Edit`s; next trigger fires fresh.
-- A single `Edit` / `Read` fails → **not** a pass failure: the error returns to the model as an `ERROR:`-prefixed `tool_result` for retry. A pass that applies no `Edit` at all still records success (logged at `debug`).
+- A single `Edit` / `Read` fails → **not** a pass failure: the error returns to the model as an `ERROR:`-prefixed `tool_result` for retry. A pass that applies **no** `Edit` at all *is* a failure — `record_summary_failure`, cursor untouched, `ContextError::UnproductiveSummary` (logged at `warn`), and the agent loop backs off before retrying.
 - Seeding `summary.md` fails → logged at `warn` only; the default template is inlined into the prompt and the pass continues.
 - Metadata update fails → file orphan; the startup FS reaper deletes orphan summary dirs whose `session_id` has no metadata row.
 
@@ -201,11 +211,12 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
 The fast-path **never waits** for an in-flight background pass — it reads whatever cursor + `summary.md` is currently on file and tolerates being stale-by-one. A refresh that lands just after this read simply applies on the next turn.
 
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
-2. **Cursor mapping**: resolve `metadata.cursor` to its index among the session's active rows via `SessionManager::active_index_of_ordinal` (the supersede filter is pushed into SQL, not walked client-side); that index is the cursor's position in the in-memory `messages` (full frame, including system), cross-checked against `SessionManager::count_active_messages`. Fall through if:
+2. **Content check**: fall through unless `summary.md` holds something beyond the untouched `DEFAULT_NOTES_TEMPLATE` scaffold (`summary_has_content`). Independent of what the metadata row claims — step 4 is an *upper* bound, so a content-free summary is the cheapest thing that could possibly be swapped in, exactly backwards. Boilerplate is recognized by matching each line against the scaffold rather than by stripping `#` / `_…_` markup, so a model that writes into the italic descriptors instead of below them still counts as content.
+3. **Cursor mapping**: resolve `metadata.cursor` to its index among the session's active rows via `SessionManager::active_index_of_ordinal` (the supersede filter is pushed into SQL, not walked client-side); that index is the cursor's position in the in-memory `messages` (full frame, including system), cross-checked against `SessionManager::count_active_messages`. Fall through if:
    - The active row count doesn't equal `messages.len()` (snapshot drift, an unpersisted system prompt, compaction in flight).
    - The cursor ordinal isn't present in the active log (compression has rewritten it).
    - The cursor maps inside the system block.
-3. **Recent slice selection** (atomic-pair backward walk):
+4. **Recent slice selection** (atomic-pair backward walk):
    ```
    walk backward from non_system.len() in atomic units
        (single message OR tool_use+tool_result pair):
@@ -213,9 +224,9 @@ The fast-path **never waits** for an in-flight background pass — it reads what
      soft stop:    tokens ≥ 10K AND text_block_msg_count ≥ 5
    ```
    Then **clamp** the cut to be no later than the index *one past* the cursor's index in the `non_system` frame: `cut = pair_preserving_cut(non_system, min(walk_cut, cursor_idx_in_non_system + 1))`. Every message *strictly after* the cursor is unsummarized — it must remain in the recent slice — and `pair_preserving_cut` guarantees the slice never starts mid-tool-pair (so a cursor that lands on a tool_use or tool_result, e.g. an iteration-boundary trigger right after a tool exchange, doesn't produce an orphan tool_result blob). `RECENT_SLICE_MAX_TOKENS` is a *forward-extension* ceiling for the walk, not a license to drop post-cursor content.
-4. **Pre-assembly threshold check** (recent slice **included**):
+5. **Pre-assembly threshold check** (recent slice **included**):
    - `tokens(summary) + tokens(skill_trailer) + tokens(recent_slice) > 0.6 × max_tokens` → fall through to inner. Including the recent slice catches stale-cursor scenarios where the post-cursor span alone overruns the budget.
-5. **Assemble**:
+6. **Assemble**:
    ```
    [system messages (all)]
    [user(continuation-summary message: intro + summary.md body +
@@ -311,7 +322,8 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 | Constant | Value | Where |
 |---|---|---|
 | `SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO` | `0.5` (× `max_tokens`) | `baybo-context` |
-| `SUMMARY_DIFF_TOKEN_THRESHOLD` | `5_000` | `baybo-context` |
+| `SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR` | `5_000` | `baybo-context` |
+| `SUMMARY_DIFF_CONTEXT_RATIO` | `0.1` (× `max_tokens`; floor above wins on small windows) | `baybo-context` |
 | `SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD` | `3` | `baybo-context` |
 | `RECENT_SLICE_MIN_TOKENS` | `10_000` | `baybo-context` |
 | `RECENT_SLICE_MIN_TEXT_BLOCK_MSGS` | `5` | `baybo-context` |

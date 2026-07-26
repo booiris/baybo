@@ -5,6 +5,7 @@ import {
   cronCollapseKey,
   cronGroupUnread,
   resolveCollapsed,
+  withoutArchived,
 } from './sessionBuckets';
 import type { SessionSummary } from './types';
 
@@ -19,6 +20,7 @@ function session(id: string, overrides: Partial<SessionSummary> = {}): SessionSu
     created_at: '2026-07-14T00:00:00Z',
     last_active: '2026-07-14T00:00:00Z',
     unread: 0,
+    archived: false,
     pinned: false,
     ...overrides,
   };
@@ -174,6 +176,72 @@ describe('cron group pin', () => {
     expect(pinned.map((s) => s.session_id)).toEqual(['a1']);
     expect(cronGroups[0].pinned).toBe(true);
     expect(cronGroups[0].sessions.map((s) => s.session_id)).toEqual(['a2']);
+  });
+});
+
+describe('archived rows', () => {
+  it('drops archived rows and keeps the rest in order', () => {
+    const kept = withoutArchived([
+      session('a'),
+      session('b', { archived: true }),
+      session('c'),
+    ]);
+    expect(kept.map((s) => s.session_id)).toEqual(['a', 'c']);
+  });
+
+  // These pass the RAW list on purpose: the sidebar must not be able to draw an
+  // archived row even when handed one, so the predicate lives in the bucketer
+  // rather than only at the call site.
+  it('drops an archived row from every block, pin included', () => {
+    const { pinned, chatsByFolder, uncategorized } = bucketSessions(
+      [
+        session('p', { pinned: true, archived: true }),
+        session('filed', { folder_id: FOLDER, archived: true }),
+        session('loose', { archived: true }),
+        session('kept'),
+      ],
+      REACHABLE,
+    );
+    // Archived beats pin, matching iOS: the row belongs to the archive, not to
+    // the pinned block.
+    expect(pinned).toEqual([]);
+    expect(chatsByFolder.size).toBe(0);
+    expect(uncategorized.map((s) => s.session_id)).toEqual(['kept']);
+  });
+
+  it('emits no cron group when every fire of the job is archived', () => {
+    // The group is derived from its members, so dropping them first is what
+    // keeps a labelled-but-empty header off the list.
+    const { cronGroups } = bucketSessions(
+      [
+        fire('f1', JOB_A, { archived: true }),
+        fire('f2', JOB_A, { archived: true }),
+        fire('b1', JOB_B, { cron_job_title: 'Nightly' }),
+      ],
+      REACHABLE,
+    );
+    expect(cronGroups.map((g) => g.jobId)).toEqual([JOB_B]);
+  });
+
+  it('keeps a cron group alive on its unarchived fires alone, and counts only those', () => {
+    const { cronGroups } = bucketSessions(
+      [fire('f1', JOB_A, { archived: true, unread: 5 }), fire('f2', JOB_A, { unread: 2 })],
+      REACHABLE,
+    );
+    expect(cronGroups[0].sessions.map((s) => s.session_id)).toEqual(['f2']);
+    expect(cronGroupUnread(cronGroups[0])).toBe(2);
+  });
+
+  it('does not float a group on an archived fire being the newest', () => {
+    const { cronGroups } = bucketSessions(
+      [
+        fire('a-archived', JOB_A, { last_active: '2026-07-14T23:00:00Z', archived: true }),
+        fire('a-old', JOB_A, { last_active: '2026-07-14T01:00:00Z' }),
+        fire('b-new', JOB_B, { last_active: '2026-07-14T09:00:00Z', cron_job_title: 'Nightly' }),
+      ],
+      REACHABLE,
+    );
+    expect(cronGroups.map((g) => g.jobId)).toEqual([JOB_B, JOB_A]);
   });
 });
 

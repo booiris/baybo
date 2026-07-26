@@ -26,6 +26,10 @@
      reservation exists to remove. */
   --attachment-max-h: 16rem;
   --chat-row-gap: 1.5rem;
+  /* How far a user message's timestamp is pulled in from the bubble's right
+     edge. Its own knob, NOT the bubble's padding: tying the two together means
+     re-aiming the clock silently re-pads every bubble. */
+  --msg-time-inset: 0.5rem;
   --md-block-gap: 0.75rem;
   /* How wide a code block may grow before it soft-wraps (see `.md pre code`) —
      a MULTIPLE OF THE READING BAND, so the cap is really a bound on how far the
@@ -209,13 +213,39 @@ button {
   78% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
   100% { opacity: 0; transform: translateX(-50%) translateY(-5px) scale(0.98); }
 }
+/* Landing mark for a message-index jump: an ink ring that blooms around the
+   arrived bubble and fades. Holds a 4px channel of paper OUTSIDE the bubble
+   (inset -4) — against a solid-ink user bubble a hugging border would just read
+   as a thicker bubble, not a mark. No colour: --color-err is reserved for
+   destructive state. Mounted inside .bubble.user (or the last .attachment-bubble
+   for an attachment-only send) — the only positioned hosts in the row; .msg-group
+   and .chat-log are both unpositioned, so a ring parented there would escape to
+   the initial containing block and paint a full-viewport rectangle. */
+.jump-ring {
+  position: absolute;
+  inset: -4px;
+  border: 1.5px solid var(--color-ink);
+  border-radius: calc(var(--radius) + 4px);
+  pointer-events: none;
+  animation: jump-ring 820ms cubic-bezier(0.33, 1, 0.68, 1) forwards;
+}
+@keyframes jump-ring {
+  0% { opacity: 0; transform: scale(1.05); }
+  16% { opacity: 1; transform: scale(1); }
+  55% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
 /* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
    bubble, vertically centered. Centered via top + negative margin (NOT
    translateY) so the spinner's transform stays free for its rotation. */
 .bubble.sending,
 .bubble.failed { position: relative; }
 /* "sending": a black ring with a rotating gap, spinning until the server echoes
-   the message back. */
+   the message back. The 400ms `delayed-in` keeps it INVISIBLE through a healthy
+   send — the echo usually lands well inside the delay and unmounts the ring
+   before it ever paints, so a normal send shows nothing (a ring flashing in and
+   out on every message read as jitter). Only a send that genuinely waits — slow
+   leg, offline queue — fades it in. */
 .send-spinner {
   position: absolute;
   left: -1.25rem;
@@ -226,7 +256,9 @@ button {
   border-radius: 50%;
   border: 1.5px solid var(--color-ink-soft);
   border-top-color: transparent;
-  animation: send-spin 0.7s linear infinite;
+  animation:
+    send-spin 0.7s linear infinite,
+    delayed-in 160ms ease-out 400ms both;
   pointer-events: none;
 }
 @keyframes send-spin { to { transform: rotate(360deg); } }
@@ -315,7 +347,7 @@ button {
   font-size: 0.75rem;
   color: var(--color-ink-soft);
   pointer-events: none;
-  animation: thread-loading-in 160ms ease-out 400ms both;
+  animation: delayed-in 160ms ease-out 400ms both;
 }
 .thread-loading::before {
   content: "";
@@ -326,7 +358,10 @@ button {
   border-top-color: transparent;
   animation: send-spin 0.7s linear infinite;
 }
-@keyframes thread-loading-in {
+/* Shared "appear only if you're still here at 400ms" ramp (thread-loading, the
+   send spinner): `both` holds opacity 0 through the delay, so anything that
+   unmounts inside it was never seen. */
+@keyframes delayed-in {
   from { opacity: 0; }
   to { opacity: 1; }
 }
@@ -419,8 +454,36 @@ button {
   font-style: italic;
 }
 .md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
-.md ul, .md ol { padding-left: 1.25rem; }
-.md li { margin: 0.15rem 0; }
+/* Lists: fixed-slot markers (the web chat's `.md-list` mechanism, done in pure
+   CSS). Native `list-style: outside` right-aligns the marker against the text,
+   hanging it INTO the list padding — 1.25rem fit "7." but not "10.", whose
+   first digit crossed the `.md` box edge and was eaten by `overflow-x: clip`
+   ("8." lost its left arc and read as "3."). A counter marker absolutely
+   positioned at the li's own left edge lives inside the content box, so no
+   digit count can overflow the page; ordered items get a wider slot to seat
+   two digits plus the dot. */
+.md ul, .md ol {
+  list-style: none;
+  padding-left: 0;
+}
+.md li {
+  margin: 0.15rem 0;
+  position: relative;
+  padding-left: 1.5rem;
+}
+.md ol > li { padding-left: 1.9rem; }
+.md li::before {
+  position: absolute;
+  left: 0;
+  line-height: inherit;
+}
+.md ul > li::before { content: "•"; }
+/* Nested bullets keep the UA's hollow-circle second level. */
+.md ul ul > li::before { content: "◦"; }
+/* The implicit `list-item` counter (not a hand-rolled one): it respects
+   `<ol start="7">` / `<li value>`, which a list interrupted by a paragraph
+   emits — a manual counter would silently renumber it from 1. */
+.md ol > li::before { content: counter(list-item) "."; }
 .md img { max-width: 100%; border-radius: 10px; }
 /* Tables: no fills — a light hairline under each row is the only structure.
    Each column is capped (max-width) so one long cell can't dominate: content
@@ -701,13 +764,39 @@ button {
   gap: 0.35rem;
   min-width: 0;
 }
-.msg-group.user { align-items: flex-end; }
+.msg-group.user {
+  align-items: flex-end;
+  /* Where a message-index jump parks its target: clear of the native header veil
+     (--thread-top-inset is .chat-log's own padding-top) plus the same 12px of air
+     the veil's fade ends on. Declared here rather than computed at the scroll
+     call site so the clearance has ONE source of truth. */
+  scroll-margin-top: calc(var(--thread-top-inset) + 12px);
+}
 .msg-group.assistant { align-items: flex-start; }
+/* The message's clock, tucked under its last bubble — the group's align-items
+   sides it (agent bottom-left, user bottom-right). Mono + tabular so a column of
+   times doesn't jitter, and pulled up tight against the bubble: the group gap is
+   sized for stacked attachment bubbles, which is too airy for a caption. Inert
+   to touch so it can't eat a long-press meant for the bubble above it. */
+.msg-time {
+  margin-top: -0.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink-soft);
+  pointer-events: none;
+}
+/* Pull the user's clock in from the bubble's right edge rather than leaving it
+   hanging on the corner. The agent's reply is bubble-less prose already flush at
+   the band's left edge, so its clock needs no inset. */
+.msg-group.user .msg-time { margin-right: var(--msg-time-inset); }
 /* Each attachment stands on its own bubble: the image tile / file chip alone,
    no text-bubble background. */
-.attachment-bubble { max-width: 100%; min-width: 0; }
-.attachment-bubble.sending,
-.attachment-bubble.failed { position: relative; }
+/* Positioned unconditionally: it hosts the send chrome (sending/failed) AND the
+   jump ring, and an attachment-only send that has already landed carries no
+   status class — leaving the ring with no positioned ancestor at all. */
+.attachment-bubble { max-width: 100%; min-width: 0; position: relative; }
 .attachment-img {
   display: block;
   max-width: 100%;

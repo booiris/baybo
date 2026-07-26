@@ -29,18 +29,22 @@ import {
   playVideo,
   postJumpVisible,
   postMarkRead,
+  postOutline,
+  postOutlineHere,
   postRunState,
   postSyncRequest,
   previewFile,
   queryAudioState,
   queryFileState,
   requestVideoPoster,
+  resendOutline,
   retrySend,
   shareFile,
   viewImage,
   subscribeTranscript,
   type AudioStatePayload,
   type FileState,
+  type OutlinePost,
   type UserSentPayload,
 } from "./bridge";
 import { MarkdownBody } from "./Markdown";
@@ -51,6 +55,7 @@ import {
   uid,
   type ChatMsg,
   type CompactionPoint,
+  type OutlineEntry,
   type PersistedState,
   type Row,
   type TranscriptRowItem,
@@ -145,6 +150,7 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
     role,
     content: item.text ?? "",
     attachments: item.attachments,
+    createdAt: item.created_at,
   };
 }
 
@@ -194,6 +200,21 @@ const GLIDE_SETTLE_CAP_MS = 1200;
 /// scrolls in, while a back-history page's off-screen images stay unfetched. See
 /// AttachmentImage.
 const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
+
+/// Cap on an outline entry's `text` / `gloss`. A TRANSPORT cap, not a display
+/// one — native truncates to its own (shorter) width; this only keeps a pasted
+/// wall of text out of every bridge message the sheet's list rides on.
+const OUTLINE_TEXT_CAP = 160;
+
+/// Fewer of the user's own sends than this and the index sheet isn't worth a
+/// header button — a thread that short is faster to scroll than to index.
+/// `hasMoreOlder` overrides it: the unloaded pages hold more.
+const OUTLINE_MIN_ENTRIES = 3;
+
+/// Delay before `jumpToMessage`'s one-shot correction pass. The jump drags
+/// never-decoded images into the lazy band and they shove the target down as
+/// their bytes land — WKWebView has no scroll anchoring to absorb it.
+const JUMP_SETTLE_MS = 400;
 
 /// Cap on the remembered image sizes (see `ImageDimsStore`). An entry is ~60
 /// bytes and a thread's images are bounded in practice — this only stops a
@@ -275,6 +296,158 @@ export function compactionDividerIds(
       if (crossed.length > 0) out.set(r.id, crossed[crossed.length - 1].at);
     }
     prevOrdinal = ordinal;
+  }
+  return out;
+}
+
+/// Fence opener / closer for the gloss flattener, mirroring `mathDelimiters`'s
+/// code mask: any indent (a list-nested fence still counts), and a closer must
+/// be alone on its line.
+const GLOSS_FENCE = /^[ \t]*(`{3,}|~{3,})/;
+const GLOSS_FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
+/// Block leaders stripped off the front of a kept line — blockquote arrows, a
+/// heading's hashes, a bullet or an ordered marker. Left in, a flattened reply
+/// reads "- one - two". Anchored, and every alternative consumes, so there is
+/// nothing for the engine to backtrack over.
+const GLOSS_LINE_LEADER = /^[ \t]*(?:>[ \t]*)*(?:#{1,6}[ \t]+|[-*+][ \t]+|\d{1,9}[.)][ \t]+)?/;
+const WHITESPACE_RUN = /\s+/g;
+
+function collapseWhitespace(text: string): string {
+  return text.replace(WHITESPACE_RUN, " ").trim();
+}
+
+/// Markdown flattened onto one line for an outline entry's gloss: fenced code
+/// dropped whole, block leaders and emphasis/code marks stripped, a link
+/// reduced to its TEXT, whitespace collapsed.
+///
+/// A LINEAR scanner, not a regex: this runs over whole assistant replies, and a
+/// 40KB paste through a backtracking pattern would hang the transcript. Every
+/// branch consumes at least one character — an unterminated `](` simply eats
+/// the rest, which is the right answer for a malformed tail anyway.
+///
+/// `_` is deliberately left alone: it carries emphasis far less often than it
+/// carries `snake_case`, and stripping it corrupts identifiers in a gloss.
+export function flattenGloss(md: string): string {
+  const kept: string[] = [];
+  let fence: string | null = null;
+  for (const line of md.split("\n")) {
+    if (fence === null) {
+      const open = GLOSS_FENCE.exec(line);
+      if (open === null) kept.push(line.replace(GLOSS_LINE_LEADER, ""));
+      else fence = open[1];
+      continue;
+    }
+    const close = GLOSS_FENCE_CLOSE.exec(line);
+    if (close !== null && close[1].charAt(0) === fence.charAt(0) && close[1].length >= fence.length) {
+      fence = null;
+    }
+  }
+
+  const src = kept.join(" ");
+  let out = "";
+  let i = 0;
+  let openBrackets = 0;
+  // Set to the character that ends a span being swallowed whole (a link target
+  // or a reference label), so the scan never looks ahead.
+  let skipUntil: string | null = null;
+  while (i < src.length) {
+    const c = src.charAt(i);
+    i++;
+    if (skipUntil !== null) {
+      if (c === skipUntil) skipUntil = null;
+      continue;
+    }
+    if (c === "*" || c === "`") continue;
+    // `~` only marks up when doubled. Dropping a lone one turns `~/bin/deploy`
+    // into `/bin/deploy` and `~50ms` into `50ms` — a gloss that misinforms.
+    if (c === "~" && src.charAt(i) === "~") {
+      i++;
+      continue;
+    }
+    if (c === "\\" && i < src.length) {
+      out += src.charAt(i);
+      i++;
+      continue;
+    }
+    if (c === "!" && src.charAt(i) === "[") continue;
+    if (c === "[") {
+      openBrackets++;
+      continue;
+    }
+    if (c === "]" && openBrackets > 0) {
+      openBrackets--;
+      const next = src.charAt(i);
+      if (next === "(") {
+        skipUntil = ")";
+        i++;
+      } else if (next === "[") {
+        skipUntil = "]";
+        i++;
+      }
+      continue;
+    }
+    out += c;
+  }
+  return collapseWhitespace(out);
+}
+
+/// `YYYY-MM-DD` in DEVICE-LOCAL time — the one field the native sheet formats
+/// (into its day header). Never `toISOString().slice(0, 10)`: that is UTC, so
+/// every evening message east of Greenwich would file under tomorrow.
+function localDayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/// Cut to `OUTLINE_TEXT_CAP` by CODE POINT, never by `String.slice`. A slice
+/// cuts UTF-16 units, so a cut landing inside a surrogate pair (any emoji or
+/// other non-BMP character straddling the cap) emits a lone surrogate — and the
+/// native handler is the one bridge message that re-serializes its payload
+/// (`JSONSerialization`), which THROWS on an ill-formed string. One such
+/// message would blank the entire index for that conversation, on every repost,
+/// until the row leaves the loaded window.
+function capOutlineText(text: string): string {
+  if (text.length <= OUTLINE_TEXT_CAP) return text;
+  return Array.from(text).slice(0, OUTLINE_TEXT_CAP).join("");
+}
+
+/// The agent's answer to the user row at `from`, or "" when the turn produced
+/// none. Work blocks and notices are scanned past — they sit between a prompt
+/// and its reply — but the next USER row is the wall: a stopped or still-running
+/// turn must gloss as empty rather than borrow the following turn's answer.
+function glossAfter(rows: Row[], from: number): string {
+  for (let i = from + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.role === "user") return "";
+    if (row.role === "assistant" && row.content.trim() !== "") {
+      return capOutlineText(flattenGloss(row.content));
+    }
+  }
+  return "";
+}
+
+/// The user's own sends, in thread order, each glossed with the agent's answer
+/// — the model behind the native message-index sheet. Derived from the SAME
+/// rows the transcript renders, so every entry has a `data-row-id` anchor by
+/// construction and the sheet can never offer a row the jump cannot reach.
+export function outlineEntries(rows: Row[]): OutlineEntry[] {
+  const out: OutlineEntry[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.role !== "user") continue;
+    out.push({
+      id: row.id,
+      text: capOutlineText(collapseWhitespace(row.content)),
+      gloss: glossAfter(rows, i),
+      // The same call the bubble's own clock uses, so the sheet and the
+      // transcript can never disagree about when something was said.
+      at: row.createdAt === undefined ? "" : formatTimestampShort(row.createdAt),
+      dayKey: row.createdAt === undefined ? "" : localDayKey(row.createdAt),
+      attachments: row.attachments?.length ?? 0,
+      state: row.sendState,
+    });
   }
   return out;
 }
@@ -1018,10 +1191,11 @@ export function formatTime(totalSeconds: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
-/// Compaction time for the pre-compaction divider: `HH:MM` same-day, prefixed
-/// `MM-DD` on an earlier day. Mirrors app/web's `formatTimestampShort` so the
-/// two clients read the same. Empty for an unparseable timestamp.
-export function formatCompactionTime(iso: string): string {
+/// Wall clock for a message's timestamp and the pre-compaction divider: `HH:MM`
+/// same-day, prefixed `MM-DD` on an earlier day. Same name and rule as app/web's
+/// `formatTimestampShort` so the two clients read the same. Empty for an
+/// unparseable timestamp.
+export function formatTimestampShort(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const p = (n: number) => String(n).padStart(2, "0");
@@ -1582,7 +1756,7 @@ function useSharePress(onShare: () => boolean): {
 /// messages above it still render (their pre-compaction originals); the model no
 /// longer sees them — it sees a summary in their place. A hairline + label.
 function CompactionDivider({ label, at }: { label: string; at?: string }) {
-  const time = at != null ? formatCompactionTime(at) : "";
+  const time = at != null ? formatTimestampShort(at) : "";
   return (
     <div className="compaction-divider" role="separator">
       <span>{time ? `${label} ${time}` : label}</span>
@@ -1599,10 +1773,15 @@ function CompactionDivider({ label, at }: { label: string; at?: string }) {
 const MessageRow = memo(function MessageRow({
   m,
   connEpoch,
+  flash,
   onRetry,
 }: {
   m: ChatMsg;
   connEpoch: number;
+  /// Replay nonce for the jump ring (0 = this row is not the jump target). A
+  /// nonce, never a boolean: jumping twice to the same row must bloom twice,
+  /// and a boolean would Object.is-bail the re-render (same idiom as `copyId`).
+  flash: number;
   onRetry: (m: ChatMsg) => void;
 }) {
   const { t } = useTranslation();
@@ -1648,6 +1827,16 @@ const MessageRow = memo(function MessageRow({
   }
 
   const attachments = m.attachments ?? [];
+  // The group's `align-items` already sides it: the agent's clock lands at the
+  // reply's bottom-left, the user's at the bubble's bottom-right. A row restored
+  // from a pre-timestamp mirror simply has none.
+  const time = m.createdAt !== undefined ? formatTimestampShort(m.createdAt) : "";
+  const timeEl =
+    time !== "" ? (
+      <time className="msg-time" dateTime={m.createdAt}>
+        {time}
+      </time>
+    ) : null;
 
   if (m.role === "assistant") {
     return (
@@ -1660,6 +1849,7 @@ const MessageRow = memo(function MessageRow({
             <MarkdownBody text={m.content} />
           </div>
         )}
+        {timeEl}
       </div>
     );
   }
@@ -1677,9 +1867,13 @@ const MessageRow = memo(function MessageRow({
       </button>
     ) : null;
   const hasText = m.content.length > 0;
+  // The ring needs a POSITIONED host: `.msg-group` is unpositioned, so parented
+  // there it would escape to the initial containing block and paint a
+  // full-viewport rectangle. Rides the same last-bubble rule as the send chrome.
+  const ring = flash !== 0 ? <span key={flash} className="jump-ring" aria-hidden="true" /> : null;
 
   return (
-    <div className="msg-group user">
+    <div className="msg-group user" data-row-id={m.id}>
       {attachments.map((a, i) => {
         const carriesSend = !hasText && i === attachments.length - 1;
         return (
@@ -1689,7 +1883,12 @@ const MessageRow = memo(function MessageRow({
             connEpoch={connEpoch}
             className={carriesSend && m.sendState ? m.sendState : undefined}
           >
-            {carriesSend ? sendChrome : null}
+            {carriesSend ? (
+              <>
+                {sendChrome}
+                {ring}
+              </>
+            ) : null}
           </AttachmentBubble>
         );
       })}
@@ -1714,8 +1913,10 @@ const MessageRow = memo(function MessageRow({
               {t("chat.copied")}
             </span>
           )}
+          {ring}
         </div>
       )}
+      {timeEl}
     </div>
   );
 });
@@ -1881,6 +2082,11 @@ export function Transcript({
   const glidingRef = useRef(false);
   const glideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(glideTimer.current), []);
+  // Which row the jump ring is blooming around, and the replay nonce that lets
+  // it bloom again on a repeat jump to the same row (see MessageRow's `flash`).
+  const [flash, setFlash] = useState({ id: "", nonce: 0 });
+  const jumpSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(jumpSettleTimer.current), []);
 
   // Sizes of the images this thread has decoded, restored from the mirror and
   // rewritten with it. Held in a ref (not state) and handed out on a context
@@ -1993,6 +2199,12 @@ export function Transcript({
   useEffect(() => {
     const down = () => {
       userTouchingRef.current = true;
+      // Any touch at all disarms a pending jump re-seat. Checking
+      // `userTouchingRef` at the deadline is not enough: it is already false
+      // during momentum scrolling and after any drag that ended inside the
+      // window, and the correction would then yank back a reader who had
+      // deliberately scrolled away from where the jump landed.
+      clearTimeout(jumpSettleTimer.current);
       const el = scrollEl();
       touchStartScrollTop.current = el?.scrollTop ?? 0;
       touchStartScrollHeight.current = el?.scrollHeight ?? 0;
@@ -2509,13 +2721,21 @@ export function Transcript({
             const existingIdx = byId.get(row.id);
             if (existingIdx !== undefined) {
               const existing = next[existingIdx];
-              // A redelivery of a row already on screen: reconcile an optimistic
-              // send's chrome (drop the spinner), or fold a same-id work block's
-              // newer server steps + timing into what's rendered (else a no-op).
-              if (existing.role === "user" && existing.sendState !== undefined) {
-                next[existingIdx] = { ...existing, sendState: undefined };
-              } else if (existing.role === "work" && row.role === "work") {
-                next[existingIdx] = reconcileWork(existing, row);
+              // A redelivery of a row already on screen: fold a same-id work
+              // block's newer server steps + timing into what's rendered, or
+              // reconcile a message row — drop an optimistic send's chrome, and
+              // adopt the server's clock over the arrival stamp a live frame /
+              // optimistic send left behind, so the time under the bubble is the
+              // one a cold open will show. Otherwise a no-op.
+              if (existing.role === "work" || row.role === "work") {
+                if (existing.role === "work" && row.role === "work") {
+                  next[existingIdx] = reconcileWork(existing, row);
+                }
+              } else {
+                const createdAt = row.createdAt ?? existing.createdAt;
+                if (existing.sendState !== undefined || createdAt !== existing.createdAt) {
+                  next[existingIdx] = { ...existing, sendState: undefined, createdAt };
+                }
               }
               continue;
             }
@@ -2626,6 +2846,10 @@ export function Transcript({
             role,
             content: frame.content,
             attachments: frame.attachments,
+            // The wire `Message` frame carries no time field, so arrival is the
+            // best clock we have; a later reconstruction overwrites it with the
+            // server's `created_at`.
+            createdAt: new Date().toISOString(),
           },
         ]);
         break;
@@ -2832,6 +3056,7 @@ export function Transcript({
         content: payload.text,
         attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
         sendState: "sending",
+        createdAt: new Date().toISOString(),
       },
     ]);
   };
@@ -2901,6 +3126,34 @@ export function Transcript({
     runSync();
   }, [runSync, setSyncInFlight]);
 
+  // The sheet's "load earlier" row runs the transcript's own backward paging;
+  // the prepend grows the outline, which re-posts on its own.
+  const handleOutlineLoadOlder = useCallback(() => {
+    loadOlder();
+  }, [loadOlder]);
+
+  // Which of the user's messages the reader is parked on, answered on demand —
+  // a live scan would force a layout on every scroll tick. The topmost row still
+  // under the header veil wins, so the sheet opens on what is being read.
+  const handleOutlineHereRequested = useCallback(() => {
+    const rows = document.querySelectorAll(".msg-group.user[data-row-id]");
+    if (rows.length === 0) {
+      postOutlineHere(null);
+      return;
+    }
+    // The line is the row's OWN `scroll-margin-top` — the same declaration
+    // `jumpToMessage` parks against. Measuring against `.chat-log`'s padding
+    // instead puts the line 12px above where a jump lands, so the row the user
+    // just jumped to would never be the one reported back as "here".
+    const margin = Number.parseFloat(getComputedStyle(rows[0]).scrollMarginTop);
+    const line = Number.isNaN(margin) ? 0 : margin;
+    let here: string | null = null;
+    rows.forEach((el) => {
+      if (el.getBoundingClientRect().top <= line + 1) here = el.getAttribute("data-row-id");
+    });
+    postOutlineHere(here);
+  }, []);
+
   // The one client loop's OPEN edge: run sync on mount (a resident re-entry —
   // hydration-matrix cell E in the retired scheme — that fires no connEpoch
   // edge still hydrates here). Safe to double with the connEpoch edge:
@@ -2955,6 +3208,9 @@ export function Transcript({
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
+    jumpToMessage,
+    handleOutlineLoadOlder,
+    handleOutlineHereRequested,
     handleSyncRequested,
   });
   handlersRef.current = {
@@ -2964,6 +3220,9 @@ export function Transcript({
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
+    jumpToMessage,
+    handleOutlineLoadOlder,
+    handleOutlineHereRequested,
     handleSyncRequested,
   };
   useEffect(
@@ -2975,6 +3234,9 @@ export function Transcript({
         sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
+        jumpToMessage: (rowId) => handlersRef.current.jumpToMessage(rowId),
+        outlineLoadOlder: () => handlersRef.current.handleOutlineLoadOlder(),
+        outlineHereRequested: () => handlersRef.current.handleOutlineHereRequested(),
         syncRequested: () => handlersRef.current.handleSyncRequested(),
       }),
     [],
@@ -3003,6 +3265,72 @@ export function Transcript({
     }, GLIDE_SETTLE_CAP_MS);
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }
+
+  // A row of the native message-index sheet was tapped: park that user message
+  // under the header veil (the clearance is `.msg-group.user`'s
+  // `scroll-margin-top`, so nothing is computed here) and bloom the ring.
+  // Imperative rather than an effect keyed on the target — the same row can be
+  // asked for twice, and the second ask must scroll on the tap, not on a render
+  // that identical state never triggers.
+  function jumpToMessage(rowId: string) {
+    const node = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
+    if (node === null) {
+      // The sheet offered a row this tree no longer holds — its list is a
+      // debounce (or a rebase) behind. `resendOutline`, not `postOutline`: the
+      // guard would drop this as a duplicate of what we believe we already sent,
+      // which is exactly the belief that just proved wrong.
+      resendOutline(outlinePostRef.current);
+      return;
+    }
+    // Cancel an in-flight jump-to-latest glide, but never SET glidingRef: its
+    // only self-clear is onScroll entering the bottom follow band, which an
+    // upward jump never reaches — it would latch follow/showJump for the whole
+    // GLIDE_SETTLE_CAP_MS.
+    clearTimeout(glideTimer.current);
+    glidingRef.current = false;
+    // Synchronously, BEFORE any scroll write: the mount pin, the follow layout
+    // effect, the ResizeObserver, the touchend catch-up and the keyboard rAF
+    // loop all slam scrollTop to the bottom while this is true.
+    followRef.current = false;
+    setFlash((f) => ({ id: rowId, nonce: f.nonce + 1 }));
+    node.scrollIntoView({ block: "start", behavior: "instant" });
+    // `showJump` is deliberately not forced on: for a near-bottom target onScroll
+    // correctly recomputes it to false, and the native button would appear only
+    // to fade straight back out.
+    //
+    // The jump drags never-decoded images into the lazy band and they shove the
+    // target as their bytes land (WKWebView has no scroll anchoring), so re-seat
+    // once. The finger always wins. `followRef` is NOT re-asserted — for a
+    // near-bottom target `true` is the right answer and onScroll owns it.
+    clearTimeout(jumpSettleTimer.current);
+    jumpSettleTimer.current = setTimeout(() => {
+      if (userTouchingRef.current) return;
+      const settled = document.querySelector(`[data-row-id="${CSS.escape(rowId)}"]`);
+      settled?.scrollIntoView({ block: "start", behavior: "instant" });
+    }, JUMP_SETTLE_MS);
+  }
+
+  // The sheet is native, but only this tree knows which sends are in it (the
+  // optimistic bubble exists here before any echo, `/stop` echoes are filtered
+  // here, and the loaded window is this tree's). bridge.ts owns the debounce and
+  // the identity guard, so every re-derive just posts.
+  const outline = useMemo(() => outlineEntries(messages), [messages]);
+  const outlinePost = useMemo<OutlinePost>(
+    () => ({
+      entries: outline,
+      hasMoreOlder,
+      loadingOlder,
+      available: outline.length >= OUTLINE_MIN_ENTRIES || hasMoreOlder,
+    }),
+    [outline, hasMoreOlder, loadingOlder],
+  );
+  // Read by `jumpToMessage`'s self-heal, which fires off a bridge event rather
+  // than a render.
+  const outlinePostRef = useRef(outlinePost);
+  outlinePostRef.current = outlinePost;
+  useEffect(() => {
+    postOutline(outlinePost);
+  }, [outlinePost]);
 
   // The button itself is native (a liquid-glass circle above the composer) —
   // mirror the visibility over the bridge; taps come back via the
@@ -3080,7 +3408,13 @@ export function Transcript({
             m.role === "work" ? (
               <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
             ) : (
-              <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
+              <MessageRow
+                key={m.id}
+                m={m}
+                connEpoch={connEpoch}
+                flash={m.id === flash.id ? flash.nonce : 0}
+                onRetry={retryMessage}
+              />
             );
           const seamAt = dividerBeforeId.get(m.id);
           if (seamAt === undefined) return row;

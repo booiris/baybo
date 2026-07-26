@@ -48,8 +48,12 @@ pub trait SessionSummaryStore: Send + Sync {
     /// summary has ever been successfully written for this session.
     async fn get(&self, session_id: &SessionId) -> Result<Option<SessionSummaryRow>>;
 
-    /// Upsert after a successful summary pass. Increments `pass_count`
-    /// from the prior value (or 0 on first insert) and adds
+    /// Upsert after a successful summary pass. `cursor` advances
+    /// **monotonically** — implementations store `max(existing, cursor)`,
+    /// never a plain assignment, because a pass pins its ordinal at trigger
+    /// time and lands minutes later, by which point a compaction may have
+    /// superseded that ordinal and re-pointed the cursor forward. Increments
+    /// `pass_count` from the prior value (or 0 on first insert) and adds
     /// `cost_micros_delta` to the cumulative `cost_micros`. Resets
     /// `error_count` to 0 — a successful pass clears prior errors so
     /// `error_count` represents "consecutive failures since the last

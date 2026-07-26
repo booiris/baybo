@@ -108,11 +108,21 @@ final class PopGestureHostController: UIViewController, UIGestureRecognizerDeleg
                 priorDelegate = recognizer.delegate
                 priorEnabled = recognizer.isEnabled
             }
-            nav.interactiveContentPopGestureRecognizer?.require(toFail: recognizer)
+            // iOS 26's content-area pop recognizer doesn't exist earlier —
+            // there the edge recognizer alone carries the whole feature.
+            if #available(iOS 26.0, *) {
+                nav.interactiveContentPopGestureRecognizer?.require(toFail: recognizer)
+            }
         }
-        PopVelocityClamp.install(on: recognizer)
-        if let contentPop = nav.interactiveContentPopGestureRecognizer {
-            PopVelocityClamp.install(on: contentPop)
+        // The clamp exists for iOS 26's fluid pop, whose settle spring seeds
+        // from `velocityInView:` and overshoots on fast flicks. Earlier pops
+        // don't overshoot — and UIKit's own finish/completion math reads the
+        // same velocity — so pre-26 the system value stays untouched.
+        if #available(iOS 26.0, *) {
+            PopVelocityClamp.install(on: recognizer)
+            if let contentPop = nav.interactiveContentPopGestureRecognizer {
+                PopVelocityClamp.install(on: contentPop)
+            }
         }
         recognizer.delegate = self
         recognizer.isEnabled = true

@@ -78,6 +78,27 @@ function newestActive(sessions: SessionSummary[]): number {
   return newest;
 }
 
+/** The rows the chat list may draw: everything the server returned minus the
+ *  archived ones.
+ *
+ *  Archiving is an iOS affordance; the web client only honours it. The list
+ *  endpoint keeps returning archived rows (clients group them), and the patch
+ *  that unarchives carries nothing but the flag — so the rows have to stay in
+ *  the client's state or an unarchive from another device would have no row to
+ *  land on. Filtering at the point of drawing is what keeps them out of sight.
+ *
+ *  `bucketSessions` applies the same predicate itself, so the sidebar is safe
+ *  whatever it is handed; this is for the callers that pick a row rather than
+ *  draw one — the cold-start anchor and the post-hide fallback, neither of
+ *  which may land the user on a conversation with no row — and for the sidebar's
+ *  own "is the list empty" reads.
+ *
+ *  Search needs no equivalent: `GET /v1/chat/search` excludes archived
+ *  conversations server-side unless asked otherwise. */
+export function withoutArchived(sessions: SessionSummary[]): SessionSummary[] {
+  return sessions.filter((s) => !s.archived);
+}
+
 /** Bucket the sidebar's sessions. Precedence, and every row lands in exactly
  *  one bucket:
  *
@@ -92,7 +113,10 @@ function newestActive(sessions: SessionSummary[]): number {
  *     when that folder isn't reachable in the rendered tree.
  *
  *  A group with no visible members is never emitted, so an empty cron group
- *  cannot exist. Hidden rows never reach here (the list drops them).
+ *  cannot exist. Hidden rows never reach here (the list drops them); archived
+ *  ones are dropped here, ahead of every rule above — matching iOS, where a
+ *  pinned+archived row belongs to the archive and not to the pinned block, and
+ *  making the sidebar safe against being handed an unfiltered list.
  */
 export function bucketSessions(
   sessions: SessionSummary[],
@@ -104,6 +128,9 @@ export function bucketSessions(
   const uncategorized: SessionSummary[] = [];
 
   for (const s of sessions) {
+    if (s.archived) {
+      continue;
+    }
     if (s.pinned) {
       pinned.push(s);
       continue;

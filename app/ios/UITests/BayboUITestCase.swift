@@ -112,4 +112,14 @@ class BayboUITestCase: XCTestCase {
             ready.waitForExistence(timeout: timeout),
             "the demo download drive never reached ready")
     }
+
+    /// Keep a shot of transient chrome — a presented sheet, a menu level — in
+    /// the xcresult, which is the only way to see it from outside the runner
+    /// (`xcrun xcresulttool export attachments`).
+    func attachScreenshot(_ app: XCUIApplication, name: String) {
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = name
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
 }

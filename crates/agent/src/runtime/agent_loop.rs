@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
-use baybo_context::ContextManager;
+use baybo_context::{ContextError, ContextManager};
 use baybo_job::{JobInput, JobLifecycle, JobOutput};
 use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
@@ -518,6 +518,19 @@ pub struct AgentLoop {
     /// token can't kill an in-flight pass — mirrors
     /// [`Self::spawn_session_end_write`].
     bg_compression: Option<tokio::task::JoinHandle<()>>,
+    /// `up_to_ordinal` of the last pass that landed no `Edit`, published by
+    /// the detached pass itself (hence the shared cell).
+    ///
+    /// The summary *cursor* records what `summary.md` covers, so an
+    /// unproductive pass must not advance it. But the in-memory *anchor*
+    /// records how much new material has piled up since we last spent a pass
+    /// on this session, and we did spend one — it just came back empty.
+    /// Because the anchor is otherwise only ever synced from the cursor, an
+    /// unproductive pass advanced neither, leaving the diff gate satisfied and
+    /// the pass re-firing at the very next boundary. Syncing the anchor to the
+    /// attempted ordinal re-arms that gate on the same work-proportional terms
+    /// as a successful pass, with no wall-clock component.
+    bg_compression_unproductive_at: Arc<parking_lot::Mutex<Option<i64>>>,
     /// Once-per-actor title-generation guard. Durable `Session.title`
     /// prevents repeats after rehydration.
     title_generation: Option<tokio::task::JoinHandle<()>>,
@@ -633,6 +646,7 @@ impl AgentLoop {
             last_task_management_turn: 0,
             last_reminder_turn: 0,
             bg_compression: None,
+            bg_compression_unproductive_at: Arc::new(parking_lot::Mutex::new(None)),
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
@@ -2873,6 +2887,16 @@ impl AgentLoop {
             return;
         }
 
+        // Charge the last unproductive pass to the diff gate before measuring
+        // it: that pass read the transcript up to this ordinal and produced
+        // nothing, so the material below it has already been paid for once.
+        // `sync_anchor_to_cursor` is monotonic and no-ops on an ordinal the
+        // transcript no longer carries.
+        let unproductive_at = self.bg_compression_unproductive_at.lock().take();
+        if let Some(ordinal) = unproductive_at {
+            self.context_manager.sync_anchor_to_cursor(ordinal).await;
+        }
+
         let Some(payload) = self
             .context_manager
             .maybe_request_background_summary(job_done)
@@ -2906,6 +2930,8 @@ impl AgentLoop {
         // it would let a reap mid-pass tear the summary down. Mirrors
         // `spawn_session_end_write`.
         let cancel_token = CancellationToken::new();
+        let unproductive_at = Arc::clone(&self.bg_compression_unproductive_at);
+        let attempted_ordinal = payload.up_to_ordinal;
 
         let handle = tokio::spawn(async move {
             let runner = crate::runtime::compression::BackgroundCompressionRunner {
@@ -2921,7 +2947,13 @@ impl AgentLoop {
                 job_id: current_job_id,
                 cancel_token,
             };
+            // A transient LLM failure is deliberately NOT charged here: it
+            // produced no work and the documented behaviour is to retry it
+            // freely on the next boundary.
             if let Err(e) = runner.run(payload).await {
+                if matches!(e, ContextError::UnproductiveSummary(_)) {
+                    *unproductive_at.lock() = Some(attempted_ordinal);
+                }
                 warn!(error = %e, "background summary pass failed");
             }
         });
