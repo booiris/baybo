@@ -148,15 +148,85 @@ pub async fn resolve_pending(live: &Path, store: &Arc<dyn SecretStore>) -> Resul
     Ok(pending_key)
 }
 
-/// Re-encrypt the whole vault under a freshly minted key and promote it,
-/// returning how many entries moved.
+/// What a rotation produced.
+pub struct Rotated {
+    pub entries: usize,
+    /// Where the pre-rotation key and ciphertext were written.
+    pub backup_dir: PathBuf,
+}
+
+/// Filenames inside the backup directory. `secrets.sql` restores with
+/// `sqlite3 <db> < secrets.sql`, so recovery needs no bespoke command.
+const BACKUP_KEY_FILE: &str = "encryption.key";
+const BACKUP_SECRETS_FILE: &str = "secrets.sql";
+
+/// Snapshot exactly what rotation is about to overwrite: the outgoing key, and
+/// the `secrets` rows as they stand.
+///
+/// Deliberately **not** a copy of the database. Rotation touches one table;
+/// everything else — transcripts, traces, jobs — is untouched, so copying it
+/// would mean hundreds of megabytes per rotation for no recovery value. These
+/// two files are jointly sufficient and individually useless, which is also why
+/// they live in one directory.
+async fn write_backup(dir: &Path, live: &Path, vault: &SecretVault) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| SecurityError::Encryption(format!("create {}: {e}", dir.display())))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| SecurityError::Encryption(format!("chmod {}: {e}", dir.display())))?;
+
+    std::fs::copy(live, dir.join(BACKUP_KEY_FILE))
+        .map_err(|e| SecurityError::Encryption(format!("back up key file: {e}")))?;
+
+    let mut sql = String::from("BEGIN;\n");
+    for (name, encrypted) in vault.export_encrypted().await? {
+        // Names are hex-cast rather than quoted: minted placeholders are
+        // arbitrary text and quoting them by hand is how a restore script
+        // silently corrupts one row.
+        sql.push_str(&format!(
+            "INSERT INTO secrets (name, encrypted_value) VALUES (CAST(X'{}' AS TEXT), X'{}') \
+             ON CONFLICT(name) DO UPDATE SET encrypted_value = excluded.encrypted_value;\n",
+            hex::encode(name.as_bytes()),
+            hex::encode(&encrypted),
+        ));
+    }
+    sql.push_str("COMMIT;\n");
+
+    let path = dir.join(BACKUP_SECRETS_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(KEY_FILE_MODE)
+        .open(&path)
+        .map_err(|e| SecurityError::Encryption(format!("create {}: {e}", path.display())))?;
+    use std::io::Write as _;
+    file.write_all(sql.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| SecurityError::Encryption(format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Re-encrypt the whole vault under a freshly minted key and promote it.
+///
+/// Writes a backup into `backup_dir` first — the outgoing key plus the current
+/// ciphertext — because the operation is otherwise unrecoverable: the old key
+/// stops opening the vault at promotion, and a backup taken of only one of the
+/// two is worthless. Doing it here rather than asking the caller to means the
+/// safety net cannot be forgotten.
 ///
 /// `_lock` is proof the caller holds the workspace singleton, which is what
 /// keeps a gateway from starting midway and writing an entry under the outgoing
 /// key — outside the snapshot being re-encrypted, and unreadable the moment the
 /// new key is promoted. Taking it as a parameter makes that a type-level
 /// requirement rather than something a caller has to remember.
-pub async fn rotate(live: &Path, vault: &SecretVault, _lock: &WorkspaceLock) -> Result<usize> {
+pub async fn rotate(
+    live: &Path,
+    vault: &SecretVault,
+    backup_dir: &Path,
+    _lock: &WorkspaceLock,
+) -> Result<Rotated> {
+    write_backup(backup_dir, live, vault).await?;
+
     let pending = pending_path(live);
     let new_key = EncryptionKey::generate();
     write(&pending, &new_key)?;
@@ -166,7 +236,10 @@ pub async fn rotate(live: &Path, vault: &SecretVault, _lock: &WorkspaceLock) -> 
     std::fs::rename(&pending, live).map_err(|e| {
         SecurityError::Encryption(format!("promote new key {}: {e}", pending.display()))
     })?;
-    Ok(entries)
+    Ok(Rotated {
+        entries,
+        backup_dir: backup_dir.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
@@ -203,8 +276,12 @@ mod tests {
         let (live, store, old) = seeded(dir.path()).await;
         let lock = baybo_workspace::acquire_workspace_lock(dir.path()).unwrap();
         let vault = SecretVault::new(old.clone(), Arc::clone(&store));
+        let backup = dir.path().join("backup");
 
-        assert_eq!(rotate(&live, &vault, &lock).await.unwrap(), 1);
+        assert_eq!(
+            rotate(&live, &vault, &backup, &lock).await.unwrap().entries,
+            1
+        );
         assert!(!pending_path(&live).exists());
 
         let new = load(&live).unwrap();
@@ -218,6 +295,81 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
             b"admin"
+        );
+    }
+
+    /// The backup must be enough to undo a rotation on its own: the outgoing
+    /// key plus the ciphertext as it stood. Anything less and the safety net is
+    /// decorative.
+    #[tokio::test]
+    async fn the_backup_restores_the_pre_rotation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (live, store, old) = seeded(dir.path()).await;
+        let lock = baybo_workspace::acquire_workspace_lock(dir.path()).unwrap();
+        let vault = SecretVault::new(old.clone(), Arc::clone(&store));
+        let before = vault.export_encrypted().await.unwrap();
+        let backup = dir.path().join("backup");
+
+        rotate(&live, &vault, &backup, &lock).await.unwrap();
+
+        // The archived key is the one that was live, not the new one.
+        let archived = load(&backup.join(BACKUP_KEY_FILE)).unwrap();
+        assert_eq!(archived.as_bytes(), old.as_bytes());
+        assert_ne!(load(&live).unwrap().as_bytes(), old.as_bytes());
+
+        // And the SQL carries every row's pre-rotation ciphertext.
+        let sql = std::fs::read_to_string(backup.join(BACKUP_SECRETS_FILE)).unwrap();
+        assert!(sql.starts_with("BEGIN;"), "must be one transaction");
+        assert!(sql.trim_end().ends_with("COMMIT;"));
+        for (name, ciphertext) in &before {
+            assert!(
+                sql.contains(&hex::encode(ciphertext)),
+                "missing ciphertext for an entry"
+            );
+            assert!(sql.contains(&hex::encode(name.as_bytes())), "missing name");
+        }
+
+        // Restoring both puts the vault back: the archived key reads the
+        // archived ciphertext.
+        for (name, ciphertext) in before {
+            store.store(&name, &ciphertext).await.unwrap();
+        }
+        let restored = SecretVault::new(archived, Arc::clone(&store));
+        assert_eq!(
+            restored
+                .get_secret("gateway.admin_token")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            b"admin"
+        );
+    }
+
+    /// Both files are credential-equivalent together, so neither may be
+    /// group- or world-readable.
+    #[tokio::test]
+    async fn the_backup_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (live, store, old) = seeded(dir.path()).await;
+        let lock = baybo_workspace::acquire_workspace_lock(dir.path()).unwrap();
+        let vault = SecretVault::new(old, Arc::clone(&store));
+        let backup = dir.path().join("backup");
+
+        rotate(&live, &vault, &backup, &lock).await.unwrap();
+
+        let mode =
+            |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(backup.clone()), 0o700, "backup dir");
+        assert_eq!(
+            mode(backup.join(BACKUP_SECRETS_FILE)),
+            KEY_FILE_MODE,
+            "secrets.sql"
+        );
+        assert_eq!(
+            mode(backup.join(BACKUP_KEY_FILE)),
+            KEY_FILE_MODE,
+            "archived key"
         );
     }
 

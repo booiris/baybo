@@ -59,6 +59,27 @@ impl SecretVault {
         }
     }
 
+    /// Every entry's name and **still-encrypted** value.
+    ///
+    /// Exists so a caller can snapshot the vault without holding the plaintext:
+    /// paired with the key file that was live at the time, this is everything
+    /// needed to put the vault back, and nothing more. Rotation is the only
+    /// caller.
+    pub async fn export_encrypted(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let names = self.list_names().await?;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let encrypted = self
+                .store
+                .retrieve(&name)
+                .await
+                .map_err(|e| SecurityError::Storage(e.to_string()))?
+                .ok_or_else(|| SecurityError::Storage(format!("entry {name} vanished")))?;
+            out.push((name, encrypted));
+        }
+        Ok(out)
+    }
+
     /// Re-encrypt every entry under `new_key`, atomically, and report how many
     /// moved.
     ///

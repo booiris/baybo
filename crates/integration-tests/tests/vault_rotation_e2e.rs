@@ -46,10 +46,10 @@ async fn rotation_preserves_every_value_and_retires_the_old_key() {
 
     let lock = baybo_workspace::acquire_workspace_lock(paths.root()).unwrap();
     let vault = SecretVault::new(old_key.clone(), stores.secret.clone());
-    let entries = key_file::rotate(&live, &vault, &lock)
+    let rotated = key_file::rotate(&live, &vault, &dir.path().join("backup"), &lock)
         .await
         .expect("rotate");
-    assert_eq!(entries, SEED.len());
+    assert_eq!(rotated.entries, SEED.len());
 
     let new_key = key_file::load(&live).unwrap();
     assert_ne!(new_key.as_bytes(), old_key.as_bytes(), "key must change");
@@ -121,9 +121,14 @@ async fn the_workspace_lock_is_exclusive_and_released_after_rotating() {
 
     let lock = baybo_workspace::acquire_workspace_lock(paths.root()).expect("re-acquire");
     let vault = SecretVault::new(key, stores.secret.clone());
-    key_file::rotate(&paths.encryption_key_file(), &vault, &lock)
-        .await
-        .expect("rotate");
+    key_file::rotate(
+        &paths.encryption_key_file(),
+        &vault,
+        &dir.path().join("backup"),
+        &lock,
+    )
+    .await
+    .expect("rotate");
     drop(lock);
 
     assert!(

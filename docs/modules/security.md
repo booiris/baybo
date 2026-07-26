@@ -110,7 +110,20 @@ in that state is re-provisioned (`baybo setup`, re-pair devices, re-enter
 `user_env.*` and provider keys), not migrated.
 
 **Key rotation.** `baybo vault rotate` mints a new master key, re-encrypts
-every entry under it, and replaces the key file. Shell-only, and it **holds**
+every entry under it, and replaces the key file.
+
+Two gates precede it. The operator must **type the outgoing key** (masked) — a
+`[y/N]` proves only that someone pressed a key, whereas producing the key proves
+they hold it somewhere other than this disk, which is precisely what rotation is
+about to invalidate. And a backup is written first, containing the outgoing key
+plus the current `secrets` rows as a restorable `.sql` transaction. That pair is
+jointly sufficient and individually useless; it is deliberately **not** a copy of
+the database, since rotation touches one table and copying transcripts and
+traces would cost hundreds of megabytes for no recovery value. Restore is
+`cp <backup>/encryption.key <key path>` plus
+`sqlite3 <db> < <backup>/secrets.sql` — no bespoke command to maintain.
+
+Shell-only, and it **holds**
 the workspace singleton lock for the whole operation rather than checking it
 first: a gateway that starts midway would write an entry under the outgoing
 key, outside the snapshot being re-encrypted, and that entry becomes unreadable
