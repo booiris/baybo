@@ -488,7 +488,7 @@ mod tests {
             .create(&baybo_store::DeviceRow {
                 device_id: "d1".into(),
                 device_pubkey: vec![0u8; 32],
-                auth_token: "devtok".into(),
+                auth_token_sha256: baybo_store::device::hash_auth_token("devtok"),
                 status: baybo_store::DeviceStatus::Approved,
                 rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
                 created_at: 1,
@@ -524,7 +524,7 @@ mod tests {
             .create(&baybo_store::DeviceRow {
                 device_id: "d1".into(),
                 device_pubkey: vec![0u8; 32],
-                auth_token: "revtok".into(),
+                auth_token_sha256: baybo_store::device::hash_auth_token("revtok"),
                 status: baybo_store::DeviceStatus::Revoked,
                 rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
                 created_at: 1,

@@ -45,9 +45,16 @@ use crate::device::load_or_create_static_keypair;
 /// after the WS upgrade — a stalled peer must not pin a connection.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A device that completed the relay leg's Noise IK handshake against an
+/// approved row.
+///
+/// Carries no bearer: the static-key match *is* the authentication, and the
+/// device's own bearer is not recoverable from storage (only its digest is
+/// kept). Downstream forwards assert this identity with the gateway's admin
+/// token plus the device-id header — see
+/// [`crate::auth::AdminAuthState::admin_bearer`].
 pub(crate) struct AuthenticatedDevice {
     pub(crate) device_id: String,
-    pub(crate) auth_token: String,
 }
 
 /// How a relay data-leg Noise session ended without an authenticated transport.
@@ -238,7 +245,6 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
         })?;
     let device = AuthenticatedDevice {
         device_id: row.device_id,
-        auth_token: row.auth_token,
     };
 
     let n = handshake
@@ -405,7 +411,7 @@ mod tests {
         DeviceRow {
             device_id: device_id.into(),
             device_pubkey: pubkey,
-            auth_token: TEST_TOKEN.into(),
+            auth_token_sha256: baybo_store::device::hash_auth_token(TEST_TOKEN),
             status: DeviceStatus::Approved,
             rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
             created_at: 0,

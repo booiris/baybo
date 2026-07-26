@@ -5,8 +5,8 @@
 //! WS/blob routes. The admin bearer stored in the secret vault under
 //! `gateway.admin_token` guards ordinary Web requests. When
 //! `x-baybo-device-id` is present, the presented bearer must either be that
-//! admin token or the matching approved device `auth_token` from the device
-//! store; only then is the request tagged as `AuthedClient::Device`.
+//! admin token or a bearer whose digest matches an approved device row; only
+//! then is the request tagged as `AuthedClient::Device`.
 
 use std::sync::Arc;
 
@@ -99,6 +99,20 @@ impl AdminAuthState {
     pub fn with_device_store(mut self, device_store: Arc<dyn DeviceStore>) -> Self {
         self.device_store = Some(device_store);
         self
+    }
+
+    /// The gateway's own admin bearer, for in-process forwards that re-enter
+    /// [`require_admin_token`].
+    ///
+    /// Used by the relay API tunnel, whose caller is already authenticated by
+    /// Noise IK static-key match before any HTTP is synthesised. It cannot
+    /// present the device's own bearer (storage keeps only a digest) and should
+    /// not: paired with `x-baybo-device-id` this lands on the branch of
+    /// [`Self::authenticate_request`] that exists for exactly this case, so the
+    /// caller keeps its [`AuthedClient::Device`] identity and the tunnel keeps
+    /// the middleware instead of bypassing it.
+    pub(crate) fn admin_bearer(&self) -> &str {
+        &self.expected
     }
 
     /// Validate the bearer on `req`, resolve the downstream caller identity, and

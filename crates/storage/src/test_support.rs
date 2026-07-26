@@ -199,7 +199,9 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
 // Device registry + pairing-slot fakes (used by `baybo-pairing` service tests)
 // ---------------------------------------------------------------------------
 
-use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
+use baybo_store::device::{
+    DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult, hash_auth_token,
+};
 
 /// In-memory [`DeviceStore`] keyed by `device_id`.
 #[derive(Default)]
@@ -217,7 +219,10 @@ impl MemoryDeviceStore {
 impl DeviceStore for MemoryDeviceStore {
     async fn create(&self, row: &DeviceRow) -> DeviceResult<()> {
         let mut g = self.rows.lock();
-        if g.contains_key(&row.device_id) || g.values().any(|r| r.auth_token == row.auth_token) {
+        if g.contains_key(&row.device_id)
+            || g.values()
+                .any(|r| r.auth_token_sha256 == row.auth_token_sha256)
+        {
             return Err(StorageError::Conflict("device or auth_token exists".into()));
         }
         // Mirror the partial unique index: at most one Approved row.
@@ -235,7 +240,7 @@ impl DeviceStore for MemoryDeviceStore {
     async fn create_replacing_approved(&self, row: &DeviceRow) -> DeviceResult<Vec<String>> {
         let mut g = self.rows.lock();
         if g.values()
-            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+            .any(|r| r.auth_token_sha256 == row.auth_token_sha256 && r.device_id != row.device_id)
         {
             return Err(StorageError::Conflict("auth_token exists".into()));
         }
@@ -254,7 +259,7 @@ impl DeviceStore for MemoryDeviceStore {
     async fn create_provisioning(&self, row: &DeviceRow) -> DeviceResult<()> {
         let mut g = self.rows.lock();
         if g.values()
-            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+            .any(|r| r.auth_token_sha256 == row.auth_token_sha256 && r.device_id != row.device_id)
         {
             return Err(StorageError::Conflict("auth_token exists".into()));
         }
@@ -292,13 +297,16 @@ impl DeviceStore for MemoryDeviceStore {
 
     async fn lookup_approved_by_auth_token(
         &self,
-        auth_token: &str,
+        presented_token: &str,
     ) -> DeviceResult<Option<DeviceRow>> {
+        // Hash exactly as the sqlite store does, or a test passes against the
+        // fake while the real lookup misses.
+        let digest = hash_auth_token(presented_token);
         Ok(self
             .rows
             .lock()
             .values()
-            .find(|r| r.auth_token == auth_token && r.status == DeviceStatus::Approved)
+            .find(|r| r.auth_token_sha256 == digest && r.status == DeviceStatus::Approved)
             .cloned())
     }
 

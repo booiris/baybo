@@ -9,6 +9,8 @@ doctest = false
 [dependencies]
 baybo-model = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

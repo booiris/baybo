@@ -16,6 +16,7 @@ use axum::routing::get;
 use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
 use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
 use baybo_storage::test_support::MemoryDeviceStore;
+use baybo_store::device::hash_auth_token;
 use baybo_store::{DeviceRow, DeviceStatus, DeviceStore};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -74,7 +75,7 @@ fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
     DeviceRow {
         device_id: device_id.into(),
         device_pubkey: vec![0u8; 32],
-        auth_token: auth_token.into(),
+        auth_token_sha256: hash_auth_token(auth_token),
         status: DeviceStatus::Approved,
         rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
         created_at: 1,

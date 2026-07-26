@@ -13,6 +13,7 @@ use baybo_config::ChannelsConfig;
 use baybo_gateway::channel::boot;
 use baybo_gateway::channel_listener::ChannelServer;
 use baybo_gateway::test_support::build_test_deps;
+use baybo_store::device::hash_auth_token;
 use baybo_store::{DeviceRow, DeviceStatus};
 use tokio::net::TcpStream;
 use tokio_tungstenite::client_async;
@@ -28,7 +29,7 @@ fn approved_device(token: &str) -> DeviceRow {
     DeviceRow {
         device_id: "dev-1".into(),
         device_pubkey: vec![0u8; 32],
-        auth_token: token.into(),
+        auth_token_sha256: hash_auth_token(token),
         status: DeviceStatus::Approved,
         rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
         created_at: 1,

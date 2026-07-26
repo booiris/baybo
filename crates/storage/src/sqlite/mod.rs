@@ -991,6 +991,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
                     ON channel_pairings(code);
 
+                -- `auth_token` holds `sha256:<hex>` — the DIGEST of the
+                -- bearer, never the bearer itself. The column name is
+                -- historical; the `sha256:` tag makes the value self-describing.
                 CREATE TABLE IF NOT EXISTS devices (
                     device_id     TEXT    NOT NULL,
                     device_pubkey BLOB    NOT NULL,
@@ -1386,6 +1389,43 @@ mod tests {
         assert!(
             err.to_string().contains("no_such_table"),
             "error should name the table, got {err}"
+        );
+    }
+
+    /// Guards against a fallback that also compares the presented token against
+    /// the stored value directly — that would re-admit the replayable
+    /// credential hashing removed.
+    #[tokio::test]
+    async fn a_plaintext_device_token_row_does_not_authenticate() {
+        use baybo_store::device::DeviceStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("legacy-device.db"))
+            .await
+            .expect("open");
+
+        let plaintext = "b7f3c1d9e2a48605f1c3d7b9e0a2f4c68d1b3e5a7c9f0b2d4e6a8c0f2b4d6e81";
+        let seed = plaintext.to_string();
+        pool.interact("test.seed", move |conn| {
+            conn.execute(
+                "INSERT INTO devices
+                   (device_id, device_pubkey, auth_token, status, created_at, approved_at)
+                 VALUES ('dev-legacy', x'00', ?1, 'approved', 1, 1)",
+                rusqlite::params![seed],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed legacy row");
+
+        let store = device::SqliteDeviceStore::new(pool);
+        assert!(
+            store
+                .lookup_approved_by_auth_token(plaintext)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a plaintext token column must not authenticate its own value"
         );
     }
 

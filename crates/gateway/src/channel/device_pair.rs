@@ -234,7 +234,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     //    static learned in-band) + consume the slot (zeroizing the secret it
     //    held). The token becomes active only after the welcome frame has been
     //    sent successfully.
-    let row = state
+    let staged = state
         .device_pairing
         .stage(
             &slot,
@@ -279,7 +279,9 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         relay_node_id,
         relay_url,
         rendezvous_id: slot.rendezvous_id.clone(),
-        auth_token: row.auth_token.clone(),
+        // The plaintext, straight from `stage` — the durable row keeps only
+        // its digest, so this is the only moment it can be sent.
+        auth_token: staged.auth_token.clone(),
         gateway_push_pubkey,
     };
     let sealed = noise
@@ -293,7 +295,11 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         return Err(e);
     }
 
-    if let Err(e) = state.device_pairing.approve_staged(&row.device_id).await {
+    if let Err(e) = state
+        .device_pairing
+        .approve_staged(&staged.row.device_id)
+        .await
+    {
         revoke_staged_device(state, &hello.device_id).await;
         return Err(format!("approve pairing: {e}"));
     }
@@ -634,7 +640,15 @@ mod tests {
         // active token, and the per-device push key (HKDF of `h`) is stored.
         let row = device_store.get(&device_id).await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
-        assert_eq!(row.auth_token, welcome.auth_token);
+        assert_eq!(
+            row.auth_token_sha256,
+            baybo_store::device::hash_auth_token(&welcome.auth_token),
+            "the row stores the digest of the bearer the device was handed"
+        );
+        assert_ne!(
+            row.auth_token_sha256, welcome.auth_token,
+            "the plaintext bearer must never be what is persisted"
+        );
         // The gateway pinned A's *peer* static — i.e. the app's static key.
         assert_eq!(row.device_pubkey.len(), 32);
         assert_ne!(

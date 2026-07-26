@@ -3,7 +3,7 @@ use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_store::StorageError;
-use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result};
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result, hash_auth_token};
 
 pub struct SqliteDeviceStore {
     pool: SqlitePool,
@@ -65,7 +65,7 @@ fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
     vec![
         Value::Text(row.device_id.clone()),
         Value::Blob(row.device_pubkey.clone()),
-        Value::Text(row.auth_token.clone()),
+        Value::Text(row.auth_token_sha256.clone()),
         Value::Text(row.status.as_str().to_string()),
         row.rendezvous_id.clone().map_or(Value::Null, Value::Text),
         Value::Integer(row.created_at),
@@ -82,7 +82,7 @@ fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
 struct RawDevice {
     device_id: String,
     device_pubkey: Vec<u8>,
-    auth_token: String,
+    auth_token_sha256: String,
     status: String,
     rendezvous_id: Option<String>,
     created_at: i64,
@@ -96,7 +96,7 @@ fn raw_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDevice> {
     Ok(RawDevice {
         device_id: row.get(0)?,
         device_pubkey: row.get(1)?,
-        auth_token: row.get(2)?,
+        auth_token_sha256: row.get(2)?,
         status: row.get(3)?,
         rendezvous_id: row.get(4)?,
         created_at: row.get(5)?,
@@ -113,7 +113,7 @@ fn into_device_row(raw: RawDevice) -> anyhow::Result<DeviceRow> {
     Ok(DeviceRow {
         device_id: raw.device_id,
         device_pubkey: raw.device_pubkey,
-        auth_token: raw.auth_token,
+        auth_token_sha256: raw.auth_token_sha256,
         status,
         rendezvous_id: raw.rendezvous_id,
         created_at: raw.created_at,
@@ -283,8 +283,15 @@ impl DeviceStore for SqliteDeviceStore {
             .await
     }
 
-    async fn lookup_approved_by_auth_token(&self, auth_token: &str) -> Result<Option<DeviceRow>> {
-        let token = auth_token.to_string();
+    async fn lookup_approved_by_auth_token(
+        &self,
+        presented_token: &str,
+    ) -> Result<Option<DeviceRow>> {
+        // Match on the digest, never the bearer. Equality on a hash is safe to
+        // index and safe to compare non-constant-time: learning the stored
+        // digest does not let an attacker authenticate, since presenting it
+        // would only be hashed again.
+        let token = hash_auth_token(presented_token);
         self.pool
             .interact("devices.lookup_approved_by_auth_token", move |conn| {
                 let raw = conn
@@ -381,11 +388,13 @@ impl DeviceStore for SqliteDeviceStore {
 mod tests {
     use super::*;
 
+    /// `token` is the **plaintext** a device would present; the fixture stores
+    /// its digest, matching what the pairing path writes.
     fn device_row(device: &str, token: &str, code: &str) -> DeviceRow {
         DeviceRow {
             device_id: device.into(),
             device_pubkey: vec![7u8; 32],
-            auth_token: token.into(),
+            auth_token_sha256: hash_auth_token(token),
             status: DeviceStatus::Approved,
             rendezvous_id: Some(code.into()),
             created_at: 100,
@@ -486,7 +495,11 @@ mod tests {
         // Row survives (audit), token no longer authenticates.
         let row = s.get("d1").await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Revoked);
-        assert_eq!(row.auth_token, "tok1", "token slot retained, not reused");
+        assert_eq!(
+            row.auth_token_sha256,
+            hash_auth_token("tok1"),
+            "token slot retained, not reused"
+        );
         assert!(
             s.lookup_approved_by_auth_token("tok1")
                 .await
@@ -586,7 +599,11 @@ mod tests {
         let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(approved.len(), 1, "no stray second row");
         assert_eq!(approved[0].device_id, "d1");
-        assert_eq!(approved[0].auth_token, "tok2", "token refreshed in place");
+        assert_eq!(
+            approved[0].auth_token_sha256,
+            hash_auth_token("tok2"),
+            "token refreshed in place"
+        );
         assert_eq!(
             approved[0].created_at, 100,
             "created_at preserved as the device's first-seen time"

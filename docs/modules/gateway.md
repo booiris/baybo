@@ -143,10 +143,12 @@ The vault-token scheme is a **workspace-binding** credential, *not*
 a defence against a same-UID hostile process.
 
 *Designed to reject*
-- connections from a different Unix user — the sqlite vault file is
-  `0o600` and `<workspace>/state/channel.port` is also `0o600`, so another
-  UID can't even locate the listener's port, let alone read the
-  freshly-rotated TUI token;
+- connections from a different Unix user — `<workspace>/state/channel.port`
+  is `0o600` and the sqlite database backing the vault is kept owner-only
+  by `baybo-storage` (`DB_FILE_MODE`, applied to the database and its
+  WAL/SHM sidecars on every open), so another UID can't even locate the
+  listener's port, let alone read the freshly-rotated TUI token. Both
+  modes are load-bearing for this claim, not hygiene;
 - cross-workspace mix-ups — every workspace has its own sqlite
   database with its own (master-key-encrypted) `gateway.tui_token`
   row, so a TUI pointed at workspace B will never come up with the
@@ -202,16 +204,25 @@ then constrains that identity to the reserved `owner` chat channel.
 Direct device clients add `x-baybo-device-id: device-<hex(ed25519 pub)>` on every
 `/v1/*` call. The header is only an identity claim: admin auth accepts it
 only when the bearer is either the admin token or the matching approved
-device `auth_token` in `DeviceStore`. Once accepted, the request is tagged
+device token in `DeviceStore` — which stores only
+`hash_auth_token(bearer)` (a `sha256:`-tagged digest), so the lookup hashes
+what was presented and compares digests. The plaintext bearer exists once, in
+the pairing response that hands it to the device, and is not recoverable from
+storage. Once accepted, the request is tagged
 as `AuthedClient::Device { device_id }`; chat REST and `/v1/channel-ws`
 resolve to the shared `owner` chat channel (device auth must register as
 `owner`, the same channel the web dashboard uses), and `/v1/blobs` stamps
 uploads with `device:<device_id>`.
 Relay-mode device clients reach the same `v1_router_and_spec()` surface through
 the Noise-authenticated API tunnel. After the IK device handshake, the
-gateway injects `Authorization: Bearer <device auth_token>` plus
+gateway injects `Authorization: Bearer <the gateway's own admin token>` plus
 `x-baybo-device-id` before dispatching into the in-process router, so relay
-and direct requests resolve identity through the same admin auth path.
+and direct requests resolve identity through the same admin auth path. It
+presents the admin token rather than the device's because the device's is not
+recoverable (only its digest is stored) — and should not be: the IK handshake
+already authenticated the caller, and the admin-token + device-id branch of
+admin auth exists precisely to carry an already-established `Device` identity
+through the middleware instead of bypassing it.
 
 The loopback channel listener remains channel-token-only for the TUI,
 tool sidecars, and subprocess sidecars. The admin listener's co-hosted

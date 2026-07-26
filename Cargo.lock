@@ -1051,7 +1051,9 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "serde",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
 ]

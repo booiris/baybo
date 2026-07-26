@@ -1278,7 +1278,7 @@ mod tests {
         let row = DeviceRow {
             device_id: device_id.into(),
             device_pubkey: vec![1u8; 32],
-            auth_token: "auth".into(),
+            auth_token_sha256: baybo_store::device::hash_auth_token("auth"),
             status: DeviceStatus::Approved,
             rendezvous_id: None,
             created_at: 0,

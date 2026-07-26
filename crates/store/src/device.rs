@@ -61,8 +61,30 @@ impl DeviceStatus {
     }
 }
 
-/// One device-registry row. Natural key is `device_id`; `auth_token` is unique
-/// across all rows (live and revoked).
+/// Tag prefixing a stored device-token digest.
+///
+/// Load-bearing, not decoration: a minted token is 32 random bytes rendered as
+/// 64 hex characters and a SHA-256 digest is *also* 64 hex characters, so
+/// nothing about the shape distinguishes a bearer from its digest. The tag
+/// makes that distinction exact, and makes a stray `SELECT auth_token FROM
+/// devices` obviously not a credential.
+pub const AUTH_TOKEN_HASH_PREFIX: &str = "sha256:";
+
+/// Digest a presented bearer into the form stored in
+/// [`DeviceRow::auth_token_sha256`].
+///
+/// Unsalted SHA-256 is deliberate, not an oversight: the input is a
+/// full-entropy 256-bit random token rather than a user-chosen password, so
+/// there is no dictionary to attack and a KDF would only add per-request
+/// latency.
+pub fn hash_auth_token(presented: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(presented.as_bytes());
+    format!("{AUTH_TOKEN_HASH_PREFIX}{}", hex::encode(digest))
+}
+
+/// One device-registry row. Natural key is `device_id`; `auth_token_sha256` is
+/// unique across all rows (live and revoked).
 #[derive(Debug, Clone)]
 pub struct DeviceRow {
     /// Client-generated and **stable per physical device**: the app keys it off
@@ -74,9 +96,15 @@ pub struct DeviceRow {
     pub device_id: String,
     /// The device's X25519 static public key, exchanged at pairing (32 bytes).
     pub device_pubkey: Vec<u8>,
-    /// 256-bit hex bearer for the scoped REST/WS surface. Active from creation
-    /// (the row only exists once both ends confirmed).
-    pub auth_token: String,
+    /// [`hash_auth_token`] of the 256-bit bearer for the scoped REST/WS
+    /// surface — **never the bearer itself**.
+    ///
+    /// The plaintext exists once, in the pairing response that hands it to the
+    /// device; nothing reads it back out of storage afterwards because nothing
+    /// can. Lives in the SQL column still named `auth_token`: renames are
+    /// outside this schema's additive-migration rule, and the
+    /// [`AUTH_TOKEN_HASH_PREFIX`] tag makes the value self-describing anyway.
+    pub auth_token_sha256: String,
     pub status: DeviceStatus,
     /// The **public** rendezvous id this device paired under, retained for the
     /// operator's device list / audit. Never the QR secret (that stays in the
@@ -140,10 +168,18 @@ pub trait DeviceStore: Send + Sync {
     /// Fetch one row by its natural key.
     async fn get(&self, device_id: &str) -> Result<Option<DeviceRow>>;
 
-    /// Resolve an **approved** device by its bearer token — the gateway auth
-    /// path. Revoked rows never match, so the security-critical status filter
-    /// lives in one place (the SQL), not at every call site.
-    async fn lookup_approved_by_auth_token(&self, auth_token: &str) -> Result<Option<DeviceRow>>;
+    /// Resolve an **approved** device by the bearer token a caller presented —
+    /// the gateway auth path. Revoked rows never match, so the
+    /// security-critical status filter lives in one place (the SQL), not at
+    /// every call site.
+    ///
+    /// Takes the **plaintext** and hashes it internally: keeping the digest
+    /// step behind the trait is what stops a caller from accidentally looking
+    /// up, or storing, a raw bearer.
+    async fn lookup_approved_by_auth_token(
+        &self,
+        presented_token: &str,
+    ) -> Result<Option<DeviceRow>>;
 
     /// Resolve an **approved** device by its X25519 static public key — the
     /// relay content path, where no bearer token is presented (the gateway

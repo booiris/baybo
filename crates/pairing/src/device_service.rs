@@ -13,13 +13,25 @@
 use std::sync::Arc;
 
 use crate::device_slot::DevicePairingSlot;
-use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore};
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, hash_auth_token};
 use chrono::Utc;
 use device_proto::psk_pair::PairingSecret;
 use parking_lot::Mutex;
 use rand::RngExt;
 
 use crate::error::DevicePairingError;
+
+/// A freshly staged device: the durable row plus the only copy of its plaintext
+/// bearer.
+///
+/// Separated at the type level so the plaintext cannot be persisted by
+/// accident — [`DeviceRow`] carries only the digest.
+pub struct StagedDevice {
+    pub row: DeviceRow,
+    /// Plaintext bearer. Send it to the pairing device and drop it; it is not
+    /// recoverable from storage afterwards.
+    pub auth_token: String,
+}
 
 /// How long a minted pairing slot stays valid. 15 minutes — long enough to walk
 /// to the phone and scan, short enough that a stale slot doesn't linger. With no
@@ -171,6 +183,9 @@ impl DevicePairingService {
     /// once. The replacement happens **here**, at finalize — not when the
     /// operator first runs `device pair` — so a working binding is kept live
     /// until the new pairing actually completes.
+    ///
+    /// Returns the plaintext bearer alongside the row because this is the only
+    /// moment it exists: the row stores only its digest.
     pub async fn stage(
         &self,
         slot: &DevicePairingSlot,
@@ -178,7 +193,7 @@ impl DevicePairingService {
         device_pubkey: Vec<u8>,
         relay_url: &str,
         remote_api_key: &str,
-    ) -> Result<DeviceRow, DevicePairingError> {
+    ) -> Result<StagedDevice, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
         // rendezvous (a retrying leg) gets `SlotConsumed` and is refused, so one
         // rendezvous mints at most one device row. Dropping the slot here also
@@ -191,10 +206,11 @@ impl DevicePairingService {
             }
         }
         let now = Utc::now().timestamp();
+        let auth_token = mint_auth_token();
         let row = DeviceRow {
             device_id: device_id.to_string(),
             device_pubkey,
-            auth_token: mint_auth_token(),
+            auth_token_sha256: hash_auth_token(&auth_token),
             status: DeviceStatus::Provisioning,
             // Only the public rendezvous id lands in the durable row — never the
             // secret.
@@ -209,7 +225,7 @@ impl DevicePairingService {
             remote_api_key: remote_api_key.to_string(),
         };
         self.devices.create_provisioning(&row).await?;
-        Ok(row)
+        Ok(StagedDevice { row, auth_token })
     }
 
     /// Promote a staged device row to `Approved` and supersede any prior approved
@@ -241,11 +257,15 @@ impl DevicePairingService {
         device_pubkey: Vec<u8>,
         relay_url: &str,
         remote_api_key: &str,
-    ) -> Result<DeviceRow, DevicePairingError> {
-        let row = self
+    ) -> Result<StagedDevice, DevicePairingError> {
+        let staged = self
             .stage(slot, device_id, device_pubkey, relay_url, remote_api_key)
             .await?;
-        self.approve_staged(&row.device_id).await
+        let row = self.approve_staged(&staged.row.device_id).await?;
+        Ok(StagedDevice {
+            row,
+            auth_token: staged.auth_token,
+        })
     }
 
     /// Revoke a device (keeps the row + token slot; the token stops
@@ -325,13 +345,24 @@ mod tests {
             )
             .await
             .unwrap();
+        let staged = row;
+        let row = &staged.row;
         assert_eq!(row.status, DeviceStatus::Approved);
         assert!(row.approved_at.is_some());
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
         assert_eq!(
-            row.auth_token.len(),
+            staged.auth_token.len(),
             AUTH_TOKEN_BYTES * 2,
-            "hex of 32 bytes"
+            "the plaintext handed to the device is hex of 32 bytes"
+        );
+        assert_eq!(
+            row.auth_token_sha256,
+            hash_auth_token(&staged.auth_token),
+            "the durable row stores only the digest"
+        );
+        assert!(
+            !row.auth_token_sha256.contains(&staged.auth_token),
+            "the plaintext must not appear anywhere in the stored value"
         );
         // Only the public rendezvous id is retained on the durable row.
         assert_eq!(row.rendezvous_id.as_deref(), Some(rid.as_str()));
@@ -398,7 +429,7 @@ mod tests {
             .complete(&slot, "d1", vec![1u8; 32], "wss://relay.test", "inst-test")
             .await
             .unwrap();
-        assert_eq!(row.status, DeviceStatus::Approved);
+        assert_eq!(row.row.status, DeviceStatus::Approved);
         assert!(svc.revoke("d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.
         assert!(

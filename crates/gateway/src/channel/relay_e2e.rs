@@ -153,7 +153,9 @@ fn device_row(device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
     DeviceRow {
         device_id: device_id.into(),
         device_pubkey: pubkey,
-        auth_token: "device-auth-token-fixed-0123456789abcdef".into(),
+        auth_token_sha256: baybo_store::device::hash_auth_token(
+            "device-auth-token-fixed-0123456789abcdef",
+        ),
         status: DeviceStatus::Approved,
         rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
         created_at: 0,
@@ -416,5 +418,9 @@ async fn real_relay_pairs_gateway_and_mock_app() {
     // An approved device row landed over the real relay pairing splice.
     let row = device_store.get(&device_id).await.unwrap().unwrap();
     assert_eq!(row.status, DeviceStatus::Approved);
-    assert_eq!(row.auth_token, welcome.auth_token);
+    assert_eq!(
+        row.auth_token_sha256,
+        baybo_store::device::hash_auth_token(&welcome.auth_token),
+        "the row stores the digest of the bearer the device was handed"
+    );
 }

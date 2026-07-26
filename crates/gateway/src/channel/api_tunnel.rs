@@ -356,7 +356,12 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
         .await;
     }
 
-    let req = match build_forward_request(&head, device, Body::empty()) {
+    let req = match build_forward_request(
+        &head,
+        device,
+        state.tunnel_http.auth.admin_bearer(),
+        Body::empty(),
+    ) {
         Ok(req) => req,
         Err((status, reason)) => {
             send_error(sink, transport, head.request_id, status, &reason).await?;
@@ -409,8 +414,12 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
 
     let request_id = head.request_id;
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(4);
-    let req = match build_forward_request(&head, device, Body::from_stream(ReceiverStream::new(rx)))
-    {
+    let req = match build_forward_request(
+        &head,
+        device,
+        state.tunnel_http.auth.admin_bearer(),
+        Body::from_stream(ReceiverStream::new(rx)),
+    ) {
         Ok(req) => req,
         Err((status, reason)) => {
             close_forward_body(tx, reason.clone()).await;
@@ -470,9 +479,14 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     Ok(leg_state)
 }
 
+/// Synthesise the in-process HTTP request for an already-Noise-authenticated
+/// device. `admin_bearer` is the gateway's own admin token — see
+/// [`crate::auth::AdminAuthState::admin_bearer`] for why it, and not the
+/// device's bearer, is what this presents.
 fn build_forward_request(
     head: &RequestHead,
     device: &AuthenticatedDevice,
+    admin_bearer: &str,
     body: Body,
 ) -> Result<Request<Body>, (u16, String)> {
     let method = head
@@ -509,10 +523,7 @@ fn build_forward_request(
         builder = builder.header(HEADER_CONTENT_LENGTH, body_len.to_string());
     }
     builder = builder
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", device.auth_token),
-        )
+        .header(header::AUTHORIZATION, format!("Bearer {admin_bearer}"))
         .header(DEVICE_ID_HEADER, device.device_id.as_str());
     let req = builder
         .body(body)
@@ -930,20 +941,23 @@ mod tests {
     fn forward_request_injects_gateway_device_auth_headers() {
         let device = AuthenticatedDevice {
             device_id: "device-abc".into(),
-            auth_token: "device-token".into(),
         };
         let req = build_forward_request(
             &head(vec![TunnelHeader::new("accept", "application/json")]),
             &device,
+            "admin-bearer",
             Body::empty(),
         )
         .expect("request");
 
+        // The gateway's own admin bearer, not the device's — storage keeps only
+        // a digest of the latter, and the middleware's admin-token + device-id
+        // branch is what preserves the Device identity downstream.
         assert_eq!(
             req.headers()
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok()),
-            Some("Bearer device-token"),
+            Some("Bearer admin-bearer"),
         );
         assert_eq!(
             req.headers()
@@ -1129,7 +1143,7 @@ mod session_tests {
             .create(&DeviceRow {
                 device_id: device_id.clone(),
                 device_pubkey: device.public().to_vec(),
-                auth_token: TEST_TOKEN.into(),
+                auth_token_sha256: baybo_store::device::hash_auth_token(TEST_TOKEN),
                 status: DeviceStatus::Approved,
                 rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
                 created_at: 0,
