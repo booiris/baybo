@@ -44,6 +44,8 @@ import {
   summaryTokens,
   traceTokens,
 } from './traceFormat';
+import type { TraceGroup } from './traceFormat';
+import { nodeGroup } from './traceFormat';
 import type { JobRollup } from './traceTreeModel';
 import { attention, isExternalAgentJob, isJobLive, jobRollup, resolveExpanded } from './traceTreeModel';
 
@@ -70,6 +72,8 @@ export interface TraceTreeProps {
   /** Session transcript — needed to resolve transcript-backed tool outputs for
    *  the inline I/O preview. */
   messageLog: SessionMessageRow[];
+  /** Legend group to highlight; non-matching rows dim. `null` = no highlight. */
+  highlight: TraceGroup | null;
   // Controlled filter (owned by the page):
   filterRaw: string;
   onFilterRawChange: (v: string) => void;
@@ -188,10 +192,12 @@ function heatTint(ms: number | null, maxMs: number, siblings: number): string {
   return '';
 }
 
-function rowShell(selected: boolean, stripe: string, tint: string): string {
+function rowShell(selected: boolean, stripe: string, tint: string, dim = false): string {
   const bg = selected ? 'bg-selected text-ink' : `${tint || 'bg-transparent'} hover:bg-gray-50`;
   const border = selected ? 'border-l-black' : stripe;
-  return `group w-full text-left flex items-center gap-2 pr-3 py-1.5 border-l-[3px] ${border} border-b border-b-black/10 cursor-pointer transition-colors ${bg}`;
+  return `group w-full text-left flex items-center gap-2 pr-3 py-1.5 border-l-[3px] ${border} border-b border-b-black/10 cursor-pointer transition-[colors,opacity] ${bg} ${
+    dim ? 'opacity-25' : ''
+  }`;
 }
 
 function rowInteractive(onSelect: () => void) {
@@ -226,6 +232,7 @@ function SpanRow({
   maxMs,
   siblings,
   heat,
+  dim,
   onSelect,
 }: {
   span: Span;
@@ -233,6 +240,7 @@ function SpanRow({
   interjected: boolean;
   maxMs: number;
   siblings: number;
+  dim: boolean;
   heat: boolean;
   onSelect: () => void;
 }) {
@@ -264,7 +272,7 @@ function SpanRow({
   const tint = heat && !selected ? heatTint(ms, maxMs, siblings) : '';
 
   return (
-    <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint)} style={{ paddingLeft: INDENT_SPAN }}>
+    <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint, dim)} style={{ paddingLeft: INDENT_SPAN }}>
       <Glyph ch={visual.glyph} accent={visual.accent} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -304,6 +312,7 @@ function StepRow({
   maxMs,
   siblings,
   heat,
+  dim,
   onToggle,
   onSelect,
 }: {
@@ -313,6 +322,7 @@ function StepRow({
   hasSpans: boolean;
   maxMs: number;
   siblings: number;
+  dim: boolean;
   heat: boolean;
   onToggle: () => void;
   onSelect: () => void;
@@ -324,7 +334,7 @@ function StepRow({
   const tint = heat && !selected ? heatTint(ms, maxMs, siblings) : '';
 
   return (
-    <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint)} style={{ paddingLeft: INDENT_STEP }}>
+    <div {...rowInteractive(onSelect)} className={rowShell(selected, stripeClass(visual), tint, dim)} style={{ paddingLeft: INDENT_STEP }}>
       {hasSpans ? <Chevron open={open} onClick={onToggle} /> : <span className="shrink-0 w-5" />}
       <Glyph ch={visual.glyph} accent={visual.accent} />
       <div className="flex-1 min-w-0">
@@ -434,6 +444,7 @@ export function TraceTree(props: TraceTreeProps) {
     interjectionCountByJob,
     interjectionSpanIds,
     messageLog,
+    highlight,
     filterRaw,
     onFilterRawChange,
     failuresOnly,
@@ -565,6 +576,7 @@ export function TraceTree(props: TraceTreeProps) {
                             maxMs={maxStepMs}
                             siblings={trace.steps.length}
                             heat={heat}
+                            dim={highlight != null && nodeGroup(stepVisual(rs.step.kind.kind), rs.step.outcome) !== highlight}
                             onToggle={() => onToggle(rs.step.id, stepOpen)}
                             onSelect={onStepClick}
                           />
@@ -581,6 +593,7 @@ export function TraceTree(props: TraceTreeProps) {
                                     maxMs={maxSpanMs}
                                     siblings={rs.spans.length}
                                     heat={heat}
+                                    dim={highlight != null && nodeGroup(spanVisual(span.kind.kind), span.outcome) !== highlight}
                                     onSelect={() => onSelectSpan(job.job_id, span.id)}
                                   />
                                   {pv != null && pv !== '' && (

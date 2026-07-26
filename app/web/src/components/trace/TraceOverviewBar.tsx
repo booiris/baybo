@@ -9,7 +9,16 @@
 import { useMemo, useState } from 'react';
 import { RiArrowDownSLine, RiArrowRightSLine } from 'react-icons/ri';
 import type { JobTrace, LifecycleState, TraceJobSummary, TraceOverview } from '../../types/trace';
-import { formatDuration, formatTok, spanVisual, stepVisual, summaryTokens, TRACE_LEGEND } from './traceFormat';
+import type { TraceGroup } from './traceFormat';
+import {
+  formatDuration,
+  formatTok,
+  nodeGroup,
+  spanVisual,
+  stepVisual,
+  summaryTokens,
+  TRACE_LEGEND,
+} from './traceFormat';
 import { scrollToAnchor } from './scrollToAnchor';
 
 // Cap the number of rendered minimap cells so a multi-thousand-span trace can't
@@ -24,6 +33,7 @@ interface Cell {
   spanId: string | null;
   cellClass: string;
   failed: boolean;
+  group: TraceGroup;
   label: string;
 }
 
@@ -67,6 +77,7 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
             spanId: span.id,
             cellClass: failed ? 'bg-err' : v.cell,
             failed,
+            group: nodeGroup(v, span.outcome),
             label,
           });
         }
@@ -88,6 +99,7 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
           spanId: single ? single.id : null,
           cellClass: failed ? 'bg-err' : v.cell,
           failed,
+          group: failed ? 'failed' : v.group,
           label: v.label,
         });
       }
@@ -130,6 +142,8 @@ export function TraceOverviewBar({
   overview,
   jobTraces,
   loadingJobs,
+  highlight,
+  onHighlight,
   selectedSpanId,
   selectedStepId,
   onSelectSpan,
@@ -138,6 +152,9 @@ export function TraceOverviewBar({
   overview: TraceOverview;
   jobTraces: Map<string, JobTrace>;
   loadingJobs: Set<string>;
+  /** Legend group to highlight; non-matching cells dim. `null` = no highlight. */
+  highlight: TraceGroup | null;
+  onHighlight: (g: TraceGroup | null) => void;
   selectedSpanId: string | null;
   selectedStepId: string | null;
   onSelectSpan: (jobId: string, spanId: string) => void;
@@ -208,8 +225,10 @@ export function TraceOverviewBar({
                   type="button"
                   title={`${c.label}${c.failed ? ' · failed' : ''}`}
                   onClick={() => jump(c)}
-                  className={`h-3.5 w-2.5 rounded-[2px] border border-black/40 cursor-pointer ${c.cellClass} ${
-                    selected ? 'ring-2 ring-black ring-offset-1' : ''
+                  className={`h-3.5 w-2.5 rounded-[2px] border border-black/40 cursor-pointer transition-opacity ${
+                    c.cellClass
+                  } ${selected ? 'ring-2 ring-black ring-offset-1' : ''} ${
+                    highlight != null && c.group !== highlight ? 'opacity-20' : ''
                   }`}
                 />
               );
@@ -249,12 +268,32 @@ export function TraceOverviewBar({
       {open && (
         <div className="mt-1.5 flex items-center gap-x-3 gap-y-1 flex-wrap text-[0.6rem] text-ink-soft font-mono">
           <span className="font-bold uppercase tracking-wider w-14 shrink-0">legend</span>
-          {TRACE_LEGEND.map((l) => (
-            <span key={l.label} className="inline-flex items-center gap-1">
-              <span className={`inline-block h-2.5 w-2.5 rounded-[2px] border border-black/40 ${l.cell}`} />
-              {l.label}
-            </span>
-          ))}
+          {TRACE_LEGEND.map((l) => {
+            const on = highlight === l.group;
+            return (
+              <button
+                key={l.group}
+                type="button"
+                onClick={() => onHighlight(on ? null : l.group)}
+                title={on ? `Showing all — click to clear` : `Highlight ${l.label} nodes`}
+                className={`inline-flex items-center gap-1 rounded px-1 cursor-pointer transition-colors ${
+                  on ? 'bg-ink text-canvas font-bold' : 'hover:bg-black/5'
+                }`}
+              >
+                <span className={`inline-block h-2.5 w-2.5 rounded-[2px] border border-black/40 ${l.cell}`} />
+                {l.label}
+              </button>
+            );
+          })}
+          {highlight != null && (
+            <button
+              type="button"
+              onClick={() => onHighlight(null)}
+              className="font-bold uppercase tracking-wider text-brand-hover hover:underline cursor-pointer"
+            >
+              clear
+            </button>
+          )}
         </div>
       )}
     </div>

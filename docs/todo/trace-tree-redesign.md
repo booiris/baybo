@@ -173,7 +173,9 @@ the rest of the dashboard. Also ported from FlowRail: a full-width **trace-overv
 (`TraceOverviewBar`) above the panes — a clickable **sequence minimap** (one cell per
 step/span across all loaded jobs, kind-coloured via a literal `cell` field, red for
 failures, click→select + scroll), token totals, wall-clock, counts, and **per-tool** call
-chips, and a **legend** (collapsible). Kind colours are one distinct hue per group —
+chips, and a **clickable legend** (collapsible) — selecting a legend entry
+highlights that group across both the minimap and the tree by dimming everything
+else, so "where did it fail" or "where are the tool calls" reads at a glance. Kind colours are one distinct hue per group —
 **LLM = green, Tool = orange, Memory = blue, Subagent = gold, Aux = gray**, with a red
 failure overlay — shared across the glyph, left stripe, and minimap cell (`TRACE_LEGEND`
 is the key). Plus a slim left **job-anchor rail** (`JobAnchors`) — a document-

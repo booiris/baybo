@@ -32,6 +32,7 @@ import { MessageList } from '../components/trace/MessageList';
 import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/SanitizeChip';
 import { TraceTree } from '../components/trace/TraceTree';
 import { TraceOverviewBar } from '../components/trace/TraceOverviewBar';
+import type { TraceGroup } from '../components/trace/traceFormat';
 import { JobAnchors } from '../components/trace/JobAnchors';
 import {
   contentText,
@@ -961,6 +962,8 @@ export function TraceSessionPage() {
   const [filterRaw, setFilterRaw] = useState('');
   const [filter, setFilter] = useState('');
   const [failuresOnly, setFailuresOnly] = useState(false);
+  // Legend group to highlight across the minimap + tree (null = show all).
+  const [highlight, setHighlight] = useState<TraceGroup | null>(null);
 
   // Lets the overview poll read the transcript it currently holds (its cursor +
   // supersede watermark) without making the fetch effect depend on `overview`
@@ -1467,6 +1470,8 @@ export function TraceSessionPage() {
         overview={overview}
         jobTraces={jobTraces}
         loadingJobs={loadingJobs}
+        highlight={highlight}
+        onHighlight={setHighlight}
         selectedSpanId={selectedSpan?.id ?? null}
         selectedStepId={selectedStepRs?.step.id ?? null}
         onSelectSpan={handleSelectSpan}
@@ -1495,6 +1500,7 @@ export function TraceSessionPage() {
           interjectionCountByJob={interjectionCountByJob}
           interjectionSpanIds={interjectionSpanIds}
           messageLog={messageLog}
+          highlight={highlight}
           filterRaw={filterRaw}
           onFilterRawChange={setFilterRaw}
           failuresOnly={failuresOnly}

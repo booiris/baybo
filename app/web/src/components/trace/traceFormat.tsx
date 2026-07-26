@@ -33,8 +33,13 @@ import { resolveInputMessages } from '../../types/trace';
 
 // ── Visual mapping per StepKind / SpanKind ───────────────────────────
 
+/** The colour groups the legend is keyed on — one per hue, plus the failure
+ *  overlay. Clicking a legend entry highlights the nodes in that group. */
+export type TraceGroup = 'llm' | 'tool' | 'memory' | 'subagent' | 'aux' | 'failed';
+
 export interface KindVisual {
   icon: IconType; // used by the right-hand detail-panel headers
+  group: TraceGroup; // which legend entry this kind belongs to
   glyph: string; // compact one-char marker for the dense tree rows (bench-web style)
   accent: string; // tailwind text color
   bg: string; // tailwind bg color (for the icon disc)
@@ -53,38 +58,46 @@ export interface KindVisual {
 // overlay, applied on top wherever an outcome failed. The glyph, left stripe,
 // and minimap cell of a kind all share its hue so the legend reads across the UI.
 export const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
-  llm_iteration: { icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM iteration' },
-  compression: { icon: RiArchiveLine, glyph: 'C', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Compression' },
-  memory_recall: { icon: RiSearchEyeLine, glyph: 'M', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory recall' },
-  memory_write: { icon: RiSave3Line, glyph: 'W', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory write' },
-  skill_selection: { icon: RiBookmark3Line, glyph: 'S', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Skill selection' },
-  progress_observer: { icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
-  title_generation: { icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
-  subagent: { icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent' },
+  llm_iteration: { group: 'llm', icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM iteration' },
+  compression: { group: 'aux', icon: RiArchiveLine, glyph: 'C', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Compression' },
+  memory_recall: { group: 'memory', icon: RiSearchEyeLine, glyph: 'M', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory recall' },
+  memory_write: { group: 'memory', icon: RiSave3Line, glyph: 'W', accent: 'text-info', bg: 'bg-info/10', stripe: 'border-l-info', cell: 'bg-info', label: 'Memory write' },
+  skill_selection: { group: 'aux', icon: RiBookmark3Line, glyph: 'S', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Skill selection' },
+  progress_observer: { group: 'aux', icon: RiBroadcastLine, glyph: 'P', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Progress observer' },
+  title_generation: { group: 'aux', icon: RiPriceTag3Line, glyph: 'T', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Title generation' },
+  subagent: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent' },
 };
 
 export const SPAN_VISUALS: Record<SpanKindTag, KindVisual> = {
-  llm_call: { icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM call' },
-  tool_call: { icon: RiToolsLine, glyph: 't', accent: 'text-warn', bg: 'bg-warn/10', stripe: 'border-l-warn', cell: 'bg-warn', label: 'Tool call' },
-  subagent_stub: { icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent stub' },
+  llm_call: { group: 'llm', icon: RiBrainLine, glyph: 'L', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'LLM call' },
+  tool_call: { group: 'tool', icon: RiToolsLine, glyph: 't', accent: 'text-warn', bg: 'bg-warn/10', stripe: 'border-l-warn', cell: 'bg-warn', label: 'Tool call' },
+  subagent_stub: { group: 'subagent', icon: RiTeamLine, glyph: 'A', accent: 'text-brand', bg: 'bg-brand/10', stripe: 'border-l-brand', cell: 'bg-brand', label: 'Subagent stub' },
 };
 
 // Colour key for the overview minimap + tree glyphs/stripes. One entry per hue
 // group above (not per kind), plus the failure overlay.
-export const TRACE_LEGEND: { label: string; cell: string }[] = [
-  { label: 'LLM', cell: 'bg-ok' },
-  { label: 'Tool', cell: 'bg-warn' },
-  { label: 'Memory', cell: 'bg-info' },
-  { label: 'Subagent', cell: 'bg-brand' },
-  { label: 'Aux', cell: 'bg-ink-soft' },
-  { label: 'Failed', cell: 'bg-err' },
+export const TRACE_LEGEND: { group: TraceGroup; label: string; cell: string }[] = [
+  { group: 'llm', label: 'LLM', cell: 'bg-ok' },
+  { group: 'tool', label: 'Tool', cell: 'bg-warn' },
+  { group: 'memory', label: 'Memory', cell: 'bg-info' },
+  { group: 'subagent', label: 'Subagent', cell: 'bg-brand' },
+  { group: 'aux', label: 'Aux', cell: 'bg-ink-soft' },
+  { group: 'failed', label: 'Failed', cell: 'bg-err' },
 ];
+
+/** A node's legend group. A failed/cancelled outcome wins over its kind, matching
+ *  how the minimap paints failures red regardless of kind. */
+export function nodeGroup(visual: KindVisual, outcome: LifecycleState): TraceGroup {
+  if (outcome.outcome === 'failed' || outcome.outcome === 'cancelled') return 'failed';
+  return visual.group;
+}
 
 // A kind the frontend doesn't know yet (wire drift, or a new Rust variant
 // shipped ahead of this map) must degrade to a generic row — never let a
 // `STEP_VISUALS[kind].icon` on `undefined` throw and white-screen the whole
 // trace view. The raw tag becomes the label so it's still legible.
 const FALLBACK_VISUAL: KindVisual = {
+  group: 'aux',
   icon: RiCpuLine,
   glyph: '·',
   accent: 'text-ink-soft',
