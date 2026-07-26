@@ -86,7 +86,7 @@ const EDIT_TOOL_NAME: &str = "Edit";
 /// headers + italic descriptors to fill in. The italic descriptors are
 /// preserved verbatim across passes (see the `STRUCTURE PRESERVATION
 /// REMINDER` block of the prompt).
-const DEFAULT_NOTES_TEMPLATE: &str = "# Session Title
+pub(crate) const DEFAULT_NOTES_TEMPLATE: &str = "# Session Title
 _A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_
 
 # Current State
@@ -116,6 +116,28 @@ _If the user asked a specific output such as an answer to a question, a table, o
 # Worklog
 _Step by step, what was attempted, done? Very terse summary for each step_
 ";
+
+/// Whether `notes` carries anything beyond the untouched
+/// [`DEFAULT_NOTES_TEMPLATE`] scaffold.
+///
+/// A pass that lands no `Edit` leaves `summary.md` byte-identical to the
+/// seeded scaffold: real headers, real italic descriptors, zero content.
+/// Handing that to the compressor's fast path would tell the model "the
+/// summary below covers the earlier portion of the conversation" while
+/// covering nothing, so the consuming side has to be able to recognize it.
+///
+/// Boilerplate is matched **line-by-line against the scaffold** rather than
+/// by stripping `#` / `_…_` markup: a model that writes its content inside
+/// the italic descriptors instead of below them (observed in the wild) still
+/// counts as content, because those lines no longer match the scaffold's.
+pub(crate) fn summary_has_content(notes: &str) -> bool {
+    notes.lines().map(str::trim).any(|line| {
+        !line.is_empty()
+            && !DEFAULT_NOTES_TEMPLATE
+                .lines()
+                .any(|seed| seed.trim() == line)
+    })
+}
 
 /// Result of one chat call inside the background-summary flow. Wraps
 /// the sanitized [`LlmResponse`] with the trace span id + post-pricing
@@ -218,6 +240,26 @@ Each section has TWO parts that must be preserved exactly as they appear in the 
 You ONLY update the actual content that comes AFTER these two preserved lines. The italic description lines starting and ending with underscores are part of the template structure, NOT content to be edited or removed.
 
 REMEMBER: Use the Edit tool in parallel and stop. Do not continue after the edits. Only include insights from the actual user conversation, never from these note-taking instructions. Do not delete or change section headers or italic _section descriptions_."#;
+
+/// Replaces the transcript + original prompt on retry rounds once the model
+/// has already attempted an `Edit`.
+///
+/// The transcript is the entire cost of this pass (~145K tokens, re-sent
+/// verbatim every iteration), and a retry round doesn't need it: the content
+/// the model wants to write is already composed in its own previous turn,
+/// which stays in the suffix. What it needs is the file's *current* bytes,
+/// which only a `Read` can give it — the embedded snapshot is what went stale
+/// in the first place. Rounds where the model has only `Read` so far keep the
+/// full transcript, since it hasn't composed anything yet.
+///
+/// `{{notesPath}}` is substituted via `String::replace`.
+const RETRY_PROMPT_TEMPLATE: &str = r#"You are still updating the session notes file {{notesPath}}.
+
+The conversation transcript and the original instructions were provided earlier in this pass and are omitted here — everything you need to finish is in your own messages above.
+
+At least one of your Edit calls did not apply. Use the Read tool on {{notesPath}} to get its current contents, then issue corrected Edit calls for the changes that have not landed yet. Do not re-apply changes that are already present. When every intended edit is in the file, make no further tool calls and stop.
+
+Keep the file's structure intact: never modify or delete the '#' section headers or the italic _section description_ lines."#;
 
 /// `tool_result` body handed back when an `Edit` fails. The `old_string`
 /// almost always went stale against the snapshot embedded once in
@@ -620,6 +662,11 @@ pub async fn run_background_summary(
     let mut cost_micros: i64 = 0;
     let mut iterations: usize = 0;
     let mut applied_any_edit = false;
+    // Whether any `Edit` has been *issued* (landed or not). Gates the
+    // transcript elision: an attempted edit means the model has already
+    // composed what it wants to write, so later rounds can work from the
+    // suffix alone.
+    let mut attempted_any_edit = false;
     let mut unproductive_rounds: usize = 0;
     loop {
         if iterations >= MAX_BACKGROUND_SUMMARY_ITERATIONS {
@@ -633,13 +680,34 @@ iterations without terminating"
         }
         iterations += 1;
 
-        let input_marker = LlmCallInputs::Persisted {
-            last_ordinal: up_to_ordinal,
-            prefix_len: transcript_len,
-            suffix: messages[transcript_len..].to_vec(),
+        // Elide the transcript once the model has composed its edits: from
+        // there on the round is recovery, and re-sending ~145K tokens buys
+        // nothing the suffix doesn't already carry. `messages` itself keeps
+        // the full history — only what goes on the wire is trimmed.
+        let elide_transcript = attempted_any_edit;
+        let (request_messages, input_marker) = if elide_transcript {
+            let mut trimmed = Vec::with_capacity(messages.len() - transcript_len);
+            trimmed.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+                RETRY_PROMPT_TEMPLATE.replace("{{notesPath}}", &notes_path.display().to_string()),
+            )]));
+            // Skip the original prompt at `transcript_len`; the retry prompt
+            // above replaces it. Everything after is the tool-round history,
+            // whose tool_use / tool_result pairing stays intact.
+            trimmed.extend_from_slice(&messages[transcript_len + 1..]);
+            let marker = LlmCallInputs::Inline(trimmed.clone());
+            (trimmed, marker)
+        } else {
+            (
+                messages.clone(),
+                LlmCallInputs::Persisted {
+                    last_ordinal: up_to_ordinal,
+                    prefix_len: transcript_len,
+                    suffix: messages[transcript_len..].to_vec(),
+                },
+            )
         };
         let request = ChatRequest {
-            messages: messages.clone(),
+            messages: request_messages,
             temperature: None,
             tools: tool_defs.clone(),
             reasoning_effort: None,
@@ -673,15 +741,41 @@ iterations without terminating"
 
         let mut tool_results: Vec<ContentBlock> = Vec::with_capacity(response.tool_calls.len());
         let mut round_applied_edit = false;
+        let mut round_was_all_clean_edits = true;
         for call in &response.tool_calls {
             let result = execute_tool_call(&notes_path, call, &tool_ctx).await;
-            if call.name == EDIT_TOOL_NAME && !tool_result_is_error(&result) {
+            if call.name == EDIT_TOOL_NAME {
+                attempted_any_edit = true;
+            }
+            let clean_edit = call.name == EDIT_TOOL_NAME && !tool_result_is_error(&result);
+            if clean_edit {
                 applied_any_edit = true;
                 round_applied_edit = true;
+            } else {
+                round_was_all_clean_edits = false;
             }
             tool_results.push(result);
         }
         messages.push(ChatMessage::agent_context(tool_results));
+
+        // The prompt asks for every edit in one parallel message, then stop.
+        // When a round is exactly that — every call an `Edit`, every one
+        // applied — the model has done what it was told, and the only thing
+        // another turn can produce is the empty tool-call reply that would
+        // break the loop anyway. Taking the model at its word here is the
+        // difference between one round-trip and two: the confirmation turn
+        // costs a full transcript re-send to receive ~500 output tokens.
+        // A round that mixed in a `Read`, or whose `Edit` errored, is still
+        // mid-recovery and gets its next turn.
+        if round_was_all_clean_edits {
+            debug!(
+                session_id = %session_id,
+                iterations,
+                edits = response.tool_calls.len(),
+                "background summary: every edit in the round applied — stopping without a confirmation turn"
+            );
+            break;
+        }
 
         // Converge-or-stop. A round that changed nothing (only `Read`s, or
         // `Edit`s that all errored) is non-progress; bail after a couple in a
@@ -705,12 +799,24 @@ iterations without terminating"
         }
     }
 
+    // A pass that landed no `Edit` left `summary.md` byte-identical to what
+    // it found, so the file still covers only what the *previous* cursor
+    // covered. Advancing to `up_to_ordinal` here would claim coverage the
+    // file does not have, and the fast path would later swap that summary in
+    // for the transcript and silently drop every message in the gap.
     if !applied_any_edit {
-        debug!(
+        let _ = sessions
+            .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
+            .await;
+        warn!(
             session_id = %session_id,
             iterations,
-            "background summary: pass produced no Edit calls — notes left unchanged"
+            cost_micros,
+            "background summary: pass landed no Edit — cursor left at its prior position"
         );
+        return Err(ContextError::UnproductiveSummary(format!(
+            "no Edit applied across {iterations} iterations"
+        )));
     }
 
     // On metadata failure the file lands but the row doesn't —
@@ -831,6 +937,39 @@ mod tests {
         assert!(!prompt.contains(
             "IMPORTANT: The following sections exceed the per-section limit and MUST be condensed:"
         ));
+    }
+
+    #[test]
+    fn untouched_scaffold_counts_as_contentless() {
+        assert!(!summary_has_content(DEFAULT_NOTES_TEMPLATE));
+        // Trailing whitespace / CRLF drift must not read as content.
+        assert!(!summary_has_content(
+            &DEFAULT_NOTES_TEMPLATE.replace('\n', "  \n")
+        ));
+        assert!(!summary_has_content(""));
+        assert!(!summary_has_content("   \n\n  "));
+    }
+
+    #[test]
+    fn body_under_a_section_counts_as_content() {
+        let notes = DEFAULT_NOTES_TEMPLATE.replace(
+            "# Session Title\n",
+            "# Session Title\nPorting the compaction cursor guard\n",
+        );
+        assert!(summary_has_content(&notes));
+    }
+
+    /// A model that rewrites the italic descriptor itself instead of writing
+    /// below it still produced real content — seen in the wild on
+    /// `subagent-3f57c66c`. Matching against the scaffold line-by-line (rather
+    /// than stripping `_…_` markup) is what keeps this from reading as empty.
+    #[test]
+    fn content_written_inside_the_italic_descriptor_counts_as_content() {
+        let notes = DEFAULT_NOTES_TEMPLATE.replace(
+            "_A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_",
+            "_Research July 2026 AI intelligence candidates_",
+        );
+        assert!(summary_has_content(&notes));
     }
 
     #[test]
