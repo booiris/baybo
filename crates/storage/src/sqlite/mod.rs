@@ -126,6 +126,168 @@ fn restrict_db_permissions(path: &std::path::Path) {
     }
 }
 
+/// One additive column migration.
+///
+/// Split into parts rather than held as a DDL string because sqlite has no
+/// `ADD COLUMN IF NOT EXISTS`, and the obvious alternative — run the `ALTER`,
+/// swallow errors whose text contains `"duplicate column name"` — makes a
+/// message string load-bearing. That check silently stops matching if sqlite
+/// rewords it, and cannot tell an already-applied migration from a broken one.
+struct AddColumn {
+    table: &'static str,
+    column: &'static str,
+    /// Type and constraints, i.e. everything after the column name.
+    definition: &'static str,
+}
+
+impl AddColumn {
+    /// Every field is a compile-time literal from [`ADD_COLUMNS`], so
+    /// interpolating them into the DDL carries no injection surface — sqlite
+    /// takes no bind parameters in `ALTER TABLE`.
+    fn apply(&self, conn: &rusqlite::Connection) -> anyhow::Result<()> {
+        let Self {
+            table,
+            column,
+            definition,
+        } = *self;
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to inspect {table}.{column}: {e}"))?;
+        if present {
+            return Ok(());
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|e| anyhow::anyhow!("migration `{table}.{column}` failed: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Columns added after their `CREATE TABLE` shipped.
+const ADD_COLUMNS: &[AddColumn] = &[
+    AddColumn {
+        table: "sessions",
+        column: "parent_span_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "last_llm",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "pinned",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "cost_records",
+        column: "reason",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "folder_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "title",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "devices",
+        column: "relay_url",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
+        table: "devices",
+        column: "remote_api_key",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
+        table: "session_messages",
+        column: "platform_msg_id",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "archived",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "read_cursor",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "cron_executions",
+        column: "completed_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "cron_executions",
+        column: "notified_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "session_messages",
+        column: "source_event_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "cron_jobs",
+        column: "deleted_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
+        table: "cron_jobs",
+        column: "pinned",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "channel",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "session_control_events",
+        column: "platform_msg_id",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
+        table: "deck_cards",
+        column: "sizes",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    AddColumn {
+        table: "deck_cards",
+        column: "maximize",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "last_model",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "last_effort",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "session_messages",
+        column: "compaction_inserted",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+];
+
 /// Pool of sqlite connections.
 ///
 /// Cheap to clone (the inner `deadpool` pool is an `Arc`) and shared by every
@@ -895,43 +1057,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
-    // Migrations for DBs created before a column was added. SQLite has no
-    // `ADD COLUMN IF NOT EXISTS`, so we attempt the ALTER and swallow the
-    // "duplicate column" error. Add new migrations to this list rather
-    // than mutating the CREATE TABLE — fresh DBs pick the column up from
-    // CREATE, existing DBs from the ALTER.
-    let migrations: &[&str] = &[
-        "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
-        "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
-        "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE cost_records ADD COLUMN reason TEXT",
-        "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
-        "ALTER TABLE sessions ADD COLUMN title TEXT",
-        "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
-        "ALTER TABLE cron_executions ADD COLUMN completed_at INTEGER",
-        "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
-        "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
-        "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
-        "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sessions ADD COLUMN channel TEXT",
-        "ALTER TABLE session_control_events ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE deck_cards ADD COLUMN sizes TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE deck_cards ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sessions ADD COLUMN last_model TEXT",
-        "ALTER TABLE sessions ADD COLUMN last_effort TEXT",
-        "ALTER TABLE session_messages ADD COLUMN compaction_inserted INTEGER NOT NULL DEFAULT 0",
-    ];
-    for stmt in migrations {
-        if let Err(e) = conn.execute(stmt, []) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(anyhow::anyhow!("migration `{stmt}` failed: {msg}"));
-            }
-        }
+    // Migrations for DBs created before a column was added. Add new migrations
+    // to this list rather than mutating the CREATE TABLE — fresh DBs pick the
+    // column up from CREATE, existing DBs from the ALTER.
+    for migration in ADD_COLUMNS {
+        migration.apply(conn)?;
     }
 
     // Indexes on migration-added columns. Created AFTER the ALTER loop,
@@ -1182,6 +1312,81 @@ mod tests {
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, DB_FILE_MODE, "reopen must re-tighten, got {mode:o}");
+    }
+
+    /// `init_db` runs on every open, so each migration is attempted many times
+    /// over a database's life. Both halves — add when missing, skip when
+    /// present — have to hold.
+    #[tokio::test]
+    async fn add_column_migration_adds_once_then_becomes_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("m.db"))
+            .await
+            .expect("open");
+
+        let migration = AddColumn {
+            table: "legacy",
+            column: "added_later",
+            definition: "TEXT NOT NULL DEFAULT 'seed'",
+        };
+
+        pool.interact("test.migrate", move |conn| {
+            conn.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)", [])?;
+            conn.execute("INSERT INTO legacy (id) VALUES (1)", [])?;
+
+            migration.apply(conn).expect("first apply adds the column");
+            migration.apply(conn).expect("second apply is a no-op");
+            migration.apply(conn).expect("and stays one");
+
+            // The pre-existing row picked up the default rather than being lost.
+            let seeded: String =
+                conn.query_row("SELECT added_later FROM legacy WHERE id = 1", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(seeded, "seed");
+
+            // Exactly one column was added, not one per apply.
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('legacy') WHERE name = 'added_later'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(count, 1, "column added more than once");
+            Ok(())
+        })
+        .await
+        .expect("migration interact");
+    }
+
+    /// A migration naming a missing table is a programming error in
+    /// [`ADD_COLUMNS`], not a benign already-applied case, and must surface as
+    /// one.
+    #[tokio::test]
+    async fn add_column_migration_surfaces_a_missing_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("m.db"))
+            .await
+            .expect("open");
+
+        let migration = AddColumn {
+            table: "no_such_table",
+            column: "whatever",
+            definition: "TEXT",
+        };
+
+        let err = pool
+            .interact("test.migrate", move |conn| {
+                migration
+                    .apply(conn)
+                    .map_err(|e| StorageError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .await
+            .expect_err("missing table must not be swallowed");
+        assert!(
+            err.to_string().contains("no_such_table"),
+            "error should name the table, got {err}"
+        );
     }
 
     /// Two pools over two files must not see each other's data, or tests
