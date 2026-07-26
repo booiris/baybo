@@ -71,9 +71,11 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
         .await
         .map_err(|e| SetupError::Storage(format!("open sqlite: {e}")))?;
 
-    // After the store exists, because deciding which key is live means asking
-    // whether it decrypts a real entry.
-    let key = crate::rotate::resolve_pending_key(&paths, &stores.secret).await?;
+    // After the store exists: deciding which key is live means asking whether
+    // it decrypts a real entry.
+    let key = baybo_security::key_file::resolve_pending(&key_file, &stores.secret)
+        .await
+        .map_err(|e| SetupError::Vault(e.to_string()))?;
 
     let vault = Arc::new(SecretVault::new(key, stores.secret.clone()));
 

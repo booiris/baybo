@@ -9,6 +9,7 @@
 //! unit tests, and decoupled from the rest of the bootstrap choreography.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use baybo_config::{BayboConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
 use baybo_llm::credentials::resolve_api_key;
@@ -204,23 +205,29 @@ impl baybo_llm::BlobFetcher for BlobStoreFetcher {
     }
 }
 
-/// Load the 32-byte encryption key from `security.encryption_key_file`
-/// (hex-encoded). `validate()` guarantees the field is set and absolute;
-/// a missing or malformed file is a hard error — there is no dev-key
-/// fallback. `baybo setup` mints the file on first run.
-pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey> {
+/// Load the 32-byte encryption key named by `security.encryption_key_file`,
+/// completing or discarding an interrupted rotation on the way.
+///
+/// `validate()` guarantees the field is set and absolute; a missing or malformed
+/// file is a hard error — there is no dev-key fallback. `baybo setup` mints the
+/// file on first run.
+///
+/// The store is required because "which key is live" is decided by trying to
+/// decrypt a real vault entry, not by reading on-disk bookkeeping. Every path
+/// that builds a `SecretVault` goes through here for that reason: routing only
+/// some of them would leave a rotation half-applied on exactly the paths that
+/// skipped it.
+pub async fn load_encryption_key(
+    cfg: &SecurityConfig,
+    store: &Arc<dyn baybo_store::SecretStore>,
+) -> anyhow::Result<EncryptionKey> {
     let path = cfg
         .encryption_key_file
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("security.encryption_key_file is not set"))?;
-    let hex = std::fs::read_to_string(Path::new(path))
-        .map_err(|e| anyhow::anyhow!("failed to read encryption_key_file {path}: {e}"))?;
-    let bytes = hex::decode(hex.trim())
-        .map_err(|e| anyhow::anyhow!("encryption key is not valid hex: {e}"))?;
-    if bytes.len() != 32 {
-        anyhow::bail!("encryption key must be 32 bytes, got {}", bytes.len());
-    }
-    EncryptionKey::new(bytes).map_err(|e| anyhow::anyhow!("invalid encryption key: {e}"))
+    baybo_security::key_file::resolve_pending(Path::new(path), store)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -94,7 +94,7 @@ pub fn build_leak_detector(
 /// rotate a token.
 pub async fn build_secret_vault(config: &BayboConfig) -> anyhow::Result<Arc<SecretVault>> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
-    let master_key = boot::load_encryption_key(&config.security)?;
+    let master_key = boot::load_encryption_key(&config.security, &storage.secret).await?;
     Ok(Arc::new(SecretVault::new(master_key, storage.secret)))
 }
 
@@ -108,7 +108,7 @@ pub async fn build_bot_registry_deps(
     config: &BayboConfig,
 ) -> anyhow::Result<(Arc<SecretVault>, Store)> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
-    let master_key = boot::load_encryption_key(&config.security)?;
+    let master_key = boot::load_encryption_key(&config.security, &storage.secret).await?;
     let vault = Arc::new(SecretVault::new(master_key, storage.secret.clone()));
     Ok((vault, storage))
 }
@@ -306,7 +306,7 @@ pub async fn build_managers(
     // Other providers ignore the vault. Can't route through
     // `build_secret_vault` here — it would re-open sqlite; load the key
     // directly and share `stores.secret` across both call sites.
-    let master_key = boot::load_encryption_key(&config.security)?;
+    let master_key = boot::load_encryption_key(&config.security, &stores.secret).await?;
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
     // CostManager built before the LLM client so its gate closure is

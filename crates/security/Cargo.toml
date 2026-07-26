@@ -19,6 +19,8 @@ test-support = ["dep:parking_lot"]
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
+tracing = { workspace = true }
 parking_lot = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -43,4 +45,3 @@ parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 chrono = { workspace = true }
 tempfile = { workspace = true }
-tracing = { workspace = true }

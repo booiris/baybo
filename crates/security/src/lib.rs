@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod error;
 pub mod http;
 pub mod injection_detector;
+pub mod key_file;
 pub mod leak_detector;
 pub mod log_redact;
 pub mod network;

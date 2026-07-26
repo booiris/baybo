@@ -120,13 +120,24 @@ fails cleanly if the workspace is in use — nothing is written.
 
 Rotation changes two things that cannot be committed together: the key file and
 every ciphertext in sqlite. The ordering is what makes the gap survivable —
-write the new key to `<workspace>/.key/encryption.key.pending`, re-encrypt in
-one transaction, then `rename` pending over the live key. A crash before the
-commit leaves ciphertext under the old key, which the live file still holds; a
-crash after it leaves ciphertext under the pending key. Exactly one of the two
-files opens the vault, and `resolve_pending_key` (called on every boot)
-determines which by decrypting a real entry rather than by inspecting on-disk
-bookkeeping. Neither working is a hard error, not a silent start.
+write the new key to `<live key path>.pending`, re-encrypt in one transaction,
+then `rename` pending over the live key. A crash before the commit leaves
+ciphertext under the old key, which the live file still holds; a crash after it
+leaves ciphertext under the pending key. Exactly one of the two files opens the
+vault, and `key_file::resolve_pending` determines which by decrypting a real
+entry rather than by inspecting on-disk bookkeeping. Neither working is a hard
+error, not a silent start.
+
+The pending path is **derived** from the live one rather than resolved
+separately. `security.encryption_key_file` is operator-configurable, so a
+pending path computed from the workspace default would have rotation promote a
+key the boot path never reads.
+
+`key_file::resolve_pending` — not a bare read — is what every vault-opening path
+must call. `boot::load_encryption_key` does, which is why it takes the secret
+store: "which key is live" is a question about the vault, not about the
+filesystem. A path that skipped it would come up with the pre-rotation key and
+fail every decrypt.
 
 Two consequences worth stating plainly:
 

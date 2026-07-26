@@ -908,6 +908,7 @@ dependencies = [
  "baybo-model",
  "baybo-security",
  "baybo-store",
+ "baybo-workspace",
  "chrono",
  "hex",
  "hkdf",

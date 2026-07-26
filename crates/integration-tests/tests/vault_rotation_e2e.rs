@@ -1,20 +1,18 @@
 //! Master-key rotation against a real sqlite vault.
 //!
-//! The unit tests in `baybo-setup` run over an in-memory store. This exercises
-//! the path that actually ships: `rewrite_all` inside a sqlite transaction, and
-//! the recovery probe reading a real row back.
+//! The unit tests in `baybo-security` run over an in-memory store. This
+//! exercises the path that ships: `rewrite_all` inside a sqlite transaction,
+//! and the recovery probe reading a real row back.
 
 use std::sync::Arc;
 
-use baybo_security::{EncryptionKey, SecretVault};
-use baybo_setup::rotate::rotate_master_key;
+use baybo_security::{EncryptionKey, SecretVault, key_file};
 use baybo_storage::Store;
 use baybo_store::SecretStore;
 use baybo_workspace::WorkspacePaths;
 
-/// Values chosen to cover the shapes the vault really holds: a fixed-name
-/// application record, a minted placeholder, and a non-UTF8 payload (push keys
-/// are raw bytes).
+/// Covers the shapes the vault really holds: a fixed-name application record, a
+/// minted placeholder, and a non-UTF8 payload (push keys are raw bytes).
 const SEED: &[(&str, &[u8])] = &[
     ("gateway.admin_token", b"7f3c1d9e2a48"),
     (
@@ -30,11 +28,7 @@ async fn seed(root: &std::path::Path) -> (WorkspacePaths, Store, EncryptionKey) 
     std::fs::create_dir_all(paths.state_dir()).unwrap();
 
     let key = EncryptionKey::generate();
-    std::fs::write(
-        paths.encryption_key_file(),
-        format!("{}\n", hex::encode(key.as_bytes())),
-    )
-    .unwrap();
+    key_file::write(&paths.encryption_key_file(), &key).unwrap();
 
     let stores = Store::open(paths.storage_db()).await.unwrap();
     let vault = SecretVault::new(key.clone(), stores.secret.clone());
@@ -48,14 +42,18 @@ async fn seed(root: &std::path::Path) -> (WorkspacePaths, Store, EncryptionKey) 
 async fn rotation_preserves_every_value_and_retires_the_old_key() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, stores, old_key) = seed(dir.path()).await;
+    let live = paths.encryption_key_file();
 
+    let lock = baybo_workspace::acquire_workspace_lock(paths.root()).unwrap();
     let vault = SecretVault::new(old_key.clone(), stores.secret.clone());
-    let out = rotate_master_key(&paths, &vault).await.expect("rotate");
-    assert_eq!(out.entries, SEED.len());
+    let entries = key_file::rotate(&live, &vault, &lock)
+        .await
+        .expect("rotate");
+    assert_eq!(entries, SEED.len());
 
-    let new_key_hex = std::fs::read_to_string(paths.encryption_key_file()).unwrap();
-    let new_key = EncryptionKey::new(hex::decode(new_key_hex.trim()).unwrap()).unwrap();
+    let new_key = key_file::load(&live).unwrap();
     assert_ne!(new_key.as_bytes(), old_key.as_bytes(), "key must change");
+    assert!(!key_file::pending_path(&live).exists(), "pending consumed");
 
     let after = SecretVault::new(new_key, stores.secret.clone());
     for (name, value) in SEED {
@@ -67,7 +65,6 @@ async fn rotation_preserves_every_value_and_retires_the_old_key() {
         assert_eq!(got.as_bytes(), *value, "{name} changed value");
     }
 
-    // The retired key is genuinely retired.
     let stale = SecretVault::new(old_key, stores.secret.clone());
     assert!(
         stale.get_secret("gateway.admin_token").await.is_err(),
@@ -76,29 +73,26 @@ async fn rotation_preserves_every_value_and_retires_the_old_key() {
 }
 
 /// A rotation interrupted between the sqlite commit and the key-file rename
-/// must complete on the next boot rather than stranding the workspace.
+/// must complete on the next open rather than stranding the workspace.
 #[tokio::test]
 async fn interrupted_rotation_recovers_on_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, stores, old_key) = seed(dir.path()).await;
+    let live = paths.encryption_key_file();
 
     // Rotate by hand, stopping just short of promoting the key file.
     let new_key = EncryptionKey::generate();
-    std::fs::write(
-        paths.pending_encryption_key_file(),
-        format!("{}\n", hex::encode(new_key.as_bytes())),
-    )
-    .unwrap();
+    key_file::write(&key_file::pending_path(&live), &new_key).unwrap();
     let vault = SecretVault::new(old_key, stores.secret.clone());
     vault.rotate_master_key(&new_key).await.unwrap();
 
     let store: Arc<dyn SecretStore> = stores.secret.clone();
-    let resolved = baybo_setup::rotate::resolve_pending_key(&paths, &store)
+    let resolved = key_file::resolve_pending(&live, &store)
         .await
         .expect("recovery");
 
     assert_eq!(resolved.as_bytes(), new_key.as_bytes());
-    assert!(!paths.pending_encryption_key_file().exists());
+    assert!(!key_file::pending_path(&live).exists());
 
     let after = SecretVault::new(resolved, stores.secret.clone());
     for (name, value) in SEED {
@@ -109,47 +103,29 @@ async fn interrupted_rotation_recovers_on_next_open() {
     }
 }
 
-/// The gateway-stopped requirement is a mutex, not a precondition: rotation
-/// holds the workspace lock for its whole run, so a gateway can neither be
-/// running nor start midway and write an entry under the outgoing key.
+/// The gateway-stopped requirement is enforced by `rotate` taking the lock as a
+/// parameter — it cannot be called without one, so there is no runtime refusal
+/// left to test. What remains is that the lock is genuinely exclusive (so the
+/// command fails while a gateway holds it) and that rotating does not leak it.
 #[tokio::test]
-async fn rotation_refuses_while_the_workspace_is_locked() {
+async fn the_workspace_lock_is_exclusive_and_released_after_rotating() {
     let dir = tempfile::tempdir().unwrap();
     let (paths, stores, key) = seed(dir.path()).await;
-    let vault = SecretVault::new(key.clone(), stores.secret.clone());
 
-    let ciphertext_before = |name: &str| {
-        let s = stores.secret.clone();
-        let name = name.to_string();
-        async move { s.retrieve(&name).await.unwrap().unwrap() }
-    };
-    let admin_before = ciphertext_before("gateway.admin_token").await;
-
-    let held = baybo_workspace::acquire_workspace_lock(paths.root()).expect("hold the lock");
-    let err = rotate_master_key(&paths, &vault)
-        .await
-        .expect_err("must refuse while another process holds the workspace");
+    let held = baybo_workspace::acquire_workspace_lock(paths.root()).expect("hold");
     assert!(
-        err.to_string().contains("stop the gateway"),
-        "error should name the remedy, got: {err}"
+        baybo_workspace::acquire_workspace_lock(paths.root()).is_err(),
+        "a second acquire must fail — this is what stops the CLI while a gateway runs"
     );
-
-    // Nothing moved: neither the key file nor any ciphertext.
-    assert_eq!(
-        std::fs::read_to_string(paths.encryption_key_file())
-            .unwrap()
-            .trim(),
-        hex::encode(key.as_bytes())
-    );
-    assert!(!paths.pending_encryption_key_file().exists());
-    assert_eq!(ciphertext_before("gateway.admin_token").await, admin_before);
-
-    // Once the holder goes away, the same call succeeds — the lock is released
-    // on drop rather than leaked by the failed attempt.
     drop(held);
-    rotate_master_key(&paths, &vault)
+
+    let lock = baybo_workspace::acquire_workspace_lock(paths.root()).expect("re-acquire");
+    let vault = SecretVault::new(key, stores.secret.clone());
+    key_file::rotate(&paths.encryption_key_file(), &vault, &lock)
         .await
-        .expect("rotate after release");
+        .expect("rotate");
+    drop(lock);
+
     assert!(
         baybo_workspace::acquire_workspace_lock(paths.root()).is_ok(),
         "rotation must not leave the workspace locked"
