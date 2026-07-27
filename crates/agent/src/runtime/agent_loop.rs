@@ -2493,9 +2493,7 @@ impl AgentLoop {
         );
         let model_id = runner.model_info.id.clone();
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
-        // report the phase when a pass will actually run; the `Compacted`
-        // end always follows the `Compacting` start (emitted even on a
-        // compress error) so the status line never dangles.
+        // report the phase when a pass will actually run.
         let compacting = self.context_manager.needs_compression(&model_id);
         if compacting {
             self.emit_status(delta_tx, session, TurnStatus::Compacting)
@@ -2507,7 +2505,10 @@ impl AgentLoop {
                 runner.run(req, marker).await
             })
             .await;
-        if compacting {
+        // The `Compacted` end always follows the `Compacting` start so the
+        // status line never dangles — except on a cancel, where the turn is
+        // unwinding and there is no line left to dangle.
+        if compacting && !cancel_token.is_cancelled() {
             self.emit_status(delta_tx, session, TurnStatus::Compacted)
                 .await;
         }
@@ -2526,12 +2527,12 @@ impl AgentLoop {
 
     /// Record a compaction that shrank the transcript without an LLM call.
     ///
-    /// The stored-summary and truncate stages never invoke the chat callback,
-    /// so `CompressionRunner` — which owns the step for the live-summary stage
-    /// — never runs for them. Without this the threshold trim that swaps in
-    /// `summary.md`, i.e. the moment the model's input context actually
-    /// changed, leaves no trace at all. The step carries no span by design:
-    /// there was no model round-trip to span.
+    /// The truncate fallback never invokes the chat callback, so
+    /// `CompressionRunner` — which owns the step for the live-summary path —
+    /// never runs for it. Without this, a compaction that fell back to
+    /// truncation leaves no trace at all, even though it is the one that
+    /// discarded the most. The step carries no span by design: there was no
+    /// model round-trip to span.
     async fn record_spanless_compaction(
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
@@ -2539,10 +2540,9 @@ impl AgentLoop {
         stage: baybo_context::CompressionStage,
     ) {
         let applied = match stage {
-            // The live-summary stage already recorded its own step around the
+            // The live-summary path already recorded its own step around the
             // LLM call; recording a second one here would double-count it.
             baybo_context::CompressionStage::LiveSummary => return,
-            baybo_context::CompressionStage::StoredSummary => CompressionApplied::StoredSummary,
             baybo_context::CompressionStage::Truncate => CompressionApplied::Truncate,
         };
         let kind = StepKind::Compression {
@@ -2835,6 +2835,9 @@ impl AgentLoop {
                     }
                     baybo_context::CompressionOutcome::NoSavings => {
                         "Compression ran but produced no savings; kept the original.".to_string()
+                    }
+                    baybo_context::CompressionOutcome::Cancelled => {
+                        "Compaction cancelled; the conversation is unchanged.".to_string()
                     }
                 };
                 let output = JobOutput::Message {

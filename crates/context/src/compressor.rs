@@ -1,23 +1,19 @@
-//! Hardcoded 3-stage context compression flow.
+//! The context compaction flow.
 //!
-//! 1. **summary.md fast-path**: when a precomputed summary is available
-//!    on disk and its assembly fits within
-//!    `FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO × max_tokens`, swap in
-//!    `[system + summary blob + recent slice]` without an LLM call.
-//! 2. **Live LLM summary**: send the full conversation +
-//!    [`SUMMARIZE_INSTRUCTION`] to the model, replace the transcript
-//!    with `[system + parsed summary]`.
-//! 3. **Truncate fallback**: when the LLM call fails or returns no
-//!    usable content, keep `system + last keep_recent non-system`
-//!    messages (pair-preserving so tool_use / tool_result stays intact).
+//! One summarizer LLM call replaces the conversation so far with
+//! `[system…, summary, verbatim recent slice]`. The slice is bounded by
+//! [`recent_slice_bounds`] and dropped when it would keep the result from
+//! shrinking; on a summarizer failure or an unusable response the
+//! transcript is truncated to `system + last keep_recent non-system`
+//! instead (pair-preserving, so tool_use / tool_result stays intact).
 //!
-//! When the conversation is already at or below `keep_recent`
-//! non-system messages, the flow returns [`CompressOutput::NoOp`]
-//! without firing the LLM — even the truncate fallback couldn't
-//! shrink it.
+//! Two things short-circuit before any of that: a conversation already at
+//! or below `keep_recent` non-system messages returns
+//! [`CompressOutput::NoOp`] (even truncation couldn't shrink it), and a
+//! cancelled summarizer call returns [`CompressOutput::Cancelled`], leaving
+//! the transcript exactly as it was.
 //!
-//! See `docs/background-compression.md` for the trigger conditions
-//! and design rationale.
+//! See `docs/modules/context.md`.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -28,14 +24,9 @@ use baybo_model::{ChatMessage, ContentBlock};
 use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
-use crate::background_summary::summary_has_content;
 use crate::error::ContextError;
 use crate::prompts::compression::{CONTINUATION_FOOTER, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION};
-use crate::{
-    ContextManager, FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
-    RECENT_SLICE_MIN_TEXT_BLOCK_MSGS, RECENT_SLICE_MIN_TOKENS, estimate_skill_trailer_tokens,
-    scan_skill_calls,
-};
+use crate::{ContextManager, estimate_skill_trailer_tokens, recent_slice_bounds};
 
 pub type ChatFuture =
     Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
@@ -54,6 +45,8 @@ pub enum CompressOutput {
     /// the truncate fallback couldn't shrink. Surfaces as
     /// `CompressionOutcome::StrategyDeclined`.
     NoOp,
+    /// The summarizer call was cancelled mid-flight. Nothing is applied.
+    Cancelled,
     /// Compressor produced a new transcript. `ContextManager` always
     /// re-attaches the skill trailer here, since every Replaced
     /// branch can drop the historical `<system-reminder>` carrying
@@ -62,33 +55,19 @@ pub enum CompressOutput {
     /// middle.
     Replaced {
         messages: Vec<ChatMessage>,
-        /// Which stage of the flow produced this replacement.
+        /// Which path produced this replacement.
         stage: CompressionStage,
-        /// Index (into `messages`) of the continuation-summary row when
-        /// this replacement came from the **stage-1 fast path** — whose
-        /// summary body is `summary.md` verbatim, so after the apply the
-        /// `session_summaries.cursor` may legally re-point at that row
-        /// and keep the fast path alive for a back-to-back compaction.
-        /// `None` for the live-LLM and truncate stages: their output is
-        /// NOT on disk, so a re-pointed cursor would claim coverage
-        /// `summary.md` doesn't have.
-        fast_path_summary_index: Option<usize>,
     },
 }
 
-/// Which stage of the 3-stage flow actually shrank the transcript. Only
-/// [`CompressionStage::LiveSummary`] runs an LLM call; the other two rewrite the
-/// context with no model round-trip, which is why they leave no `LlmCall` span
-/// and have to be recorded by the caller to be visible in a trace at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// How the transcript was actually shrunk. `Truncate` runs no LLM call, so it
+/// leaves no `LlmCall` span and has to be recorded by the caller to be visible
+/// in a trace at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStage {
-    /// Stage 1: swapped in the `summary.md` the background pass wrote, plus the
-    /// recent slice. No LLM call.
-    StoredSummary,
-    /// Stage 2: summarised the transcript with a live LLM call.
+    /// Summarised the transcript with a live LLM call.
     LiveSummary,
-    /// Stage 3: dropped the middle of the transcript. No LLM call.
+    /// Dropped the middle of the transcript after the summarizer failed.
     Truncate,
 }
 
@@ -270,10 +249,6 @@ impl ContextManager {
         &self,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
-        if let Some(out) = self.try_summary_fast_path().await {
-            return Ok(out);
-        }
-
         // Skip the LLM call when even the truncate fallback couldn't
         // shrink — a /compact on a tiny conversation shouldn't burn
         // tokens producing a single-line summary.
@@ -285,221 +260,11 @@ impl ContextManager {
         Ok(self.summarize_or_truncate(chat).await)
     }
 
-    /// Stage 1: try to assemble `[system + summary.md + recent slice]`.
-    /// Returns `None` on any fall-through condition; all such
-    /// conditions log at debug/warn so production has a paper trail.
+    /// The compaction itself: one summarizer call, then assemble.
     ///
-    /// Reads whatever cursor + `summary.md` is on file without waiting
-    /// for a concurrent background pass to land (stale-by-one
-    /// tolerated): a background refresh that finishes after this read
-    /// simply lands for the next turn.
-    async fn try_summary_fast_path(&self) -> Option<CompressOutput> {
-        let metadata = match self.sessions.summary_metadata(&self.session_id).await {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                debug!(
-                    session_id = %self.session_id,
-                    "fast-path: no summary metadata; falling through to LLM summary"
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "fast-path: summary metadata read failed; falling through"
-                );
-                return None;
-            }
-        };
-        let summary_path = self
-            .workspace
-            .session_summary_file(self.session_id.as_str());
-        let summary_content = match tokio::fs::read_to_string(&summary_path).await {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
-                    session_id = %self.session_id,
-                    cursor = metadata.cursor,
-                    "fast-path: metadata exists but summary.md missing; falling through"
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "fast-path: summary.md read failed; falling through"
-                );
-                return None;
-            }
-        };
-
-        // Independent of whatever the metadata row claims: a summary with no
-        // content is not coverage. The only other budget check below is an
-        // *upper* bound, so an empty summary is the cheapest thing that could
-        // possibly be swapped in — exactly backwards. Stage 2 spends one LLM
-        // call and produces a real summary instead.
-        if !summary_has_content(&summary_content) {
-            warn!(
-                session_id = %self.session_id,
-                cursor = metadata.cursor,
-                summary_bytes = summary_content.len(),
-                "fast-path: summary.md holds no content beyond the scaffold; falling through"
-            );
-            return None;
-        }
-
-        // Map `metadata.cursor` (a `session_messages.ordinal`) back to
-        // an in-memory index so the recent slice can't be cut past
-        // the cursor and silently drop unsummarized middle history.
-        // Any mismatch with `messages.len()` collapses the fast-path
-        // — we can't prove cursor coverage, so fall through.
-        let cursor_idx_in_active = match self
-            .sessions
-            .active_index_of_ordinal(&self.session_id, metadata.cursor)
-            .await
-        {
-            Ok(Some(idx)) => idx,
-            Ok(None) => {
-                debug!(
-                    session_id = %self.session_id,
-                    cursor = metadata.cursor,
-                    "fast-path: cursor ordinal not present in active log; falling through"
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "fast-path: cursor index lookup failed; falling through"
-                );
-                return None;
-            }
-        };
-        match self.sessions.count_active_messages(&self.session_id).await {
-            Ok(active_count) if active_count == self.messages.len() => {}
-            Ok(active_count) => {
-                debug!(
-                    session_id = %self.session_id,
-                    active_count,
-                    in_memory_len = self.messages.len(),
-                    "fast-path: active log / in-memory length mismatch; falling through"
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "fast-path: active count lookup failed; falling through"
-                );
-                return None;
-            }
-        }
-
-        let (system_msgs, non_system) = partition_system(&self.messages);
-
-        // A cursor inside the system block is degenerate — the
-        // summary would cover only soul-prompt content and we can't
-        // reason about the post-cursor tail.
-        let cursor_idx_in_non_system = if cursor_idx_in_active >= system_msgs.len() {
-            cursor_idx_in_active - system_msgs.len()
-        } else {
-            debug!(
-                session_id = %self.session_id,
-                cursor_idx_in_active,
-                system_count = system_msgs.len(),
-                "fast-path: cursor falls inside the system block; falling through"
-            );
-            return None;
-        };
-
-        // The recent slice must cover every message *strictly* after
-        // the cursor (those are unsummarized originals); it may
-        // extend further back when the natural walk needs more to
-        // satisfy `RECENT_SLICE_MIN_*`. `RECENT_SLICE_MAX_TOKENS` is
-        // a forward-extension ceiling — it never trims unsummarized
-        // content. `pair_preserving_cut` guards against a cursor
-        // landing between `assistant{tool_use}` and the matching
-        // `user{tool_result}`, which both Anthropic and OpenAI reject.
-        let tokenize_msg = |m: &ChatMessage| self.tokenizer.count_message(m);
-        let walk_cut = walk_backward_atomic(
-            &non_system,
-            RECENT_SLICE_MIN_TOKENS,
-            RECENT_SLICE_MIN_TEXT_BLOCK_MSGS,
-            RECENT_SLICE_MAX_TOKENS,
-            tokenize_msg,
-        );
-        let post_cursor_cut = (cursor_idx_in_non_system + 1).min(non_system.len());
-        let cut = pair_preserving_cut(&non_system, walk_cut.min(post_cursor_cut));
-        let recent_slice = non_system[cut..].to_vec();
-
-        let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
-        let summary_msg = build_summary_message(
-            &summary_content,
-            &transcript_path,
-            /* prefix_summary_label */ false,
-        );
-        let summary_tokens = self.tokenizer.count_message(&summary_msg);
-        let called = scan_skill_calls(&recent_slice);
-        let skill_trailer_tokens = estimate_skill_trailer_tokens(
-            self.skill_registry.as_ref(),
-            self.tokenizer.as_ref(),
-            &called,
-            &self.invocable_skill_summaries(),
-        );
-        let recent_slice_tokens: usize = recent_slice
-            .iter()
-            .map(|m| self.tokenizer.count_message(m))
-            .sum();
-        let fallthrough_budget =
-            (self.budget.max_tokens() as f64 * FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO) as usize;
-        // Recent slice counts toward the budget: a far-back cursor
-        // can leave post-cursor content larger than summary + trailer,
-        // and an over-budget assembly would just re-trip on the next
-        // turn.
-        let assembled_tokens = summary_tokens + skill_trailer_tokens + recent_slice_tokens;
-        if assembled_tokens > fallthrough_budget {
-            warn!(
-                session_id = %self.session_id,
-                summary_tokens,
-                skill_trailer_tokens,
-                recent_slice_tokens,
-                fallthrough_budget,
-                "fast-path: assembled total exceeds fall-through threshold; falling through"
-            );
-            return None;
-        }
-
-        let mut new_messages = system_msgs;
-        let summary_index = new_messages.len();
-        new_messages.push(summary_msg);
-        new_messages.extend(recent_slice);
-
-        debug!(
-            session_id = %self.session_id,
-            cursor = metadata.cursor,
-            cursor_idx_in_non_system,
-            cut,
-            recent_msg_count = (non_system.len() - cut),
-            summary_tokens,
-            recent_slice_tokens,
-            skill_trailer_tokens,
-            "fast-path: assembled list with precomputed summary"
-        );
-
-        Some(CompressOutput::Replaced {
-            messages: new_messages,
-            stage: CompressionStage::StoredSummary,
-            fast_path_summary_index: Some(summary_index),
-        })
-    }
-
-    /// Stages 2 + 3. Always returns `Replaced` — the pre-flight gate
-    /// already filtered the "nothing to shrink" case, and the
-    /// truncate fallback is guaranteed to shorten when reached.
+    /// Returns `Replaced` in every case but a cancel — the pre-flight gate
+    /// already filtered "nothing to shrink", and the truncate fallback is
+    /// guaranteed to shorten when reached.
     async fn summarize_or_truncate(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
@@ -512,6 +277,12 @@ impl ContextManager {
         // when the in-memory set provably mirrors the persisted log;
         // `instruction` is the only message not in `session_messages`, so
         // it rides as the suffix. On any mismatch fall back to inline.
+        //
+        // This is also why the whole transcript is sent even though the tail
+        // is about to be kept verbatim: `Persisted` can only name the entire
+        // active set, so trimming the request to a strict prefix would force
+        // an `Inline` marker and re-embed the transcript into every
+        // compaction span.
         let input_marker = match self.synced_last_ordinal().await {
             Some((last_ordinal, prefix_len)) => LlmCallInputs::Persisted {
                 last_ordinal,
@@ -535,59 +306,119 @@ impl ContextManager {
             CompressOutput::Replaced {
                 messages: out,
                 stage: CompressionStage::Truncate,
-                fast_path_summary_index: None,
             }
         };
 
-        let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
-        match chat(request, input_marker).await {
-            Ok(response) => match parse_summary_response(&response.content) {
-                Some(content) => {
-                    let mut new_messages = system_msgs;
-                    new_messages.push(build_summary_message(
-                        &content,
-                        &transcript_path,
-                        /* prefix_summary_label */ true,
-                    ));
-                    CompressOutput::Replaced {
-                        messages: new_messages,
-                        stage: CompressionStage::LiveSummary,
-                        fast_path_summary_index: None,
-                    }
-                }
-                None => {
-                    warn!(
-                        "summarizer response empty after stripping analysis; falling back to truncation"
-                    );
-                    truncate_fallback()
-                }
-            },
+        let summary = match chat(request, input_marker).await {
+            Ok(response) => parse_summary_response(&response.content),
+            // A cancel is not a failure to summarise — the turn is unwinding
+            // and nothing further goes to the model, so truncating here would
+            // cost the user their history for no gain.
+            Err(ContextError::Cancelled(reason)) => {
+                debug!(%reason, "compaction cancelled; leaving the transcript untouched");
+                return CompressOutput::Cancelled;
+            }
             Err(e) => {
                 warn!(error = %e, "summarization failed; falling back to truncation");
-                truncate_fallback()
+                None
+            }
+        };
+        let Some(summary) = summary else {
+            return truncate_fallback();
+        };
+
+        self.assemble_summary(system_msgs, &non_system, &summary)
+    }
+
+    /// Assemble `[system…, summary, recent slice…]`, or `[system…, summary]`
+    /// when the slice doesn't pay for itself.
+    ///
+    /// The slice is what keeps a compaction from turning the last tool
+    /// results and the user's own words into a paraphrase of themselves. But
+    /// it is also re-added to the compacted transcript, so on a short
+    /// conversation — a `/compact` typed early, a small context window — the
+    /// walk can pull in nearly everything and the "compacted" result comes
+    /// out no smaller than what it replaced. Rather than spend the
+    /// summarizer call and then decline to apply it, pick between the two
+    /// assemblies here: the summary is already in hand, so this costs a
+    /// tokenize, not a round-trip.
+    fn assemble_summary(
+        &self,
+        system_msgs: Vec<ChatMessage>,
+        non_system: &[ChatMessage],
+        summary: &str,
+    ) -> CompressOutput {
+        let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
+        let summary_msg = build_summary_message(summary, &transcript_path);
+
+        let (min_tokens, min_text_block_msgs, max_tokens) =
+            recent_slice_bounds(self.budget.max_tokens());
+        let cut = walk_backward_atomic(
+            non_system,
+            min_tokens,
+            min_text_block_msgs,
+            max_tokens,
+            |m| self.message_budget_tokens(m),
+        );
+
+        let with_slice = || {
+            let mut out = system_msgs.clone();
+            out.push(summary_msg.clone());
+            out.extend_from_slice(&non_system[cut..]);
+            out
+        };
+        let summary_only = || {
+            let mut out = system_msgs.clone();
+            out.push(summary_msg.clone());
+            out
+        };
+
+        for candidate in [with_slice(), summary_only()] {
+            if self.compaction_fits(&candidate) {
+                return CompressOutput::Replaced {
+                    messages: candidate,
+                    stage: CompressionStage::LiveSummary,
+                };
             }
         }
+        // Neither shrinks. Hand back the richer one and let
+        // `run_compression`'s savings gate reject it — one place decides
+        // whether an apply is worth it.
+        CompressOutput::Replaced {
+            messages: with_slice(),
+            stage: CompressionStage::LiveSummary,
+        }
+    }
+
+    /// Whether a candidate assembly is small enough to be worth applying:
+    /// strictly smaller than what it replaces, and under the ceiling whose
+    /// crossing triggers the next compaction — otherwise it would compact
+    /// again on the very next iteration.
+    ///
+    /// Counted the way [`ContextManager::run_compression`]'s savings gate
+    /// counts, trailer included, so a candidate accepted here can't be
+    /// rejected there.
+    fn compaction_fits(&self, candidate: &[ChatMessage]) -> bool {
+        let body: usize = candidate
+            .iter()
+            .map(|m| self.message_budget_tokens(m))
+            .sum();
+        let trailer = estimate_skill_trailer_tokens(
+            self.skill_registry.as_ref(),
+            self.tokenizer.as_ref(),
+            &self.called_skills,
+            &self.invocable_skill_summaries(),
+        );
+        let total = self.calibrate(body) + trailer;
+        total < self.budget.current() && total <= self.budget.compression_ceiling()
     }
 }
 
-/// Build a continuation-style summary message.
-///
-/// The fast-path passes the precomputed `summary.md` body directly;
-/// the LLM-summary path passes the parsed inner body and sets
-/// `prefix_summary_label = true` so the model sees an explicit
-/// `Summary:` header. `transcript_path` points at the per-session
-/// JSONL the agent loop appends to so the model can request specific
-/// pre-compaction details if needed.
-fn build_summary_message(
-    body: &str,
-    transcript_path: &std::path::Path,
-    prefix_summary_label: bool,
-) -> ChatMessage {
-    let body_block = if prefix_summary_label {
-        format!("Summary:\n{}", body.trim())
-    } else {
-        body.trim().to_string()
-    };
+/// Build a continuation-style summary message from the parsed summary body.
+/// `transcript_path` points at the per-session JSONL the agent loop appends
+/// to, so the model can go read specific pre-compaction details.
+fn build_summary_message(body: &str, transcript_path: &std::path::Path) -> ChatMessage {
+    let body_block = format!("Summary:\n{}", body.trim());
     let text = format!(
         "{intro}\n\n{body}\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: {transcript}\n\n{footer}",
         intro = CONTINUATION_INTRO,
