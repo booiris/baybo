@@ -2,14 +2,56 @@
 //! Notification Service Extension can decrypt lock-screen previews. Longer-lived
 //! app-only credentials stay in the app's private keychain.
 //!
-//! The NSE reads the key in Swift (`apple/NotificationExtension/PushKeyStore
-//! .swift`); this is the matching WRITE side. It calls the Security framework
+//! The NSE reads the key in Swift (`NotificationExtension/PushKeyStore.swift`);
+//! this is the matching WRITE side. It calls the Security framework
 //! (`SecItemAdd`) directly from Rust — the framework is already linked into the
 //! app (`Security.framework` in `project.yml`), so no extra Swift in the app
 //! target is needed. On non-iOS targets (the desktop dev build of the shell)
 //! it is a no-op: there is no keychain off-device.
 
 use device_proto::aead::KEY_LEN;
+
+/// The one distinction this module has to get right, split out of the iOS
+/// implementation so it is testable off-device (the host build has no keychain).
+#[cfg(any(target_os = "ios", test))]
+mod read_status {
+    /// `errSecSuccess`.
+    pub(super) const ERR_SEC_SUCCESS: i32 = 0;
+    /// `errSecItemNotFound` — the ONLY status meaning the item isn't there.
+    /// Also what makes a delete of an absent item a benign no-op.
+    pub(super) const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+    /// What a lookup actually said, as opposed to what it returns.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum ReadOutcome {
+        Found,
+        Absent,
+        Failed,
+    }
+
+    /// Classify a `SecItemCopyMatching` status.
+    ///
+    /// **Absence and failure must never collapse into each other.** Absence is
+    /// load-bearing here: `Ok(None)` is what sends
+    /// [`super::load_or_create_device_sign_key`] and `relay::pairing`'s
+    /// device-identity loader down their mint-and-PERSIST branch. Report a
+    /// transient failure as absence and the app quietly mints a fresh identity
+    /// over the stored one — the phone's `device_id` and its
+    /// `baybo.push-key.<id>` entry stop matching the gateway's, push dies, and
+    /// the continuity contract's "never deleted" device key is gone with no
+    /// error anyone sees.
+    ///
+    /// Reachable, not hypothetical: every item here is `…AfterFirstUnlock…`, so
+    /// a background wake before the first unlock since boot answers
+    /// `errSecInteractionNotAllowed`.
+    pub(super) fn classify_read(status: i32) -> ReadOutcome {
+        match status {
+            ERR_SEC_SUCCESS => ReadOutcome::Found,
+            ERR_SEC_ITEM_NOT_FOUND => ReadOutcome::Absent,
+            _ => ReadOutcome::Failed,
+        }
+    }
+}
 
 #[cfg(target_os = "ios")]
 mod imp {
@@ -45,10 +87,9 @@ mod imp {
         static kSecMatchLimitOne: CFStringRef;
     }
 
-    const ERR_SEC_SUCCESS: OSStatus = 0;
-    /// `errSecItemNotFound` — a delete of an absent item is a benign no-op.
-    const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
-    const MISSING_ACCESS_GROUP: &str = "missing BAYBO_IOS_KEYCHAIN_ACCESS_GROUP; build through Xcode/Tauri iOS or set BAYBO_IOS_KEYCHAIN_ACCESS_GROUP explicitly";
+    use super::read_status::{ERR_SEC_ITEM_NOT_FOUND, ERR_SEC_SUCCESS, ReadOutcome, classify_read};
+
+    const MISSING_ACCESS_GROUP: &str = "missing BAYBO_IOS_KEYCHAIN_ACCESS_GROUP; build through Xcode or set BAYBO_IOS_KEYCHAIN_ACCESS_GROUP explicitly";
     const ACCOUNT_PREFIX: &str = "baybo.push-key.";
 
     /// Wrap a `static` Security-framework `CFStringRef` constant as a borrowed
@@ -120,7 +161,8 @@ mod imp {
         }
     }
 
-    /// Read an opaque blob back. `Ok(None)` = not found.
+    /// Read an opaque blob back. `Ok(None)` = **not found, and only that** — see
+    /// [`classify_read`] for why a read failure must not answer absence.
     fn read_blob(account: &str, shared: bool) -> Result<Option<Vec<u8>>, String> {
         let account = CFString::new(account).as_CFType();
         // SAFETY: as in `store_blob` — valid constants, the dictionary outlives
@@ -141,8 +183,15 @@ mod imp {
             let query = CFDictionary::from_CFType_pairs(&attrs);
             let mut out: CFTypeRef = std::ptr::null();
             let status = SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out);
-            if status != ERR_SEC_SUCCESS || out.is_null() {
-                return Ok(None);
+            match classify_read(status) {
+                ReadOutcome::Absent => return Ok(None),
+                ReadOutcome::Failed => {
+                    return Err(format!("keychain read failed (OSStatus {status})"));
+                }
+                ReadOutcome::Found => {}
+            }
+            if out.is_null() {
+                return Err("keychain read succeeded with no data".to_string());
             }
             let data = CFData::wrap_under_create_rule(out as CFDataRef);
             Ok(Some(data.bytes().to_vec()))
@@ -415,4 +464,32 @@ pub fn delete_push_key(bid: &str) -> Result<(), String> {
 #[cfg(all(debug_assertions, target_os = "ios"))]
 pub fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
     imp::read_push_key(bid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_status::{ReadOutcome, classify_read};
+
+    #[test]
+    fn success_is_found_and_item_not_found_is_absent() {
+        assert_eq!(classify_read(0), ReadOutcome::Found);
+        assert_eq!(classify_read(-25300), ReadOutcome::Absent);
+    }
+
+    /// The regression this split exists for. These statuses used to be
+    /// indistinguishable from "no such item", so a read that failed for any
+    /// reason sent the identity loaders down their mint-and-PERSIST branch and
+    /// rotated the device identity out from under a paired install.
+    #[test]
+    fn a_read_failure_is_never_reported_as_absence() {
+        // errSecInteractionNotAllowed — locked keychain before the first unlock
+        // since boot, which `…AfterFirstUnlock…` items make reachable.
+        assert_eq!(classify_read(-25308), ReadOutcome::Failed);
+        // errSecMissingEntitlement — a build whose access group didn't apply.
+        assert_eq!(classify_read(-34018), ReadOutcome::Failed);
+        // errSecNotAvailable / errSecAuthFailed / anything unrecognised.
+        assert_eq!(classify_read(-25291), ReadOutcome::Failed);
+        assert_eq!(classify_read(-25293), ReadOutcome::Failed);
+        assert_eq!(classify_read(1), ReadOutcome::Failed);
+    }
 }
