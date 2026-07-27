@@ -219,3 +219,15 @@ export const WorkBlockView = memo(function WorkBlockView({
     </div>
   );
 });
+
+/// Line shown for a turn-phase `status` frame. A ternary rather than a switch
+/// on purpose: `wire.test.ts` scrapes `case "…":` labels out of Transcript.tsx
+/// to prove the frame router handles exactly the declared kinds, and a stray
+/// switch anywhere it reads would be counted as a routed frame.
+export function compactionStatusText(t: TFunction, phase: string): string {
+  return phase === "compacting"
+    ? t("chat.compacting")
+    : phase === "compacted"
+      ? t("chat.compacted")
+      : phase;
+}

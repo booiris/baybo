@@ -7,6 +7,8 @@ export const en = {
     chat: {
       loadOlder: "Load earlier messages",
       preCompaction: "Compacted",
+      compacting: "Compacting context…",
+      compacted: "Context compacted",
       loadingThread: "Loading conversation…",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",

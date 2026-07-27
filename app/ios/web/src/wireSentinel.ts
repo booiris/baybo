@@ -39,6 +39,7 @@ type MirroredKind =
   | "approval_resolved"
   | "gap"
   | "notice"
+  | "status"
   // Deck frames — no deck UI here; the native deck shell consumes them. Pinned
   // anyway so a wire-side rename/retype of the deck contract fails this build.
   | "deck_card_data"
