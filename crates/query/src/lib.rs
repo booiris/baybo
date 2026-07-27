@@ -378,6 +378,41 @@ pub struct JobTrace {
 
 // ── QueryApi ────────────────────────────────────────────────────────
 
+/// Decode a batch of persisted trace rows, dropping any row the current
+/// model can no longer parse instead of failing the whole batch.
+///
+/// A `data` blob is append-only history, so a field whose enum variant was
+/// retired after the row was written fails to deserialize even though the
+/// store is perfectly intact. Propagating that took out an entire job's
+/// trace — and `session export`, which replays every job — for one such
+/// row. A batch therefore degrades; point lookups ([`QueryApi::load_step`]
+/// and replay's truncation target) still error, because there the caller
+/// named the row and hiding it would answer a different question.
+fn decode_batch<R, T, E: std::fmt::Display>(
+    rows: Vec<R>,
+    row_kind: &'static str,
+    id_of: impl Fn(&R) -> String,
+    decode: impl Fn(R) -> std::result::Result<T, E>,
+) -> Vec<T> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let id = id_of(&row);
+            match decode(row) {
+                Ok(decoded) => Some(decoded),
+                Err(e) => {
+                    tracing::warn!(
+                        row_kind,
+                        %id,
+                        error = %e,
+                        "trace: skipping undecodable row; it drops out of the tree"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Read-only view onto the session/job/trace/cost stores.
 ///
 /// `Arc<JobLifecycle>` rather than `Arc<dyn JobStore>` because the
@@ -457,14 +492,15 @@ impl QueryApi {
             .get(id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {id}")))?;
-        let steps = self
-            .trace
-            .list_steps_by_job(id)
-            .await
-            .map_err(TraceError::from)?
-            .into_iter()
-            .map(Step::from_row)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let steps = decode_batch(
+            self.trace
+                .list_steps_by_job(id)
+                .await
+                .map_err(TraceError::from)?,
+            "step",
+            |r| r.id.to_string(),
+            Step::from_row,
+        );
         Ok(JobDetail { job, steps })
     }
 
@@ -478,14 +514,15 @@ impl QueryApi {
                 .map_err(TraceError::from)?
                 .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?,
         )?;
-        let mut spans = self
-            .trace
-            .list_spans_by_step(id)
-            .await
-            .map_err(TraceError::from)?
-            .into_iter()
-            .map(Span::from_row)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut spans = decode_batch(
+            self.trace
+                .list_spans_by_step(id)
+                .await
+                .map_err(TraceError::from)?,
+            "span",
+            |r| r.id.to_string(),
+            Span::from_row,
+        );
         // Span events are stored separately; fold them in so callers
         // get a fully self-contained `StepDetail`.
         self.attach_span_events(&mut spans).await?;
@@ -506,17 +543,18 @@ impl QueryApi {
             return Ok(());
         }
         let mut events_by_span: HashMap<baybo_model::SpanId, Vec<SpanEvent>> = HashMap::new();
-        for row in self
+        let rows = self
             .trace
             .list_span_events_for_spans(&need)
             .await
-            .map_err(TraceError::from)?
-        {
-            let span_id = row.span_id;
-            events_by_span
-                .entry(span_id)
-                .or_default()
-                .push(SpanEvent::from_row(row)?);
+            .map_err(TraceError::from)?;
+        for event in decode_batch(
+            rows,
+            "span_event",
+            |r| format!("{}#{}", r.span_id, r.seq),
+            SpanEvent::from_row,
+        ) {
+            events_by_span.entry(event.span_id).or_default().push(event);
         }
         for span in spans.iter_mut() {
             if span.events.is_empty()
@@ -533,24 +571,26 @@ impl QueryApi {
     /// per-step / per-span round-trip fan-out this replaces cost
     /// O(steps + spans) pool checkouts per call.
     async fn load_step_tree_for_job(&self, job_id: &JobId) -> Result<Vec<ReplayStep>> {
-        let mut steps = self
-            .trace
-            .list_steps_by_job(job_id)
-            .await
-            .map_err(TraceError::from)?
-            .into_iter()
-            .map(Step::from_row)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut steps = decode_batch(
+            self.trace
+                .list_steps_by_job(job_id)
+                .await
+                .map_err(TraceError::from)?,
+            "step",
+            |r| r.id.to_string(),
+            Step::from_row,
+        );
         steps.sort_by_key(|s| s.started_at);
 
-        let mut spans = self
-            .trace
-            .list_spans_by_job(job_id)
-            .await
-            .map_err(TraceError::from)?
-            .into_iter()
-            .map(Span::from_row)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut spans = decode_batch(
+            self.trace
+                .list_spans_by_job(job_id)
+                .await
+                .map_err(TraceError::from)?,
+            "span",
+            |r| r.id.to_string(),
+            Span::from_row,
+        );
         self.attach_span_events(&mut spans).await?;
 
         let mut spans_by_step: HashMap<StepId, Vec<Span>> = HashMap::new();
@@ -2038,6 +2078,146 @@ mod tests {
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
+    }
+
+    /// Hands back row bytes verbatim, the way `SqliteTraceStore` does — its
+    /// generated `job_id` column is a `json_extract`, so a row whose `kind`
+    /// no longer decodes is still selected and still returned.
+    /// `MemoryTraceStore` decodes inside its own list methods and silently
+    /// drops what fails, which would make the test below vacuous.
+    struct RawRowTraceStore {
+        steps: Vec<baybo_store::StepRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl TraceStore for RawRowTraceStore {
+        async fn save_step(&self, _: &baybo_store::StepRow) -> baybo_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_step(
+            &self,
+            _: &StepId,
+        ) -> baybo_store::trace::Result<Option<baybo_store::StepRow>> {
+            Ok(None)
+        }
+        async fn list_steps_by_job(
+            &self,
+            _: &JobId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::StepRow>> {
+            Ok(self.steps.clone())
+        }
+        async fn list_unfinished_steps(
+            &self,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::StepRow>> {
+            Ok(Vec::new())
+        }
+        async fn save_span(&self, _: &baybo_store::SpanRow) -> baybo_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_span(
+            &self,
+            _: &baybo_model::SpanId,
+        ) -> baybo_store::trace::Result<Option<baybo_store::SpanRow>> {
+            Ok(None)
+        }
+        async fn list_spans_by_step(
+            &self,
+            _: &StepId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
+            Ok(Vec::new())
+        }
+        async fn trace_counts_by_job(
+            &self,
+            _: &JobId,
+        ) -> baybo_store::trace::Result<(usize, usize)> {
+            Ok((self.steps.len(), 0))
+        }
+        async fn list_spans_by_job(
+            &self,
+            _: &JobId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
+            Ok(Vec::new())
+        }
+        async fn list_span_events_for_spans(
+            &self,
+            _: &[baybo_model::SpanId],
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
+            Ok(Vec::new())
+        }
+        async fn append_span_event(
+            &self,
+            _: &baybo_store::SpanEventRow,
+        ) -> baybo_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn list_span_events(
+            &self,
+            _: &baybo_model::SpanId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A persisted step whose `kind` carries a value this build's enum no
+    /// longer has must cost that one step, not the job. Retiring a `StepKind`
+    /// variant is a normal thing to do, and every row written before the
+    /// retirement stays on disk forever — collecting the batch into a
+    /// `Result` turned each of those into a permanent 500 on the job's trace
+    /// page and an unclosable job in boot recovery.
+    #[tokio::test]
+    async fn an_undecodable_step_row_costs_one_step_not_the_job() {
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let job = lifecycle
+            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+
+        let mut step = Step {
+            id: StepId::new(),
+            job_id: job.id,
+            kind: baybo_trace::StepKind::LlmIteration,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            outcome: baybo_trace::LifecycleState::Pending,
+        };
+        let good_row = step.to_row().expect("serialize");
+
+        // Same shape, but tagged with a value this build's enum does not have
+        // — exactly what a row written before a variant was retired looks like.
+        step.id = StepId::new();
+        step.kind = baybo_trace::StepKind::compression(
+            CompressionTrigger::Threshold,
+            CompressionApplied::LiveSummary,
+        );
+        let legacy_row = baybo_store::StepRow {
+            id: step.id,
+            data: step
+                .to_row()
+                .expect("serialize")
+                .data
+                .replace("\"threshold\"", "\"a_variant_from_a_past_build\""),
+        };
+        assert!(
+            Step::from_row(legacy_row.clone()).is_err(),
+            "fixture must actually fail to decode, or the test proves nothing"
+        );
+
+        let api = QueryApi::new(
+            Arc::new(MemSessionStore::default()),
+            lifecycle,
+            Arc::new(RawRowTraceStore {
+                steps: vec![good_row, legacy_row],
+            }),
+            Arc::new(MemoryCostStore::default()),
+        );
+
+        let detail = api.load_job(&job.id).await.expect("job trace still loads");
+        assert_eq!(
+            detail.steps.len(),
+            1,
+            "the decodable step survives and the legacy row is dropped"
+        );
+        assert_eq!(detail.steps[0].kind, baybo_trace::StepKind::LlmIteration);
     }
 
     #[tokio::test]

@@ -336,12 +336,22 @@ async fn close_job_subtree(
     let mut spans_closed = 0usize;
     let mut job_end_floor = clock.close_time(job_started);
 
+    // Skip rather than propagate: an undecodable row can't be closed anyway,
+    // and failing here leaves the whole job non-terminal — so the next boot
+    // finds the same open subtree, fails on the same row, and never converges.
     let steps: Vec<Step> = trace_store
         .list_steps_by_job(job_id)
         .await?
         .into_iter()
-        .map(Step::from_row)
-        .collect::<std::result::Result<_, _>>()?;
+        .filter_map(|row| {
+            let step_id = row.id;
+            Step::from_row(row)
+                .map_err(|e| {
+                    warn!(%job_id, %step_id, error = %e, "recovery: skipping undecodable step row");
+                })
+                .ok()
+        })
+        .collect();
     for step in steps {
         let step_started = step.started_at;
         let (closed_spans, step_end_floor) =
