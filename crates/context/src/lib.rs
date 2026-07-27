@@ -46,6 +46,12 @@ pub(crate) const RECENT_SLICE_MIN_RATIO_OF_CAP: f64 = 0.25;
 /// the cap and needs no scaling.
 pub(crate) const RECENT_SLICE_MIN_TEXT_BLOCK_MSGS: usize = 5;
 
+/// Below this, a compaction cannot beat its own continuation framing — the
+/// intro, the transcript pointer, the footer — so the summariser call would be
+/// spent to make the transcript *longer*. Sized well above that framing's own
+/// cost so the margin isn't a coin flip.
+pub(crate) const MIN_COMPACTABLE_TOKENS: usize = 1_000;
+
 /// `(min_tokens, min_text_block_msgs, max_tokens)` for the backward walk at
 /// this context window.
 pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
@@ -3104,6 +3110,40 @@ mod tests {
             applied.last().map(|m| &m.content),
             Some(&last.content),
             "the newest message must survive byte-identical, not paraphrased"
+        );
+    }
+
+    /// A few pasted files is a real conversation shape: three messages, tens of
+    /// thousands of tokens, far past the budget. The pre-flight gate asks the
+    /// truncate fallback's question — "are there more messages than I keep?" —
+    /// which is `false` here and says nothing about whether a summary would
+    /// shrink it. Gating on that alone refused to compact such a transcript at
+    /// all, for as many turns as it stayed under `keep_recent` messages.
+    #[tokio::test]
+    async fn few_but_huge_messages_still_compact() {
+        let mut ctx = make_ctx(10, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(10_000)),
+            ))
+            .await;
+        }
+        let (_, non_system) = compressor::partition_system(ctx.messages());
+        assert!(
+            non_system.len() <= 10,
+            "fixture must sit at or below keep_recent, or it proves nothing"
+        );
+        assert!(ctx.budget.needs_compression(), "and must be over budget");
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed { .. }),
+            "expected a compaction, got {outcome:?}"
         );
     }
 

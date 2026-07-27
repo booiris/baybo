@@ -424,26 +424,25 @@ async fn a_non_retriable_summariser_failure_is_not_retried() {
 async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    // A window big enough that the compaction genuinely shrinks: at 200 tokens
-    // the continuation framing alone outweighs the conversation, so the result
-    // would be declined for no savings and prove nothing.
     let mut harness = AgentTestHarness::builder()
-        .with_model_context_window(10_000)
-        .with_compression_threshold(0.1)
+        .with_model_context_window(4_000)
+        .with_compression_threshold(0.65)
         .with_keep_recent(1)
         .with_chat_gate(Arc::clone(&entered), Arc::clone(&release))
         .build();
 
+    // The weight is in turn 1's REPLY, not its prompt: a compaction is decided
+    // at the top of a turn, so a heavy prompt would trip the threshold on its
+    // own turn and park in the gate before the test is watching. A light
+    // prompt with a heavy reply leaves turn 1 under the ceiling and turn 2
+    // over it, which puts the first summariser call exactly where the cancel
+    // is aimed.
     harness
         .stub_llm
-        .push_stream(vec![StreamEvent::Text("first".into())]);
+        .push_stream(vec![StreamEvent::Text("padding. ".repeat(1_500))]);
     harness
         .stub_llm
-        .push_stream(vec![StreamEvent::Text("second".into())]);
-    harness
-        .stub_llm
-        .push_stream(vec![StreamEvent::Text("third".into())]);
-    // One summariser response, queued for whichever turn gets that far.
+        .push_stream(vec![StreamEvent::Text("after the redo".into())]);
     harness.stub_llm.push_response(LlmResponse {
         content: "<summary>the earlier conversation</summary>".into(),
         content_blocks: vec![],
@@ -452,10 +451,7 @@ async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
         thinking: None,
     });
 
-    harness
-        .send_text(&"a long first turn ".repeat(400))
-        .await
-        .unwrap();
+    harness.send_text("hello").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
     let before = harness
         .session_manager
@@ -470,7 +466,7 @@ async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
     });
     tokio::task::yield_now().await;
     harness.send_text("again").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), entered_wait)
+    tokio::time::timeout(Duration::from_secs(5), entered_wait)
         .await
         .expect("the compaction call should have started")
         .expect("waiter task");

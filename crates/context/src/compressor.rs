@@ -28,7 +28,9 @@ use crate::error::ContextError;
 use crate::prompts::compression::{
     CONTINUATION_FOOTER, CONTINUATION_FOOTER_WITH_SLICE, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION,
 };
-use crate::{ContextManager, estimate_skill_trailer_tokens, recent_slice_bounds};
+use crate::{
+    ContextManager, MIN_COMPACTABLE_TOKENS, estimate_skill_trailer_tokens, recent_slice_bounds,
+};
 
 pub type ChatFuture =
     Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
@@ -249,11 +251,22 @@ impl ContextManager {
         &self,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
-        // Skip the LLM call when even the truncate fallback couldn't
-        // shrink — a /compact on a tiny conversation shouldn't burn
-        // tokens producing a single-line summary.
+        // Decline only when there is genuinely nothing to gain: too few
+        // messages for truncation to drop any, AND too little text for a
+        // summary to beat its own framing. Both, not either.
+        //
+        // The message count alone is the truncate fallback's question — it
+        // keeps the last `keep_recent`, so at or below that it can't shrink.
+        // It says nothing about the summariser, which collapses any number of
+        // messages into one. Gating on it alone refused to compact a
+        // transcript of a few pasted files: ten messages, 26k tokens, well
+        // past the budget, declined four turns running.
         let (_, non_system) = partition_system(&self.messages);
-        if non_system.len() <= self.keep_recent {
+        let non_system_tokens: usize = non_system
+            .iter()
+            .map(|m| self.message_budget_tokens(m))
+            .sum();
+        if non_system.len() <= self.keep_recent && non_system_tokens <= MIN_COMPACTABLE_TOKENS {
             return Ok(CompressOutput::NoOp);
         }
 
