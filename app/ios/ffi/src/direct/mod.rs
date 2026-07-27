@@ -47,8 +47,8 @@ const REST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) use device_proto::DEVICE_ID_HEADER;
 
 /// Persisted direct-connection credentials. Serialized to JSON in the keychain;
-/// the byte format is the upgrade-continuity contract with installs made by the
-/// Tauri shell, so field names must not change.
+/// the byte format is the upgrade-continuity contract with already-shipped
+/// installs, so field names must not change.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DirectCredentials {
     pub(crate) base_url: String,
@@ -421,11 +421,31 @@ pub(crate) fn logout() -> Result<(), String> {
     keychain::delete_direct_credentials()
 }
 
-/// Whether a direct login is persisted — the `direct` arm of the active-binding
-/// resolver ([`crate::binding`]). Cheaper than [`credentials`]: it never decodes
-/// the record, just checks the keychain slot is populated.
+/// Whether a direct login is persisted AND still decodes — the `direct` arm of
+/// the active-binding resolver ([`crate::binding`]), mirroring
+/// [`crate::relay::has_pairing`]. Bytes [`credentials`] cannot parse read as
+/// signed OUT, so the app falls back to the login screen rather than routing
+/// every command to a leg that cannot construct.
+///
+/// Deliberately NOT a cheap slot-populated check — it runs the same decode
+/// [`credentials`] does and discards the value. Re-inlining `is_some()` here to
+/// save that parse restores the stranding bug.
 pub(crate) fn has_credentials() -> Result<bool, String> {
-    Ok(keychain::read_direct_credentials()?.is_some())
+    Ok(keychain::read_direct_credentials()?.is_some_and(|bytes| credentials_decode(&bytes)))
+}
+
+/// The decode half of [`has_credentials`] — the `direct` mirror of
+/// [`crate::relay::has_pairing`]'s, and stranding the user the same way if it
+/// answered `true` on bytes [`credentials`] cannot parse. Split out because the
+/// host keychain stub always reads empty, so this is the testable half.
+fn credentials_decode(bytes: &[u8]) -> bool {
+    match serde_json::from_slice::<DirectCredentials>(bytes) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("direct credentials present but undecodable, treating as signed out: {e}");
+            false
+        }
+    }
 }
 
 /// Read the stored direct credentials (base URL + gateway access token).
@@ -468,10 +488,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// The exact bytes `login` writes to `baybo.direct-credentials` — the
-    /// upgrade-continuity contract with Tauri-shell installs. Asserted as literal
-    /// TEXT: a round-trip stays green with every field renamed, while a renamed
-    /// field on a real install reads back as `None` and the app silently forgets
-    /// its gateway.
+    /// upgrade-continuity contract with already-shipped installs. Asserted as
+    /// literal TEXT: a round-trip stays green with every field renamed, while a
+    /// renamed field on a real install reads back as `None` and the app silently
+    /// forgets its gateway.
     const GOLDEN_CREDENTIALS_JSON: &str = r#"{"base_url":"https://gw.example","token":"tok-1"}"#;
 
     fn golden_credentials() -> DirectCredentials {
@@ -557,6 +577,22 @@ mod tests {
         let with_extra = r#"{"base_url":"https://gw.example","token":"tok-1","future":"x"}"#;
         let creds: DirectCredentials = serde_json::from_str(with_extra).expect("decode");
         assert_eq!(creds.token, "tok-1");
+    }
+
+    #[test]
+    fn credentials_that_decode_count_as_signed_in() {
+        assert!(credentials_decode(GOLDEN_CREDENTIALS_JSON.as_bytes()));
+    }
+
+    /// The `direct` mirror of the relay stranding case: bytes `credentials`
+    /// cannot parse must read as SIGNED OUT, so the app offers the login screen
+    /// rather than routing every command to a leg that cannot construct.
+    /// `DirectCredentials` carries no defaults, so a missing field is this case.
+    #[test]
+    fn credentials_that_no_longer_decode_read_as_signed_out() {
+        assert!(!credentials_decode(b""));
+        assert!(!credentials_decode(br#"{"base_url":"https://gw.exa"#));
+        assert!(!credentials_decode(br#"{"base_url":"https://gw.example"}"#));
     }
 
     /// The coupling under test: `channel_ws_url`'s `strip_prefix` is case-SENSITIVE

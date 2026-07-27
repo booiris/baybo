@@ -76,8 +76,8 @@ struct PairControl {
 /// The durable record persisted after pairing — everything the app needs to
 /// reconnect and open a content session after a relaunch. Serialized into the
 /// keychain (`keychain::store_paired_record`) as JSON; the byte format is the
-/// upgrade-continuity contract with installs made by the Tauri shell, so field
-/// names must not change.
+/// upgrade-continuity contract with already-shipped installs, so field names
+/// must not change.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PairedRecord {
     pub(crate) device_id: String,
@@ -100,11 +100,39 @@ pub(crate) struct PairedRecord {
     pub(crate) noise_public: [u8; 32],
 }
 
-/// Whether a scan-to-pair record is persisted — the `relay` arm of the
-/// active-binding resolver ([`crate::binding`]). Doesn't decode the record, just
-/// checks the keychain slot is populated.
+/// Whether a scan-to-pair record is persisted AND still decodes — the `relay`
+/// arm of the active-binding resolver ([`crate::binding`]).
+///
+/// The decode is the point. A populated slot whose bytes no longer parse is
+/// reported as NOT paired, so the app falls back to the pair/login screen and
+/// the user can re-pair over the bad blob. Answering `true` there is the one
+/// reply that strands them: [`crate::binding::active_leg`] would route every
+/// chat and blob command to the relay leg, each would fail at
+/// [`load_paired_record`], and the app would sit claiming to be paired with no
+/// error to act on and no way out. It also kept `has_pairing` and
+/// [`paired_device`] — which has always answered `None` on a decode error —
+/// disagreeing about the same bytes.
+///
+/// A keychain READ error propagates rather than reading as unpaired, and that
+/// is real rather than decorative: `keychain::classify_read` answers absence for
+/// `errSecItemNotFound` and only that, so a transient failure —
+/// `errSecInteractionNotAllowed` before the first unlock since boot, which these
+/// `…AfterFirstUnlockThisDeviceOnly` items make reachable on a background wake —
+/// arrives here as `Err` and does NOT invite a re-pair over a good record.
 pub(crate) fn has_pairing() -> Result<bool, String> {
-    Ok(crate::keychain::read_paired_record()?.is_some())
+    Ok(crate::keychain::read_paired_record()?.is_some_and(|bytes| record_decodes(&bytes)))
+}
+
+/// The decode half of [`has_pairing`], split out because it is the only half
+/// testable off-device — the host keychain stub always reads empty.
+fn record_decodes(bytes: &[u8]) -> bool {
+    match serde_json::from_slice::<PairedRecord>(bytes) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("paired-gateway record present but undecodable, treating as unpaired: {e}");
+            false
+        }
+    }
 }
 
 /// Load and decode the persisted pairing record, if the app is paired.
@@ -598,8 +626,8 @@ fn decode_secret(s: &str) -> Result<PairingSecret, String> {
 }
 
 /// The keychain byte format of [`PairedRecord`] is the upgrade-continuity contract
-/// with installs made by the Tauri shell: a paired user who upgrades reads THIS
-/// blob back. A renamed field, a re-typed key, or a dropped `#[serde(default)]`
+/// with already-shipped installs: a paired user who upgrades reads THIS blob
+/// back. A renamed field, a re-typed key, or a dropped `#[serde(default)]`
 /// deserializes to `None`/an error and the app silently forgets its gateway
 /// binding — no error the user can act on, no way back but a re-pair. So the
 /// assertions below are on the literal JSON TEXT, not on a round-trip (which
@@ -612,9 +640,20 @@ mod tests {
     /// name here is frozen; the two 32-byte keys are JSON ARRAYS of numbers.
     const GOLDEN_RECORD_JSON: &str = r#"{"device_id":"device-abc","auth_token":"tok-1","gateway_static_pubkey":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"relay_node_id":"node-1","relay_url":"wss://relay.example","remote_api_key":"key-1","noise_secret":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"noise_public":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#;
 
-    /// A record written by a Tauri-shell build that predates `relay_url`,
-    /// `remote_api_key`, and `noise_public` — all three are `#[serde(default)]`
-    /// precisely so this blob still loads.
+    /// A record missing all three `#[serde(default)]` fields. **No shipped build
+    /// ever wrote this shape** — `relay_url`, `remote_api_key`, and
+    /// `noise_public` have carried their defaults since the first commit of the
+    /// first iOS app, and nothing serializes the record without them. So this
+    /// fixture does not stand in for any real install; the defaults are a
+    /// failure-mode choice and this pins it.
+    ///
+    /// The choice: `has_pairing` treats an undecodable record as UNPAIRED, which
+    /// costs the user a re-pair. Defaulting the three fields that can carry a
+    /// sane empty value keeps a record that is merely short one of them loading
+    /// and working instead — `relay_url` and `remote_api_key` are legitimately
+    /// empty on a relay-off pairing anyway, and `dial` already guards on both.
+    /// The fields with no default stay required, so a record missing something
+    /// with no sane empty value still fails loudly rather than half-loading.
     const LEGACY_RECORD_JSON: &str = r#"{"device_id":"device-legacy","auth_token":"tok-old","gateway_static_pubkey":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"relay_node_id":"node-old","noise_secret":[8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8]}"#;
 
     fn golden_record() -> PairedRecord {
@@ -684,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_record_without_the_defaulted_fields_still_loads() {
+    fn a_record_short_a_defaulted_field_degrades_instead_of_failing() {
         let record: PairedRecord = serde_json::from_str(LEGACY_RECORD_JSON).expect("decode legacy");
         assert_eq!(record.device_id, "device-legacy");
         assert_eq!(record.auth_token, "tok-old");
@@ -705,7 +744,28 @@ mod tests {
         assert!(serde_json::from_str::<PairedRecord>(&missing_token).is_err());
     }
 
-    /// A newer Tauri/iOS build may add a field this build doesn't know; reading the
+    #[test]
+    fn a_record_that_decodes_counts_as_paired() {
+        assert!(record_decodes(GOLDEN_RECORD_JSON.as_bytes()));
+        // Short the defaulted fields and it must still count — that is what the
+        // defaults buy, and reading it as unpaired would cost a needless re-pair.
+        assert!(record_decodes(LEGACY_RECORD_JSON.as_bytes()));
+    }
+
+    /// The stranding case: a populated slot whose bytes no longer parse must read
+    /// as UNPAIRED, so the app offers the pairing screen instead of routing every
+    /// command to a relay leg that cannot construct. Answering `true` here left
+    /// `has_pairing` and `paired_device` disagreeing about the same bytes.
+    #[test]
+    fn a_record_that_no_longer_decodes_reads_as_unpaired() {
+        assert!(!record_decodes(b""));
+        assert!(!record_decodes(br#"{"device_id":"truncated-mid"#));
+        assert!(!record_decodes(b"not json at all"));
+        let missing_token = LEGACY_RECORD_JSON.replace(r#""auth_token":"tok-old","#, "");
+        assert!(!record_decodes(missing_token.as_bytes()));
+    }
+
+    /// A newer iOS build may add a field this build doesn't know; reading the
     /// blob must not fail on it.
     #[test]
     fn an_unknown_field_from_a_newer_build_is_ignored() {
