@@ -1,4 +1,25 @@
 {
+  "llm": [
+    {
+      "name": "primary",
+      "provider": "anthropic",
+      "model": "claude-opus-4",
+      "model_list": [
+        { "model": "claude-opus-4" },
+        { "model": "claude-sonnet-4" },
+        {
+          "model": "claude-haiku-4",
+          "context_window": 200000,
+          "pricing": {
+            "input_per_1m_tokens": 1000000,
+            "output_per_1m_tokens": 5000000
+          }
+        }
+      ],
+      "lite_model": "claude-haiku-4"
+    }
+  ],
+  "default-llm": "primary",
   "agent": {
     "max_iterations": 300,
     "context": {

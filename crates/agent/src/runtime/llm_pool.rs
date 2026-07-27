@@ -31,7 +31,7 @@ pub struct LlmClientPool {
     /// Entry → its DEFAULT-model client.
     clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
     /// (entry, candidate model id) → client, for models other than the
-    /// entry's default. Pre-built at boot/reload from `model_candidates`.
+    /// entry's default. Pre-built at boot/reload from `model_list`.
     overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
     /// Entry → every model id it can serve (`[default] + candidates` that
     /// actually built a client). The pinnable set for validation.

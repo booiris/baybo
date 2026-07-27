@@ -1,7 +1,7 @@
 use baybo_config::{
     BayboConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig,
-    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, PermissionPolicy, ProxyConfig,
-    TelegramChannelConfig,
+    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, LlmModelSpec, PermissionPolicy,
+    ProxyConfig, TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -90,13 +90,10 @@ fn entry(name: &str) -> LlmEntry {
         name: name.into(),
         provider: "openai".into(),
         model: "gpt-4o-mini".into(),
-        model_candidates: Vec::new(),
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env: None,
         base_url: None,
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort: None,
     }
 }
@@ -123,6 +120,33 @@ fn empty_model_fails_validation() {
     c.llm[0].model = String::new();
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "llm[0].model"));
+}
+
+/// Caught in `validate()` rather than at client-build time, so a reload
+/// dry-run rejects the typo without constructing any client.
+#[test]
+fn lite_model_outside_model_list_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.llm[0].lite_model = Some("gpt-4o-nano".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].lite_model"));
+}
+
+#[test]
+fn lite_model_naming_a_listed_model_validates() {
+    let mut c = config_with_default_entry();
+    c.llm[0].model_list = vec![LlmModelSpec::bare("gpt-4o-nano")];
+    c.llm[0].lite_model = Some("gpt-4o-nano".into());
+    assert!(c.validate().is_ok());
+}
+
+/// The entry's own default model is always serveable, so naming it as
+/// the lite model is legal even with an empty `model_list`.
+#[test]
+fn lite_model_may_name_the_entry_default() {
+    let mut c = config_with_default_entry();
+    c.llm[0].lite_model = Some(c.llm[0].model.clone());
+    assert!(c.validate().is_ok());
 }
 
 #[test]

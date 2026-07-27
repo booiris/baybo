@@ -27,7 +27,7 @@ Width knob: `ModelMenuPanel.panelWidth` (232).
 Three levels replace in place, sub-levels headed by a back row:
 
 1. **Entries by name** — trailing ✓ on the effective entry, no chevron.
-2. **That entry's models** (`model` + `model_candidates`, ✓ on the effective model) plus, below a hairline, the **Thinking** row — subtitled with the entry's current level and carrying the panel's one trailing `›`.
+2. **That entry's models** (`model` + `model_list`, ✓ on the effective model) plus, below a hairline, the **Thinking** row — subtitled with the entry's current level and carrying the panel's one trailing `›`.
 3. **The levels** — `none/minimal/low/medium/high/xhigh` (`crates/llm` registry contract).
 
 ### Accessibility contract
@@ -36,7 +36,7 @@ Panel rows set `accessibilityLabel` = title and `accessibilityValue` = subtitle,
 
 ## The catalog
 
-The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_candidates**/reasoning_effort) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits, deleted on logout/rebind) for offline cold-paint.
+The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits, deleted on logout/rebind) for offline cold-paint.
 
 Because of the mirror, a cold offline start still paints the pill and the panel. The pill renders only once the catalog has entries, and the pill **NEVER shows a placeholder** — always the best-known model id.
 
@@ -45,7 +45,7 @@ Because of the mirror, a cold offline start still paints the pill and the panel.
 **The pin is an `(entry, model, effort)` TRIPLE** — `ChatStore.modelPin` / `modelPinModel` / `modelPinEffort`:
 
 - the **entry** is `SessionState.last_llm`;
-- the **model** is a `model_candidates` id in `last_model` (`nil` ⇒ entry default);
+- the **model** is a `model_list` id in `last_model` (`nil` ⇒ entry default);
 - the **effort** (thinking level) is **PER-SESSION**, not a global entry edit.
 
 `ChatStore.selectEffort` pins (entry, its relevant model, effort); `selectModel` keeps the current effort; both funnel through `applySelection` → one PUT. The panel's Thinking checkmark/subtitle read `store.modelPinEffort ?? entry's default` (session value wins, applies whatever entry — effort is INDEPENDENT of the llm/model pin).
@@ -74,7 +74,7 @@ That failure path **defers its notice** (`draftPinFailed`, surfaced after the se
 
 Root workspace, **NOT** covered by `app/ios` CI:
 
-- `LlmEntry.model_candidates` / `lite_model` (config). The LLM pool pre-builds a client per candidate model; `resolve(name, model)` picks it.
+- `LlmEntry.model_list` / `lite_model` (config). The LLM pool pre-builds a client per listed model; `resolve(name, model)` picks it.
 - Effort is a **PER-REQUEST** override on `ChatRequest.reasoning_effort` that only `openai-subscription` consumes (`AnyCompletionModel::stream(request, effort)`; other providers ignore it — no `additional_params` pollution).
 - `last_model` + `last_effort` are their own flat SQLite columns (`set_last_model` / `set_last_effort`, additive migrations — keep `last_llm`'s golden JSON).
 - `AgentMessage::SetModel{llm, model, effort}` threads the triple through the spawner (`ActorSpawner`'s `initial_effort`) → `AgentLoop.initial_effort` → every turn's `ChatRequest`.

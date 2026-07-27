@@ -97,7 +97,7 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<bool>;
 
     /// Set (or clear, with `None`) the session's per-session MODEL pick
-    /// within [`Self::set_last_llm`]'s entry — a `model_candidates` id.
+    /// within [`Self::set_last_llm`]'s entry — a `model_list` id.
     /// Same flat-column discipline as [`Self::set_last_llm`]: writes only
     /// the `last_model` column, leaving the JSON `data` blob alone. `get`
     /// patches `Session.state.last_model` from the column at read time.

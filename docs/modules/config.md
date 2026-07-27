@@ -71,6 +71,23 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`) may opt into `#[serde(deny_unknown_fields)]` individually; today no section has. The root `BayboConfig` intentionally keeps permissive semantics.
 
+### LLM entries and `model_list`
+
+An `LlmEntry` splits into two halves that behave differently:
+
+- **The entry** owns what its models genuinely share: `provider`, `base_url`, `api_key_env`, and `reasoning_effort`. Effort sits here because it is a *preference*, not a fact about a model — a session's own thinking-level pick (`sessions.last_effort`) overrides it per request, and the provider clamps it to what the chosen model allows.
+- **`model_list`** owns per-model facts: `context_window`, `pricing`, `supports_vision`. Every item is an object `{model, context_window?, pricing?, supports_vision?}` — one shape, whether or not the model carries overrides.
+
+`model` names the entry's default. `LlmEntry::models()` normalizes with one rule — **prepend `model` when `model_list` doesn't already contain it** — so listing only the *extra* models is equivalent to listing the default first, and both resolve to `[default, …rest]`. An operator who lists the default explicitly keeps control of its position, and that order is the chat model picker's order.
+
+Effective value = the model's own spec field → the provider factory's per-model resolution (bundled OpenRouter snapshot, keyed by model slug) → a per-provider constant. An unset override is therefore already per-model-correct; the spec only exists for the cases the snapshot gets wrong.
+
+`lite_model` names one of the entry's models — the cheaper one used for lightweight auxiliary calls. It is validated against `models()` in `validate()`, not at client-build time, so a stranded reference is rejected by a reload dry-run without constructing anything.
+
+The entry-level `context_window` / `pricing` / `supports_vision` keys that predate `model_list` are simply **gone** — no tombstone field, no migration check. A config still carrying them parses, and the keys are ignored like any other unknown key (§"Unknown fields"); the affected models fall back to the factory's per-model resolution. This follows the repo rule against legacy-data migrations: remove the field and its consumers, leave the orphaned data inert.
+
+The `PUT /v1/llm/models/{name}` admin endpoint and `baybo llm edit` both address the **default** model's spec when they set one of the three (materialising it at the front of `model_list` if needed). Overrides for an entry's other models are config-file edits only.
+
 ### Secret handling
 
 Config does **not** store live secret values; it stores references:
@@ -84,7 +101,7 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 
 | Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
 | ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `llm`      | `Vec<LlmEntry>` + `default-llm: LlmEntryName` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, api_key_env?, base_url?, supports_vision?, context_window?, pricing?, reasoning_effort?}` record. `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
+| `llm`      | `Vec<LlmEntry>` + `default-llm: LlmEntryName` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, model_list?, lite_model?, api_key_env?, base_url?, reasoning_effort?}` record — provider + credentials on the entry, per-model facts in `model_list`. See §"LLM entries and `model_list`". `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
 | `agent`    | `AgentLoopConfig` (`max_iterations`) + `ContextManager`/`TokenBudget` (context budget, `keep_recent`) + subagent caps + tier map | Carries `max_iterations`, the context-window budget, `max_subagent_depth`, `max_subagents_per_root`, and `model_tiers` (`ModelTier` → `LlmEntryName`). Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s). |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
@@ -141,6 +158,8 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `llm[i].name`                         | non-empty; unique within `llm`                       |
 | `llm[i].provider`                     | non-empty                                            |
 | `llm[i].model`                        | non-empty                                            |
+| `llm[i].model_list[j].model`          | non-empty                                            |
+| `llm[i].lite_model`                   | if set, non-empty **and** names one of the entry's `models()` (default + `model_list`) |
 | `llm[i].base_url`                     | if set, scheme is `http://` or `https://`            |
 | `llm[i].api_key_env`                  | if set, valid env-var identifier                     |
 | `default-llm`                         | when `llm` is non-empty, must name an existing entry |

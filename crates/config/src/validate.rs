@@ -66,21 +66,31 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
                 "must be non-empty",
             ));
         }
-        for (j, candidate) in entry.model_candidates.iter().enumerate() {
-            if candidate.trim().is_empty() {
+        for (j, spec) in entry.model_list.iter().enumerate() {
+            if spec.model.trim().is_empty() {
                 errors.push(ValidationError::new(
-                    format!("{prefix}.model_candidates[{j}]"),
+                    format!("{prefix}.model_list[{j}].model"),
                     "must be non-empty",
                 ));
             }
         }
-        if let Some(lite) = &entry.lite_model
-            && lite.trim().is_empty()
-        {
-            errors.push(ValidationError::new(
-                format!("{prefix}.lite_model"),
-                "must be non-empty when set (omit the field to leave it unset)",
-            ));
+        if let Some(lite) = &entry.lite_model {
+            if lite.trim().is_empty() {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.lite_model"),
+                    "must be non-empty when set (omit the field to leave it unset)",
+                ));
+            } else if !entry.models().iter().any(|s| &s.model == lite) {
+                // Caught here rather than at client-build time so a
+                // stranded reference is rejected by the reload dry-run
+                // without constructing anything.
+                errors.push(ValidationError::new(
+                    format!("{prefix}.lite_model"),
+                    format!(
+                        "{lite:?} is not one of this entry's models; add it to {prefix}.model_list"
+                    ),
+                ));
+            }
         }
         if let Some(url) = &entry.base_url
             && !is_http_url(url)
