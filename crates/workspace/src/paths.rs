@@ -113,25 +113,6 @@ pub const CHANNEL_PORT_FILE: &str = "channel.port";
 /// gets bind-mounted at `/data/profile` inside the container.
 pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
 
-/// Per-session writable state dir lives at
-/// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/`. Currently holds
-/// `summary.md` for the async summary-refresh design (see
-/// `docs/background-compression.md`); future per-session writable
-/// artifacts go alongside it. Distinct from `<LOGS_DIR>/sessions/`,
-/// which is the *append-only* per-session LLM call log.
-pub const STATE_SESSIONS_SUBDIR: &str = "sessions";
-
-/// Per-session summary file (markdown). Authoritative content for the
-/// async-refresh fast-path lives at
-/// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/<SUMMARY_FILE>`;
-/// the durable metadata index is the `session_summaries` sqlite table.
-pub const SUMMARY_FILE: &str = "summary.md";
-
-/// Sibling of [`SUMMARY_FILE`] used by the atomic write path
-/// (write-tempfile + rename). Surfaces only between the write and
-/// rename steps; the orphan reaper deletes `*.tmp` files at startup.
-pub const SUMMARY_FILE_TMP: &str = "summary.md.tmp";
-
 // ---------------------------------------------------------------------------
 // Files inside `work/` (not version-controlled)
 // ---------------------------------------------------------------------------
@@ -461,33 +442,6 @@ impl WorkspacePaths {
         self.state_dir().join(BROWSER_PROFILE_SUBDIR)
     }
 
-    /// Parent dir for per-session writable state:
-    /// `<root>/state/sessions/`. Distinct from `sessions_log_dir()`,
-    /// which holds *append-only* per-session LLM call logs.
-    pub fn state_sessions_dir(&self) -> PathBuf {
-        self.state_dir().join(STATE_SESSIONS_SUBDIR)
-    }
-
-    /// Per-session writable state directory:
-    /// `<root>/state/sessions/<session_id>/`. Contains [`SUMMARY_FILE`]
-    /// (and any future per-session artifacts).
-    pub fn session_state_dir(&self, session_id: &str) -> PathBuf {
-        self.state_sessions_dir().join(session_id)
-    }
-
-    /// Per-session summary file:
-    /// `<root>/state/sessions/<session_id>/summary.md`.
-    pub fn session_summary_file(&self, session_id: &str) -> PathBuf {
-        self.session_state_dir(session_id).join(SUMMARY_FILE)
-    }
-
-    /// Tempfile sibling of [`Self::session_summary_file`] used by the
-    /// atomic write path: write-then-rename guarantees readers either
-    /// see the previous summary or the new one, never a partial.
-    pub fn session_summary_tmp_file(&self, session_id: &str) -> PathBuf {
-        self.session_state_dir(session_id).join(SUMMARY_FILE_TMP)
-    }
-
     /// Virtual per-session transcript path:
     /// `<root>/logs/sessions/<sanitized_session_id>.jsonl`. No file is
     /// written here — the compaction summary embeds this path as a
@@ -629,22 +583,6 @@ mod tests {
             PathBuf::from("/var/baybo/work/.baybo-tool-spills"),
         );
         assert_eq!(p.work_tmp_dir(), PathBuf::from("/var/baybo/work/tmp"));
-        assert_eq!(
-            p.state_sessions_dir(),
-            PathBuf::from("/var/baybo/state/sessions"),
-        );
-        assert_eq!(
-            p.session_state_dir("abc-123"),
-            PathBuf::from("/var/baybo/state/sessions/abc-123"),
-        );
-        assert_eq!(
-            p.session_summary_file("abc-123"),
-            PathBuf::from("/var/baybo/state/sessions/abc-123/summary.md"),
-        );
-        assert_eq!(
-            p.session_summary_tmp_file("abc-123"),
-            PathBuf::from("/var/baybo/state/sessions/abc-123/summary.md.tmp"),
-        );
     }
 
     #[test]

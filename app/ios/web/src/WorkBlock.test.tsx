@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { I18nextProvider } from "react-i18next";
 
 import i18n from "./i18n";
-import { WorkBlockView } from "./WorkBlock";
+import { compactionStatusText, WorkBlockView } from "./WorkBlock";
 import type { WorkRow, WorkStep } from "./types";
 
 // The one render test in this bundle. WorkBlockView is a small presentational
@@ -178,5 +178,18 @@ describe("WorkBlockView — closed", () => {
     await user.click(summary);
     expect(onToggle).toHaveBeenCalledWith(true);
     expect(screen.getByText("done scanning")).toBeInTheDocument();
+  });
+});
+
+describe("compactionStatusText", () => {
+  const t = ((key: string) => key) as unknown as Parameters<typeof compactionStatusText>[0];
+
+  it("names the two phases the server emits", () => {
+    expect(compactionStatusText(t, "compacting")).toBe("chat.compacting");
+    expect(compactionStatusText(t, "compacted")).toBe("chat.compacted");
+  });
+
+  it("shows an unknown phase raw rather than swallowing the turn's only explanation", () => {
+    expect(compactionStatusText(t, "recompiling")).toBe("recompiling");
   });
 });

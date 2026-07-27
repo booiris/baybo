@@ -133,18 +133,26 @@ fn web_trace_types_declare_no_kinds_rust_lacks() {
     }
 }
 
-/// The `kind: '…'` tags inside one exported TS union, e.g. everything between
-/// `export type StepKind =` and the terminating `;`.
-fn declared_tags(ts: &str, ty: &str) -> Vec<String> {
+/// The body of one exported TS union: everything between `export type {ty} =`
+/// and the blank line that ends the declaration.
+///
+/// The terminator is `";\n\n"`, not `";\n"`. A union member can carry its own
+/// fields — `StepKind`'s `compression` declares `trigger?: … ;` on its own line
+/// — and stopping at the first `;\n` cut the body off inside that member, so
+/// the scrape saw two of seven tags and the contract test was quietly guarding
+/// almost nothing.
+fn union_body<'a>(ts: &'a str, ty: &str) -> &'a str {
     let header = format!("export type {ty} =");
     let Some(start) = ts.find(&header) else {
         panic!("app/web/src/types/trace.ts has no `{header}` — did the mirror move?")
     };
     let body = &ts[start + header.len()..];
-    let body = &body[..body.find(";\n").unwrap_or(body.len())];
+    &body[..body.find(";\n\n").unwrap_or(body.len())]
+}
 
+/// Every occurrence of `needle` followed by a `'…'` literal, in order.
+fn scrape_quoted(body: &str, needle: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let needle = "kind: '";
     let mut rest = body;
     while let Some(i) = rest.find(needle) {
         rest = &rest[i + needle.len()..];
@@ -154,4 +162,73 @@ fn declared_tags(ts: &str, ty: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The `kind: '…'` tags inside one exported TS union.
+fn declared_tags(ts: &str, ty: &str) -> Vec<String> {
+    scrape_quoted(union_body(ts, ty), "kind: '")
+}
+
+/// The bare string literals of a flat union like
+/// `export type CompressionTrigger = 'threshold' | 'forced';`. These have no
+/// `kind: '` needle, so they need their own scrape — and they had no coverage
+/// at all, which is exactly how a retired variant would linger in the mirror.
+fn declared_literals(ts: &str, ty: &str) -> Vec<String> {
+    // Split on the quote: the odd-indexed pieces are what sat inside it.
+    union_body(ts, ty)
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Both compression unions, both directions. `trigger` and `applied` are
+/// rendered as raw strings by the trace viewer, so a drift here shows up as a
+/// row labelled with a value that no longer means anything.
+#[test]
+fn web_trace_types_cover_the_compression_unions() {
+    let ts = web_trace_types();
+
+    let triggers = [CompressionTrigger::Threshold, CompressionTrigger::Forced];
+    for t in triggers {
+        // Exhaustiveness tripwire: a new variant fails to compile here.
+        match t {
+            CompressionTrigger::Threshold | CompressionTrigger::Forced => {}
+        }
+    }
+    let applied = [
+        CompressionApplied::LiveSummary,
+        CompressionApplied::Truncate,
+    ];
+    for a in applied {
+        match a {
+            CompressionApplied::LiveSummary | CompressionApplied::Truncate => {}
+        }
+    }
+
+    for (ty, wire) in [
+        ("CompressionTrigger", vec!["threshold", "forced"]),
+        ("CompressionApplied", vec!["live_summary", "truncate"]),
+    ] {
+        let declared = declared_literals(&ts, ty);
+        assert!(
+            !declared.is_empty(),
+            "scraped no literals out of `{ty}` in app/web/src/types/trace.ts — the \
+             scraper is broken, not the mirror"
+        );
+        for tag in &wire {
+            assert!(
+                declared.iter().any(|d| d == tag),
+                "`{ty}` variant `{tag}` is missing from app/web/src/types/trace.ts"
+            );
+        }
+        for d in &declared {
+            assert!(
+                wire.contains(&d.as_str()),
+                "app/web/src/types/trace.ts declares `{ty}` value `{d}`, which no Rust \
+                 variant produces — delete it, or add the Rust variant"
+            );
+        }
+    }
 }

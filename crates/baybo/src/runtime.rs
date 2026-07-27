@@ -440,16 +440,8 @@ pub async fn build_managers(
 
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
-        stores.session_summary.clone(),
         stores.session_folder.clone(),
     ));
-
-    // Delete orphan summary directories under `state/sessions/` left by
-    // a background-summary pass that wrote `summary.md` but exited before
-    // recording its `session_summaries` row. Best-effort — logged at warn
-    // on failure, never blocks boot.
-    baybo_agent::compression::reap_orphan_summaries(session_manager.as_ref(), &workspace_paths)
-        .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 
@@ -864,11 +856,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // `initial_model` is the chat pick WITHIN that entry
                 // (`session.state.last_model`); `None` ⇒ entry default.
 
-                // `summary_state_dir` connects the compressor's
-                // fast-path to the background refresh runner's output.
-                // Without it the background passes still run and bill
-                // LLM, but their summaries never reach the hot path.
-                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
@@ -894,7 +881,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
-                    workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),
                     task_store: task_store.clone(),

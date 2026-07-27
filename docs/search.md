@@ -193,7 +193,7 @@ projected out of `$[*].Text` — indexing the column raw would index JSON keys a
 
 **Superseded rows are indexed.** `superseded_by` marks compaction, not a user edit — the pre-
 compaction originals are the real history, and the live transcript holds a reseeded system prompt
-plus a summary that lives on disk at `state/sessions/<id>/summary.md`, not in this table. Skipping
+plus the compaction machinery's own re-inserted rows, which the join filters out. Skipping
 them would make search go progressively blind as sessions age: the longest conversations, the ones
 most worth searching, would be the emptiest. This is also what makes search useful to the agent —
 it is how it recovers detail compaction threw away.

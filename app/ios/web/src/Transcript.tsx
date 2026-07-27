@@ -49,7 +49,7 @@ import {
 } from "./bridge";
 import { MarkdownBody } from "./Markdown";
 import { advanceFromLive, advanceFromSync, type CursorState } from "./transcript/cursor";
-import { WorkBlockView } from "./WorkBlock";
+import { compactionStatusText, WorkBlockView } from "./WorkBlock";
 import {
   blobContentDigest,
   uid,
@@ -174,8 +174,13 @@ const SAFETY_TICK_MS = 180_000;
 /// Hard ceiling on the optimistic post-send run-state window (`awaitingReply`).
 /// A real turn clears it far sooner — via its first output or its terminal frame
 /// — so this only fires when BOTH were missed (a disconnect that hid the turn's
-/// output and its close), un-sticking the composer's stop button. Well above any
-/// realistic pre-first-token latency, so it never expires under a live turn.
+/// output and its close), un-sticking the composer's stop button.
+///
+/// It is NOT above every pre-first-token latency: a compaction blocks the turn
+/// on a full-transcript summarizer call that routinely outlasts this. What keeps
+/// the window alive there is the `status` frame — it opens the work block, and
+/// `running` reads `workLive` too. Raising the number instead would just make a
+/// genuinely lost turn hold the composer hostage for twice as long.
 const AWAITING_MAX_MS = 30_000;
 
 /// How close to the top of the chat log (px) triggers a scroll-up fetch of the
@@ -2967,6 +2972,21 @@ export function Transcript({
         // pull. (`session_id` scoping is native's concern; the webview holds one
         // session, so any gap means "sync me".)
         runSync();
+        break;
+      case "status":
+        // A compaction blocks the turn on a full-transcript summarizer call, so
+        // without a line here the thread just sits silent for however long that
+        // takes. Folding it into the work block (rather than minting a row) also
+        // keeps `workLive` true across the pause, which is what stops the
+        // `awaitingReply` backstop from flipping the composer back to send
+        // mid-turn.
+        foldStreamingIntoProse();
+        pushWorkStep({ kind: "status", text: compactionStatusText(t, frame.phase) });
+        if (frame.phase === "compacted") {
+          // The divider is derived from `compaction_points`, which no live frame
+          // carries — without this pull it appears on the next cold open.
+          runSync();
+        }
         break;
       case "notice":
         if (frame.transient) {

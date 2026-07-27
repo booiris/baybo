@@ -19,9 +19,7 @@ use baybo_agent::state::DurableActorState;
 use baybo_model::{ApprovedResource, ChannelType, SessionId, User};
 use baybo_session::SessionManager;
 use baybo_session::SessionStore;
-use baybo_session::test_support::{
-    MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-};
+use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
 
 fn test_user() -> User {
     User {
@@ -80,9 +78,8 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
 #[tokio::test]
 async fn rehydrate_after_idle_eviction_preserves_session_state() {
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    let summary_store = Arc::new(MemorySessionSummaryStore::new());
     let folder_store = Arc::new(MemorySessionFolderStore::new());
-    let sessions = SessionManager::new(session_store.clone(), summary_store, folder_store);
+    let sessions = SessionManager::new(session_store.clone(), folder_store);
 
     // First actor: create session, mutate observable session state
     // (a permanent approval grant — what `ApproveAlways` writes), persist.
@@ -141,9 +138,8 @@ async fn background_notification_buffer_survives_session_round_trip() {
     use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    let summary_store = Arc::new(MemorySessionSummaryStore::new());
     let folder_store = Arc::new(MemorySessionFolderStore::new());
-    let sessions = SessionManager::new(session_store.clone(), summary_store, folder_store);
+    let sessions = SessionManager::new(session_store.clone(), folder_store);
 
     let mut session = sessions
         .create_session(test_user(), ChannelType::tui())

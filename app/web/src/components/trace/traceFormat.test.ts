@@ -68,20 +68,20 @@ describe('stepSummaryText — compression', () => {
       ),
     ).toBe('threshold · live summary · 21,080 → 260 tokens');
     expect(
-      stepSummaryText(step({ kind: 'compression', trigger: 'background' }), [llmSpan(result)]),
-    ).toBe('background · 21,080 → 260 tokens');
+      stepSummaryText(step({ kind: 'compression', trigger: 'forced' }), [llmSpan(result)]),
+    ).toBe('forced · 21,080 → 260 tokens');
   });
 
   it('still describes a compaction that made no LLM call', () => {
-    // The threshold trim that swaps in `summary.md` has no span and no token
-    // figures, but it is the moment the input context changed — a bare
-    // "compression" would say nothing about the one row that matters most.
+    // The truncate fallback has no span and no token figures, but it is the
+    // compaction that discarded the most — a bare "compression" would say
+    // nothing about the one row that matters most.
     expect(
       stepSummaryText(
-        step({ kind: 'compression', trigger: 'threshold', applied: 'stored_summary' }),
+        step({ kind: 'compression', trigger: 'threshold', applied: 'truncate' }),
         [],
       ),
-    ).toBe('threshold · stored summary');
+    ).toBe('threshold · truncate');
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'forced', applied: 'truncate' }), []),
     ).toBe('forced · truncate');

@@ -28,7 +28,6 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tiktoken-rs = { workspace = true }
 parking_lot = { workspace = true }
-# Used by the fast-path's async `summary.md` read.
 tokio = { workspace = true, features = ["fs"] }
 # Cancellation tokens: the background-summary tool loop hands a token
 # to `baybo_tools::ToolContext` so a parent cancel kills any in-flight

@@ -39,8 +39,7 @@ pub enum MessagePriority {
     Stop,
     /// Autonomous reaction to a finished background subagent.
     BackgroundJobFinished,
-    /// Triggering work: live user input, cron fire, subagent spawn,
-    /// background-compression dispatch.
+    /// Triggering work: live user input, cron fire, subagent spawn.
     Trigger,
 }
 

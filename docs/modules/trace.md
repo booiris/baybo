@@ -51,8 +51,8 @@ pub enum SpanKind {
 - Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: ParallelGroup`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
 - `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection`, `ProgressObserver`, and `TitleGeneration` are first-class Step kinds, not events on an LLM step.
-- `Compression` carries two orthogonal fields. `CompressionTrigger` says **why** it ran (`Threshold` / `Forced` / `Background`): threshold and forced rewrite the transcript the **next** `LlmCall` reads — those are the moments the model's input context changed — while the background pass only refreshes the session's `summary.md` and leaves the live transcript alone. `CompressionApplied` says **how** the flow shrank it (`StoredSummary` / `LiveSummary` / `Truncate`).
-- **Only `LiveSummary` makes an LLM call**, so only that stage produces a step with an `LlmCall` span. The stored-summary and truncate stages rewrite the context with no model round-trip; the agent records their step explicitly (`record_spanless_compaction`), because otherwise the threshold trim that swaps in `summary.md` — the compaction an operator most wants to see — would leave no trace at all. A `Compression` step with zero spans is therefore expected, not a defect.
+- `Compression` carries two orthogonal fields. `CompressionTrigger` says **why** it ran (`Threshold` / `Forced`) — the token threshold tripped, or the user typed `/compact`. `CompressionApplied` says **how** it shrank (`LiveSummary` / `Truncate`).
+- **Only `LiveSummary` makes an LLM call**, so only it produces a step with `LlmCall` spans — two of them when a transient failure was retried, both under the one step. `Truncate` rewrites the context with no model round-trip, so the agent records its step explicitly (`record_spanless_compaction`): without that, the compaction that discarded the most would be the only one leaving no trace at all. A `Compression` step with zero spans is therefore expected, not a defect.
 
 ### Provenance lives on Span variants, not on Step
 
@@ -183,7 +183,7 @@ an LLM or tool request goes out. There is no deferred/background write path.
 At boot, `recover_orphaned_traces_and_jobs` walks non-terminal jobs from the
 prior process, closes pending spans/steps at the last observed child activity,
 and cancels the job as `SystemCrash`. It also asks `TraceStore` for unfinished
-steps so detached work under already-terminal jobs (background compression,
+steps so detached work under already-terminal jobs (title generation,
 title generation, progress observer) is closed without reopening or cancelling
 the owning job. While the process is still alive, `recover_panicked_actor_session`
 performs the same repair for the panicked session's active turn jobs, using the

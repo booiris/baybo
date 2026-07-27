@@ -246,7 +246,6 @@ async fn main() -> anyhow::Result<()> {
         builder = builder
             .session(Arc::new(baybo_agent::SessionManager::new(
                 stores.session.clone(),
-                stores.session_summary.clone(),
                 stores.session_folder.clone(),
             )))
             .job(Arc::new(baybo_job::JobLifecycle::new(stores.job.clone())))

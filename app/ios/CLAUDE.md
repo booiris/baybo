@@ -48,7 +48,8 @@ for Swift/web iteration), and the Swift tiers need `xcodegen generate` plus a
 **`app/ios` is its own cargo workspace and its own pnpm project.** The root
 `cargo test --workspace` and the root `frontend` CI job have never covered any
 of it. Its CI is the `ios-checks` (ubuntu, 1×) and `ios-sim` (macos-26, 10×)
-jobs — see [`docs/testing.md`](docs/testing.md) for what each gates.
+jobs — **both currently `if: false`**, so nothing here is covered until they are
+re-enabled; see [`docs/testing.md`](docs/testing.md).
 
 ## Continuity contract (do not change — existing installs depend on it)
 

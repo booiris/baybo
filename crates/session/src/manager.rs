@@ -11,7 +11,6 @@ use tracing::{debug, warn};
 use crate::SessionError;
 use baybo_store::{SessionFolderRow, SessionFolderStore};
 use baybo_store::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
-use baybo_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
 
@@ -84,24 +83,15 @@ fn validate_folder_name(name: String) -> Result<String> {
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
-    /// Per-session summary-metadata store. Required at construction —
-    /// production wires the sqlite backend; tests pass
-    /// `crate::test_support::MemorySessionSummaryStore`.
-    summary_store: Arc<dyn SessionSummaryStore>,
     /// Chat-list folder store. Required at construction — production wires
     /// the sqlite backend; tests pass `MemorySessionFolderStore`.
     folder_store: Arc<dyn SessionFolderStore>,
 }
 
 impl SessionManager {
-    pub fn new(
-        store: Arc<dyn SessionStore>,
-        summary_store: Arc<dyn SessionSummaryStore>,
-        folder_store: Arc<dyn SessionFolderStore>,
-    ) -> Self {
+    pub fn new(store: Arc<dyn SessionStore>, folder_store: Arc<dyn SessionFolderStore>) -> Self {
         Self {
             store,
-            summary_store,
             folder_store,
         }
     }
@@ -111,69 +101,6 @@ impl SessionManager {
     /// `QueryApi` against the same store the manager writes to.
     pub fn store(&self) -> Arc<dyn SessionStore> {
         Arc::clone(&self.store)
-    }
-
-    /// Read-only handle to the underlying `SessionSummaryStore`. Used
-    /// by callers that need direct access (orphan reaper's FS sweep
-    /// over `list_session_ids`, query-layer joins).
-    pub fn summary_store(&self) -> Arc<dyn SessionSummaryStore> {
-        Arc::clone(&self.summary_store)
-    }
-
-    /// Read this session's summary-metadata row. `Ok(None)` when the
-    /// session has never had a summary pass written.
-    pub async fn summary_metadata(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<SessionSummaryRow>> {
-        self.summary_store
-            .get(session_id)
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Record a successful summary pass: bumps `pass_count`, advances
-    /// `cursor`, accumulates cost, resets `error_count` to 0.
-    pub async fn record_summary_success(
-        &self,
-        session_id: &SessionId,
-        cursor: i64,
-        cost_micros_delta: i64,
-        model_id: &str,
-        span_id: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.summary_store
-            .upsert_success(
-                session_id,
-                cursor,
-                cost_micros_delta,
-                model_id,
-                span_id,
-                updated_at,
-            )
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Record a failed summary attempt: bumps `error_count` and
-    /// accumulates `cost_micros_delta`. Inserts a row with cursor=0 /
-    /// pass_count=0 if absent so failure telemetry surfaces even on
-    /// sessions that have never had a successful pass. The spend is
-    /// recorded because a failed pass still paid for every LLM call it
-    /// made before giving up.
-    pub async fn record_summary_failure(
-        &self,
-        session_id: &SessionId,
-        cost_micros_delta: i64,
-        model_id: &str,
-        span_id: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.summary_store
-            .bump_error_count(session_id, cost_micros_delta, model_id, span_id, updated_at)
-            .await
-            .map_err(SessionError::from)
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -624,25 +551,6 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Re-point `session_summaries.cursor` without touching pass_count /
-    /// cost / error telemetry. Used after a fast-path compaction apply:
-    /// the fresh continuation-summary row carries `summary.md` verbatim,
-    /// so the on-disk summary still covers everything at or before it and
-    /// the cursor may legally advance there — keeping the fast path alive
-    /// for a back-to-back compaction. Returns `false` when the session
-    /// has no summary row (nothing to re-point).
-    pub async fn repoint_summary_cursor(
-        &self,
-        session_id: &SessionId,
-        cursor: i64,
-        updated_at: DateTime<Utc>,
-    ) -> Result<bool> {
-        self.summary_store
-            .repoint_cursor(session_id, cursor, updated_at)
-            .await
-            .map_err(SessionError::from)
-    }
-
     /// Load the active transcript for `session_id` — used by the
     /// router to seed `ContextManager` on actor cold start. Returns
     /// an empty vector when no turns have been recorded yet.
@@ -698,21 +606,6 @@ impl SessionManager {
     pub async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
         self.store
             .count_active_messages(session_id)
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Active transcript clipped to `ordinal <= up_to_ordinal`. Used
-    /// by background compression to load the snapshot pinned at
-    /// trigger time without dragging the post-snapshot tail across
-    /// the wire.
-    pub async fn load_active_session_messages_up_to(
-        &self,
-        session_id: &SessionId,
-        up_to_ordinal: i64,
-    ) -> Result<Vec<ChatMessage>> {
-        self.store
-            .load_active_session_messages_up_to(session_id, up_to_ordinal)
             .await
             .map_err(SessionError::from)
     }
@@ -1092,9 +985,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
-    use crate::test_support::{
-        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-    };
+    use crate::test_support::{MemorySessionFolderStore, MemorySessionStore};
 
     fn test_user() -> User {
         User {
@@ -1107,11 +998,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_returns_valid_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1128,11 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_returns_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1150,11 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_creates_new_when_missing() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let id = SessionId::from("cli-abc");
         let session = mgr
@@ -1170,7 +1049,6 @@ mod tests {
     fn folder_mgr() -> SessionManager {
         SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         )
     }
@@ -1260,11 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn set_folder_requires_existing_folder_and_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
         let session = mgr
             .create_session(test_user(), ChannelType::owner())
             .await
@@ -1298,11 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn set_title_round_trips_and_rejects_unknown_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
         let session = mgr
             .create_session(test_user(), ChannelType::owner())
             .await
@@ -1337,11 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn touch_updates_last_active() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1364,11 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn touch_nonexistent_returns_not_found() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let err = mgr
             .touch(&SessionId::from("nonexistent"))
@@ -1380,11 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn idle_sessions_lists_without_deleting() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
 
         let mut idle = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1409,11 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
 
         let mut first = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1436,11 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn history_returns_messages_for_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1454,11 +1304,7 @@ mod tests {
     #[tokio::test]
     async fn history_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let err = mgr
             .history(&SessionId::from("nonexistent"))
@@ -1478,11 +1324,7 @@ mod tests {
         use baybo_model::{ChatMessage, ContentBlock};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
@@ -1531,11 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn full_transcript_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let err = mgr
             .full_transcript(&SessionId::from("nonexistent"))
@@ -1547,11 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1565,11 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn delete_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let err = mgr
             .delete(&SessionId::from("nonexistent"))
@@ -1587,11 +1417,7 @@ mod tests {
         // in-memory only (router/supervisor drop the actor); history
         // stays put.
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionFolderStore::new()));
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1623,11 +1449,7 @@ mod tests {
         use baybo_model::{ChatMessage, ContentBlock, Role};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1672,11 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn load_active_messages_empty_for_session_without_turns() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Arc::new(MemorySessionFolderStore::new()),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -1698,7 +1516,6 @@ mod tests {
 
         let mgr = SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         );
         let mut ids = Vec::new();
@@ -1759,7 +1576,6 @@ mod tests {
 
         let mgr = SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         );
         let session = mgr

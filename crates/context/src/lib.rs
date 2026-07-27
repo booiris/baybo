@@ -1,4 +1,3 @@
-pub mod background_summary;
 pub mod budget;
 pub mod calibration;
 pub mod compressor;
@@ -7,10 +6,6 @@ pub mod prompts;
 pub mod tokenizer;
 mod transcript_repair;
 
-pub use background_summary::{
-    BackgroundSummaryCallback, BackgroundSummaryConfig, BackgroundSummaryFuture,
-    BackgroundSummaryOutcome, SummaryChatRun, run_background_summary,
-};
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, CompressionStage, parse_summary_response};
@@ -19,70 +14,55 @@ pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
-// Configuration constants for the async summary-refresh feature.
+// Recent-slice bounds for the compaction's backward atomic-pair walk.
 //
-// All triggers and budgets that the agent loop / compressor consult
-// live here as named constants, not magic numbers — they're
-// referenced from at least two crates (context + agent) and the design
-// doc treats them as a single configuration surface. See
-// `docs/background-compression.md` for the full rationale.
+// A compaction keeps the tail of the conversation verbatim under the
+// summary, so the model still sees the last tool results and the user's
+// own words rather than a paraphrase of them. These bound how much tail.
+// See `docs/modules/context.md`.
 // ---------------------------------------------------------------------------
 
-/// Token threshold (as fraction of `TokenBudget::max_tokens`) above
-/// which a background summary becomes eligible. Sized **below** the
-/// compression threshold (typically 0.7-0.85) so summary.md is fresh
-/// by the time compression hits the fast-path swap-in.
-pub const SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO: f64 = 0.5;
+/// Absolute ceiling on the verbatim tail a compaction keeps.
+pub(crate) const RECENT_SLICE_MAX_TOKENS_ABS: usize = 40_000;
 
-/// Floor for the minimum new tokens (`tokens_since_anchor`) since the last
-/// summary pass before the trigger gate fires. The effective threshold is
-/// `max(this, SUMMARY_DIFF_CONTEXT_RATIO × max_tokens)` — see
-/// [`summary_diff_threshold`]; this floor only binds on small context
-/// windows.
-pub const SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR: usize = 5_000;
-
-/// Fraction of the active context window that must accumulate since the last
-/// pass before another one is worth its cost.
+/// Window-relative ceiling on that tail, applied alongside the absolute one.
 ///
-/// An absolute floor doesn't scale: the pass re-sends the whole transcript, so
-/// its cost grows with the window while the admission price stays fixed. On a
-/// 272K window the background trigger opens at 136K (0.5×) and compression
-/// only fires at ~177K (0.65×), leaving a ~41K band that a 5K threshold lets a
-/// session cross in up to eight passes — each one re-sending ~145K tokens to
-/// absorb ~30 new messages. Tying admission to the window keeps the ratio of
-/// "new material" to "tokens spent looking at it" constant.
-pub const SUMMARY_DIFF_CONTEXT_RATIO: f64 = 0.1;
+/// **Must stay below `compression_threshold`.** The tail is re-added to the
+/// compacted transcript, so a ratio at or above the trigger threshold makes
+/// every compaction land back above its own trigger — an unshrinkable
+/// transcript that re-compacts on every iteration. At 0.15 against the 0.65
+/// default, a compaction lands near 0.2 and leaves most of the window for new
+/// material.
+pub(crate) const RECENT_SLICE_MAX_TOKENS_RATIO: f64 = 0.15;
 
-/// Effective diff threshold for the background-summary trigger's clause (b).
-pub fn summary_diff_threshold(max_tokens: usize) -> usize {
-    SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
-        .max((max_tokens as f64 * SUMMARY_DIFF_CONTEXT_RATIO) as usize)
+/// The walk's soft-stop token floor, as a fraction of the derived cap — so
+/// `min <= max` holds structurally at every window size instead of by
+/// coincidence at large ones.
+pub(crate) const RECENT_SLICE_MIN_RATIO_OF_CAP: f64 = 0.25;
+
+/// The walk's soft-stop message floor: how many text-carrying messages the
+/// tail must hold before the walk may stop. A count, not a token quantity —
+/// the cap check breaks first and unconditionally, so this can never exceed
+/// the cap and needs no scaling.
+pub(crate) const RECENT_SLICE_MIN_TEXT_BLOCK_MSGS: usize = 5;
+
+/// Below this, a compaction cannot beat its own continuation framing — the
+/// intro, the transcript pointer, the footer — so the summariser call would be
+/// spent to make the transcript *longer*. Sized well above that framing's own
+/// cost so the margin isn't a coin flip.
+pub(crate) const MIN_COMPACTABLE_TOKENS: usize = 1_000;
+
+/// `(min_tokens, min_text_block_msgs, max_tokens)` for the backward walk at
+/// this context window.
+pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
+    let cap = RECENT_SLICE_MAX_TOKENS_ABS
+        .min((max_tokens as f64 * RECENT_SLICE_MAX_TOKENS_RATIO) as usize);
+    (
+        (cap as f64 * RECENT_SLICE_MIN_RATIO_OF_CAP) as usize,
+        RECENT_SLICE_MIN_TEXT_BLOCK_MSGS,
+        cap,
+    )
 }
-
-/// Disjunctive clause's tool-call half: how many tool_use blocks
-/// past the anchor before the end-of-iteration trigger fires
-/// (logical-OR'd with `job_done` for the end-of-job trigger).
-pub const SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD: usize = 3;
-
-/// Recent slice's minimum-tokens floor for the backward atomic-pair
-/// walk. Walk doesn't stop until tokens ≥ this value.
-pub const RECENT_SLICE_MIN_TOKENS: usize = 10_000;
-
-/// Recent slice's minimum-text-block-message floor for the walk.
-/// Both this and `RECENT_SLICE_MIN_TOKENS` must be satisfied before
-/// the walk's soft-stop fires.
-pub const RECENT_SLICE_MIN_TEXT_BLOCK_MSGS: usize = 5;
-
-/// Recent slice's hard token cap. The atomic-pair walk never adds a
-/// unit that would push tokens past this — pair preservation must
-/// not extend past the cap (P1 / γ-i).
-pub const RECENT_SLICE_MAX_TOKENS: usize = 40_000;
-
-/// Fall-through threshold (as fraction of `TokenBudget::max_tokens`):
-/// if the assembled `summary + recent slice + skill_trailer` exceeds
-/// this, the fast-path falls through to the live LLM summary stage.
-/// Recent slice is bounded by `RECENT_SLICE_MAX_TOKENS`.
-pub const FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO: f64 = 0.6;
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
@@ -91,7 +71,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse};
-use baybo_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
+use baybo_model::{ChatMessage, ContentBlock, Role, SessionId};
 use baybo_session::{SessionManager, SessionMessageAppendOutcome};
 use baybo_skills::render::{render_skill_block, render_skill_reminder};
 use baybo_skills::{
@@ -132,9 +112,9 @@ struct TokenBaseline {
 /// Result of a [`ContextManager::maybe_compress`] /
 /// [`ContextManager::force_compress`] call.
 ///
-/// "Nothing changed" is split into three reason-specific variants so
-/// callers (notably the `/compact` notice path in the agent loop) can
-/// surface *why* nothing was applied instead of a generic message.
+/// "Nothing changed" is split into reason-specific variants so callers
+/// (notably the `/compact` notice path in the agent loop) can surface
+/// *why* nothing was applied instead of a generic message.
 ///
 /// Cost recording is the caller's responsibility — both entry points
 /// invoke the supplied chat closure for any LLM call, and that closure
@@ -160,12 +140,15 @@ pub enum CompressionOutcome {
     /// to apply it (so the budget stays honest) and the transcript
     /// is unchanged.
     NoSavings,
+    /// The turn was cancelled while the summariser call was in flight. The
+    /// transcript is untouched and still over budget, so the next turn
+    /// compacts it — nothing is lost but the abandoned call.
+    Cancelled,
 }
 
 /// Manages a session's context: owns the conversation transcript,
-/// tracks the token budget, and runs the hardcoded 3-stage
-/// compression flow (summary.md fast-path → live LLM summary →
-/// truncate fallback). See [`compressor`] for the flow contract.
+/// tracks the token budget, and runs the compaction flow (live LLM
+/// summary, truncate on failure). See [`compressor`] for the contract.
 ///
 /// This is the **single owner** of `messages` for the actor handling
 /// one session. `Session` (in `baybo-model`) carries only metadata.
@@ -174,9 +157,9 @@ pub enum CompressionOutcome {
 /// owner here, eliminating the drift-detection logic.
 pub struct ContextManager {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// Source of truth for per-session paths the compressor needs:
-    /// `summary.md` for the fast-path stage, and the JSONL transcript
-    /// referenced from the continuation-summary message.
+    /// Source of truth for per-session paths: the JSONL transcript the
+    /// continuation-summary message points at, the identity files, and the
+    /// tool-spills dir.
     pub(crate) workspace: Arc<baybo_workspace::WorkspacePaths>,
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
@@ -224,22 +207,19 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
-    /// Boundary the trigger gate measures from. Set to `messages.len()`
-    /// after every compression apply and reconstructed from
-    /// `session_summaries.cursor` on cold start.
-    last_summary_anchor: Option<usize>,
-    /// Last cursor value resolved through [`Self::lookup_anchor_index_for_cursor`].
-    /// Skips the index lookup when [`Self::sync_anchor_to_cursor`] is
-    /// invoked with the same cursor again. Cleared by
-    /// [`Self::restore_messages`] (the active set has been replaced
-    /// wholesale, so any prior resolution is stale).
+    /// Transcript length at which a compaction last came back with no
+    /// savings, so the next threshold check can short-circuit instead of
+    /// spending another full-transcript LLM call on the same input.
     ///
-    /// Safe because for a fixed cursor, the lookup result can only
-    /// transition `Some(idx) → None` (when inline compaction
-    /// supersedes the row). The inline path *also* sets
-    /// `last_summary_anchor = Some(messages.len())`, so skipping the
-    /// now-`None` lookup preserves the more-conservative anchor.
-    last_synced_cursor: Option<i64>,
+    /// The compaction keeps a verbatim tail, so its output is not
+    /// guaranteed smaller than its input — and the threshold check runs at
+    /// the top of *every* loop iteration with no backoff of its own. Without
+    /// this the first `NoSavings` would be followed by one more identical
+    /// call per iteration for the rest of the turn. Cleared as soon as the
+    /// transcript grows past the recorded length: more material is exactly
+    /// the condition under which compaction can start paying again.
+    /// `force_compress` (`/compact`) ignores and clears it — the user asked.
+    compaction_declined_at_len: Option<usize>,
     /// Transient per-turn planning-checklist reminder (`Task*`),
     /// rendered from the durable `session_tasks` list and refreshed by the
     /// agent loop via [`Self::refresh_task_reminder`]. Kept OUT of
@@ -270,9 +250,8 @@ pub struct ContextManager {
 /// struct literal at the call site keeps every field visible by name.
 pub struct ContextManagerConfig {
     pub tokenizer: Arc<dyn Tokenizer>,
-    /// Workspace paths handle. Used to resolve `summary.md` for the
-    /// fast-path read and the JSONL transcript path referenced from
-    /// the continuation-summary message.
+    /// Workspace paths handle. Resolves the JSONL transcript path the
+    /// continuation-summary message points at.
     pub workspace: Arc<baybo_workspace::WorkspacePaths>,
     pub keep_recent: usize,
     /// Fraction of the active model's context window at which the
@@ -320,8 +299,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
-            last_summary_anchor: None,
-            last_synced_cursor: None,
+            compaction_declined_at_len: None,
             task_reminder: None,
             task_reminder_raw: 0,
             notification_cue: None,
@@ -584,9 +562,8 @@ impl ContextManager {
             // Record eagerly so a compaction *this turn* (before any rebuild)
             // re-broadcasts the definition via the skill trailer — the body
             // row carries no `ToolUse` for `scan_skill_calls` to find, and a
-            // live-LLM-summary pass (a first compaction's only option — no
-            // `summary.md` yet, no recent slice kept) folds it into the
-            // summary. Later compactions + cold-start restore re-derive it
+            // compaction folds it into the summary unless it happens to land
+            // in the kept tail. Later compactions + cold-start restore re-derive it
             // durably from the persisted `/command` row (`called_skills_in`).
             push_called_skill(&mut self.called_skills, &skill_name);
             self.append(&msg).await;
@@ -701,14 +678,9 @@ impl ContextManager {
         self.messages = messages;
         self.invalidate_baseline();
         self.budget.update(self.calibrate(self.raw_estimate()));
-        // The prior anchor referred to a slice that's been replaced
-        // wholesale. `restore_from_store` reconstructs it from
-        // `session_summaries.cursor` if available; for direct callers,
-        // it stays `None` until the next compression apply.
-        self.last_summary_anchor = None;
-        // Cached cursor → idx resolution belonged to the old slice.
-        // Any subsequent `sync_anchor_to_cursor` must re-resolve.
-        self.last_synced_cursor = None;
+        // The latch described a transcript that has been replaced wholesale;
+        // whatever it proved about compactability no longer applies.
+        self.compaction_declined_at_len = None;
     }
 
     /// Settle calibration + baseline post-response from a main LLM
@@ -925,7 +897,26 @@ impl ContextManager {
         }
     }
 
-    /// Check the token budget and compress if the threshold is exceeded.
+    /// Whether the next [`Self::maybe_compress`] for `model_id` would
+    /// actually run a pass rather than short-circuit. Lets the caller
+    /// bracket the pass with progress events without re-implementing the
+    /// gate. Cheap — the token count is a baseline-plus-delta sum, the same
+    /// one `maybe_compress` does.
+    pub fn needs_compression(&mut self, model_id: &str) -> bool {
+        self.set_current_model(model_id);
+        self.budget.update(self.count_tokens());
+        self.budget.needs_compression() && !self.compaction_declined()
+    }
+
+    /// Whether a compaction already ran at this transcript length and came
+    /// back with no savings. Until the transcript grows past that length,
+    /// the same call would buy the same answer.
+    fn compaction_declined(&self) -> bool {
+        self.compaction_declined_at_len
+            .is_some_and(|len| self.messages.len() <= len)
+    }
+
+    /// Check the token budget and compact if the threshold is exceeded.
     /// Called at the top of every agent-loop iteration before the next
     /// `ChatRequest` is built.
     ///
@@ -935,25 +926,10 @@ impl ContextManager {
     /// the baseline (the prior `actual_tokens` was tokenised by the
     /// old provider).
     ///
-    /// `chat` is invoked only if the compressor reaches the live LLM
-    /// summary stage (no precomputed `summary.md`, conversation past
-    /// the pre-flight gate). It performs the request inside a trace
-    /// span and records cost against the ledger; the compressor owns
-    /// trim + empty-summary checking and falls back to a
-    /// Truncate-equivalent slice on transport / sanitize failure or
-    /// empty content so a transient summarizer failure never kills
-    /// the user's turn.
-    /// Whether the next [`Self::maybe_compress`] for `model_id` would
-    /// actually run a pass (budget over threshold) rather than return
-    /// `BelowThreshold`. Lets the caller bracket the pass with progress
-    /// events without re-implementing the gate. Cheap — the token count
-    /// is a baseline-plus-delta sum, the same one `maybe_compress` does.
-    pub fn needs_compression(&mut self, model_id: &str) -> bool {
-        self.set_current_model(model_id);
-        self.budget.update(self.count_tokens());
-        self.budget.needs_compression()
-    }
-
+    /// `chat` performs the summarizer request inside a trace span and
+    /// records cost against the ledger; the compressor owns parsing and
+    /// falls back to a truncate slice on failure or empty content, so a
+    /// transient summarizer failure never kills the user's turn.
     pub async fn maybe_compress<F, Fut>(
         &mut self,
         model_id: &str,
@@ -963,18 +939,23 @@ impl ContextManager {
         F: FnOnce(ChatRequest, LlmCallInputs) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
-        if !self.needs_compression(model_id) {
+        self.set_current_model(model_id);
+        self.budget.update(self.count_tokens());
+        if !self.budget.needs_compression() {
             return Ok(CompressionOutcome::BelowThreshold);
+        }
+        if self.compaction_declined() {
+            return Ok(CompressionOutcome::NoSavings);
         }
 
         self.run_compression(chat).await
     }
 
-    /// Like [`Self::maybe_compress`] but skips the threshold gate.
-    /// A strategy NoOp surfaces as `StrategyDeclined`; a non-shrinking
-    /// apply surfaces as `NoSavings`, so a too-small conversation isn't
-    /// rewritten as a one-line summary. For caller-initiated passes
-    /// (e.g. a user-typed `/compact`).
+    /// Like [`Self::maybe_compress`] but skips the threshold gate and the
+    /// no-savings latch — the user asked, so re-try even if the last
+    /// attempt at this length declined. A strategy NoOp surfaces as
+    /// `StrategyDeclined`; a non-shrinking apply surfaces as `NoSavings`,
+    /// so a too-small conversation isn't rewritten as a one-line summary.
     pub async fn force_compress<F, Fut>(
         &mut self,
         model_id: &str,
@@ -986,6 +967,7 @@ impl ContextManager {
     {
         self.set_current_model(model_id);
         self.budget.update(self.count_tokens());
+        self.compaction_declined_at_len = None;
         self.run_compression(chat).await
     }
 
@@ -997,13 +979,10 @@ impl ContextManager {
         let chat_box: compressor::ChatCallback =
             Box::new(move |req, marker| Box::pin(chat(req, marker)));
         let plan = self.run_compression_flow(chat_box).await?;
-        let (mut new_messages, stage, fast_path_summary_index) = match plan {
+        let (mut new_messages, stage) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
-            CompressOutput::Replaced {
-                messages,
-                stage,
-                fast_path_summary_index,
-            } => (messages, stage, fast_path_summary_index),
+            CompressOutput::Cancelled => return Ok(CompressionOutcome::Cancelled),
+            CompressOutput::Replaced { messages, stage } => (messages, stage),
         };
 
         // Refuse to apply an empty replacement: persist would mark
@@ -1023,17 +1002,14 @@ impl ContextManager {
         // `<system-reminder>` by construction; the truncate fallback
         // can drop it too when it lands in the dropped middle.
         // Cheaper to always re-insert than to track whether the kept
-        // slice still carries one. The trailer rows land between the
-        // system block and the summary row, so the fast-path summary
-        // index shifts by however many were inserted.
-        let trailer_rows = insert_skill_trailer(
+        // slice still carries one.
+        insert_skill_trailer(
             &mut new_messages,
             self.skill_registry.as_ref(),
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),
         );
-        let fast_path_summary_index = fast_path_summary_index.map(|i| i + trailer_rows);
 
         let before_tokens = self.budget.current();
         let start = Instant::now();
@@ -1053,7 +1029,10 @@ impl ContextManager {
 
         if after_tokens >= before_tokens {
             // Don't apply. The transcript and per-message cache stay
-            // in sync; nothing to undo.
+            // in sync; nothing to undo. Latch the length so the next
+            // threshold check short-circuits instead of buying the same
+            // answer again on every remaining iteration of this turn.
+            self.compaction_declined_at_len = Some(self.messages.len());
             return Ok(CompressionOutcome::NoSavings);
         }
 
@@ -1066,10 +1045,7 @@ impl ContextManager {
         let rebuilt = self.called_skills_in(&self.messages);
         self.called_skills = rebuilt;
         self.budget.update(after_tokens);
-        // Post-compression transcript counts as fully covered;
-        // anchoring at len() avoids a degenerate retrigger from the
-        // skill trailer alone exceeding the diff threshold.
-        self.last_summary_anchor = Some(self.messages.len());
+        self.compaction_declined_at_len = None;
 
         if after_tokens > self.budget.max_tokens() {
             warn!(
@@ -1086,34 +1062,7 @@ impl ContextManager {
             "proactive context compression"
         );
 
-        let base_ordinal = self.persist_compaction().await;
-        // After a FAST-PATH apply, advance `session_summaries.cursor` onto
-        // the freshly-inserted continuation-summary row: its body is
-        // `summary.md` verbatim, so the on-disk summary still covers
-        // everything at or before it and a back-to-back compaction (giant
-        // single turn, immediate `/compact`) hits the fast path again
-        // instead of burning a full-transcript stage-2 summarize. Stage-2 /
-        // truncate replacements never re-point — their summary text is NOT
-        // on disk, so the cursor would claim coverage `summary.md` lacks.
-        if let (Some(base), Some(idx)) = (base_ordinal, fast_path_summary_index) {
-            match self
-                .sessions
-                .repoint_summary_cursor(&self.session_id, base + idx as i64, chrono::Utc::now())
-                .await
-            {
-                Ok(true) => {}
-                // No summary row: unreachable in practice (the fast path
-                // only fires when summary metadata exists), but harmless.
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(
-                        session_id = %self.session_id,
-                        error = %e,
-                        "failed to re-point summary cursor after fast-path compaction"
-                    );
-                }
-            }
-        }
+        self.persist_compaction().await;
         // Refresh the system row from the workspace soul now that the shrink
         // decision is committed + persisted — kept out of the savings gate
         // above so a grown soul can't veto a real compaction, and after
@@ -1122,24 +1071,20 @@ impl ContextManager {
         Ok(CompressionOutcome::Compressed { stage })
     }
 
-    /// Returns the base ordinal of the newly-inserted active rows, or
-    /// `None` when the persist failed (logged; the in-memory window is
-    /// still the source of truth for this actor's lifetime).
-    async fn persist_compaction(&self) -> Option<i64> {
-        match self
+    /// Failures are logged, not propagated: the in-memory window stays the
+    /// source of truth for this actor's lifetime, and hydration re-reads the
+    /// (un-compacted) persisted set on the next boot.
+    async fn persist_compaction(&self) {
+        if let Err(e) = self
             .sessions
             .apply_session_compaction(&self.session_id, &self.messages)
             .await
         {
-            Ok(base) => Some(base),
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "failed to persist session compaction"
-                );
-                None
-            }
+            warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "failed to persist session compaction"
+            );
         }
     }
 
@@ -1153,14 +1098,6 @@ impl ContextManager {
     ///
     /// Failures log at warn and fall through to a fresh transcript;
     /// startup must not block on a transient store error.
-    ///
-    /// Also reconstructs `last_summary_anchor` from
-    /// `session_summaries.cursor` if both the metadata row and a
-    /// matching `session_messages.ordinal` are present in the
-    /// restored active set. When the metadata cursor refers to a
-    /// since-superseded ordinal (compression has rewritten the
-    /// transcript), the anchor stays `None` — the next compression
-    /// apply will set it conservatively to `messages.len()`.
     pub async fn restore_from_store(&mut self) {
         // Clone the bound handles up-front so we can call
         // `&mut self` methods inside the function without holding a
@@ -1168,7 +1105,7 @@ impl ContextManager {
         let session_id = self.session_id.clone();
         let sessions = Arc::clone(&self.sessions);
 
-        // Step 1: restore the transcript itself. A crash mid-tool-batch
+        // A crash mid-tool-batch
         // leaves dangling `ToolUse` rows that strict providers reject on
         // the next request, so normalize pairing before the window goes
         // live: synthetic fills are persisted (append-only) and the
@@ -1195,235 +1132,12 @@ impl ContextManager {
                 self.restore_messages(repaired);
             }
             Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "failed to load persisted transcript; starting fresh"
-                );
-                return;
-            }
+            Err(e) => warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to load persisted transcript; starting fresh"
+            ),
         }
-
-        // Step 2: reconstruct the anchor from summary metadata, if any.
-        // Mapping: walk the supersede log, filter to active rows
-        // (`superseded_by IS NULL`), find the active row whose
-        // `ordinal == metadata.cursor`. The active row's position in
-        // the active sequence is the in-memory anchor index.
-        let metadata = match sessions.summary_metadata(&session_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "failed to load summary metadata on cold start"
-                );
-                return;
-            }
-        };
-        let Some(metadata) = metadata else { return };
-
-        self.last_summary_anchor = self.lookup_anchor_index_for_cursor(metadata.cursor).await;
-        // Prime the cache so the first trigger-gate iteration after
-        // cold start doesn't re-issue the same lookup.
-        self.last_synced_cursor = Some(metadata.cursor);
-    }
-
-    /// Resolve `cursor` (a `session_messages.ordinal`) to the index
-    /// **after** its row in the active sequence — i.e. the position
-    /// of the first message whose ordinal is strictly greater than
-    /// `cursor`. That's the right anchor for `tokens_since_anchor`
-    /// because `cursor` is the highest ordinal already covered by
-    /// the summary; counting it as "new growth" would let a single
-    /// heavy tool_result message immediately blow past the
-    /// [`summary_diff_threshold`] gate and retrigger a fresh pass
-    /// after a successful one just landed. Returns `None` when the
-    /// cursor's ordinal isn't in the active set (compression has
-    /// rewritten that message away) or the lookup fails.
-    async fn lookup_anchor_index_for_cursor(&self, cursor: i64) -> Option<usize> {
-        match self
-            .sessions
-            .active_index_of_ordinal(&self.session_id, cursor)
-            .await
-        {
-            Ok(Some(idx)) => Some(idx + 1),
-            Ok(None) => None,
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    cursor,
-                    "failed to resolve cursor → active index; anchor lookup aborted"
-                );
-                None
-            }
-        }
-    }
-
-    /// Notification handler for "background background summary just landed
-    /// at `cursor`". Maps the persisted `session_messages.ordinal` to
-    /// the corresponding in-memory message index and advances
-    /// `last_summary_anchor` so the parent's trigger-gate
-    /// `tokens_since_anchor` / `tool_calls_since_anchor` measure
-    /// growth *since* the latest successful pass — preventing the same
-    /// 50%-budget session from re-spawning a fresh background pass on
-    /// every later job.
-    ///
-    /// Monotonic: only advances; never moves the anchor backwards.
-    /// When the cursor's ordinal is no longer in the active set (an
-    /// inline compression has rewritten the transcript past it), the
-    /// anchor stays where the inline path put it.
-    ///
-    /// Caches `cursor` so repeated calls with the same value (the
-    /// trigger gate's hot path: every iteration past 50% budget hits
-    /// this until either the cursor advances or in-flight is set)
-    /// short-circuit before the store round-trip.
-    pub async fn sync_anchor_to_cursor(&mut self, cursor: i64) {
-        if self.last_synced_cursor == Some(cursor) {
-            return;
-        }
-        let lookup = self.lookup_anchor_index_for_cursor(cursor).await;
-        // Mark the cursor processed regardless of outcome — the
-        // result for a fixed cursor only ever transitions
-        // `Some(idx) → None` (inline compaction supersedes the row),
-        // and that transition is already handled by the inline path
-        // pushing `last_summary_anchor` to `messages.len()` directly.
-        self.last_synced_cursor = Some(cursor);
-        let Some(idx) = lookup else {
-            debug!(
-                session_id = %self.session_id,
-                cursor,
-                "background-summary settle: cursor not in active set; anchor unchanged"
-            );
-            return;
-        };
-        let advance = self.last_summary_anchor.is_none_or(|current| idx > current);
-        if advance {
-            self.last_summary_anchor = Some(idx);
-            debug!(
-                session_id = %self.session_id,
-                cursor,
-                anchor_idx = idx,
-                "background-summary settle: anchor advanced"
-            );
-        }
-    }
-
-    /// Sum of per-message tokens from the anchor to the end of the
-    /// transcript. When the anchor is `None`, returns the full
-    /// transcript token count. Cheap — reuses the per-message cache
-    /// the budget tracker maintains.
-    pub fn tokens_since_anchor(&self) -> usize {
-        let anchor = self
-            .last_summary_anchor
-            .unwrap_or(0)
-            .min(self.per_message_tokens.len());
-        self.per_message_tokens[anchor..].iter().sum()
-    }
-
-    /// Number of `ContentBlock::ToolUse` blocks past the anchor.
-    /// Used by the trigger gate's disjunctive clause `tool_calls > 3`.
-    pub fn tool_calls_since_anchor(&self) -> usize {
-        let anchor = self
-            .last_summary_anchor
-            .unwrap_or(0)
-            .min(self.messages.len());
-        self.messages[anchor..]
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            .count()
-    }
-
-    /// Trigger-gate decision for the background summary.
-    ///
-    /// Inspects the in-memory budget, the parent's `session_summaries`
-    /// cursor, and the anchor-relative diff/tool-call thresholds.
-    /// Returns `Some(payload)` when all gates pass — the caller (the
-    /// agent loop) owns the at-most-one-in-flight invariant via an
-    /// in-memory `JoinHandle` and spawns the detached pass itself.
-    /// Returns `None` otherwise.
-    ///
-    /// Side-effecting steps (`summary_metadata` round-trip,
-    /// `sync_anchor_to_cursor`, `latest_session_ordinal`) only fire
-    /// after the cheap budget check, so callers can invoke this on
-    /// every iteration without rate-limiting.
-    pub async fn maybe_request_background_summary(
-        &mut self,
-        job_done: bool,
-    ) -> Option<BackgroundCompressionPayload> {
-        let max_tokens = self.budget.max_tokens();
-        let tokens_now = self.budget.current();
-        let tokens_threshold = (max_tokens as f64 * SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
-        if tokens_now <= tokens_threshold {
-            return None;
-        }
-
-        // Read the parent's `session_summaries` row for the cursor of
-        // the latest successful pass. It pulls the in-memory anchor
-        // forward *before* the anchor-relative threshold checks below
-        // — otherwise a session that crossed the 50% mark once would
-        // re-fire the background path on every subsequent job until
-        // inline compression eventually resets the anchor.
-        let metadata = match self.sessions.summary_metadata(&self.session_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "background-summary trigger: summary_metadata lookup failed; skipping"
-                );
-                return None;
-            }
-        };
-        if let Some(meta) = metadata.as_ref() {
-            // `sync_anchor_to_cursor` is monotonic and a no-op when
-            // the cursor isn't in the current active set.
-            self.sync_anchor_to_cursor(meta.cursor).await;
-        }
-
-        let tokens_since = self.tokens_since_anchor();
-        if tokens_since <= summary_diff_threshold(max_tokens) {
-            return None;
-        }
-
-        let tool_calls = self.tool_calls_since_anchor();
-        if !job_done && tool_calls <= SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
-            return None;
-        }
-
-        // Pin the snapshot's upper bound at trigger time so concurrent
-        // appends don't bleed into this pass' input.
-        let up_to_ordinal = match self.sessions.latest_session_ordinal(&self.session_id).await {
-            Ok(Some(o)) => o,
-            Ok(None) => 0,
-            Err(e) => {
-                warn!(
-                    session_id = %self.session_id,
-                    error = %e,
-                    "background-summary trigger: ordinal lookup failed; skipping"
-                );
-                return None;
-            }
-        };
-        debug!(
-            session_id = %self.session_id,
-            tokens_now,
-            tokens_since,
-            tool_calls,
-            job_done,
-            up_to_ordinal,
-            "background-summary trigger: gate passed"
-        );
-
-        Some(BackgroundCompressionPayload { up_to_ordinal })
-    }
-
-    /// Read the anchor index. Test-only: production callers measure
-    /// tokens / tool-calls through the dedicated accessors above.
-    #[cfg(test)]
-    pub(crate) fn last_summary_anchor(&self) -> Option<usize> {
-        self.last_summary_anchor
     }
 
     /// Build the `LlmCallInputs` an `LlmCall` trace span should
@@ -1481,7 +1195,7 @@ impl ContextManager {
     /// `Some((last_ordinal, active_count))` only when the in-memory
     /// transcript provably mirrors the persisted active set — the same
     /// `active_count == len` invariant [`Compressor`](crate::compressor)'s
-    /// fast path trusts. A compression call sends `self.messages` verbatim,
+    /// the marker requires. A compaction call sends `self.messages` verbatim,
     /// so a `Persisted` trace reference is only safe to emit when hydration
     /// would rebuild exactly that slice; otherwise the caller embeds inline.
     /// The returned count seeds the `prefix_len` tripwire. `None` on any
@@ -1888,46 +1602,6 @@ mod frame_recalled_memories_tests {
 }
 
 #[cfg(test)]
-mod summary_diff_threshold_tests {
-    use super::*;
-
-    #[test]
-    fn scales_with_the_context_window() {
-        // 272K window (gpt-5.x): a pass costs ~145K tokens to run, so
-        // admitting one for 5K of new material was the frequency bug.
-        assert_eq!(summary_diff_threshold(272_000), 27_200);
-        assert_eq!(summary_diff_threshold(1_000_000), 100_000);
-    }
-
-    #[test]
-    fn floor_binds_on_small_windows() {
-        assert_eq!(
-            summary_diff_threshold(8_000),
-            SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
-        );
-        assert_eq!(
-            summary_diff_threshold(0),
-            SUMMARY_DIFF_TOKEN_THRESHOLD_FLOOR
-        );
-    }
-
-    /// The gate must stay reachable: the band between the background trigger
-    /// (0.5×) and compression (0.65×) has to fit at least one pass, or
-    /// `summary.md` would never refresh before the compaction that consumes it.
-    #[test]
-    fn threshold_fits_inside_the_trigger_to_compaction_band() {
-        let max = 272_000;
-        let band = (max as f64 * 0.65) as usize
-            - (max as f64 * SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
-        assert!(
-            summary_diff_threshold(max) < band,
-            "threshold {} must fit in the {band}-token band",
-            summary_diff_threshold(max)
-        );
-    }
-}
-
-#[cfg(test)]
 mod merge_for_llm_tests {
     use super::merge_for_llm;
     use baybo_model::{BlobRef, ChatMessage, ContentBlock, Role};
@@ -2203,8 +1877,9 @@ pub(crate) fn insert_skill_trailer(
 
 /// Estimate the **token cost** of the skill trailer that
 /// [`insert_skill_trailer`] would attach for `called_skills` against
-/// the given registry. Used by the fast-path's pre-assembly threshold
-/// check (`summary + skill_trailer ≤ 0.6 × max_tokens`) without
+/// the given registry. Used by the compaction's candidate-fit check —
+/// the trailer is inserted after the compressor returns, so a candidate
+/// that ignored it could be accepted and then land over budget — without
 /// committing the trailer to the assembled list. Returns the sum of
 /// the rendered reminder + detail payload tokens, or just the
 /// reminder if no called_skills carry a renderable definition.
@@ -2299,20 +1974,13 @@ mod tests {
     fn test_sessions() -> Arc<baybo_session::SessionManager> {
         let store = Arc::new(baybo_session::test_support::MemorySessionStore::new())
             as Arc<dyn baybo_session::SessionStore>;
-        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn baybo_session::SessionSummaryStore>;
         let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
             as Arc<dyn baybo_session::SessionFolderStore>;
-        Arc::new(baybo_session::SessionManager::new(
-            store,
-            summary_store,
-            folder_store,
-        ))
+        Arc::new(baybo_session::SessionManager::new(store, folder_store))
     }
 
-    /// Workspace rooted at a non-existent path so the fast-path read
-    /// hits `NotFound` and falls through cleanly. No tempdir to
-    /// clean up.
+    /// Workspace rooted at a non-existent path — nothing under it is read
+    /// in these tests, and there is no tempdir to clean up.
     fn test_workspace() -> Arc<baybo_workspace::WorkspacePaths> {
         Arc::new(baybo_workspace::WorkspacePaths::new(
             "/nonexistent-baybo-test-workspace",
@@ -2598,220 +2266,6 @@ mod tests {
         // system + 2 most recent non-system.
         assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, Role::System);
-    }
-
-    #[tokio::test]
-    async fn fast_path_apply_repoints_summary_cursor() {
-        // A transcript big enough that dropping the pre-cursor bulk beats
-        // the summary boilerplate + the ≥RECENT_SLICE_MIN_TOKENS recent
-        // slice, so the fast-path Replaced actually APPLIES — and the
-        // apply must advance `session_summaries.cursor` onto the
-        // freshly-inserted continuation-summary row (keeping the fast
-        // path alive for a back-to-back compaction).
-        let workspace_root = tempfile::tempdir().expect("tempdir");
-        let sessions = test_sessions();
-        let mut ctx = ContextManager::from_config(ContextManagerConfig {
-            tokenizer: Arc::new(SimpleTokenizer),
-            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
-                workspace_root.path().to_path_buf(),
-            )),
-            keep_recent: 2,
-            compression_threshold: 0.2,
-            calibration: Arc::new(TokenCalibration::new()),
-            skill_registry: Arc::new(SkillRegistry::new()),
-            channel: baybo_model::ChannelType::owner(),
-            session_id: test_session_id(),
-            sessions: Arc::clone(&sessions),
-            subagent_profile: None,
-        });
-        ctx.set_active_model_context_window(100_000);
-
-        // system + 14 big turns (~2K tokens each with SimpleTokenizer).
-        ctx.append(&make_msg(Role::System, "sys")).await;
-        let big = "x".repeat(8_000);
-        let mut cursor_seed = 0;
-        for i in 0..14 {
-            let role = if i % 2 == 0 {
-                Role::User
-            } else {
-                Role::Assistant
-            };
-            let ordinal = ctx
-                .append(&make_msg(role, &format!("m{i} {big}")))
-                .await
-                .expect("persisted append");
-            // Cursor at turn #9: post-cursor tail (5 msgs ≈ 10K tokens)
-            // satisfies the recent-slice minima without pulling the walk
-            // past the cursor.
-            if i == 9 {
-                cursor_seed = ordinal;
-            }
-        }
-
-        let summary_path = ctx.workspace.session_summary_file(ctx.session_id.as_str());
-        tokio::fs::create_dir_all(summary_path.parent().expect("dir"))
-            .await
-            .expect("summary dir");
-        tokio::fs::write(&summary_path, "PRECOMPUTED SUMMARY BODY")
-            .await
-            .expect("write summary.md");
-        sessions
-            .record_summary_success(
-                &ctx.session_id,
-                cursor_seed,
-                0,
-                "m",
-                "s",
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
-
-        // `never_chat`: the fast path must serve this without an LLM call.
-        let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-
-        let row = sessions
-            .summary_metadata(&ctx.session_id)
-            .await
-            .unwrap()
-            .expect("metadata row");
-        assert_ne!(
-            row.cursor, cursor_seed,
-            "cursor must advance off the superseded row"
-        );
-        assert_eq!(row.pass_count, 1, "re-point must not count as a pass");
-
-        // The new cursor resolves into the ACTIVE set (what keeps the fast
-        // path alive) and lands on the continuation-summary row.
-        let idx = sessions
-            .active_index_of_ordinal(&ctx.session_id, row.cursor)
-            .await
-            .unwrap()
-            .expect("re-pointed cursor must reference an active row");
-        assert!(
-            ctx.messages()[idx].content.iter().any(
-                |b| matches!(b, ContentBlock::Text(t) if t.contains("PRECOMPUTED SUMMARY BODY"))
-            ),
-            "cursor must land on the continuation-summary row, got {:?}",
-            ctx.messages()[idx].content
-        );
-    }
-
-    /// A `summary.md` that is still the untouched scaffold covers nothing, so
-    /// the fast path must refuse it and fall through to the LLM stage — even
-    /// though the metadata row claims coverage and the assembly is *well*
-    /// under the fall-through budget (an empty summary is the cheapest thing
-    /// that could be swapped in, which is exactly why size alone can't gate
-    /// this). Regression guard for the 2026-07-22 `a4e1ebf3` incident, where
-    /// 234 messages were replaced by the bare scaffold.
-    #[tokio::test]
-    async fn fast_path_refuses_a_contentless_summary_file() {
-        let workspace_root = tempfile::tempdir().expect("tempdir");
-        let sessions = test_sessions();
-        let mut ctx = ContextManager::from_config(ContextManagerConfig {
-            tokenizer: Arc::new(SimpleTokenizer),
-            workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
-                workspace_root.path().to_path_buf(),
-            )),
-            keep_recent: 2,
-            compression_threshold: 0.2,
-            calibration: Arc::new(TokenCalibration::new()),
-            skill_registry: Arc::new(SkillRegistry::new()),
-            channel: baybo_model::ChannelType::owner(),
-            session_id: test_session_id(),
-            sessions: Arc::clone(&sessions),
-            subagent_profile: None,
-        });
-        ctx.set_active_model_context_window(100_000);
-
-        ctx.append(&make_msg(Role::System, "sys")).await;
-        let big = "x".repeat(8_000);
-        let mut cursor_seed = 0;
-        for i in 0..14 {
-            let role = if i % 2 == 0 {
-                Role::User
-            } else {
-                Role::Assistant
-            };
-            let ordinal = ctx
-                .append(&make_msg(role, &format!("m{i} {big}")))
-                .await
-                .expect("persisted append");
-            if i == 9 {
-                cursor_seed = ordinal;
-            }
-        }
-
-        let summary_path = ctx.workspace.session_summary_file(ctx.session_id.as_str());
-        tokio::fs::create_dir_all(summary_path.parent().expect("dir"))
-            .await
-            .expect("summary dir");
-        tokio::fs::write(
-            &summary_path,
-            crate::background_summary::DEFAULT_NOTES_TEMPLATE,
-        )
-        .await
-        .expect("write summary.md");
-        sessions
-            .record_summary_success(
-                &ctx.session_id,
-                cursor_seed,
-                0,
-                "m",
-                "s",
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
-
-        // `err_chat` proves stage 2 was actually reached: had the fast path
-        // served the scaffold, no chat call would fire at all.
-        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-
-        let scaffold_marker = "_What is actively being worked on right now?";
-        assert!(
-            !ctx.messages().iter().any(|m| m
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(scaffold_marker)))),
-            "the empty scaffold must never reach the transcript"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage2_apply_does_not_repoint_summary_cursor() {
-        // Metadata exists (cursor=1) but summary.md is absent (the test
-        // workspace root doesn't exist), so the fast path falls through
-        // and the truncate/stage-2 lane applies. That lane's output is
-        // NOT on disk, so the cursor must stay where the last real
-        // background pass left it — re-pointing would claim coverage
-        // summary.md doesn't have.
-        let sessions = test_sessions();
-        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 2, 200, 0.25);
-        ctx.append(&make_msg(Role::System, "You are helpful")).await;
-        ctx.append(&make_msg(Role::User, &padded("First"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("Reply 1")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("Second"))).await;
-        sessions
-            .record_summary_success(&ctx.session_id, 1, 0, "m", "s", chrono::Utc::now())
-            .await
-            .unwrap();
-
-        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-
-        let row = sessions
-            .summary_metadata(&ctx.session_id)
-            .await
-            .unwrap()
-            .expect("metadata row");
-        assert_eq!(
-            row.cursor, 1,
-            "a non-fast-path apply must leave the summary cursor untouched"
-        );
     }
 
     #[tokio::test]
@@ -3599,6 +3053,263 @@ mod tests {
         assert_eq!(bare.len(), 1, "empty advertised set inserts no reminder");
     }
 
+    // ---------- compaction shape ----------
+
+    #[test]
+    fn recent_slice_cap_scales_with_the_window() {
+        // The absolute ceiling only binds on a large window.
+        assert_eq!(recent_slice_bounds(1_000_000).2, 40_000);
+        assert_eq!(recent_slice_bounds(272_000).2, 40_000);
+        assert_eq!(recent_slice_bounds(100_000).2, 15_000);
+        assert_eq!(recent_slice_bounds(8_192).2, 1_228);
+    }
+
+    /// The walk takes the floor as a soft stop and the cap as a hard one, so a
+    /// floor above the cap would mean "never stop" — the slice would swallow
+    /// the transcript it was meant to trim.
+    #[test]
+    fn recent_slice_floor_never_exceeds_the_cap() {
+        for window in [0, 1, 200, 1_000, 8_192, 50_000, 272_000, 1_000_000] {
+            let (min_tokens, _, cap) = recent_slice_bounds(window);
+            assert!(
+                min_tokens <= cap,
+                "window {window}: floor {min_tokens} above cap {cap}"
+            );
+        }
+    }
+
+    /// A compaction keeps the tail verbatim. Losing that is what would turn the
+    /// last tool results and the user's own words into a paraphrase of
+    /// themselves the moment the threshold trips.
+    #[tokio::test]
+    async fn compaction_keeps_a_verbatim_recent_slice_after_the_summary() {
+        let mut ctx = make_ctx(2, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(2_400)),
+            ))
+            .await;
+        }
+        let last = ctx.messages().last().cloned().expect("a last message");
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+
+        let applied = ctx.messages();
+        assert!(
+            applied.len() > 2,
+            "expected system + summary + a tail, got {}",
+            applied.len()
+        );
+        assert_eq!(
+            applied.last().map(|m| &m.content),
+            Some(&last.content),
+            "the newest message must survive byte-identical, not paraphrased"
+        );
+    }
+
+    /// A few pasted files is a real conversation shape: three messages, tens of
+    /// thousands of tokens, far past the budget. The pre-flight gate asks the
+    /// truncate fallback's question — "are there more messages than I keep?" —
+    /// which is `false` here and says nothing about whether a summary would
+    /// shrink it. Gating on that alone refused to compact such a transcript at
+    /// all, for as many turns as it stayed under `keep_recent` messages.
+    #[tokio::test]
+    async fn few_but_huge_messages_still_compact() {
+        let mut ctx = make_ctx(10, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(10_000)),
+            ))
+            .await;
+        }
+        let (_, non_system) = compressor::partition_system(ctx.messages());
+        assert!(
+            non_system.len() <= 10,
+            "fixture must sit at or below keep_recent, or it proves nothing"
+        );
+        assert!(ctx.budget.needs_compression(), "and must be over budget");
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed { .. }),
+            "expected a compaction, got {outcome:?}"
+        );
+    }
+
+    /// The slice is cut in atomic units, so it can never start between an
+    /// `assistant{tool_use}` and its `user{tool_result}` — both Anthropic and
+    /// OpenAI reject that array outright.
+    #[tokio::test]
+    async fn compaction_slice_never_splits_a_tool_use_result_pair() {
+        let mut ctx = make_ctx(2, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..10 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(2_400)),
+            ))
+            .await;
+        }
+        ctx.append(&ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "tu1".into(),
+            name: "bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }]))
+        .await;
+        ctx.append(&ChatMessage::agent_context(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tu1".into(),
+                content: "ok".into(),
+                meta: None,
+            },
+        ]))
+        .await;
+
+        ctx.maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+
+        let has_result = ctx.messages().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu1"))
+        });
+        let has_use = ctx.messages().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "tu1"))
+        });
+        assert!(
+            !has_result || has_use,
+            "a kept tool_result must keep its tool_use"
+        );
+    }
+
+    /// On a window too small to afford one, the tail is dropped — a slice
+    /// sized by an absolute constant would exceed the very threshold that
+    /// triggered the compaction. And having compacted, the turn must not keep
+    /// buying the same call: on a window this small the continuation framing
+    /// alone outweighs the ceiling, so what stops the loop is the pre-flight
+    /// gate, not the budget.
+    #[tokio::test]
+    async fn small_window_compaction_degrades_to_summary_only() {
+        let mut ctx = make_ctx(1, 200, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..5 {
+            ctx.append(&make_msg(Role::User, &format!("m{i} {}", "x".repeat(240))))
+                .await;
+        }
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+
+        let surviving_originals = ctx
+            .messages()
+            .iter()
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text(t) if t.starts_with('m')))
+            })
+            .count();
+        assert_eq!(
+            surviving_originals, 0,
+            "no window-relative tail fits here, so none should have been kept"
+        );
+
+        // `never_chat` panics if the summarizer is reached a second time.
+        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(second, CompressionOutcome::StrategyDeclined));
+    }
+
+    /// The candidate pick spends no second LLM call: the summary is already in
+    /// hand, so dropping the slice is a re-assembly, not a round-trip.
+    #[tokio::test]
+    async fn dropping_the_slice_costs_no_second_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+
+        let mut ctx = make_ctx(1, 1_000, 0.1);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(Role::User, &format!("m{i} {}", "x".repeat(240))))
+                .await;
+        }
+
+        ctx.maybe_compress("test-model", move |req, marker| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            ok_summary_chat(req, marker)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the summarizer must be called exactly once per compaction"
+        );
+    }
+
+    /// Once a compaction has come back with no savings, repeating it at the
+    /// same transcript length buys the same answer — and the threshold check
+    /// runs at the top of every loop iteration, so without the latch the rest
+    /// of the turn is one full-transcript LLM call per iteration.
+    #[tokio::test]
+    async fn declined_compaction_does_not_refire_until_the_transcript_grows() {
+        let mut ctx = make_ctx(1, 100, 0.1);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(Role::User, &format!("m{i}"))).await;
+        }
+
+        let first = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, CompressionOutcome::NoSavings),
+            "fixture must actually produce NoSavings, got {first:?}"
+        );
+
+        // `never_chat` panics if the summarizer is reached.
+        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(second, CompressionOutcome::NoSavings));
+
+        // Growth is exactly the condition under which compaction can start
+        // paying again, so the latch releases.
+        for i in 0..40 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("grown{i} {}", "x".repeat(400)),
+            ))
+            .await;
+        }
+        let third = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(third, CompressionOutcome::NoSavings),
+            "the latch must release once the transcript grows past it"
+        );
+    }
+
     /// Chat closure returning a well-formed `<summary>S</summary>` so the
     /// LLM-summary stage produces a usable summary message.
     async fn ok_summary_chat(
@@ -3863,211 +3574,5 @@ mod tests {
             build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()])
                 .is_none()
         );
-    }
-
-    // ---------- last_summary_anchor / trigger-gate tests ----------
-
-    fn tool_use_msg(id: &str) -> ChatMessage {
-        ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: id.into(),
-            name: "bash".into(),
-            input: serde_json::Value::Null,
-            signature: None,
-        }])
-    }
-
-    /// Default anchor is `None`; both `tokens_since_anchor` and
-    /// `tool_calls_since_anchor` therefore measure the entire
-    /// transcript so the *very first* trigger check on a fresh
-    /// session can pass the diff threshold once budget is reached.
-    #[tokio::test]
-    async fn anchor_starts_unset_and_measures_entire_transcript() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        assert_eq!(ctx.last_summary_anchor(), None);
-        assert_eq!(ctx.tokens_since_anchor(), 0);
-        assert_eq!(ctx.tool_calls_since_anchor(), 0);
-
-        ctx.append(&make_msg(Role::User, "hello world")).await;
-        ctx.append(&tool_use_msg("tu-1")).await;
-        ctx.append(&make_msg(Role::Assistant, "ok")).await;
-
-        let total: usize = ctx.per_message_tokens.iter().sum();
-        assert_eq!(ctx.tokens_since_anchor(), total);
-        assert_eq!(ctx.tool_calls_since_anchor(), 1);
-    }
-
-    /// After any compression apply, the anchor moves to
-    /// `messages.len()`, so trigger metrics reset to 0 for the new
-    /// transcript and only re-grow as fresh turns arrive.
-    #[tokio::test]
-    async fn compression_apply_resets_anchor_to_transcript_end() {
-        let mut ctx = make_ctx(2, 200, 0.25);
-        ctx.append(&make_msg(Role::System, "system prompt")).await;
-        ctx.append(&make_msg(Role::User, &padded("first"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("reply 1")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("second"))).await;
-
-        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-        assert_eq!(ctx.last_summary_anchor(), Some(ctx.messages().len()));
-        assert_eq!(ctx.tokens_since_anchor(), 0);
-        assert_eq!(ctx.tool_calls_since_anchor(), 0);
-
-        // A fresh tool_use post-compression shows up past the anchor.
-        ctx.append(&tool_use_msg("tu-after-compaction")).await;
-        assert_eq!(ctx.tool_calls_since_anchor(), 1);
-        assert!(ctx.tokens_since_anchor() > 0);
-    }
-
-    /// Background pass settled: cursor maps to *one past* the
-    /// matching active row's position so the cursor message itself —
-    /// already covered by the summary — does not count as new growth.
-    /// Future `tokens_since_anchor` measures only ordinals strictly
-    /// greater than the cursor.
-    #[tokio::test]
-    async fn sync_anchor_to_cursor_advances_anchor_to_persisted_position() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        // Three messages → ordinals 0, 1, 2 in the in-memory store.
-        ctx.append(&make_msg(Role::User, "msg-0")).await;
-        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
-        ctx.append(&make_msg(Role::User, "msg-2")).await;
-
-        // Default: anchor unset, tokens_since_anchor = full transcript.
-        let total: usize = ctx.per_message_tokens.iter().sum();
-        assert_eq!(ctx.tokens_since_anchor(), total);
-
-        // Background pass landed at ordinal 1 → cursor row sits at
-        // active idx 1, so anchor lands at idx 2 (strictly after the
-        // cursor) and tokens_since_anchor counts only msg-2.
-        ctx.sync_anchor_to_cursor(1).await;
-        assert_eq!(ctx.last_summary_anchor(), Some(2));
-        let after = ctx.per_message_tokens[2..].iter().sum::<usize>();
-        assert_eq!(ctx.tokens_since_anchor(), after);
-    }
-
-    /// A heavy cursor message must not, by itself, push
-    /// `tokens_since_anchor` past [`summary_diff_threshold`]. The
-    /// cursor message is already covered by the summary, so right
-    /// after a successful background pass the diff measure should be
-    /// 0 — otherwise a single big tool_result re-fires the gate even
-    /// though no new content arrived.
-    #[tokio::test]
-    async fn sync_anchor_to_cursor_excludes_cursor_message_tokens() {
-        let mut ctx = make_ctx(5, 1_000_000, 0.75);
-        ctx.append(&make_msg(Role::User, "msg-0")).await;
-        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
-        // msg-2 is a fat tool-result-shaped message: if the anchor
-        // landed *on* it, tokens_since_anchor would include it.
-        ctx.append(&make_msg(Role::User, &"x".repeat(50_000))).await;
-
-        // Cursor=2: the just-appended fat message is the most-recent
-        // ordinal included in the summary. Anchor should sit one past
-        // it (i.e. at messages.len()) so diff measures zero growth.
-        ctx.sync_anchor_to_cursor(2).await;
-        assert_eq!(ctx.last_summary_anchor(), Some(ctx.messages().len()));
-        assert_eq!(
-            ctx.tokens_since_anchor(),
-            0,
-            "fat cursor message must not count as new growth"
-        );
-        assert_eq!(ctx.tool_calls_since_anchor(), 0);
-    }
-
-    /// Cursor that's not in the active set (e.g. an inline
-    /// compression has rewritten the row away) is a no-op — the
-    /// anchor stays where it was.
-    #[tokio::test]
-    async fn sync_anchor_to_cursor_noop_when_cursor_missing() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        ctx.append(&make_msg(Role::User, "msg-0")).await;
-        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
-
-        // Anchor pre-positioned at end-of-transcript (mirrors a fresh
-        // inline compression apply).
-        let pre_len = ctx.messages().len();
-        ctx.last_summary_anchor = Some(pre_len);
-
-        // ordinal 999 isn't in the supersede log — stale cursor.
-        ctx.sync_anchor_to_cursor(999).await;
-        assert_eq!(
-            ctx.last_summary_anchor(),
-            Some(pre_len),
-            "anchor must not move when cursor is unmapped"
-        );
-    }
-
-    /// An unproductive pass re-arms the diff gate by anchoring on the ordinal
-    /// it *attempted*, even though the summary cursor stays put. Without this
-    /// the pass advances neither cursor nor anchor, so
-    /// `tokens_since_anchor` keeps reading the whole transcript and clause (b)
-    /// of the trigger is satisfied on the very next boundary — a tight retry
-    /// loop re-sending ~145K tokens to a model that just declined to write.
-    /// This is what replaced the wall-clock backoff: the debounce rides the
-    /// same work-proportional measure a successful pass leaves behind.
-    #[tokio::test]
-    async fn anchoring_on_an_unproductive_pass_rearms_the_diff_gate() {
-        // 200K window → 20K diff threshold; four ~10K-token messages clear it.
-        let mut ctx = make_ctx(5, 200_000, 0.75);
-        for i in 0..4 {
-            ctx.append(&make_msg(
-                Role::User,
-                &format!("m{i} {}", "x".repeat(40_000)),
-            ))
-            .await;
-        }
-        let attempted = 3;
-
-        // Before: no anchor, so the gate sees the entire transcript and a
-        // retry would fire immediately.
-        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
-
-        // The pass came back empty — the cursor must NOT move, but the work
-        // mark must, because the pass was paid for.
-        ctx.sync_anchor_to_cursor(attempted).await;
-        assert_eq!(
-            ctx.tokens_since_anchor(),
-            0,
-            "material the failed pass already read must not re-admit a retry"
-        );
-
-        // Only genuinely new material past the attempted ordinal re-opens it.
-        ctx.append(&make_msg(Role::User, &"y".repeat(120_000)))
-            .await;
-        assert!(ctx.tokens_since_anchor() > summary_diff_threshold(ctx.budget.max_tokens()));
-    }
-
-    /// Sync is monotonic — it never moves the anchor backward, so a
-    /// late-arriving notification from an earlier pass cannot undo a
-    /// fresher inline compression apply.
-    #[tokio::test]
-    async fn sync_anchor_to_cursor_does_not_retreat() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        ctx.append(&make_msg(Role::User, "msg-0")).await;
-        ctx.append(&make_msg(Role::Assistant, "msg-1")).await;
-        ctx.append(&make_msg(Role::User, "msg-2")).await;
-
-        // Anchor already past where cursor 0 would land (e.g. a more
-        // recent pass landed first).
-        ctx.last_summary_anchor = Some(2);
-        ctx.sync_anchor_to_cursor(0).await;
-        assert_eq!(
-            ctx.last_summary_anchor(),
-            Some(2),
-            "monotonic: stale cursor must not retreat the anchor"
-        );
-    }
-
-    /// `restore_messages` drops the anchor — the prior position
-    /// referred to a slice that's been replaced wholesale.
-    #[tokio::test]
-    async fn restore_messages_clears_anchor() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        ctx.append(&make_msg(Role::User, "earlier")).await;
-        // Force a compression apply so anchor lands at messages.len().
-        let _ = ctx.maybe_compress("test-model", never_chat).await;
-
-        ctx.restore_messages(vec![make_msg(Role::User, "fresh slice")]);
-        assert_eq!(ctx.last_summary_anchor(), None);
     }
 }

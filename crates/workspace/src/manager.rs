@@ -27,11 +27,6 @@ impl WorkspaceManager {
             paths.agents_dir(),
             paths.key_dir(),
             paths.state_dir(),
-            // Per-session writable artifacts (currently `summary.md` for
-            // the async summary-refresh design). Per-session subdirs are
-            // created lazily by the BackgroundCompressionRunner; this just guarantees
-            // the parent dir exists so the lazy create can land.
-            paths.state_sessions_dir(),
             paths.work_dir(),
             paths.work_tmp_dir(),
             paths.logs_dir(),
@@ -158,11 +153,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_layout_creates_dirs_and_local_git_repos() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_tmp")
-            .join("workspace_layout_test");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mgr = WorkspaceManager::new(dir.clone());
         mgr.ensure_layout().await.expect("layout");
@@ -196,8 +188,6 @@ mod tests {
         assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -206,11 +196,8 @@ mod tests {
         // identity content. (The on-demand seeding now lives in
         // `load_identity_files`; the contract guarded here is just
         // that `ensure_layout` itself is purely about directories.)
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_tmp")
-            .join("workspace_layout_no_seed_test");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mgr = WorkspaceManager::new(dir.clone());
         mgr.ensure_layout().await.expect("layout");
@@ -223,17 +210,12 @@ mod tests {
                 kind.file_name()
             );
         }
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn seed_default_identity_files_writes_each_default() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_tmp")
-            .join("workspace_seed_defaults_test");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mgr = WorkspaceManager::new(dir.clone());
         mgr.ensure_layout().await.expect("layout");
@@ -243,17 +225,12 @@ mod tests {
         assert_eq!(loaded.soul, IdentityKind::Soul.default_content());
         assert_eq!(loaded.user, IdentityKind::User.default_content());
         assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn seed_default_identity_files_preserves_user_edits() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_tmp")
-            .join("workspace_preserve_edits_test");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mgr = WorkspaceManager::new(dir.clone());
         mgr.ensure_layout().await.expect("first layout");
@@ -270,7 +247,5 @@ mod tests {
         let loaded = mgr.load_identity_files().await.expect("load");
         assert_eq!(loaded.soul, CUSTOM);
         assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

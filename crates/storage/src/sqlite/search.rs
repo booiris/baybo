@@ -352,6 +352,12 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                 // that match most (`的` hits 43% of the corpus). The scope
                 // filters must stay INSIDE, or the limit would be applied before
                 // them and return short.
+                //
+                // `compaction_inserted = 0` on the join: a compaction re-inserts
+                // the recent slice it keeps as fresh rows and indexes those too,
+                // so without it every kept message answers a search twice — once
+                // as the real turn, once as the machinery's copy. Same predicate
+                // the display reads use, for the same reason.
                 let mut stmt = conn.prepare(
                     "SELECT f.session_id, f.ordinal, f.channel, m.role, m.content, m.source, \
                             m.platform_msg_id, m.created_at, m.superseded_by, f.score \
@@ -370,6 +376,7 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                      ) f \
                      JOIN session_messages m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
+                      AND m.compaction_inserted = 0 \
                      ORDER BY f.score",
                 )?;
                 let params = rusqlite::params![
@@ -925,22 +932,58 @@ mod tests {
         );
         assert_eq!(hits[0].superseded_by, Some(1));
 
-        // The reseeded system prompt compaction wrote is hidden, so it is not
-        // indexed; the summary it wrote is an assistant bubble, so it is.
-        assert!(
-            store
-                .search_messages("系统提示", &SearchScope::default(), 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // Neither row compaction wrote is searchable: the reseeded system
+        // prompt is hidden from the index entirely, and the summary is
+        // `compaction_inserted` — machinery, not conversation. Search matches
+        // what the transcript displays, and a display read filters the same
+        // way, so a hit here would navigate to a row the user cannot be shown.
+        for term in ["系统提示", "摘要"] {
+            assert!(
+                store
+                    .search_messages(term, &SearchScope::default(), 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "compaction machinery must not answer a search: {term}"
+            );
+        }
+    }
+
+    /// A compaction re-inserts the tail it keeps as fresh rows and indexes
+    /// them, so the same sentence exists twice in `message_fts` — once as the
+    /// real turn, once as the copy. It must answer a search once.
+    #[tokio::test]
+    async fn a_kept_message_answers_a_search_once_after_compaction() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = super::super::SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        let sid = SessionId::from(TEST_SESSION.to_string());
+        let kept = ChatMessage::user(vec![ContentBlock::Text("独一无二的句子".into())]);
+        sessions.append_session_message(&sid, &kept).await.unwrap();
+        // The shape a compaction now produces: a summary plus the verbatim
+        // tail it decided to keep.
+        sessions
+            .apply_session_compaction(
+                &sid,
+                &[
+                    ChatMessage::assistant(vec![ContentBlock::Text("压缩后的摘要".into())]),
+                    kept.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let hits = SqliteMessageSearchStore::new(pool)
+            .search_messages("独一无二", &SearchScope::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the kept message must not answer twice");
         assert_eq!(
-            store
-                .search_messages("摘要", &SearchScope::default(), 10)
-                .await
-                .unwrap()
-                .len(),
-            1
+            hits[0].superseded_by,
+            Some(1),
+            "and the hit is the real turn, not the copy"
         );
     }
 

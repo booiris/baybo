@@ -381,10 +381,8 @@ mod tests {
     // pre-compaction content for the owning session.
     #[tokio::test]
     async fn recovers_compacted_away_content_via_real_manager() {
-        use baybo_session::test_support::{
-            MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-        };
-        use baybo_session::{SessionFolderStore, SessionStore, SessionSummaryStore};
+        use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
+        use baybo_session::{SessionFolderStore, SessionStore};
 
         let now = chrono::Utc::now();
         let sid = SessionId::from("recover-sess");
@@ -426,7 +424,6 @@ mod tests {
             .unwrap();
         let mgr = crate::SessionManager::new(
             store as Arc<dyn SessionStore>,
-            Arc::new(MemorySessionSummaryStore::new()) as Arc<dyn SessionSummaryStore>,
             Arc::new(MemorySessionFolderStore::new()) as Arc<dyn SessionFolderStore>,
         );
 

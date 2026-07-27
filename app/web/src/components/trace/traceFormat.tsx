@@ -275,10 +275,10 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       return 'llm iteration';
     }
     case 'compression': {
-      // `trigger` (why) leads, `applied` (how) follows. A stored-summary or
-      // truncate compaction makes no LLM call, so it has no span and no token
-      // figures — it must still say what it did, because that spanless row IS
-      // the moment the model's input context changed.
+      // `trigger` (why) leads, `applied` (how) follows. A truncate compaction
+      // makes no LLM call, so it has no span and no token figures — it must
+      // still say what it did, because that spanless row is the compaction
+      // that discarded the most.
       const { trigger, applied } = step.kind;
       const parts: string[] = [];
       if (trigger != null) parts.push(trigger);

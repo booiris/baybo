@@ -10,7 +10,7 @@ pub mod test_support;
 use baybo_store::{
     AgentProfileStore, BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore,
     CostStore, CronStore, DeckCardStore, DeviceStore, JobStore, MessageSearchStore, SecretStore,
-    SessionFolderStore, SessionStore, SessionSummaryStore, SkillRiskStore, TaskStore, TraceStore,
+    SessionFolderStore, SessionStore, SkillRiskStore, TaskStore, TraceStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -24,7 +24,6 @@ use baybo_store::{
 pub struct Store {
     pub session: std::sync::Arc<dyn SessionStore>,
     pub message_search: std::sync::Arc<dyn MessageSearchStore>,
-    pub session_summary: std::sync::Arc<dyn SessionSummaryStore>,
     pub session_folder: std::sync::Arc<dyn SessionFolderStore>,
     pub task: std::sync::Arc<dyn TaskStore>,
     pub trace: std::sync::Arc<dyn TraceStore>,
@@ -70,9 +69,6 @@ impl Store {
         Ok(Self {
             session: std::sync::Arc::new(sqlite::SqliteSessionStore::new(pool.clone())),
             message_search: std::sync::Arc::new(sqlite::SqliteMessageSearchStore::new(
-                pool.clone(),
-            )),
-            session_summary: std::sync::Arc::new(sqlite::SqliteSessionSummaryStore::new(
                 pool.clone(),
             )),
             session_folder: std::sync::Arc::new(sqlite::SqliteSessionFolderStore::new(

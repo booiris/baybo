@@ -3,7 +3,7 @@
 ## Overview
 
 The `context` crate owns the per-actor conversation state: the
-transcript (`messages`), the token budget, and the hardcoded 3-stage
+transcript (`messages`), the token budget, and the hardcoded
 compression flow. Persistence is wired in directly — every
 `ContextManager` takes a bound `SessionId` + `Arc<SessionManager>` at
 construction; `append` and the compression apply mirror to
@@ -17,7 +17,7 @@ Core responsibilities:
 - **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`); `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation; on load it runs `transcript_repair::repair_tool_pairing`, which persists a synthetic "interrupted" `ToolResult` for any `ToolUse` a crash left unanswered (append-only) and repositions displaced result rows next to their issuing assistant row, so a crash-torn transcript can't wedge the next request on provider tool-pairing validation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
-- **Hardcoded compression flow**: a single `Compressor` impl block on `ContextManager` runs three stages in sequence — summary.md fast-path → live LLM summary → truncate fallback. No trait, no dispatch — every production session takes the same path.
+- **Hardcoded compaction flow**: a single impl block on `ContextManager` — one blocking summariser call, assembled with the verbatim tail, truncating only if that call fails. No trait, no dispatch — every production session takes the same path.
 
 **Goal**: ensure the context sent to the LLM never exceeds the model's context window while preserving the most valuable information.
 
@@ -34,23 +34,19 @@ ContextManager (struct)
 ├── current_model     — Option<String>; written by maybe_compress, used as
 │                       calibration key + baseline-invalidation trigger
 ├── workspace         — Arc<baybo_workspace::WorkspacePaths>; resolves
-│                       summary.md (fast-path), the transcript-recovery pointer,
-│                       the identity files (soul assembly), and the
+│                       the transcript-recovery pointer, the identity files
+│                       (soul assembly), and the
 │                       tool-spills dir (oversize tool output)
 ├── system_prompt     — resolved system prompt for the initial seed (workspace
 │                       soul or a subagent profile override); reseed-after-
 │                       compaction re-reads the workspace instead
-├── compressor.rs     — impl ContextManager block: 3-stage hardcoded flow
-│   ├── Stage 1: try_summary_fast_path  — read summary.md, assemble
-│   │                                     [system + summary + recent slice]
-│   ├── pre-flight gate                 — NoOp if non_system.len() ≤ keep_recent
-│   ├── Stage 2: LLM summary            — invoke ChatCallback with
-│   │                                     SUMMARIZE_INSTRUCTION
-│   ├── Stage 3: truncate fallback      — keep system + last keep_recent
-│   │                                     (only on Stage 2 failure)
-│   └── reseed_system_row               — re-read workspace soul on every apply
-├── background_summary.rs — run_background_summary: detached summary.md
-│                           refresh pass (see background-compression.md)
+├── compressor.rs     — impl ContextManager block: the compaction flow
+│   ├── pre-flight gate    — NoOp if non_system.len() ≤ keep_recent
+│   ├── summarize          — invoke ChatCallback with SUMMARIZE_INSTRUCTION
+│   ├── assemble_summary   — [system + summary + verbatim recent slice],
+│   │                        or summary-only when the slice would not shrink
+│   ├── truncate fallback  — keep system + last keep_recent (summariser failed)
+│   └── reseed_system_row  — re-read workspace soul on every apply
 └── prompts/          — all model-facing framing text + pure builders
     ├── soul.rs            — assemble_from_workspace (TOP/TAIL hints + identity)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
@@ -107,23 +103,30 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token, delta_tx.
 | ------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------ |
 | Token budget (how much room is left) | `TokenBudget`                      | Pure state; agent can query `budget().remaining()` for other decisions                     |
 | When to compress                     | `ContextManager::maybe_compress`   | Caller (agent loop) triggers at the top of each iteration so cost recording can be wrapped |
-| How to compress                      | `compressor.rs` impl block         | Hardcoded 3-stage flow on `ContextManager`; no swappable strategy                          |
-| Per-session paths                    | `Arc<WorkspacePaths>`              | Resolves `summary.md` for the fast-path and the transcript-recovery pointer for the message |
+| How to compress                      | `compressor.rs` impl block         | One hardcoded flow on `ContextManager`; no swappable strategy                              |
+| Per-session paths                    | `Arc<WorkspacePaths>`              | Resolves the transcript-recovery pointer baked into the summary message                   |
 | Token counting                       | `Tokenizer` trait                  | Trait and `TiktokenTokenizer` impl both live here; no LLM-SDK coupling                     |
 | Calibration key (which model)        | `maybe_compress`'s `model_id` arg  | Caller passes the LLM id at compression time; `ContextManager` stores and reuses it        |
 
-### The 3-stage compression flow
+### The compaction flow
 
-`ContextManager::run_compression_flow` (in `compressor.rs`) is `async` and receives a one-shot `ChatCallback`. It runs the three stages in order:
+`ContextManager::run_compression_flow` (in `compressor.rs`) is `async` and receives a one-shot `ChatCallback`.
 
-1. **Stage 1 — `try_summary_fast_path`**: read `<state>/<session_id>/summary.md` via `WorkspacePaths::session_summary_file`, look up the summary's cursor in the persisted active log, and assemble `[system + summary blob + recent slice]`. Falls through on any of: no metadata, file missing, cursor stale, length mismatch, or assembled total > `0.6 × max_tokens`. Returns `Replaced { messages }` on success.
-2. **Pre-flight gate**: if `non_system.len() ≤ keep_recent`, return `NoOp` without firing the LLM. Mirrors the old `Truncate` strategy's NoOp exit so a `/compact` on a tiny conversation doesn't burn tokens producing a single-line summary.
-3. **Stage 2 — LLM summary** (`summarize_or_truncate`): send the full conversation + `SUMMARIZE_INSTRUCTION` to the model via the `ChatCallback`. On success, replace with `[system + parsed summary]` and return `Replaced { messages }`.
-4. **Stage 3 — truncate fallback**: only reached when Stage 2 returns an error or empty content. Keep `system + last keep_recent non-system` messages (pair-preserving so tool_use / tool_result stays intact) and return `Replaced { messages }`.
+1. **Pre-flight gate**: return `NoOp` without firing the LLM when `non_system.len() ≤ keep_recent` **and** the non-system total is under `MIN_COMPACTABLE_TOKENS` — both, not either. The message count alone is the *truncate fallback's* question: it keeps the last `keep_recent`, so at or below that it cannot shrink. It says nothing about the summariser, which collapses any number of messages into one. Gating on the count alone refused to compact a transcript of a few pasted files — ten messages, 26k tokens, well past the budget — for as many turns as it stayed under the count. The token half preserves the original intent: a `/compact` on a genuinely tiny conversation still declines rather than burning a call to produce something longer than what it replaced.
+2. **Summarise**: send the full conversation + `SUMMARIZE_INSTRUCTION` through the `ChatCallback`. The whole transcript goes even though its tail is about to be kept verbatim, because `LlmCallInputs::Persisted` can only name the *entire* active set — trimming the request to a strict prefix would force an `Inline` marker and re-embed the transcript into every compaction span.
+3. **Assemble** (`assemble_summary`): `[system…, summary, verbatim recent slice]`. The slice is a backward walk in atomic units (a message, or a `tool_use`/`tool_result` pair) bounded by `recent_slice_bounds(max_tokens)`, and it is what keeps a compaction from turning the last tool results and the user's own words into a paraphrase of themselves.
+4. **Truncate fallback**: only when the summariser failed or returned nothing usable. Keep `system + last keep_recent non-system` messages, pair-preserving. This is the one path that makes no LLM call, so the agent loop records its `StepKind::Compression` step separately — otherwise the compaction that discarded the most would leave no trace at all.
 
-The summary message itself follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the summary body (verbatim from `summary.md` for the fast-path; LLM output prefixed with `Summary:` for stage 2), a `read the full transcript at: <path>` pointer (resolved through `WorkspacePaths::session_log_file`) — a **virtual** path with no file behind it: a `Read` of it is served by a virtual-read resolver (`ReadTool` consults `ctx.virtual_reads` before the filesystem) from the durable `session_messages` transcript (full, including rows compaction has since superseded), and a closing paragraph instructing the model to resume work without acknowledging the summary. `parse_summary_response` strips both `<analysis>` and `<summary>` tags so the body lands cleanly in either path.
+Two things can make the flow decline instead:
 
-Every `Replaced` return triggers `ContextManager` to insert the skill trailer right after the system block (`insert_skill_trailer`). The historical `<system-reminder>` carrying the skill list lives in a `User` message — the summary stages discard it by construction, and the truncate fallback can drop it whenever the reminder lands in the dropped middle. Re-inserting is cheaper than tracking whether the kept slice still carries one. The reminder block re-advertises the session's *filtered* set (`invocable_skill_summaries` — agent-invocable, non-untrusted, channel-admitted; skipped when empty), never the raw registry, so a hidden skill can't leak back in after compaction; the per-called-skill `<skill>` detail blocks stay keyed on `called_skills` unfiltered. Putting it adjacent to the system prompt also keeps the "what tools are available" context lined up for prompt caching.
+- **The slice has to pay for itself.** It is re-added to the compacted transcript, so on a short conversation the walk can pull in nearly everything and the result comes out no smaller than its input. `assemble_summary` therefore tokenizes both `[system, summary, slice]` and `[system, summary]` and takes the first that is strictly smaller than the current count *and* at or below the ceiling whose crossing triggers the next compaction. No extra round-trip: the summary is already in hand. If neither fits, `run_compression`'s savings gate returns `NoSavings` and latches the transcript length — the threshold check runs at the top of every loop iteration with no backoff of its own, so without the latch the rest of the turn would be one full-transcript call per iteration. Growth past that length releases it; `force_compress` ignores and clears it.
+- **A `/stop` aborts the compaction; the next turn redoes it.** The summariser call is raced against the turn's cancel token, so a cancel is answered promptly instead of waiting out the read timeout (600s). The abandoned call still costs its tokens, but the transcript is left exactly as it was — `ContextError::Cancelled` returns `CompressOutput::Cancelled` rather than falling to truncate, because nothing was learned about the transcript and destroying the middle of the conversation over a `/stop` would be pure loss. It is still over budget, so the threshold check at the top of the next turn runs the compaction again. A transient *failure* (as opposed to a cancel) is retried once inside the same `Compression` step, so it reads as one compaction with two `LlmCall` spans, before the truncate fallback; a non-retriable one — a context-window 400 is the likeliest — is not retried at all.
+
+**Slice bounds.** `RECENT_SLICE_MAX_TOKENS_RATIO` (0.15) is window-relative, and **must stay below `compression_threshold`**: the tail rides along into the compacted transcript, so a ratio at or above the trigger would land every compaction back above its own threshold and re-fire it forever. `RECENT_SLICE_MAX_TOKENS_ABS` (40K) caps it on very large windows; the walk's token floor is expressed as a fraction of the derived cap so `min ≤ max` holds structurally rather than by coincidence at large sizes. On a window small enough that no tail fits, the compaction is summary-only.
+
+The summary message follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the body prefixed with `Summary:`, a `read the full transcript at: <path>` pointer (resolved through `WorkspacePaths::session_log_file`) — a **virtual** path with no file behind it: a `Read` of it is served by a virtual-read resolver (`ReadTool` consults `ctx.virtual_reads` before the filesystem) from the durable `session_messages` transcript (full, including rows compaction has since superseded), and a closing paragraph instructing the model to resume work without acknowledging the summary. The footer has two variants because its claim has to be true — one says the recent messages are preserved verbatim below, one doesn't. `parse_summary_response` strips both `<analysis>` and `<summary>` tags.
+
+Every `Replaced` return triggers `ContextManager` to insert the skill trailer right after the system block (`insert_skill_trailer`). The historical `<system-reminder>` carrying the skill list lives in a `User` message — the summary discards it by construction, and the truncate fallback can drop it whenever the reminder lands in the dropped middle. Re-inserting is cheaper than tracking whether the kept slice still carries one. The reminder block re-advertises the session's *filtered* set (`invocable_skill_summaries` — agent-invocable, non-untrusted, channel-admitted; skipped when empty), never the raw registry, so a hidden skill can't leak back in after compaction; the per-called-skill `<skill>` detail blocks stay keyed on `called_skills` unfiltered. Putting it adjacent to the system prompt also keeps the "what tools are available" context lined up for prompt caching.
 
 ### Context priority structure
 
@@ -137,21 +140,21 @@ The context sent to the LLM is organized in descending priority:
 ### Dependency boundaries
 
 - Depends on `baybo-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
-- Depends on `baybo-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, transcript-recovery pointer) resolve through the same source of truth the rest of the runtime uses.
+- Depends on `baybo-workspace` for `WorkspacePaths` so the transcript-recovery pointer resolves through the same source of truth the rest of the runtime uses.
 - Does **not** depend on `memory` — memory recall is injected from the agent layer: `AgentLoop::recall_and_inject` recalls via `baybo-memory` and appends framed `RecalledMemory` rows through `ContextManager::append_recalled_memory`; context only supplies the envelope (`prompts/recalled_memory.rs`).
 - Depends on `baybo-trace` only for the `LlmCallInputs` marker type carried through the `ChatCallback` — the compressor builds a `Persisted`-ordinal/`Inline` input marker for the span, but opening the span and recording cost still happen inside the caller's closure; `context` only sees its `Result<LlmResponse, ContextError>`. No direct `storage` dependency — transcript persistence is brokered through the `Arc<SessionManager>` (from `baybo-session`) supplied at construction.
 
 ## Constraints
 
 - `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. There is no separate configured cap; resize the model's `context_window` if you need headroom for output tokens.
-- Compression threshold around 0.7–0.85 is usually reasonable
+- `agent.context.compression_threshold` ships at `0.65` (`crates/config/src/agent.rs`). Raising it leaves less headroom for the compaction's own output; lowering it compacts more often.
 - Tool-heavy conversations often need a larger `keep_recent`
 
 ## Cost recording
 
 `ContextManager::maybe_compress` takes a chat closure from the caller and forwards it to the strategy as a `ChatCallback`. The agent loop's chat closure brackets the real LLM call in a `StepKind::Compression` step + `SpanKind::LlmCall` span (real lifecycle — start/end times, real `input_messages`) and calls `CostManager::record_call` with the span's id while the span is still open. The cost row's `span_id` is therefore a join key into a real trace span. `context` itself takes no `CostManager` dependency and never opens spans.
 
-Failure handling: when `Summarize`'s callback errors or returns empty content, the strategy itself falls back to a Truncate-equivalent slice (still returned as `CompressOutput::Replaced`). A transient summarizer failure logs `warn!` and continues the user's turn rather than killing it.
+Failure handling: when the callback errors or returns empty content, the compressor falls back to a truncate slice (still returned as `CompressOutput::Replaced`). A summariser failure logs `warn!` and continues the user's turn rather than killing it.
 
 ## Token-count estimation: baseline + delta
 
@@ -182,4 +185,4 @@ Wiring contract:
 
 ## See also
 
-- [`background-compression.md`](../background-compression.md) — async per-session summary maintenance. It feeds the summary fast-path **inside** the existing hardcoded `Compressor` (Stage 1 `try_summary_fast_path`, which reads the precomputed `summary.md` and swaps it in when fresh); it does **not** introduce a new strategy type. There is no `CompressionStrategy` trait, no dispatch, and no swappable `Summarize`/`SummaryAwareWrapper` — when the fast-path declines, the same `Compressor` falls through to the live LLM summary (Stage 2) and the truncate fallback (Stage 3). `force_compress` (`/compact`) runs that same flow without the budget gate.
+There is no `CompressionStrategy` trait, no dispatch, and no swappable strategy type — one hardcoded flow, described above. `force_compress` (`/compact`) runs it without the budget gate.

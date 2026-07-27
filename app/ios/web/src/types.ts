@@ -197,6 +197,12 @@ export type WireFrame =
   // is absent for unattributable loss; native additionally refetches the
   // session list for that case.)
   | { kind: "gap"; session_id?: string }
+  // A turn-phase marker the server emits around work the user is waiting on.
+  // Today the only phases are compaction start/end: with the compaction now
+  // blocking the turn on a full-transcript summarizer call, a turn can sit
+  // silent for 30s+ before its first token, and without this the transcript
+  // shows nothing to explain the pause.
+  | { kind: "status"; session_id?: string; phase: string }
   // Deck frames — no deck UI here; the native deck shell consumes them. They
   // fall through the router's `default` like any unrendered kind; modeled only
   // so wireSentinel.ts pins their shape against the generated contract.

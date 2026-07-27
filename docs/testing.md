@@ -140,14 +140,11 @@ keeping it in lockstep with the Rust router is what lets the frontend
   `AgentTestHarness`. Pins clean-stream deltas, secret minting at the
   router seam, the tool-call round trip, and inbound injection
   warnings.
-- `background_compression_e2e.rs` — the in-actor background-summary pass
-  plus the FS orphan reaper.
 - `channel_registration.rs` — drives the real Telegram sidecar bundle
   through the production registration driver.
-- `context_compression_e2e.rs` — the LLM context-compression path under a
-  tight token budget.
-- `summary_aware_wrapper_e2e.rs` — the compressor's fast-path stage as
-  wired into the live agent loop.
+- `context_compression_e2e.rs` — the blocking context-compaction path
+  under a tight token budget: cost/span join, the status pair, the
+  summariser retry, and the spanless truncate step.
 - `token_calibration_e2e.rs` — the token-count calibration feedback loop.
 - `tool_concurrency.rs` — tool-call concurrency scheduling in
   `run_iteration`.

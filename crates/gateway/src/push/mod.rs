@@ -1440,7 +1440,6 @@ mod tests {
             .expect("open store");
         let session_manager = Arc::new(SessionManager::new(
             stores.session.clone(),
-            stores.session_summary.clone(),
             stores.session_folder.clone(),
         ));
         let vault = Arc::new(baybo_security::SecretVault::new(
