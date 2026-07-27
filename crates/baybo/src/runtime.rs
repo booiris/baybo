@@ -856,11 +856,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // `initial_model` is the chat pick WITHIN that entry
                 // (`session.state.last_model`); `None` ⇒ entry default.
 
-                // `summary_state_dir` connects the compressor's
-                // fast-path to the background refresh runner's output.
-                // Without it the background passes still run and bill
-                // LLM, but their summaries never reach the hot path.
-                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,

@@ -23,7 +23,7 @@
 //!    `ended_at = max(child_steps.ended_at, job.started_at_or_created_at)`
 //!    and `reason = SystemCrash`.
 //! 3. Sweep unfinished trace rows under terminal jobs. Detached work
-//!    (background compression, title generation, progress observers) can
+//!    (title generation, progress observers) can
 //!    outlive the turn job that owns its step; if the process exits mid-pass,
 //!    the job is already terminal, so recovery closes only the trace subtree
 //!    and leaves the job status untouched.

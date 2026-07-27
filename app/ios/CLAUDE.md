@@ -107,9 +107,11 @@ simulator is shared across a suite, so the attachment demo reached six video
 tiles and a by-label query that is unambiguous on a fresh install started
 matching six elements. Demo flags are only hermetic with it.
 
-CI (`.github/workflows/ci.yml`): `ios-checks` (ubuntu, gating) runs the Rust and
-web tiers; `ios-sim` (macos-26, gating build + unit tests, non-gating UI smokes)
-runs the Swift half. Both are path-filtered — and the filter deliberately
+CI (`.github/workflows/ci.yml`): **both iOS jobs are currently `if: false`** —
+`ios-checks` (ubuntu, would run the Rust and web tiers) and `ios-sim` (macos-26,
+would run the Swift half). Nothing under `app/ios` is covered until they are
+re-enabled; run the four commands above by hand and say so in the PR. Both are
+path-filtered — and the filter deliberately
 includes `crates/{wire,device-proto,model}` and `remote-host/`, because the ffi
 workspace path-depends on them and a root-crate change can break the iOS build
 without touching `app/ios` at all.

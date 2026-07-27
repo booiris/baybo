@@ -195,7 +195,7 @@ pub struct SessionSummaryFilter {
     pub session_id_prefix: Option<String>,
     /// Coarse trigger/lineage label. Filters the `list_all` pool by
     /// [`derive_session_kind`]. `Compression` matches no live row
-    /// (background compression runs as an in-actor step), so that
+    /// (compaction runs as a step inside the turn's job), so that
     /// variant yields an empty listing.
     pub kind: Option<SessionKind>,
 }

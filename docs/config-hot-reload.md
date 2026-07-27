@@ -69,7 +69,7 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 
 ### Pool handle + per-turn swap
 
-`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `crates/baybo/src/runtime.rs` — used for top-level, cron, subagent, and background-compression actors alike — plus the integration-test harness and `AgentLoop` unit tests).
+`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `crates/baybo/src/runtime.rs` — used for top-level, cron, and subagent actors alike — plus the integration-test harness and `AgentLoop` unit tests).
 
 `AgentLoop` resolves at **turn start** (not construction): `pool_handle.read().resolve(self.initial_llm)`, pinned for the whole turn (a turn may issue many LLM calls; they all use one model). When the resolved client differs from the current one **by pointer** (`Arc::ptr_eq`, *not* by model id — a reload always builds fresh `Arc<BillableLlm>`s, so this also catches a `base_url` / credential / `reasoning_effort` / `context_window` edit that kept the same model id; an unchanged pool returns the same `Arc`, so the common path stays a no-op), the loop:
 

@@ -152,9 +152,9 @@ pub enum CompressionOutcome {
 /// owner here, eliminating the drift-detection logic.
 pub struct ContextManager {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// Source of truth for per-session paths the compressor needs:
-    /// `summary.md` for the fast-path stage, and the JSONL transcript
-    /// referenced from the continuation-summary message.
+    /// Source of truth for per-session paths: the JSONL transcript the
+    /// continuation-summary message points at, the identity files, and the
+    /// tool-spills dir.
     pub(crate) workspace: Arc<baybo_workspace::WorkspacePaths>,
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
@@ -245,9 +245,8 @@ pub struct ContextManager {
 /// struct literal at the call site keeps every field visible by name.
 pub struct ContextManagerConfig {
     pub tokenizer: Arc<dyn Tokenizer>,
-    /// Workspace paths handle. Used to resolve `summary.md` for the
-    /// fast-path read and the JSONL transcript path referenced from
-    /// the continuation-summary message.
+    /// Workspace paths handle. Resolves the JSONL transcript path the
+    /// continuation-summary message points at.
     pub workspace: Arc<baybo_workspace::WorkspacePaths>,
     pub keep_recent: usize,
     /// Fraction of the active model's context window at which the
@@ -558,9 +557,8 @@ impl ContextManager {
             // Record eagerly so a compaction *this turn* (before any rebuild)
             // re-broadcasts the definition via the skill trailer — the body
             // row carries no `ToolUse` for `scan_skill_calls` to find, and a
-            // live-LLM-summary pass (a first compaction's only option — no
-            // `summary.md` yet, no recent slice kept) folds it into the
-            // summary. Later compactions + cold-start restore re-derive it
+            // compaction folds it into the summary unless it happens to land
+            // in the kept tail. Later compactions + cold-start restore re-derive it
             // durably from the persisted `/command` row (`called_skills_in`).
             push_called_skill(&mut self.called_skills, &skill_name);
             self.append(&msg).await;
@@ -1192,7 +1190,7 @@ impl ContextManager {
     /// `Some((last_ordinal, active_count))` only when the in-memory
     /// transcript provably mirrors the persisted active set — the same
     /// `active_count == len` invariant [`Compressor`](crate::compressor)'s
-    /// fast path trusts. A compression call sends `self.messages` verbatim,
+    /// the marker requires. A compaction call sends `self.messages` verbatim,
     /// so a `Persisted` trace reference is only safe to emit when hydration
     /// would rebuild exactly that slice; otherwise the caller embeds inline.
     /// The returned count seeds the `prefix_len` tripwire. `None` on any
@@ -1874,8 +1872,9 @@ pub(crate) fn insert_skill_trailer(
 
 /// Estimate the **token cost** of the skill trailer that
 /// [`insert_skill_trailer`] would attach for `called_skills` against
-/// the given registry. Used by the fast-path's pre-assembly threshold
-/// check (`summary + skill_trailer ≤ 0.6 × max_tokens`) without
+/// the given registry. Used by the compaction's candidate-fit check —
+/// the trailer is inserted after the compressor returns, so a candidate
+/// that ignored it could be accepted and then land over budget — without
 /// committing the trailer to the assembled list. Returns the sum of
 /// the rendered reminder + detail payload tokens, or just the
 /// reminder if no called_skills carry a renderable definition.

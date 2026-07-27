@@ -288,9 +288,7 @@ pub struct ToolContext {
     /// contract. `Read` records each file's fingerprint here; `Edit`
     /// (always) and `Write` (when overwriting an existing file) refuse to
     /// run unless the file was read and is unchanged since. `Some` **only
-    /// for the interactive agent loop** — system passes that legitimately
-    /// rewrite their own files without a prior read (the background-summary
-    /// pass over `summary.md`) and argv-mode / test call sites leave it
+    /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
     /// Runtime hook for detaching a slow command into the background.

@@ -31,7 +31,7 @@ agent/src/
 │   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
 │   ├── tool_executor.rs      # ToolExecutor + approval gate; wires virtual-file providers into ToolContext
 │   ├── virtual_read.rs       # SessionTranscriptReader: VirtualReadResolver serving the transcript (ReadTool consults it)
-│   ├── compression.rs        # inline + background compression wiring
+│   ├── compression.rs        # compaction LLM call: step/span, cost, retry
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
@@ -163,7 +163,7 @@ Gate (all must hold): the turn is `UserChat`; a `SessionTitleSink` is wired (the
 On boot, `baybo_agent::recovery::recover_orphaned_traces_and_jobs` closes
 half-open trace rows and cancels non-terminal jobs left by a prior process death
 as `SystemCrash`. It also closes half-open detached trace rows under terminal
-jobs (for example a background-compression step that outlived its turn) without
+jobs (for example a title-generation step that outlived its turn) without
 changing that terminal job. During the current process,
 `actor::runner::spawn_actor` watches actor task panics and calls
 `recover_panicked_actor_session` for that session's active turn jobs, then emits

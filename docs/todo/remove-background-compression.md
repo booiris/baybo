@@ -1,6 +1,8 @@
 # Remove background compression — implementation plan
 
-**Status:** planned, not started. Owner-approved design (14 decisions below). One PR, spanning
+**Status:** implemented on `refactor/remove-background-compression`; the operator runbook in §8
+has NOT been run. Kept as the record of why each decision was made — the surviving design lives in
+[`docs/modules/context.md`](../modules/context.md). One PR, spanning
 `baybo-context` / `baybo-agent` / `baybo-session` / `baybo-store` / `baybo-storage` /
 `baybo-workspace` / `baybo-trace` / `baybo-model` / `baybo-query`, `app/web`, `app/ios`, and docs.
 

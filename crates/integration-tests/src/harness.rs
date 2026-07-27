@@ -69,7 +69,7 @@ pub struct AgentTestHarness {
     pub token_calibration: Arc<baybo_context::TokenCalibration>,
     /// Session manager backing the wired `ContextManager`. Exposed so
     /// tests can pre-seed session messages or summary metadata before
-    /// driving the agent loop (e.g. compressor fast-path e2e coverage).
+    /// driving the agent loop.
     pub session_manager: Arc<baybo_agent::SessionManager>,
     /// Planning-checklist store shared by the registered `Task*` tools and the
     /// loop's per-turn reminder. Exposed so a task e2e can assert what the
@@ -431,8 +431,8 @@ impl AgentTestHarnessBuilder {
         // `TokenCalibration` keys observe and adjust identically.
         let stub_model_id = wired_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
-        // Non-existent root → fast-path read hits NotFound → falls
-        // through. No tempdir to clean up.
+        // Non-existent root: nothing under it is read in these tests, so
+        // there is no tempdir to clean up.
         let workspace = self.workspace.unwrap_or_else(|| {
             Arc::new(baybo_workspace::WorkspacePaths::new(PathBuf::from(
                 "/nonexistent-baybo-it-workspace",

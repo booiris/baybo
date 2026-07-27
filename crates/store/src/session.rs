@@ -280,9 +280,7 @@ pub trait SessionStore: Send + Sync {
     /// system row resurfaces on the next `load_active_session_messages`.
     ///
     /// Returns the ordinal of the FIRST newly-inserted row; `new_active`
-    /// lands contiguously, so `base + i` addresses row `i` — the
-    /// compression flow uses this to re-point `session_summaries.cursor`
-    /// at the fresh continuation-summary row after a fast-path apply.
+    /// lands contiguously, so `base + i` addresses row `i`.
     async fn apply_session_compaction(
         &self,
         session_id: &SessionId,
@@ -408,8 +406,8 @@ pub trait SessionStore: Send + Sync {
     /// Cheaper than [`Self::load_session_messages_with_supersede`] +
     /// walking: backed by a `COUNT(*)` + `EXISTS` against the partial
     /// `idx_session_messages_active` index, so message contents never
-    /// cross the wire. Used by anchor-lookup paths that only need to
-    /// translate a `session_summaries.cursor` into an in-memory index.
+    /// cross the wire. Used by paths that only need to translate a stored
+    /// ordinal into its position in the active set.
     async fn active_index_of_ordinal(
         &self,
         session_id: &SessionId,

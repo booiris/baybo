@@ -34,7 +34,7 @@ pub type ChatFuture =
     Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
 
 /// One-shot chat invocation handed to the compressor. Invoked at most
-/// once, only when the fast-path misses and the pre-flight gate passes.
+/// once, only when the pre-flight gate passes.
 /// The second argument is the trace `input_messages` marker the LLM
 /// span should record — a `Persisted` ordinal reference (so the large
 /// transcript prefix isn't cloned into the span) or an inline fallback;
@@ -99,13 +99,9 @@ fn strip_analysis_block(text: &str) -> String {
 /// `<summary>` block (tags removed) if present, else the non-empty
 /// leftover. `None` only when nothing usable remains.
 ///
-/// Used by both compression flows (inline `summarize_or_truncate`
-/// and `run_background_summary`); both must agree on the tag contract
-/// or summaries silently corrupt when one path's prompt is updated
-/// without the other's. Returning the inner body (rather than the
-/// verbatim block) keeps `summary.md` clean of the tags and lets the
-/// compressor wrap the body in a fresh "Summary:" prefix when it
-/// lands in the LLM transcript.
+/// Returning the inner body rather than the wrapped block lets the compressor
+/// put its own `Summary:` prefix on it, and keeps the tags out of the
+/// transcript the model reads back.
 pub fn parse_summary_response(text: &str) -> Option<String> {
     let stripped = strip_analysis_block(text);
     if let Some(inner) = find_tagged_inner(&stripped, "summary")
