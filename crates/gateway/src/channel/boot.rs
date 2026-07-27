@@ -148,8 +148,10 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
     //   broadcasts nothing at all, so a mark retired by `ApprovalResolved`
     //   alone would stick forever on exactly the turns that went unanswered.
     //
-    // The queue publishes both edges (see `PendingWatcher`), under its own
-    // lock — so this closure only broadcasts, and must keep doing only that.
+    // The queue publishes both edges (see `PendingWatcher`), in mutation order
+    // and with no lock of its own held. It still runs INLINE on whichever
+    // thread wins the drain — usually the blocked tool's own future — so this
+    // closure must stay non-blocking; it just can no longer deadlock the gate.
     let weak_for_watcher = Arc::clone(&weak_slot);
     queue.add_pending_watcher(Arc::new(move |session_id, edge| {
         let Some(channel) = weak_for_watcher.lock().upgrade() else {

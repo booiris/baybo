@@ -205,8 +205,8 @@ impl Channel {
     }
 
     /// Add a per-session pending-edge watcher to this channel's approval
-    /// queue. See [`PendingWatcher`] — the callback runs under the queue lock,
-    /// so it must only publish and must never read the queue back.
+    /// queue. See [`PendingWatcher`] — the callback runs inline on the blocked
+    /// tool's future, so it must stay non-blocking.
     ///
     /// No-op when this channel has no approval surface.
     pub fn add_pending_approval_watcher(&self, watcher: PendingWatcher) {

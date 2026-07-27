@@ -22,6 +22,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -221,9 +222,8 @@ pub type ResolveFn = Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingEdge {
     /// The session's FIRST prompt just parked. Carries the prompt's identity
-    /// because watchers run **under the queue lock** and so must never read
-    /// the queue back to find out what woke them — `parking_lot` locks are not
-    /// reentrant, and that lookup would deadlock the gate.
+    /// so a watcher never has to read the queue back to find out what woke it
+    /// — a lookup that is now merely wasteful, and used to be a deadlock.
     Raised { call_id: String, tool: String },
     /// Its LAST prompt was answered by a decision someone made.
     Answered,
@@ -250,12 +250,24 @@ impl PendingEdge {
 /// mark hung off the resolution event alone would stick forever on exactly
 /// the turns nobody answered.
 ///
-/// Runs **while the queue lock is held**, which is what keeps two concurrent
-/// mutations from publishing their edges out of order (a `false` overtaking
-/// the `true` that superseded it would strand the flag inverted, i.e. silently
-/// stop asking the user for a decision the agent is still blocked on). The
-/// implementation must therefore only *publish* — never re-enter the queue,
-/// never block.
+/// Runs with **no queue lock held**, so a watcher may read the queue back.
+/// It still runs INLINE, on whichever thread wins the drain — usually the
+/// blocked tool's own future — and that thread keeps draining while others
+/// enqueue, so it can be conscripted into publishing *other* sessions' edges.
+/// A slow watcher therefore still delays a turn; it just no longer holds the
+/// gate's lock while doing it. Keep it non-blocking.
+///
+/// Order is preserved: edges are appended to `outbox` under the queue lock, so
+/// their order is the order the mutations happened, and
+/// [`ApprovalQueue::publish_pending`] lets only one thread drain at a time.
+/// That ordering is load-bearing — a stale `false` overtaking the `true` that
+/// superseded it would strand the flag inverted, silently no longer asking the
+/// user for a decision the agent is still blocked on.
+///
+/// A watcher that MUTATES the queue re-enters `publish_pending`, which returns
+/// immediately (the active publisher drains what the mutation enqueued), so
+/// that is safe too — but it makes the watcher's own edge land after the one it
+/// is handling, which is rarely what such code wants.
 pub type PendingWatcher = Arc<dyn Fn(SessionId, PendingEdge) + Send + Sync>;
 
 /// Thread-safe queue of pending approval prompts. Shared between a
@@ -266,6 +278,17 @@ pub struct ApprovalQueue {
     inner: Arc<Mutex<VecDeque<PendingApproval>>>,
     resolver: Arc<Mutex<Option<ResolveFn>>>,
     pending_watchers: Arc<Mutex<Arc<Vec<PendingWatcher>>>>,
+    /// Edges awaiting publication, in the order their mutations happened.
+    ///
+    /// The indirection exists so foreign watcher code never runs under the
+    /// queue lock. Appending here is the only thing a mutation does while
+    /// holding `inner`, and appending is what fixes the order — the draining
+    /// happens afterwards, outside the lock.
+    outbox: Arc<Mutex<VecDeque<(SessionId, PendingEdge)>>>,
+    /// Whether a thread is currently draining [`Self::outbox`]. At most one
+    /// may, which is what keeps two concurrent drains from interleaving their
+    /// callbacks and inverting the order the outbox established.
+    publishing: Arc<AtomicBool>,
 }
 
 impl ApprovalQueue {
@@ -274,6 +297,8 @@ impl ApprovalQueue {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             resolver: Arc::new(Mutex::new(None)),
             pending_watchers: Arc::new(Mutex::new(Arc::new(Vec::new()))),
+            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            publishing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -290,30 +315,81 @@ impl ApprovalQueue {
         *slot = Arc::new(next);
     }
 
-    /// Publish `session_id`'s boundary crossing if the caller's mutation
-    /// caused one. `q` is the **still-locked** queue with the mutation already
-    /// applied, so it is the truth; `was_pending` is what the caller observed
-    /// before mutating, and `edge` labels *why* the crossing happened. See
-    /// [`PendingWatcher`] for why this fires under the lock.
+    /// Queue `session_id`'s boundary crossing for publication if the caller's
+    /// mutation caused one. `q` is the **still-locked** queue with the mutation
+    /// already applied, so it is the truth; `was_pending` is what the caller
+    /// observed before mutating, and `edge` labels *why* the crossing happened.
+    ///
+    /// Enqueues only, and returns whether it did. A caller that enqueued must
+    /// follow the lock release with [`Self::publish_pending`]; one that did not
+    /// must NOT — a mutation that crosses no boundary (a second prompt on an
+    /// already-waiting session, a `resolve_head` on an empty queue) ran no
+    /// foreign code before this indirection existed, and should not start now.
     fn note_pending_edge(
         &self,
         q: &VecDeque<PendingApproval>,
         session_id: &SessionId,
         was_pending: bool,
         edge: PendingEdge,
-    ) {
+    ) -> bool {
         let pending = q.iter().any(|e| &e.req.session_id == session_id);
         if pending == was_pending {
-            return;
+            return false;
         }
         debug_assert_eq!(
             pending,
             edge.is_pending(),
             "caller labelled the edge in the opposite direction to the queue"
         );
-        let watchers = Arc::clone(&*self.pending_watchers.lock());
-        for watcher in watchers.iter() {
-            watcher(session_id.clone(), edge.clone());
+        self.outbox.lock().push_back((session_id.clone(), edge));
+        true
+    }
+
+    /// Drain [`Self::outbox`] into the watchers. **Call only with the queue
+    /// lock released** — that is the whole point of the outbox.
+    ///
+    /// Non-blocking: a second caller arriving while another thread is draining
+    /// returns immediately, because that thread will pick up whatever the
+    /// second caller enqueued. Single-drainer is also what preserves order.
+    fn publish_pending(&self) {
+        /// Releases the drain claim on the unwind path too. A watcher that
+        /// panics must merely DELAY the remaining edges to the next mutation —
+        /// a plain store on the fall-through path would be skipped by the
+        /// unwind and bounce every future publisher forever, silently ending
+        /// all chat-list marks and approval pushes for the process. (Release
+        /// builds set `panic = "abort"`, so this is a dev/test wedge, not a
+        /// production one — but `PendingWatcher` is a public seam.)
+        struct DrainClaim<'a>(&'a AtomicBool);
+        impl Drop for DrainClaim<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        if self.publishing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        loop {
+            {
+                let _claim = DrainClaim(&self.publishing);
+                loop {
+                    // Scoped so the outbox lock is NOT held across a callback.
+                    let next = self.outbox.lock().pop_front();
+                    let Some((session_id, edge)) = next else {
+                        break;
+                    };
+                    let watchers = Arc::clone(&*self.pending_watchers.lock());
+                    for watcher in watchers.iter() {
+                        watcher(session_id.clone(), edge.clone());
+                    }
+                }
+            }
+            // Something may have been enqueued between the last pop and the
+            // claim's release. Re-claim and drain it, unless another thread
+            // already claimed the slot — in which case it will.
+            if self.outbox.lock().is_empty() || self.publishing.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
     }
 
@@ -346,10 +422,15 @@ impl ApprovalQueue {
             call_id: entry.req.call_id.clone(),
             tool: entry.req.tool.clone(),
         };
-        let mut q = self.inner.lock();
-        let was_pending = q.iter().any(|e| e.req.session_id == session_id);
-        q.push_back(entry);
-        self.note_pending_edge(&q, &session_id, was_pending, raised);
+        let crossed = {
+            let mut q = self.inner.lock();
+            let was_pending = q.iter().any(|e| e.req.session_id == session_id);
+            q.push_back(entry);
+            self.note_pending_edge(&q, &session_id, was_pending, raised)
+        };
+        if crossed {
+            self.publish_pending();
+        }
     }
 
     /// Snapshot the head request for rendering. Returns `None` when empty.
@@ -365,14 +446,17 @@ impl ApprovalQueue {
     /// responder (remote mirrors) pop silently; the caller handles
     /// the actual resolution out-of-band.
     pub fn resolve_head(&self, decision: ApprovalDecision) -> bool {
-        let popped = {
+        let (popped, crossed) = {
             let mut q = self.inner.lock();
             let popped = q.pop_front();
-            if let Some(pending) = popped.as_ref() {
-                self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered);
-            }
-            popped
+            let crossed = popped.as_ref().is_some_and(|pending| {
+                self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered)
+            });
+            (popped, crossed)
         };
+        if crossed {
+            self.publish_pending();
+        }
         let Some(pending) = popped else {
             return false;
         };
@@ -403,13 +487,17 @@ impl ApprovalQueue {
         call_id: &str,
         decision: ApprovalDecision,
     ) -> Option<SessionId> {
-        let pending = {
+        let (pending, crossed) = {
             let mut q = self.inner.lock();
             let pos = q.iter().position(|e| e.req.call_id == call_id)?;
             let pending = q.remove(pos)?;
-            self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered);
-            pending
+            let crossed =
+                self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered);
+            (pending, crossed)
         };
+        if crossed {
+            self.publish_pending();
+        }
         let session_id = pending.req.session_id.clone();
         // Outside the lock: the oneshot wakes the blocked tool future, which
         // may run to its next `gate.request` on another worker and re-enter
@@ -438,14 +526,21 @@ impl ApprovalQueue {
     /// another client resolved the same approval, so we drop the
     /// local mirror without second-guessing the decision.
     pub fn drop_call(&self, call_id: &str) -> bool {
-        let mut q = self.inner.lock();
-        let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) else {
-            return false;
-        };
-        let Some(removed) = q.remove(pos) else {
-            return false;
-        };
-        self.note_pending_edge(&q, &removed.req.session_id, true, PendingEdge::Abandoned);
+        let crossed;
+        {
+            let mut q = self.inner.lock();
+            let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) else {
+                return false;
+            };
+            let Some(removed) = q.remove(pos) else {
+                return false;
+            };
+            crossed =
+                self.note_pending_edge(&q, &removed.req.session_id, true, PendingEdge::Abandoned);
+        }
+        if crossed {
+            self.publish_pending();
+        }
         true
     }
 
@@ -936,6 +1031,192 @@ mod tests {
             ],
             "a human decision is ANSWERED — the next prompt may interrupt again"
         );
+    }
+
+    #[test]
+    fn a_watcher_may_read_the_queue_without_deadlocking() {
+        // The capability the outbox buys. Watchers used to run under the queue
+        // lock, so this exact call — the obvious thing to write — would wedge
+        // the gate forever, and only a doc comment stood between a future
+        // watcher and that. Now it just works.
+        let queue = ApprovalQueue::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (probe, sink) = (queue.clone(), Arc::clone(&seen));
+        queue.add_pending_watcher(Arc::new(move |session_id: SessionId, _edge| {
+            sink.lock()
+                .push((session_id, probe.pending_sessions().len(), probe.len()));
+        }));
+
+        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        assert_eq!(*seen.lock(), vec![(SessionId::from("s1"), 1, 1)]);
+        assert!(queue.drop_call("a1"));
+        assert_eq!(seen.lock().len(), 2);
+        assert_eq!(seen.lock()[1], (SessionId::from("s1"), 0, 0));
+    }
+
+    #[test]
+    fn concurrent_raises_and_removals_leave_the_flag_agreeing_with_the_queue() {
+        // Quiescence: however two threads interleave, once they are done the
+        // last edge published must agree with the queue's final state. A stale
+        // `false` landing after the `true` that superseded it reads as "nothing
+        // is waiting" while a turn is still blocked on the user — the exact
+        // inversion this whole feature exists to prevent.
+        //
+        // This does NOT prove ordering: with two threads doing two lock-bounded
+        // ops each the outbox is essentially never deeper than one entry, so a
+        // reversed drain has nothing to invert. `a_pile_up_during_one_drain_...`
+        // is the test that pins order; measured against a LIFO mutation, this
+        // one catches it ~0% of the time and that one catches it always.
+        for round in 0..200 {
+            let queue = ApprovalQueue::new();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&log);
+            queue.add_pending_watcher(Arc::new(move |_sid, edge: PendingEdge| {
+                sink.lock().push(edge.is_pending());
+            }));
+
+            let threads: Vec<_> = ["x", "y"]
+                .into_iter()
+                .map(|call_id| {
+                    let q = queue.clone();
+                    std::thread::spawn(move || {
+                        q.enqueue_mirror(mirror_req(call_id, "s1"));
+                        q.drop_call(call_id);
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("worker");
+            }
+
+            let published = log.lock().clone();
+            assert!(
+                !published.is_empty(),
+                "round {round}: at least one edge crossed"
+            );
+            assert_eq!(
+                *published.last().expect("an edge"),
+                !queue.pending_sessions().is_empty(),
+                "round {round}: last published edge disagrees with the queue \
+                 (published {published:?}) — the flag is stranded inverted"
+            );
+            // One session, so the edges are boundary crossings and must
+            // alternate; two `true`s in a row would mean an edge was published
+            // that never happened.
+            for pair in published.windows(2) {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "round {round}: repeated edge in {published:?}"
+                );
+            }
+            assert!(queue.is_empty(), "round {round}: both prompts were removed");
+        }
+    }
+
+    #[test]
+    fn a_pile_up_during_one_drain_publishes_in_mutation_order() {
+        // The ordering test with teeth. Park a watcher mid-drain so a second
+        // thread can pile two more edges behind the one being published, then
+        // release it and check what comes out. Reverse the drain and this
+        // fails every time.
+        use std::sync::atomic::AtomicUsize;
+
+        let queue = ApprovalQueue::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let parked = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let (log, parked, release, calls) = (
+                Arc::clone(&log),
+                Arc::clone(&parked),
+                Arc::clone(&release),
+                Arc::clone(&calls),
+            );
+            queue.add_pending_watcher(Arc::new(move |_sid, edge: PendingEdge| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    parked.store(true, Ordering::SeqCst);
+                    spin_until(&release);
+                }
+                log.lock().push(edge);
+            }));
+        }
+
+        let raiser = {
+            let q = queue.clone();
+            std::thread::spawn(move || q.enqueue_mirror(mirror_req("x", "s1")))
+        };
+        spin_until(&parked);
+
+        // The raiser holds the drain claim, so both of these only enqueue.
+        assert!(queue.drop_call("x"));
+        queue.enqueue_mirror(mirror_req("y", "s1"));
+        release.store(true, Ordering::SeqCst);
+        raiser.join().expect("raiser");
+
+        let published = log.lock().clone();
+        assert_eq!(published.len(), 3, "got {published:?}");
+        assert!(
+            matches!(published[0], PendingEdge::Raised { .. }),
+            "got {published:?}"
+        );
+        assert_eq!(published[1], PendingEdge::Abandoned, "got {published:?}");
+        assert!(
+            matches!(published[2], PendingEdge::Raised { .. }),
+            "got {published:?}"
+        );
+    }
+
+    #[test]
+    fn a_panicking_watcher_does_not_wedge_publication() {
+        // The drain claim must be released on the unwind path. A plain store on
+        // the fall-through path is skipped by a panicking watcher, and every
+        // later publisher then bounces off a claim nobody holds — chat-list
+        // marks and approval pushes stop for the life of the process. Release
+        // builds abort on panic so this is a dev/test wedge, but the watcher is
+        // a public seam and the failure is silent.
+        let queue = ApprovalQueue::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let armed = Arc::new(AtomicBool::new(true));
+        {
+            let (log, armed) = (Arc::clone(&log), Arc::clone(&armed));
+            queue.add_pending_watcher(Arc::new(move |_sid, edge: PendingEdge| {
+                if armed.swap(false, Ordering::SeqCst) {
+                    panic!("watcher blew up mid-drain");
+                }
+                log.lock().push(edge);
+            }));
+        }
+
+        let raised = {
+            let q = queue.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                q.enqueue_mirror(mirror_req("x", "s1"))
+            }))
+        };
+        assert!(raised.is_err(), "the watcher was supposed to panic");
+        assert!(log.lock().is_empty(), "…and to publish nothing");
+
+        // Publication must still work afterwards.
+        assert!(queue.drop_call("x"));
+        assert_eq!(
+            *log.lock(),
+            vec![PendingEdge::Abandoned],
+            "publication is wedged after a panicking watcher"
+        );
+    }
+
+    /// Spin until `flag`, with a deadline so a regression fails the test
+    /// instead of hanging the suite.
+    fn spin_until(flag: &AtomicBool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the drain to reach the watcher"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

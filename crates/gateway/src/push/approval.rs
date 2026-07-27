@@ -17,9 +17,9 @@
 //! came, stop shouting".
 //!
 //! The relay is sync and non-blocking end to end: its watcher runs inline on
-//! the blocked tool's future, under the queue lock, so it only ever stamps a
-//! `DashMap` and `try_send`s onto a bounded channel. All the real work — store
-//! reads, crypto, HTTP — happens on the push task that drains the receiver.
+//! the blocked tool's future, so it only ever stamps a `DashMap` and
+//! `try_send`s onto a bounded channel. All the real work — store reads,
+//! crypto, HTTP — happens on the push task that drains the receiver.
 
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -130,8 +130,8 @@ impl ApprovalPushRelay {
         }));
     }
 
-    /// Watcher body. Runs under the approval queue's lock — see
-    /// [`PendingEdge`]. `pub(crate)` so tests drive it without a channel.
+    /// Watcher body. Runs inline on the blocked tool's future, so it must stay
+    /// non-blocking. `pub(crate)` so tests drive it without a channel.
     pub(crate) fn observe(
         &self,
         session_id: &SessionId,
