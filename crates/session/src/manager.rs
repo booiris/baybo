@@ -1516,7 +1516,6 @@ mod tests {
 
         let mgr = SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         );
         let mut ids = Vec::new();
