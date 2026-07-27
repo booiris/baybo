@@ -13,7 +13,7 @@ pub use background_summary::{
 };
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
-pub use compressor::{CompressOutput, parse_summary_response};
+pub use compressor::{CompressOutput, CompressionStage, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
@@ -142,8 +142,11 @@ struct TokenBaseline {
 /// Hence the outcome carries no LLM-call provenance.
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionOutcome {
-    /// The transcript was replaced with a shorter list.
-    Compressed,
+    /// The transcript was replaced with a shorter list. `stage` says how —
+    /// only [`CompressionStage::LiveSummary`] involved an LLM call, so the
+    /// caller needs it to know whether a trace span already covers this
+    /// compaction or whether it has to record the event itself.
+    Compressed { stage: CompressionStage },
     /// Budget was under the configured compression threshold; the
     /// compressor was not invoked. Only produced by `maybe_compress` —
     /// `force_compress` bypasses the threshold by design.
@@ -994,12 +997,13 @@ impl ContextManager {
         let chat_box: compressor::ChatCallback =
             Box::new(move |req, marker| Box::pin(chat(req, marker)));
         let plan = self.run_compression_flow(chat_box).await?;
-        let (mut new_messages, fast_path_summary_index) = match plan {
+        let (mut new_messages, stage, fast_path_summary_index) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
             CompressOutput::Replaced {
                 messages,
+                stage,
                 fast_path_summary_index,
-            } => (messages, fast_path_summary_index),
+            } => (messages, stage, fast_path_summary_index),
         };
 
         // Refuse to apply an empty replacement: persist would mark
@@ -1115,7 +1119,7 @@ impl ContextManager {
         // above so a grown soul can't veto a real compaction, and after
         // `persist_compaction` so it stays an in-memory-only refresh.
         self.reseed_system_row().await;
-        Ok(CompressionOutcome::Compressed)
+        Ok(CompressionOutcome::Compressed { stage })
     }
 
     /// Returns the base ordinal of the newly-inserted active rows, or
@@ -2590,7 +2594,7 @@ mod tests {
         // empty, so no trailer reminder is inserted.
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
         // system + 2 most recent non-system.
         assert_eq!(ctx.messages().len(), 3);
         assert_eq!(ctx.messages()[0].role, Role::System);
@@ -2665,7 +2669,7 @@ mod tests {
 
         // `never_chat`: the fast path must serve this without an LLM call.
         let outcome = ctx.maybe_compress("test-model", never_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         let row = sessions
             .summary_metadata(&ctx.session_id)
@@ -2764,7 +2768,7 @@ mod tests {
         // `err_chat` proves stage 2 was actually reached: had the fast path
         // served the scaffold, no chat call would fire at all.
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         let scaffold_marker = "_What is actively being worked on right now?";
         assert!(
@@ -2797,7 +2801,7 @@ mod tests {
             .unwrap();
 
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         let row = sessions
             .summary_metadata(&ctx.session_id)
@@ -2847,7 +2851,7 @@ mod tests {
         // `err_chat` makes the LLM stage fail, falling through to truncate.
         let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
         // system + keep_recent=2 most recent non-system (empty test
         // registry → no trailer reminder).
         assert_eq!(ctx.messages().len(), 3);
@@ -2898,7 +2902,7 @@ mod tests {
         // Savings gate compared the old (small) soul on both sides, so the real
         // shrink is honoured rather than vetoed by the large workspace soul.
         assert!(
-            matches!(outcome, CompressionOutcome::Compressed),
+            matches!(outcome, CompressionOutcome::Compressed { .. }),
             "{outcome:?}"
         );
         // And the system row was refreshed from the workspace after the commit.
@@ -2959,7 +2963,7 @@ mod tests {
 
         let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
         assert!(
-            matches!(outcome, CompressionOutcome::Compressed),
+            matches!(outcome, CompressionOutcome::Compressed { .. }),
             "{outcome:?}"
         );
         match &ctx.messages()[0].content[0] {
@@ -3255,7 +3259,7 @@ mod tests {
         ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // Cache must be in lockstep with the post-compression slice.
         assert_eq!(ctx.per_message_tokens.len(), ctx.messages().len());
@@ -3633,7 +3637,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // [system, reminder, detail, summary]
         assert_eq!(ctx.messages().len(), 4);
@@ -3713,7 +3717,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
 
         // The agent-context body row was folded into the summary; the full
         // definition is back only because the trailer detail block carries it.
@@ -3905,7 +3909,7 @@ mod tests {
         ctx.append(&make_msg(Role::User, &padded("second"))).await;
 
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed));
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
         assert_eq!(ctx.last_summary_anchor(), Some(ctx.messages().len()));
         assert_eq!(ctx.tokens_since_anchor(), 0);
         assert_eq!(ctx.tool_calls_since_anchor(), 0);

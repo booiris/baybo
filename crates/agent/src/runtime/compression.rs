@@ -32,7 +32,8 @@ use baybo_llm::{Attribution, BillableLlm, ModelInfo};
 use baybo_model::{BackgroundCompressionPayload, JobId, SessionId};
 use baybo_session::SessionManager;
 use baybo_trace::{
-    CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind,
+    CompressionApplied, CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult,
+    SpanRecorder, StepKind,
 };
 use baybo_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
@@ -114,6 +115,9 @@ impl CompressionRunner {
             job_id,
             StepKind::Compression {
                 trigger: Some(trigger),
+                // The callback is only reached by the live-summary stage; the
+                // stored-summary and truncate stages never call it.
+                applied: Some(CompressionApplied::LiveSummary),
             },
             cancel_ctx,
             |step| async move {

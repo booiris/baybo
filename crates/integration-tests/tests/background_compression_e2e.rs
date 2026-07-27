@@ -795,7 +795,8 @@ async fn agent_background_pass_records_compression_step_on_parent_job() {
             matches!(
                 step.kind,
                 StepKind::Compression {
-                    trigger: Some(CompressionTrigger::Background)
+                    trigger: Some(CompressionTrigger::Background),
+                    ..
                 }
             )
         })

@@ -341,22 +341,37 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   const t0 = Date.now() - 5 * 60 * 1000;
   const job1 = mid('job');
 
-  // Step 1: a context compaction — the transcript so far is replaced by a
-  // summary. This is a real emitted StepKind (unlike skill_selection, which the
-  // wire defines but no production path records).
-  const compStarted = new Date(t0);
-  const compEnded = new Date(t0 + 80);
-  const compStep = step(job1, { kind: 'compression', trigger: 'inline' }, compStarted, compEnded);
-  const compLlm = llmSpan(
-    compStep.id,
+  // Step 1: the background pass — a real LLM call that writes the session's
+  // `summary.md`. It does NOT touch the live transcript.
+  const bgStarted = new Date(t0);
+  const bgEnded = new Date(t0 + 80);
+  const bgStep = step(
+    job1,
+    { kind: 'compression', trigger: 'background', applied: 'live_summary' },
+    bgStarted,
+    bgEnded,
+  );
+  const bgLlm = llmSpan(
+    bgStep.id,
     'claude-sonnet-4-6',
     [systemMsg('Summarize the conversation so far.'), userMsg('Help me list files.')],
     'Earlier: the user asked to list files and read README.md.',
     [],
     12_400,
     260,
-    compStarted,
-    compEnded,
+    bgStarted,
+    bgEnded,
+  );
+
+  // Step 2: the threshold trim — the context crossed its limit and was cut down
+  // by swapping in the `summary.md` the pass above wrote. NO LLM call, so this
+  // step carries no span; it is the moment the model's input context changed.
+  const trimAt = new Date(t0 + 90);
+  const trimStep = step(
+    job1,
+    { kind: 'compression', trigger: 'threshold', applied: 'stored_summary' },
+    trimAt,
+    new Date(t0 + 92),
   );
 
   // Step 2: LLM iteration with parallel tool calls
@@ -467,7 +482,8 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     started_at: startedAt,
     ended_at: endedAt,
     steps: [
-      { step: compStep, spans: [compLlm] },
+      { step: bgStep, spans: [bgLlm] },
+      { step: trimStep, spans: [] },
       { step: it1Step, spans: [it1Llm, tool1, tool2] },
       { step: it2Step, spans: [it2Llm] },
     ],

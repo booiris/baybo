@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use baybo_trace::{SpanKind, StepKind};
+use baybo_trace::{CompressionApplied, CompressionTrigger, SpanKind, StepKind};
 
 /// The hand-maintained frontend mirror of this crate's trace types.
 fn web_trace_types() -> String {
@@ -42,7 +42,10 @@ fn web_trace_types_cover_every_step_kind() {
     let ts = web_trace_types();
     let kinds = [
         StepKind::LlmIteration,
-        StepKind::inline_compression(),
+        StepKind::compression(
+            CompressionTrigger::Threshold,
+            CompressionApplied::LiveSummary,
+        ),
         StepKind::MemoryRecall,
         StepKind::MemoryWrite,
         StepKind::SkillSelection,
@@ -101,7 +104,10 @@ fn web_trace_types_declare_no_kinds_rust_lacks() {
 
     let step_tags = [
         StepKind::LlmIteration,
-        StepKind::inline_compression(),
+        StepKind::compression(
+            CompressionTrigger::Threshold,
+            CompressionApplied::LiveSummary,
+        ),
         StepKind::MemoryRecall,
         StepKind::MemoryWrite,
         StepKind::SkillSelection,

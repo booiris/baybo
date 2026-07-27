@@ -275,21 +275,20 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       return 'llm iteration';
     }
     case 'compression': {
+      // `trigger` (why) leads, `applied` (how) follows. A stored-summary or
+      // truncate compaction makes no LLM call, so it has no span and no token
+      // figures — it must still say what it did, because that spanless row IS
+      // the moment the model's input context changed.
+      const { trigger, applied } = step.kind;
+      const parts: string[] = [];
+      if (trigger != null) parts.push(trigger);
+      if (applied != null) parts.push(applied.replace('_', ' '));
       const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result) {
-        // The compacted context is the WHOLE input, cache reads included —
-        // a cached token still occupied the window. Counting only
-        // `input_tokens` under-reports it and disagrees with the token
-        // totals everywhere else (`summaryTokens`/`traceTokens.inputTotal`).
+      if (llm?.kind.kind === 'llm_call' && llm.kind.result) {
         const { input, output } = compressionTokens(llm.kind.result);
-        // The trigger leads: inline/forced compactions rewrote the transcript
-        // the NEXT llm call reads, so this row is the moment the model's input
-        // context changed. A background pass did not touch the next prompt.
-        const trigger = step.kind.trigger;
-        const lead = trigger != null ? `${trigger} · ` : '';
-        return `${lead}${input.toLocaleString()} → ${output.toLocaleString()} tokens`;
+        parts.push(`${input.toLocaleString()} → ${output.toLocaleString()} tokens`);
       }
-      return 'compression';
+      return parts.length > 0 ? parts.join(' · ') : 'compression';
     }
     case 'memory_recall': {
       const tool = spans.find((s) => s.kind.kind === 'tool_call');

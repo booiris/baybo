@@ -62,6 +62,8 @@ pub enum CompressOutput {
     /// middle.
     Replaced {
         messages: Vec<ChatMessage>,
+        /// Which stage of the flow produced this replacement.
+        stage: CompressionStage,
         /// Index (into `messages`) of the continuation-summary row when
         /// this replacement came from the **stage-1 fast path** — whose
         /// summary body is `summary.md` verbatim, so after the apply the
@@ -72,6 +74,22 @@ pub enum CompressOutput {
         /// `summary.md` doesn't have.
         fast_path_summary_index: Option<usize>,
     },
+}
+
+/// Which stage of the 3-stage flow actually shrank the transcript. Only
+/// [`CompressionStage::LiveSummary`] runs an LLM call; the other two rewrite the
+/// context with no model round-trip, which is why they leave no `LlmCall` span
+/// and have to be recorded by the caller to be visible in a trace at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionStage {
+    /// Stage 1: swapped in the `summary.md` the background pass wrote, plus the
+    /// recent slice. No LLM call.
+    StoredSummary,
+    /// Stage 2: summarised the transcript with a live LLM call.
+    LiveSummary,
+    /// Stage 3: dropped the middle of the transcript. No LLM call.
+    Truncate,
 }
 
 fn find_tagged_block(text: &str, tag: &str) -> Option<std::ops::Range<usize>> {
@@ -474,6 +492,7 @@ impl ContextManager {
 
         Some(CompressOutput::Replaced {
             messages: new_messages,
+            stage: CompressionStage::StoredSummary,
             fast_path_summary_index: Some(summary_index),
         })
     }
@@ -515,6 +534,7 @@ impl ContextManager {
             out.extend_from_slice(&non_system[split..]);
             CompressOutput::Replaced {
                 messages: out,
+                stage: CompressionStage::Truncate,
                 fast_path_summary_index: None,
             }
         };
@@ -531,6 +551,7 @@ impl ContextManager {
                     ));
                     CompressOutput::Replaced {
                         messages: new_messages,
+                        stage: CompressionStage::LiveSummary,
                         fast_path_summary_index: None,
                     }
                 }

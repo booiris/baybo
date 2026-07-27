@@ -39,22 +39,34 @@ export function isTerminal(state: LifecycleState): boolean {
 // ── Step ──────────────────────────────────────────────────────────────
 
 /**
- * Which path ran a compaction (mirrors `baybo_trace::CompressionTrigger`).
- * `inline` / `forced` rewrote the transcript the NEXT llm_call reads — those are
- * the moments the model's input context actually changed. `background` is a
- * detached pass nobody waits on. Absent on rows written before the trigger was
- * recorded.
+ * Why a compaction ran (mirrors `baybo_trace::CompressionTrigger`).
+ * `threshold` / `forced` rewrote the transcript the NEXT llm_call reads — those
+ * are the moments the model's input context actually changed. `background` only
+ * refreshes `summary.md` and does not touch the live transcript. Absent on rows
+ * written before the trigger was recorded.
  */
-export type CompressionTrigger = 'inline' | 'forced' | 'background';
+export type CompressionTrigger = 'threshold' | 'forced' | 'background';
+
+/**
+ * How a compaction shrank the transcript (mirrors `baybo_trace::CompressionApplied`).
+ * Only `live_summary` made an LLM call — `stored_summary` swaps in the `summary.md`
+ * a background pass wrote, and `truncate` drops the middle, so those steps carry no
+ * span. Absent on rows written before it was recorded.
+ */
+export type CompressionApplied = 'stored_summary' | 'live_summary' | 'truncate';
 
 /** Whether a compaction changed what the next LLM call was sent. */
 export function changesNextInput(trigger: CompressionTrigger | null | undefined): boolean {
-  return trigger === 'inline' || trigger === 'forced';
+  return trigger === 'threshold' || trigger === 'forced';
 }
 
 export type StepKind =
   | { kind: 'llm_iteration' }
-  | { kind: 'compression'; trigger?: CompressionTrigger | null }
+  | {
+      kind: 'compression';
+      trigger?: CompressionTrigger | null;
+      applied?: CompressionApplied | null;
+    }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }
   | { kind: 'skill_selection' }

@@ -127,7 +127,8 @@ async fn compression_call_records_cost_with_matching_span_id() {
                     matches!(
                         s.kind,
                         StepKind::Compression {
-                            trigger: Some(CompressionTrigger::Inline)
+                            trigger: Some(CompressionTrigger::Threshold),
+                            ..
                         }
                     )
                 }),

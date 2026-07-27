@@ -60,16 +60,31 @@ describe('stepSummaryText — compression', () => {
     output_tokens: 260,
   };
 
-  it('leads with the trigger, so the row says whether the next prompt changed', () => {
-    expect(stepSummaryText(step({ kind: 'compression', trigger: 'inline' }), [llmSpan(result)])).toBe(
-      'inline · 21,080 → 260 tokens',
-    );
-    expect(stepSummaryText(step({ kind: 'compression', trigger: 'forced' }), [llmSpan(result)])).toBe(
-      'forced · 21,080 → 260 tokens',
-    );
+  it('leads with why it ran and how it applied', () => {
+    expect(
+      stepSummaryText(
+        step({ kind: 'compression', trigger: 'threshold', applied: 'live_summary' }),
+        [llmSpan(result)],
+      ),
+    ).toBe('threshold · live summary · 21,080 → 260 tokens');
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'background' }), [llmSpan(result)]),
     ).toBe('background · 21,080 → 260 tokens');
+  });
+
+  it('still describes a compaction that made no LLM call', () => {
+    // The threshold trim that swaps in `summary.md` has no span and no token
+    // figures, but it is the moment the input context changed — a bare
+    // "compression" would say nothing about the one row that matters most.
+    expect(
+      stepSummaryText(
+        step({ kind: 'compression', trigger: 'threshold', applied: 'stored_summary' }),
+        [],
+      ),
+    ).toBe('threshold · stored summary');
+    expect(
+      stepSummaryText(step({ kind: 'compression', trigger: 'forced', applied: 'truncate' }), []),
+    ).toBe('forced · truncate');
   });
 
   it('omits the trigger on a legacy row that never recorded one', () => {
@@ -78,7 +93,7 @@ describe('stepSummaryText — compression', () => {
     );
   });
 
-  it('falls back when the compaction has no llm span', () => {
-    expect(stepSummaryText(step({ kind: 'compression', trigger: 'inline' }), [])).toBe('compression');
+  it('falls back only when a legacy row says nothing at all', () => {
+    expect(stepSummaryText(step({ kind: 'compression' }), [])).toBe('compression');
   });
 });
