@@ -1970,20 +1970,13 @@ mod tests {
     fn test_sessions() -> Arc<baybo_session::SessionManager> {
         let store = Arc::new(baybo_session::test_support::MemorySessionStore::new())
             as Arc<dyn baybo_session::SessionStore>;
-        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn baybo_session::SessionSummaryStore>;
         let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
             as Arc<dyn baybo_session::SessionFolderStore>;
-        Arc::new(baybo_session::SessionManager::new(
-            store,
-            summary_store,
-            folder_store,
-        ))
+        Arc::new(baybo_session::SessionManager::new(store, folder_store))
     }
 
-    /// Workspace rooted at a non-existent path so the fast-path read
-    /// hits `NotFound` and falls through cleanly. No tempdir to
-    /// clean up.
+    /// Workspace rooted at a non-existent path — nothing under it is read
+    /// in these tests, and there is no tempdir to clean up.
     fn test_workspace() -> Arc<baybo_workspace::WorkspacePaths> {
         Arc::new(baybo_workspace::WorkspacePaths::new(
             "/nonexistent-baybo-test-workspace",

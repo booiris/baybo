@@ -639,9 +639,7 @@ mod tests {
         ChannelType, Lineage, LineageKind, Session, SessionId, SubagentExitStatus, User,
     };
     use baybo_session::SessionStore;
-    use baybo_session::test_support::{
-        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-    };
+    use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -680,13 +678,8 @@ mod tests {
     /// directly against the underlying store.
     async fn sessions_with_root() -> Arc<SessionManager> {
         let store = Arc::new(MemorySessionStore::new());
-        let summary_store = Arc::new(MemorySessionSummaryStore::new());
         let folder_store = Arc::new(MemorySessionFolderStore::new());
-        let manager = Arc::new(SessionManager::new(
-            store.clone(),
-            summary_store,
-            folder_store,
-        ));
+        let manager = Arc::new(SessionManager::new(store.clone(), folder_store));
         let user = User {
             id: "u".into(),
             name: None,
@@ -749,7 +742,6 @@ mod tests {
     fn empty_session_manager() -> Arc<SessionManager> {
         Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         ))
     }

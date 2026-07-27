@@ -403,13 +403,10 @@ impl AgentTestHarnessBuilder {
         memory_session_store.seed_session(&session);
         let session_store =
             Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
-        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn baybo_session::SessionSummaryStore>;
         let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
             as Arc<dyn baybo_session::SessionFolderStore>;
         let session_manager = Arc::new(baybo_agent::SessionManager::new(
             session_store,
-            summary_store,
             folder_store,
         ));
         let virtual_reads: Option<Arc<dyn baybo_tools::VirtualReadResolver>> =

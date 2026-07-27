@@ -12,7 +12,6 @@ mod search;
 mod secret;
 mod session;
 mod session_folder;
-mod session_summary;
 mod skill_risk;
 mod task;
 mod time;
@@ -32,7 +31,6 @@ pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
 pub use session_folder::SqliteSessionFolderStore;
-pub use session_summary::SqliteSessionSummaryStore;
 pub use skill_risk::SqliteSkillRiskStore;
 pub use task::SqliteTaskStore;
 pub use trace::SqliteTraceStore;
@@ -681,41 +679,6 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     platform_msg_id TEXT    NOT NULL DEFAULT '',
                     PRIMARY KEY (session_id, seq)
                 );
-
-                -- Per-session summary metadata. Content lives on disk at
-                -- `<workspace>/state/sessions/<session_id>/summary.md`; this
-                -- row is the durable, queryable index. ON DELETE CASCADE
-                -- with sessions so removing a parent removes its summary
-                -- row automatically. The on-disk file is reaped separately
-                -- on startup (orphan FS sweep).
-                --
-                -- See `docs/background-compression.md`.
-                CREATE TABLE IF NOT EXISTS session_summaries (
-                    session_id  TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                    -- session_messages.ordinal of the most-recent message
-                    -- included in the last successful summary pass.
-                    cursor      INTEGER NOT NULL,
-                    pass_count  INTEGER NOT NULL DEFAULT 0,
-                    -- Unix µs (matches the rest of the µs schema).
-                    updated_at  INTEGER NOT NULL,
-                    -- Cumulative micro-USD spent on this session's summary
-                    -- passes. INTEGER, never REAL — same `feedback_money_no_float`
-                    -- invariant as `cost_records.cost_usd`.
-                    cost_micros INTEGER NOT NULL DEFAULT 0,
-                    model_id    TEXT    NOT NULL,
-                    span_id     TEXT    NOT NULL,
-                    -- Telemetry only — does NOT gate triggers. A persistent
-                    -- failure burns one LLM call per trigger event until the
-                    -- underlying issue resolves; that's an explicit design
-                    -- choice (no backoff complexity).
-                    error_count INTEGER NOT NULL DEFAULT 0
-                );
-                -- Old DBs may additionally carry two orphan columns,
-                -- `in_flight` / `in_flight_owner` — the DB-flag
-                -- at-most-one-in-flight mechanism the in-memory JoinHandle
-                -- replaced. Nothing reads or writes them; they stay inert
-                -- there (no data migration), and fresh DBs no longer
-                -- create them.
 
                 -- The session planning checklist (Task*). One row
                 -- per task; each TaskUpdate is a per-row UPDATE so it never

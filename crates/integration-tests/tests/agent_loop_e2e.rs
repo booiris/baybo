@@ -179,13 +179,10 @@ async fn turn_state_projector_brackets_a_slow_turn() {
         store.seed_session(&session);
         store as Arc<dyn baybo_session::SessionStore>
     };
-    let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
-        as Arc<dyn baybo_session::SessionSummaryStore>;
     let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
         as Arc<dyn baybo_session::SessionFolderStore>;
     let sessions = Arc::new(baybo_agent::SessionManager::new(
         session_store,
-        summary_store,
         folder_store,
     ));
 

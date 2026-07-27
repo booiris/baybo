@@ -25,7 +25,9 @@ use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
 use crate::error::ContextError;
-use crate::prompts::compression::{CONTINUATION_FOOTER, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION};
+use crate::prompts::compression::{
+    CONTINUATION_FOOTER, CONTINUATION_FOOTER_WITH_SLICE, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION,
+};
 use crate::{ContextManager, estimate_skill_trailer_tokens, recent_slice_bounds};
 
 pub type ChatFuture =
@@ -349,7 +351,6 @@ impl ContextManager {
         summary: &str,
     ) -> CompressOutput {
         let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
-        let summary_msg = build_summary_message(summary, &transcript_path);
 
         let (min_tokens, min_text_block_msgs, max_tokens) =
             recent_slice_bounds(self.budget.max_tokens());
@@ -363,13 +364,13 @@ impl ContextManager {
 
         let with_slice = || {
             let mut out = system_msgs.clone();
-            out.push(summary_msg.clone());
+            out.push(build_summary_message(summary, &transcript_path, true));
             out.extend_from_slice(&non_system[cut..]);
             out
         };
         let summary_only = || {
             let mut out = system_msgs.clone();
-            out.push(summary_msg.clone());
+            out.push(build_summary_message(summary, &transcript_path, false));
             out
         };
 
@@ -417,13 +418,26 @@ impl ContextManager {
 /// Build a continuation-style summary message from the parsed summary body.
 /// `transcript_path` points at the per-session JSONL the agent loop appends
 /// to, so the model can go read specific pre-compaction details.
-fn build_summary_message(body: &str, transcript_path: &std::path::Path) -> ChatMessage {
+///
+/// `with_slice` tells the model whether verbatim recent messages actually
+/// follow — the footer must not promise a tail the assembly then dropped.
+fn build_summary_message(
+    body: &str,
+    transcript_path: &std::path::Path,
+    with_slice: bool,
+) -> ChatMessage {
     let body_block = format!("Summary:\n{}", body.trim());
+    let slice_note = if with_slice {
+        CONTINUATION_FOOTER_WITH_SLICE
+    } else {
+        ""
+    };
     let text = format!(
-        "{intro}\n\n{body}\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: {transcript}\n\n{footer}",
+        "{intro}\n\n{body}\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: {transcript}\n\n{slice_note}{footer}",
         intro = CONTINUATION_INTRO,
         body = body_block,
         transcript = transcript_path.display(),
+        slice_note = slice_note,
         footer = CONTINUATION_FOOTER,
     );
     ChatMessage::agent_context(vec![ContentBlock::Text(text)])

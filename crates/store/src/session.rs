@@ -422,17 +422,6 @@ pub trait SessionStore: Send + Sync {
     /// without reading message contents.
     async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize>;
 
-    /// Active transcript with `ordinal <= up_to_ordinal`, in ordinal
-    /// order. Equivalent to filtering [`Self::load_active_session_messages`]
-    /// by ordinal but pushes the predicate into SQL so the row content
-    /// for newer ordinals never crosses the wire. Used by background
-    /// compression to load the snapshot pinned at trigger time.
-    async fn load_active_session_messages_up_to(
-        &self,
-        session_id: &SessionId,
-        up_to_ordinal: i64,
-    ) -> Result<Vec<ChatMessage>>;
-
     /// Reverse-paginated slice of the transcript for DISPLAY: at most
     /// `limit` rows whose `ordinal` is strictly below `before_ordinal`
     /// (or the tail when `before_ordinal` is `None`), in **ascending**
