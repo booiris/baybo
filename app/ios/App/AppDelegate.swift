@@ -1,9 +1,9 @@
 import UIKit
 import UserNotifications
 
-/// Real APNs delegate callbacks — this whole file replaces the Tauri shell's
-/// `push_register.rs` (which had to inject these methods into wry's delegate at
-/// runtime via `class_addMethod`).
+/// The app delegate: APNs registration and device-token delivery, memory-
+/// pressure eviction, and the notification-center callbacks for foreground
+/// presentation and taps.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     /// Whether iOS has delivered a device token this launch; foreground re-arms
     /// registration while it hasn't (APNs registration can fail transiently at

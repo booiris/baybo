@@ -1,8 +1,8 @@
-//! The core's `log` bridge, replacing tauri-plugin-log: a rotating on-device
-//! file (`<log_dir>/baybo.log`, 2 MiB × 3 — the exportable log bundle, same
-//! format as the Tauri shell's so exported sessions stay comparable) plus a
-//! stderr mirror (visible in Xcode's console on debug runs). Levels match the
-//! old shell: Warn globally, Debug for our own crates.
+//! The core's `log` bridge: a rotating on-device file (`<log_dir>/baybo.log`,
+//! 2 MiB × 3 — the exportable log bundle, whose format stays fixed so exported
+//! sessions stay comparable across builds) plus a stderr mirror (visible in
+//! Xcode's console on debug runs). Levels are Warn globally, Debug for our own
+//! crates.
 //!
 //! Timestamps are seconds-precision UTC derived from `SystemTime` — enough to
 //! sequence a session against gateway/relay logs without pulling a chrono/time
@@ -21,7 +21,7 @@ const LOG_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Rotated files kept beside the live one (`baybo.log.1`, `baybo.log.2`).
 const LOG_FILES_KEPT: usize = 2;
 
-/// Crates logged at Debug; everything else at Warn (matches the Tauri shell).
+/// Crates logged at Debug; everything else at Warn.
 const DEBUG_TARGETS: [&str; 2] = ["baybo_ffi", "baybo_ffi::core"];
 
 struct FileState {

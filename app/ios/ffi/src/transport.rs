@@ -18,11 +18,10 @@
 //! outbound user messages — is the one [`SessionRegistry`] + [`pump`] below,
 //! written once.
 //!
-//! Lifted from the Tauri shell's `transport.rs`; the webview `Channel<Frame>` is
-//! now a [`FrameSink`] callback interface, and the app-wide
-//! `content-disconnected` event is the sink's `on_disconnected` — same contract:
-//! it fires ONLY when the global leg ends on its own, because deliberate teardown
-//! aborts the pump task before the call runs.
+//! Frames reach the app through the [`FrameSink`] callback interface, and a lost
+//! global leg surfaces as that sink's `on_disconnected` — which fires ONLY when
+//! the leg ends on its own, because deliberate teardown aborts the pump task
+//! before the call runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;

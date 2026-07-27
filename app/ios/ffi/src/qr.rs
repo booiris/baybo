@@ -3,9 +3,6 @@
 //! Noise PSK) are required — there is no typeable fallback, because a short
 //! secret would be offline-crackable by a hostile relay. `h` and `k` are
 //! optional; a missing `h` falls back to [`DEFAULT_ENDPOINT`].
-//!
-//! Lifted from the webview's `parseScan` (App.tsx) so the parser has exactly one
-//! implementation now that the scan screen is native.
 
 use crate::api::PairTarget;
 
@@ -15,10 +12,10 @@ pub(crate) const DEFAULT_ENDPOINT: &str = "wss://proxy.baybo.space";
 const PAIR_SCHEME_PREFIX: &str = "baybo://pair";
 
 /// Parse a scanned QR payload into a [`PairTarget`]. `None` = not a pairing QR
-/// (the scan screen keeps scanning). Mirrors the leniency of the webview's
-/// `new URL()`-based parser it replaces: scheme matching is case-insensitive, a
-/// fragment is stripped, and malformed percent escapes are kept literal rather
-/// than rejecting the payload.
+/// (the scan screen keeps scanning). Deliberately LENIENT, because a QR that a
+/// gateway really emitted must never fail to scan over a cosmetic difference:
+/// scheme matching is case-insensitive, a fragment is stripped, and a malformed
+/// percent escape is kept literal rather than rejecting the payload.
 pub(crate) fn parse_pair_qr(text: &str) -> Option<PairTarget> {
     let text = text.trim();
     if text.len() < PAIR_SCHEME_PREFIX.len()
@@ -134,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_old_parser_leniency() {
-        // Case-insensitive scheme (new URL() normalized case).
+    fn a_cosmetically_odd_payload_still_scans() {
+        // Case-insensitive scheme.
         let t = parse_pair_qr("BAYBO://pair?r=rv1&s=aabb").expect("parses");
         assert_eq!(t.rendezvous_id, "rv1");
         // Fragments are stripped, not folded into the last value.

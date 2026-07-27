@@ -10,7 +10,7 @@ import type { WorkRow, WorkStep } from "./types";
 // The one render test in this bundle. WorkBlockView is a small presentational
 // card with no scrollHeight / follow / pin logic, so it renders cleanly in
 // jsdom — unlike <Transcript>, which is why the rest of the suite stays pure
-// (see app/ios/CLAUDE.md "web/"). Its pure helpers are covered by
+// (see app/ios/docs/testing.md "web/"). Its pure helpers are covered by
 // formatters.test.ts; this pins the component wiring: active vs closed, the
 // expand toggle, and the step feed. Text is the real en locale via i18n.
 

@@ -1,9 +1,8 @@
 import SwiftUI
 import VisionKit
 
-/// The native QR scan sheet, replacing the Tauri windowed-scanner hack (camera
-/// drawn behind a transparent webview). QR symbology only — matching the old
-/// `scan({ windowed: true, formats: [QRCode] })` restriction.
+/// The native QR scan sheet: a full-bleed `DataScannerViewController` under a
+/// reticle overlay. QR symbology only.
 struct ScanView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss

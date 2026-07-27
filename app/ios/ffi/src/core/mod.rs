@@ -1,9 +1,8 @@
 //! Device client protocol core used by the iOS app.
 //!
-//! This used to live in `app/mobile/core` for the deleted Tauri companion. The
-//! SwiftUI app is now the only mobile shell, so the thin protocol wrappers live
-//! directly in the UniFFI crate while still depending on the shared wire and
-//! device-proto crates.
+//! The SwiftUI app is the only mobile shell, so these thin protocol wrappers
+//! live directly in the UniFFI crate while still depending on the shared wire
+//! and device-proto crates.
 
 pub mod api_tunnel;
 pub mod content;

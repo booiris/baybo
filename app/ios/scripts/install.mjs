@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 // Build a development-signed IPA of the SwiftUI app and install + launch it on
-// a USB-connected device via `xcrun devicectl` — the successor of app/mobile's
-// ios-install.mjs, minus Tauri. Assumes scripts/build-app.sh --device --release
-// inputs (web bundle + xcframework) are already in place, or run with
-// --prepare to build them first.
+// a USB-connected device via `xcrun devicectl`. Assumes scripts/build-app.sh
+// --device --release inputs (web bundle + xcframework) are already in place, or
+// run with --prepare to build them first.
 //
 //   node scripts/install.mjs [--prepare] [--debug] [--no-launch] [--device <udid>]
 import { execFileSync, execSync } from "node:child_process";
@@ -24,7 +23,7 @@ const opt = (f) => {
 const configuration = has("--debug") ? "Debug" : "Release";
 
 // Non-GUI sessions (SSH/launchd) need the login keychain unlocked so codesign
-// works headlessly — same prep app/mobile's tauri-env.mjs did.
+// works headlessly.
 try {
   const manager = execSync("launchctl managername", { encoding: "utf8" }).trim();
   if (manager !== "Aqua" && !process.env.BAYBO_SKIP_KEYCHAIN_PREP) {

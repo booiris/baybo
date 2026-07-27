@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// The design tokens from the mobile style guide (`app/mobile/CLAUDE.md`):
+/// The design tokens from the style guide (`app/ios/docs/design-system.md`):
 /// monochrome soft line minimalism, light-only, ink-on-paper. Flat surfaces,
 /// 1px hairlines, pill corners, red reserved for destructive/error state.
 ///
