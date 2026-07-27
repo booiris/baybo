@@ -259,6 +259,45 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   enter/leave marks the foreground session and clears its badge. Relay warms the
   leg via `relay_preconnect`; direct via `direct_preconnect` (both best-effort
   on launch/foreground) so the pings arrive while parked on the list.
+- **Chat-list approval mark**: a conversation whose tool call is parked on the
+  gateway's approval gate wears an ink `hand.raised` glyph in the row's trailing
+  meta column, leading the unread capsule (`ChatRowBody.approvalMark`); a cron
+  GROUP row ORs it over its fires. The bit is `SessionRow.approvalPending`, fed
+  by two paths that mirror unread's: server-computed `approvalPending` on the
+  REST list summary (cold-start truth) and a connection-global
+  `SessionUpdated{approval_pending}` patch tee'd to `SessionListSink`
+  (`on_approval_pending` → `SessionIndex.noteApprovalPending`) as the
+  between-pulls accelerator. It rides a broadcast PATCH rather than
+  `Frame::ApprovalRequested` because that frame only reaches connections
+  **subscribed to that session**, and the client that needs it is the one parked
+  on the list, subscribed to nothing. Server-side the edges are published by the
+  approval QUEUE itself (`PendingEdge::Raised/Answered/Abandoned`), because the
+  five-minute gate timeout and a `/stop` both retire a prompt through
+  `QueueCleanup::drop` and broadcast no resolution at all — a mark hung off
+  `ApprovalResolved` would stick forever on exactly the turns nobody answered.
+  `approvalPending` is **never decoded from disk**: a parked gate lives in
+  gateway memory, so a mark restored on an offline cold start could only
+  describe a prompt that no longer exists. `-baybo-demo-approval` with
+  `-baybo-open-home` flips three rows live 2s in (screenshot before/after).
+- **App-icon badge**: `BadgeCenter` (`App/Core/BadgeCenter.swift`) is the one
+  writer on the app side, driven from `SessionIndex.save()` (the funnel every
+  list mutation already passes through) and counting exactly what the main list
+  counts — archived rows excluded, coalesced on equality. The gateway is the
+  other writer, sealing a `badge` into the encrypted preview so the NSE can set
+  `content.badge` while the app is dead; it counts through the same
+  `fold_unread` as the chat list's per-row badges, so the icon and the rows
+  cannot drift into two implementations. Only `SessionIndex.shared` owns the
+  icon (`ownsAppBadge`) — the suites run in parallel against temp directories
+  and would otherwise race over the host app's real badge.
+  **`AppDelegate.registerForPush` asks for FULL authorization**
+  (`[.alert, .sound, .badge]`), not provisional: provisional is granted silently
+  but delivers *quietly* — no sound, no lock-screen alert, and no badge — which
+  is fine for "your agent replied" and useless for "a tool call denies itself in
+  five minutes unless you answer". iOS honours `options` only on the FIRST
+  determination, so an install that already took provisional on an earlier build
+  does not widen its grant; `logAuthorizationState` records what was actually
+  granted so that case is observable instead of presenting as a feature that
+  silently never works.
 - **Push tap routing**: the gateway embeds `session_id` INSIDE the encrypted
   preview plaintext (never the outer APNs payload — C stays blind, matching the
   hashed collapse-id invariant). The NSE decodes it (optional field; the pinned

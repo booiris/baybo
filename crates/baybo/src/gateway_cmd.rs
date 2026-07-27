@@ -464,13 +464,38 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             Arc::new(baybo_gateway::push::HttpNotifySink::new(push_client)),
             Some(registrar),
         ));
+        // Second push source: a tool call parked at the approval gate. Nothing
+        // reaches the lifecycle bus while it waits — the turn has not
+        // completed, and never will unless the user answers — so the gate
+        // needs its own path to the dispatcher.
+        //
+        // Installed on `owner` alone: the queue is per-channel, and the app
+        // holds an `owner` connection, so a prompt parked on the TUI's or
+        // Telegram's queue is one the phone could not answer even after
+        // opening the conversation the push routed it to.
+        let (approval_relay, approval_stream) =
+            baybo_gateway::push::approval::ApprovalPushRelay::new();
+        let approval_wired = match graph
+            .channels_registry
+            .get(&baybo_model::ChannelType::owner())
+        {
+            Some(owner) => {
+                approval_relay.install(&owner);
+                true
+            }
+            None => false,
+        };
         let push_shutdown = shutdown.clone();
         task_tracker.track(baybo_gateway::push::spawn(
             dispatcher,
             Arc::clone(&graph.job_lifecycle),
+            approval_stream,
             async move { push_shutdown.wait().await },
         ));
-        tracing::info!("push: dispatcher started (subscribed to job lifecycle bus)");
+        tracing::info!(
+            approval_pushes = approval_wired,
+            "push: dispatcher started (job lifecycle bus + approval gate)"
+        );
     }
 
     // Deck services: boot starts every enabled card (with the

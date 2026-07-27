@@ -137,6 +137,11 @@ struct SessionSummary {
     /// into the one group row. Distinct from `pinned`, this row's own pin.
     #[serde(default)]
     cron_group_pinned: bool,
+    /// A tool call in this conversation is parked on the approval gate.
+    /// `#[serde(default)]` so an older gateway (which omits the key entirely,
+    /// and one that predates the field) reads as "nothing is waiting".
+    #[serde(default)]
+    approval_pending: bool,
 }
 
 #[derive(Deserialize)]
@@ -468,6 +473,7 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             cron_job_id: s.cron_job_id,
             cron_job_title: s.cron_job_title,
             cron_group_pinned: s.cron_group_pinned,
+            approval_pending: s.approval_pending,
         })
         .collect())
 }
@@ -1353,12 +1359,15 @@ mod tests {
         assert_eq!(row.title, None);
         assert_eq!(row.cron_job_id, None);
         assert_eq!(row.cron_job_title, None);
+        // The gateway skips the key when nothing is parked (and an older one
+        // never sends it at all) — both must read as "nothing is waiting".
+        assert!(!row.approval_pending);
     }
 
     #[tokio::test]
     async fn list_sessions_carries_every_row_field_through() {
         let client = RecordingClient::new(
-            r#"{"items":[{"session_id":"s1","created_at":"c","last_active":"l","last_user_text":"hi","last_message_text":"reply","title":"A chat","pinned":false,"archived":true,"unread_count":3,"cron_job_id":"cj-1","cron_job_title":"Morning brief"}]}"#,
+            r#"{"items":[{"session_id":"s1","created_at":"c","last_active":"l","last_user_text":"hi","last_message_text":"reply","title":"A chat","pinned":false,"archived":true,"unread_count":3,"approval_pending":true,"cron_job_id":"cj-1","cron_job_title":"Morning brief"}]}"#,
         );
         let rows = list_sessions(&client).await.expect("list");
 
@@ -1370,6 +1379,7 @@ mod tests {
         assert_eq!(row.unread_count, 3);
         assert_eq!(row.cron_job_id.as_deref(), Some("cj-1"));
         assert_eq!(row.cron_job_title.as_deref(), Some("Morning brief"));
+        assert!(row.approval_pending);
     }
 
     /// The whole reason the batch route exists: ONE round-trip, and no ordinal —

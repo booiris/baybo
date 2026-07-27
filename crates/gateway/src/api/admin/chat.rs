@@ -231,7 +231,7 @@ const PREVIEW_MAX_CHARS: usize = 120;
 /// Ceiling for the chat-list unread badge. A session with more unread replies
 /// than this reports exactly this, and the client renders it as "N+". Bounds
 /// the per-session count scan (see `SessionManager::unread_reply_count`).
-const UNREAD_COUNT_CAP: usize = 99;
+pub(crate) const UNREAD_COUNT_CAP: usize = 99;
 
 /// How far back the second-line preview (`last_message_preview`) walks the
 /// transcript tail for the newest bubble. A completed turn's final answer is
@@ -806,6 +806,16 @@ pub struct ChatSessionSummary {
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// True while a tool call in this session is parked on the approval gate,
+    /// waiting for the user to approve or deny it. The client marks the row so
+    /// the user knows which conversation to open; the prompt itself is only
+    /// answerable inside the conversation.
+    ///
+    /// Derived from live in-memory gate state, never the store: a parked turn
+    /// dies with the gateway process, so reading `false` after a restart is
+    /// correct rather than stale. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub approval_pending: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -879,6 +889,9 @@ async fn create_session(
             // uncategorized.
             folder_id: None,
             title: None,
+            // A session that has never run a turn cannot be parked on the
+            // approval gate; the queue publishes its own edges from there on.
+            approval_pending: None,
         },
     );
     Ok(Json(ChatSessionCreated {
@@ -1041,6 +1054,14 @@ async fn list_sessions(
         .await
         .unwrap_or_default();
     let cron_jobs = live_cron_job_meta(&state, &visible).await;
+    // One queue pass for the whole list. Taken here, with no `.await` between
+    // the snapshot and its use below, so every row reads one consistent
+    // instant of the gate's state.
+    let waiting_on_approval = state
+        .channel_registry
+        .get(&channel_type)
+        .map(|ch| ch.pending_approval_sessions())
+        .unwrap_or_default();
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .map(|s| {
@@ -1067,6 +1088,7 @@ async fn list_sessions(
                 last_message_text,
                 folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
                 unread_count: unread as i64,
+                approval_pending: waiting_on_approval.contains(&s.id),
                 title: s.title.clone(),
             }
         })
@@ -2072,6 +2094,10 @@ async fn unhide_session(
                 id: f.as_str().to_owned(),
             }),
             title: session.title.clone(),
+            // Absent = no change. A prompt parked while the row was hidden
+            // keeps its mark from the queue's own edge; the re-added row picks
+            // it up on the next list merge.
+            approval_pending: None,
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -2617,7 +2643,7 @@ pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &Channel
 ///
 /// A recurring fire's session *is* the notification, so it is listed and
 /// replyable like any other conversation.
-fn is_hidden_cron_session(session: &Session) -> bool {
+pub(crate) fn is_hidden_cron_session(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
 }
 

@@ -46,6 +46,15 @@ final class NotificationService: UNNotificationServiceExtension {
                 userInfo[PushPayloadKeys.sessionId] = sessionId
                 mutable.userInfo = userInfo
             }
+            // The icon badge rides inside the sealed plaintext rather than
+            // `aps.badge`, so the relay that carried this notification — and
+            // Apple — never learn the count. An ABSENT badge means "leave the
+            // icon alone" (the gateway could not count, or predates this); it
+            // must not be mistaken for a zero, which is a real instruction to
+            // clear.
+            if let badge = preview.badge {
+                mutable.badge = NSNumber(value: badge)
+            }
         }
         contentHandler(mutable)
     }
@@ -57,17 +66,37 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 
     /// The decrypted preview shape A encrypts (see the pinned `PLAINTEXT`).
-    /// `sessionId` is optional: senders predating tap-routing omit it, and the
-    /// pinned interop fixture stays valid without it.
+    /// `sessionId` and `badge` are optional: senders predating tap-routing omit
+    /// the first, senders predating the icon badge omit the second, and the
+    /// pinned interop fixture stays valid without either.
     struct Preview: Decodable {
         let title: String
         let body: String
         let sessionId: String?
+        let badge: Int?
 
         enum CodingKeys: String, CodingKey {
             case title
             case body
             case sessionId = "session_id"
+            case badge
+        }
+
+        /// Hand-written so a malformed `badge` costs only the badge.
+        ///
+        /// The synthesized decoder is all-or-nothing: a `badge` of the wrong
+        /// JSON type would fail the whole `Preview`, and this extension ships
+        /// inside the app bundle — a client already on a user's phone cannot be
+        /// rolled back to match a server that starts emitting something
+        /// unexpected. Losing the badge is cosmetic; losing the container also
+        /// loses `sessionId`, which is what makes tapping the notification open
+        /// the right conversation.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            title = try c.decode(String.self, forKey: .title)
+            body = try c.decode(String.self, forKey: .body)
+            sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+            badge = try? c.decodeIfPresent(Int.self, forKey: .badge)
         }
     }
 

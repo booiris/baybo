@@ -4927,6 +4927,10 @@
           "unread_count"
         ],
         "properties": {
+          "approval_pending": {
+            "type": "boolean",
+            "description": "True while a tool call in this session is parked on the approval gate,\nwaiting for the user to approve or deny it. The client marks the row so\nthe user knows which conversation to open; the prompt itself is only\nanswerable inside the conversation.\n\nDerived from live in-memory gate state, never the store: a parked turn\ndies with the gateway process, so reading `false` after a restart is\ncorrect rather than stale. Absent when false."
+          },
           "archived": {
             "type": "boolean",
             "description": "True when the user has archived this session. Always emitted —\nthe list never filters on it, so clients with an archived view\ngroup rows themselves and clients without one keep showing every\nrow; set via `PUT /v1/chat/sessions/{id}/archive`."

@@ -303,6 +303,25 @@ final class AppStore: ObservableObject {
             for id in ["demo-1", "demo-5"] {
                 SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
             }
+            // The approval mark, seeded LIVE rather than statically: the flip
+            // runs through `noteApprovalPending`, the same entry point the
+            // connection-global `SessionUpdated` patch drives in production, so
+            // a before/after screenshot pair proves the live path and not just
+            // the renderer. Shoot at ~1s (no marks) and ~3s (three).
+            //
+            // Three cases in one frame: the mark on a PINNED row (demo-3, which
+            // also keeps it clear of the centred notification-permission alert
+            // on a fresh install), the mark beside an unread capsule (demo-5),
+            // and a cron GROUP row surfacing a child fire's prompt
+            // (demo-cron-2).
+            if args.contains("-baybo-demo-approval") {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    for id in ["demo-3", "demo-5", "demo-cron-2"] {
+                        SessionIndex.shared.noteApprovalPending(sessionId: id, pending: true)
+                    }
+                }
+            }
             // Two fires of one scheduled job, so the CRON GROUP row (clock glyph,
             // newest fire's preview, summed unread) is screenshotable headlessly —
             // and so is the screen it pushes. They collapse into ONE row; that is

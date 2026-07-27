@@ -34,7 +34,8 @@ struct SessionIndexMergeTests {
         unreadCount: Int64 = 0,
         cronJobId: String? = nil,
         cronJobTitle: String? = nil,
-        cronGroupPinned: Bool = false
+        cronGroupPinned: Bool = false,
+        approvalPending: Bool = false
     ) -> ChatSessionSummary {
         ChatSessionSummary(
             sessionId: id,
@@ -46,6 +47,7 @@ struct SessionIndexMergeTests {
             pinned: pinned,
             archived: archived,
             unreadCount: unreadCount,
+            approvalPending: approvalPending,
             cronJobId: cronJobId,
             cronJobTitle: cronJobTitle,
             cronGroupPinned: cronGroupPinned)

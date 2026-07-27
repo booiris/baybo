@@ -756,6 +756,81 @@ async fn chat_list_unread_count_reflects_read_cursor() {
     assert_eq!(unread_of(&list), 0, "read cursor never regresses");
 }
 
+/// The chat list marks the conversation whose tool call is parked on the
+/// approval gate, so the user can tell which one needs them. Cold-start truth:
+/// a client that just launched has no live frames to have missed.
+#[tokio::test]
+async fn chat_list_flags_a_session_parked_on_the_approval_gate() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default())
+        .expect("install channels");
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let blocked = seed_tool_turn_session(&tg, &router).await;
+    let bystander = seed_tool_turn_session(&tg, &router).await;
+
+    let flag_of = |list: &Value, session_id: &str| -> bool {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["session_id"] == json!(session_id))
+            .expect("session in list")
+            .get("approval_pending")
+            .and_then(Value::as_bool)
+            // Absent is the wire's "false" — the field is skipped when unset.
+            .unwrap_or(false)
+    };
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert!(!flag_of(&list, &blocked), "nothing is parked yet");
+
+    // Park a real prompt on the owner channel's gate. The request future stays
+    // pending until someone resolves it — exactly the state the mark describes.
+    let channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner channel");
+    let gate = channel.approval_gate().expect("owner channel has a gate");
+    let req = baybo_tools::ApprovalRequest {
+        call_id: "prompt-1".into(),
+        tool_call_id: None,
+        session_id: SessionId::from(blocked.as_str()),
+        user_id: String::new(),
+        tool: "Bash".into(),
+        accesses: vec![],
+        params_preview: String::new(),
+        description: None,
+    };
+    let parked = tokio::spawn(async move { gate.request(req).await });
+    // The gate pushes onto the queue before it awaits, but the spawn has to be
+    // polled at least once for that to have happened.
+    while channel.pending_approval_sessions().is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert!(flag_of(&list, &blocked), "the blocked session is marked");
+    assert!(
+        !flag_of(&list, &bystander),
+        "the mark is per-session, not per-gateway"
+    );
+
+    // Answering it retires the mark.
+    assert_eq!(
+        channel.resolve_approval("prompt-1", baybo_tools::ApprovalDecision::Approve),
+        Some(SessionId::from(blocked.as_str()))
+    );
+    assert_eq!(
+        parked.await.expect("gate task"),
+        baybo_tools::ApprovalDecision::Approve
+    );
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert!(!flag_of(&list, &blocked), "resolved → the mark is gone");
+}
+
 /// Web and device share the one `owner` chat channel, so a device-authed list
 /// (as forwarded from the relay tunnel) returns every owner session — including
 /// ones the web operator created. There is no per-surface universe to scope to.

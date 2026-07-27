@@ -137,6 +137,40 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         );
     });
 
+    // The chat-list "waiting for you" mark. Two things force it onto a
+    // BROADCAST patch driven by the QUEUE rather than off the waker above:
+    //
+    // - `ApprovalRequested` is dispatched only to connections subscribed to
+    //   the call's session, so a client parked on its conversation list —
+    //   the one that needs to know which chat to open — never sees it.
+    // - The waker fires on the way IN and has no counterpart on the way out.
+    //   A gate that nobody answers self-denies after `APPROVAL_TIMEOUT` and
+    //   broadcasts nothing at all, so a mark retired by `ApprovalResolved`
+    //   alone would stick forever on exactly the turns that went unanswered.
+    //
+    // The queue publishes both edges (see `PendingWatcher`), in mutation order
+    // and with no lock of its own held. It still runs INLINE on whichever
+    // thread wins the drain — usually the blocked tool's own future — so this
+    // closure must stay non-blocking; it just can no longer deadlock the gate.
+    let weak_for_watcher = Arc::clone(&weak_slot);
+    queue.add_pending_watcher(Arc::new(move |session_id, edge| {
+        let Some(channel) = weak_for_watcher.lock().upgrade() else {
+            return;
+        };
+        // Multiplexed channels (telegram/discord/weixin) have no session list
+        // to mark, and `broadcast_session_patch` is a Subscribed-only concept.
+        let Some(sub) = channel.as_subscribed() else {
+            return;
+        };
+        sub.broadcast_session_patch(
+            session_id,
+            baybo_channels::wire::SessionPatch {
+                approval_pending: Some(edge.is_pending()),
+                ..Default::default()
+            },
+        );
+    }));
+
     let gate: Arc<dyn ApprovalGate> = Arc::new(ChannelApprovalGate::new(
         queue.clone(),
         waker,
