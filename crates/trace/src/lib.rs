@@ -32,6 +32,6 @@ pub use span::{
     SpanFinalize, SpanHandle, SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallOutput,
     ToolCallResult,
 };
-pub use step::{Step, StepHandle, StepKind};
+pub use step::{CompressionApplied, CompressionTrigger, Step, StepHandle, StepKind};
 
 pub type Result<T> = std::result::Result<T, TraceError>;

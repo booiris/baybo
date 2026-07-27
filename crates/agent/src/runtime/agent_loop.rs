@@ -17,7 +17,8 @@ use tokio::sync::mpsc;
 use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
 use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
+    CompressionApplied, CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult,
+    SpanRecorder, StepHandle, StepKind,
 };
 use tracing::{debug, info, warn};
 
@@ -2538,7 +2539,13 @@ impl AgentLoop {
         cancel_token: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<()> {
-        let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
+        let runner = self.build_compression_runner(
+            session,
+            span_recorder,
+            job_id,
+            cancel_token,
+            CompressionTrigger::Threshold,
+        );
         let model_id = runner.model_info.id.clone();
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
         // report the phase when a pass will actually run; the `Compacted`
@@ -2559,8 +2566,55 @@ impl AgentLoop {
             self.emit_status(delta_tx, session, TurnStatus::Compacted)
                 .await;
         }
+        if let Ok(baybo_context::CompressionOutcome::Compressed { stage }) = &result {
+            Self::record_spanless_compaction(
+                span_recorder,
+                job_id,
+                CompressionTrigger::Threshold,
+                *stage,
+            )
+            .await;
+        }
         result?;
         Ok(())
+    }
+
+    /// Record a compaction that shrank the transcript without an LLM call.
+    ///
+    /// The stored-summary and truncate stages never invoke the chat callback,
+    /// so `CompressionRunner` — which owns the step for the live-summary stage
+    /// — never runs for them. Without this the threshold trim that swaps in
+    /// `summary.md`, i.e. the moment the model's input context actually
+    /// changed, leaves no trace at all. The step carries no span by design:
+    /// there was no model round-trip to span.
+    async fn record_spanless_compaction(
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        trigger: CompressionTrigger,
+        stage: baybo_context::CompressionStage,
+    ) {
+        let applied = match stage {
+            // The live-summary stage already recorded its own step around the
+            // LLM call; recording a second one here would double-count it.
+            baybo_context::CompressionStage::LiveSummary => return,
+            baybo_context::CompressionStage::StoredSummary => CompressionApplied::StoredSummary,
+            baybo_context::CompressionStage::Truncate => CompressionApplied::Truncate,
+        };
+        let kind = StepKind::Compression {
+            trigger: Some(trigger),
+            applied: Some(applied),
+        };
+        match span_recorder.begin_step(job_id, kind).await {
+            Ok(step) => {
+                if let Err(e) = span_recorder
+                    .end_step(step, baybo_trace::LifecycleOutcome::Ok)
+                    .await
+                {
+                    warn!(error = %e, "failed to close the spanless compaction step");
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to record the spanless compaction step"),
+        }
     }
 
     fn build_compression_runner(
@@ -2569,6 +2623,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         cancel_token: &CancellationToken,
+        trigger: CompressionTrigger,
     ) -> CompressionRunner {
         let model_info = self.llm_client.model_info().clone();
         CompressionRunner {
@@ -2580,6 +2635,7 @@ impl AgentLoop {
             session_id: session.id.clone(),
             model_info,
             cancel_token: cancel_token.clone(),
+            trigger,
         }
     }
 
@@ -2799,8 +2855,13 @@ impl AgentLoop {
             cancel_token.clone(),
             spec,
             |job_id| async move {
-                let runner =
-                    self.build_compression_runner(session, span_recorder, job_id, &cancel_token);
+                let runner = self.build_compression_runner(
+                    session,
+                    span_recorder,
+                    job_id,
+                    &cancel_token,
+                    CompressionTrigger::Forced,
+                );
                 let model_id = runner.model_info.id.clone();
                 let outcome = self
                     .context_manager
@@ -2808,8 +2869,17 @@ impl AgentLoop {
                         runner.run(req, marker).await.map(|run| run.response)
                     })
                     .await?;
+                if let baybo_context::CompressionOutcome::Compressed { stage } = &outcome {
+                    Self::record_spanless_compaction(
+                        span_recorder,
+                        job_id,
+                        CompressionTrigger::Forced,
+                        *stage,
+                    )
+                    .await;
+                }
                 let text = match outcome {
-                    baybo_context::CompressionOutcome::Compressed => {
+                    baybo_context::CompressionOutcome::Compressed { .. } => {
                         "Context compressed.".to_string()
                     }
                     baybo_context::CompressionOutcome::BelowThreshold => {

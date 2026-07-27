@@ -38,15 +38,40 @@ export function isTerminal(state: LifecycleState): boolean {
 
 // ── Step ──────────────────────────────────────────────────────────────
 
+/**
+ * Why a compaction ran (mirrors `baybo_trace::CompressionTrigger`).
+ * `threshold` / `forced` rewrote the transcript the NEXT llm_call reads — those
+ * are the moments the model's input context actually changed. `background` only
+ * refreshes `summary.md` and does not touch the live transcript. Absent on rows
+ * written before the trigger was recorded.
+ */
+export type CompressionTrigger = 'threshold' | 'forced' | 'background';
+
+/**
+ * How a compaction shrank the transcript (mirrors `baybo_trace::CompressionApplied`).
+ * Only `live_summary` made an LLM call — `stored_summary` swaps in the `summary.md`
+ * a background pass wrote, and `truncate` drops the middle, so those steps carry no
+ * span. Absent on rows written before it was recorded.
+ */
+export type CompressionApplied = 'stored_summary' | 'live_summary' | 'truncate';
+
+/** Whether a compaction changed what the next LLM call was sent. */
+export function changesNextInput(trigger: CompressionTrigger | null | undefined): boolean {
+  return trigger === 'threshold' || trigger === 'forced';
+}
+
 export type StepKind =
   | { kind: 'llm_iteration' }
-  | { kind: 'compression' }
+  | {
+      kind: 'compression';
+      trigger?: CompressionTrigger | null;
+      applied?: CompressionApplied | null;
+    }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }
   | { kind: 'skill_selection' }
   | { kind: 'progress_observer' }
-  | { kind: 'title_generation' }
-  | { kind: 'subagent'; child_session_id: string };
+  | { kind: 'title_generation' };
 
 export type StepKindTag = StepKind['kind'];
 
@@ -201,8 +226,7 @@ export interface ToolCallResult {
 
 export type SpanKind =
   | { kind: 'llm_call'; begin: LlmCallBegin; result?: LlmCallResult | null }
-  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null }
-  | { kind: 'subagent_stub'; child_session_id: string };
+  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null };
 
 export type SpanKindTag = SpanKind['kind'];
 

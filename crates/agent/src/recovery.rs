@@ -466,6 +466,7 @@ mod tests {
         TriggerKind,
     };
     use baybo_trace::test_support::MemoryTraceStore;
+    use baybo_trace::{CompressionApplied, CompressionTrigger};
     use baybo_trace::{
         LlmCallBegin, LlmCallInputs, SpanEvent, SpanEventKind, SpanKind, StepKind, ToolCallBegin,
     };
@@ -850,7 +851,10 @@ mod tests {
         let step = Step {
             id: StepId::new(),
             job_id: job.id,
-            kind: StepKind::Compression,
+            kind: StepKind::compression(
+                CompressionTrigger::Threshold,
+                CompressionApplied::LiveSummary,
+            ),
             started_at: t0 + Duration::seconds(20),
             ended_at: None,
             outcome: LifecycleState::Pending,

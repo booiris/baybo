@@ -51,6 +51,8 @@ pub enum SpanKind {
 - Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: ParallelGroup`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
 - `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection`, `ProgressObserver`, and `TitleGeneration` are first-class Step kinds, not events on an LLM step.
+- `Compression` carries two orthogonal fields. `CompressionTrigger` says **why** it ran (`Threshold` / `Forced` / `Background`): threshold and forced rewrite the transcript the **next** `LlmCall` reads — those are the moments the model's input context changed — while the background pass only refreshes the session's `summary.md` and leaves the live transcript alone. `CompressionApplied` says **how** the flow shrank it (`StoredSummary` / `LiveSummary` / `Truncate`).
+- **Only `LiveSummary` makes an LLM call**, so only that stage produces a step with an `LlmCall` span. The stored-summary and truncate stages rewrite the context with no model round-trip; the agent records their step explicitly (`record_spanless_compaction`), because otherwise the threshold trim that swaps in `summary.md` — the compaction an operator most wants to see — would leave no trace at all. A `Compression` step with zero spans is therefore expected, not a defect.
 
 ### Provenance lives on Span variants, not on Step
 

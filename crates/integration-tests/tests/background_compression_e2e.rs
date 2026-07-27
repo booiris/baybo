@@ -37,7 +37,7 @@ use baybo_model::{
     ChannelType, ChatMessage, ContentBlock, Session, SessionId, SessionState, TriggerSource, User,
 };
 use baybo_storage::Store;
-use baybo_trace::{Step, StepKind, TraceStore};
+use baybo_trace::{CompressionTrigger, Step, StepKind, TraceStore};
 use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use tempfile::TempDir;
@@ -788,7 +788,18 @@ async fn agent_background_pass_records_compression_step_on_parent_job() {
         .collect();
     let compression_steps: Vec<_> = steps
         .iter()
-        .filter(|step| matches!(step.kind, StepKind::Compression))
+        // Asserting the trigger, not just the kind: this suite exists to prove
+        // the DETACHED pass ran, and an inline compaction would otherwise
+        // satisfy a bare `StepKind::Compression` match.
+        .filter(|step| {
+            matches!(
+                step.kind,
+                StepKind::Compression {
+                    trigger: Some(CompressionTrigger::Background),
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(
         compression_steps.len(),

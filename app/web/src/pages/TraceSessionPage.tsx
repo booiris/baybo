@@ -1,444 +1,74 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   RiArrowLeftLine,
-  RiArchiveLine,
-  RiBookmark3Line,
-  RiBroadcastLine,
-  RiBrainLine,
+  RiArrowRightLine,
   RiCornerDownLeftLine,
   RiCornerDownRightLine,
   RiCpuLine,
   RiLoader4Line,
-  RiPriceTag3Line,
   RiRefreshLine,
-  RiSave3Line,
-  RiSearchEyeLine,
-  RiTeamLine,
-  RiToolsLine,
-  RiArrowRightLine,
 } from 'react-icons/ri';
-import type { IconType } from 'react-icons';
 import { IconButton } from '../components/IconButton';
 import { Button } from '../components/Button';
 import { useAdminClient, useAuth } from '../api/auth';
-import { getMockJobTrace, getMockTraceOverview } from '../api/mock';
-import { useMockMode } from '../api/mock';
+import { getMockJobTrace, getMockTraceOverview, useMockMode } from '../api/mock';
 import type {
-  ChatMessage,
-  ContentBlock,
-  JobTrace,
-  LifecycleState,
+  JobStatusKind,
   LlmCallInputs,
+  JobTrace,
   ReplayStep,
   SecretKind,
   SessionMessageRow,
   Span,
   SpanEvent,
-  SpanKindTag,
-  Step,
-  StepKindTag,
   ToolEventPayload,
   TraceJobSummary,
   TraceOverview,
 } from '../types/trace';
-import {
-  isTerminal,
-  resolveInputMessages,
-  resolveToolCallOutput,
-} from '../types/trace';
+import { resolveInputMessages, resolveToolCallOutput } from '../types/trace';
 import { MessageList } from '../components/trace/MessageList';
 import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/SanitizeChip';
+import { TraceTree } from '../components/trace/TraceTree';
+import { TraceOverviewBar } from '../components/trace/TraceOverviewBar';
+import type { TraceGroup } from '../components/trace/traceFormat';
+import { JobAnchors } from '../components/trace/JobAnchors';
+import {
+  contentText,
+  durationMs,
+  formatDuration,
+  formatTime,
+  jobDurationMs,
+  jobInputText,
+  jobOutputText,
+  jobQueuedMs,
+  OutcomeBadge,
+  SPAWN_SUBAGENT_TOOL,
+  spanVisual,
+  spanVisualOf,
+  stepSummaryText,
+  stepVisual,
+  summaryTokens,
+  traceTokens,
+} from '../components/trace/traceFormat';
+import {
+  findSpan,
+  findStep,
+  isExternalAgentJob,
+  isJobLive,
+  neededJobIds,
+  traceHasPendingSpan,
+} from '../components/trace/traceTreeModel';
 
 const POLL_ACTIVE_MS = 2_000;
 const POLL_TERMINAL_MS = 10_000;
 
-// ── Visual mapping per StepKind ──────────────────────────────────────
-
-interface KindVisual {
-  icon: IconType;
-  accent: string; // tailwind text color
-  bg: string; // tailwind bg color (for the icon disc)
-  label: string;
-}
-
-const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
-  llm_iteration: {
-    icon: RiBrainLine,
-    accent: 'text-brand',
-    bg: 'bg-brand/10',
-    label: 'LLM iteration',
-  },
-  compression: {
-    icon: RiArchiveLine,
-    accent: 'text-ink-soft',
-    bg: 'bg-gray-100',
-    label: 'Compression',
-  },
-  memory_recall: {
-    icon: RiSearchEyeLine,
-    accent: 'text-info',
-    bg: 'bg-info/10',
-    label: 'Memory recall',
-  },
-  memory_write: {
-    icon: RiSave3Line,
-    accent: 'text-ok',
-    bg: 'bg-ok/10',
-    label: 'Memory write',
-  },
-  skill_selection: {
-    icon: RiBookmark3Line,
-    accent: 'text-ok',
-    bg: 'bg-ok/10',
-    label: 'Skill selection',
-  },
-  progress_observer: {
-    icon: RiBroadcastLine,
-    accent: 'text-info',
-    bg: 'bg-info/10',
-    label: 'Progress observer',
-  },
-  title_generation: {
-    icon: RiPriceTag3Line,
-    accent: 'text-ink-soft',
-    bg: 'bg-gray-100',
-    label: 'Title generation',
-  },
-  subagent: {
-    icon: RiTeamLine,
-    accent: 'text-brand',
-    bg: 'bg-brand/10',
-    label: 'Subagent',
-  },
-};
-
-const SPAN_VISUALS: Record<SpanKindTag, KindVisual> = {
-  llm_call: {
-    icon: RiBrainLine,
-    accent: 'text-brand',
-    bg: 'bg-brand/10',
-    label: 'LLM call',
-  },
-  tool_call: {
-    icon: RiToolsLine,
-    accent: 'text-warn',
-    bg: 'bg-warn/10',
-    label: 'Tool call',
-  },
-  subagent_stub: {
-    icon: RiTeamLine,
-    accent: 'text-brand',
-    bg: 'bg-brand/10',
-    label: 'Subagent stub',
-  },
-};
-
-// A kind the frontend doesn't know yet (wire drift, or a new Rust variant
-// shipped ahead of this map) must degrade to a generic row — never let a
-// `STEP_VISUALS[kind].icon` on `undefined` throw and white-screen the whole
-// trace view. The raw tag becomes the label so it's still legible.
-const FALLBACK_VISUAL: KindVisual = {
-  icon: RiCpuLine,
-  accent: 'text-ink-soft',
-  bg: 'bg-gray-100',
-  label: 'step',
-};
-
-function stepVisual(kind: StepKindTag): KindVisual {
-  return STEP_VISUALS[kind] ?? { ...FALLBACK_VISUAL, label: kind };
-}
-
-function spanVisual(kind: SpanKindTag): KindVisual {
-  return SPAN_VISUALS[kind] ?? { ...FALLBACK_VISUAL, label: kind };
-}
-
-// ── Utilities ────────────────────────────────────────────────────────
-
-function durationMs(span: { started_at: string; ended_at?: string | null }): number | null {
-  if (!span.ended_at) return null;
-  return Math.max(0, new Date(span.ended_at).getTime() - new Date(span.started_at).getTime());
-}
-
-function formatDuration(ms: number | null): string {
-  if (ms === null) return '…';
-  if (ms < 1_000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1_000).toFixed(2)} s`;
-  return `${(ms / 60_000).toFixed(2)} min`;
-}
-
-function formatTime(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-}
-
-function outcomeColor(state: LifecycleState): string {
-  switch (state.outcome) {
-    case 'pending':
-      return 'text-info';
-    case 'ok':
-      return 'text-ok';
-    case 'failed':
-      return 'text-err';
-    case 'cancelled':
-      return 'text-ink-soft';
-  }
-}
-
-function outcomeLabel(state: LifecycleState): string {
-  switch (state.outcome) {
-    case 'pending':
-      return 'pending';
-    case 'ok':
-      return 'ok';
-    case 'failed':
-      return 'failed';
-    case 'cancelled':
-      return `cancelled (${state.reason})`;
-  }
-}
-
-function OutcomeBadge({ state }: { state: LifecycleState }) {
-  const cls = outcomeColor(state);
-  return (
-    <span className={`inline-flex items-center text-[0.7rem] font-bold uppercase tracking-wider ${cls}`}>
-      {state.outcome === 'pending' && (
-        <span className="inline-block w-2 h-2 rounded-full bg-info animate-pulse mr-1.5" />
-      )}
-      {outcomeLabel(state)}
-    </span>
-  );
-}
-
-// ── Step summary text per StepKind ───────────────────────────────────
-
-function stepSummaryText(step: Step, spans: Span[]): string {
-  const k = step.kind.kind;
-  switch (k) {
-    case 'llm_iteration': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call') {
-        const model = llm.kind.begin.model_id;
-        const tools = spans.filter((s) => s.kind.kind === 'tool_call').length;
-        return tools > 0 ? `${model} • ${tools} tool ${tools === 1 ? 'call' : 'calls'}` : model;
-      }
-      return 'llm iteration';
-    }
-    case 'compression': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result) {
-        const inT = llm.kind.result.input_tokens ?? 0;
-        const outT = llm.kind.result.output_tokens ?? 0;
-        return `${inT.toLocaleString()} → ${outT.toLocaleString()} tokens`;
-      }
-      return 'compression';
-    }
-    case 'memory_recall': {
-      const tool = spans.find((s) => s.kind.kind === 'tool_call');
-      if (tool && tool.kind.kind === 'tool_call') {
-        return `recall via ${tool.kind.begin.tool_name}`;
-      }
-      return 'memory recall';
-    }
-    case 'memory_write':
-      return `wrote ${spans.length} memor${spans.length === 1 ? 'y' : 'ies'}`;
-    case 'skill_selection': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result?.output_content) {
-        return llm.kind.result.output_content.slice(0, 80);
-      }
-      return 'skill selection';
-    }
-    case 'progress_observer': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result?.output_content) {
-        return llm.kind.result.output_content.slice(0, 80);
-      }
-      return 'progress update';
-    }
-    case 'title_generation': {
-      const llm = spans.find((s) => s.kind.kind === 'llm_call');
-      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result?.output_content) {
-        return llm.kind.result.output_content.slice(0, 80);
-      }
-      return 'conversation title';
-    }
-    case 'subagent':
-      return `child ${step.kind.child_session_id}`;
-  }
-}
-
-// ── Span list with pairing connector + parallel chip ─────────────────
-
-function SpanRow({
-  span,
-  selected,
-  interjected,
-  onSelect,
-}: {
-  span: Span;
-  selected: boolean;
-  interjected: boolean;
-  onSelect: (id: string) => void;
-}) {
-  const visual = spanVisual(span.kind.kind);
-  const Icon = visual.icon;
-  const ms = durationMs(span);
-
-  let title = '';
-  let subtitle = '';
-  if (span.kind.kind === 'llm_call') {
-    title = span.kind.begin.model_id;
-    if (span.kind.result) {
-      const cached = span.kind.result.cached_input_tokens ?? 0;
-      subtitle = `${span.kind.result.input_tokens ?? 0} in / ${span.kind.result.output_tokens ?? 0} out${
-        cached > 0 ? ` (${cached} cached)` : ''
-      }`;
-    } else {
-      subtitle = 'in flight';
-    }
-  } else if (span.kind.kind === 'tool_call') {
-    title = span.kind.begin.tool_name;
-    if (!span.kind.result) {
-      subtitle = 'in flight';
-    } else if (span.kind.result.success) {
-      subtitle = 'success';
-    } else {
-      // Surface the structured outcome reason when present — the row
-      // is otherwise the only place a glanceable error sits.
-      subtitle =
-        span.outcome.outcome === 'failed' && span.outcome.reason
-          ? `failed: ${span.outcome.reason}`
-          : 'failed';
-    }
-  } else {
-    title = `subagent → ${span.kind.child_session_id}`;
-    subtitle = 'wait window';
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={() => onSelect(span.id)}
-      className={`w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md transition-all ${
-        selected
-          ? 'bg-selected shadow-brutal-xs'
-          : 'bg-white hover:bg-gray-50 hover:shadow-brutal-xs'
-      }`}
-    >
-      <div
-        className={`w-8 h-8 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}
-      >
-        <Icon className={`${visual.accent} text-base`} />
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="font-bold uppercase tracking-wide text-[0.85rem] truncate">{title}</span>
-          {interjected && (
-            <span
-              title="A mid-turn user interjection was folded into this iteration's input"
-              className="shrink-0 inline-flex items-center gap-1 text-[0.7rem] font-bold uppercase tracking-wider text-warn border-2 border-warn rounded px-1"
-            >
-              <RiCornerDownLeftLine className="text-[0.75rem]" />
-              interjected
-            </span>
-          )}
-          {span.parallel_group && (
-            <span className="text-[0.7rem] font-bold uppercase tracking-wider text-warn border-2 border-warn rounded px-1">
-              ‖ parallel
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-3 text-[0.75rem] text-ink-soft font-mono mt-0.5 min-w-0">
-          <span className="shrink-0">{visual.label}</span>
-          <span className="shrink-0">•</span>
-          <span className="truncate">{subtitle}</span>
-        </div>
-      </div>
-      <div className="shrink-0 text-right">
-        <div className="text-[0.75rem] font-mono text-ink">{formatDuration(ms)}</div>
-        <div className="mt-0.5">
-          <OutcomeBadge state={span.outcome} />
-        </div>
-      </div>
-    </button>
-  );
-}
-
-function StepBlock({
-  rs,
-  selectedSpanId,
-  interjectionSpanIds,
-  onSelect,
-}: {
-  rs: ReplayStep;
-  selectedSpanId: string | null;
-  interjectionSpanIds: Set<string>;
-  onSelect: (id: string) => void;
-}) {
-  const { step, spans } = rs;
-  const visual = stepVisual(step.kind.kind);
-  const Icon = visual.icon;
-  const summary = stepSummaryText(step, spans);
-  const ms = durationMs(step);
-
-  // Sibling spans, sorted by started_at (the wire already does so but
-  // be defensive).
-  const sortedSpans = useMemo(
-    () =>
-      [...spans].sort(
-        (a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime(),
-      ),
-    [spans],
-  );
-
-  // Group consecutive parallel-group siblings to render the "‖" rail.
-  return (
-    <div className="bg-surface border-[3px] border-black rounded-md shadow-brutal flex flex-col">
-      <div className="flex items-center gap-3 px-4 py-3 border-b-2 border-black">
-        <div
-          className={`w-9 h-9 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}
-        >
-          <Icon className={`${visual.accent} text-lg`} />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="font-bold uppercase tracking-wider text-[0.85rem]">{visual.label}</span>
-            <OutcomeBadge state={step.outcome} />
-          </div>
-          <div className="text-[0.85rem] text-ink-soft font-mono truncate">{summary}</div>
-        </div>
-        <div className="shrink-0 text-right">
-          <div className="text-[0.75rem] text-ink-soft font-mono">{formatTime(step.started_at)}</div>
-          <div className="text-[0.75rem] text-ink font-mono">{formatDuration(ms)}</div>
-        </div>
-      </div>
-      <div className="px-4 py-3 bg-surface flex flex-col gap-2">
-        {sortedSpans.length === 0 && (
-          <div className="text-ink-soft text-[0.85rem] italic">No spans yet…</div>
-        )}
-        {sortedSpans.map((span) => (
-          <SpanRow
-            key={span.id}
-            span={span}
-            selected={selectedSpanId === span.id}
-            interjected={interjectionSpanIds.has(span.id)}
-            onSelect={onSelect}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
+type DetailTab = 'io' | 'meta' | 'events';
 
 // ── Right-hand detail panel (per-kind) ───────────────────────────────
 
-function SanitizeKindHint(events: SpanEvent[] | undefined): SecretKind | undefined {
+function sanitizeKindHint(events: SpanEvent[] | undefined): SecretKind | undefined {
   for (const e of events ?? []) {
     if (e.kind.kind === 'sanitize_hit' && e.kind.kinds.length > 0) {
       return e.kind.kinds[0];
@@ -447,23 +77,12 @@ function SanitizeKindHint(events: SpanEvent[] | undefined): SecretKind | undefin
   return undefined;
 }
 
-function LlmCallDetail({
-  span,
-  messageLog,
-}: {
-  span: Span;
-  messageLog: SessionMessageRow[];
-}) {
+function LlmCallDetail({ span, messageLog }: { span: Span; messageLog: SessionMessageRow[] }) {
   if (span.kind.kind !== 'llm_call') return null;
   const { begin, result } = span.kind;
-  const hint = SanitizeKindHint(span.events);
-  const failureReason =
-    span.outcome.outcome === 'failed' ? span.outcome.reason : null;
-  const inputMessages = resolveInputMessages(
-    begin.input_messages,
-    messageLog,
-    span.started_at,
-  );
+  const hint = sanitizeKindHint(span.events);
+  const failureReason = span.outcome.outcome === 'failed' ? span.outcome.reason : null;
+  const inputMessages = resolveInputMessages(begin.input_messages, messageLog, span.started_at);
 
   return (
     <div className="space-y-6">
@@ -507,20 +126,13 @@ function LlmCallDetail({
           )}
           {result.tool_calls && result.tool_calls.length > 0 && (
             <div className="mt-3 space-y-2">
-              <div className="text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
-                Emitted tool calls
-              </div>
+              <div className="text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">Emitted tool calls</div>
               {result.tool_calls.map((tc) => (
-                <div
-                  key={tc.id}
-                  className="border-2 border-black rounded-md p-2 bg-canvas font-mono text-[0.8rem]"
-                >
+                <div key={tc.id} className="border-2 border-black rounded-md p-2 bg-canvas font-mono text-[0.8rem]">
                   <div className="text-ink-soft">
                     {tc.id} → <span className="text-brand font-bold">{tc.name}</span>
                   </div>
-                  <pre className="mt-1 whitespace-pre-wrap break-all">
-                    {JSON.stringify(tc.arguments, null, 2)}
-                  </pre>
+                  <pre className="mt-1 whitespace-pre-wrap break-all">{JSON.stringify(tc.arguments, null, 2)}</pre>
                 </div>
               ))}
             </div>
@@ -535,26 +147,28 @@ function ToolCallDetail({
   span,
   messageLog,
   onJumpToLlm,
+  onDrillIn,
 }: {
   span: Span;
   messageLog: SessionMessageRow[];
   onJumpToLlm: (llmSpanId: string) => void;
+  onDrillIn: (sessionId: string) => void;
 }) {
   if (span.kind.kind !== 'tool_call') return null;
   const { begin, result } = span.kind;
-  const hint = SanitizeKindHint(span.events);
-  const failureReason =
-    span.outcome.outcome === 'failed' ? span.outcome.reason : null;
-  const output = result
-    ? resolveToolCallOutput(result.output, messageLog, span.started_at)
-    : null;
+  const hint = sanitizeKindHint(span.events);
+  const failureReason = span.outcome.outcome === 'failed' ? span.outcome.reason : null;
+  // A larger output rides as a transcript pointer keyed by `tool_use_id` —
+  // resolve it before rendering or the panel shows the raw `$baybo_ref` object.
+  const output = result ? resolveToolCallOutput(result.output, messageLog, span.started_at) : null;
+  const childId =
+    begin.tool_name === SPAWN_SUBAGENT_TOOL && output != null ? childSessionOf(output) : null;
 
   return (
     <div className="space-y-6">
+      {childId != null && <SubagentLink childId={childId} onDrillIn={onDrillIn} />}
       <section>
-        <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-          Tool
-        </h4>
+        <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Tool</h4>
         <div className="font-mono text-[0.95rem] font-bold">{begin.tool_name}</div>
         {begin.triggered_by && (
           <button
@@ -580,9 +194,7 @@ function ToolCallDetail({
       )}
 
       <section>
-        <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-          Params
-        </h4>
+        <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Params</h4>
         <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
           {renderWithSanitizeChips(JSON.stringify(begin.params, null, 2), hint)}
         </pre>
@@ -595,9 +207,8 @@ function ToolCallDetail({
           </h4>
           {result.output_truncated_from != null && (
             <p className="mb-2 font-mono text-[0.75rem] text-warning font-bold">
-              partial output — {result.output_truncated_from.toLocaleString()}{' '}
-              serialized bytes originally. Tool results entering model context
-              use the same 32 KiB ceiling.
+              partial output — {result.output_truncated_from.toLocaleString()} serialized bytes
+              originally. Tool results entering model context use the same 32 KiB ceiling.
             </p>
           )}
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
@@ -612,37 +223,36 @@ function ToolCallDetail({
   );
 }
 
-function SubagentStubDetail({
-  span,
-  onDrillIn,
-}: {
-  span: Span;
-  onDrillIn: (sessionId: string) => void;
-}) {
-  if (span.kind.kind !== 'subagent_stub') return null;
+/** The child session a `spawn_subagent` call produced, read off its result —
+ *  the only place the link survives now that `SubagentStub` spans are gone. */
+function childSessionOf(output: unknown): string | null {
+  if (output != null && typeof output === 'object') {
+    const id = (output as Record<string, unknown>).child_session_id;
+    if (typeof id === 'string' && id !== '') return id;
+  }
+  return null;
+}
+
+function SubagentLink({ childId, onDrillIn }: { childId: string; onDrillIn: (id: string) => void }) {
   return (
-    <div className="space-y-4">
+    <section>
       <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
         Subagent
       </h4>
-      <p className="text-[0.85rem] text-ink-soft">
-        This stub bounds the parent's wait window. The actual work runs in the child session.
+      <p className="text-[0.85rem] text-ink-soft mb-2">
+        This call spawned a child session; the work itself runs there.
       </p>
-      <Button
-        variant="primary"
-        onClick={() => onDrillIn(span.kind.kind === 'subagent_stub' ? span.kind.child_session_id : '')}
-        className="!py-2 !px-4 !text-[0.85rem] gap-2"
-      >
+      <Button variant="primary" onClick={() => onDrillIn(childId)} className="!py-2 !px-4 !text-[0.85rem] gap-2">
         Open child session <RiArrowRightLine />
       </Button>
-    </div>
+    </section>
   );
 }
 
 function MetaTab({ span }: { span: Span }) {
   const ms = durationMs(span);
   const visual = spanVisual(span.kind.kind);
-  const baseRows: [string, React.ReactNode][] = [
+  const baseRows: [string, ReactNode][] = [
     ['Span ID', <code className="break-all">{span.id}</code>],
     ['Step ID', <code className="break-all">{span.step_id}</code>],
     ['Kind', visual.label],
@@ -690,8 +300,6 @@ function MetaTab({ span }: { span: Span }) {
         </code>,
       ]);
     }
-  } else if (span.kind.kind === 'subagent_stub') {
-    baseRows.push(['Child session', <code className="break-all">{span.kind.child_session_id}</code>]);
   }
   return (
     <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 font-mono text-[0.85rem]">
@@ -705,13 +313,7 @@ function MetaTab({ span }: { span: Span }) {
   );
 }
 
-function ToolEventRow({
-  action,
-  payload,
-}: {
-  action: string;
-  payload: ToolEventPayload;
-}) {
+function ToolEventRow({ action, payload }: { action: string; payload: ToolEventPayload }) {
   if (payload.type === 'phase') {
     return (
       <div className="flex items-baseline justify-between font-mono text-[0.85rem] gap-3">
@@ -729,17 +331,13 @@ function ToolEventRow({
             {payload.status} · {payload.bytes} B
           </span>
         </div>
-        {payload.content_type && (
-          <div className="text-ink-soft break-all">{payload.content_type}</div>
-        )}
+        {payload.content_type && <div className="text-ink-soft break-all">{payload.content_type}</div>}
         {payload.body_preview && (
           <details>
             <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
               Body preview ({payload.body_preview.length} chars)
             </summary>
-            <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
-              {payload.body_preview}
-            </pre>
+            <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">{payload.body_preview}</pre>
           </details>
         )}
       </div>
@@ -752,9 +350,7 @@ function ToolEventRow({
           <span className="break-all">{action}</span>
           <span className="font-bold shrink-0 text-warning">parse failed</span>
         </div>
-        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
-          {payload.command}
-        </pre>
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">{payload.command}</pre>
       </div>
     );
   }
@@ -768,17 +364,13 @@ function ToolEventRow({
         <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
           Input ({payload.input.length} chars)
         </summary>
-        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
-          {payload.input}
-        </pre>
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">{payload.input}</pre>
       </details>
       <details>
         <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
           Output ({payload.output.length} chars)
         </summary>
-        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
-          {payload.output}
-        </pre>
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">{payload.output}</pre>
       </details>
     </div>
   );
@@ -791,10 +383,7 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
   return (
     <div className="space-y-3">
       {events.map((e) => (
-        <div
-          key={`${e.span_id}-${e.seq}`}
-          className="border-2 border-black rounded-md p-3 bg-canvas"
-        >
+        <div key={`${e.span_id}-${e.seq}`} className="border-2 border-black rounded-md p-3 bg-canvas">
           <div className="flex items-center justify-between mb-2">
             <span className="font-bold uppercase tracking-wider text-[0.75rem]">
               {e.kind.kind === 'sanitize_hit'
@@ -878,8 +467,8 @@ function SpanDetailPanel({
 }: {
   span: Span;
   messageLog: SessionMessageRow[];
-  tab: 'io' | 'meta' | 'events';
-  onTabChange: (t: 'io' | 'meta' | 'events') => void;
+  tab: DetailTab;
+  onTabChange: (t: DetailTab) => void;
   onJumpToLlm: (id: string) => void;
   onDrillIn: (id: string) => void;
 }) {
@@ -890,19 +479,15 @@ function SpanDetailPanel({
   const ms = durationMs(span);
 
   return (
-    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+    <div className="flex-1 min-h-0 flex flex-col">
       <div className="flex flex-col border-b-[3px] border-black bg-canvas">
         <div className="flex items-center p-4 pb-2">
           <div className="flex items-center gap-3 min-w-0">
-            <div
-              className={`w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}
-            >
+            <div className={`w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}>
               <Icon className={`${visual.accent} text-xl`} />
             </div>
             <div className="min-w-0">
-              <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
-                {visual.label}
-              </h3>
+              <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">{visual.label}</h3>
               <div className="text-ink-soft text-[0.8rem] font-mono">
                 {span.kind.kind} • {formatDuration(ms)}
               </div>
@@ -911,7 +496,6 @@ function SpanDetailPanel({
         </div>
         <div className="flex px-4 gap-6 relative top-[3px]">
           {(['io', 'meta', 'events'] as const).map((t) => {
-            // Hide events tab when there are zero events.
             if (t === 'events' && eventCount === 0) return null;
             const active = t === tab;
             return (
@@ -934,14 +518,13 @@ function SpanDetailPanel({
         {tab === 'io' &&
           (span.kind.kind === 'llm_call' ? (
             <LlmCallDetail span={span} messageLog={messageLog} />
-          ) : span.kind.kind === 'tool_call' ? (
+          ) : (
             <ToolCallDetail
               span={span}
               messageLog={messageLog}
               onJumpToLlm={onJumpToLlm}
+              onDrillIn={onDrillIn}
             />
-          ) : (
-            <SubagentStubDetail span={span} onDrillIn={onDrillIn} />
           ))}
         {tab === 'meta' && <MetaTab span={span} />}
         {tab === 'events' && <EventsTab events={events} />}
@@ -950,217 +533,96 @@ function SpanDetailPanel({
   );
 }
 
-// ── Job helpers (summary-level vs trace-level) ──────────────────────
+// ── Step-level detail (no span selected) ─────────────────────────────
 
-// Total job execution time. Prefers the backend's `started_at`/`ended_at`
-// (covers setup, teardown, and gaps that fall outside any step) and
-// falls back to deriving from step timestamps for older traces where
-// the wire didn't carry job-level times. For in-flight jobs we use
-// `now` as the upper bound so the counter keeps ticking; callers
-// re-render on each poll. Accepts an optional loaded trace so we can
-// fall back when the summary is missing `started_at`.
-function jobDurationMs(
-  job: { started_at?: string | null; ended_at?: string | null },
-  trace: JobTrace | undefined,
-): number | null {
-  if (job.started_at) {
-    const start = new Date(job.started_at).getTime();
-    const end = job.ended_at ? new Date(job.ended_at).getTime() : Date.now();
-    return Math.max(0, end - start);
-  }
-  if (!trace) return null;
-  let minStart = Infinity;
-  let maxEnd = -Infinity;
-  let inFlight = false;
-  for (const rs of trace.steps) {
-    const start = new Date(rs.step.started_at).getTime();
-    if (start < minStart) minStart = start;
-    if (rs.step.ended_at) {
-      const end = new Date(rs.step.ended_at).getTime();
-      if (end > maxEnd) maxEnd = end;
-    } else {
-      inFlight = true;
-    }
-  }
-  if (minStart === Infinity) return null;
-  const end = inFlight ? Date.now() : maxEnd;
-  if (end === -Infinity) return null;
-  return Math.max(0, end - minStart);
-}
-
-// Time the job sat in queue before execution started. Only meaningful
-// when both timestamps are present; returns null for legacy traces or
-// jobs that never started.
-function jobQueuedMs(job: { created_at?: string | null; started_at?: string | null }): number | null {
-  if (!job.created_at || !job.started_at) return null;
-  return Math.max(
-    0,
-    new Date(job.started_at).getTime() - new Date(job.created_at).getTime(),
-  );
-}
-
-interface JobTokenTotals {
-  input: number;
-  output: number;
-  cached: number;
-  cacheCreate: number;
-  inputTotal: number;
-}
-
-function summaryTokens(summary: TraceJobSummary): JobTokenTotals {
-  return {
-    input: summary.input_tokens,
-    output: summary.output_tokens,
-    cached: summary.cached_input_tokens,
-    cacheCreate: summary.cache_creation_input_tokens,
-    inputTotal:
-      summary.input_tokens + summary.cached_input_tokens + summary.cache_creation_input_tokens,
-  };
-}
-
-// Derive token totals from a loaded JobTrace's spans. Used when we
-// have the full step/span tree (active job that finished loading).
-// Otherwise prefer `summaryTokens` so the sidebar stays populated for
-// jobs the user hasn't drilled into yet.
-function traceTokens(trace: JobTrace): JobTokenTotals {
-  let input = 0;
-  let output = 0;
-  let cached = 0;
-  let cacheCreate = 0;
-  for (const rs of trace.steps) {
-    for (const span of rs.spans) {
-      if (span.kind.kind === 'llm_call' && span.kind.result) {
-        input += span.kind.result.input_tokens ?? 0;
-        output += span.kind.result.output_tokens ?? 0;
-        cached += span.kind.result.cached_input_tokens ?? 0;
-        cacheCreate += span.kind.result.cache_creation_input_tokens ?? 0;
-      }
-    }
-  }
-  return { input, output, cached, cacheCreate, inputTotal: input + cached + cacheCreate };
-}
-
-// Flatten a message's content blocks into a single display string (text
-// verbatim; non-text blocks as a `[kind …]` placeholder).
-function contentText(content: ContentBlock[]): string {
-  const parts: string[] = [];
-  for (const block of content) {
-    if ('Text' in block) parts.push(block.Text);
-    else if ('ToolResult' in block) parts.push(`[tool_result ${block.ToolResult.tool_use_id}]`);
-    else if ('Image' in block) parts.push(`[image ${block.Image.mime_type}]`);
-    else if ('Audio' in block) parts.push(`[audio ${block.Audio.mime_type}]`);
-    else if ('File' in block) parts.push(`[file ${block.File.filename}]`);
-  }
-  return parts.join('\n');
-}
-
-// Derive the user-facing input that kicked off the job: the last
-// message in the *first* LLM call's input_messages whose `source` is
-// 'user'. The agent injects several `Role::User` messages of its own
-// (skill reminders, system-reminders) so role alone isn't enough to
-// identify the genuine prompt. Requires the message log because the
-// LLM call may reference it via `LlmCallInputs::Persisted`.
-function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string | null {
-  for (const rs of trace.steps) {
-    for (const span of rs.spans) {
-      if (span.kind.kind === 'llm_call') {
-        const messages: ChatMessage[] = resolveInputMessages(
-          span.kind.begin.input_messages,
-          messageLog,
-          span.started_at,
-        );
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].source === 'user') {
-            const text = contentText(messages[i].content);
-            return text.length > 0 ? text : null;
-          }
-        }
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
-// Derive the final output text of the job: the most recent LLM call's
-// output_content (walking jobs back-to-front).
-function jobOutputText(trace: JobTrace): string | null {
-  for (let i = trace.steps.length - 1; i >= 0; i--) {
-    const rs = trace.steps[i];
-    for (let j = rs.spans.length - 1; j >= 0; j--) {
-      const span = rs.spans[j];
-      if (span.kind.kind === 'llm_call' && span.kind.result?.output_content) {
-        return span.kind.result.output_content;
-      }
-    }
-  }
-  return null;
-}
-
-function formatTok(n: number): string {
-  if (n < 1_000) return n.toString();
-  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(2)}M`;
-}
-
-// ── Job sidebar (multi-job picker) ─────────────────────────────────
-
-function JobSidebar({
-  jobs,
-  active,
-  interjectionCounts,
-  onChange,
+function StepDetail({
+  rs,
+  jobId,
+  onSelectSpan,
 }: {
-  jobs: TraceJobSummary[];
-  active: string;
-  interjectionCounts: Map<string, number>;
-  onChange: (id: string) => void;
+  rs: ReplayStep;
+  jobId: string;
+  onSelectSpan: (jobId: string, spanId: string) => void;
 }) {
+  const { step, spans } = rs;
+  const visual = stepVisual(step.kind.kind);
+  const Icon = visual.icon;
+  const ms = durationMs(step);
+  const failureReason =
+    step.outcome.outcome === 'failed'
+      ? step.outcome.reason
+      : step.outcome.outcome === 'cancelled'
+        ? `cancelled (${step.outcome.reason})`
+        : null;
+
   return (
-    <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-canvas flex flex-col z-10 overflow-y-auto">
-      <div className="px-2 py-1.5 border-b-2 border-black font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft bg-canvas">
-        Jobs · {jobs.length}
+    <div className="flex-1 min-h-0 flex flex-col">
+      <div className="flex items-center gap-3 min-w-0 p-4 border-b-[3px] border-black bg-canvas">
+        <div className={`w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}>
+          <Icon className={`${visual.accent} text-xl`} />
+        </div>
+        <div className="min-w-0">
+          <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">{visual.label}</h3>
+          <div className="text-ink-soft text-[0.8rem] font-mono flex items-center gap-2">
+            <OutcomeBadge state={step.outcome} /> • {formatDuration(ms)}
+          </div>
+        </div>
       </div>
-      <div className="flex flex-col">
-        {jobs.map((j, i) => {
-          const isActive = j.job_id === active;
-          const { inputTotal, output } = summaryTokens(j);
-          return (
-            <button
-              type="button"
-              key={j.job_id}
-              onClick={() => onChange(j.job_id)}
-              className={`px-2 py-1.5 text-left border-b border-black/20 cursor-pointer transition-colors border-l-[3px] ${
-                isActive
-                  ? 'bg-brand/10 border-l-brand'
-                  : 'bg-white hover:bg-gray-50 border-l-transparent'
-              }`}
-            >
-              <div className="font-bold text-[0.85rem] leading-tight">#{i + 1}</div>
-              <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5 truncate">
-                {j.job_status_kind}
-              </div>
-              <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5">
-                ↑{formatTok(inputTotal)} ↓{formatTok(output)}
-              </div>
-              {(interjectionCounts.get(j.job_id) ?? 0) > 0 && (
-                <div
-                  title="This job folded in mid-turn user message(s) (steering)"
-                  className="mt-1 inline-flex items-center gap-0.5 border-2 border-black rounded bg-warn/15 px-1 py-px text-[0.6rem] font-bold uppercase tracking-wider text-warn"
-                >
-                  <RiCornerDownLeftLine className="text-[0.7rem]" />
-                  {interjectionCounts.get(j.job_id)}
-                </div>
-              )}
-            </button>
-          );
-        })}
+
+      <div className="flex-1 overflow-y-scroll p-5 space-y-6">
+        <section>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Summary</h4>
+          <div className="font-mono text-[0.85rem] text-ink-soft">{stepSummaryText(step, spans)}</div>
+        </section>
+
+        {failureReason && (
+          <section>
+            <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-err pb-1 text-err">
+              Failure reason
+            </h4>
+            <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-all text-err">
+              {failureReason}
+            </div>
+          </section>
+        )}
+
+        {spans.length > 0 && (
+          <section>
+            <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
+              Spans ({spans.length})
+            </h4>
+            <div className="space-y-2">
+              {spans.map((s) => {
+                const sv = spanVisualOf(s);
+                const SvIcon = sv.icon;
+                const title = s.kind.kind === 'llm_call' ? s.kind.begin.model_id : s.kind.begin.tool_name;
+                return (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => onSelectSpan(jobId, s.id)}
+                    className="w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md bg-white hover:bg-gray-50 hover:shadow-brutal-xs transition-all"
+                  >
+                    <div className={`w-8 h-8 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${sv.bg}`}>
+                      <SvIcon className={`${sv.accent} text-base`} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-[0.85rem] truncate">{title}</div>
+                      <div className="text-[0.72rem] text-ink-soft font-mono">{sv.label}</div>
+                    </div>
+                    <OutcomeBadge state={s.outcome} />
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        )}
       </div>
     </div>
   );
 }
 
-// ── Right panel default: job-level summary ─────────────────────────
+// ── Job-level summary (default detail) ───────────────────────────────
 
 function JobSummaryPanel({
   summary,
@@ -1181,17 +643,9 @@ function JobSummaryPanel({
 }) {
   const interjectionCount = interjections.length;
   if (!summary) {
-    return (
-      <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
-        <div className="p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>
-      </div>
-    );
+    return <div className="flex-1 min-h-0 p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>;
   }
-  // Tokens come from the summary (always present); span-derived figures
-  // (llm/tool counts, input/output text) need the loaded trace.
-  const { input, output, cached, cacheCreate, inputTotal } = trace
-    ? traceTokens(trace)
-    : summaryTokens(summary);
+  const { input, output, cached, cacheCreate, inputTotal } = trace ? traceTokens(trace) : summaryTokens(summary);
   const total = inputTotal + output;
   const inputText = trace ? jobInputText(trace, messageLog) : null;
   const outputText = trace ? jobOutputText(trace) : null;
@@ -1210,7 +664,7 @@ function JobSummaryPanel({
   const queuedMs = jobQueuedMs(summary);
 
   return (
-    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+    <div className="flex-1 min-h-0 flex flex-col">
       <div className="border-b-[3px] border-black bg-canvas p-4">
         <div className="flex items-center gap-3 min-w-0">
           <div className="w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 bg-brand/10">
@@ -1243,9 +697,7 @@ function JobSummaryPanel({
 
       <div className="flex-1 overflow-y-scroll p-5 space-y-6">
         <section>
-          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-            Input
-          </h4>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Input</h4>
           {inputText ? (
             <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {inputText}
@@ -1281,9 +733,7 @@ function JobSummaryPanel({
         )}
 
         <section>
-          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-            Output
-          </h4>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Output</h4>
           {outputText ? (
             <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {outputText}
@@ -1294,17 +744,13 @@ function JobSummaryPanel({
             </div>
           ) : (
             <div className="text-ink-soft text-[0.8rem] italic">
-              {summary.job_status_kind === 'completed'
-                ? 'No output text.'
-                : 'Awaiting final output…'}
+              {summary.job_status_kind === 'completed' ? 'No output text.' : 'Awaiting final output…'}
             </div>
           )}
         </section>
 
         <section>
-          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
-            Activity
-          </h4>
+          <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Activity</h4>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
             <dt className="font-bold text-ink-soft">Job ID</dt>
             <dd className="break-all">
@@ -1354,52 +800,62 @@ function JobSummaryPanel({
         </section>
 
         <section className="text-[0.8rem] text-ink-soft italic">
-          Select a span on the left to inspect its inputs, outputs, and metadata.
+          Select a step or span in the tree to inspect its inputs, outputs, and metadata.
         </section>
       </div>
     </div>
   );
 }
 
-// ── Page ─────────────────────────────────────────────────────────────
-
-function deriveSpanIndex(trace: JobTrace | undefined): Map<string, Span> {
-  const m = new Map<string, Span>();
-  if (!trace) return m;
-  for (const rs of trace.steps) {
-    for (const span of rs.spans) {
-      m.set(span.id, span);
-    }
-  }
-  return m;
+function TranscriptPanel({ messageLog }: { messageLog: SessionMessageRow[] }) {
+  return (
+    <div className="flex-1 min-h-0 flex flex-col">
+      <div className="border-b-[3px] border-black bg-canvas p-4">
+        <h3 className="font-bold uppercase tracking-wider text-[1rem]">Session transcript</h3>
+        <div className="text-ink-soft text-[0.8rem] font-mono">external agent · no step tree</div>
+      </div>
+      <div className="flex-1 overflow-y-scroll p-5">
+        {messageLog.length > 0 ? (
+          <MessageList messages={messageLog.map((r) => r.message)} foldHistory={false} />
+        ) : (
+          <div className="text-ink-soft text-[0.85rem] italic">No transcript recorded.</div>
+        )}
+      </div>
+    </div>
+  );
 }
 
-function findStepIdForSpan(trace: JobTrace | undefined, spanId: string): string | null {
-  if (!trace) return null;
-  for (const rs of trace.steps) {
-    if (rs.spans.some((s) => s.id === spanId)) return rs.step.id;
-  }
-  return null;
+// ── Breadcrumb (orientation for the right-hand detail) ───────────────
+
+interface Crumb {
+  label: string;
+  onClick?: () => void;
 }
 
-function isJobLive(status: string): boolean {
-  return status === 'pending' || status === 'in_progress' || status === 'stuck';
+function Breadcrumb({ crumbs }: { crumbs: Crumb[] }) {
+  return (
+    <div className="shrink-0 flex items-center gap-1 flex-wrap px-4 py-2 border-b-2 border-black bg-canvas font-mono text-[0.7rem] text-ink-soft">
+      {crumbs.map((c, i) => (
+        <span key={i} className="inline-flex items-center gap-1 min-w-0">
+          {i > 0 && <span className="text-ink-soft/50">›</span>}
+          {c.onClick ? (
+            <button type="button" onClick={c.onClick} className="hover:text-ink hover:underline cursor-pointer truncate max-w-[160px]">
+              {c.label}
+            </button>
+          ) : (
+            <span className="truncate max-w-[160px]">{c.label}</span>
+          )}
+        </span>
+      ))}
+    </div>
+  );
 }
 
-function traceHasPendingSpan(trace: JobTrace | undefined): boolean {
-  if (!trace) return false;
-  for (const rs of trace.steps) {
-    if (!isTerminal(rs.step.outcome)) return true;
-    for (const s of rs.spans) {
-      if (!isTerminal(s.outcome)) return true;
-    }
-  }
-  return false;
-}
+// ── Interjection index ───────────────────────────────────────────────
 
-// Precomputed lookup over a session's transcript so the per-span
-// interjection count is O(log N) instead of rebuilding + re-scanning the
-// whole message log for every LLM span on every poll tick.
+// Precomputed lookup over a session's transcript so the per-span interjection
+// count is O(log N) instead of rebuilding + re-scanning the whole message log
+// for every LLM span on every poll tick.
 interface InterjectionIndex {
   // Interjection rows in ascending ordinal order (a small subset), carrying
   // just what the hydration window predicate needs.
@@ -1458,10 +914,10 @@ function maxCreatedUpToOrdinal(index: InterjectionIndex, lastOrdinal: number): n
   return found >= 0 ? prefixMaxCreated[found] : Number.NEGATIVE_INFINITY;
 }
 
-// Count of `user_interjection` messages an LLM span's resolved input folds
-// in, without rebuilding the message list. Mirrors `resolveInputMessages` /
-// `hydratePersistedInput`: the epoch guard drops the whole input (count 0)
-// when the reconstructed prefix holds a row created after the span started;
+// Count of `user_interjection` messages an LLM span's resolved input folds in,
+// without rebuilding the message list. Mirrors `resolveInputMessages` /
+// `hydratePersistedInput`: the epoch guard drops the whole input (count 0) when
+// the reconstructed prefix holds a row created after the span started;
 // otherwise it is (in-window prefix interjections) + (suffix ones).
 function interjectionInputCount(
   input: LlmCallInputs,
@@ -1482,6 +938,8 @@ function interjectionInputCount(
   return count;
 }
 
+// ── Page ─────────────────────────────────────────────────────────────
+
 export function TraceSessionPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -1492,26 +950,44 @@ export function TraceSessionPage() {
 
   const [overview, setOverview] = useState<TraceOverview | null>(null);
   const [jobTraces, setJobTraces] = useState<Map<string, JobTrace>>(() => new Map());
+  const [loadingJobs, setLoadingJobs] = useState<Set<string>>(() => new Set());
+  const [userToggles, setUserToggles] = useState<Map<string, boolean>>(() => new Map());
   const [overviewLoading, setOverviewLoading] = useState(false);
-  const [activeJobLoading, setActiveJobLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [overviewRefreshKey, setOverviewRefreshKey] = useState(0);
-  const [jobRefreshKey, setJobRefreshKey] = useState(0);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [filterRaw, setFilterRaw] = useState('');
+  const [filter, setFilter] = useState('');
+  const [failuresOnly, setFailuresOnly] = useState(false);
+  // Legend group to highlight across the minimap + tree (null = show all).
+  const [highlight, setHighlight] = useState<TraceGroup | null>(null);
 
-  // Mirror the latest committed overview so the incremental poll can read the
-  // currently-held transcript (its cursor + supersede watermark) without
-  // adding `overview` to the fetch effect's deps — which would refire the
-  // effect on every appended delta.
+  // Lets the overview poll read the transcript it currently holds (its cursor +
+  // supersede watermark) without making the fetch effect depend on `overview`
+  // (which it sets — that would re-fire itself every tick).
   const overviewRef = useRef<TraceOverview | null>(null);
   overviewRef.current = overview;
 
+  const inFlight = useRef<Set<string>>(new Set());
+  // The job_status_kind each cached trace was fetched at, so a status change
+  // (live → terminal) triggers a refetch of the finalized tree — a pending-span
+  // heuristic alone misses a job cached at a no-pending moment that then ends.
+  const fetchedStatus = useRef<Map<string, JobStatusKind>>(new Map());
+
+  // Debounce the tree filter text (matches TracesPage/LogsPage cadence).
+  useEffect(() => {
+    const t = window.setTimeout(() => setFilter(filterRaw), 250);
+    return () => window.clearTimeout(t);
+  }, [filterRaw]);
+  const filtering = failuresOnly || filter.trim() !== '';
+
   const sessionId = id ?? '';
   const jobIdParam = searchParams.get('job');
+  const stepIdParam = searchParams.get('step');
   const spanIdParam = searchParams.get('span');
-  const tabParam = (searchParams.get('tab') as 'io' | 'meta' | 'events' | null) ?? 'io';
+  const tabParam = (searchParams.get('tab') as DetailTab | null) ?? 'io';
 
-  // Fetch the overview (session messages + job summaries). A same-session
-  // poll pulls only the transcript delta above the cursor it already holds
+  // Fetch the overview (session messages + job summaries). A same-session poll
+  // pulls only the transcript delta above the cursor it already holds
   // (`since_ordinal`); a fresh session or cold start pulls the full page.
   // `jobs` is always the full (tiny) array — replaced, never merged.
   useEffect(() => {
@@ -1553,9 +1029,7 @@ export function TraceSessionPage() {
       }
       const held = overviewRef.current;
       const sinceOrdinal =
-        held != null && held.session_id === sessionId
-          ? maxOrdinal(held.session_messages)
-          : undefined;
+        held != null && held.session_id === sessionId ? maxOrdinal(held.session_messages) : undefined;
 
       setOverviewLoading(true);
       setError(null);
@@ -1568,8 +1042,8 @@ export function TraceSessionPage() {
         }
         // A moved supersede watermark means a compaction re-marked rows we may
         // already hold: the cached prefix is stale, so drop it and pull the
-        // whole transcript once. (`held != null` whenever `sinceOrdinal` is
-        // set, but the compiler needs the explicit guard to narrow it.)
+        // whole transcript once. (`held != null` whenever `sinceOrdinal` is set,
+        // but the compiler needs the explicit guard to narrow it.)
         if (
           sinceOrdinal != null &&
           held != null &&
@@ -1596,9 +1070,7 @@ export function TraceSessionPage() {
         }
       } catch (e) {
         if (cancelled) return;
-        setError(
-          e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
-        );
+        setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
       } finally {
         if (!cancelled) setOverviewLoading(false);
       }
@@ -1607,38 +1079,128 @@ export function TraceSessionPage() {
     return () => {
       cancelled = true;
     };
-  }, [client, isMock, logout, sessionId, overviewRefreshKey]);
+  }, [client, isMock, logout, sessionId, refreshKey]);
 
-  // Reset cached per-job traces whenever the session changes so
-  // navigating to another session doesn't surface a stale tree.
+  // Reset per-session caches when the session id changes.
   useEffect(() => {
     setJobTraces(new Map());
+    setUserToggles(new Map());
+    inFlight.current = new Set();
+    fetchedStatus.current = new Map();
   }, [sessionId]);
 
-  // Derive the active job id from URL ∩ overview. Default to the oldest job
-  // (sidebar's `#1`) when no URL hint resolves. On a deep link
-  // (`?job=<id>`) the param is trusted *optimistically* until the overview
-  // arrives, so the per-job trace fetch fires concurrently with the
-  // overview instead of waiting to validate it; if the overview then
-  // disowns the id, this recomputes to the default job (and its harmless
-  // 404 fetch is discarded).
+  // Derive the active job id from URL ∩ overview. Default to the oldest job.
   const activeJobId =
-    jobIdParam && (!overview || overview.jobs.some((j) => j.job_id === jobIdParam))
+    jobIdParam && overview?.jobs.some((j) => j.job_id === jobIdParam)
       ? jobIdParam
       : (overview?.jobs[0]?.job_id ?? '');
   const activeJobSummary = overview?.jobs.find((j) => j.job_id === activeJobId);
   const activeJobTrace = activeJobId ? jobTraces.get(activeJobId) : undefined;
-  const messageLog = overview?.session_messages ?? [];
+  const messageLog = useMemo(() => overview?.session_messages ?? [], [overview]);
+  const interjectionIndex = useMemo(() => buildInterjectionIndex(messageLog), [messageLog]);
 
-  // Map each job to the mid-turn user interjections folded into it. A
-  // `user_interjection` row is only persisted mid-drain, so it belongs to the
-  // job whose [started_at, ended_at) window contains its `created_at` — jobs
-  // run sequentially, so the assignment is unambiguous.
+  const fetchJobTrace = useCallback(
+    async (jobId: string, status?: JobStatusKind) => {
+      if (!jobId) return;
+      // `inFlight` dedupes concurrent fetches (double-invoke, overlapping
+      // polls); the cache-hit skip lives in the caller, which holds current
+      // `jobTraces` — so this callback stays a stable identity.
+      if (inFlight.current.has(jobId)) return;
+      inFlight.current.add(jobId);
+      setLoadingJobs((prev) => {
+        const next = new Set(prev);
+        next.add(jobId);
+        return next;
+      });
+      const record = () => {
+        if (status) fetchedStatus.current.set(jobId, status);
+      };
+      try {
+        if (isMock) {
+          const mock = getMockJobTrace(sessionId, jobId);
+          if (mock) {
+            setJobTraces((prev) => new Map(prev).set(jobId, mock));
+            record();
+          }
+          return;
+        }
+        const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}/jobs/{job_id}', {
+          params: { path: { session_id: sessionId, job_id: jobId } },
+        });
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        if (apiError || !response.ok) {
+          // Non-fatal — keep the overview visible; the next poll retries.
+          return;
+        }
+        setJobTraces((prev) => new Map(prev).set(jobId, data as unknown as JobTrace));
+        record();
+      } catch {
+        // Network errors on the per-job fetch are non-fatal.
+      } finally {
+        inFlight.current.delete(jobId);
+        setLoadingJobs((prev) => {
+          const next = new Set(prev);
+          next.delete(jobId);
+          return next;
+        });
+      }
+    },
+    [client, isMock, logout, sessionId],
+  );
+
+  // The jobs whose step tree we need loaded: the failure path + expanded +
+  // selection. While a filter is active every job must load — a content filter
+  // that searched only the already-loaded jobs would silently hide matches.
+  const neededIds = useMemo(() => {
+    if (!overview) return [];
+    if (filtering) return overview.jobs.map((j) => j.job_id);
+    return neededJobIds(overview.jobs, userToggles, activeJobId);
+  }, [overview, userToggles, activeJobId, filtering]);
+
+  // Load missing needed jobs and keep live ones fresh. A poll bumps
+  // `refreshKey` → overview refetches → `neededIds` gets a new identity → this
+  // effect re-runs, refreshing live jobs at the fast cadence. `jobTraces` is
+  // read as a snapshot, NOT a dep — a job becomes needed solely via
+  // `neededIds`/`overview`, and depending on `jobTraces` would make a live
+  // job's completed fetch re-trigger and refetch forever.
+  useEffect(() => {
+    if (!overview) return;
+    for (const jid of neededIds) {
+      const summary = overview.jobs.find((j) => j.job_id === jid);
+      const live = summary ? isJobLive(summary.job_status_kind) : false;
+      const missing = !jobTraces.has(jid);
+      if (missing || live) void fetchJobTrace(jid, summary?.job_status_kind);
+    }
+    // `jobTraces` is a deliberate snapshot read: adding it as a dep would make a
+    // completed fetch re-fire this effect and refetch a live job forever.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [neededIds, overview, fetchJobTrace]);
+
+  // Completion catcher: a job whose cached trace was fetched at a now-stale
+  // status (its last fetch happened while live, before it went terminal) is
+  // refetched once so the finalized tree/output loads. Keyed on `jobTraces` so
+  // it fires even after polling stops (the fast-path load effect above can miss
+  // this when a per-job fetch outlives the poll interval). Excludes live jobs,
+  // so `status` settling makes it converge instead of looping.
+  useEffect(() => {
+    if (!overview) return;
+    for (const summary of overview.jobs) {
+      if (!jobTraces.has(summary.job_id)) continue;
+      if (isJobLive(summary.job_status_kind)) continue;
+      if (fetchedStatus.current.get(summary.job_id) !== summary.job_status_kind) {
+        void fetchJobTrace(summary.job_id, summary.job_status_kind);
+      }
+    }
+  }, [jobTraces, overview, fetchJobTrace]);
+
+  // Interjections folded into each job (the [started, ended) window contains
+  // the interjection row's created_at). Jobs run sequentially → unambiguous.
   const interjectionsByJob = useMemo(() => {
     const byJob = new Map<string, SessionMessageRow[]>();
-    const interjections = (overview?.session_messages ?? []).filter(
-      (r) => r.message.source === 'user_interjection',
-    );
+    const interjections = (overview?.session_messages ?? []).filter((r) => r.message.source === 'user_interjection');
     if (interjections.length === 0) return byJob;
     for (const job of overview?.jobs ?? []) {
       const startIso = job.started_at ?? job.created_at;
@@ -1653,138 +1215,93 @@ export function TraceSessionPage() {
     }
     return byJob;
   }, [overview]);
+
   const interjectionCountByJob = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const [id, rows] of interjectionsByJob) counts.set(id, rows.length);
+    for (const [jid, rows] of interjectionsByJob) counts.set(jid, rows.length);
     return counts;
   }, [interjectionsByJob]);
 
-  const interjectionIndex = useMemo(() => buildInterjectionIndex(messageLog), [messageLog]);
-  // LLM-call spans of the active job whose input first folds in a mid-turn
-  // interjection — i.e. the iteration where the user's steering message
-  // entered the context. Walk LLM calls in time order: the interjection count
-  // in a call's resolved input is monotonic across the job (the row persists in
-  // later contexts), so a count that JUMPS marks the iteration that absorbed
-  // the new message(s). Marked in the step tree so a reader sees exactly where
-  // a turn was steered.
+  // LLM-call spans whose input first folds in a mid-turn interjection — marked
+  // across EVERY loaded job (the tree renders spans for any expanded job, not
+  // just the active one). The monotonic count resets per job.
   const interjectionSpanIds = useMemo(() => {
     const ids = new Set<string>();
-    if (!activeJobTrace) return ids;
-    const llmSpans: Span[] = [];
-    for (const rs of activeJobTrace.steps) {
-      for (const span of rs.spans) {
-        if (span.kind.kind === 'llm_call') llmSpans.push(span);
+    for (const trace of jobTraces.values()) {
+      const llmSpans: Span[] = [];
+      for (const rs of trace.steps) {
+        for (const span of rs.spans) {
+          if (span.kind.kind === 'llm_call') llmSpans.push(span);
+        }
       }
-    }
-    llmSpans.sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime());
-    let seen = 0;
-    for (const span of llmSpans) {
-      if (span.kind.kind !== 'llm_call') continue;
-      const count = interjectionInputCount(
-        span.kind.begin.input_messages,
-        span.started_at,
-        interjectionIndex,
-      );
-      if (count > seen) ids.add(span.id);
-      seen = Math.max(seen, count);
+      llmSpans.sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime());
+      let seen = 0;
+      let first = true;
+      for (const span of llmSpans) {
+        if (span.kind.kind !== 'llm_call') continue;
+        // Counted off the precomputed index, NOT by rebuilding the message list
+        // per span — that was O(spans × transcript) on every poll tick.
+        const count = interjectionInputCount(span.kind.begin.input_messages, span.started_at, interjectionIndex);
+        // Seed the baseline from the job's FIRST LLM input: interjections
+        // already carried in from earlier jobs (persisted transcripts replay the
+        // whole history) are not new to this job, so only a count that RISES
+        // above the baseline marks the iteration this job's steering entered.
+        if (first) {
+          seen = count;
+          first = false;
+        } else if (count > seen) {
+          ids.add(span.id);
+        }
+        seen = Math.max(seen, count);
+      }
     }
     return ids;
-  }, [activeJobTrace, interjectionIndex]);
+  }, [jobTraces, interjectionIndex]);
 
-  // Fetch the active job's step/span tree on demand. Re-fires when the
-  // user picks a different sidebar entry or the polling tick bumps
-  // `jobRefreshKey`. Caches per job id; bumping the key re-fetches the
-  // active job only.
-  useEffect(() => {
-    if (!activeJobId) return;
-    let cancelled = false;
-    async function fetchJobTrace() {
-      if (isMock) {
-        const mock = getMockJobTrace(sessionId, activeJobId);
-        if (mock) {
-          setJobTraces((prev) => {
-            const next = new Map(prev);
-            next.set(activeJobId, mock);
-            return next;
-          });
-        }
-        setActiveJobLoading(false);
-        return;
-      }
-      setActiveJobLoading(true);
-      try {
-        const { data, error: apiError, response } = await client.GET(
-          '/v1/traces/{session_id}/jobs/{job_id}',
-          { params: { path: { session_id: sessionId, job_id: activeJobId } } },
-        );
-        if (cancelled) return;
-        if (response.status === 401) {
-          logout();
-          return;
-        }
-        if (apiError || !response.ok) {
-          // Don't blow away the overview-level page; show inline panel
-          // hints instead. A 404 here is harmless (job deleted between
-          // overview and detail fetches).
-          return;
-        }
-        const trace = data as unknown as JobTrace;
-        setJobTraces((prev) => {
-          const next = new Map(prev);
-          next.set(activeJobId, trace);
-          return next;
-        });
-      } catch {
-        // Network errors on the per-job fetch are non-fatal — keep the
-        // overview visible and let the next poll retry.
-      } finally {
-        if (!cancelled) setActiveJobLoading(false);
-      }
-    }
-    void fetchJobTrace();
-    return () => {
-      cancelled = true;
-    };
-  }, [client, isMock, logout, sessionId, activeJobId, jobRefreshKey]);
-
-  // Polling — visibility-aware, two-tier.
-  //   * Active job non-terminal → bump `jobRefreshKey` every 2s.
-  //   * Any *other* job non-terminal → bump `overviewRefreshKey` every
-  //     10s so the sidebar reflects state changes elsewhere.
-  // If everything is fully terminal, no polling at all.
+  // Polling — visibility-aware, two-tier. A single `refreshKey` bump refetches
+  // the overview; that cascades (via `neededIds`) into refetching live jobs.
   const activeIsLive =
-    !!activeJobSummary &&
-    (isJobLive(activeJobSummary.job_status_kind) || traceHasPendingSpan(activeJobTrace));
+    !!activeJobSummary && (isJobLive(activeJobSummary.job_status_kind) || traceHasPendingSpan(activeJobTrace));
   const anyJobLive = overview?.jobs.some((j) => isJobLive(j.job_status_kind)) ?? false;
   const polling = activeIsLive || anyJobLive;
 
   useEffect(() => {
     if (isMock || !polling) return;
-    const visible = () => document.visibilityState === 'visible';
-    const timers: number[] = [];
-    // Job tree is light — poll the active job fast.
-    if (activeIsLive) {
-      timers.push(
-        window.setInterval(() => {
-          if (visible()) setJobRefreshKey((k) => k + 1);
-        }, POLL_ACTIVE_MS),
-      );
-    }
-    // Overview carries the full transcript (avg ~150KB, up to ~1.5MB), so it
-    // must refresh on its own slow cadence even while the active job polls
-    // fast — never dragged to the 2s tick.
-    timers.push(
-      window.setInterval(() => {
-        if (visible()) setOverviewRefreshKey((k) => k + 1);
-      }, POLL_TERMINAL_MS),
-    );
-    return () => timers.forEach((t) => window.clearInterval(t));
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      setRefreshKey((k) => k + 1);
+    };
+    const cadence = activeIsLive ? POLL_ACTIVE_MS : POLL_TERMINAL_MS;
+    const t = window.setInterval(tick, cadence);
+    return () => window.clearInterval(t);
   }, [isMock, polling, activeIsLive]);
 
-  const spanIndex = useMemo(() => deriveSpanIndex(activeJobTrace), [activeJobTrace]);
+  // When the selection changes via URL — deep link, breadcrumb, jump-to-llm,
+  // back/forward — drop any stale collapse override on its ancestors so the
+  // selected node is revealed (the design's "URL-selected node auto-expands its
+  // ancestors"). Keyed on the URL params only, NOT on jobTraces, so a poll
+  // refetch never re-expands a node the user deliberately collapsed.
+  useEffect(() => {
+    setUserToggles((prev) => {
+      const ancestors: string[] = [];
+      if (jobIdParam) ancestors.push(jobIdParam);
+      if (stepIdParam) ancestors.push(stepIdParam);
+      if (spanIdParam) {
+        const owning = findSpan(jobTraces.get(activeJobId), spanIdParam)?.stepId;
+        if (owning) ancestors.push(owning);
+      }
+      if (!ancestors.some((a) => prev.has(a))) return prev;
+      const next = new Map(prev);
+      for (const a of ancestors) next.delete(a);
+      return next;
+    });
+    // `jobTraces` is read as a snapshot, deliberately NOT a dep: re-running on
+    // every poll refetch would re-expand a node the user just collapsed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobIdParam, stepIdParam, spanIdParam, activeJobId]);
 
   const updateUrl = useCallback(
-    (next: Partial<{ job: string | null; span: string | null; tab: string | null }>) => {
+    (next: Partial<{ job: string | null; step: string | null; span: string | null; tab: string | null }>) => {
       const sp = new URLSearchParams(searchParams);
       for (const [k, v] of Object.entries(next)) {
         if (v == null || v === '') sp.delete(k);
@@ -1795,25 +1312,46 @@ export function TraceSessionPage() {
     [searchParams, setSearchParams],
   );
 
-  const handleSelectSpan = useCallback(
-    (spanId: string) => {
-      updateUrl({ span: spanId, tab: tabParam });
+  const handleToggle = useCallback((nodeId: string, currentlyOpen: boolean) => {
+    // Persist the flip of the *displayed* state — the tree passes the current
+    // open state so a default-expanded (failure-path) node collapses on click
+    // and a default-collapsed node expands, both correctly.
+    setUserToggles((prev) => new Map(prev).set(nodeId, !currentlyOpen));
+  }, []);
+
+  const handleSelectJob = useCallback(
+    (jobId: string) => updateUrl({ job: jobId, step: null, span: null }),
+    [updateUrl],
+  );
+  // A job anchor is a "take me to this job" action, so it must clear an active
+  // filter — otherwise the filter can hide the very job it just selected and the
+  // tree shows nothing while the detail panel switches.
+  const handleJumpToJob = useCallback(
+    (jobId: string) => {
+      setFailuresOnly(false);
+      setFilterRaw('');
+      setFilter('');
+      handleSelectJob(jobId);
     },
+    [handleSelectJob],
+  );
+
+  const handleSelectStep = useCallback(
+    (jobId: string, stepId: string) => updateUrl({ job: jobId, step: stepId, span: null }),
+    [updateUrl],
+  );
+  const handleSelectSpan = useCallback(
+    (jobId: string, spanId: string) => updateUrl({ job: jobId, span: spanId, step: null, tab: tabParam }),
     [tabParam, updateUrl],
   );
 
   const handleJumpToLlm = useCallback(
     (llmSpanId: string) => {
-      // Stays within the active job — `tool_call` `triggered_by` only
-      // ever points at an LLM span in the same step.
-      updateUrl({ span: llmSpanId });
-      const stepId = findStepIdForSpan(activeJobTrace, llmSpanId);
-      if (stepId) {
-        // setTimeout so the panel re-renders with the new selection first.
+      updateUrl({ span: llmSpanId, step: null });
+      const found = findSpan(activeJobTrace, llmSpanId);
+      if (found) {
         setTimeout(() => {
-          document
-            .querySelector(`[data-step-id="${stepId}"]`)
-            ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          document.querySelector(`[data-step-id="${found.stepId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }, 16);
       }
     },
@@ -1821,16 +1359,11 @@ export function TraceSessionPage() {
   );
 
   const handleDrillIntoChild = useCallback(
-    (childSessionId: string) => {
-      navigate(`/traces/${encodeURIComponent(childSessionId)}`);
-    },
+    (childSessionId: string) => navigate(`/traces/${encodeURIComponent(childSessionId)}`),
     [navigate],
   );
 
-  const handleManualRefresh = useCallback(() => {
-    setOverviewRefreshKey((k) => k + 1);
-    setJobRefreshKey((k) => k + 1);
-  }, []);
+  const handleManualRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   if (overviewLoading && !overview) {
     return (
@@ -1852,8 +1385,41 @@ export function TraceSessionPage() {
     return <div className="p-5 text-ink-soft">No trace.</div>;
   }
 
-  const selectedSpan = spanIdParam ? (spanIndex.get(spanIdParam) ?? null) : null;
+  const selectedSpan = spanIdParam ? (findSpan(activeJobTrace, spanIdParam)?.span ?? null) : null;
+  const selectedStepRs = !selectedSpan && stepIdParam ? findStep(activeJobTrace, stepIdParam) : null;
   const activeJobIndex = activeJobSummary ? overview.jobs.indexOf(activeJobSummary) : 0;
+  const externalAgent =
+    !selectedSpan &&
+    !selectedStepRs &&
+    !!activeJobSummary &&
+    isExternalAgentJob(activeJobTrace, activeJobSummary.job_status_kind);
+
+  const activeTokens = activeJobTrace
+    ? traceTokens(activeJobTrace)
+    : activeJobSummary
+      ? summaryTokens(activeJobSummary)
+      : null;
+
+  // Breadcrumb: session › Job #i › [step] › [span].
+  const crumbs: Crumb[] = [{ label: `Session ${overview.session_id.slice(0, 10)}` }];
+  if (activeJobSummary) {
+    crumbs.push({ label: `Job #${activeJobIndex + 1}`, onClick: () => handleSelectJob(activeJobId) });
+  }
+  const spanStepId = selectedSpan
+    ? findSpan(activeJobTrace, selectedSpan.id)?.stepId ?? null
+    : selectedStepRs?.step.id ?? null;
+  if (spanStepId) {
+    const rs = findStep(activeJobTrace, spanStepId);
+    if (rs) {
+      crumbs.push({
+        label: stepVisual(rs.step.kind.kind).label,
+        onClick: () => handleSelectStep(activeJobId, rs.step.id),
+      });
+    }
+  }
+  if (selectedSpan) {
+    crumbs.push({ label: spanVisual(selectedSpan.kind.kind).label });
+  }
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-canvas">
@@ -1862,9 +1428,7 @@ export function TraceSessionPage() {
           <RiArrowLeftLine />
         </IconButton>
         <div className="flex-1 min-w-0">
-          <h2 className="text-[1.4rem] font-bold uppercase -tracking-[0.05em] leading-tight">
-            TRACE DETAILS
-          </h2>
+          <h2 className="text-[1.4rem] font-bold uppercase -tracking-[0.05em] leading-tight">TRACE DETAILS</h2>
           <div className="text-ink-soft text-[0.85rem] font-mono truncate flex items-center gap-3 flex-wrap">
             <span className="inline-flex items-center gap-1">
               <RiCpuLine /> Session: {overview.session_id}
@@ -1872,24 +1436,14 @@ export function TraceSessionPage() {
             <span>
               {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
             </span>
-            {activeJobSummary && (
+            {activeJobSummary && activeTokens && (
               <span className="inline-flex items-center gap-2">
                 <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
                   {overview.jobs.length === 1 ? 'Tokens' : `Job #${activeJobIndex + 1}`}
                 </span>
-                {(() => {
-                  const t = activeJobTrace
-                    ? traceTokens(activeJobTrace)
-                    : summaryTokens(activeJobSummary);
-                  const d = jobDurationMs(activeJobSummary, activeJobTrace);
-                  return (
-                    <>
-                      <span className="text-ink">↑ {t.inputTotal.toLocaleString()}</span>
-                      <span className="text-ink">↓ {t.output.toLocaleString()}</span>
-                      <span className="text-ink-soft">• {formatDuration(d)}</span>
-                    </>
-                  );
-                })()}
+                <span className="text-ink">↑ {activeTokens.inputTotal.toLocaleString()}</span>
+                <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
+                <span className="text-ink-soft">• {formatDuration(jobDurationMs(activeJobSummary, activeJobTrace))}</span>
               </span>
             )}
             {polling && !isMock && (
@@ -1901,77 +1455,83 @@ export function TraceSessionPage() {
         </div>
         <Button
           onClick={handleManualRefresh}
-          disabled={overviewLoading || activeJobLoading || isMock}
+          disabled={overviewLoading || isMock}
           className="!py-2 !px-3 !text-[0.85rem] h-9 gap-1.5"
         >
           <RiRefreshLine className="text-lg shrink-0" /> Refresh
         </Button>
       </div>
 
+      <TraceOverviewBar
+        overview={overview}
+        jobTraces={jobTraces}
+        loadingJobs={loadingJobs}
+        highlight={highlight}
+        onHighlight={setHighlight}
+        selectedSpanId={selectedSpan?.id ?? null}
+        selectedStepId={selectedStepRs?.step.id ?? null}
+        onSelectSpan={handleSelectSpan}
+        onSelectStep={handleSelectStep}
+      />
+
       <div className="flex-1 flex overflow-hidden min-h-0">
-        <JobSidebar
-          jobs={overview.jobs}
-          active={activeJobId}
-          interjectionCounts={interjectionCountByJob}
-          onChange={(j) => updateUrl({ job: j, span: null })}
+        <JobAnchors
+          overview={overview}
+          jobTraces={jobTraces}
+          messageLog={messageLog}
+          activeJobId={activeJobId}
+          onSelectJob={handleJumpToJob}
+        />
+        <TraceTree
+          overview={overview}
+          jobTraces={jobTraces}
+          loadingJobs={loadingJobs}
+          userToggles={userToggles}
+          onToggle={handleToggle}
+          selectedJobId={activeJobId}
+          selectedStepId={selectedStepRs?.step.id ?? null}
+          selectedSpanId={selectedSpan?.id ?? null}
+          onSelectJob={handleSelectJob}
+          onSelectStep={handleSelectStep}
+          onSelectSpan={handleSelectSpan}
+          interjectionCountByJob={interjectionCountByJob}
+          interjectionSpanIds={interjectionSpanIds}
+          messageLog={messageLog}
+          highlight={highlight}
+          filterRaw={filterRaw}
+          onFilterRawChange={setFilterRaw}
+          failuresOnly={failuresOnly}
+          onToggleFailures={() => setFailuresOnly((v) => !v)}
+          filter={filter}
         />
 
-        <div className="flex-1 overflow-y-scroll p-5">
-          <div className="max-w-4xl mx-auto space-y-4 pb-10">
-            {activeJobTrace?.steps.map((rs) => (
-              <div key={rs.step.id} data-step-id={rs.step.id}>
-                <StepBlock
-                  rs={rs}
-                  selectedSpanId={spanIdParam}
-                  interjectionSpanIds={interjectionSpanIds}
-                  onSelect={handleSelectSpan}
-                />
-              </div>
-            ))}
-            {activeJobLoading && !activeJobTrace && (
-              <div className="text-ink-soft text-[0.95rem] italic flex items-center gap-2">
-                <RiLoader4Line className="animate-spin" /> Loading job…
-              </div>
-            )}
-            {activeJobTrace && activeJobTrace.steps.length === 0 && (
-              messageLog.length > 0 ? (
-                // External-agent (claude/codex) jobs record no step/span
-                // tree — their internal loop is opaque. Surface the
-                // persisted session transcript instead so the run is
-                // still inspectable.
-                <div className="space-y-2">
-                  <div className="text-ink-soft text-[0.7rem] font-bold uppercase tracking-wider">
-                    Session transcript
-                  </div>
-                  <MessageList messages={messageLog.map((r) => r.message)} foldHistory={false} />
-                </div>
-              ) : (
-                <div className="text-ink-soft text-[0.95rem] italic">No steps yet for this job.</div>
-              )
-            )}
-          </div>
-        </div>
-
-        {selectedSpan ? (
-          <SpanDetailPanel
-            span={selectedSpan}
-            messageLog={messageLog}
-            tab={tabParam}
-            onTabChange={(t) => updateUrl({ tab: t })}
-            onJumpToLlm={handleJumpToLlm}
-            onDrillIn={handleDrillIntoChild}
-          />
-        ) : (
-          <JobSummaryPanel
-            summary={activeJobSummary}
-            trace={activeJobTrace}
-            traceLoading={activeJobLoading}
-            messageLog={messageLog}
-            jobIndex={activeJobIndex}
-            totalJobs={overview.jobs.length}
-            interjections={interjectionsByJob.get(activeJobId) ?? []}
-          />
-        )}
+        <aside className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+          <Breadcrumb crumbs={crumbs} />
+          {selectedSpan ? (
+            <SpanDetailPanel
+              span={selectedSpan}
+              messageLog={messageLog}
+              tab={tabParam}
+              onTabChange={(t) => updateUrl({ tab: t })}
+              onJumpToLlm={handleJumpToLlm}
+              onDrillIn={handleDrillIntoChild}
+            />
+          ) : selectedStepRs ? (
+            <StepDetail rs={selectedStepRs} jobId={activeJobId} onSelectSpan={handleSelectSpan} />
+          ) : externalAgent ? (
+            <TranscriptPanel messageLog={messageLog} />
+          ) : (
+            <JobSummaryPanel
+              summary={activeJobSummary}
+              trace={activeJobTrace}
+              traceLoading={loadingJobs.has(activeJobId)}
+              messageLog={messageLog}
+              jobIndex={activeJobIndex}
+              totalJobs={overview.jobs.length}
+              interjections={interjectionsByJob.get(activeJobId) ?? []}
+            />
+          )}
+        </aside>
       </div>
     </div>
   );

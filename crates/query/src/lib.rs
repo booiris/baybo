@@ -1311,6 +1311,7 @@ mod tests {
     use baybo_session::SessionStore;
     use baybo_store::JobStore as _;
     use baybo_trace::test_support::MemoryTraceStore;
+    use baybo_trace::{CompressionApplied, CompressionTrigger};
     use std::sync::Arc;
 
     fn user_input() -> JobInput {
@@ -2279,7 +2280,10 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::compression(
+                        CompressionTrigger::Threshold,
+                        CompressionApplied::LiveSummary,
+                    ),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
@@ -2523,7 +2527,10 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::compression(
+                        CompressionTrigger::Threshold,
+                        CompressionApplied::LiveSummary,
+                    ),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
@@ -2647,7 +2654,10 @@ mod tests {
                 &Step {
                     id: step_id,
                     job_id: j.id,
-                    kind: StepKind::Compression,
+                    kind: StepKind::compression(
+                        CompressionTrigger::Threshold,
+                        CompressionApplied::LiveSummary,
+                    ),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
