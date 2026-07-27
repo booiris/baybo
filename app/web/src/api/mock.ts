@@ -341,13 +341,13 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   const t0 = Date.now() - 5 * 60 * 1000;
   const job1 = mid('job');
 
-  // Step 1: the background pass — a real LLM call that writes the session's
-  // `summary.md`. It does NOT touch the live transcript.
+  // Step 1: the compaction — the transcript crossed its token threshold and the
+  // turn blocked on one summarizer call before continuing.
   const bgStarted = new Date(t0);
   const bgEnded = new Date(t0 + 80);
   const bgStep = step(
     job1,
-    { kind: 'compression', trigger: 'background', applied: 'live_summary' },
+    { kind: 'compression', trigger: 'threshold', applied: 'live_summary' },
     bgStarted,
     bgEnded,
   );
@@ -363,13 +363,13 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     bgEnded,
   );
 
-  // Step 2: the threshold trim — the context crossed its limit and was cut down
-  // by swapping in the `summary.md` the pass above wrote. NO LLM call, so this
-  // step carries no span; it is the moment the model's input context changed.
+  // Step 2: a compaction whose summarizer failed, so it fell back to dropping
+  // the middle. NO LLM call, so this step carries no span — and without the
+  // row it records, the compaction that discarded the most would be invisible.
   const trimAt = new Date(t0 + 90);
   const trimStep = step(
     job1,
-    { kind: 'compression', trigger: 'threshold', applied: 'stored_summary' },
+    { kind: 'compression', trigger: 'forced', applied: 'truncate' },
     trimAt,
     new Date(t0 + 92),
   );

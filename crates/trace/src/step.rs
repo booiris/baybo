@@ -90,54 +90,29 @@ pub enum StepKind {
     TitleGeneration,
 }
 
-/// Which path ran a compaction. The difference matters when reading a trace:
-/// `Inline` and `Forced` rewrite the transcript the next LLM call reads — they
-/// are the moments the model's input context actually changed — while
-/// `Background` is a detached pass nobody waits on.
+/// Why a compaction ran. Both rewrite the transcript the next LLM call reads;
+/// the difference is who decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionTrigger {
     /// The live transcript crossed its token threshold at the top of an
-    /// iteration and was trimmed. The turn blocks on it and the next LLM call
-    /// sees the rewritten transcript.
+    /// iteration. The turn blocks on the compaction before continuing.
     Threshold,
-    /// An on-demand pass the user asked for (`/compact`). Like `Inline` it
-    /// rewrites the transcript the next call will see; unlike it, nothing was
+    /// An on-demand pass the user asked for (`/compact`). Nothing was
     /// overflowing — the user just asked.
     Forced,
-    /// The detached pass spawned at an iteration boundary once tokens and
-    /// activity cross their thresholds. It refreshes the session's
-    /// `summary.md` and does NOT touch the live transcript — a later threshold
-    /// trim is what swaps that summary in.
-    Background,
 }
 
-/// How a compaction shrank the transcript — the three stages of the flow, tried
-/// in order. Only [`CompressionApplied::LiveSummary`] makes an LLM call; the
-/// other two rewrite the context with no model round-trip, which is why their
-/// steps carry no `LlmCall` span.
+/// How a compaction shrank the transcript. [`CompressionApplied::Truncate`] is
+/// the fallback taken when the summarizer failed, and makes no model
+/// round-trip — which is why its step carries no `LlmCall` span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionApplied {
-    /// Swapped in the `summary.md` a background pass had already written, plus
-    /// the recent slice. No LLM call.
-    StoredSummary,
     /// Summarised the transcript with a live LLM call.
     LiveSummary,
-    /// Dropped the middle of the transcript. No LLM call.
+    /// Dropped the middle of the transcript after the summarizer failed.
     Truncate,
-}
-
-impl CompressionTrigger {
-    /// Whether this compaction rewrote the transcript the next LLM call reads.
-    /// The background pass produces a summary out of band; the other two change
-    /// what the model is about to be sent.
-    pub fn changes_next_input(&self) -> bool {
-        matches!(
-            self,
-            CompressionTrigger::Threshold | CompressionTrigger::Forced
-        )
-    }
 }
 
 impl StepKind {

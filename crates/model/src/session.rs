@@ -190,18 +190,6 @@ pub enum TriggerKind {
     Cron,
     Spawned,
 }
-
-/// Payload carried by a background compression trigger. Built by the
-/// parent's agent loop at trigger time and handed to the detached
-/// background-summary task the loop spawns in-process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackgroundCompressionPayload {
-    /// Highest `session_messages.ordinal` to include in this pass'
-    /// input. Pinned at trigger time so concurrent appends to the
-    /// parent don't bleed in mid-pass.
-    pub up_to_ordinal: i64,
-}
-
 /// Direct parent relationship for sessions spawned from another session.
 ///
 /// `parent_session_id` + `parent_job_id` together pin the **exact moment**
@@ -884,15 +872,6 @@ mod tests {
         assert!(back.parent_span_id.is_none());
         assert_eq!(back.kind, LineageKind::Subagent);
     }
-
-    #[test]
-    fn background_compression_payload_round_trip() {
-        let p = BackgroundCompressionPayload { up_to_ordinal: 42 };
-        let s = serde_json::to_string(&p).unwrap();
-        let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, p);
-    }
-
     #[test]
     fn session_state_last_llm_round_trip() {
         let state = SessionState {

@@ -27,11 +27,6 @@ impl WorkspaceManager {
             paths.agents_dir(),
             paths.key_dir(),
             paths.state_dir(),
-            // Per-session writable artifacts (currently `summary.md` for
-            // the async summary-refresh design). Per-session subdirs are
-            // created lazily by the BackgroundCompressionRunner; this just guarantees
-            // the parent dir exists so the lazy create can land.
-            paths.state_sessions_dir(),
             paths.work_dir(),
             paths.work_tmp_dir(),
             paths.logs_dir(),
