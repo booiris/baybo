@@ -1555,6 +1555,9 @@ enum SandboxEscapePolicy {
 }
 
 enum SandboxEscapeDecision {
+    /// The failure was not the sandbox's doing: surface it unchanged, without
+    /// offering an escape the user has no reason to grant.
+    Keep,
     Run(String),
     Prompt(String),
 }
@@ -1762,27 +1765,31 @@ impl BashTool {
             }
         };
 
-        match decision {
+        let rationale = match decision {
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
-                self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
-                    .await
+                return self
+                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .await;
             }
-            SandboxEscapeDecision::Prompt(rationale) => {
-                if self
-                    .request_unsandboxed_retry_approval(command, ctx, &rationale, Some(&reason))
-                    .await?
-                {
-                    self.notify_escape(ctx, command, &rationale);
-                    self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
-                        .await
-                } else {
-                    Err(ToolError::Execution(format!(
-                        "sandboxed run failed and the unsandboxed retry was not approved: \
-                         {sandbox_err}"
-                    )))
-                }
-            }
+            SandboxEscapeDecision::Prompt(rationale) => rationale,
+            // The sandbox never started, so the failure is sandbox-caused by
+            // construction — the judge's `sandbox_related` half carries no
+            // information here, only its risk verdict does. Still ask.
+            SandboxEscapeDecision::Keep => reason.clone(),
+        };
+
+        if self
+            .request_unsandboxed_retry_approval(command, ctx, &rationale, Some(&reason))
+            .await?
+        {
+            self.notify_escape(ctx, command, &rationale);
+            self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                .await
+        } else {
+            Err(ToolError::Execution(format!(
+                "sandboxed run failed and the unsandboxed retry was not approved: {sandbox_err}"
+            )))
         }
     }
 
@@ -1911,9 +1918,7 @@ impl BashTool {
         {
             PostFail::Unsandbox(rationale) => Ok(SandboxEscapeDecision::Run(rationale)),
             PostFail::Prompt(rationale) => Ok(SandboxEscapeDecision::Prompt(rationale)),
-            PostFail::Keep => Ok(SandboxEscapeDecision::Prompt(
-                "risk judge did not approve automatic sandbox escape".to_string(),
-            )),
+            PostFail::Keep => Ok(SandboxEscapeDecision::Keep),
         }
     }
 
@@ -1955,9 +1960,12 @@ impl BashTool {
     }
 
     /// On sandbox failure, decide whether to retry unsandboxed. Auto asks the
-    /// risk judge first and falls through to human approval when automatic
-    /// escape is not approved; manual goes straight to approval. Returns the
-    /// (possibly re-run) output plus an optional note for the tool result.
+    /// risk judge first: a failure the judge ties to the sandbox either re-runs
+    /// outright (safe) or falls through to human approval (risky), while an
+    /// ordinary failure the sandbox had no part in is returned untouched — the
+    /// escape prompt is the most privileged one in the system, so it must not
+    /// fire on every non-zero exit. Manual goes straight to approval. Returns
+    /// the (possibly re-run) output plus an optional note for the tool result.
     #[allow(clippy::too_many_arguments)]
     async fn escalate_if_failed(
         &self,
@@ -1996,6 +2004,7 @@ impl BashTool {
         };
 
         match decision {
+            SandboxEscapeDecision::Keep => Ok((out, None)),
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 let new = self
@@ -3432,11 +3441,15 @@ mod tests {
         assert!(note.unwrap().contains("user approval"));
     }
 
+    /// An ordinary failure (compile error, network flake, deliberate exit 1)
+    /// is not the sandbox's doing, so it must surface as-is. Offering the
+    /// full-host escape here would put the most privileged prompt in the system
+    /// in front of the user on every non-zero exit.
     #[tokio::test]
-    async fn escalate_prompts_when_judge_does_not_auto_escape() {
+    async fn escalate_keeps_failure_when_judge_says_not_sandbox_related() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
-        let mut ctx = ctx_with_approval(None, gate);
+        let mut ctx = ctx_with_approval(None, gate.clone());
         ctx.llm = Some(judge_llm(V_UNRELATED));
         let (out, note) = tool
             .escalate_if_failed(
@@ -3450,8 +3463,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.exit_code, 0, "approval allows unsandboxed retry");
-        assert!(note.unwrap().contains("user approval"));
+        assert_eq!(out.exit_code, 1, "original failure kept, no escape");
+        assert!(note.is_none());
+        assert!(
+            gate.requests().is_empty(),
+            "user must not be asked to approve an escape the judge never proposed"
+        );
     }
 
     #[tokio::test]
@@ -4694,8 +4711,11 @@ mod tests {
         );
     }
 
+    /// End-to-end shape of the reported regression: a curl that fails on the
+    /// network is not a sandbox problem, so it must come back as a plain
+    /// failure the model can read and retry — not as an escape prompt.
     #[tokio::test]
-    async fn auto_network_failure_prompts_when_judge_does_not_auto_escape() {
+    async fn auto_network_failure_keeps_result_without_prompting() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 6,
             stdout: Vec::new(),
@@ -4710,7 +4730,7 @@ mod tests {
             .with_permission(auto_permission())
             .execute(json!({ "command": "curl https://example.com" }), &ctx)
             .await
-            .expect("denied unsandboxed retry preserves original failure");
+            .expect("an ordinary failure returns Ok");
         let ToolOutput::Json(v) = out else { panic!() };
         assert_eq!(v["exit_code"], 6);
         assert!(
@@ -4720,7 +4740,10 @@ mod tests {
                 .contains("Could not resolve host"),
             "original stderr must be preserved verbatim: {v:?}"
         );
-        assert_eq!(gate.requests().len(), 1, "auto non-escape asks approval");
+        assert!(
+            gate.requests().is_empty(),
+            "a non-sandbox failure must not raise an escape prompt"
+        );
     }
 
     #[tokio::test]
