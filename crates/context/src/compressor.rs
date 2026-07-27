@@ -22,7 +22,7 @@ use std::pin::Pin;
 use baybo_llm::{ChatRequest, LlmResponse};
 use baybo_model::{ChatMessage, ContentBlock};
 use baybo_trace::LlmCallInputs;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::error::ContextError;
 use crate::prompts::compression::{
@@ -47,8 +47,6 @@ pub enum CompressOutput {
     /// the truncate fallback couldn't shrink. Surfaces as
     /// `CompressionOutcome::StrategyDeclined`.
     NoOp,
-    /// The summarizer call was cancelled mid-flight. Nothing is applied.
-    Cancelled,
     /// Compressor produced a new transcript. `ContextManager` always
     /// re-attaches the skill trailer here, since every Replaced
     /// branch can drop the historical `<system-reminder>` carrying
@@ -260,9 +258,9 @@ impl ContextManager {
 
     /// The compaction itself: one summarizer call, then assemble.
     ///
-    /// Returns `Replaced` in every case but a cancel — the pre-flight gate
-    /// already filtered "nothing to shrink", and the truncate fallback is
-    /// guaranteed to shorten when reached.
+    /// Always returns `Replaced` — the pre-flight gate already filtered
+    /// "nothing to shrink", and the truncate fallback is guaranteed to
+    /// shorten when reached.
     async fn summarize_or_truncate(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
@@ -309,13 +307,6 @@ impl ContextManager {
 
         let summary = match chat(request, input_marker).await {
             Ok(response) => parse_summary_response(&response.content),
-            // A cancel is not a failure to summarise — the turn is unwinding
-            // and nothing further goes to the model, so truncating here would
-            // cost the user their history for no gain.
-            Err(ContextError::Cancelled(reason)) => {
-                debug!(%reason, "compaction cancelled; leaving the transcript untouched");
-                return CompressOutput::Cancelled;
-            }
             Err(e) => {
                 warn!(error = %e, "summarization failed; falling back to truncation");
                 None

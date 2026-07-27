@@ -24,7 +24,8 @@ the next LLM call. `/compact` (`force_compress`) runs the same flow without the 
 | D2 | Stage 2 keeps a **verbatim recent slice**: `[system…, summary, recent slice…]`, not `[system…, summary]`. | Stage 1 was the only compaction that kept verbatim recent context. Without this, every compaction turns the last tool results and the user's own last words into third-person prose. `walk_backward_atomic` / `pair_preserving_cut` / the `RECENT_SLICE_*` consts therefore **survive**. |
 | D3 | Delete `CompressionTrigger::Background`, `CompressionApplied::StoredSummary`, `CompressionStage::StoredSummary`, `CompressionTrigger::changes_next_input`, and the TS mirrors. | Nothing produces them after D1. |
 | D4 | Historical trace rows are fixed by a **manual one-off SQL scrub** run before deploy. No boot-time migration. The `Option<>` wrappers on `trigger`/`applied` **stay**. | Repo rule: no legacy-data cleanup migrations. The `Option`s are load-bearing for pre-#222 rows, which omit the keys entirely (`serde(default)` covers a missing key, not an unknown value). |
-| D5 | A **cancellation** (`/stop`, preempt) returns a no-op and leaves the transcript untouched; a real LLM failure retries once and only then falls back to truncate. No user-facing notice. | Truncate is the only irreversible step in the flow. Post-D1 every threshold trip is a live LLM call, so provider flakes and `/stop` would otherwise convert directly into destructive truncation. |
+| D5 | **`/stop` does not interrupt a compaction at all** — the summariser call is not raced against the cancel token, so an in-flight compaction runs to completion and applies. A real LLM failure retries once and only then falls back to truncate. No user-facing notice. | *(Revised after implementation — see D5′ below.)* Truncate is the only irreversible step in the flow, so a failure must not go straight to it. |
+| D5′ | The original D5 made a cancel return a no-op with the transcript untouched. Superseded: the request is already placed and already billed, and a compaction is housekeeping that makes the **next** turn cheaper — abandoning it throws that spend away *and* leaves the transcript over-budget, so the next turn pays for the whole thing again. The turn still stops on the loop's own cancel checkpoint; the compaction lands first. | Cost: `/stop` is unresponsive for as long as the summariser takes. Pinned by `a_stop_does_not_abort_a_compaction_already_in_flight`, verified to fail when the race is re-added. |
 | D6 | iOS gets the compaction indicator (a `status` frame → a work-block step). Web chat unchanged. No new persisted control event. | iOS drops `Frame::Status` entirely today, so a 30–90s blocking compaction is indistinguishable from a hung turn. The durable trace of a compaction is already the `compaction_points` divider; the status line only has to explain the stall while it lasts. |
 | D7 | `RECENT_SLICE_MAX_TOKENS` becomes relative: `min(40_000, 0.15 × max_tokens)`; the token floor scales with it. `compression_threshold` stays `0.65`. | The absolute 40K was safe only because stage 1 sat behind a `0.6 × max_tokens` fall-through gate. Stage 2 is the terminal stage — nothing to fall through to — so on a 32K window a 40K slice makes every compaction land *above* its own trigger threshold. |
 | D8 | The summarizer still receives the **full** transcript; `SUMMARIZE_INSTRUCTION` gains a static paragraph saying recent messages may be preserved verbatim below the summary. No message count substituted in. | `LlmCallInputs::Persisted{last_ordinal, prefix_len, suffix}` can only express "the whole active set + a suffix". Sending a strict prefix forces `Inline`, re-embedding the transcript into every compaction span — the O(n²) trace-disk regression PR #179 fixed. |
@@ -39,16 +40,11 @@ the next LLM call. `/compact` (`force_compress`) runs the same flow without the 
 
 Each of these is a decision above that the code does not support as stated.
 
-**A1 — D5's cancel branch is unreachable today.** `compression.rs:139` is a bare
-`bound.chat(&request).await`; the token is used only to build `cancel_ctx` for trace classification.
-A `/stop` mid-compaction currently blocks until `LLM_READ_TIMEOUT` (600s, `crates/llm/src/error.rs:126`).
-Race the call: `tokio::select! { biased; _ = cancel_token.cancelled() => …, res = bound.chat(&request) => res }`,
-mirroring `agent_loop.rs:1689-1696`.
-
-**A2 — cancellation needs a type.** `LlmError` is flattened to `String` at `compression.rs:192` and
-again at `:202`, so the compressor cannot tell cancel from failure. Add `ContextError::Cancelled(String)`,
-produce it when the token is tripped, and handle it in `summarize_or_truncate`'s `Err` arm as
-`CompressOutput::NoOp`. Fix the now-false doc at `compressor.rs:501-503` ("Always returns `Replaced`").
+**A1/A2 — obsolete under D5′.** They called for racing the provider call against the cancel token
+and giving cancellation its own `ContextError` variant. D5′ wants the opposite: the call is left
+un-raced, so no cancellation error is ever produced and no variant is needed. What A1 *did*
+establish stands — before this branch, `compression.rs` never consulted the token at all, so the
+pre-existing behaviour was to wait out the 600s read timeout and then truncate.
 
 **A3 — the retry belongs in `CompressionRunner`, not the compressor.** `ChatCallback` is `FnOnce`
 and `run(self, …)` consumes the runner. Implement it as a two-iteration loop around `with_llm_span`
@@ -58,13 +54,10 @@ and `run(self, …)` consumes the runner. Implement it as a two-iteration loop a
 must not consume the retry. Cancel never retries. This is the compaction path's *first* retry layer,
 not a second: `ErrorHandler` wraps `call_llm` only (`docs/modules/agent.md:206-214`), never compaction.
 
-**A4 — `Compacted` is emitted unconditionally** (`agent_loop.rs:2554-2568`). Keep it unconditional
-except when the token is tripped: the turn is unwinding, nothing can dangle. Update
-`docs/turn-progress-events.md:45` — the end edge means "the pass finished", not "the transcript changed".
-
-**A5 — a cancelled `/compact` would print a lie.** `NoOp` maps to `CompressionOutcome::StrategyDeclined`
-(`lib.rs:1001`), which prints "nothing to summarize (conversation too short)" (`agent_loop.rs:2888`).
-Add `CompressionOutcome::Cancelled` with a neutral string. The match is exhaustive, so this is compiler-forced.
+**A4/A5 — obsolete under D5′.** Both existed to describe a cancelled compaction: suppressing the
+`Compacted` edge, and giving `/compact` a truthful string for it. With the pass no longer
+interruptible there is no such outcome. The doc fix A4 named still applies: the end edge means
+"the pass finished", not "the transcript changed".
 
 **A6 — pin D9's predicate.** `before_tokens = budget.current()` is provider-anchored;
 `after_tokens = calibrate(Σ message_budget_tokens)` (`lib.rs:1038,1048-1058`). A loose predicate can

@@ -83,9 +83,8 @@ impl CompressionRunner {
             trigger,
         } = self;
 
-        // `cancel_ctx` borrows the token for span/step outcome classification;
-        // the loop body needs its own handle to race the provider call.
-        let cancel = cancel_token.clone();
+        // Borrowed for span/step outcome classification only. The compaction
+        // call is deliberately NOT raced against it — see below.
         let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
         let recorder_inner = Arc::clone(&recorder);
         crate::runtime::scope::with_step(
@@ -128,7 +127,6 @@ impl CompressionRunner {
                             let llm_client = Arc::clone(&llm_client);
                             let security_gateway = Arc::clone(&security_gateway);
                             let retriable = Arc::clone(&retriable);
-                            let cancel = cancel.clone();
                             let user_id = user_id.clone();
                             let session_id = session_id.clone();
                             let request = &request;
@@ -140,23 +138,17 @@ impl CompressionRunner {
                                     span_id: span.span_id,
                                     reason: baybo_llm::CallReason::Compression,
                                 });
-                                // Race the provider call against the token.
-                                // Without this a `/stop` mid-compaction waits
-                                // out the full read timeout and then truncates
-                                // — the user's history destroyed by the very
-                                // action meant to stop the work.
-                                let call = tokio::select! {
-                                    biased;
-                                    _ = cancel.cancelled() => None,
-                                    res = bound.chat(request) => Some(res),
-                                };
-                                let Some(call) = call else {
-                                    return (
-                                        LlmCallResult::default(),
-                                        Err(anyhow::anyhow!("cancelled during compaction")),
-                                    );
-                                };
-                                match call {
+                                // NOT raced against the cancel token, on
+                                // purpose. `/stop` means "stop working on my
+                                // request", and a compaction is housekeeping
+                                // that makes the NEXT turn cheaper — the
+                                // request is already in flight and already
+                                // being billed, so abandoning it throws that
+                                // spend away and leaves the transcript
+                                // over-budget for the next turn to compact
+                                // from scratch. Letting it land means the
+                                // money already spent buys something.
+                                match bound.chat(request).await {
                                     Ok(billed) => {
                                         let mut response = billed.response;
                                         // Scrub before the summary lands in
@@ -214,9 +206,6 @@ impl CompressionRunner {
                         Ok(response) => return Ok((LifecycleOutcome::Ok, Ok(response))),
                         Err(e) => e.to_string(),
                     };
-                    if cancel.is_cancelled() {
-                        return Ok((LifecycleOutcome::Ok, Err(ContextError::Cancelled(error))));
-                    }
                     let retriable = *retriable.lock();
                     if !retriable || attempt + 1 == MAX_COMPACTION_ATTEMPTS {
                         return Ok((LifecycleOutcome::Ok, Err(ContextError::Compression(error))));

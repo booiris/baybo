@@ -134,11 +134,6 @@ pub enum CompressionOutcome {
     /// to apply it (so the budget stays honest) and the transcript
     /// is unchanged.
     NoSavings,
-    /// The turn was cancelled while the summarizer call was in flight.
-    /// The transcript is untouched — a cancel must not cost the user their
-    /// history via the truncate fallback, and nothing more will be sent to
-    /// the model on this turn anyway.
-    Cancelled,
 }
 
 /// Manages a session's context: owns the conversation transcript,
@@ -976,7 +971,6 @@ impl ContextManager {
         let plan = self.run_compression_flow(chat_box).await?;
         let (mut new_messages, stage) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
-            CompressOutput::Cancelled => return Ok(CompressionOutcome::Cancelled),
             CompressOutput::Replaced { messages, stage } => (messages, stage),
         };
 
@@ -3224,42 +3218,6 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "the summarizer must be called exactly once per compaction"
-        );
-    }
-
-    /// A cancel is not a failed summary: the turn is unwinding and nothing more
-    /// goes to the model, so truncating would destroy the middle of the
-    /// conversation for no gain.
-    #[tokio::test]
-    async fn cancelled_compaction_leaves_the_transcript_untouched() {
-        async fn cancelled_chat(
-            _: ChatRequest,
-            _: LlmCallInputs,
-        ) -> std::result::Result<LlmResponse, ContextError> {
-            Err(ContextError::Cancelled("stopped".into()))
-        }
-
-        let mut ctx = make_ctx(2, 10_000, 0.5);
-        ctx.append(&make_msg(Role::System, "sys")).await;
-        for i in 0..12 {
-            ctx.append(&make_msg(
-                Role::User,
-                &format!("m{i} {}", "x".repeat(2_400)),
-            ))
-            .await;
-        }
-        let before: Vec<ChatMessage> = ctx.messages().to_vec();
-
-        let outcome = ctx
-            .maybe_compress("test-model", cancelled_chat)
-            .await
-            .unwrap();
-
-        assert!(matches!(outcome, CompressionOutcome::Cancelled));
-        assert_eq!(
-            ctx.messages(),
-            before.as_slice(),
-            "a cancelled compaction must not rewrite the transcript"
         );
     }
 

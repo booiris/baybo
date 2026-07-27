@@ -33,6 +33,7 @@ use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use chrono::Utc;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -205,6 +206,7 @@ pub struct AgentTestHarnessBuilder {
     /// fixture whose call blocks until cancelled) when `StubLlm`'s
     /// return-immediately contract doesn't fit.
     llm: Option<Arc<dyn LlmCompletion>>,
+    chat_gate: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -223,6 +225,7 @@ impl Default for AgentTestHarnessBuilder {
             compression_threshold: None,
             memory: None,
             llm: None,
+            chat_gate: None,
         }
     }
 }
@@ -318,6 +321,18 @@ impl AgentTestHarnessBuilder {
         self
     }
 
+    /// Park every non-streaming `chat` (the compaction summariser is the only
+    /// caller in these suites) until `release` is notified, signalling
+    /// `entered` first so the test can act while the call is in flight.
+    ///
+    /// Wraps the harness's OWN stub rather than replacing it — `with_llm`
+    /// swaps the client out entirely, which would silently orphan
+    /// `harness.stub_llm` and every `push_*` the test made.
+    pub fn with_chat_gate(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.chat_gate = Some((entered, release));
+        self
+    }
+
     /// Wire everything and spawn the `AgentActor`. The returned harness
     /// owns the mailbox sender and the response receiver.
     pub fn build(self) -> AgentTestHarness {
@@ -378,7 +393,14 @@ impl AgentTestHarnessBuilder {
         // entry name + tokenizer so they stay consistent either way.
         let wired_llm: Arc<dyn baybo_llm::LlmCompletion> = match self.llm {
             Some(custom) => custom,
-            None => stub_llm.clone(),
+            None => match self.chat_gate {
+                Some((entered, release)) => Arc::new(GatedChat {
+                    inner: stub_llm.clone(),
+                    entered,
+                    release,
+                }),
+                None => stub_llm.clone(),
+            },
         };
         let mut tool_registry = ToolRegistry::new();
         for (tool, manifest) in self.tools {
@@ -582,3 +604,37 @@ fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore
 // Avoid unused-import lints when callers don't reference these types.
 #[allow(dead_code)]
 fn _typecheck_session(_: &User, _: &ChannelType) {}
+
+/// Wraps the harness's stub so a non-streaming `chat` parks mid-flight.
+///
+/// Exists for one question no other fixture can ask: what happens to work
+/// already in flight when the turn is cancelled. Streaming calls pass
+/// straight through, so only the compaction summariser is held.
+struct GatedChat {
+    inner: Arc<StubLlm>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl LlmCompletion for GatedChat {
+    async fn chat(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmResponse> {
+        self.entered.notify_waiters();
+        self.release.notified().await;
+        self.inner.chat(request).await
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmStream> {
+        self.inner.chat_stream(request).await
+    }
+
+    fn model_info(&self) -> &baybo_llm::ModelInfo {
+        self.inner.model_info()
+    }
+}
