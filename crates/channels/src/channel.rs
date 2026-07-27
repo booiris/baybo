@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest};
+use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, PendingWatcher};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -188,6 +188,31 @@ impl Channel {
             .into_iter()
             .filter(|req| req.session_id == *session_id)
             .collect()
+    }
+
+    /// Every session with at least one prompt parked on this channel's
+    /// approval gate, from one queue pass. The chat-list endpoint asks once
+    /// per refresh and answers a bool per row from the result — calling
+    /// [`Self::pending_approvals`] per session would instead clone the whole
+    /// queue once per row.
+    ///
+    /// Empty when this channel has no approval surface.
+    pub fn pending_approval_sessions(&self) -> std::collections::HashSet<SessionId> {
+        self.approvals
+            .as_ref()
+            .map(|a| a.queue.pending_sessions())
+            .unwrap_or_default()
+    }
+
+    /// Add a per-session pending-edge watcher to this channel's approval
+    /// queue. See [`PendingWatcher`] — the callback runs under the queue lock,
+    /// so it must only publish and must never read the queue back.
+    ///
+    /// No-op when this channel has no approval surface.
+    pub fn add_pending_approval_watcher(&self, watcher: PendingWatcher) {
+        if let Some(approvals) = self.approvals.as_ref() {
+            approvals.queue.add_pending_watcher(watcher);
+        }
     }
 
     /// Resolve a pending approval by `call_id`. Returns the matched

@@ -41,12 +41,20 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// the job carries the same value and the list folds it into the one group
     /// row. `false` on an ordinary chat, and on a tombstone group (job deleted).
     var cronGroupPinned: Bool
+    /// A tool call in this conversation is parked on the approval gate and the
+    /// user's decision is the only thing that will unblock it. Server-computed
+    /// (`approvalPending` on the summary) and reconciled on every merge; the
+    /// connection-global `SessionUpdated` patch is the between-pulls
+    /// accelerator.
+    ///
+    /// Deliberately NOT restored from disk — see `init(from:)`.
+    var approvalPending: Bool
 
     init(
         id: String, createdAt: Date, lastActive: Date, title: String? = nil,
         preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
         unread: Int = 0, cronJobId: String? = nil, cronJobTitle: String? = nil,
-        cronGroupPinned: Bool = false
+        cronGroupPinned: Bool = false, approvalPending: Bool = false
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -57,6 +65,7 @@ struct SessionRow: Codable, Identifiable, Equatable {
         self.pinned = pinned
         self.archived = archived
         self.unread = unread
+        self.approvalPending = approvalPending
         self.cronJobId = cronJobId
         self.cronJobTitle = cronJobTitle
         self.cronGroupPinned = cronGroupPinned
@@ -97,6 +106,17 @@ struct SessionRow: Codable, Identifiable, Equatable {
         cronJobId = try c.decodeIfPresent(String.self, forKey: .cronJobId)
         cronJobTitle = try c.decodeIfPresent(String.self, forKey: .cronJobTitle)
         cronGroupPinned = try c.decodeIfPresent(Bool.self, forKey: .cronGroupPinned) ?? false
+        // NOT decoded, on purpose. A parked approval lives in the GATEWAY's
+        // memory: it self-denies after five minutes, and a gateway restart
+        // drops every one of them. A mark loaded off disk could therefore only
+        // ever be a claim about a prompt that no longer exists — an offline
+        // cold start would show "waiting for your approval" on a conversation
+        // that stopped waiting hours ago, with no way to act on it. The launch
+        // merge is the only thing allowed to raise it.
+        //
+        // It is still ENCODED (synthesized) so `SessionRow` stays one shape;
+        // `PersistedFormatTests` asserts key presence, not round-tripping.
+        approvalPending = false
     }
 }
 
@@ -107,7 +127,7 @@ struct SessionRow: Codable, Identifiable, Equatable {
 @MainActor
 final class SessionIndex: ObservableObject {
     static let shared = SessionIndex(
-        supportDirectory: supportDirectory(), defaults: .standard)
+        supportDirectory: supportDirectory(), defaults: .standard, ownsAppBadge: true)
 
     private static let indexFileName = "sessions.json"
 
@@ -182,12 +202,23 @@ final class SessionIndex: ObservableObject {
     /// entry is gone — `merge` compares epochs and drops it.
     private(set) var mutationEpoch = 0
 
-    init(supportDirectory: URL, defaults: UserDefaults) {
+    /// Whether this instance drives the app-icon badge. True only for
+    /// [`shared`]: the suites run in parallel and construct their own indexes
+    /// against temp directories, and every one of those writing the host app's
+    /// real badge would make the number a race between unrelated tests.
+    private let ownsAppBadge: Bool
+
+    init(supportDirectory: URL, defaults: UserDefaults, ownsAppBadge: Bool = false) {
         self.supportDirectory = supportDirectory
         self.defaults = defaults
+        self.ownsAppBadge = ownsAppBadge
         fileURL = supportDirectory.appendingPathComponent(Self.indexFileName)
         rows = Self.load(from: fileURL)
         migrateLegacySingleSession()
+        // A cold launch must correct a badge left over from pushes that landed
+        // while the app was dead — including down to zero, which no later
+        // mutation would necessarily produce.
+        publishBadge()
     }
 
     /// Pinned block first, then most recently active — the web sidebar's order.
@@ -350,6 +381,25 @@ final class SessionIndex: ObservableObject {
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
         else { return }
         rows[idx].title = title
+        save()
+    }
+
+    /// A connection-global `SessionUpdated{approval_pending}` reached the list
+    /// sink: a tool call in `sessionId` is now waiting on the user, or its last
+    /// prompt just went away.
+    ///
+    /// An unknown id means the gateway is telling us about a conversation this
+    /// device has no row for — one started on the web, or a cron fire — and the
+    /// single thing that conversation needs is the user. Nudge a refetch so the
+    /// row appears, exactly as `noteActivity` does. A CLEAR for an unknown id
+    /// is nothing to act on.
+    func noteApprovalPending(sessionId: String, pending: Bool) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else {
+            if pending { noteListStale() }
+            return
+        }
+        guard rows[idx].approvalPending != pending else { return }
+        rows[idx].approvalPending = pending
         save()
     }
 
@@ -604,7 +654,12 @@ final class SessionIndex: ObservableObject {
             // an older gateway (no `last_message_text`) still renders a preview.
             let remotePreview = summary.lastMessageText ?? summary.lastUserText
             let hasRemotePreview = !(remotePreview ?? "").isEmpty
-            guard mine != nil || hasRemotePreview || summary.pinned else { continue }
+            // `approvalPending` joins the admission test because an
+            // agent-started conversation can block on its very first tool call,
+            // before any displayable turn exists — filtering it out as an empty
+            // draft would drop precisely the row the user most needs to see.
+            guard mine != nil || hasRemotePreview || summary.pinned || summary.approvalPending
+            else { continue }
             // Remote title is authoritative, but a live patch may have set it
             // before this (older) snapshot caught up — keep the local one when
             // the snapshot has none rather than blanking a title just shown.
@@ -655,7 +710,13 @@ final class SessionIndex: ObservableObject {
                     // — the same rule `pendingMutations` enforces for a row's own
                     // pin, applied to the object that actually holds the bit.
                     cronGroupPinned: summary.cronJobId
-                        .flatMap { pendingCronPins[$0] } ?? summary.cronGroupPinned))
+                        .flatMap { pendingCronPins[$0] } ?? summary.cronGroupPinned,
+                    // Adopted wholesale, with no `pendingMutations` shielding:
+                    // unlike pin / archive / hide this is never a local intent.
+                    // The client cannot decide a conversation is waiting on the
+                    // user — only the gateway's gate knows, and it is the
+                    // arbiter across every client.
+                    approvalPending: summary.approvalPending))
         }
         // A row the server no longer lists was deleted from another client, and
         // this rebuild is where it leaves the list for good. Its transcript goes
@@ -704,10 +765,20 @@ final class SessionIndex: ObservableObject {
     /// session this device has rendered; they are dropped only when the user
     /// deletes the session (`beginHide`) or unbinds the gateway (`removeAll`).
     private func save() {
+        // Every list mutation funnels through here, which makes it the one
+        // place the icon can be kept in step with the rows without scattering
+        // badge writes across a dozen call sites. `BadgeCenter` coalesces, so
+        // the saves that do not move the number cost nothing.
+        publishBadge()
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(rows) else { return }
         try? data.write(to: fileURL, options: .atomic)
+    }
+
+    private func publishBadge() {
+        guard ownsAppBadge else { return }
+        BadgeCenter.apply(BadgeCenter.total(rows))
     }
 
     private static func load(from url: URL) -> [SessionRow] {
@@ -782,6 +853,15 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 SessionIndex.shared.applyTitle(sessionId: sessionId, title: title)
+            }
+        }
+    }
+
+    func onApprovalPending(sessionId: String, pending: Bool) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.noteApprovalPending(
+                    sessionId: sessionId, pending: pending)
             }
         }
     }

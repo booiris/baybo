@@ -54,6 +54,7 @@ struct SessionIndexMirrorTests {
             pinned: false,
             archived: false,
             unreadCount: 0,
+            approvalPending: false,
             cronJobId: nil,
             cronJobTitle: nil,
             cronGroupPinned: false)

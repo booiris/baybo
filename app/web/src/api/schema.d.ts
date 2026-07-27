@@ -1303,6 +1303,17 @@ export interface components {
         };
         ChatSessionSummary: {
             /**
+             * @description True while a tool call in this session is parked on the approval gate,
+             *     waiting for the user to approve or deny it. The client marks the row so
+             *     the user knows which conversation to open; the prompt itself is only
+             *     answerable inside the conversation.
+             *
+             *     Derived from live in-memory gate state, never the store: a parked turn
+             *     dies with the gateway process, so reading `false` after a restart is
+             *     correct rather than stale. Absent when false.
+             */
+            approval_pending?: boolean;
+            /**
              * @description True when the user has archived this session. Always emitted —
              *     the list never filters on it, so clients with an archived view
              *     group rows themselves and clients without one keep showing every

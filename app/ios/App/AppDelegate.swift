@@ -69,19 +69,50 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
     }
 
-    /// Provisional auth (granted silently, so the mutable-content push lands in
-    /// Notification Center / lock screen) + remote-notification registration.
+    /// Notification authorization + remote-notification registration.
     /// Idempotent; re-run on foreground while no token is held.
+    ///
+    /// **Full authorization, not provisional.** Provisional is granted silently
+    /// but delivers *quietly*: straight into Notification Center, with no
+    /// sound, no lock-screen alert, and no icon badge. That was tolerable while
+    /// a push only said "your agent replied"; it is not, now that a push also
+    /// says "a tool call is blocked and will deny itself in five minutes unless
+    /// you answer it". A notification the user cannot notice is not a
+    /// notification. The cost is one system prompt on first launch.
+    ///
+    /// **iOS honours `options` only on the FIRST determination.** An install
+    /// that already answered — including one that took provisional silently on
+    /// an earlier build, which is every existing install — does not widen its
+    /// granted set just because we asked for more. `logAuthorizationState`
+    /// exists so that case is observable instead of presenting as "the badge
+    /// mysteriously never appears"; those users have to enable it in Settings.
     static func registerForPush() {
         UNUserNotificationCenter.current().requestAuthorization(
-            options: [.provisional, .alert, .sound]
+            options: [.alert, .sound, .badge]
         ) { _, error in
             if let error {
                 NSLog("baybo: notification authorization failed: %@", error.localizedDescription)
             }
+            Self.logAuthorizationState()
             DispatchQueue.main.async {
                 UIApplication.shared.registerForRemoteNotifications()
             }
+        }
+    }
+
+    /// Record what the system actually granted. The badge and the alert are
+    /// each load-bearing for a feature, and each degrades SILENTLY when
+    /// unauthorized — `setBadgeCount` just fails, a quiet alert just does not
+    /// interrupt — so without this line the only symptom is a feature that
+    /// appears not to have been built.
+    private static func logAuthorizationState() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            NSLog(
+                "baybo: notification settings — status=%ld alert=%ld sound=%ld badge=%ld",
+                settings.authorizationStatus.rawValue,
+                settings.alertSetting.rawValue,
+                settings.soundSetting.rawValue,
+                settings.badgeSetting.rawValue)
         }
     }
 }

@@ -18,6 +18,8 @@
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
 //! best-effort, so a lag just drops that buzz).
 
+pub mod approval;
+pub(crate) mod badge;
 pub(crate) mod web;
 
 use std::sync::Arc;
@@ -48,6 +50,15 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// preview — 1 is enough (the reply sits exactly at `reply_ordinal`); a small
 /// margin tolerates an interleaved row without a second round-trip.
 const PREVIEW_READ_LIMIT: usize = 4;
+
+/// Title of a completed-turn push. Unchanged from before approval pushes
+/// existed, which is why it is spelled out beside
+/// [`approval::APPROVAL_TITLE`] rather than shared with it.
+const REPLY_TITLE: &str = "Baybo";
+
+/// How long a computed badge total stays good enough to reuse. See
+/// [`PushDispatcher::badge_memo`].
+const BADGE_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Remote host (C) that direct-mode device push bindings register +
 /// notify through. Hardcoded to the public proxy the app already defaults to for
@@ -370,6 +381,18 @@ pub struct PushDispatcher {
     /// One-shot guard so the vault high-water is read into `push_counter` exactly
     /// once, on the first mint.
     push_counter_seeded: OnceCell<()>,
+    /// Last computed icon-badge total, and when. Internal state, not a
+    /// dependency — same class as `registered` / `push_counter`.
+    ///
+    /// The count is a full session-list read plus an unread scan, and it runs
+    /// on the single task that also drains the job-lifecycle bus. That bus is
+    /// bounded and a lagged reader *drops* pushes, so paying the scan on every
+    /// completed turn would let a burst (a cron sweep, a batch of finishing
+    /// turns) turn "the badge is a beat stale" into "the reply push never
+    /// went out". Memoising bounds it to one scan per [`BADGE_MEMO_TTL`],
+    /// which the badge can afford: it is an absolute value that the next push
+    /// or the next foreground corrects.
+    badge_memo: Mutex<Option<(std::time::Instant, i64)>>,
 }
 
 impl PushDispatcher {
@@ -392,7 +415,29 @@ impl PushDispatcher {
             push_signing_key: OnceCell::new(),
             push_counter: AtomicU64::new(0),
             push_counter_seeded: OnceCell::new(),
+            badge_memo: Mutex::new(None),
         }
+    }
+
+    /// The icon-badge total, recomputed at most once per [`BADGE_MEMO_TTL`].
+    /// `None` means "could not count" and the caller omits the key entirely —
+    /// never a zero, which APNs would apply as a clear.
+    async fn badge_total(&self) -> Option<i64> {
+        // Read and drop the guard BEFORE the await. Holding a lock across it
+        // trips `clippy::await_holding_lock` and would serialise the push task
+        // behind a store scan.
+        let fresh = {
+            let memo = self.badge_memo.lock();
+            (*memo)
+                .filter(|(at, _)| at.elapsed() < BADGE_MEMO_TTL)
+                .map(|(_, total)| total)
+        };
+        if let Some(total) = fresh {
+            return Some(total);
+        }
+        let total = badge::unread_badge_total(&self.session_manager).await?;
+        *self.badge_memo.lock() = Some((std::time::Instant::now(), total));
+        Some(total)
     }
 
     /// The next strictly-increasing replay counter for a signed push. On first
@@ -523,10 +568,26 @@ impl PushDispatcher {
             );
             return;
         }
-        // Fan out to every approved paired device AND every direct-mode device push
-        // binding — one gateway = one user, so there is no per-user scoping.
-        // A direct binding is cryptographically identical to a paired-device
-        // binding, so both ride the same dispatch path (see [`web`]).
+        self.fan_out(&ev.session_id, || {
+            let session_id = ev.session_id.clone();
+            async move { self.build_preview(&session_id, reply_ordinal).await }
+        })
+        .await;
+    }
+
+    /// Enumerate every push target and deliver `preview` to each.
+    ///
+    /// Shared by the completed-turn and approval paths: the target set (every
+    /// approved paired device plus every direct-mode binding, deduped) and the
+    /// per-target delivery are identical for both — only *what* gets composed
+    /// differs, which is why the preview arrives as a builder rather than a
+    /// string. The builder runs **after** the empty-target check, so a gateway
+    /// with nothing paired never pays to compose a preview nobody receives.
+    async fn fan_out<F, Fut>(&self, session_id: &SessionId, build_preview: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
         let device_rows = match self.device_store.list(Some(DeviceStatus::Approved)).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -550,14 +611,14 @@ impl PushDispatcher {
         retain_routable_targets(&mut targets);
         if targets.is_empty() {
             tracing::debug!(
-                session = %ev.session_id,
+                session = %session_id,
                 "push: no push targets (no approved device, no web binding); skipping"
             );
             return;
         }
-        let preview = self.build_preview(&ev.session_id, reply_ordinal).await;
+        let preview = build_preview().await;
         for t in &targets {
-            match self.dispatch_to_target(t, &ev.session_id, &preview).await {
+            match self.dispatch_to_target(t, session_id, &preview).await {
                 // A 2xx from C's `/notify` — the encrypted preview is on its way to
                 // APNs. Logged so the push path is observable end to end.
                 Ok(()) => {
@@ -567,12 +628,78 @@ impl PushDispatcher {
                     tracing::warn!(
                         error = %e,
                         device = %t.device_id,
-                        session = %ev.session_id,
+                        session = %session_id,
                         "push: notify to remote host failed for this device"
                     )
                 }
             }
         }
+    }
+
+    /// Dispatch on a tool call parking at the approval gate — the second push
+    /// source, fed by [`approval::ApprovalPushRelay`] rather than the job
+    /// lifecycle bus (nothing terminal has happened; that is the point).
+    pub async fn dispatch_approval(&self, push: &approval::ApprovalPush) {
+        let session = match self.session_manager.get(&push.session_id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                tracing::debug!(
+                    session = %push.session_id,
+                    "push: session not found for approval prompt; skipping"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %push.session_id,
+                    error = %e,
+                    "push: session lookup failed for approval prompt; push skipped"
+                );
+                return;
+            }
+        };
+        // A one-shot cron fire's workspace is not a conversation the app can
+        // open, so a notification deep-linking into it would be a dead end.
+        if crate::api::admin::chat::is_hidden_cron_session(&session) {
+            tracing::debug!(
+                session = %push.session_id,
+                "push: approval prompt is in a private cron workspace; not pushing"
+            );
+            return;
+        }
+        // Everything between the relay's `try_send` and the POST below — store
+        // reads, vault reads, crypto, two TLS round-trips — is time in which
+        // someone at a desk can answer this prompt. Sending anyway would buzz a
+        // phone whose tap opens a conversation with no card in it.
+        let Some(channel) = push.channel.upgrade() else {
+            return;
+        };
+        if !channel
+            .pending_approvals(&push.session_id)
+            .iter()
+            .any(|req| req.call_id == push.call_id)
+        {
+            tracing::debug!(
+                session = %push.session_id,
+                call_id = %push.call_id,
+                "push: approval prompt was resolved before its push went out; dropping"
+            );
+            return;
+        }
+        let body = approval::approval_push_body(&push.tool);
+        self.fan_out(&push.session_id, || {
+            let session_id = push.session_id.clone();
+            async move {
+                // An approval prompt is not an unread message, so this carries
+                // the CURRENT total rather than bumping it: the prompt expires
+                // silently with no server-side signal to decrement, and a badge
+                // that counted it would strand a digit on the icon forever. Its
+                // urgency rides the alert, which is louder than a digit anyway.
+                let badge = self.badge_total().await;
+                preview_json(approval::APPROVAL_TITLE, &body, &session_id, badge)
+            }
+        })
+        .await;
     }
 
     async fn dispatch_to_target(
@@ -821,11 +948,12 @@ impl PushDispatcher {
     /// tool-only reply) yields the generic placeholder — **never** a stale
     /// previous reply.
     async fn build_preview(&self, session_id: &SessionId, reply_ordinal: i64) -> String {
-        preview_json(
+        reply_preview_json(
             self.reply_text_at(session_id, reply_ordinal)
                 .await
                 .as_deref(),
             session_id,
+            self.badge_total().await,
         )
     }
 
@@ -858,12 +986,30 @@ impl PushDispatcher {
 /// while C stays blind to session ids (the same invariant that hashes
 /// [`push_collapse_id`]). Older NSE builds ignore the extra field
 /// (`JSONDecoder` tolerates unknown keys); newer ones treat it as optional.
-fn preview_json(text: Option<&str>, session_id: &SessionId) -> String {
+fn reply_preview_json(text: Option<&str>, session_id: &SessionId, badge: Option<i64>) -> String {
     let body = match text {
         Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
         None => "New message".to_string(),
     };
-    json!({ "title": "Baybo", "body": body, "session_id": session_id.to_string() }).to_string()
+    preview_json(REPLY_TITLE, &body, session_id, badge)
+}
+
+/// Frame the sealed plaintext. `badge` rides **inside** the AEAD for the same
+/// reason `session_id` does — the remote host relays it blind and must not
+/// learn it — and is omitted (not zeroed) when unknown, because APNs reads a
+/// missing badge as "leave the icon alone" and a `0` as "clear it".
+fn preview_json(title: &str, body: &str, session_id: &SessionId, badge: Option<i64>) -> String {
+    let mut v = json!({
+        "title": title,
+        "body": body,
+        "session_id": session_id.to_string(),
+    });
+    if let Some(badge) = badge
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.insert("badge".into(), json!(badge));
+    }
+    v.to_string()
 }
 
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
@@ -979,17 +1125,26 @@ fn relay_url_to_http_base(relay_url: &str) -> String {
 pub fn spawn<F>(
     dispatcher: Arc<PushDispatcher>,
     job_lifecycle: Arc<JobLifecycle>,
+    mut approvals: approval::ApprovalPushStream,
     shutdown: F,
 ) -> JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let mut events = job_lifecycle.subscribe_lifecycle_events();
+    // A closed approval stream disables its arm rather than ending the task:
+    // completed-turn pushes are a separate, independently-useful feature and
+    // must survive the approval relay going away.
+    let mut approvals_open = true;
     tokio::spawn(async move {
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
+                recv = approvals.recv(), if approvals_open => match recv {
+                    Some(push) => dispatcher.dispatch_approval(&push).await,
+                    None => approvals_open = false,
+                },
                 recv = events.recv() => match recv {
                     Ok(ev) => {
                         dispatcher.handle_event(&ev).await;
@@ -1105,7 +1260,7 @@ mod tests {
         let session = SessionId::from("sess-9");
         let long = "x".repeat(500);
         let v: serde_json::Value =
-            serde_json::from_str(&preview_json(Some(&long), &session)).unwrap();
+            serde_json::from_str(&reply_preview_json(Some(&long), &session, None)).unwrap();
         assert_eq!(v["title"], "Baybo");
         assert_eq!(
             v["body"].as_str().unwrap().chars().count(),
@@ -1115,9 +1270,58 @@ mod tests {
         // payload must never carry it — C stays blind to session ids).
         assert_eq!(v["session_id"], "sess-9");
         // None → generic placeholder (never a stale previous-turn reply).
-        let g: serde_json::Value = serde_json::from_str(&preview_json(None, &session)).unwrap();
+        let g: serde_json::Value =
+            serde_json::from_str(&reply_preview_json(None, &session, None)).unwrap();
         assert_eq!(g["body"], "New message");
         assert_eq!(g["session_id"], "sess-9");
+    }
+
+    #[test]
+    fn preview_json_omits_the_badge_key_when_unknown() {
+        // APNs reads an ABSENT badge as "leave the icon alone" and a `0` as
+        // "clear it". A gateway that failed to count must not wipe a truthful
+        // badge, so `None` has to omit the key rather than send zero.
+        let session = SessionId::from("s1");
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_json("T", "b", &session, None)).unwrap();
+        assert!(
+            v.as_object().unwrap().get("badge").is_none(),
+            "None must omit the key, not emit null or 0"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_json("T", "b", &session, Some(0))).unwrap();
+        assert_eq!(v["badge"], 0, "an explicit zero is a real clear");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_json("T", "b", &session, Some(7))).unwrap();
+        assert_eq!(v["badge"], 7);
+        assert_eq!(v["title"], "T");
+        assert_eq!(v["body"], "b");
+        assert_eq!(v["session_id"], "s1");
+    }
+
+    #[test]
+    fn approval_and_reply_pushes_are_distinguishable_on_a_locked_screen() {
+        // With "Show Previews: When Unlocked" the title is the only line a
+        // locked phone renders, so it has to carry whether this is something
+        // to read or something to act on.
+        let session = SessionId::from("s1");
+        let reply: serde_json::Value =
+            serde_json::from_str(&reply_preview_json(Some("hi"), &session, None)).unwrap();
+        assert_eq!(reply["title"], REPLY_TITLE);
+        let approval: serde_json::Value = serde_json::from_str(&preview_json(
+            approval::APPROVAL_TITLE,
+            &approval::approval_push_body("Bash"),
+            &session,
+            None,
+        ))
+        .unwrap();
+        assert_ne!(approval["title"], reply["title"]);
+        // And the body never carries the call's arguments.
+        let body = approval["body"].as_str().unwrap();
+        assert!(body.contains("Bash"));
+        assert!(!body.contains('{') && !body.contains('"'));
     }
 
     #[test]

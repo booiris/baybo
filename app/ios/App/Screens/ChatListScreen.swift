@@ -422,6 +422,7 @@ struct SessionRowView: View {
             preview: row.preview,
             lastActive: row.lastActive,
             unread: row.unread,
+            approvalPending: row.approvalPending,
             langCode: langCode,
             glyph: nil
         )
@@ -485,6 +486,7 @@ struct CronGroupRowView: View {
             preview: group.preview,
             lastActive: group.lastActive,
             unread: group.unread,
+            approvalPending: group.approvalPending,
             langCode: langCode,
             // `alarm`, not `clock`: a clock's silhouette at row size is a thin
             // ring — its hands are the first thing to dissolve, and what is left
@@ -523,6 +525,9 @@ struct ChatRowBody: View {
     let preview: String?
     let lastActive: Date
     let unread: Int
+    /// A tool call in this conversation (or, on a group row, in any fire inside
+    /// it) is parked on the approval gate.
+    let approvalPending: Bool
     /// The app language's locale identifier (drives the time formatter, so it
     /// can't diverge from the chrome language).
     let langCode: String
@@ -588,9 +593,38 @@ struct ChatRowBody: View {
                 .font(Theme.sys(11))
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
-            if unread > 0 { unreadBadge }
+            if approvalPending || unread > 0 {
+                HStack(spacing: 6) {
+                    if approvalPending { approvalMark }
+                    if unread > 0 { unreadBadge }
+                }
+            }
         }
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// A conversation waiting on the user's decision.
+    ///
+    /// A LINE glyph, not a filled shape: every filled capsule in this row's
+    /// vocabulary is a COUNT (`unreadBadge`, the ink CTA pill), and a second
+    /// ink capsule beside the first would read as a second number. Ink rather
+    /// than `Theme.err`, because red is the destructive token and
+    /// `ApprovalCardView` already spends it on Deny alone — painting the
+    /// REQUEST in the colour of the refusal collapses the feature's two states
+    /// into one hue.
+    ///
+    /// Static, not breathing. The transcript's blocked step animates to
+    /// separate *waiting* from *executing* among sibling steps, a distinction a
+    /// list row does not have; a repeating animation inside a scrolling `List`
+    /// reads as flicker and makes headless screenshot checks nondeterministic.
+    /// Salience comes from weight instead — full ink against a column whose
+    /// only other resident is 11pt `inkSoft`.
+    private var approvalMark: some View {
+        Image(systemName: "hand.raised")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(Theme.ink)
+            .frame(width: 18, height: 18)
+            .accessibilityLabel(Text(Lang.shared.t("list.approvalPending")))
     }
 
     /// The unread count: an ink capsule with paper digits, matching the ink CTA

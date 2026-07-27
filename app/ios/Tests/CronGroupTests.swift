@@ -210,6 +210,7 @@ struct CronGroupPersistenceTests {
                     pinned: false,
                     archived: false,
                     unreadCount: 1,
+                    approvalPending: false,
                     cronJobId: "cj-1",
                     cronJobTitle: "Morning brief",
                     cronGroupPinned: false)

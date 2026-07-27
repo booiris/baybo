@@ -1031,6 +1031,22 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub title: Option<String>,
+    /// `true` while at least one tool call in this session is parked on the
+    /// approval gate; `false` the moment its LAST prompt is answered,
+    /// cancelled, or times out. Absent means no change.
+    ///
+    /// This rides a patch rather than [`Frame::ApprovalRequested`] because the
+    /// prompt frame is dispatched only to connections **subscribed to that
+    /// session**, and the client that most needs to know is the one parked on
+    /// its conversation list, subscribed to nothing. Patches broadcast to
+    /// every connection on the channel, so the mark reaches a session the
+    /// device has never opened.
+    ///
+    /// Carries nothing about *what* the tool wants — a list row must not leak
+    /// a command line. Opening the conversation is what shows the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub approval_pending: Option<bool>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -1496,6 +1512,7 @@ mod tests {
                 archived: Some(true),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
                 title: Some("Reset password flow".into()),
+                approval_pending: Some(true),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1517,9 +1534,33 @@ mod tests {
                 archived: None,
                 folder_id: None,
                 title: None,
+                approval_pending: None,
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_updated_approval_pending_only() {
+        // The approval-gate shape: a lone bool, both edges. The clear is the
+        // only signal a timed-out gate ever emits, so `Some(false)` must
+        // survive the round trip distinctly from absent (no change).
+        for pending in [true, false] {
+            let frame = Frame::SessionUpdated {
+                session_id: "sess-abc".into(),
+                patch: SessionPatch {
+                    approval_pending: Some(pending),
+                    ..Default::default()
+                },
+            };
+            let decoded = decode(&encode(&frame).unwrap()).unwrap();
+            assert_eq!(frame, decoded);
+            let Frame::SessionUpdated { patch, .. } = decoded else {
+                panic!("expected SessionUpdated");
+            };
+            assert_eq!(patch.approval_pending, Some(pending));
+            assert_eq!(patch.title, None, "a lone flag carries nothing else");
+        }
     }
 
     #[test]

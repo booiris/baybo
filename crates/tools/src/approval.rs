@@ -20,7 +20,7 @@
 //! queue-and-oneshot pattern so each channel only provides a sync waker
 //! callback instead of reimplementing the full gate.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -210,6 +210,54 @@ struct PendingApproval {
 /// that need async work should spawn a task themselves.
 pub type ResolveFn = Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>;
 
+/// Which way a session crossed the "has at least one parked prompt" boundary,
+/// and — on the way out — whether a human was behind it.
+///
+/// The distinction is not cosmetic. [`Self::Answered`] means the user is
+/// present and acting, so the next prompt deserves to interrupt them again
+/// immediately; [`Self::Abandoned`] means nobody came, and re-announcing the
+/// same conversation at the same volume is how an agent that keeps retrying
+/// gated approaches turns into an all-night stream of notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEdge {
+    /// The session's FIRST prompt just parked. Carries the prompt's identity
+    /// because watchers run **under the queue lock** and so must never read
+    /// the queue back to find out what woke them — `parking_lot` locks are not
+    /// reentrant, and that lookup would deadlock the gate.
+    Raised { call_id: String, tool: String },
+    /// Its LAST prompt was answered by a decision someone made.
+    Answered,
+    /// Its LAST prompt went away with no decision — the gate timed out, or
+    /// the turn was cancelled out from under it.
+    Abandoned,
+}
+
+impl PendingEdge {
+    /// Whether the session is waiting on the user after this edge.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, PendingEdge::Raised { .. })
+    }
+}
+
+/// Fired when a session crosses the "has at least one parked prompt"
+/// boundary. **Edge-only**: a second prompt on an already-waiting session is
+/// silent, and resolving one of two leaves the session waiting.
+///
+/// This exists because the queue is the *only* place that sees every way a
+/// prompt leaves. A client resolve broadcasts `ApprovalResolved`, but the
+/// 300 s gate timeout and a cancelled turn both exit through
+/// [`QueueCleanup::drop`] and broadcast nothing at all — a "waiting for you"
+/// mark hung off the resolution event alone would stick forever on exactly
+/// the turns nobody answered.
+///
+/// Runs **while the queue lock is held**, which is what keeps two concurrent
+/// mutations from publishing their edges out of order (a `false` overtaking
+/// the `true` that superseded it would strand the flag inverted, i.e. silently
+/// stop asking the user for a decision the agent is still blocked on). The
+/// implementation must therefore only *publish* — never re-enter the queue,
+/// never block.
+pub type PendingWatcher = Arc<dyn Fn(SessionId, PendingEdge) + Send + Sync>;
+
 /// Thread-safe queue of pending approval prompts. Shared between a
 /// [`ChannelApprovalGate`] (producer) and the channel's event loop
 /// (consumer). Cloneable — both sides hold a handle.
@@ -217,6 +265,7 @@ pub type ResolveFn = Arc<dyn Fn(String, ApprovalDecision) + Send + Sync>;
 pub struct ApprovalQueue {
     inner: Arc<Mutex<VecDeque<PendingApproval>>>,
     resolver: Arc<Mutex<Option<ResolveFn>>>,
+    pending_watchers: Arc<Mutex<Arc<Vec<PendingWatcher>>>>,
 }
 
 impl ApprovalQueue {
@@ -224,7 +273,59 @@ impl ApprovalQueue {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             resolver: Arc::new(Mutex::new(None)),
+            pending_watchers: Arc::new(Mutex::new(Arc::new(Vec::new()))),
         }
+    }
+
+    /// Add a [`PendingWatcher`] fired on every per-session
+    /// has-parked-prompts edge. **Appends** — the chat-list broadcast and the
+    /// push relay are installed at different moments in boot (one when the
+    /// channel is built, one when the push dispatcher exists), and a
+    /// replace-style slot would silently leave whichever lost the race with
+    /// no signal at all. Watchers fire in install order, each independently.
+    pub fn add_pending_watcher(&self, watcher: PendingWatcher) {
+        let mut slot = self.pending_watchers.lock();
+        let mut next = Vec::clone(slot.as_ref());
+        next.push(watcher);
+        *slot = Arc::new(next);
+    }
+
+    /// Publish `session_id`'s boundary crossing if the caller's mutation
+    /// caused one. `q` is the **still-locked** queue with the mutation already
+    /// applied, so it is the truth; `was_pending` is what the caller observed
+    /// before mutating, and `edge` labels *why* the crossing happened. See
+    /// [`PendingWatcher`] for why this fires under the lock.
+    fn note_pending_edge(
+        &self,
+        q: &VecDeque<PendingApproval>,
+        session_id: &SessionId,
+        was_pending: bool,
+        edge: PendingEdge,
+    ) {
+        let pending = q.iter().any(|e| &e.req.session_id == session_id);
+        if pending == was_pending {
+            return;
+        }
+        debug_assert_eq!(
+            pending,
+            edge.is_pending(),
+            "caller labelled the edge in the opposite direction to the queue"
+        );
+        let watchers = Arc::clone(&*self.pending_watchers.lock());
+        for watcher in watchers.iter() {
+            watcher(session_id.clone(), edge.clone());
+        }
+    }
+
+    /// Sessions with at least one parked prompt. One pass cloning only the
+    /// ids — the chat-list endpoint asks once per refresh and must not pay
+    /// [`Self::list`]'s clone of every request body to answer a bool.
+    pub fn pending_sessions(&self) -> HashSet<SessionId> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|e| e.req.session_id.clone())
+            .collect()
     }
 
     /// Install a callback that runs whenever a queue entry is resolved
@@ -240,7 +341,15 @@ impl ApprovalQueue {
     }
 
     fn push(&self, entry: PendingApproval) {
-        self.inner.lock().push_back(entry);
+        let session_id = entry.req.session_id.clone();
+        let raised = PendingEdge::Raised {
+            call_id: entry.req.call_id.clone(),
+            tool: entry.req.tool.clone(),
+        };
+        let mut q = self.inner.lock();
+        let was_pending = q.iter().any(|e| e.req.session_id == session_id);
+        q.push_back(entry);
+        self.note_pending_edge(&q, &session_id, was_pending, raised);
     }
 
     /// Snapshot the head request for rendering. Returns `None` when empty.
@@ -256,7 +365,14 @@ impl ApprovalQueue {
     /// responder (remote mirrors) pop silently; the caller handles
     /// the actual resolution out-of-band.
     pub fn resolve_head(&self, decision: ApprovalDecision) -> bool {
-        let popped = self.inner.lock().pop_front();
+        let popped = {
+            let mut q = self.inner.lock();
+            let popped = q.pop_front();
+            if let Some(pending) = popped.as_ref() {
+                self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered);
+            }
+            popped
+        };
         let Some(pending) = popped else {
             return false;
         };
@@ -287,10 +403,17 @@ impl ApprovalQueue {
         call_id: &str,
         decision: ApprovalDecision,
     ) -> Option<SessionId> {
-        let mut q = self.inner.lock();
-        let pos = q.iter().position(|e| e.req.call_id == call_id)?;
-        let pending = q.remove(pos)?;
+        let pending = {
+            let mut q = self.inner.lock();
+            let pos = q.iter().position(|e| e.req.call_id == call_id)?;
+            let pending = q.remove(pos)?;
+            self.note_pending_edge(&q, &pending.req.session_id, true, PendingEdge::Answered);
+            pending
+        };
         let session_id = pending.req.session_id.clone();
+        // Outside the lock: the oneshot wakes the blocked tool future, which
+        // may run to its next `gate.request` on another worker and re-enter
+        // the queue.
         if let Some(responder) = pending.responder {
             let _ = responder.send(decision);
         }
@@ -316,11 +439,14 @@ impl ApprovalQueue {
     /// local mirror without second-guessing the decision.
     pub fn drop_call(&self, call_id: &str) -> bool {
         let mut q = self.inner.lock();
-        if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) {
-            q.remove(pos);
-            return true;
-        }
-        false
+        let Some(pos) = q.iter().position(|e| e.req.call_id == call_id) else {
+            return false;
+        };
+        let Some(removed) = q.remove(pos) else {
+            return false;
+        };
+        self.note_pending_edge(&q, &removed.req.session_id, true, PendingEdge::Abandoned);
+        true
     }
 
     /// Snapshot the full queue for listing via a REST endpoint. Order
@@ -658,6 +784,167 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(q.resolve_head(ApprovalDecision::Approve));
         assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
+        assert!(queue.is_empty());
+    }
+
+    // --- per-session pending edges (the chat-list "waiting for you" mark) ---
+
+    /// Every `(session, pending)` edge the queue published, in order.
+    type SeenEdges = Arc<Mutex<Vec<(String, PendingEdge)>>>;
+
+    /// The edge a first-parked prompt publishes, for assertions.
+    fn raised(call_id: &str) -> PendingEdge {
+        PendingEdge::Raised {
+            call_id: call_id.into(),
+            tool: "Bash".into(),
+        }
+    }
+
+    /// A queue whose pending-edge watcher records into [`SeenEdges`].
+    fn watched_queue() -> (ApprovalQueue, SeenEdges) {
+        let queue = ApprovalQueue::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        queue.add_pending_watcher(Arc::new(move |session_id: SessionId, edge| {
+            sink.lock().push((session_id.to_string(), edge));
+        }));
+        (queue, seen)
+    }
+
+    fn mirror_req(call_id: &str, session_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            tool_call_id: None,
+            call_id: call_id.into(),
+            session_id: session_id.into(),
+            user_id: "u".into(),
+            tool: "Bash".into(),
+            accesses: vec![],
+            params_preview: String::new(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn pending_edges_fire_once_per_session_boundary_not_once_per_prompt() {
+        let (queue, seen) = watched_queue();
+        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        queue.enqueue_mirror(mirror_req("a2", "s1"));
+        queue.enqueue_mirror(mirror_req("b1", "s2"));
+        assert_eq!(
+            *seen.lock(),
+            vec![("s1".into(), raised("a1")), ("s2".into(), raised("b1"))],
+            "the second prompt on an already-waiting session is silent"
+        );
+
+        // Resolving one of s1's two leaves the mark up — the session is still
+        // blocked on the other.
+        seen.lock().clear();
+        assert!(queue.drop_call("a1"));
+        assert!(seen.lock().is_empty(), "s1 still has a parked prompt");
+
+        assert!(queue.drop_call("a2"));
+        assert_eq!(*seen.lock(), vec![("s1".into(), PendingEdge::Abandoned)]);
+    }
+
+    #[test]
+    fn pending_sessions_dedupes_and_tracks_removal() {
+        let (queue, _) = watched_queue();
+        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        queue.enqueue_mirror(mirror_req("a2", "s1"));
+        queue.enqueue_mirror(mirror_req("b1", "s2"));
+        assert_eq!(
+            queue.pending_sessions(),
+            HashSet::from([SessionId::from("s1"), SessionId::from("s2")])
+        );
+        queue.drop_call("b1");
+        assert_eq!(
+            queue.pending_sessions(),
+            HashSet::from([SessionId::from("s1")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_gate_clears_the_session_mark() {
+        // The invariant no resolution event can provide: a gate nobody answers
+        // self-denies and broadcasts NOTHING, so the queue's own drop path is
+        // the only thing that can retire the chat-list mark. Without it the row
+        // wears "waiting for your approval" forever.
+        let (queue, seen) = watched_queue();
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_millis(30));
+        assert_eq!(
+            gate.request(mirror_req("c1", "s1")).await,
+            ApprovalDecision::Deny,
+            "an unanswered gate fails closed"
+        );
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                ("s1".into(), raised("c1")),
+                ("s1".into(), PendingEdge::Abandoned)
+            ],
+            "a gate nobody answered is ABANDONED, not answered"
+        );
+        assert!(queue.pending_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_future_clears_the_session_mark() {
+        // `/stop` (or any cancellation) drops the request future mid-wait; the
+        // same RAII cleanup must publish the clear.
+        let (queue, seen) = watched_queue();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            queue.clone(),
+            Arc::new(|_| {}),
+            Duration::from_secs(60),
+        ));
+        let task = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.request(mirror_req("c1", "s1")).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(*seen.lock(), vec![("s1".into(), raised("c1"))]);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                ("s1".into(), raised("c1")),
+                ("s1".into(), PendingEdge::Abandoned)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_by_call_id_clears_the_session_mark() {
+        let (queue, seen) = watched_queue();
+        let gate =
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_secs(60));
+        let q = queue.clone();
+        let task = tokio::spawn(async move { gate.request(mirror_req("c1", "s1")).await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            q.resolve_by_call_id("c1", ApprovalDecision::Approve),
+            Some(SessionId::from("s1"))
+        );
+        assert_eq!(task.await.unwrap(), ApprovalDecision::Approve);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                ("s1".into(), raised("c1")),
+                ("s1".into(), PendingEdge::Answered)
+            ],
+            "a human decision is ANSWERED — the next prompt may interrupt again"
+        );
+    }
+
+    #[test]
+    fn a_queue_with_no_watcher_installed_still_mutates() {
+        // The TUI's client-side mirror queue installs no watcher.
+        let queue = ApprovalQueue::new();
+        queue.enqueue_mirror(mirror_req("a1", "s1"));
+        assert_eq!(queue.len(), 1);
+        assert!(queue.drop_call("a1"));
         assert!(queue.is_empty());
     }
 }

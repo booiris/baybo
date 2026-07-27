@@ -1667,6 +1667,23 @@
         }
       }
     },
+    "list.approvalPending": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for your approval"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待你的批准"
+          }
+        }
+      }
+    },
     "list.archive": {
       "extractionState": "stale",
       "localizations": {
