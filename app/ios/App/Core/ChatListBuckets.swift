@@ -71,6 +71,14 @@ struct CronGroup: Identifiable, Equatable {
     var lastActive: Date { members.first?.lastActive ?? .distantPast }
     var preview: String? { members.first?.preview }
     var unread: Int { members.reduce(0) { $0 + $1.unread } }
+    /// Whether any fire in this group is blocked on the approval gate.
+    ///
+    /// An OR, never a count: a count would imply the user could answer N of
+    /// them from the list, and they cannot. The group's mark says only
+    /// "something inside needs you"; the decision lives one tap deeper, where
+    /// `CronGroupScreen` renders each member through the same row view and
+    /// shows exactly which fire is waiting.
+    var approvalPending: Bool { members.contains(where: \.approvalPending) }
     /// The sessions the group's own actions act on — "mark all read", and the
     /// delete that clears the job's execution records. Escaped rows are their own
     /// row elsewhere and answer for themselves there.

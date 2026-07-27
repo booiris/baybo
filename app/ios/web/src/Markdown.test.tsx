@@ -30,7 +30,7 @@ import { MarkdownBody } from "./Markdown";
 // attached to <ReactMarkdown>. KaTeX builds plain DOM with inline styles (no
 // layout/measurement), so it renders in jsdom. Like WorkBlock.test.tsx, this is
 // a small presentational component with no scrollHeight/follow/pin dependency,
-// so mounting it is fine (see app/ios/CLAUDE.md "web/").
+// so mounting it is fine (see app/ios/docs/testing.md "web/").
 describe("MarkdownBody math", () => {
   it("renders inline $...$ as KaTeX", () => {
     const { container } = render(<MarkdownBody text={"energy is $E = mc^2$ today"} />);

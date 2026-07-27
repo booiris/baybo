@@ -60,4 +60,20 @@ folder_id?: FolderChange,
 /**
  * Generated conversation title; absent means no change.
  */
-title?: string, };
+title?: string, 
+/**
+ * `true` while at least one tool call in this session is parked on the
+ * approval gate; `false` the moment its LAST prompt is answered,
+ * cancelled, or times out. Absent means no change.
+ *
+ * This rides a patch rather than [`Frame::ApprovalRequested`] because the
+ * prompt frame is dispatched only to connections **subscribed to that
+ * session**, and the client that most needs to know is the one parked on
+ * its conversation list, subscribed to nothing. Patches broadcast to
+ * every connection on the channel, so the mark reaches a session the
+ * device has never opened.
+ *
+ * Carries nothing about *what* the tool wants — a list row must not leak
+ * a command line. Opening the conversation is what shows the prompt.
+ */
+approval_pending?: boolean, };

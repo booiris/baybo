@@ -5,10 +5,9 @@
 //! Notification Service Extension. The protocol/crypto live in the shared crates,
 //! so interop with the gateway is guaranteed by construction.
 //!
-//! Lifted from the Tauri shell (`app/mobile/src-tauri`): the command surface is
-//! the same, with Tauri channels/events replaced by the callback interfaces in
-//! [`api`] and the ambient Tauri runtime replaced by the owned one in
-//! [`runtime`].
+//! The whole command surface is exported over UniFFI: events are pushed back to
+//! Swift through the callback interfaces in [`api`], and every async call runs
+//! on the runtime this crate owns in [`runtime`].
 
 mod api;
 mod apns;

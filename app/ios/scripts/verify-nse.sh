@@ -2,7 +2,6 @@
 #
 # verify-nse.sh — end-to-end proof that the iOS NSE decrypts a real push on the
 # Simulator, using the pinned cross-language fixture from `device_proto::fixtures`.
-# Port of app/mobile/apple/verify-nse.sh to the SwiftUI app (app/ios).
 #
 # WHY a script you run (not CI): the App Group keychain the NSE reads is gated by
 # the `com.apple.security.application-groups` entitlement, and signing needs your
@@ -17,11 +16,11 @@
 # this and prints the Xcode-automatic-signing path). Re-signing also requires the
 # `com.apple.security.get-task-allow` entitlement or the sim refuses to launch.
 #
-# Differences from the app/mobile original (behavior, not intent):
+# Why the build/sign steps look the way they do:
 #   * Build: scripts/build-core.sh --sim-only (DEBUG profile — the seed
 #     hook is compiled out otherwise) → web transcript bundle if missing →
 #     xcodegen → xcodebuild with CODE_SIGNING_ALLOWED=NO and a deterministic
-#     -derivedDataPath (build/DerivedData), instead of `cargo tauri ios build`.
+#     -derivedDataPath (build/DerivedData).
 #   * BAYBO_IOS_KEYCHAIN_ACCESS_GROUP is exported before the Rust build: the
 #     app-side keychain group is baked into the staticlib at compile time
 #     (ffi/build.rs), so it must match the group this script signs with.
@@ -29,9 +28,10 @@
 #     group before re-signing: with signing disabled, $(AppIdentifierPrefix)
 #     expands empty and the NSE would query the wrong access group.
 #   * The push payload's `enc` is derived from CIPHERTEXT_HEX in
-#     crates/device-proto/src/fixtures.rs at run time. The original pinned a
-#     stale base64 ciphertext predating the Aura→Baybo rename (it decrypts to
-#     title "Aura"); deriving from the Rust source keeps the two in lockstep.
+#     crates/device-proto/src/fixtures.rs at run time — a base64 ciphertext
+#     pinned here instead goes stale silently (an earlier one predated the
+#     Aura→Baybo rename and decrypts to title "Aura"); deriving from the Rust
+#     source keeps the two in lockstep.
 #
 # Steps: build (debug, sim) → code-sign app + NSE with your Dev identity +
 # get-task-allow + the App Group → boot an iOS 26 sim → install → launch (the

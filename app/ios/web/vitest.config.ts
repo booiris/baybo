@@ -7,8 +7,9 @@ import react from "@vitejs/plugin-react";
 // `window.webkit` and registers window listeners, so `node` throws on import.
 // Most suites exercise pure reducers; the one render test (WorkBlock.test.tsx)
 // mounts that small presentational card — no scrollHeight/follow/pin, so it does
-// NOT hit the reason <Transcript> stays unrendered (see app/ios/CLAUDE.md
-// "web/"). `setup.ts` wires the jest-dom matchers and per-test unmount.
+// NOT hit the reason <Transcript> stays unrendered (see
+// app/ios/docs/testing.md "web/"). `setup.ts` wires the jest-dom matchers and
+// per-test unmount.
 export default defineConfig({
   plugins: [react()],
   test: {

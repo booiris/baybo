@@ -696,6 +696,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 archived: Some(false),
                 folder_id: None,
                 title: None,
+                approval_pending: None,
             },
         );
 
@@ -718,6 +719,81 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     }
 
     drop(subscriber);
+    drop(bystander);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_gate_marks_the_session_for_an_unsubscribed_client() {
+    // The reason the mark is a broadcast patch and not `ApprovalRequested`:
+    // the prompt frame only reaches connections subscribed to the call's
+    // session, but the client that needs to know which chat to open is the one
+    // parked on its conversation list, subscribed to nothing at all.
+    //
+    // And the clear must survive the case with no resolution event: a gate
+    // nobody answers self-denies silently, so the queue's own drop path is
+    // what retires the mark.
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
+
+    let channel_registry = Arc::clone(&tg.deps.channel_registry);
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let mut bystander = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
+        .await
+        .expect("bystander handshake");
+
+    let channel = channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner channel");
+    let gate = channel.approval_gate().expect("owner channel has a gate");
+    let req = baybo_tools::ApprovalRequest {
+        call_id: "prompt-1".into(),
+        tool_call_id: None,
+        session_id: "sess-blocked".into(),
+        user_id: String::new(),
+        tool: "Bash".into(),
+        accesses: vec![],
+        params_preview: String::new(),
+        description: None,
+    };
+    let parked = tokio::spawn(async move { gate.request(req).await });
+
+    let frame = recv_frame(&mut bystander, Duration::from_secs(2))
+        .await
+        .expect("bystander receives the raise");
+    match frame {
+        Frame::SessionUpdated { session_id, patch } => {
+            assert_eq!(session_id, "sess-blocked");
+            assert_eq!(patch.approval_pending, Some(true));
+        }
+        other => panic!("expected SessionUpdated, got {other:?}"),
+    }
+
+    assert_eq!(
+        channel.resolve_approval("prompt-1", baybo_tools::ApprovalDecision::Deny),
+        Some(baybo_model::SessionId::from("sess-blocked"))
+    );
+    assert_eq!(
+        parked.await.expect("gate task"),
+        baybo_tools::ApprovalDecision::Deny
+    );
+
+    let frame = recv_frame(&mut bystander, Duration::from_secs(2))
+        .await
+        .expect("bystander receives the clear");
+    match frame {
+        Frame::SessionUpdated { session_id, patch } => {
+            assert_eq!(session_id, "sess-blocked");
+            assert_eq!(patch.approval_pending, Some(false));
+        }
+        other => panic!("expected SessionUpdated, got {other:?}"),
+    }
+
     drop(bystander);
     shutdown.trigger();
     let _ = server_handle.await;

@@ -22,6 +22,19 @@ const UNREAD_SCAN_MULTIPLIER: usize = 10;
 /// A row that renders as an unread chat bubble: a final assistant
 /// reply. Intermediate agentic iterations (assistant rows carrying
 /// tool calls) don't count as separate unread bubbles.
+/// Fold an `unread_scan` result into per-session counts of visible replies,
+/// each clamped at `cap`.
+fn fold_unread(rows: Vec<(SessionId, ChatMessage)>, cap: usize) -> HashMap<SessionId, usize> {
+    let mut counts: HashMap<SessionId, usize> = HashMap::new();
+    for (id, msg) in rows {
+        if is_visible_reply(&msg) {
+            let count = counts.entry(id).or_default();
+            *count = (*count + 1).min(cap);
+        }
+    }
+    counts
+}
+
 fn is_visible_reply(msg: &ChatMessage) -> bool {
     msg.role == Role::Assistant && !msg.has_tool_use()
 }
@@ -385,21 +398,37 @@ impl SessionManager {
                 .or_default()
                 .push((ordinal, created_at, msg));
         }
-        let mut unread_counts: HashMap<SessionId, usize> = HashMap::new();
-        if unread_cap > 0 {
+        let unread_counts = if unread_cap > 0 {
             let scan_bound = unread_cap.saturating_mul(UNREAD_SCAN_MULTIPLIER);
-            for (id, msg) in self.store.unread_scan(session_ids, scan_bound).await? {
-                if is_visible_reply(&msg) {
-                    let count = unread_counts.entry(id).or_default();
-                    *count = (*count + 1).min(unread_cap);
-                }
-            }
-        }
+            fold_unread(
+                self.store.unread_scan(session_ids, scan_bound).await?,
+                unread_cap,
+            )
+        } else {
+            HashMap::new()
+        };
         Ok(ChatListScan {
             last_user,
             tails,
             unread_counts,
         })
+    }
+
+    /// Total unread visible replies across `session_ids`, each session clamped
+    /// at `cap` exactly as the chat list clamps its per-row badge.
+    ///
+    /// This is what the app-icon badge counts. It goes through the same
+    /// [`fold_unread`] as [`Self::chat_list_scan`] on purpose: the number on
+    /// the icon and the numbers on the rows are the same claim, and two
+    /// implementations of it would drift into disagreeing with each other on
+    /// the user's home screen.
+    pub async fn unread_total(&self, session_ids: &[SessionId], cap: usize) -> Result<usize> {
+        if cap == 0 || session_ids.is_empty() {
+            return Ok(0);
+        }
+        let scan_bound = cap.saturating_mul(UNREAD_SCAN_MULTIPLIER);
+        let rows = self.store.unread_scan(session_ids, scan_bound).await?;
+        Ok(fold_unread(rows, cap).values().sum())
     }
 
     /// `title` per session (flat column, one grouped query). Sessions
@@ -1474,6 +1503,66 @@ mod tests {
 
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// The app-icon badge and the chat-list row badges are the same claim, so
+    /// they must be the same number. Both fold through `fold_unread`; this
+    /// pins that they agree, including the per-session clamp — a sum taken
+    /// before clamping would let one loud conversation inflate the icon past
+    /// anything the list can account for.
+    #[tokio::test]
+    async fn unread_total_agrees_with_the_per_row_chat_list_counts() {
+        use baybo_model::{ChatMessage, ContentBlock};
+
+        let mgr = SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let mut ids = Vec::new();
+        for replies in [1usize, 3] {
+            let session = mgr
+                .create_session(test_user(), ChannelType::tui())
+                .await
+                .unwrap();
+            mgr.append_session_message(
+                &session.id,
+                &ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
+            )
+            .await
+            .unwrap();
+            for _ in 0..replies {
+                mgr.append_session_message(
+                    &session.id,
+                    &ChatMessage::assistant(vec![ContentBlock::Text("ok".into())]),
+                )
+                .await
+                .unwrap();
+            }
+            ids.push(session.id);
+        }
+
+        let cap = 99;
+        let scan = mgr.chat_list_scan(&ids, 8, cap).await.unwrap();
+        let per_row: usize = scan.unread_counts.values().sum();
+        assert_eq!(per_row, 4, "one reply here, three there");
+        assert_eq!(mgr.unread_total(&ids, cap).await.unwrap(), per_row);
+
+        // The clamp is per session, applied before the sum.
+        let clamped = mgr.unread_total(&ids, 2).await.unwrap();
+        let clamped_rows: usize = mgr
+            .chat_list_scan(&ids, 8, 2)
+            .await
+            .unwrap()
+            .unread_counts
+            .values()
+            .sum();
+        assert_eq!(clamped, clamped_rows);
+        assert_eq!(clamped, 3, "1 + min(3, 2)");
+
+        // A zero cap means "do not count" on both sides, not "count freely".
+        assert_eq!(mgr.unread_total(&ids, 0).await.unwrap(), 0);
+        assert_eq!(mgr.unread_total(&[], cap).await.unwrap(), 0);
     }
 
     /// The unread badge counts what a user is meant to read: final assistant

@@ -546,15 +546,46 @@ Keys (all established at pairing — see
 
 ### Notify flow
 
-Dispatch trigger:
+Dispatch triggers — there are **two**, and only the first is a turn ending:
+
+**A completed turn.**
 
 1. A's `PushDispatcher` subscribes to the `JobLifecycle` broadcast bus.
-2. A dispatches only successfully completed real user chat turns:
-   `phase == Completed` and `kind == UserChat`.
-3. Cron, Compact (`/compact`), Spawned, SubagentNotification, failed turns, and
+2. A dispatches only successfully completed chat turns a user is meant to read:
+   `phase == Completed` and `kind` in `UserChat` / `Cron` / `CronNotification`.
+3. Compact (`/compact`), Spawned, SubagentNotification, failed turns, and
    cancelled turns do not trigger push.
 4. The `Completed { reply_ordinal }` event identifies the persisted assistant
    reply row. If there is no ordinal, A does not push.
+
+**A tool call parking on the approval gate.** Nothing reaches the lifecycle bus
+while a prompt waits — the turn has not ended, and never will unless the user
+answers — yet this is the one push whose value expires: the gate denies itself
+after `APPROVAL_TIMEOUT` (300 s). The relay
+(`crates/gateway/src/push/approval.rs`) therefore watches the approval queue's
+per-session edges directly, on the `owner` channel only (a prompt parked on the
+TUI's or Telegram's queue is one the app could not answer even after opening
+the conversation the push routed it to).
+
+Four suppressions apply, each closing a way this becomes noise rather than
+signal:
+
+1. **A live subscriber on that session.** Someone already has the conversation
+   open and the card is on their screen — and a push arriving while the app is
+   frontmost presents nothing anyway. This is also what stops a user answering
+   prompts in the web dashboard from buzzing the phone in their pocket once per
+   prompt (web and mobile share the `owner` channel).
+2. **The session is already marked waiting.** The edge is raised once per
+   blocked stretch, not once per prompt.
+3. **A 30-minute quiet period after an abandoned prompt.** A denied call does
+   not end the turn; the agent commonly reaches for an alternative that is also
+   gated. Unattended, that announces itself once per gate timeout — about twelve
+   times an hour, all night. A prompt someone actually *answers* clears the
+   quiet period, so an attended conversation still interrupts immediately.
+4. **A liveness recheck immediately before the POST.** Store reads, vault reads
+   and two TLS round-trips separate the trigger from delivery; a prompt resolved
+   inside that window must not buzz a phone whose tap would open a conversation
+   with no card in it.
 
 Preview construction:
 
@@ -565,12 +596,31 @@ Preview construction:
 4. A frames the plaintext preview as JSON:
 
 ```json
-{ "title": "Baybo", "body": "...", "session_id": "..." }
+{ "title": "Baybo", "body": "...", "session_id": "...", "badge": 3 }
 ```
 
    The `session_id` rides inside the sealed plaintext — never the outer APNs
    payload — so the app can deep-link a notification tap to its conversation
    while C stays blind to session ids. Older NSE builds ignore the field.
+
+   `badge` is the unread total the NSE applies to the app icon, and it is inside
+   the AEAD for the same reason: an absolute unread count is exactly the kind of
+   activity metadata this design hides elsewhere (the collapse id is hashed, the
+   session id is sealed). Routing it through `aps.badge` would also have made a
+   badge digit a fleet-wide deploy problem — C's payload builder is fixed, so an
+   unsigned field would be a silent no-op until every host rebuilt, and a signed
+   one would 403 every push from every already-deployed host. `NotifyRequest` is
+   byte-identical to before; no host changes. Omitted when A cannot count, which
+   APNs reads as "leave the icon alone" — never sent as `0`, which is a real
+   instruction to clear.
+
+   An approval push differs only in `title` (`"Baybo needs approval"`, the one
+   line a locked phone renders under "Show Previews: When Unlocked") and `body`
+   (`"<Tool> is waiting for your approval"`). **The body never carries the
+   call's arguments.** `params_preview` is unredacted JSON that can hold a
+   credential from a command line, and a lock screen is a shoulder-surfing
+   surface a WebSocket is not; the card inside the conversation is what is
+   informative.
 
 Encryption and `/notify`:
 

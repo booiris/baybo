@@ -80,7 +80,7 @@
             // unregistered session has none. (On a BOUND sim the next list merge
             // drops this local-only row anyway — remote wins for existence — and
             // takes the mirror with it, which is why the relaunch half of this
-            // check wants an unbound sim; see the app's CLAUDE.md.)
+            // check wants an unbound sim; see app/ios/docs/testing.md.)
             SessionIndex.shared.recordUserSend(sessionId: sessionId, text: "把那几张图发我")
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))

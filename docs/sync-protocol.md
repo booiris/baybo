@@ -19,8 +19,9 @@ Related docs: [`docs/web-chat.md`](web-chat.md) (current web data flow),
 [`docs/turn-progress-events.md`](turn-progress-events.md) (streaming frames +
 work-block reconstruction), [`docs/modules/gateway.md`](modules/gateway.md)
 (wire + REST surface), [`docs/modules/channels.md`](modules/channels.md)
-(channel kinds, dispatch), `app/ios/CLAUDE.md` (the v2 iOS transcript-sync
-loop; the seven-cell hydration matrix this doc proposed deleting is gone).
+(channel kinds, dispatch), `app/ios/docs/sync-and-outbox.md` (the v2 iOS
+transcript-sync loop; the seven-cell hydration matrix this doc proposed
+deleting is gone).
 
 ## Problem
 
@@ -35,7 +36,7 @@ combine them differently:
 | REST `GET …/catch-up` (`chat.rs:854-924`) | messages + work, **no notices**; `truncated` returns nothing | iOS only |
 | REST `GET /v1/chat/sessions/{id}` (`chat.rs:728-852`) | full fidelity (messages + work + notices) | web hydrate/paging; iOS paging **after an FFI filter strips work/notices** (`gateway_api.rs:197-206`) |
 | `Frame::Reset` | "give up, refetch" | web wipes **every** session view (`ChatPage.tsx:848-875`); iOS rebuilds one session at message-only fidelity |
-| iOS mirror + `listed` flag + `ensureBackfilled` + hydration matrix (cells A–G, `app/ios/CLAUDE.md`) | whatever the mirror had | iOS only |
+| iOS mirror + `listed` flag + `ensureBackfilled` + hydration matrix (cells A–G) | whatever the mirror had | iOS only |
 
 The split is not hypothetical cost. The 2026-07-06 audit verified these
 user-visible defects, all downstream of the mechanism split:

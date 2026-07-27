@@ -1,9 +1,8 @@
-//! The APNs token + environment shared across the legs. The Tauri shell held
-//! the token in a process global captured by an injected app-delegate method;
-//! under SwiftUI the real `didRegisterForRemoteNotifications` delivers it, and
-//! Swift hands it in through `BayboClient::set_apns_token` — this is where it
-//! lands. Read by pairing (`DeviceHello.apns_token`), relay's best-effort APNs
-//! refresh API call, and direct push registration.
+//! The APNs token + environment shared across the legs. Swift's
+//! `didRegisterForRemoteNotifications` delivers the token and hands it in
+//! through `BayboClient::set_apns_token` — this is where it lands. Read by
+//! pairing (`DeviceHello.apns_token`), relay's best-effort APNs refresh API
+//! call, and direct push registration.
 
 use parking_lot::Mutex;
 

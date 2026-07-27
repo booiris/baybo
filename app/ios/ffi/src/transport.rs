@@ -18,11 +18,10 @@
 //! outbound user messages — is the one [`SessionRegistry`] + [`pump`] below,
 //! written once.
 //!
-//! Lifted from the Tauri shell's `transport.rs`; the webview `Channel<Frame>` is
-//! now a [`FrameSink`] callback interface, and the app-wide
-//! `content-disconnected` event is the sink's `on_disconnected` — same contract:
-//! it fires ONLY when the global leg ends on its own, because deliberate teardown
-//! aborts the pump task before the call runs.
+//! Frames reach the app through the [`FrameSink`] callback interface, and a lost
+//! global leg surfaces as that sink's `on_disconnected` — which fires ONLY when
+//! the leg ends on its own, because deliberate teardown aborts the pump task
+//! before the call runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -890,10 +889,21 @@ async fn dispatch_inbound_frame(
         // can swap its bold first line live — and STILL routes per-session
         // exactly as before (the transcript webview simply ignores it). Pin /
         // archive / hide patches carry no title and skip the title hop.
+        //
+        // The approval bit rides the same tee for the same reason, and one it
+        // does not share: `Frame::ApprovalRequested` is dispatched only to
+        // connections subscribed to that session, so a device sitting on the
+        // chat list would otherwise learn nothing about a conversation whose
+        // tool call is blocked waiting on it.
         Frame::SessionUpdated { session_id, patch } => {
             if let Some(title) = &patch.title {
                 with_global_sink(list_sink, |sink| {
                     sink.on_title(session_id.as_str().to_owned(), title.clone())
+                });
+            }
+            if let Some(pending) = patch.approval_pending {
+                with_global_sink(list_sink, |sink| {
+                    sink.on_approval_pending(session_id.as_str().to_owned(), pending)
                 });
             }
             true
@@ -1025,6 +1035,7 @@ mod tests {
     struct RecordingListSink {
         activity: parking_lot::Mutex<Vec<(String, String, i64)>>,
         titles: parking_lot::Mutex<Vec<(String, String)>>,
+        approvals: parking_lot::Mutex<Vec<(String, bool)>>,
         stale: parking_lot::Mutex<usize>,
     }
 
@@ -1035,6 +1046,10 @@ mod tests {
 
         fn on_title(&self, session_id: String, title: String) {
             self.titles.lock().push((session_id, title));
+        }
+
+        fn on_approval_pending(&self, session_id: String, pending: bool) {
+            self.approvals.lock().push((session_id, pending));
         }
 
         fn on_list_stale(&self) {
@@ -1147,6 +1162,98 @@ mod tests {
         assert_eq!(fixture.list.activity.lock().len(), 1);
         assert_eq!(fixture.list.activity.lock()[0].0, "unopened");
         assert!(sinks[0].frames().is_empty());
+    }
+
+    /// The mark for "this conversation is blocked waiting on you" has to reach
+    /// a device with NOTHING subscribed — that is the state the app is in
+    /// while the user is looking at the chat list, and it is the only state in
+    /// which the mark is useful. `Frame::ApprovalRequested` cannot do this
+    /// (the gateway dispatches it to a session's subscribers only), which is
+    /// why the bit rides a `SessionUpdated` broadcast instead.
+    #[tokio::test]
+    async fn an_approval_mark_for_a_never_opened_session_still_reaches_the_list() {
+        let (fixture, _sinks) = Fixture::new(&[]);
+
+        fixture
+            .dispatch(Frame::SessionUpdated {
+                session_id: "unopened".into(),
+                patch: wire::SessionPatch {
+                    approval_pending: Some(true),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        assert_eq!(
+            *fixture.list.approvals.lock(),
+            vec![("unopened".to_string(), true)]
+        );
+    }
+
+    /// The clear is load-bearing on its own: a gate nobody answers self-denies
+    /// after five minutes and broadcasts NO resolution, so `false` here is the
+    /// only thing that ever retires the mark on those turns.
+    #[tokio::test]
+    async fn an_approval_clear_rides_the_same_tee() {
+        let (fixture, sinks) = Fixture::new(&["s1"]);
+
+        fixture
+            .dispatch(Frame::SessionUpdated {
+                session_id: "s1".into(),
+                patch: wire::SessionPatch {
+                    approval_pending: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        assert_eq!(
+            *fixture.list.approvals.lock(),
+            vec![("s1".to_string(), false)]
+        );
+        // TEE, not a lane: the frame still reaches the session's own sink.
+        assert_eq!(sinks[0].frames().len(), 1);
+    }
+
+    /// A patch with both fields fires both hops — the title path and the
+    /// approval path are independent taps on one frame, not an either/or.
+    #[tokio::test]
+    async fn a_patch_carrying_a_title_and_an_approval_flag_fires_both_hops() {
+        let (fixture, _sinks) = Fixture::new(&[]);
+
+        fixture
+            .dispatch(Frame::SessionUpdated {
+                session_id: "s1".into(),
+                patch: wire::SessionPatch {
+                    title: Some("Reset password flow".into()),
+                    approval_pending: Some(true),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        assert_eq!(fixture.list.titles.lock().len(), 1);
+        assert_eq!(fixture.list.approvals.lock().len(), 1);
+    }
+
+    /// A pin / archive / hide patch carries neither field and must stay silent
+    /// on both — an absent `approval_pending` means "no change", never `false`.
+    #[tokio::test]
+    async fn a_patch_without_the_approval_field_changes_nothing() {
+        let (fixture, _sinks) = Fixture::new(&[]);
+
+        fixture
+            .dispatch(Frame::SessionUpdated {
+                session_id: "s1".into(),
+                patch: wire::SessionPatch {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        assert!(fixture.list.approvals.lock().is_empty());
+        assert!(fixture.list.titles.lock().is_empty());
     }
 
     /// `Gap { session_id: None }` is the gateway's "I dropped a session-less

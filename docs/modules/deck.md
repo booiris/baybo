@@ -348,7 +348,7 @@ materializes; web deck parity for blobs.
 
 ### Tab and navigation
 
-`HomeTab.agents` is renamed to `.deck` outright — label Deck (en + zh-Hans), icon `rectangle.stack` — including the `-baybo-home-tab` debug-arg literal and the `-baybo-demo-tabs` cycle order (the "agents" placeholder was never real, so no compat shim). `PlaceholderScreen` survives for the Projects tab. `app/ios/CLAUDE.md`'s navigation prose changes accordingly.
+`HomeTab.agents` is renamed to `.deck` outright — label Deck (en + zh-Hans), icon `rectangle.stack` — including the `-baybo-home-tab` debug-arg literal and the `-baybo-demo-tabs` cycle order (the "agents" placeholder was never real, so no compat shim). `PlaceholderScreen` survives for the Projects tab. `app/ios/docs/navigation.md`'s navigation prose changes accordingly.
 
 ### Render host: one deck webview, per-card iframes
 

@@ -152,6 +152,11 @@ pub struct ChatSessionSummary {
     /// a device that missed the live `SessionActivity` pings — unlike a
     /// client-local ping counter. `0` when caught up.
     pub unread_count: i64,
+    /// A tool call in this conversation is parked on the approval gate and
+    /// cannot proceed until the user answers it. Server-computed from live
+    /// gate state — a gateway restart kills every parked turn, so `false`
+    /// after a restart is the truth, not a stale read.
+    pub approval_pending: bool,
     /// The cron job this row is a fire of — the key the list groups on so a
     /// job's fires collapse into one row instead of flooding the list (a **cron
     /// group**; see `docs/cron-groups.md`). `None` for an ordinary chat.
@@ -476,6 +481,17 @@ pub trait SessionListSink: Send + Sync {
     /// REST refetch. Only the title patch is forwarded; pin / archive / hide
     /// stay on the optimistic + REST-merge path the list already owns.
     fn on_title(&self, session_id: String, title: String);
+    /// A `SessionUpdated` patch flipped `session_id`'s approval-gate bit: a
+    /// tool call there is now waiting on the user (`true`), or its last prompt
+    /// was answered, cancelled, or timed out (`false`).
+    ///
+    /// Connection-global like `on_title`, and that is the entire point. The
+    /// prompt frame itself (`Frame::ApprovalRequested`) only reaches
+    /// connections subscribed to that session, so a device parked on the chat
+    /// list — the one that needs to know which conversation to open — would
+    /// never see it. `false` is also the ONLY signal a timed-out gate emits:
+    /// it self-denies after five minutes and broadcasts no resolution.
+    fn on_approval_pending(&self, session_id: String, pending: bool);
     /// The device's session-list mirror may be behind the gateway's: refetch it.
     ///
     /// Fires on `Frame::Gap { session_id: None }` — the gateway's "I dropped a

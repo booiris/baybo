@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalQueue, ApprovalRequest,
-    ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
+    ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, PendingEdge, PendingWatcher,
+    ResourceAccess,
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::read::READ_TOOL_NAME;

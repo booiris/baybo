@@ -1,5 +1,6 @@
-/* Monochrome, light-only — SOFT LINE MINIMALISM (see app/mobile/CLAUDE.md; this
-   bundle inherits that system). Plain CSS: no Tailwind — only the transcript
+/* Monochrome, light-only — SOFT LINE MINIMALISM (see
+   app/ios/docs/design-system.md; this bundle is one half of that system, the
+   other being Theme.swift). Plain CSS: no Tailwind — only the transcript
    renders here, everything else is native SwiftUI. Token names mirror app/web's
    so the palettes read as one system. */
 :root {

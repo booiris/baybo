@@ -3,9 +3,9 @@
 # the Rust core first — the Generated/ + Externals/ inputs below come from
 # scripts/build-core.sh).
 #
-# CONTINUITY CONTRACT with installs made by the Tauri shell (app/mobile) — do
-# not change any of these or existing users silently lose their device
-# identity, pairing, and push key:
+# CONTINUITY CONTRACT with already-shipped installs — do not change any of
+# these or existing users silently lose their device identity, pairing, and
+# push key:
 #   * bundle ids: com.baybo.app + com.baybo.app.NotificationExtension
 #   * DEVELOPMENT_TEAM KLK5BP5YS6 (the App-Identifier prefix)
 #   * keychain-access-groups: $(AppIdentifierPrefix)com.baybo.app must stay the
