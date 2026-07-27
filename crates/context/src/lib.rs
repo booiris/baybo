@@ -3049,6 +3049,265 @@ mod tests {
         assert_eq!(bare.len(), 1, "empty advertised set inserts no reminder");
     }
 
+    // ---------- compaction shape ----------
+
+    #[test]
+    fn recent_slice_cap_scales_with_the_window() {
+        // The absolute ceiling only binds on a large window.
+        assert_eq!(recent_slice_bounds(1_000_000).2, 40_000);
+        assert_eq!(recent_slice_bounds(272_000).2, 40_000);
+        assert_eq!(recent_slice_bounds(100_000).2, 15_000);
+        assert_eq!(recent_slice_bounds(8_192).2, 1_228);
+    }
+
+    /// The walk takes the floor as a soft stop and the cap as a hard one, so a
+    /// floor above the cap would mean "never stop" — the slice would swallow
+    /// the transcript it was meant to trim.
+    #[test]
+    fn recent_slice_floor_never_exceeds_the_cap() {
+        for window in [0, 1, 200, 1_000, 8_192, 50_000, 272_000, 1_000_000] {
+            let (min_tokens, _, cap) = recent_slice_bounds(window);
+            assert!(
+                min_tokens <= cap,
+                "window {window}: floor {min_tokens} above cap {cap}"
+            );
+        }
+    }
+
+    /// A compaction keeps the tail verbatim. Losing that is what would turn the
+    /// last tool results and the user's own words into a paraphrase of
+    /// themselves the moment the threshold trips.
+    #[tokio::test]
+    async fn compaction_keeps_a_verbatim_recent_slice_after_the_summary() {
+        let mut ctx = make_ctx(2, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(2_400)),
+            ))
+            .await;
+        }
+        let last = ctx.messages().last().cloned().expect("a last message");
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+
+        let applied = ctx.messages();
+        assert!(
+            applied.len() > 2,
+            "expected system + summary + a tail, got {}",
+            applied.len()
+        );
+        assert_eq!(
+            applied.last().map(|m| &m.content),
+            Some(&last.content),
+            "the newest message must survive byte-identical, not paraphrased"
+        );
+    }
+
+    /// The slice is cut in atomic units, so it can never start between an
+    /// `assistant{tool_use}` and its `user{tool_result}` — both Anthropic and
+    /// OpenAI reject that array outright.
+    #[tokio::test]
+    async fn compaction_slice_never_splits_a_tool_use_result_pair() {
+        let mut ctx = make_ctx(2, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..10 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(2_400)),
+            ))
+            .await;
+        }
+        ctx.append(&ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "tu1".into(),
+            name: "bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }]))
+        .await;
+        ctx.append(&ChatMessage::agent_context(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tu1".into(),
+                content: "ok".into(),
+                meta: None,
+            },
+        ]))
+        .await;
+
+        ctx.maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+
+        let has_result = ctx.messages().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu1"))
+        });
+        let has_use = ctx.messages().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "tu1"))
+        });
+        assert!(
+            !has_result || has_use,
+            "a kept tool_result must keep its tool_use"
+        );
+    }
+
+    /// On a window too small to afford one, the tail is dropped — a slice
+    /// sized by an absolute constant would exceed the very threshold that
+    /// triggered the compaction. And having compacted, the turn must not keep
+    /// buying the same call: on a window this small the continuation framing
+    /// alone outweighs the ceiling, so what stops the loop is the pre-flight
+    /// gate, not the budget.
+    #[tokio::test]
+    async fn small_window_compaction_degrades_to_summary_only() {
+        let mut ctx = make_ctx(1, 200, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..5 {
+            ctx.append(&make_msg(Role::User, &format!("m{i} {}", "x".repeat(240))))
+                .await;
+        }
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+
+        let surviving_originals = ctx
+            .messages()
+            .iter()
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text(t) if t.starts_with('m')))
+            })
+            .count();
+        assert_eq!(
+            surviving_originals, 0,
+            "no window-relative tail fits here, so none should have been kept"
+        );
+
+        // `never_chat` panics if the summarizer is reached a second time.
+        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(second, CompressionOutcome::StrategyDeclined));
+    }
+
+    /// The candidate pick spends no second LLM call: the summary is already in
+    /// hand, so dropping the slice is a re-assembly, not a round-trip.
+    #[tokio::test]
+    async fn dropping_the_slice_costs_no_second_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+
+        let mut ctx = make_ctx(1, 1_000, 0.1);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(Role::User, &format!("m{i} {}", "x".repeat(240))))
+                .await;
+        }
+
+        ctx.maybe_compress("test-model", move |req, marker| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            ok_summary_chat(req, marker)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the summarizer must be called exactly once per compaction"
+        );
+    }
+
+    /// A cancel is not a failed summary: the turn is unwinding and nothing more
+    /// goes to the model, so truncating would destroy the middle of the
+    /// conversation for no gain.
+    #[tokio::test]
+    async fn cancelled_compaction_leaves_the_transcript_untouched() {
+        async fn cancelled_chat(
+            _: ChatRequest,
+            _: LlmCallInputs,
+        ) -> std::result::Result<LlmResponse, ContextError> {
+            Err(ContextError::Cancelled("stopped".into()))
+        }
+
+        let mut ctx = make_ctx(2, 10_000, 0.5);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("m{i} {}", "x".repeat(2_400)),
+            ))
+            .await;
+        }
+        let before: Vec<ChatMessage> = ctx.messages().to_vec();
+
+        let outcome = ctx
+            .maybe_compress("test-model", cancelled_chat)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CompressionOutcome::Cancelled));
+        assert_eq!(
+            ctx.messages(),
+            before.as_slice(),
+            "a cancelled compaction must not rewrite the transcript"
+        );
+    }
+
+    /// Once a compaction has come back with no savings, repeating it at the
+    /// same transcript length buys the same answer — and the threshold check
+    /// runs at the top of every loop iteration, so without the latch the rest
+    /// of the turn is one full-transcript LLM call per iteration.
+    #[tokio::test]
+    async fn declined_compaction_does_not_refire_until_the_transcript_grows() {
+        let mut ctx = make_ctx(1, 100, 0.1);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        for i in 0..3 {
+            ctx.append(&make_msg(Role::User, &format!("m{i}"))).await;
+        }
+
+        let first = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, CompressionOutcome::NoSavings),
+            "fixture must actually produce NoSavings, got {first:?}"
+        );
+
+        // `never_chat` panics if the summarizer is reached.
+        let second = ctx.maybe_compress("test-model", never_chat).await.unwrap();
+        assert!(matches!(second, CompressionOutcome::NoSavings));
+
+        // Growth is exactly the condition under which compaction can start
+        // paying again, so the latch releases.
+        for i in 0..40 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("grown{i} {}", "x".repeat(400)),
+            ))
+            .await;
+        }
+        let third = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(third, CompressionOutcome::NoSavings),
+            "the latch must release once the transcript grows past it"
+        );
+    }
+
     /// Chat closure returning a well-formed `<summary>S</summary>` so the
     /// LLM-summary stage produces a usable summary message.
     async fn ok_summary_chat(

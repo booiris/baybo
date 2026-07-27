@@ -1,10 +1,8 @@
-//! End-to-end exercise of the LLM context-compression path.
+//! End-to-end exercise of the context-compaction path.
 //!
-//! Drives the live `AgentLoop` through `AgentTestHarness` configured
-//! with a tight token budget. The harness's default empty
-//! `InMemorySummaryLoader` makes the compressor's fast-path stage
-//! fall through, so the live LLM-summary stage runs and bills
-//! through the same `StubLlm`.
+//! Drives the live `AgentLoop` through `AgentTestHarness` configured with a
+//! tight token budget, so the threshold trips on the second turn and the
+//! summariser call bills through the same `StubLlm`.
 //!
 //! Asserts:
 //!  1. The agent runs two consecutive turns; compression fires before
@@ -263,4 +261,153 @@ fn status_phases(outputs: &[AgentOutput]) -> Vec<TurnStatus> {
             _ => None,
         })
         .collect()
+}
+
+/// The truncate fallback makes no LLM call, so `CompressionRunner` never runs
+/// for it and the step has to be recorded separately. Without that row, the
+/// compaction that discarded the most — the one that gave up on summarising —
+/// would be the only one leaving no trace at all.
+#[tokio::test]
+async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
+    let mut harness = AgentTestHarness::builder()
+        .with_model_context_window(200)
+        .with_compression_threshold(0.1)
+        .with_keep_recent(1)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("first".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("second".into())]);
+    // Both summariser attempts fail: transient, so the retry is spent, and the
+    // compaction falls back to truncation.
+    for _ in 0..2 {
+        harness
+            .stub_llm
+            .push_response_err(baybo_llm::LlmError::Transient("summariser down".into()));
+    }
+
+    harness.send_text("hello").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    harness.send_text("again").await.unwrap();
+    let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // A summariser failure must not kill the turn.
+    assert!(
+        turn2
+            .iter()
+            .any(|o| matches!(&o.event, AgentEvent::Message(_))),
+        "the turn must still answer after the summariser failed, got {turn2:?}"
+    );
+    assert_eq!(
+        status_phases(&turn2),
+        vec![TurnStatus::Compacting, TurnStatus::Compacted],
+        "the status pair must still bracket a failed compaction"
+    );
+
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    let mut truncate_steps = Vec::new();
+    let mut summariser_spans = 0usize;
+    for job_id in harness
+        .job_lifecycle
+        .list(None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+    {
+        for row in trace_store.list_steps_by_job(&job_id).await.unwrap() {
+            let step = baybo_trace::Step::from_row(row).unwrap();
+            let StepKind::Compression { applied, .. } = step.kind else {
+                continue;
+            };
+            let spans = trace_store.list_spans_by_step(&step.id).await.unwrap();
+            match applied {
+                Some(baybo_trace::CompressionApplied::Truncate) => {
+                    assert!(
+                        spans.is_empty(),
+                        "a truncate compaction makes no LLM call, so it spans nothing"
+                    );
+                    truncate_steps.push(step);
+                }
+                // The live-summary step around the two failed attempts.
+                _ => summariser_spans += spans.len(),
+            }
+        }
+    }
+    assert_eq!(
+        truncate_steps.len(),
+        1,
+        "expected exactly one truncate compaction step; got {truncate_steps:#?}"
+    );
+    assert_eq!(
+        summariser_spans, 2,
+        "a transient failure is retried once, and both attempts span"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A non-retriable failure must not spend the retry. A context-window 400 is
+/// the likeliest way a compaction fails, and asking again buys the same 400 at
+/// full transcript price.
+#[tokio::test]
+async fn a_non_retriable_summariser_failure_is_not_retried() {
+    let mut harness = AgentTestHarness::builder()
+        .with_model_context_window(200)
+        .with_compression_threshold(0.1)
+        .with_keep_recent(1)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("first".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("second".into())]);
+    harness
+        .stub_llm
+        .push_response_err(baybo_llm::LlmError::BadRequest("context too long".into()));
+
+    harness.send_text("hello").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    harness.send_text("again").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    let mut summariser_spans = 0usize;
+    for job_id in harness
+        .job_lifecycle
+        .list(None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+    {
+        for row in trace_store.list_steps_by_job(&job_id).await.unwrap() {
+            let step = baybo_trace::Step::from_row(row).unwrap();
+            if !matches!(
+                step.kind,
+                StepKind::Compression {
+                    applied: Some(baybo_trace::CompressionApplied::LiveSummary),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            summariser_spans += trace_store
+                .list_spans_by_step(&step.id)
+                .await
+                .unwrap()
+                .len();
+        }
+    }
+    assert_eq!(
+        summariser_spans, 1,
+        "a non-retriable failure must cost exactly one attempt"
+    );
+
+    harness.shutdown().await;
 }
