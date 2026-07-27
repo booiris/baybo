@@ -2505,9 +2505,10 @@ impl AgentLoop {
                 runner.run(req, marker).await
             })
             .await;
-        // The `Compacted` end always follows the `Compacting` start, whatever
-        // the outcome, so the status line never dangles.
-        if compacting {
+        // The `Compacted` end always follows the `Compacting` start so the
+        // status line never dangles — except on a cancel, where the compaction
+        // was abandoned and the turn is unwinding behind it.
+        if compacting && !cancel_token.is_cancelled() {
             self.emit_status(delta_tx, session, TurnStatus::Compacted)
                 .await;
         }
@@ -2834,6 +2835,9 @@ impl AgentLoop {
                     }
                     baybo_context::CompressionOutcome::NoSavings => {
                         "Compression ran but produced no savings; kept the original.".to_string()
+                    }
+                    baybo_context::CompressionOutcome::Cancelled => {
+                        "Compaction cancelled; the conversation is unchanged.".to_string()
                     }
                 };
                 let output = JobOutput::Message {

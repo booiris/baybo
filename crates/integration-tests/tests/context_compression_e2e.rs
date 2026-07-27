@@ -412,19 +412,21 @@ async fn a_non_retriable_summariser_failure_is_not_retried() {
     harness.shutdown().await;
 }
 
-/// `/stop` must not abort a compaction that is already in flight.
+/// `/stop` aborts an in-flight compaction, and the NEXT turn compacts instead.
 ///
-/// The request is placed and already being billed, and a compaction is
-/// housekeeping that makes the NEXT turn cheaper — abandoning it throws that
-/// spend away AND leaves the transcript over-budget, so the next turn pays for
-/// the whole thing again. The turn still stops; the compaction still lands.
+/// Both halves matter. Cancelling promptly is the point — otherwise the turn
+/// cannot unwind until the summariser returns, up to the full read timeout.
+/// But the abandoned call must not cost the user their history: the transcript
+/// is left exactly as it was, still over budget, so the threshold check at the
+/// top of the next turn runs the compaction again. Truncating on a cancel
+/// would destroy the middle of the conversation over a `/stop`.
 #[tokio::test]
-async fn a_stop_does_not_abort_a_compaction_already_in_flight() {
+async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     // A window big enough that the compaction genuinely shrinks: at 200 tokens
     // the continuation framing alone outweighs the conversation, so the result
-    // would be declined for no savings and prove nothing about cancellation.
+    // would be declined for no savings and prove nothing.
     let mut harness = AgentTestHarness::builder()
         .with_model_context_window(10_000)
         .with_compression_threshold(0.1)
@@ -438,6 +440,10 @@ async fn a_stop_does_not_abort_a_compaction_already_in_flight() {
     harness
         .stub_llm
         .push_stream(vec![StreamEvent::Text("second".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("third".into())]);
+    // One summariser response, queued for whichever turn gets that far.
     harness.stub_llm.push_response(LlmResponse {
         content: "<summary>the earlier conversation</summary>".into(),
         content_blocks: vec![],
@@ -451,6 +457,11 @@ async fn a_stop_does_not_abort_a_compaction_already_in_flight() {
         .await
         .unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let before = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load the active transcript");
 
     // Turn 2 trips the threshold, so the summariser call parks in the gate.
     let entered_wait = tokio::spawn({
@@ -478,24 +489,47 @@ async fn a_stop_does_not_abort_a_compaction_already_in_flight() {
             .await
             .expect("cancel the in-flight turn");
     }
-
     release.notify_waiters();
-    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let cancelled_turn = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    let active = harness
+    let after_cancel = harness
         .session_manager
         .load_active_session_messages(&harness.session.id)
         .await
         .expect("load the active transcript");
-    let compacted = active.iter().any(|m| {
-        m.content.iter().any(|b| {
-            matches!(b, baybo_model::ContentBlock::Text(t) if t.contains("the earlier conversation"))
-        })
-    });
     assert!(
-        compacted,
-        "the compaction must land despite the cancel; active transcript: {active:#?}"
+        !holds_summary(&after_cancel),
+        "a cancelled compaction must not rewrite the transcript: {after_cancel:#?}"
+    );
+    assert!(
+        after_cancel.len() >= before.len(),
+        "nothing may be dropped either — a cancel must not truncate"
+    );
+    assert!(
+        !status_phases(&cancelled_turn).contains(&TurnStatus::Compacted),
+        "the compaction was abandoned, so it must not report Compacted"
+    );
+
+    // The transcript is still over budget, so the next turn compacts it.
+    harness.send_text("once more").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let after_retry = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load the active transcript");
+    assert!(
+        holds_summary(&after_retry),
+        "the next turn must redo the compaction the cancel abandoned: {after_retry:#?}"
     );
 
     harness.shutdown().await;
+}
+
+fn holds_summary(messages: &[baybo_model::ChatMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.content.iter().any(|b| {
+            matches!(b, baybo_model::ContentBlock::Text(t) if t.contains("the earlier conversation"))
+        })
+    })
 }

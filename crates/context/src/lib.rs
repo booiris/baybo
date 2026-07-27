@@ -134,6 +134,10 @@ pub enum CompressionOutcome {
     /// to apply it (so the budget stays honest) and the transcript
     /// is unchanged.
     NoSavings,
+    /// The turn was cancelled while the summariser call was in flight. The
+    /// transcript is untouched and still over budget, so the next turn
+    /// compacts it — nothing is lost but the abandoned call.
+    Cancelled,
 }
 
 /// Manages a session's context: owns the conversation transcript,
@@ -971,6 +975,7 @@ impl ContextManager {
         let plan = self.run_compression_flow(chat_box).await?;
         let (mut new_messages, stage) = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
+            CompressOutput::Cancelled => return Ok(CompressionOutcome::Cancelled),
             CompressOutput::Replaced { messages, stage } => (messages, stage),
         };
 

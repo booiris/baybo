@@ -321,9 +321,11 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Park every non-streaming `chat` (the compaction summariser is the only
-    /// caller in these suites) until `release` is notified, signalling
-    /// `entered` first so the test can act while the call is in flight.
+    /// Park the FIRST non-streaming `chat` (the compaction summariser is the
+    /// only caller in these suites) until `release` is notified, signalling
+    /// `entered` first so the test can act while the call is in flight. Later
+    /// calls pass straight through, so a test can hold one compaction and then
+    /// let the next one run normally.
     ///
     /// Wraps the harness's OWN stub rather than replacing it — `with_llm`
     /// swaps the client out entirely, which would silently orphan
@@ -398,6 +400,7 @@ impl AgentTestHarnessBuilder {
                     inner: stub_llm.clone(),
                     entered,
                     release,
+                    held: std::sync::atomic::AtomicBool::new(false),
                 }),
                 None => stub_llm.clone(),
             },
@@ -605,15 +608,17 @@ fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore
 #[allow(dead_code)]
 fn _typecheck_session(_: &User, _: &ChannelType) {}
 
-/// Wraps the harness's stub so a non-streaming `chat` parks mid-flight.
+/// Wraps the harness's stub so the first non-streaming `chat` parks mid-flight.
 ///
 /// Exists for one question no other fixture can ask: what happens to work
-/// already in flight when the turn is cancelled. Streaming calls pass
-/// straight through, so only the compaction summariser is held.
+/// already in flight when the turn is cancelled. Streaming calls pass straight
+/// through, so only the compaction summariser is held — and only once, so the
+/// test can go on to observe the compaction the next turn runs.
 struct GatedChat {
     inner: Arc<StubLlm>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    held: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -622,8 +627,10 @@ impl LlmCompletion for GatedChat {
         &self,
         request: &baybo_llm::ChatRequest,
     ) -> baybo_llm::Result<baybo_llm::LlmResponse> {
-        self.entered.notify_waiters();
-        self.release.notified().await;
+        if !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_waiters();
+            self.release.notified().await;
+        }
         self.inner.chat(request).await
     }
 
