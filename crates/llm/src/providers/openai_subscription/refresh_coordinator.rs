@@ -2,7 +2,7 @@
 //! gate, and the proactive background loop.
 //!
 //! One credential — one `const` vault key holding one OAuth bundle — backs
-//! many clients: the entry's default model, every `model_candidates` model,
+//! many clients: the entry's default model, every `model_list` model,
 //! every hot-reload generation, every admin probe. Modelling the refresh
 //! state per client let them race into `refresh_token_reused` and wipe the
 //! vault out from under the user, so it is interned per credential instead.
@@ -917,7 +917,7 @@ mod tests {
     }
 
     /// The bug this module exists to prevent: an entry's default model and
-    /// each of its `model_candidates` build separate clients, and before
+    /// each of its `model_list` build separate clients, and before
     /// interning they each got their own cache + flight lock. Two of them
     /// hitting expiry together both called `refresh()` with the same
     /// refresh_token; the loser got `refresh_token_reused` → vault wiped.
@@ -955,7 +955,7 @@ mod tests {
     /// Two `SecretVault` handles over ONE store are two views of ONE
     /// credential. Keying coordination on the vault handle would hand them
     /// separate caches and separate flight locks — the same race as the
-    /// `model_candidates` fan-out, reached a different way.
+    /// `model_list` fan-out, reached a different way.
     #[tokio::test]
     async fn coordinator_is_shared_across_vaults_on_one_store() {
         let store = Arc::new(MemorySecretStore::new());

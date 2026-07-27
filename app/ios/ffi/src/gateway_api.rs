@@ -407,10 +407,18 @@ struct WireLlmModel {
     name: String,
     provider: String,
     model: String,
+    /// The gateway sends every model the entry serves — default included,
+    /// each as an object carrying that model's config overrides. Only the
+    /// id reaches the picker.
     #[serde(default)]
-    model_candidates: Vec<String>,
+    model_list: Vec<WireLlmModelSpec>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireLlmModelSpec {
+    model: String,
 }
 
 /// `GET /v1/chat/sessions/{id}?limit=1` read for the session meta only — the
@@ -892,7 +900,7 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
                 name: m.name,
                 provider: m.provider,
                 model: m.model,
-                model_candidates: m.model_candidates,
+                model_candidates: m.model_list.into_iter().map(|s| s.model).collect(),
                 reasoning_effort: m.reasoning_effort,
             })
             .collect(),
@@ -1665,7 +1673,7 @@ mod tests {
         let client = RecordingClient::new(
             r#"{"default_name":"fast","items":[
                 {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
-                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_candidates":["gpt-5.5","o3"],"reasoning_effort":"xhigh","api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
             ]}"#,
         );
         let catalog = list_llm_models(&client).await.expect("models");
@@ -1678,10 +1686,12 @@ mod tests {
         assert_eq!(catalog.items[0].model, "claude-haiku-4-5");
         // No override on the row → provider default, not a decode error.
         assert_eq!(catalog.items[0].reasoning_effort, None);
-        // Absent candidate list decodes to empty, not an error.
+        // Absent model list decodes to empty, not an error.
         assert!(catalog.items[0].model_candidates.is_empty());
         assert_eq!(catalog.items[1].name, "5.5-max");
         assert_eq!(catalog.items[1].reasoning_effort.as_deref(), Some("xhigh"));
+        // Each row's per-model overrides are dropped; only the ids reach the
+        // picker, and the entry's default is already among them.
         assert_eq!(catalog.items[1].model_candidates, ["gpt-5.5", "o3"]);
     }
 

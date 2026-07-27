@@ -502,7 +502,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- `Session.state.last_llm` from this column on read.
                     last_llm              TEXT,
                     -- Per-session MODEL pin WITHIN `last_llm`'s entry (a
-                    -- `model_candidates` id). Flat column with the same
+                    -- `model_list` id). Flat column with the same
                     -- targeted-UPDATE discipline as `last_llm` (owned by
                     -- `set_last_model`, omitted from `save`'s DO UPDATE),
                     -- NULL ⇒ the entry's default model; `get` patches

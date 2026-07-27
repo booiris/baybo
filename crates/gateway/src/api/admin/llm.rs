@@ -132,8 +132,11 @@ async fn update_model(
     if let Some(effort) = req.reasoning_effort {
         entry.reasoning_effort = effort.filter(|s| !s.is_empty());
     }
+    // The three below are facts about a model, so they land on the default
+    // model's `model_list` spec. Overrides for the entry's *other* models
+    // are config-file edits — this endpoint only addresses the default.
     if let Some(vision) = req.supports_vision {
-        entry.supports_vision = vision;
+        entry.default_spec_mut().supports_vision = vision;
     }
     if let Some(ctx) = req.context_window {
         if let Some(0) = ctx {
@@ -141,10 +144,10 @@ async fn update_model(
                 "context_window must be > 0 (omit field or pass null to clear override)".into(),
             ));
         }
-        entry.context_window = ctx;
+        entry.default_spec_mut().context_window = ctx;
     }
     if let Some(p) = req.pricing {
-        entry.pricing = p.map(Into::into);
+        entry.default_spec_mut().pricing = p.map(Into::into);
     }
 
     current
@@ -230,14 +233,19 @@ async fn test_model(
         Some(state.secret_vault.as_ref()),
     )
     .await;
+    // The probe exercises the entry's default model, so it wants that
+    // model's overrides.
+    let probe_spec = entry
+        .spec_for(&entry.model)
+        .unwrap_or_else(|| baybo_config::LlmModelSpec::bare(entry.model.clone()));
     let provider_cfg = LlmProviderConfig {
         provider: entry.provider.clone(),
         api_key,
         base_url: entry.base_url.clone(),
         model: entry.model.clone(),
-        supports_vision: entry.supports_vision,
-        context_window: entry.context_window,
-        pricing: entry.pricing,
+        supports_vision: probe_spec.supports_vision,
+        context_window: probe_spec.context_window,
+        pricing: probe_spec.pricing,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: Some(state.secret_vault.clone()),
         proxy: cfg
@@ -450,11 +458,17 @@ async fn build_model_entry(
         baybo_llm::openrouter::pricing_for(&entry.provider, &entry.model).unwrap_or_default();
     let defaults = baybo_llm::factory_defaults_for(&entry.provider);
 
-    let effective_context_window = entry
+    // The dashboard's "effective" columns describe the entry's DEFAULT
+    // model, so they layer that model's own spec — not an entry-wide one.
+    let default_spec = entry
+        .spec_for(&entry.model)
+        .unwrap_or_else(|| baybo_config::LlmModelSpec::bare(entry.model.clone()));
+
+    let effective_context_window = default_spec
         .context_window
         .or_else(|| caps.and_then(|c| c.context_window))
         .unwrap_or(defaults.context_window);
-    let effective_supports_vision = entry
+    let effective_supports_vision = default_spec
         .supports_vision
         .or_else(|| caps.and_then(|c| c.supports_vision))
         .unwrap_or(defaults.supports_vision);
@@ -465,7 +479,7 @@ async fn build_model_entry(
         cached_input_per_1m_tokens: factory_pricing.cached_input_per_1m_tokens,
         cache_write_per_1m_tokens: factory_pricing.cache_write_per_1m_tokens,
     };
-    if let Some(p) = entry.pricing {
+    if let Some(p) = default_spec.pricing {
         if let Some(v) = p.input_per_1m_tokens {
             effective_pricing.input_per_1m_tokens = v;
         }
@@ -493,16 +507,16 @@ async fn build_model_entry(
         name: entry.name.to_string(),
         provider: entry.provider.clone(),
         model: entry.model.clone(),
-        model_candidates: entry.model_candidates.clone(),
+        model_list: entry.models().into_iter().map(Into::into).collect(),
+        supports_vision_override: default_spec.supports_vision,
+        context_window_override: default_spec.context_window,
+        pricing_override: default_spec.pricing.map(LlmPricingOverrideDto::from),
         lite_model: entry.lite_model.clone(),
         base_url: entry.base_url.clone(),
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,
         reasoning_effort: entry.reasoning_effort.clone(),
         is_default: cfg.default_llm == entry.name,
-        supports_vision_override: entry.supports_vision,
-        context_window_override: entry.context_window,
-        pricing_override: entry.pricing.map(LlmPricingOverrideDto::from),
         effective_context_window,
         effective_supports_vision,
         effective_pricing,

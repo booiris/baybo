@@ -7,7 +7,7 @@ This is the approved design for config hot-reload. It folds together what were o
 
 Apply a subset of `baybo.json` changes to a running gateway without a restart, honoring the contract in [`docs/modules/config.md`](modules/config.md) §"Reload semantics": an explicit hot-updatable whitelist, an atomic swap, validation rollback, and in-flight isolation.
 
-The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`, `pricing`, `context_window`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
+The headline win is **LLM identity** (`provider`, `model`, `model_list` — including its per-model `pricing` / `context_window` — `base_url`, `api_key`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
 
 ## Non-goals
 

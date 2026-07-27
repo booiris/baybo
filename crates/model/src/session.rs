@@ -362,7 +362,7 @@ pub struct SessionState {
     pub last_llm: Option<LlmEntryName>,
 
     /// Per-session MODEL pin WITHIN [`Self::last_llm`]'s entry: a specific id
-    /// from that entry's `[model] + model_candidates`. `None` (the default)
+    /// from that entry's `[model] + model_list`. `None` (the default)
     /// means "use the entry's default `model`", so an entry that offers only
     /// one model never needs this set. Sibling to `last_llm` rather than a
     /// change to it: the resolution stays entry-first, and old sessions (no

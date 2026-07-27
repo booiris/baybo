@@ -115,13 +115,10 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: String::from("(unset)"),
-        model_candidates: Vec::new(),
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env: api_key_env.clone(),
         base_url: base_url.clone(),
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort: None,
     };
 
@@ -172,15 +169,12 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: model.clone(),
-        // The wizard configures one model at a time; operators add candidates
-        // by editing baybo.json (`model_candidates`) directly.
-        model_candidates: Vec::new(),
+        // The wizard configures one model at a time; operators add further
+        // models by editing baybo.json (`model_list`) directly.
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env,
         base_url,
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort,
     };
 
@@ -243,9 +237,9 @@ async fn fetch_live_models(
         } else {
             entry.model.clone()
         },
-        supports_vision: entry.supports_vision,
         // Live model discovery doesn't bill anything and only needs
         // the catalog endpoint — leave overrides off for this path.
+        supports_vision: None,
         context_window: None,
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),

@@ -113,7 +113,7 @@ pub enum AgentMessage {
     /// `PUT /v1/chat/sessions/{id}/model` via [`AgentSupervisor::route`].
     SetModel {
         llm: Option<LlmEntryName>,
-        /// The model within `llm`'s entry (a `model_candidates` id), or
+        /// The model within `llm`'s entry (a `model_list` id), or
         /// `None` for the entry's default. Persisted to
         /// `session.state.last_model` alongside `last_llm`.
         model: Option<String>,

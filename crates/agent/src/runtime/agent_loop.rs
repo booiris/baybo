@@ -464,7 +464,7 @@ pub struct AgentLoop {
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
     /// actors); `Some` ⇒ a subagent's pinned entry name.
     initial_llm: Option<LlmEntryName>,
-    /// The model WITHIN `initial_llm`'s entry (a `model_candidates` id), or
+    /// The model WITHIN `initial_llm`'s entry (a `model_list` id), or
     /// `None` for the entry's default model. Paired with `initial_llm`
     /// through every re-resolve so a per-session model pick takes effect.
     initial_model: Option<String>,
