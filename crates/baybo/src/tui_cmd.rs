@@ -10,8 +10,10 @@
 //! the secret vault at `gateway.tui_token` (rotated on every
 //! `baybo gateway start`); the TUI opens the same vault, reads the
 //! token, and presents it in the `x-baybo-channel-token` header on the
-//! WS upgrade. The token is bound to the `tui` label, so the channel-
-//! auth middleware admits it through the same path as a sidecar.
+//! WS upgrade. The token is bound to the `tui` label, which is what the
+//! admin listener's co-hosted auth middleware
+//! (`require_channel_or_admin_token`) admits — the web chat's admin
+//! bearer and a paired device's bearer come through the same door.
 //!
 //! If the connect fails the command prints a concrete block telling
 //! the operator how to start a gateway and exits. The dev-only
@@ -31,7 +33,7 @@ use baybo_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
 
 use crate::gateway_client::{
-    admin_addr_from_config, read_tui_token, try_connect_with_token, unreachable_gateway_error,
+    admin_addr_from_config, dial_failure_error, read_tui_token, try_connect_with_token,
 };
 use crate::runtime::force_exit_watchdog;
 use crate::runtime::install_signal_handler;
@@ -81,7 +83,7 @@ pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> 
         match try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id).await {
             Ok(t) => Arc::new(t),
             Err(err) if !matches!(err, ChannelError::NotReachable(_)) => {
-                return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
+                return Err(dial_failure_error(admin_addr, &err));
             }
             Err(err) => {
                 #[cfg(debug_assertions)]
@@ -100,14 +102,14 @@ pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> 
                     Arc::new(
                         try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id)
                             .await
-                            .map_err(|e| unreachable_gateway_error(admin_addr, &e.to_string()))?,
+                            .map_err(|e| dial_failure_error(admin_addr, &e))?,
                     )
                 } else {
-                    return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
+                    return Err(dial_failure_error(admin_addr, &err));
                 }
                 #[cfg(not(debug_assertions))]
                 {
-                    return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
+                    return Err(dial_failure_error(admin_addr, &err));
                 }
             }
         };

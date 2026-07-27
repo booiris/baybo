@@ -42,6 +42,13 @@ pub enum WsClientError {
     #[error("websocket upgrade failed: {0}")]
     WsUpgrade(String),
 
+    /// The endpoint answered the upgrade with an HTTP error status — a
+    /// live server that refused us, not a transport failure. Kept as a
+    /// typed status so callers can tell a credential rejection from a
+    /// protocol error without parsing the message.
+    #[error("gateway refused the websocket upgrade: HTTP {status}")]
+    WsUpgradeRejected { status: u16 },
+
     #[error("registration rejected: {0}")]
     RegistrationRejected(String),
 
@@ -125,9 +132,12 @@ impl WsClient {
                 WsClientError::WsUpgrade(format!("{header_name} is not a valid header"))
             })?,
         );
-        let (ws, _) = client_async(request, stream)
-            .await
-            .map_err(|e| WsClientError::WsUpgrade(e.to_string()))?;
+        let (ws, _) = client_async(request, stream).await.map_err(|e| match e {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => WsClientError::WsUpgradeRejected {
+                status: resp.status().as_u16(),
+            },
+            other => WsClientError::WsUpgrade(other.to_string()),
+        })?;
         let (sink, source) = ws.split();
         let client = Self {
             sink: Arc::new(Mutex::new(sink)),

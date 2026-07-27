@@ -16,6 +16,15 @@ pub enum ChannelError {
     #[error("channel endpoint not reachable: {0}")]
     NotReachable(String),
 
+    /// The endpoint answered and refused our credential (HTTP 401/403 on
+    /// the upgrade). Split from [`NotReachable`] (nothing listening) and
+    /// [`Config`] (live endpoint, malformed handshake) so the CLI can say
+    /// "running but rejected our token" instead of "no gateway" — and so
+    /// the TUI's auto-spawn path, which is gated on [`NotReachable`],
+    /// never fires because a live gateway turned us away.
+    #[error("channel endpoint rejected our credential: {0}")]
+    Unauthorized(String),
+
     #[error("channel {0} already installed")]
     DuplicateChannel(String),
 }

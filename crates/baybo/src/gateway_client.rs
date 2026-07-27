@@ -1,15 +1,17 @@
 //! Shared dial path for CLI commands that act as a WS channel client of
 //! a running `baybo gateway` — the interactive TUI (`baybo tui`) and the
-//! headless one-shot prompt (`baybo -p`).
+//! headless one-shot prompt (`baybo prompt`).
 //!
 //! Both connect the same way: resolve the gateway's admin listener from
 //! config, read the per-start TUI token the gateway published to the
 //! secret vault, and dial [`WsTransport`] against `/v1/channel-ws`. The
-//! token is bound to the built-in `tui` channel label, so the channel-
-//! auth middleware admits either client through the same path as a
-//! sidecar. Keeping the resolution + token-read + connect logic here
-//! means the two entrypoints can't drift on bind-address rewriting or
-//! the "no live gateway" error text.
+//! token is bound to the built-in `tui` channel label, which is what the
+//! admin listener's co-hosted auth middleware admits alongside the web
+//! chat's admin bearer and a paired device's bearer. Keeping the
+//! resolution + token-read + connect logic here means the two
+//! entrypoints can't drift on bind-address rewriting or on which dial
+//! failure earns which operator-facing message — see
+//! [`dial_failure_error`], the one place that decides.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -92,4 +94,85 @@ pub fn unreachable_gateway_error(admin_addr: SocketAddr, underlying: &str) -> an
     anyhow::anyhow!(
         "no baybo gateway reachable at {admin_addr}\n  - start it with:       baybo gateway start\n  (underlying error: {underlying})"
     )
+}
+
+const REJECTED_TOKEN_HELP: &str = r#"gateway at {{addr}} is running, but it rejected our TUI token
+  - the gateway mints a fresh TUI token on every start and publishes it to vault key `{{vault_key}}`
+  - most likely it restarted after this client read the token, or it serves a different workspace
+  - fix: restart the gateway so both ends hold the same token, then retry
+  (underlying error: {{underlying}})"#;
+
+const HANDSHAKE_FAILED_HELP: &str = r#"gateway at {{addr}} answered, but the channel handshake failed
+  - the gateway is listening, so this is not a "not running" problem
+  - check the gateway log for the matching reject, then retry
+  (underlying error: {{underlying}})"#;
+
+/// Turn a dial failure into the right operator-facing message. Every
+/// caller routes through here so "unreachable" is only ever printed for
+/// an endpoint that genuinely is not listening.
+pub fn dial_failure_error(admin_addr: SocketAddr, err: &ChannelError) -> anyhow::Error {
+    match err {
+        ChannelError::NotReachable(underlying) => unreachable_gateway_error(admin_addr, underlying),
+        ChannelError::Unauthorized(underlying) => anyhow::anyhow!(
+            REJECTED_TOKEN_HELP
+                .replace("{{addr}}", &admin_addr.to_string())
+                .replace("{{vault_key}}", TUI_TOKEN_VAULT_KEY)
+                .replace("{{underlying}}", underlying)
+        ),
+        other => anyhow::anyhow!(
+            HANDSHAKE_FAILED_HELP
+                .replace("{{addr}}", &admin_addr.to_string())
+                .replace("{{underlying}}", &other.to_string())
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:8888".parse().expect("literal addr")
+    }
+
+    #[test]
+    fn not_reachable_keeps_the_start_the_gateway_advice() {
+        let msg = dial_failure_error(addr(), &ChannelError::NotReachable("dial: refused".into()))
+            .to_string();
+        assert!(
+            msg.contains("no baybo gateway reachable at 127.0.0.1:8888"),
+            "{msg}"
+        );
+        assert!(msg.contains("baybo gateway start"), "{msg}");
+    }
+
+    /// The whole point of the [`ChannelError::Unauthorized`] split: a live
+    /// gateway that refused our credential must never be reported as an
+    /// absent one, or the operator is sent to start a process already running.
+    #[test]
+    fn unauthorized_reports_a_running_gateway_not_a_missing_one() {
+        let msg =
+            dial_failure_error(addr(), &ChannelError::Unauthorized("HTTP 401".into())).to_string();
+        assert!(
+            msg.contains("is running, but it rejected our TUI token"),
+            "{msg}"
+        );
+        assert!(msg.contains(TUI_TOKEN_VAULT_KEY), "{msg}");
+        assert!(
+            !msg.contains("no baybo gateway reachable") && !msg.contains("start it with"),
+            "must not claim the gateway is absent: {msg}"
+        );
+    }
+
+    #[test]
+    fn other_errors_say_the_endpoint_answered() {
+        let msg =
+            dial_failure_error(addr(), &ChannelError::Config("bad handshake".into())).to_string();
+        assert!(
+            msg.contains("answered, but the channel handshake failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("bad handshake"), "{msg}");
+        assert!(!msg.contains("no baybo gateway reachable"), "{msg}");
+    }
 }
