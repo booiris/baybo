@@ -444,13 +444,6 @@ pub async fn build_managers(
         stores.session_folder.clone(),
     ));
 
-    // Delete orphan summary directories under `state/sessions/` left by
-    // a background-summary pass that wrote `summary.md` but exited before
-    // recording its `session_summaries` row. Best-effort — logged at warn
-    // on failure, never blocks boot.
-    baybo_agent::compression::reap_orphan_summaries(session_manager.as_ref(), &workspace_paths)
-        .await;
-
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 
     // Crash recovery: roll forward orphan trace rows (steps/spans left
@@ -894,7 +887,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
-                    workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),
                     task_store: task_store.clone(),
