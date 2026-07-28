@@ -223,7 +223,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             Some(t) => Some(t),
             None => {
                 return Err(format!(
-                    "unknown model_tier '{label}'; expected fast|balanced|deep"
+                    "unknown model_tier '{label}'; expected lite|balanced|deep"
                 ));
             }
         },
@@ -482,7 +482,7 @@ fn parameters_schema() -> Value {
             },
             "model_tier": {
                 "type": "string",
-                "enum": ["fast", "balanced", "deep"],
+                "enum": ["lite", "balanced", "deep"],
                 "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Only applies to backend='baybo'."
             },
             "backend": {
@@ -836,7 +836,7 @@ mod tests {
                     "subagent_type": "general-purpose",
                     "description": "look up X",
                     "prompt": "Investigate X and report what you find.",
-                    "model_tier": "fast",
+                    "model_tier": "lite",
                 }),
                 &ctx(),
             )
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(req.subagent_type, "general-purpose");
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
-        assert_eq!(req.model_tier, Some(ModelTier::Fast));
+        assert_eq!(req.model_tier, Some(ModelTier::Lite));
         assert!(!req.background);
         assert!(
             matches!(&req.backend, SubagentBackend::Baybo),
@@ -1146,7 +1146,7 @@ mod tests {
         }
         // Tier hints surface so the LLM can read the default tier
         // without guessing.
-        assert!(desc.contains("(default tier: fast)"));
+        assert!(desc.contains("(default tier: lite)"));
         assert!(desc.contains("(default tier: deep)"));
         // Sorted by name: explorer < general-purpose < planner < reviewer.
         let pos = |needle: &str| desc.find(needle).expect("present");

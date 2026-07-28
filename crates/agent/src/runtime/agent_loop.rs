@@ -459,6 +459,18 @@ pub struct AgentLoop {
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
     /// hot-reload takes effect on the next message.
     llm_client: Arc<BillableLlm>,
+    /// Auxiliary model for this turn, re-resolved alongside
+    /// [`Self::llm_client`]. Drives title generation and everything a
+    /// tool reaches through `ToolContext::lite_llm` (the Bash risk
+    /// judges, WebFetch's page summary). Equals `llm_client` when no
+    /// lite model is configured anywhere.
+    ///
+    /// Context compression and the progress observer deliberately stay
+    /// on `llm_client`: their input is the session transcript, i.e. the
+    /// exact prefix provider prompt-caching keeps warm, and that cache is
+    /// per-model — sending it to a second model turns every call into a
+    /// cold full-transcript read.
+    lite_client: Arc<BillableLlm>,
     /// Hot-swappable pool handle this loop re-resolves against per turn.
     llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
@@ -590,14 +602,20 @@ impl AgentLoop {
             task_store,
             title_sink,
         } = config;
-        let (llm_client, _effective_name) = llm_pool
-            .read()
-            .resolve(initial_llm.as_ref(), initial_model.as_deref());
+        let (llm_client, lite_client) = {
+            let pool = llm_pool.read();
+            let (client, _effective_name) =
+                pool.resolve(initial_llm.as_ref(), initial_model.as_deref());
+            let (lite, _lite_name) =
+                pool.resolve_lite(initial_llm.as_ref(), initial_model.as_deref());
+            (client, lite)
+        };
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
 
         Self {
             llm_client,
+            lite_client,
             llm_pool,
             initial_llm,
             initial_model,
@@ -701,6 +719,13 @@ impl AgentLoop {
         let pool = Arc::clone(&self.llm_pool.read());
         let (client, _name) =
             pool.resolve(self.initial_llm.as_ref(), self.initial_model.as_deref());
+        // Resolved unconditionally: the lite cascade can change without the
+        // main client changing (an entry gaining a `lite_model`, or the Lite
+        // tier being re-pointed), and the pointer check below would then
+        // short-circuit past it.
+        let (lite, _lite_name) =
+            pool.resolve_lite(self.initial_llm.as_ref(), self.initial_model.as_deref());
+        self.lite_client = lite;
         // Compare by pointer, not model id: a config reload swaps in a
         // fresh `Arc<BillableLlm>` even when the model id is unchanged
         // (a `base_url`, credential, `reasoning_effort`, or
@@ -1250,7 +1275,11 @@ impl AgentLoop {
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
-        let llm_for_calls = Arc::clone(&self.llm_client);
+        // Tools get the LITE client: every consumer of the tool-layer
+        // side-LLM slot is an auxiliary call (the Bash risk judges,
+        // WebFetch's page summary), and none of them sends the session
+        // transcript, so there is no prompt cache to lose.
+        let llm_for_calls = Arc::clone(&self.lite_client);
         let registry_for_calls = Arc::clone(&self.tool_registry);
         // Promote the previous response's staged reads before this batch runs,
         // so a `Read` and an `Edit`/`Write` of the same file in THIS response
@@ -2910,9 +2939,9 @@ impl AgentLoop {
 
         let session_id = session.id.clone();
         let user_id = session.user.id.clone();
-        let llm_client = self.llm_client.clone();
+        let llm_client = self.lite_client.clone();
         let security_gateway = self.security_gateway.clone();
-        let model_info = self.llm_client.model_info().clone();
+        let model_info = self.lite_client.model_info().clone();
         let recorder = Arc::clone(span_recorder);
         let cancel_token = cancel_token.clone();
 
@@ -2944,11 +2973,19 @@ impl AgentLoop {
     }
 }
 
+/// Cap on the opening message handed to title generation. Naming a
+/// conversation never needs more than its first couple of paragraphs, and
+/// the message is unbounded user input — a pasted log as the first turn
+/// would otherwise be sent verbatim, which a small lite model may not even
+/// have the window for.
+const TITLE_QUESTION_MAX_CHARS: usize = 2_000;
+
 /// Extract the session's first genuine user question from the transcript:
 /// the first `MessageSource::User` row that actually carries text (a
 /// media-only opener — an uncaptioned image with no `Text` block — is
 /// skipped, so a session that opens with media then a real question still
 /// titles from the question). `None` when there is no text-bearing user row.
+/// Truncated to [`TITLE_QUESTION_MAX_CHARS`].
 fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
     messages
         .iter()
@@ -2965,17 +3002,39 @@ fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
                 .join("\n");
             let text = text.trim();
             if text.is_empty() {
-                None
-            } else {
-                Some(text.to_string())
+                return None;
             }
+            Some(match text.char_indices().nth(TITLE_QUESTION_MAX_CHARS) {
+                Some((cut, _)) => text[..cut].to_string(),
+                None => text.to_string(),
+            })
         })
 }
 
 #[cfg(test)]
 mod first_user_question_tests {
+    use super::TITLE_QUESTION_MAX_CHARS;
     use super::first_user_question;
     use baybo_model::{ChatMessage, ContentBlock};
+
+    /// The opener is unbounded user input; a pasted log must not ride
+    /// into the title prompt verbatim.
+    #[test]
+    fn a_long_opener_is_truncated() {
+        let long = "x".repeat(TITLE_QUESTION_MAX_CHARS * 3);
+        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
+        let q = first_user_question(&msgs).expect("text-bearing row");
+        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
+    }
+
+    /// Truncation slices on a char boundary, not a byte one.
+    #[test]
+    fn truncation_is_char_boundary_safe() {
+        let long = "\u{03b1}\u{03b2}\u{03b3}".repeat(TITLE_QUESTION_MAX_CHARS);
+        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
+        let q = first_user_question(&msgs).expect("text-bearing row");
+        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
+    }
 
     #[test]
     fn picks_first_genuine_user_row_over_injected_and_assistant() {

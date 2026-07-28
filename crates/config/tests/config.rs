@@ -235,7 +235,7 @@ fn model_tier_mapping_to_unknown_entry_fails_validation() {
     let mut c = config_with_default_entry();
     c.agent
         .model_tiers
-        .insert(ModelTier::Fast, "missing".into());
+        .insert(ModelTier::Lite, "missing".into());
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "agent.model_tiers"));
 }
@@ -243,7 +243,7 @@ fn model_tier_mapping_to_unknown_entry_fails_validation() {
 #[test]
 fn model_tier_mapping_to_existing_entry_is_valid() {
     let mut c = config_with_default_entry();
-    c.agent.model_tiers.insert(ModelTier::Fast, "openai".into());
+    c.agent.model_tiers.insert(ModelTier::Lite, "openai".into());
     c.validate()
         .expect("model_tier pointing at a real llm entry is valid");
 }

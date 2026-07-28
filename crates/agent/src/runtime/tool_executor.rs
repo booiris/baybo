@@ -463,7 +463,7 @@ impl ToolExecutor {
         _parent_job_for_log: Option<JobId>,
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
-        // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
+        // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
         // Whether this session may background work (user-facing session).
         // Gates whether the [`BackgroundJobSink`] reaches the tool's ctx.
@@ -704,8 +704,10 @@ impl ToolExecutor {
                 // any) is bound to this exact tool span so a tool that
                 // makes a side-LLM call (e.g. `WebFetch`'s extraction)
                 // sees its `cost_records` row attributed to the running
-                // tool span, not a synthetic placeholder.
-                let llm: Option<Arc<dyn BilledChat>> = bind_source.map(|guarded| {
+                // tool span, not a synthetic placeholder. `bind_source`
+                // is the agent loop's LITE client — see
+                // `ToolContext::lite_llm`.
+                let lite_llm: Option<Arc<dyn BilledChat>> = bind_source.map(|guarded| {
                     let bound = guarded.bind(Attribution {
                         user_id: user.id.clone(),
                         session_id: session_id.clone(),
@@ -733,7 +735,7 @@ impl ToolExecutor {
                     approval: Some(approval),
                     notifier: notifier.clone(),
                     events: Arc::clone(&event_sink) as Arc<dyn baybo_tools::ToolEventSink>,
-                    llm,
+                    lite_llm,
                     secrets: Some(
                         Arc::clone(&self.security_gateway) as Arc<dyn baybo_tools::SecretAccess>
                     ),

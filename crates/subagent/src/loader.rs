@@ -80,7 +80,7 @@ pub fn parse_profile_md(content: &str, default_name: &str) -> Result<SubagentPro
             Some(tier) => Some(tier),
             None => {
                 return Err(format!(
-                    "subagent profile '{name}' has unknown default_tier '{label}'; expected fast|balanced|deep"
+                    "subagent profile '{name}' has unknown default_tier '{label}'; expected lite|balanced|deep"
                 ));
             }
         },

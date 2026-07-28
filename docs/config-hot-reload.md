@@ -76,6 +76,8 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 - swaps `self.llm_client` — in-tool side-LLM calls need no extra step: `ctx.llm` is bound per tool call from the active client (`BillableLlm::bind` → `BoundBilledLlm`, wrapped in `BilledChatRunner`; `crates/agent/src/runtime/tool_executor.rs`), so they bill the new model automatically,
 - calls `context_manager.set_active_model_context_window(new)` — load-bearing: a smaller replacement context would otherwise overflow because compression still gated on the old larger window.
 
+The loop's **lite** client (`resolve_lite`, driving the risk judges / page summary / title) is re-resolved on every turn *before* that pointer check, not inside it: the lite cascade can change while the main client does not — an entry gaining a `lite_model`, or `model_tiers.lite` being re-pointed — and the short-circuit would otherwise skip past it.
+
 The **tokenizer is deliberately not swapped**. `TiktokenTokenizer` is already an estimate and the `TokenCalibration` layer corrects drift against observed usage within a few turns; adding a mutable tokenizer surface to `ContextManager` isn't worth it.
 
 Subagent pinning needs no special handling: `resolve(Some(removed_entry))` already falls back to the default with a `warn!`, and a pinned entry whose model changed picks up the new model on its next turn.
@@ -157,7 +159,7 @@ Deferred (the orchestrator is bin-only, so these need bin-crate or end-to-end fi
 ## Related
 
 - [`docs/modules/config.md`](modules/config.md) §"Reload semantics" — the contract this honors; firmed up + linked here.
-- `crates/baybo/src/runtime.rs` — pool build (`with_tier_map`), boot CostManager seed (`merge_pricings`), the `wire_router` spawn closure. All re-run / re-wired on reload.
+- `crates/baybo/src/runtime.rs` — pool build (`LlmClientPool::from_config`), boot CostManager seed (`merge_pricings`), the `wire_router` spawn closure. All re-run / re-wired on reload.
 - `crates/baybo/src/reload.rs` — the reload orchestrator (`RuntimeConfigReloader`), pool rebuild (`build_pool_clients`), and the `fetch_overlay_for` refresh loop (`spawn_pricing_refresh`).
 - `crates/gateway/src/api/admin/llm.rs` — `update_model` / `set_default`; "restart required" → inline reload.
 - `crates/agent/src/runtime/billed_chat.rs` — cost lookup keyed by `model_info.id`, the reason the pricing re-seed is mandatory.

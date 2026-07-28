@@ -49,8 +49,9 @@ impl TitleRunner {
             messages: messages.clone(),
             temperature: None,
             tools: Vec::new(),
-            // Title generation runs on the default model, not the session
-            // pin — no per-session effort.
+            // Naming a conversation is a one-shot classification, so it
+            // runs on the session entry's lite model and never carries the
+            // session's thinking-level pin.
             reasoning_effort: None,
         };
 

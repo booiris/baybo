@@ -44,7 +44,7 @@ pub use background_jobs::BackgroundJobManager;
 pub use baybo_cron::{CronScheduler, CronTriggerEvent};
 pub use baybo_security::SecretVault;
 pub use baybo_session::SessionManager;
-pub use llm_pool::{LlmClientPool, LlmPoolHandle};
+pub use llm_pool::{LlmClientPool, LlmPoolConfig, LlmPoolHandle};
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};

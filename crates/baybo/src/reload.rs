@@ -31,12 +31,14 @@ use crate::boot;
 
 /// The built LLM clients for a config: one default-model client per entry,
 /// plus a client per further `model_list` model, plus the per-entry pinnable
-/// model list — everything [`baybo_agent::LlmClientPool::with_candidates`]
-/// needs. `dropped` names entries whose DEFAULT client failed to build.
+/// model list and lite client — everything
+/// [`baybo_agent::LlmPoolConfig`] needs. `dropped` names entries whose
+/// DEFAULT client failed to build.
 pub(crate) struct BuiltPoolClients {
     pub clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
     pub overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
     pub entry_models: HashMap<LlmEntryName, Vec<String>>,
+    pub lite: HashMap<LlmEntryName, Arc<BillableLlm>>,
     pub dropped: Vec<LlmEntryName>,
 }
 
@@ -163,10 +165,53 @@ pub(crate) async fn build_pool_clients(
         }
     }
 
+    // `validate()` guarantees `lite_model` names one of the entry's own
+    // models, so the client already exists — this is a lookup, never a
+    // second build.
+    //
+    // A surviving entry that declares a lite model and hasn't got one is a
+    // HARD error, unlike a merely-unpickable `model_list` model. Strictness
+    // tracks observability, not importance: a dropped pickable model is
+    // visible the moment a user opens the picker, whereas a dropped lite
+    // has no symptom at all beyond the bill quietly staying at main-model
+    // rates. Client construction is local and offline, so this can only
+    // fire on a deterministic config error, never on provider flap.
+    let mut lite = HashMap::new();
+    for entry in &config.llm {
+        let Some(model) = entry.lite_model.as_deref() else {
+            continue;
+        };
+        // An entry whose own default failed is already dropped; chasing its
+        // lite would just be a secondary failure of a thing nobody can use.
+        let Some(default_client) = clients.get(&entry.name) else {
+            continue;
+        };
+        let client = if model == entry.model {
+            Some(default_client.clone())
+        } else {
+            overrides
+                .get(&(entry.name.clone(), model.to_string()))
+                .cloned()
+        };
+        match client {
+            Some(client) => {
+                lite.insert(entry.name.clone(), client);
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "llm entry {:?} declares lite_model {model:?} but no client for it was built; \
+                     it must name one of the entry's model_list models and that model must build",
+                    entry.name.as_str(),
+                ));
+            }
+        }
+    }
+
     Ok(BuiltPoolClients {
         clients,
         overrides,
         entry_models,
+        lite,
         dropped,
     })
 }
@@ -312,13 +357,14 @@ impl LlmReloader {
         .map_err(|e| e.to_string())?;
         let overlay = pricing_overlay(&built);
         let dropped = built.dropped.clone();
-        let pool = LlmClientPool::with_candidates(
-            built.clients,
-            built.overrides,
-            built.entry_models,
-            new.default_llm.clone(),
-            new.agent.model_tiers.clone(),
-        )?;
+        let pool = LlmClientPool::from_config(baybo_agent::LlmPoolConfig {
+            clients: built.clients,
+            overrides: built.overrides,
+            entry_models: built.entry_models,
+            lite: built.lite,
+            default_name: new.default_llm.clone(),
+            tier_map: new.agent.model_tiers.clone(),
+        })?;
         let active_model = pool.default_client().model_info().id.clone();
         let mut entries: Vec<String> = pool
             .entry_names()

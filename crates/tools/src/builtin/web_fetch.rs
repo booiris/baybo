@@ -83,11 +83,28 @@ use crate::{
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-/// Cap on the rendered text passed into the side LLM when a `prompt` is
-/// supplied. 96 KiB ≈ 24 K tokens — well inside every modern context
-/// window after the system+prompt overhead, and capped low enough that a
+/// Ceiling on the rendered text passed into the side LLM when a `prompt`
+/// is supplied. 96 KiB ≈ 24 K tokens, capped low enough that a
 /// pathological page can't dominate the per-call cost.
+///
+/// A ceiling, not the cap: [`summary_input_budget`] narrows it to fit the
+/// answering model's own window. This used to be justified as "well
+/// inside every modern context window", which stopped being true once the
+/// summariser moved to the entry's lite model — that model is chosen for
+/// price, and a small one would take a hard provider error on 24 K tokens
+/// of input rather than degrade.
 const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
+
+/// Fraction of the answering model's context window the page body may
+/// occupy. The rest absorbs the system prompt, the caller's own prompt,
+/// the reply, and the slack between our byte estimate and the provider's
+/// real tokenizer.
+const SUMMARY_INPUT_WINDOW_FRACTION: usize = 2;
+
+/// Bytes per token assumed when converting a context window into a byte
+/// budget. Deliberately pessimistic — English prose runs ~4, but a page
+/// of CJK or dense markup runs closer to 1.
+const SUMMARY_BYTES_PER_TOKEN: usize = 2;
 /// Threshold below which a `prompt` is ignored even when an LLM is
 /// wired in. Short pages fit comfortably in the agent's own context;
 /// burning a side-LLM call to summarise <2 KB of text is almost always
@@ -521,7 +538,7 @@ Usage notes:
 
         // Side-channel summary path: only when the caller asked for one
         // (`prompt` is non-empty), the agent layer bound a billed LLM
-        // into `ctx.llm`, AND the rendered content is large enough to
+        // into `ctx.lite_llm`, AND the rendered content is large enough to
         // be worth summarising. Pages under `SUMMARY_MIN_CHARS` are
         // returned as raw markdown — they fit in the agent's own
         // context, and a side-LLM round-trip would cost tokens for
@@ -529,11 +546,12 @@ Usage notes:
         // original. Argv-mode boot, tests, and any deployment that
         // hasn't configured a model also get the raw output.
         if let (Some(llm), Some(prompt_text)) = (
-            ctx.llm.as_ref(),
+            ctx.lite_llm.as_ref(),
             p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ) && rendered.chars().count() > SUMMARY_MIN_CHARS
         {
-            let summary_page = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
+            let summary_page =
+                truncate_utf8(rendered.as_bytes(), summary_input_budget(llm.model_info()));
             let summary_user_text =
                 format!("Prompt: {prompt_text}\n\nPage content:\n{summary_page}");
             let summary = {
@@ -591,11 +609,21 @@ Usage notes:
     }
 }
 
+/// Bytes of page body the summariser may be handed, given the model that
+/// will answer: [`MAX_SUMMARY_INPUT_BYTES`] narrowed to a fraction of that
+/// model's own context window. A model with a big window keeps the flat
+/// ceiling; a small one gets a page it can actually read.
+fn summary_input_budget(model: &baybo_llm::ModelInfo) -> usize {
+    let from_window = model.context_window.saturating_mul(SUMMARY_BYTES_PER_TOKEN)
+        / SUMMARY_INPUT_WINDOW_FRACTION;
+    MAX_SUMMARY_INPUT_BYTES.min(from_window)
+}
+
 /// Run the side LLM with the fixed extraction system prompt and the user's
 /// `(prompt, page)` pair. Honours `ctx.cancellation_token` and `ctx.timeout`
 /// so a slow model can't pin the outer deadline. Cost is recorded inside
 /// the [`BilledChat::chat`] impl that the agent layer binds into
-/// `ctx.llm`, so a successful return here implies the spend already
+/// `ctx.lite_llm`, so a successful return here implies the spend already
 /// landed in `cost_records`.
 async fn run_summary(
     llm: &dyn BilledChat,
@@ -819,6 +847,44 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The flat ceiling stands for any model with room for it…
+    #[test]
+    fn summary_budget_keeps_the_ceiling_on_a_large_window() {
+        let info = model_info_with_window(200_000);
+        assert_eq!(super::summary_input_budget(&info), MAX_SUMMARY_INPUT_BYTES);
+    }
+
+    /// …but a small window narrows it, because the summariser now runs on
+    /// whatever cheap model the operator picked and a hard provider error
+    /// is the alternative.
+    #[test]
+    fn summary_budget_narrows_to_a_small_window() {
+        let info = model_info_with_window(8_000);
+        let budget = super::summary_input_budget(&info);
+        assert!(budget < MAX_SUMMARY_INPUT_BYTES, "budget = {budget}");
+        assert_eq!(budget, 8_000);
+    }
+
+    /// A model advertising no window at all must not yield a zero budget
+    /// that silently summarises an empty page.
+    #[test]
+    fn summary_budget_is_monotonic_in_the_window() {
+        let small = super::summary_input_budget(&model_info_with_window(4_000));
+        let large = super::summary_input_budget(&model_info_with_window(64_000));
+        assert!(small < large);
+    }
+
+    fn model_info_with_window(context_window: usize) -> baybo_llm::ModelInfo {
+        baybo_llm::ModelInfo {
+            id: "stub".into(),
+            provider: "stub".into(),
+            context_window,
+            supports_tools: false,
+            supports_vision: false,
+            pricing: baybo_llm::ModelPricing::default(),
+        }
+    }
     use super::*;
     use crate::test_support::unbilled_chat;
     use axum::{
@@ -1272,7 +1338,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "summarise" }),
@@ -1355,7 +1421,7 @@ mod tests {
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let metrics = Arc::new(RecorderStub::default());
         let mut tctx = ctx_with_event_sink(Arc::clone(&metrics));
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         tool.execute(
             json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
             &tctx,
@@ -1419,7 +1485,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "summarise" }),
@@ -1735,7 +1801,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
@@ -1803,7 +1869,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(json!({ "url": url_to(&server, "/") }), &tctx)
             .await
@@ -1831,7 +1897,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "   \t\n  " }),
@@ -1872,7 +1938,7 @@ mod tests {
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
-        tctx.llm = Some(llm);
+        tctx.lite_llm = Some(llm);
         let out = tool
             .execute(json!({ "url": url_to(&server, "/"), "prompt": "?" }), &tctx)
             .await
