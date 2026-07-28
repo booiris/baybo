@@ -146,7 +146,9 @@ The poster's natural size is recorded into the same `ImageDimsStore`/`imageDims`
 
 ### Two pickers behind one `+`
 
-The composer's `+` is a stock `Menu` with **Photos** (`PhotosPicker`, `matching: .images`) and **Files** (`.fileImporter`, no type restriction). Both are MULTI-select; the strip holds at most `ChatStore.maxStagedAttachments` (10) and the over-cap picks raise the composer notice.
+The composer's `+` opens `AttachMenuPanel` (hand-rolled, overlaid on the dock with its scrim over the transcript — see [navigation.md](navigation.md) § The composer pill) with **Photos** (`PhotosPicker`, `matching: .images`) and **Files** (`.fileImporter`, no type restriction). Both are MULTI-select; the strip holds at most `ChatStore.maxStagedAttachments` (10) and the over-cap picks raise the composer notice.
+
+**The panel owns no staging state.** It is presented by `ChatScreen` while both pickers stay modifiers on `ComposerView` — their selection cap reads the strip's free slots and their results feed `ComposerStaging` directly — so a row tap travels down as an `AttachSource` request (`AttachMenu.pick`) and the picker answering it clears the request as it dismisses.
 
 That count is a **UI limit, not a wire cap** — it bounds thumbnails, uploads and strip tiles, and the gateway enforces its own per-message attachment cap independently (`MAX_MESSAGE_BATCH_ATTACHMENTS`, which the singular `Frame::Message` path validates too). The BYTE cap is separate and is the gateway's: `ChatStore.maxAttachmentBytes` mirrors `MAX_BLOB_BYTES` (100 MiB) and there is exactly one of it.
 

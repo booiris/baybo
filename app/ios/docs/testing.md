@@ -178,7 +178,12 @@ touching `app/ios` at all.
   at mount vs after the decode — they must be equal.
 
 - **`-baybo-demo-jump`** scrolls the log off the newest edge at 4s (native glass
-  jump button pops) and runs the native jump path at 7s.
+  jump button pops) and runs the native jump path at 7s. Pair it with a thread
+  tall enough to scroll — `-baybo-demo-index` seeds one in 400ms, where
+  `-baybo-demo-frames` is still streaming its single turn at 4s — and remember
+  the disc is only up for those three seconds: `ComposerAttachUITests` opens the
+  `+` panel inside that window, which is the only headless way to put the disc
+  and the panel on screen together.
 
 - **`-baybo-demo-index`** pushes ONE synthesized `sync_page` carrying six of the
   user's own sends (one attachment-only, one past the row's text cap) with their
@@ -194,7 +199,7 @@ touching `app/ios` at all.
   affordance). Staging for real is not a path a smoke can take: both the
   document picker and the photo picker run OUT OF PROCESS, so this flag is the
   strip's only headless entry point (`ComposerAttachUITests` drives it, and the
-  `+` menu itself, which is in-process, by hand). It seeds in
+  `+` panel itself, which is in-process, by hand). It seeds in
   `ComposerStaging.init`, i.e. once per CONVERSATION — seeded per composer frame
   it refilled the strip after every `fullScreenCover`, which is exactly the
   teardown one of those smokes drives it through. Its fixture names are prefixed

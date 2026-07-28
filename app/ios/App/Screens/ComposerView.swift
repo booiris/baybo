@@ -27,15 +27,18 @@ struct ComposerView: View {
     /// viewer, video player) tears down and puts back.
     @ObservedObject private var staging: ComposerStaging
     @ObservedObject private var lang = Lang.shared
+    /// The `+`'s panel, owned by `ChatScreen` — it floats over the TRANSCRIPT
+    /// and over this dock's own rows, so the screen is what presents it (as an
+    /// overlay on the dock). This side reports the anchor and answers the pick.
+    @ObservedObject private var attach: AttachMenu
     @State private var text = ""
     @State private var photoPicks: [PhotosPickerItem] = []
-    @State private var photosPresented = false
-    @State private var filesPresented = false
     @FocusState private var focused: Bool
 
-    init(store: ChatStore) {
+    init(store: ChatStore, attach: AttachMenu) {
         _store = ObservedObject(wrappedValue: store)
         _staging = ObservedObject(wrappedValue: store.staging)
+        _attach = ObservedObject(wrappedValue: attach)
     }
 
     private static let inputHitSlop: CGFloat = 10
@@ -91,7 +94,7 @@ struct ComposerView: View {
             // One ChatGPT-style pill: inline plus on the left, in-field send
             // on the right — no satellite icon circles.
             HStack(alignment: .bottom, spacing: 4) {
-                plusMenu
+                plusButton
 
                 // 13pt vertical padding makes the single-line field exactly
                 // the row's 48pt (17pt body ≈ 22pt line), so the cursor sits
@@ -159,7 +162,7 @@ struct ComposerView: View {
         .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.callId)
         .background { composerVeil }
         .photosPicker(
-            isPresented: $photosPresented,
+            isPresented: pickerBinding(.photos),
             selection: $photoPicks,
             maxSelectionCount: max(1, ChatStore.maxStagedAttachments - staging.staged.count),
             matching: .images
@@ -168,7 +171,7 @@ struct ComposerView: View {
         // attach — the mime the extension implies is what decides server-side
         // whether it is readable at all.
         .fileImporter(
-            isPresented: $filesPresented,
+            isPresented: pickerBinding(.files),
             allowedContentTypes: [.data],
             allowsMultipleSelection: true
         ) { result in
@@ -251,21 +254,21 @@ struct ComposerView: View {
         }
     }
 
-    /// The inline `+`. A stock `Menu` (system popup, no custom panel — this one
-    /// is two flat entries), pinned to the plus's own frame: an unconstrained
-    /// menu label grows greedily and eats the field beside it.
-    private var plusMenu: some View {
-        Menu {
-            Button {
-                photosPresented = true
-            } label: {
-                Label(lang.t("chat.attachPhotos"), systemImage: "photo.on.rectangle")
-            }
-            Button {
-                filesPresented = true
-            } label: {
-                Label(lang.t("chat.attachFiles"), systemImage: "folder")
-            }
+    /// The inline `+`, at its own 46×48 frame. It toggles `AttachMenuPanel`
+    /// (hand-rolled, overlaid on the dock by `ChatScreen`) rather than opening a
+    /// stock `Menu`, which would dim the screen and lift this pill out of the
+    /// dock.
+    ///
+    /// The button reports its own frame in the DOCK's coordinate space, which
+    /// is the column the panel blooms from: the pill's horizontal padding
+    /// animates between at-rest and focused, so there is no fixed coordinate to
+    /// hardcode. Not `.global` — the panel is laid out in the dock's space, and
+    /// a frame measured in another container is a rendering that disagrees with
+    /// its own touch region.
+    private var plusButton: some View {
+        Button {
+            Haptics.tap()
+            withAnimation(AttachMenuPanel.fade) { attach.isOpen.toggle() }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 22, weight: .light))
@@ -273,9 +276,26 @@ struct ComposerView: View {
                 .frame(width: Self.plusSize.width, height: Self.plusSize.height)
                 .contentShape(Rectangle())
         }
-        .menuOrder(.fixed)
-        .frame(width: Self.plusSize.width, height: Self.plusSize.height)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(AttachMenuPanel.dockSpace))
+        } action: { frame in
+            attach.report(anchor: frame)
+        }
         .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.addImage")))
+    }
+
+    /// The panel's pick, as the picker that answers it sees it. The panel is
+    /// presented by `ChatScreen` (it floats over the dock) while the
+    /// pickers stay HERE — their selection cap reads the strip's free slots and
+    /// their results feed `staging` — so only the row tap travels down, and
+    /// each picker clears the request as it dismisses.
+    private func pickerBinding(_ source: AttachSource) -> Binding<Bool> {
+        Binding(
+            get: { attach.pick == source },
+            set: { presented in
+                guard !presented, attach.pick == source else { return }
+                attach.pick = nil
+            })
     }
 
     private var stagedStrip: some View {

@@ -15,6 +15,11 @@ struct ChatScreen: View {
     /// The hand-rolled model menu (`ModelMenuPanel`) — state lives here
     /// because the panel overlays the TRANSCRIPT, not just the header bar.
     @State private var modelMenuOpen = false
+    /// The composer's attach panel (`AttachMenuPanel`), here for the same
+    /// reason — it floats over the transcript AND over the dock's own rows, so
+    /// it is presented in two layers this screen owns; the `+` it blooms from
+    /// is measured by the composer rather than fixed.
+    @StateObject private var attach = AttachMenu()
     /// The header's message index (`MessageIndexSheet`).
     @State private var messageIndexOpen = false
     /// The row a sheet tap picked. The jump runs from the sheet content's
@@ -57,6 +62,14 @@ struct ChatScreen: View {
                 ModelMenuPanel(store: store, catalog: .shared, isPresented: $modelMenuOpen)
                     .zIndex(2)
             }
+
+            // Only the attach panel's SCRIM lands here — the panel itself rides
+            // with the dock (below), which is the one layer that can stack above
+            // the dock's own content. `AttachMenuScrim` explains the split.
+            if attach.isOpen {
+                AttachMenuScrim(isPresented: $attach.isOpen)
+                    .zIndex(2)
+            }
         }
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
@@ -76,7 +89,7 @@ struct ChatScreen: View {
                     .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
                     .transition(.scale(scale: 0.7).combined(with: .opacity))
                 }
-                ComposerView(store: store)
+                ComposerView(store: store, attach: attach)
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.frame(in: .global).minY
                     } action: { minY in
@@ -90,6 +103,27 @@ struct ChatScreen: View {
                         bridge.setComposerTop(minY)
                     }
             }
+            // The space the `+` reports its frame in and the space the panel is
+            // laid out in, in one container — no `.global` round trip between
+            // two of them, so the panel's paint and its hit region are the same
+            // rectangle.
+            .coordinateSpace(.named(AttachMenuPanel.dockSpace))
+            // The panel rides HERE, not in the stack above: this is the only
+            // layer that composites over the dock's own content — the notice
+            // line, the approval card, the staged strip and the jump disc. An
+            // overlay adds nothing to the inset, so the transcript's bottom
+            // inset stays what `ComposerView` alone measures.
+            .overlay(alignment: .topLeading) {
+                if attach.isOpen {
+                    AttachMenuPanel(
+                        anchor: attach.anchor, isPresented: $attach.isOpen
+                    ) { source in
+                        attach.pick = source
+                    }
+                }
+            }
+            // Inside this, so the panel travels with the dock the jump disc
+            // pushes up rather than stepping to the new position on its own.
             .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
         }
         .background(Theme.paper)
@@ -119,6 +153,17 @@ struct ChatScreen: View {
                 pendingJump = nil
                 bridge.jumpToMessage(rowId)
             }
+        }
+        // One floating panel at a time — two scrims stack, and the one behind
+        // strands its own dismiss. Only this direction is reachable: the attach
+        // scrim covers the header, while the model panel's runs UNDER the dock
+        // (`.safeAreaInset` composites above it), so the `+` stays live there.
+        // The dismissal is wrapped like every other one of that panel's (the
+        // header's index button makes the same move): bare, it popped out
+        // instantly under a scrim that was still fading in.
+        .onChange(of: attach.isOpen) { _, open in
+            guard open, modelMenuOpen else { return }
+            withAnimation(.easeOut(duration: 0.15)) { modelMenuOpen = false }
         }
         .onAppear {
             host.bridge.retarget(to: store)

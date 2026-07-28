@@ -22,6 +22,12 @@ enum Theme {
     /// curvature, or it reads sharp next to iOS 26 chrome.
     static let radiusModal: CGFloat = 20
 
+    /// The whisper of dim a hand-rolled panel (`ModelMenuPanel`,
+    /// `AttachMenuPanel`) lays over what it floats above — enough to read as a
+    /// layer, not enough to darken the screen. It doubles as the panel's
+    /// outside-tap dismiss surface.
+    static let panelScrim = Color.black.opacity(0.06)
+
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
     }
