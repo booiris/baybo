@@ -236,10 +236,20 @@ injects a `deck` global before your code runs:
   image only re-paints when you emit a NEW ref — see the reuse rule above.
   Handle `<img onerror>` if a blob might be unavailable.
 - `await deck.pickBlob({accept})` → `{blobId, contentType, size, name}` — ask
-  the user to pick a photo (the native picker). Resolves once the pick
+  the user to pick a file (the native picker). Resolves once the pick
   uploads; pass the `blobId` into `deck.call(op, {blobId})` for your service
   to consume. Rejects on cancel, or `busy` if a pick is already open (one at
-  a time). Every call settles exactly once.
+  a time). Every call settles exactly once. `name` is always present (the
+  file's own name, or a synthesized `photo.<ext>` for a photo).
+  `accept` is a mime-glob list — `"image/*"`, `"application/pdf"`, `"*/*"`,
+  either as one comma-separated string or as an array — and it picks the
+  surface: an all-image list (or no `accept` at all) opens the photo library,
+  anything else the file browser restricted to those types. An older app may
+  not honor `accept` and will open the photo library regardless, so check the
+  `contentType` you get back instead of trusting it.
+  **You can only DISPLAY an image.** A picked PDF/CSV/zip has nowhere to go but
+  `deck.call` (to your service) or `deck.shareBlob` (back to the user) —
+  `deck.blobUrl` feeds an `<img>` and nothing else.
 - `deck.shareBlob(ref, {filename})` — offer a blob to the system share sheet
   (save to Photos/Files, AirDrop). Fire-and-forget.
 

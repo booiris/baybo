@@ -11,6 +11,11 @@ struct BayboApp: App {
             RootView()
                 .environmentObject(store)
                 .preferredColorScheme(.light) // the design system is light-only
+                // Composer spools a kill, a crash or a jetsam left behind: a
+                // strip's own tiles reclaim theirs, but only while the process
+                // that staged them lives. Launch is the one moment nothing of
+                // this run can be staged yet.
+                .task { await StagedAttachment.sweepAbandonedSpools() }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {

@@ -67,6 +67,12 @@ so the frame paths, the approval queue, and the outbox's two-stage confirmation
 are testable with no gateway. XCTest stays for `BayboUITests` (Swift Testing has
 no UI API); both bundles coexist.
 
+`ComposerStaging` takes the same injected client, which is what makes the
+composer's *lifetimes* testable below the UI: `FakeBayboClient.holdBlobUploads()`
+parks an upload on the wire (deaf to cancellation, exactly like the real UniFFI
+binding) so a test can remove the tile underneath it and assert what the strip,
+the notice line and the temp spool do next.
+
 ### `app/ios/UITests/` (`BayboUITests`)
 
 XCUITest over the `-baybo-*` fixture flags. Non-gating in CI (gesture/timing
@@ -175,7 +181,12 @@ touching `app/ios` at all.
   at mount vs after the decode — they must be equal.
 
 - **`-baybo-demo-jump`** scrolls the log off the newest edge at 4s (native glass
-  jump button pops) and runs the native jump path at 7s.
+  jump button pops) and runs the native jump path at 7s. Pair it with a thread
+  tall enough to scroll — `-baybo-demo-index` seeds one in 400ms, where
+  `-baybo-demo-frames` is still streaming its single turn at 4s — and remember
+  the disc is only up for those three seconds: `ComposerAttachUITests` opens the
+  `+` panel inside that window, which is the only headless way to put the disc
+  and the panel on screen together.
 
 - **`-baybo-demo-index`** pushes ONE synthesized `sync_page` carrying six of the
   user's own sends (one attachment-only, one past the row's text cap) with their
@@ -184,6 +195,19 @@ touching `app/ios` at all.
   headlessly. A `sync_page` rather than live `message` frames on purpose: the
   wire's `Frame::Message` has no time field, so the sheet's clock and day key
   only exist on the reconstructed-row path.
+
+- **`-baybo-demo-compose`** (DEBUG, with `-baybo-open-chat`) seeds the composer's
+  staged strip with one pick of each state — a ready image thumbnail, a ready
+  file pill, one mid-upload (spinner + byte counter) and one failed (retry
+  affordance). Staging for real is not a path a smoke can take: both the
+  document picker and the photo picker run OUT OF PROCESS, so this flag is the
+  strip's only headless entry point (`ComposerAttachUITests` drives it, and the
+  `+` panel itself, which is in-process, by hand). It seeds in
+  `ComposerStaging.init`, i.e. once per CONVERSATION — seeded per composer frame
+  it refilled the strip after every `fullScreenCover`, which is exactly the
+  teardown one of those smokes drives it through. Its fixture names are prefixed
+  `staged-` so a by-label query can't confuse a strip tile with a transcript
+  card when this flag runs beside `-baybo-demo-attachments`.
 
 - **`-baybo-demo-keyboard`** raises the keyboard 2s in and drops it at 5s (record
   with `simctl io recordVideo`, extract frames with ffmpeg); the software

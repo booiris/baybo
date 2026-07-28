@@ -248,18 +248,26 @@ final class SessionIndex: ObservableObject {
 
     /// A user message left this device: capture the preview + activity locally
     /// so the list is correct even where remote refresh is unavailable
-    /// (offline/failed tunnel). An attachment-only send (empty text) bumps
-    /// activity but keeps the previous preview.
-    func recordUserSend(sessionId: String, text: String) {
-        let preview = Self.previewText(text)
+    /// (offline/failed tunnel). An attachment-only send (empty text) describes
+    /// its attachments instead of leaving the row showing the PREVIOUS message
+    /// — the gateway's own `last_message_preview` is `None` for a media-only
+    /// turn and `merge` keeps a local preview over a nil remote one, so this is
+    /// that row's only second line. `userText` stays the user's last real
+    /// question: it is the title fallback, and "Attachment: x.pdf" names
+    /// nothing.
+    func recordUserSend(sessionId: String, text: String, attachments: [AttachmentRef] = []) {
+        let typed = Self.previewText(text)
+        let preview = typed.isEmpty ? Self.attachmentPreview(attachments) : typed
         let now = Date()
         if let idx = rows.firstIndex(where: { $0.id == sessionId }) {
+            // The just-sent message is both the newest message overall and
+            // the newest USER message, so it drives the preview AND the
+            // bold-line fallback until REST reconciles.
             if !preview.isEmpty {
-                // The just-sent message is both the newest message overall and
-                // the newest USER message, so it drives the preview AND the
-                // bold-line fallback until REST reconciles.
                 rows[idx].preview = preview
-                rows[idx].userText = preview
+            }
+            if !typed.isEmpty {
+                rows[idx].userText = typed
             }
             rows[idx].lastActive = now
         } else {
@@ -267,9 +275,30 @@ final class SessionIndex: ObservableObject {
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
                     preview: preview.isEmpty ? nil : preview,
-                    userText: preview.isEmpty ? nil : preview, pinned: false))
+                    userText: typed.isEmpty ? nil : typed, pinned: false))
         }
         save()
+    }
+
+    /// The chat-list second line for an attachment-only send: the picks' names,
+    /// marked as attachments. Run through `previewText` like every other
+    /// capture, so a locally-shown preview truncates exactly the way a
+    /// server-sent one would. A nameless batch (a photo carries no filename)
+    /// falls back to the count.
+    static func attachmentPreview(_ attachments: [AttachmentRef]) -> String {
+        guard !attachments.isEmpty else { return "" }
+        let names = attachments.compactMap { ref -> String? in
+            let name = (ref.filename ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
+        }
+        guard !names.isEmpty else {
+            return previewText(
+                String(format: Lang.shared.t("chat.previewAttachments"), attachments.count))
+        }
+        return previewText(
+            String(
+                format: Lang.shared.t("chat.previewAttachment"),
+                names.joined(separator: ", ")))
     }
 
     /// The agent's final reply landed on this (foreground or still-resident)

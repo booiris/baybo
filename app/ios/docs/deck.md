@@ -40,13 +40,15 @@ Destructive card actions confirm **NATIVELY** — the shell only reports intent.
 native→web:
 
 ```
-init/deckState/cardData/bundle/callResult/setEditMode/setLanguage
+init/deckState/cardData/bundle/callResult/pickResult/setEditMode/setSetupInflight/
+setLanguage/restoreMaximized
 ```
 
 web→native:
 
 ```
-ready/refetch/requestBundle/call/layout/cardAction/editMode/quickSetup/maximize/log
+ready/refetch/requestBundle/call/pick/share/layout/cardAction/editMode/
+quickSetup/maximize/haptic/log
 ```
 
 - `quickSetup` is the empty-board CTA: native opens a fresh chat and auto-sends
@@ -54,6 +56,39 @@ ready/refetch/requestBundle/call/layout/cardAction/editMode/quickSetup/maximize/
 - `maximize` reports a card entered/left its full-screen layout so `DeckScreen`
   fades the wordmark header out — the tab bar stays — while `DeckStore.maximized`
   is set.
+- `pick`/`pickResult` and `share` are the blob plane (below). Only the shell
+  (main frame) may drive this handler at all — WKWebView injects the message
+  handler into EVERY frame, so `DeckBridge` gates on `frameInfo.isMainFrame` or
+  a sandboxed card could call the native surface directly instead of going
+  through its port.
+
+## Blobs: pick and share
+
+`docs/modules/deck.md` §Blobs is the contract; the iOS-side shape:
+
+- **`deck.pickBlob({accept})`** → `DeckStore.requestPick`. `accept` is a
+  mime-glob list the SHELL has already normalized to one comma-joined string
+  (`normalizeAccept`); `DeckStore.electPicker` re-parses it and returns a
+  `PickerMode` — `.photos` for an all-image or absent list (the compat floor
+  every pre-`accept` card depends on), `.files([UTType])` otherwise.
+- **One mode, two presentations.** `DeckScreen` binds `.photosPicker` and
+  `.fileImporter` to the same `pickerMode`; SwiftUI cannot bind two
+  presentation modifiers to one Bool.
+- **The two cancels are NOT shared.** `PhotosPicker` has no cancel callback, so
+  `photosPickerDismissed` infers one from "dismissed with nothing chosen",
+  deferred a runloop turn so a same-tick selection wins. `.fileImporter` has
+  `onCancellation` → `filePickCancelled`, no inference. Every request settles
+  exactly once through `settlePick`, whose id guard keeps a `busy` rejection
+  (a *different* id) from freeing the pick it was rejected against.
+- **The file leg streams.** It holds the URL's security-scoped access open for
+  the whole upload (`ScopedFile`, RAII — an iCloud item reads as empty without
+  it), sizes the file off disk, and calls `deckBlobUploadFile(path:…)` so a
+  100 MiB pick never enters memory. The photo leg still uploads bytes.
+- **`cardId` rides every upload** so the gateway stamps the blob
+  `deck:<card_id>` — without it the blob is an immortal `device:*` orphan, since
+  card purge is the only sweeper.
+- **`deck.shareBlob`** → `requestShare`: fetch cache-first, materialize under a
+  real filename, present the share sheet via `DeckStore.shareItem`.
 
 ## Card size
 

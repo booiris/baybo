@@ -107,10 +107,53 @@ top-right).
 
 ### The composer pill
 
-The composer is ONE ChatGPT-style glass pill (inline plus picker on the left,
-in-field ink send circle on the right; at rest it holds a moderate width, and
-focus stretches it toward the screen edges — a small gutter stays — on the
-keyboard's beat).
+The composer is ONE ChatGPT-style glass pill (inline plus on the left, in-field
+ink send circle on the right; at rest it holds a moderate width, and focus
+stretches it toward the screen edges — a small gutter stays — on the keyboard's
+beat).
+
+The plus opens `AttachMenuPanel` — two flat rows (Photos → the `PhotosPicker`,
+Files → a `.fileImporter`) — a HAND-ROLLED panel, `ModelMenuPanel`'s sibling,
+and NOT the stock `Menu` it shipped as first. A SwiftUI `Menu` is a `UIMenu`: it
+dims the whole screen, lifts its anchor view into a system layer and puts the
+bubble where it decides. This one has to leave the pill exactly where it is,
+un-dimmed and still tappable, and bloom UPWARD out of the `+`. It stays INLINE
+in the one pill at its 46×48 frame: no satellite icon circles. What the panel
+stages is [attachments.md](attachments.md) § Outbound staging.
+
+`ChatScreen` owns the state (`AttachMenu`) and presents the panel in **two
+layers**, which is the whole design:
+
+- the **scrim** (`AttachMenuScrim`) lands in the screen's ZStack, which the
+  dock's `.safeAreaInset` composites ABOVE — so it dims the transcript and the
+  header and NOT the dock. That layering is what leaves the pill un-dimmed and
+  live, and it is what `plus.isHittable` in `ComposerAttachUITests` pins;
+- the **panel** is an `.overlay` on the DOCK's content, because that is the only
+  layer that stacks over the dock's own rows. Presented in the ZStack it drew
+  UNDER everything the dock grows upward — the notice line, the approval card,
+  the staged strip — and under the jump-to-latest disc that shares the inset
+  stack, 44pt of which took the Files row's taps. An overlay adds nothing to the
+  inset, so the transcript's bottom inset is still what `ComposerView` alone
+  measures.
+
+Its column is MEASURED, never hardcoded the way the header's `anchorLeading` can
+be: the `+` reports its own frame (`AttachMenu.report`) and `AttachMenuPanel.box`
+puts the panel's leading edge on it, because the pill's horizontal padding
+animates between 40 at rest and 14 focused. That frame republishes only while
+the panel is UP — it changes on every tick of the focus and keyboard animations,
+the same reason `setComposerTop` publishes nothing at all.
+
+Its FLOOR is the dock's top edge, `anchorGap` below the panel's bottom — not the
+`+`'s top edge, which is the shape this shipped as and the bug: the `+` sinks
+INTO the dock as those rows stack above it, so against a 4-tile staged strip 68
+of the panel's 92pt drew behind the strip with the Files row hidden and
+untappable, and behind an approval card nothing showed at all. `box` works in
+the DOCK's own coordinate space (`AttachMenuPanel.dockSpace`, the space the `+`
+reports in), so its whole box is negative — it floats above `y = 0` — and the
+panel's own height arrives from the layout system through an alignment guide
+rather than a measurement fed back in. Measuring in one container and drawing in
+another is what put the live touch region ~14pt below the paint: the top of the
+Photos row dismissed the panel and the empty gap under it fired Files.
 
 Constraints: white tint only, no `.interactive()` shimmer on the field, the pill
 is BORDERLESS — a soft ink shadow carries its boundary over the blank at-rest

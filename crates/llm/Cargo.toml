@@ -16,7 +16,10 @@ serde_json = { workspace = true }
 # downstream crates' tests. Pull in via:
 #   baybo-llm = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
-test-support = []
+# `media_probe::fixture` builds the compressed object stream and the WAVE
+# container the probes have to see through; downstream ingest tests need
+# payloads that really parse, not byte soup.
+test-support = ["dep:flate2"]
 
 [dependencies]
 baybo-model = { workspace = true }
@@ -40,8 +43,13 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
+lopdf = { workspace = true }
+lofty = { workspace = true }
+imagesize = { workspace = true }
+flate2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 baybo-security = { workspace = true, features = ["test-support"] }
+flate2 = { workspace = true }
 tempfile = { workspace = true }
 baybo-storage = { workspace = true, features = ["test-support"] }

@@ -264,7 +264,7 @@ impl ContextManager {
         let (_, non_system) = partition_system(&self.messages);
         let non_system_tokens: usize = non_system
             .iter()
-            .map(|m| self.message_budget_tokens(m))
+            .map(|m| self.message_budget_tokens(m).total())
             .sum();
         if non_system.len() <= self.keep_recent && non_system_tokens <= MIN_COMPACTABLE_TOKENS {
             return Ok(CompressOutput::NoOp);
@@ -370,7 +370,7 @@ impl ContextManager {
             min_tokens,
             min_text_block_msgs,
             max_tokens,
-            |m| self.message_budget_tokens(m),
+            |m| self.message_budget_tokens(m).total(),
         );
 
         let with_slice = || {
@@ -413,7 +413,7 @@ impl ContextManager {
     fn compaction_fits(&self, candidate: &[ChatMessage]) -> bool {
         let body: usize = candidate
             .iter()
-            .map(|m| self.message_budget_tokens(m))
+            .map(|m| self.message_budget_tokens(m).total())
             .sum();
         let trailer = estimate_skill_trailer_tokens(
             self.skill_registry.as_ref(),

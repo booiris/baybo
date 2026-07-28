@@ -302,6 +302,15 @@
             ],
         ]
 
+        /// The optimistic user-echo path's own fixture: `userSent` hands the
+        /// staged refs straight to the webview, a different entry point from
+        /// the durable `message` frame the rest of this feeder pushes. Same
+        /// blob as the agent's card below, so the two cards' shared per-blob
+        /// state is visible too.
+        private static let demoSentAttachment = AttachmentRef(
+            kind: .file, blobId: "sha256:demo2.tok", mimeType: "image/svg+xml", size: 24_190,
+            filename: "bg_character_card.svg")
+
         /// An audio card (play affordance once ready) and a video tile
         /// (centered disc + corner chip). Both render straight from the frame;
         /// real playback needs real bytes, so tapping them here only exercises
@@ -515,7 +524,9 @@
             }
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(500))
-                pushDemoUserSent(msgId: "demo-att-user", text: "把角色卡和架构评审发我")
+                pushDemoUserSent(
+                    msgId: "demo-att-user", text: "把角色卡和架构评审发我",
+                    attachments: [Self.demoSentAttachment])
                 pushDemo(["kind": "turn_state", "active": true])
                 try? await Task.sleep(for: .milliseconds(600))
                 pushDemo([
@@ -747,6 +758,65 @@
                 index = end
             }
             return out
+        }
+    }
+
+    /// `-baybo-demo-compose` (DEBUG, with `-baybo-open-chat`): seed the
+    /// composer's staged strip with one of each state — a ready image, a ready
+    /// file, one mid-upload (byte counter) and one failed (retry affordance) —
+    /// so the strip is screenshot- and XCUITest-verifiable headlessly. The
+    /// system document picker is out-of-process UI a UI test can barely reach,
+    /// so staging by hand is not a path a smoke can take.
+    ///
+    /// Every name here is prefixed `staged-`: this flag runs ALONGSIDE
+    /// `-baybo-demo-attachments` (a strip surviving what the transcript
+    /// presents is exactly what one smoke drives), and a by-label query that
+    /// matches both a strip tile and a transcript card picks whichever it
+    /// pleases.
+    extension StagedAttachment {
+        private static let demoComposeArg = "-baybo-demo-compose"
+        /// Nothing retries or uploads under this flag (there is no gateway);
+        /// the source only has to exist. `.scoped` on purpose — it is the case
+        /// nothing ever deletes, so dismissing a demo tile can't try to unlink
+        /// this path.
+        private static let demoSourceUrl = URL(fileURLWithPath: "/dev/null")
+
+        static func demoStagedIfRequested() -> [StagedAttachment] {
+            guard ProcessInfo.processInfo.arguments.contains(demoComposeArg) else { return [] }
+            return [
+                StagedAttachment(
+                    preview: .image(demoThumbnail()), source: .scoped(demoSourceUrl),
+                    mime: "image/jpeg", filename: nil, byteCount: 1_482_752,
+                    state: .ready(blobId: "sha256:democompose1.tok")),
+                demoFile(
+                    name: "staged-architecture-review-2026-Q3.pdf",
+                    mime: "application/pdf", byteCount: 2_413_512,
+                    state: .ready(blobId: "sha256:democompose2.tok")),
+                demoFile(
+                    name: "staged-landing-flow-capture.mp4", mime: "video/mp4",
+                    byteCount: 24_804_352, state: .uploading(sent: 9_120_000)),
+                demoFile(
+                    name: "staged-quarterly.numbers", mime: StagedAttachment.fallbackMime,
+                    byteCount: 812, state: .error),
+            ]
+        }
+
+        private static func demoFile(
+            name: String, mime: String, byteCount: UInt32, state: State
+        ) -> StagedAttachment {
+            StagedAttachment(
+                preview: .file(name: name, mime: mime), source: .scoped(demoSourceUrl),
+                mime: mime, filename: name, byteCount: byteCount, state: state)
+        }
+
+        private static func demoThumbnail() -> UIImage {
+            let size = CGSize(width: 240, height: 240)
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = 1
+            return UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+                UIColor(white: 0.85, alpha: 1).setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+            }
         }
     }
 #endif

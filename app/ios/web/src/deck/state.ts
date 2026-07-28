@@ -156,6 +156,98 @@ export function cycleSize(size: DeckSize, sizes: DeckSize[]): DeckSize {
   return ordered[(i + 1) % ordered.length] ?? ordered[0];
 }
 
+// ---- deck.pickBlob -------------------------------------------------
+
+/// `deck.pickBlob({accept})` speaks mime globs — the `<input accept>`
+/// convention (`"image/*"`, `"application/pdf"`, `"*/*"`) — as an array or a
+/// comma-separated string. This is the ONLY normalizer on the web side: a card
+/// hands over whatever it was authored with, the shell canonicalizes once, and
+/// native receives a comma-joined token list (or `null` for "no constraint",
+/// which keeps the photo library — the behavior every pre-accept card was
+/// written against). Native re-parses that list against its own mirror of this
+/// grammar; neither side owns a second copy.
+export const ACCEPT_SEPARATOR = ",";
+/// The only token the grammar admits beside a mime atom, in either half.
+export const ACCEPT_WILDCARD = "*";
+const ACCEPT_ATOM = "[a-z0-9!#$&^_.+-]+";
+const ACCEPT_TOKEN = new RegExp(
+  `^(${ACCEPT_ATOM}|\\${ACCEPT_WILDCARD})/(${ACCEPT_ATOM}|\\${ACCEPT_WILDCARD})$`,
+);
+
+/// Canonicalize a card's `accept` into a comma-joined token list, or `null`
+/// when nothing survives — a garbage value must degrade to "no constraint",
+/// never forward garbage native would silently drop.
+export function normalizeAccept(raw: unknown): string | null {
+  const parts: string[] = Array.isArray(raw)
+    ? (raw as unknown[]).map((v) => String(v))
+    : typeof raw === "string"
+      ? [raw]
+      : [];
+  const tokens: string[] = [];
+  for (const part of parts) {
+    for (const piece of part.split(ACCEPT_SEPARATOR)) {
+      const token = piece.trim().toLowerCase();
+      if (ACCEPT_TOKEN.test(token) && !tokens.includes(token)) tokens.push(token);
+    }
+  }
+  return tokens.length > 0 ? tokens.join(ACCEPT_SEPARATOR) : null;
+}
+
+/// A card's in-flight `call` / `pick`, pinned to the `MessagePort` it was made
+/// on — i.e. to the tile GENERATION. An iframe that reloads (spec change) or is
+/// removed gets a fresh port, so a late result must be DROPPED rather than
+/// mis-delivered: it would resolve an unrelated promise in the new generation
+/// and then silently eat that generation's real answer. `pickBlob`'s
+/// minutes-long window makes the reload race routine, not rare.
+export type PendingRequest = {
+  cardId: string;
+  localId: number;
+  port: MessagePort | null;
+  kind: "call" | "pick";
+};
+
+export class PendingRegistry {
+  private entries = new Map<string, PendingRequest>();
+  private serial = 1;
+
+  /// Register a request and mint the id native answers with.
+  add(
+    cardId: string,
+    localId: number,
+    port: MessagePort | null,
+    kind: PendingRequest["kind"],
+  ): string {
+    const id = `${cardId}#${this.serial++}`;
+    this.entries.set(id, { cardId, localId, port, kind });
+    return id;
+  }
+
+  /// Take the entry for `id` — always removing it — and return it only if the
+  /// card's live port is still the one the request was made on.
+  claim(
+    id: string,
+    livePortFor: (cardId: string) => MessagePort | null,
+  ): PendingRequest | null {
+    const entry = this.entries.get(id);
+    if (entry === undefined) return null;
+    this.entries.delete(id);
+    const live = livePortFor(entry.cardId);
+    return live !== null && live === entry.port ? entry : null;
+  }
+
+  /// Drop every request for a card whose iframe is being torn down, so the map
+  /// can't leak and a late result can't resolve a dead generation.
+  purge(cardId: string): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.cardId === cardId) this.entries.delete(id);
+    }
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+}
+
 /// The card iframe's CSP: no network of any kind EXCEPT opaque blob-capability
 /// image GETs against the user's own gateway (the `baybo-transcript:` custom
 /// scheme, served by the app's own WKURLSchemeHandler — never a real socket).

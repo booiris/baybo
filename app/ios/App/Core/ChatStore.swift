@@ -56,7 +56,19 @@ final class ChatStore: ObservableObject {
     static let foregroundDebounce: Duration = .milliseconds(400)
     /// Matches the gateway's 100 MiB blob cap (`MAX_BLOB_BYTES`) so an
     /// over-size pick is rejected up front instead of failing after upload.
-    static let maxAttachmentBytes = 100 * 1024 * 1024
+    nonisolated static let maxAttachmentBytes = 100 * 1024 * 1024
+    /// How many picks the composer will stage on ONE message. A UI limit, not
+    /// a second copy of a wire cap: multi-select makes an accidental 200-file
+    /// pick one gesture away, and every staged item holds an upload, a
+    /// thumbnail and a strip tile. The gateway enforces its own per-message
+    /// attachment cap independently.
+    static let maxStagedAttachments = 10
+    /// How many staged picks upload at once; the rest queue. A ten-pick batch
+    /// fired off in parallel is ten sockets on one uplink AND ten 100ms
+    /// progress tickers hopping to the main actor — about a hundred composer
+    /// re-evaluations a second, which defeats the coalescing the tick interval
+    /// exists to provide.
+    static let maxConcurrentUploads = 2
     /// Ceiling on the offscreen frame buffer. A long agent turn on a
     /// backgrounded session streams every delta as a JSON string into
     /// `bufferedFrames`; past this the buffer is dropped and the transcript
@@ -99,7 +111,40 @@ final class ChatStore: ObservableObject {
     var legDownDelay: Duration = .seconds(4)
     private var legDownTask: Task<Void, Never>?
     /// Transient composer notice (send failed / waiting for upload / too large).
-    @Published var notice: String?
+    /// Its lifetime is the VISIT, not the writer's, and that is enforced on the
+    /// WRITE: a raise is dropped once `chatOpen` is false. Retracting always
+    /// lands — taking a line back can never strand one.
+    ///
+    /// `leaveChat`'s retraction alone could not hold this. Every raise but the
+    /// strip's comes from an unstructured `Task` that nothing cancels on leave —
+    /// an approval echo that times out seconds later, the pin line a send defers
+    /// to its tail, a queued model PUT — so each could land AFTER the retraction
+    /// ran; and this store stays cached resident (`AppStore`'s LRU), so the line
+    /// then stood in red over the composer on the next visit to the
+    /// conversation.
+    var notice: String? {
+        get { noticeLine }
+        set {
+            guard chatOpen || newValue == nil else { return }
+            noticeLine = newValue
+        }
+    }
+    @Published private var noticeLine: String?
+    /// Whether this conversation is the one the user is in — the property every
+    /// notice write consults. A store exists because a conversation is being
+    /// opened, so it starts true; `leaveChat` ends the visit; `attachBridge`
+    /// starts the next one (the single transcript webview is aimed at exactly
+    /// the conversation on screen, and `ChatScreen.onAppear` re-aims it through
+    /// `TranscriptBridge.retarget` on every entry).
+    private(set) var chatOpen = true
+    /// The composer's staged attachment strip. Owned by the SESSION, not by the
+    /// composer frame: `ChatScreen` docks the composer in a `.safeAreaInset`,
+    /// and every `fullScreenCover` it presents — the image viewer, the video
+    /// player — tears that inset down and puts it back. A strip whose lifetime
+    /// was the frame's therefore lost mid-upload picks to a tap on a transcript
+    /// image. What "the user actually left" means is `AppStore.chatPath`
+    /// (`leaveChat` below), exactly as it is for audio.
+    private(set) lazy var staging = ComposerStaging(store: self, client: client)
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
     /// A long-pressed attachment awaiting the system share sheet.
@@ -418,9 +463,37 @@ final class ChatStore: ObservableObject {
         await client.chatUnsubscribe(sessionId: sessionId)
     }
 
+    /// The user left this conversation: its `.session` route dropped off
+    /// `AppStore.chatPath`. Whatever was staged in the composer can never ride a
+    /// send from here again, so its work is cancelled and its spools reclaimed
+    /// (up to 100 MiB a pick, ten to a strip). A cover or a sheet OVER the chat
+    /// is emphatically NOT this — see `staging`. The visit closes FIRST, so
+    /// everything the teardown below stirs up can only retract a line, never
+    /// raise one.
+    func leaveChat() {
+        chatOpen = false
+        staging.clear()
+        retractNotice()
+    }
+
+    /// The dock's line dies with the VISIT, whoever raised it. The strip retracts
+    /// its own (`ComposerStaging.clear` above), but a model-pin, draft-pin, or
+    /// approval failure names no tile and so has nothing to take it back. This
+    /// only covers what is on the dock at the moment of leaving; everything that
+    /// lands after it is refused by the `chatOpen` gate on `notice` itself. The
+    /// guard is the one `ComposerView.send` documents — an unconditional write
+    /// publishes an `objectWillChange` even when already nil.
+    private func retractNotice() {
+        guard notice != nil else { return }
+        notice = nil
+    }
+
     // MARK: - Bridge lifecycle
 
     func attachBridge(_ bridge: TranscriptBridge) {
+        // The transcript is aimed here, so this conversation is the open one
+        // again — a resident store left on a previous visit may raise notices.
+        chatOpen = true
         self.bridge = bridge
         defer { flushPendingAnswers(to: bridge) }
         if needsSyncOnAttach {
@@ -497,8 +570,10 @@ final class ChatStore: ObservableObject {
     }
 
     #if DEBUG
-        func pushDemoUserSent(msgId: String, text: String) {
-            bridge?.userSent(msgId: msgId, text: text, attachments: [])
+        func pushDemoUserSent(
+            msgId: String, text: String, attachments: [AttachmentRef] = []
+        ) {
+            bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
         }
 
         func pushDemoFrame(_ frameJson: String) {
@@ -575,7 +650,8 @@ final class ChatStore: ObservableObject {
         Task {
             do {
                 try await ensureRemoteSession()
-                index.recordUserSend(sessionId: sessionId, text: text)
+                index.recordUserSend(
+                    sessionId: sessionId, text: text, attachments: attachments)
                 try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
             } catch {
                 // Queued, not failed: the outbox owns redelivery (see above). A

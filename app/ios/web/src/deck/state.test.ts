@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   CARD_CSP,
   DeckCard,
+  PendingRegistry,
   applyCardData,
   buildSrcdoc,
   cycleSize,
   layoutEntries,
+  normalizeAccept,
   reorderTo,
   parsePayload,
   replaceState,
@@ -143,6 +145,71 @@ describe("srcdoc composition", () => {
     // No network is reachable under this CSP even though sandbox alone
     // would allow a fire-and-forget fetch.
     expect(CARD_CSP).toContain("default-src 'none'");
+  });
+});
+
+describe("normalizeAccept", () => {
+  it("takes an array or a comma-separated string and canonicalizes both", () => {
+    expect(normalizeAccept(["image/*", "application/pdf"])).toBe("image/*,application/pdf");
+    // The pre-array authoring form keeps working.
+    expect(normalizeAccept("image/*,application/pdf")).toBe("image/*,application/pdf");
+    expect(normalizeAccept(" IMAGE/PNG , image/png ")).toBe("image/png");
+    expect(normalizeAccept("*/*")).toBe("*/*");
+  });
+
+  it("degrades anything unusable to null — the no-constraint (photo) floor", () => {
+    expect(normalizeAccept(undefined)).toBeNull();
+    expect(normalizeAccept(null)).toBeNull();
+    expect(normalizeAccept("")).toBeNull();
+    expect(normalizeAccept("nonsense")).toBeNull();
+    expect(normalizeAccept(["/", "x/", "/y", ""])).toBeNull();
+    expect(normalizeAccept({ accept: "image/*" })).toBeNull();
+    // A garbage member is dropped; the good ones survive.
+    expect(normalizeAccept(["image/*", "nonsense", 7])).toBe("image/*");
+  });
+});
+
+describe("PendingRegistry", () => {
+  const port = () => new MessageChannel().port1;
+
+  it("delivers a result only to the generation that asked", () => {
+    const registry = new PendingRegistry();
+    const live = port();
+    const id = registry.add("a", 1, live, "pick");
+    expect(registry.claim(id, () => live)?.localId).toBe(1);
+    expect(registry.size).toBe(0);
+  });
+
+  it("drops a result addressed to a reloaded or removed generation", () => {
+    const registry = new PendingRegistry();
+    const stale = port();
+    // A spec-change reload gives the tile a NEW port while the pick is open;
+    // the late answer must not resolve the new generation's promise.
+    const reloaded = registry.add("a", 1, stale, "pick");
+    expect(registry.claim(reloaded, () => port())).toBeNull();
+    // Tile gone entirely (removed card).
+    const removed = registry.add("a", 2, stale, "pick");
+    expect(registry.claim(removed, () => null)).toBeNull();
+    // Either way the entry is consumed — the map can't accumulate.
+    expect(registry.size).toBe(0);
+  });
+
+  it("mints distinct ids per card and purges a card's pending requests", () => {
+    const registry = new PendingRegistry();
+    const live = port();
+    const first = registry.add("a", 1, live, "call");
+    const second = registry.add("a", 2, live, "pick");
+    registry.add("b", 1, live, "pick");
+    expect(first).not.toBe(second);
+    registry.purge("a");
+    expect(registry.size).toBe(1);
+    expect(registry.claim(first, () => live)).toBeNull();
+    expect(registry.claim(second, () => live)).toBeNull();
+  });
+
+  it("ignores an unknown id", () => {
+    const registry = new PendingRegistry();
+    expect(registry.claim("a#99", () => port())).toBeNull();
   });
 });
 

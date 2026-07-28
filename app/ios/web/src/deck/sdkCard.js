@@ -27,6 +27,15 @@
     }
   }
 
+  // Coerce `pickBlob({accept})` to plain strings ONLY so the port's structured
+  // clone can't throw on an exotic value. The shell is the single normalizer —
+  // the token grammar and its validation live there, not in two places.
+  function acceptOf(opts) {
+    const raw = opts && opts.accept;
+    if (Array.isArray(raw)) return raw.map(String);
+    return raw == null ? null : String(raw);
+  }
+
   function flushQueued() {
     while (queuedCalls.length > 0) {
       port.postMessage(queuedCalls.shift());
@@ -126,23 +135,22 @@
         else queuedCalls.push(msg);
       });
     },
-    /// Ask the user to pick a photo (docs/modules/deck.md §Blobs). Resolves to
+    /// Ask the user to pick a file (docs/modules/deck.md §Blobs). Resolves to
     /// a blob ref `{blobId, contentType, size, name}` once the native picker
     /// uploads it — the bytes never cross into the card; pass `blobId` as a
     /// plain string into a following `deck.call(op, {blobId})` for the service
-    /// to consume, and/or `deck.blobUrl(ref)` to display it. Rejects on cancel
+    /// to consume, and/or `deck.blobUrl(ref)` to display it (images only —
+    /// the card CSP admits no other blob rendering). Rejects on cancel
     /// (`"cancelled"`), on another pick already in progress (`"busy"`), or on
-    /// an upload failure. `opts.accept` is advisory (v1 presents the photo
-    /// library). Every call settles exactly once.
+    /// an upload failure. `opts.accept` is a mime-glob list — a string
+    /// ("image/*", or comma-separated) or an array — and elects the picker:
+    /// all-image (or absent) opens the photo library, anything else the file
+    /// browser. Every call settles exactly once.
     pickBlob: function (opts) {
       return new Promise(function (resolve, reject) {
         const id = nextId++;
         pending.set(id, { resolve: resolve, reject: reject });
-        const msg = {
-          type: "pick",
-          id: id,
-          accept: opts && opts.accept ? String(opts.accept) : null,
-        };
+        const msg = { type: "pick", id: id, accept: acceptOf(opts) };
         if (port) port.postMessage(msg);
         else queuedCalls.push(msg);
       });

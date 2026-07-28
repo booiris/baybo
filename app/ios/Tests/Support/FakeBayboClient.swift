@@ -28,11 +28,24 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         let decision: ApprovalDecision
     }
 
+    struct DeckFileUpload: Equatable {
+        let path: String
+        let mimeType: String
+        let cardId: String
+    }
+
     struct SetModelCall: Equatable {
         let sessionId: String
         let llm: String?
         let model: String?
         let effort: String?
+    }
+
+    /// A composer upload (`ComposerStaging`). The path proves the bytes never
+    /// crossed the FFI — every staged pick streams off a file.
+    struct BlobUploadCall: Equatable {
+        let path: String
+        let mimeType: String
     }
 
     /// Everything the app never calls under test. Distinct prose so an
@@ -58,6 +71,14 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// pin must land between session creation and the first send), and the
     /// per-method arrays can't see across each other.
     private var callOrder: [String] = []
+
+    private var deckFileUploads: [DeckFileUpload] = []
+    private var deckFileUploadBlobId: String?
+
+    private var blobUploads: [BlobUploadCall] = []
+    private var blobUploadsHeld = false
+    private var blobUploadWaiters: [CheckedContinuation<Void, Never>] = []
+    private var blobUploadOutcome: Result<String, Error> = .success(FakeBayboClient.uploadedBlobId)
 
     private var apiLegInvalidations = 0
 
@@ -96,6 +117,17 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var setModelCalls: [SetModelCall] { lock.withLock { modelSets } }
     var modelReadSessions: [String] { lock.withLock { modelReads } }
     var callTimeline: [String] { lock.withLock { callOrder } }
+    /// Streaming deck picker uploads (`deck.pickBlob`'s file leg) — the path
+    /// proves the bytes never crossed the FFI, the card id proves the blob is
+    /// stamped `deck:<card>` and reclaimable at purge.
+    var deckFileUploadCalls: [DeckFileUpload] { lock.withLock { deckFileUploads } }
+    /// Composer uploads, in the order they reached the wire.
+    var blobUploadCalls: [BlobUploadCall] { lock.withLock { blobUploads } }
+    /// Composer uploads currently PARKED, i.e. the ones a one-at-a-time release
+    /// can actually finish. The call log records an upload the moment it
+    /// arrives, a beat before its continuation is registered — waiting on the
+    /// log and then releasing one can therefore release nothing at all.
+    var parkedBlobUploads: Int { lock.withLock { blobUploadWaiters.count } }
     /// How many times the app dropped its warm relay API legs — the `.background`
     /// barrier. iOS suspends without warning and takes the sockets with it, so a
     /// leg that outlives a suspend is a zombie.
@@ -120,6 +152,50 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     /// stranded draft's next recovery attempt succeeds.
     func succeedCreateSession() { lock.withLock { createSessionError = nil } }
     func failApproval(with error: Error) { lock.withLock { approvalError = error } }
+    /// Let the streaming deck upload succeed with `blobId` (it throws by
+    /// default, like every other unstubbed call).
+    func answerDeckFileUpload(with blobId: String) {
+        lock.withLock { deckFileUploadBlobId = blobId }
+    }
+
+    /// The blob a composer upload lands as, unless `releaseBlobUploads` names
+    /// another outcome.
+    static let uploadedBlobId = "sha256:staged.tok"
+
+    /// Park every composer upload until `releaseBlobUploads` — the window a
+    /// test needs to remove a tile while its bytes are on the wire.
+    /// Deliberately DEAF to cancellation, exactly like the real one: the
+    /// generated UniFFI async binding has no cancellation hook, so a cancelled
+    /// upload still runs to completion.
+    func holdBlobUploads() { lock.withLock { blobUploadsHeld = true } }
+
+    /// Finish every parked upload with `outcome`, and stop parking.
+    func releaseBlobUploads(
+        _ outcome: Result<String, Error> = .success(FakeBayboClient.uploadedBlobId)
+    ) {
+        let parked: [CheckedContinuation<Void, Never>] = lock.withLock {
+            blobUploadsHeld = false
+            blobUploadOutcome = outcome
+            let waiters = blobUploadWaiters
+            blobUploadWaiters.removeAll()
+            return waiters
+        }
+        for waiter in parked { waiter.resume() }
+    }
+
+    /// Finish the OLDEST parked upload and keep holding the rest. How many
+    /// picks a completion releases is the concurrency budget, and a blanket
+    /// release starts every queued one at once — which is precisely the bug it
+    /// would have to distinguish.
+    func releaseOneBlobUpload(
+        _ outcome: Result<String, Error> = .success(FakeBayboClient.uploadedBlobId)
+    ) {
+        let waiter: CheckedContinuation<Void, Never>? = lock.withLock {
+            blobUploadOutcome = outcome
+            return blobUploadWaiters.isEmpty ? nil : blobUploadWaiters.removeFirst()
+        }
+        waiter?.resume()
+    }
 
     func answerSync(with frameJson: String) {
         lock.withLock { syncOutcome = .success(frameJson) }
@@ -372,6 +448,38 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func deckBlobUploadBytes(bytes: Data, mimeType: String, cardId: String) async throws -> String {
         throw Self.unsupported
+    }
+
+    func blobUploadFile(path: String, mimeType: String, progress: BlobProgress?) async throws
+        -> String
+    {
+        let held: Bool = lock.withLock {
+            blobUploads.append(BlobUploadCall(path: path, mimeType: mimeType))
+            return blobUploadsHeld
+        }
+        if held {
+            await withCheckedContinuation { continuation in
+                // The release can land between the check above and here.
+                let alreadyReleased: Bool = lock.withLock {
+                    guard blobUploadsHeld else { return true }
+                    blobUploadWaiters.append(continuation)
+                    return false
+                }
+                if alreadyReleased { continuation.resume() }
+            }
+        }
+        return try lock.withLock { blobUploadOutcome }.get()
+    }
+
+    func deckBlobUploadFile(
+        path: String, mimeType: String, cardId: String, progress: BlobProgress?
+    ) async throws -> String {
+        let blobId = lock.withLock { () -> String? in
+            deckFileUploads.append(DeckFileUpload(path: path, mimeType: mimeType, cardId: cardId))
+            return deckFileUploadBlobId
+        }
+        guard let blobId else { throw Self.unsupported }
+        return blobId
     }
 
     func directLogin(baseUrl: String, token: String) async throws -> String {

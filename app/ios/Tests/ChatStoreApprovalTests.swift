@@ -142,6 +142,53 @@ struct ChatStoreApprovalTests {
         #expect(store.pendingApprovals.isEmpty)
     }
 
+    /// And the line leaves with the conversation. It names no staged tile, so
+    /// the composer's strip cannot retract it, and this store stays cached
+    /// resident (`AppStore`'s LRU) — until the store took its own line back,
+    /// "Could not send the decision" stood over the composer on the next visit.
+    @Test func theLostDecisionsNoticeLeavesWithTheChat() async {
+        client.failApproval(with: BayboError.Other(message: "leg is down"))
+        #expect(await connect())
+        deliver(Self.requestedFrame)
+        #expect(await waitUntil { store.pendingApprovals.count == 1 })
+
+        guard let card = store.pendingApprovals.first else {
+            Issue.record("a prompt must be pending")
+            return
+        }
+        store.resolveApproval(card, decision: .deny)
+        #expect(await waitUntil { store.notice != nil })
+
+        store.leaveChat()
+
+        #expect(store.notice == nil)
+    }
+
+    /// And the half retraction cannot reach: the card dismisses optimistically,
+    /// the user backs out, and the echo fails SECONDS LATER — `leaveChat` had
+    /// already taken back everything on the dock and nothing cancels the Task,
+    /// so the line landed on a conversation the user had left and was there in
+    /// red on the next visit. The echo is dispatched before the leave and lands
+    /// after it, which is the race itself; asserting only that the call reached
+    /// the leg is what proves the catch ran at all.
+    @Test func aDecisionThatFailsAfterTheUserLeftRaisesNoLine() async {
+        client.failApproval(with: BayboError.Other(message: "leg is down"))
+        #expect(await connect())
+        deliver(Self.requestedFrame)
+        #expect(await waitUntil { store.pendingApprovals.count == 1 })
+
+        guard let card = store.pendingApprovals.first else {
+            Issue.record("a prompt must be pending")
+            return
+        }
+        store.resolveApproval(card, decision: .deny)
+        store.leaveChat()
+
+        #expect(await waitUntil { !client.approvalCalls.isEmpty }, "the echo still goes out")
+        try? await Task.sleep(for: Self.negativeTimeout)
+        #expect(store.notice == nil, "a line raised after the leave is refused, not stranded")
+    }
+
     /// The offscreen buffer is the WEBVIEW's replay queue; overflowing it drops
     /// frames. The approval observer runs AHEAD of that bail on purpose — a
     /// `sync_page` carries rows, not pending prompts, so a card dropped with the

@@ -32,7 +32,7 @@ struct ModelMenuPanel: View {
         ZStack(alignment: .topLeading) {
             // A whisper of dim doubles as the outside-tap dismiss surface; it
             // must swallow scrolls so the transcript can't move underneath.
-            Color.black.opacity(0.06)
+            Theme.panelScrim
                 .ignoresSafeArea()
                 .onTapGesture { close() }
                 .transition(.opacity)
