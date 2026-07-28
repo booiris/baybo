@@ -22,12 +22,25 @@ pub struct AgentConfig {
     /// root session, surfacing as
     /// `ToolError::SubagentFanoutExceeded`. Independent of depth.
     pub max_subagents_per_root: u32,
-    /// Maps coarse `ModelTier` (Fast / Balanced / Deep) to a concrete
-    /// `llm[*].name`. Consumed by `spawn_subagent`'s tier resolution
-    /// when neither the call's explicit `llm` override nor the
-    /// profile's default supplies a name. Unmapped tiers fall through
-    /// to the pool's `default-llm` with a `warn!` so operator misconfig
-    /// is visible.
+    /// Maps coarse `ModelTier` (Lite / Balanced / Deep) to a concrete
+    /// `llm[*].name`. Two consumers:
+    ///
+    /// - `spawn_subagent`'s tier resolution, when neither the call's
+    ///   explicit `llm` override nor the profile's default supplies a
+    ///   name. Unmapped tiers fall through to the pool's `default-llm`
+    ///   with a `warn!` so operator misconfig is visible.
+    /// - `LlmClientPool::resolve_lite`, which uses the **`Lite`** entry as
+    ///   the fallback for auxiliary LLM calls (the Bash risk judges,
+    ///   WebFetch's page summary, title generation) when the resolved
+    ///   entry declares no `lite_model` of its own.
+    ///
+    /// So re-pointing `lite` moves both the cheap subagent tier and the
+    /// auxiliary calls. An operator who wants them apart sets a per-entry
+    /// `lite_model`, which outranks this map.
+    ///
+    /// The `fast` key is the pre-rename spelling of `lite` and still
+    /// deserializes — these are enum-typed map keys, so dropping the alias
+    /// would turn an older `baybo.json` into a load failure.
     pub model_tiers: HashMap<ModelTier, LlmEntryName>,
 }
 
