@@ -3270,13 +3270,13 @@ function HideSessionModal({
       onClick={onCancel}
     >
       <div
-        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 px-6 py-4 border-b-2 border-black">
           <h3 className="font-bold uppercase tracking-wider">Remove conversation</h3>
         </header>
-        <div className="px-6 py-4 space-y-3">
+        <div className="px-6 py-4 space-y-3 overflow-y-auto min-h-0">
           <p className="text-[0.95rem] leading-relaxed">
             Remove this conversation from your list?
           </p>
@@ -3286,7 +3286,7 @@ function HideSessionModal({
             </div>
           ) : null}
         </div>
-        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+        <footer className="shrink-0 flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
           <button
             type="button"
             onClick={onCancel}

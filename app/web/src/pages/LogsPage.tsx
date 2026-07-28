@@ -461,10 +461,10 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
       onClick={onClose}
     >
       <div
-        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b-2 border-black">
           <div className="flex items-center gap-3 min-w-0">
             <span
               className={`inline-flex items-center px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs shrink-0 ${className}`}
@@ -481,7 +481,7 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
             Close
           </button>
         </header>
-        <div className="px-6 py-4 space-y-4">
+        <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
           <div className="text-ink-soft text-[0.85rem] font-mono">
             {date} {time}
           </div>

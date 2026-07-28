@@ -560,17 +560,17 @@ function EditLlmModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6 overflow-y-auto"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
       role="dialog"
       aria-modal="true"
       onClick={onClose}
     >
       <form
-        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal my-8"
+        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
         onSubmit={handleSubmit}
       >
-        <header className="flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
           <h3 className="font-bold uppercase tracking-wider min-w-0 break-all">Edit LLM · {entry.name}</h3>
           <button
             type="button"
@@ -581,7 +581,7 @@ function EditLlmModal({
           </button>
         </header>
 
-        <div className="px-6 py-4 space-y-5">
+        <div className="px-6 py-4 space-y-5 overflow-y-auto min-h-0">
           <p className="text-[0.85rem] text-ink-soft bg-yellow-50 border-2 border-black px-3 py-2 rounded">
             Edits persist to <code>baybo.json</code> immediately. Most fields take effect only after a
             gateway restart — the active runtime keeps its current configuration until then.
@@ -719,7 +719,7 @@ function EditLlmModal({
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+        <footer className="shrink-0 flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
           <Button
             type="button"
             onClick={onClose}
