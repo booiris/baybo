@@ -1,4 +1,4 @@
-//! In-memory `SessionStore` / `SessionSummaryStore` for downstream tests.
+//! In-memory `SessionStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so they never ship in
 //! release builds. Live in `baybo-session` (next to the traits they
@@ -18,7 +18,6 @@ use parking_lot::Mutex;
 use baybo_store::StorageError;
 use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
-use baybo_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
 /// the sqlite layout closely enough that `apply_session_compaction`
@@ -630,26 +629,6 @@ impl SessionStore for MemorySessionStore {
             .unwrap_or(0))
     }
 
-    async fn load_active_session_messages_up_to(
-        &self,
-        session_id: &SessionId,
-        up_to_ordinal: i64,
-    ) -> Result<Vec<ChatMessage>> {
-        Ok(self
-            .transcripts
-            .lock()
-            .get(session_id)
-            .map(|log| {
-                let mut active: Vec<&StoredMessageRow> = log
-                    .iter()
-                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) <= up_to_ordinal)
-                    .collect();
-                active.sort_by_key(|m| m.ordinal);
-                active.into_iter().map(|m| m.message.clone()).collect()
-            })
-            .unwrap_or_default())
-    }
-
     async fn load_active_session_messages_tail(
         &self,
         session_id: &SessionId,
@@ -747,118 +726,6 @@ impl SessionStore for MemorySessionStore {
                 .max_by_key(|m| m.ordinal)
                 .map(|m| m.ordinal as i64)
         }))
-    }
-}
-
-/// In-memory `SessionSummaryStore` for tests across the workspace.
-/// Mirrors the sqlite backend's behaviour for the trait surface
-/// (`upsert_success` resets `error_count`, `bump_error_count` inserts
-/// a zero row when missing) so unit tests can assert against the same
-/// invariants production exercises.
-#[derive(Default)]
-pub struct MemorySessionSummaryStore {
-    rows: Mutex<HashMap<SessionId, SessionSummaryRow>>,
-}
-
-impl MemorySessionSummaryStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl SessionSummaryStore for MemorySessionSummaryStore {
-    async fn get(&self, session_id: &SessionId) -> Result<Option<SessionSummaryRow>> {
-        Ok(self.rows.lock().get(session_id).cloned())
-    }
-
-    async fn upsert_success(
-        &self,
-        session_id: &SessionId,
-        cursor: i64,
-        cost_micros_delta: i64,
-        model_id: &str,
-        span_id: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut guard = self.rows.lock();
-        let entry = guard
-            .entry(session_id.clone())
-            .or_insert_with(|| SessionSummaryRow {
-                session_id: session_id.clone(),
-                cursor: 0,
-                pass_count: 0,
-                updated_at,
-                cost_micros: 0,
-                model_id: String::new(),
-                span_id: String::new(),
-                error_count: 0,
-            });
-        // Monotonic, matching the sqlite store's `MAX(...)`: a late-landing
-        // pass must not drag the cursor back onto an ordinal a compaction
-        // already superseded.
-        entry.cursor = entry.cursor.max(cursor);
-        entry.pass_count += 1;
-        entry.cost_micros += cost_micros_delta;
-        entry.model_id = model_id.to_string();
-        entry.span_id = span_id.to_string();
-        entry.updated_at = updated_at;
-        entry.error_count = 0;
-        Ok(())
-    }
-
-    async fn repoint_cursor(
-        &self,
-        session_id: &SessionId,
-        cursor: i64,
-        updated_at: DateTime<Utc>,
-    ) -> Result<bool> {
-        let mut guard = self.rows.lock();
-        match guard.get_mut(session_id) {
-            Some(entry) => {
-                entry.cursor = cursor;
-                entry.updated_at = updated_at;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn bump_error_count(
-        &self,
-        session_id: &SessionId,
-        cost_micros_delta: i64,
-        model_id: &str,
-        span_id: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut guard = self.rows.lock();
-        let entry = guard
-            .entry(session_id.clone())
-            .or_insert_with(|| SessionSummaryRow {
-                session_id: session_id.clone(),
-                cursor: 0,
-                pass_count: 0,
-                updated_at,
-                cost_micros: 0,
-                model_id: String::new(),
-                span_id: String::new(),
-                error_count: 0,
-            });
-        entry.error_count += 1;
-        entry.cost_micros += cost_micros_delta;
-        entry.model_id = model_id.to_string();
-        entry.span_id = span_id.to_string();
-        entry.updated_at = updated_at;
-        Ok(())
-    }
-
-    async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        Ok(self.rows.lock().remove(session_id).is_some())
-    }
-
-    async fn list_session_ids(&self) -> Result<Vec<SessionId>> {
-        Ok(self.rows.lock().keys().cloned().collect())
     }
 }
 

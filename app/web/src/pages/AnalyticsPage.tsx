@@ -349,7 +349,7 @@ export function AnalyticsPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       )}
@@ -489,7 +489,7 @@ export function AnalyticsPage() {
 
           <div className="mb-8">
             <SectionTitle icon={RiHistoryLine} title="Last 7 Days Detail" />
-            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden">
+            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-x-auto">
               <table className="w-full border-separate border-spacing-0">
                 <thead>
                   <tr>
@@ -534,7 +534,7 @@ export function AnalyticsPage() {
 
           <div className="mb-10">
             <SectionTitle icon={RiCpuLine} title="Per-Model Breakdown" />
-            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden">
+            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-x-auto">
               <table className="w-full border-separate border-spacing-0">
                 <thead>
                   <tr>
@@ -557,7 +557,7 @@ export function AnalyticsPage() {
                   {data.by_model.map((m) => (
                     <tr key={m.model} className="hover:bg-gray-50">
                       <td className={tdCell}>
-                        <span className="font-bold">{m.model}</span>
+                        <span className="font-bold break-all">{m.model}</span>
                       </td>
                       <td className={`${tdCell} text-right`}>{m.call_count.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(totalInput(m))}</td>
@@ -581,7 +581,7 @@ export function AnalyticsPage() {
 
           <div className="mb-10">
             <SectionTitle icon={RiPriceTag3Line} title="Per-Reason Breakdown" />
-            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden">
+            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-x-auto">
               <table className="w-full border-separate border-spacing-0">
                 <thead>
                   <tr>

@@ -66,10 +66,13 @@ safe.
 
 - Sandbox-related and safe: rerun the same command outside the OS sandbox
   automatically.
-- Any other verdict — sandbox-related but risky, not sandbox-related, or the
-  judge is unavailable: ask for approval before the unsandboxed retry. On
-  approval it reruns unsandboxed; on denial the original sandboxed failure is
-  returned.
+- Sandbox-related but risky, or the judge is unavailable: ask for approval
+  before the unsandboxed retry. On approval it reruns unsandboxed; on denial the
+  original sandboxed failure is returned.
+- Not sandbox-related — a compile error, a failing test, a network error, a
+  deliberate non-zero exit: return the failure untouched, with no prompt. The
+  escape prompt grants full host access, so it must not fire on failures the
+  sandbox had no part in; that would reduce it to a reflex click.
 - No approval handle for a verdict that needs one, such as cron or an
   unattended nested run: return the original sandboxed failure.
 

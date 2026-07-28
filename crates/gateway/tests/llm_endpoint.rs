@@ -109,13 +109,10 @@ fn entry(name: &str, provider: &str, model: &str) -> LlmEntry {
         name: name.into(),
         provider: provider.into(),
         model: model.into(),
-        model_candidates: Vec::new(),
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env: None,
         base_url: None,
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort: None,
     }
 }
@@ -170,7 +167,11 @@ async fn list_models_returns_default_and_effective_fields() {
     // must mirror it; a snapshot hit will only widen the value.
     assert!(primary["effective_context_window"].as_u64().unwrap() >= 128_000);
     assert_eq!(primary["effective_supports_vision"], true);
-    assert_eq!(primary["context_window_override"], Value::Null);
+    // `model_list` always contains the entry's default model, even when
+    // the operator never wrote the key.
+    let models = primary["model_list"].as_array().expect("model_list array");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["model"], "gpt-4o");
 
     let secondary = &items[1];
     assert_eq!(secondary["name"], "secondary");
@@ -179,8 +180,11 @@ async fn list_models_returns_default_and_effective_fields() {
 
 // ── update_model ─────────────────────────────────────────────────────
 
+/// The per-model facts are addressed through the entry, but land on the
+/// entry's default model inside `model_list` — that is where the runtime
+/// reads them from when it builds that model's client.
 #[tokio::test]
-async fn update_model_persists_overrides_to_disk() {
+async fn update_model_persists_overrides_onto_the_default_model_spec() {
     let (router, _dir, path) = router_with_seed_config(seed_two_entries()).await;
     let body = json!({
         "context_window": 64_000,
@@ -207,9 +211,12 @@ async fn update_model_persists_overrides_to_disk() {
 
     let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     let primary = on_disk.llm_entry("primary").expect("primary present");
-    assert_eq!(primary.context_window, Some(64_000));
-    assert_eq!(primary.supports_vision, Some(false));
-    let pricing = primary.pricing.expect("pricing override saved");
+    // The default model was not previously listed, so the write
+    // materialised its spec at the front of `model_list`.
+    let spec = primary.spec_for(&primary.model).expect("default spec");
+    assert_eq!(spec.context_window, Some(64_000));
+    assert_eq!(spec.supports_vision, Some(false));
+    let pricing = spec.pricing.expect("pricing override saved");
     assert_eq!(
         pricing.input_per_1m_tokens,
         Some(MicroUsd::from_micros(2_500_000))
@@ -219,6 +226,9 @@ async fn update_model_persists_overrides_to_disk() {
         Some(MicroUsd::from_micros(10_000_000))
     );
     assert!(pricing.cached_input_per_1m_tokens.is_none());
+    // …and only the default model's spec — the write must not leak onto
+    // the entry's other models.
+    assert_eq!(primary.model_list.len(), 1);
 }
 
 #[tokio::test]
@@ -227,8 +237,9 @@ async fn update_model_clears_override_on_explicit_null() {
     // `null` clears them. `Option<Option<T>>` is the only way the
     // backend can tell "absent (keep)" from "present-as-null (clear)".
     let mut seed = seed_two_entries();
-    seed.llm[0].context_window = Some(64_000);
-    seed.llm[0].supports_vision = Some(false);
+    let spec = seed.llm[0].default_spec_mut();
+    spec.context_window = Some(64_000);
+    spec.supports_vision = Some(false);
 
     let (router, _dir, path) = router_with_seed_config(seed).await;
     let body = json!({
@@ -247,8 +258,9 @@ async fn update_model_clears_override_on_explicit_null() {
     assert_eq!(status, StatusCode::OK);
     let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     let primary = on_disk.llm_entry("primary").expect("primary present");
-    assert_eq!(primary.context_window, None);
-    assert_eq!(primary.supports_vision, None);
+    let spec = primary.spec_for(&primary.model).expect("default spec");
+    assert_eq!(spec.context_window, None);
+    assert_eq!(spec.supports_vision, None);
 }
 
 #[tokio::test]
@@ -266,7 +278,13 @@ async fn update_model_rejects_zero_context_window() {
     let (status, _) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
-    assert_eq!(on_disk.llm_entry("primary").unwrap().context_window, None);
+    let primary = on_disk.llm_entry("primary").unwrap();
+    assert_eq!(
+        primary
+            .spec_for(&primary.model)
+            .and_then(|s| s.context_window),
+        None
+    );
 }
 
 #[tokio::test]

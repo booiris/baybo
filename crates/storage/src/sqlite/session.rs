@@ -1021,30 +1021,6 @@ impl SessionStore for SqliteSessionStore {
         Ok(count as usize)
     }
 
-    async fn load_active_session_messages_up_to(
-        &self,
-        session_id: &SessionId,
-        up_to_ordinal: i64,
-    ) -> Result<Vec<ChatMessage>> {
-        let sid = session_id.as_str().to_string();
-        let rows = self
-            .pool
-            .interact("sessions.load_active_session_messages_up_to", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT role, content, source, platform_msg_id FROM session_messages \
-                     WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
-                     ORDER BY ordinal",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid, up_to_ordinal], read_message_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await?;
-
-        rows.into_iter().map(decode_message_row).collect()
-    }
-
     async fn load_active_session_messages_tail(
         &self,
         session_id: &SessionId,

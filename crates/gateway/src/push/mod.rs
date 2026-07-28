@@ -3,7 +3,8 @@
 //! Subscribes to the `JobLifecycle` broadcast bus and, for each
 //! **successfully-completed real user turn** (`phase == Completed`,
 //! `kind == UserChat` — which excludes Cron / Compact / Spawned /
-//! SubagentNotification), encrypts a short preview **per approved device**
+//! SubagentNotification) **on the `owner` chat pool**, encrypts a short
+//! preview **per approved device**
 //! with that device's push key and POSTs the opaque ciphertext to the remote
 //! host (C). A encrypts, C relays blind, the iOS NSE decrypts — so the preview
 //! is real on the lock screen while C and Apple see only ciphertext.
@@ -13,6 +14,13 @@
 //! dispatcher reads exactly that row (no read-after-write poll). A completion
 //! with no ordinal — a non-message output, or a reply whose store write failed
 //! — has no durable row to preview, so it is **not pushed** at all.
+//!
+//! The `owner` scope is not a preference: a push names its session so the app
+//! can deep-link the tap, and every chat read is scoped to that pool, so a
+//! session on `tui` or a Multiplexed channel answers `NotFound`. Pushing those
+//! buzzed a phone about a conversation it could not open — and about work the
+//! user was already watching on the surface that started it. See
+//! [`PushDispatcher::is_pushable_session`].
 //!
 //! Modeled on `spawn_turn_state_projector`: subscribe synchronously, then a
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
@@ -492,6 +500,19 @@ impl PushDispatcher {
             .map(Arc::clone)
     }
 
+    /// True iff a push naming this session would land somewhere the app can
+    /// actually open.
+    ///
+    /// Every chat read is scoped to the `owner` pool — a session on `tui` or
+    /// on a Multiplexed channel (Telegram/WeChat) answers `NotFound` from
+    /// [`crate::api::admin::chat`], deliberately. A notification for one of
+    /// those deep-links into a 404, and buzzes a phone about a conversation
+    /// the user is already holding somewhere else. Scoped off the chat API's
+    /// own channel so the two cannot drift.
+    fn is_pushable_session(session: &baybo_model::Session) -> bool {
+        session.channel == crate::api::admin::chat::chat_list_channel(None)
+    }
+
     /// True iff this terminal event might buzz a phone: a successfully-
     /// completed turn whose reply a user is meant to read.
     ///
@@ -556,6 +577,14 @@ impl PushDispatcher {
                 return;
             }
         };
+        if !Self::is_pushable_session(&session) {
+            tracing::debug!(
+                session = %ev.session_id,
+                channel = %session.channel,
+                "push: session is off the owner chat pool; the app cannot open it, not pushing"
+            );
+            return;
+        }
         // A one-shot fire's session is a private workspace: its reply is
         // delivered into the conversation that scheduled it, and *that*
         // delivery pushes (as a `CronNotification`). Pushing here as well would
@@ -658,6 +687,15 @@ impl PushDispatcher {
                 return;
             }
         };
+        if !Self::is_pushable_session(&session) {
+            tracing::debug!(
+                session = %push.session_id,
+                channel = %session.channel,
+                "push: approval prompt is off the owner chat pool; the surface that \
+                 raised it owns the answer, not pushing"
+            );
+            return;
+        }
         // A one-shot cron fire's workspace is not a conversation the app can
         // open, so a notification deep-linking into it would be a dead end.
         if crate::api::admin::chat::is_hidden_cron_session(&session) {
@@ -1178,6 +1216,51 @@ mod tests {
         }
     }
 
+    fn session_on(channel: baybo_model::ChannelType) -> baybo_model::Session {
+        let now = chrono::Utc::now();
+        let id = SessionId::from("s1");
+        baybo_model::Session {
+            id: id.clone(),
+            user: baybo_model::User {
+                id: "u1".to_owned(),
+                name: None,
+                channel: channel.clone(),
+            },
+            channel,
+            created_at: now,
+            last_active: now,
+            state: Default::default(),
+            root_session_id: id,
+            trigger: baybo_model::TriggerSource::User,
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        }
+    }
+
+    /// A push names a session the app opens by id, and every chat read is
+    /// scoped to the `owner` pool — so a `tui` or Telegram session would
+    /// deep-link into a `NotFound`. Locks the push gate to the same scope the
+    /// chat API enforces.
+    #[test]
+    fn only_owner_pool_sessions_are_worth_a_push() {
+        assert!(PushDispatcher::is_pushable_session(&session_on(
+            baybo_model::ChannelType::owner()
+        )));
+        for off_pool in [
+            baybo_model::ChannelType::tui(),
+            baybo_model::ChannelType::telegram(),
+        ] {
+            assert!(
+                !PushDispatcher::is_pushable_session(&session_on(off_pool.clone())),
+                "{off_pool} is not reachable from the app and must not buzz a phone",
+            );
+        }
+    }
+
     #[test]
     fn dispatches_only_completed_turns_a_user_is_meant_to_read() {
         // The three buzzing cases: a real user turn, a cron fire (confirmed to
@@ -1440,7 +1523,6 @@ mod tests {
             .expect("open store");
         let session_manager = Arc::new(SessionManager::new(
             stores.session.clone(),
-            stores.session_summary.clone(),
             stores.session_folder.clone(),
         ));
         let vault = Arc::new(baybo_security::SecretVault::new(

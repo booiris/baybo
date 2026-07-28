@@ -17,7 +17,7 @@ the descriptions, and the list re-injected into the model's context as a
 throttled periodic reminder (a nudge once the model has ignored task management
 for a while) rather than on every turn.
 
-The layering follows the `session_summaries` precedent:
+The layering follows the store/storage split the rest of the schema uses:
 
 - **`baybo-model`** — the value types (`Task`, `TaskStatus`, `TaskId`) plus the
   tool-name consts (`TASK_CREATE_TOOL_NAME`, …, `TASK_MUTATING_TOOL_NAMES`).

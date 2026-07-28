@@ -1935,36 +1935,41 @@ export interface components {
             api_key_configured: boolean;
             api_key_env?: string | null;
             base_url?: string | null;
-            /** @description Operator override for `context_window`. `None` = factory default. */
+            /**
+             * @description The default model's `context_window` override. `None` = factory
+             *     default.
+             */
             context_window_override?: number | null;
             /**
-             * @description Effective `context_window` that the runtime would observe given
-             *     the current overrides and snapshot/factory defaults.
+             * @description Effective `context_window` of the entry's **default** model, given
+             *     its overrides and the snapshot/factory defaults.
              */
             effective_context_window: number;
-            /** @description Effective pricing. */
+            /** @description Effective pricing of the entry's default model. */
             effective_pricing: components["schemas"]["LlmModelPricingDto"];
-            /** @description Effective vision flag. */
+            /** @description Effective vision flag of the entry's default model. */
             effective_supports_vision: boolean;
             is_default: boolean;
             /**
-             * @description Cheaper/faster model for lightweight auxiliary calls — reserved, no
-             *     runtime path consumes it yet. `None` when unconfigured.
+             * @description Cheaper/faster model this entry uses for lightweight auxiliary
+             *     calls. Names one of `model_list`. `None` when unconfigured.
              */
             lite_model?: string | null;
             model: string;
             /**
-             * @description Extra model ids this entry can serve (same provider + credentials).
-             *     A session can be pinned to any of `[model] + model_candidates`; the
-             *     chat header picker lists them under the entry. Empty for an entry
-             *     that offers only its default `model`.
+             * @description Every model this entry serves, in picker order, each with its own
+             *     overrides. Always contains `model`. Read-only here.
              */
-            model_candidates?: string[];
+            model_list?: components["schemas"]["LlmModelSpecDto"][];
             name: string;
             pricing_override?: null | components["schemas"]["LlmPricingOverrideDto"];
             provider: string;
             reasoning_effort?: string | null;
-            /** @description Operator override for `supports_vision`. `None` = factory default. */
+            /**
+             * @description The **default** model's `supports_vision` override. `None` =
+             *     factory default. Mirrors `model_list[default].supports_vision`;
+             *     overrides for the entry's other models are file-edited only.
+             */
             supports_vision_override?: boolean | null;
         };
         /**
@@ -1980,6 +1985,17 @@ export interface components {
             input_per_1m_tokens: number;
             /** Format: int64 */
             output_per_1m_tokens: number;
+        };
+        /**
+         * @description One model an entry serves, with the operator's per-model overrides.
+         *     Read-only mirror of `baybo_config::LlmModelSpec` — `model_list` is
+         *     edited in `baybo.json`, not through this API.
+         */
+        LlmModelSpecDto: {
+            context_window?: number | null;
+            model: string;
+            pricing?: null | components["schemas"]["LlmPricingOverrideDto"];
+            supports_vision?: boolean | null;
         };
         /**
          * @description `POST /v1/llm/models/{name}/test` response. Carries the latency and
@@ -2412,7 +2428,7 @@ export interface components {
             api_key_env?: string | null;
             /** @description Custom base URL or `null` to clear. */
             base_url?: string | null;
-            /** @description `context_window` override, or `null` to clear. */
+            /** @description `context_window` override for the default model, or `null` to clear. */
             context_window?: number | null;
             /** @description Set the model id (e.g. `"gpt-4o"`). Requires gateway restart. */
             model?: string | null;
@@ -2421,7 +2437,11 @@ export interface components {
             provider?: string | null;
             /** @description Reasoning-effort override, or `null` to clear. */
             reasoning_effort?: string | null;
-            /** @description `supports_vision` override, or `null` to clear. */
+            /**
+             * @description `supports_vision` override for the entry's **default** model, or
+             *     `null` to clear. Lands in that model's `model_list` spec; the
+             *     entry's other models are file-edited only.
+             */
             supports_vision?: boolean | null;
         };
         /**

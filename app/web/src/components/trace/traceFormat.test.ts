@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import type { LlmCallResult, Span, Step, StepKind } from '../../types/trace';
-import { compressionTokens, stepSummaryText } from './traceFormat';
+import type {
+  ChatMessage,
+  JobTrace,
+  LlmCallResult,
+  ReplayStep,
+  Span,
+  Step,
+  StepKind,
+} from '../../types/trace';
+import { compressionTokens, jobInputText, jobOutputText, stepSummaryText } from './traceFormat';
 
 const T0 = '2026-01-01T00:00:00.000Z';
 const T1 = '2026-01-01T00:00:01.000Z';
@@ -68,20 +76,20 @@ describe('stepSummaryText — compression', () => {
       ),
     ).toBe('threshold · live summary · 21,080 → 260 tokens');
     expect(
-      stepSummaryText(step({ kind: 'compression', trigger: 'background' }), [llmSpan(result)]),
-    ).toBe('background · 21,080 → 260 tokens');
+      stepSummaryText(step({ kind: 'compression', trigger: 'forced' }), [llmSpan(result)]),
+    ).toBe('forced · 21,080 → 260 tokens');
   });
 
   it('still describes a compaction that made no LLM call', () => {
-    // The threshold trim that swaps in `summary.md` has no span and no token
-    // figures, but it is the moment the input context changed — a bare
-    // "compression" would say nothing about the one row that matters most.
+    // The truncate fallback has no span and no token figures, but it is the
+    // compaction that discarded the most — a bare "compression" would say
+    // nothing about the one row that matters most.
     expect(
       stepSummaryText(
-        step({ kind: 'compression', trigger: 'threshold', applied: 'stored_summary' }),
+        step({ kind: 'compression', trigger: 'threshold', applied: 'truncate' }),
         [],
       ),
-    ).toBe('threshold · stored summary');
+    ).toBe('threshold · truncate');
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'forced', applied: 'truncate' }), []),
     ).toBe('forced · truncate');
@@ -95,5 +103,99 @@ describe('stepSummaryText — compression', () => {
 
   it('falls back only when a legacy row says nothing at all', () => {
     expect(stepSummaryText(step({ kind: 'compression' }), [])).toBe('compression');
+  });
+});
+
+describe('jobInputText / jobOutputText — meta steps riding the turn', () => {
+  const TITLE_PROMPT =
+    'You are titling a brand-new conversation from the user\'s first message.\n\nUser\'s first message:\n<user_message>\nwhat broke the build?\n</user_message>';
+
+  function userMsg(text: string): ChatMessage {
+    return { role: 'user', content: [{ Text: text }], source: 'user' };
+  }
+
+  function inlineLlmSpan(id: string, messages: ChatMessage[], output: string): Span {
+    return {
+      id,
+      step_id: `step-${id}`,
+      kind: {
+        kind: 'llm_call',
+        begin: { model_id: 'm', provider: 'p', provider_config_hash: 'h', input_messages: messages },
+        result: { output_content: output },
+      },
+      parallel_group: null,
+      started_at: T0,
+      ended_at: T1,
+      outcome: { outcome: 'ok' },
+    };
+  }
+
+  function replayStep(id: string, kind: StepKind, spans: Span[]): ReplayStep {
+    return {
+      step: { id, job_id: 'job-1', kind, started_at: T0, ended_at: T1, outcome: { outcome: 'ok' } },
+      spans,
+    };
+  }
+
+  function trace(steps: ReplayStep[]): JobTrace {
+    return { job_id: 'job-1', session_id: 'sess-1', job_status_kind: 'completed', steps };
+  }
+
+  // The title pass is spawned before the turn's first iteration, so its step
+  // sorts first — reading "the job's first LLM span" showed the prompt template
+  // in the job list and the job-summary panel instead of the actual question.
+  it('skips a leading title_generation step and reads the real question', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'title_generation' }, [
+        inlineLlmSpan('a', [userMsg(TITLE_PROMPT)], 'Build failure triage'),
+      ]),
+      replayStep('s1', { kind: 'llm_iteration' }, [
+        inlineLlmSpan('b', [userMsg('what broke the build?')], 'The lint job failed.'),
+      ]),
+    ]);
+    expect(jobInputText(t, [])).toBe('what broke the build?');
+    expect(jobOutputText(t)).toBe('The lint job failed.');
+  });
+
+  // The observer and a compaction land AFTER the reply, so the trailing-span
+  // read surfaced a progress notice / summary as the job's answer.
+  it('skips trailing progress_observer and compression steps for the output', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'llm_iteration' }, [
+        inlineLlmSpan('a', [userMsg('what broke the build?')], 'The lint job failed.'),
+      ]),
+      replayStep('s1', { kind: 'progress_observer' }, [
+        inlineLlmSpan('b', [userMsg('summarize progress')], 'Still checking CI…'),
+      ]),
+      replayStep('s2', { kind: 'compression', trigger: 'threshold', applied: 'live_summary' }, [
+        inlineLlmSpan('c', [userMsg('summarize the transcript')], 'Earlier: CI triage.'),
+      ]),
+    ]);
+    expect(jobInputText(t, [])).toBe('what broke the build?');
+    expect(jobOutputText(t)).toBe('The lint job failed.');
+  });
+
+  // A standalone `/compact` has no agent-loop step at all — its compaction is
+  // the only thing the job did, so it still gets shown rather than blanked.
+  it('falls back to the job own work when there is no llm_iteration', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'compression', trigger: 'forced' }, [
+        inlineLlmSpan('a', [userMsg('summarize the transcript')], 'Earlier: CI triage.'),
+      ]),
+    ]);
+    expect(jobInputText(t, [])).toBe('summarize the transcript');
+    expect(jobOutputText(t)).toBe('Earlier: CI triage.');
+  });
+
+  // A turn that died before recording an iteration leaves the title step alone
+  // in the job. The fallback must NOT reach for it — that is the template again.
+  it('reports nothing rather than falling back to a lone side pass', () => {
+    const t = trace([
+      replayStep('s0', { kind: 'title_generation' }, [
+        inlineLlmSpan('a', [userMsg(TITLE_PROMPT)], 'Build failure triage'),
+      ]),
+    ]);
+    expect(jobInputText(t, [])).toBeNull();
+    expect(jobOutputText(t)).toBeNull();
   });
 });

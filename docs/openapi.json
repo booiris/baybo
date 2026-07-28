@@ -5947,21 +5947,21 @@
               "integer",
               "null"
             ],
-            "description": "Operator override for `context_window`. `None` = factory default.",
+            "description": "The default model's `context_window` override. `None` = factory\ndefault.",
             "minimum": 0
           },
           "effective_context_window": {
             "type": "integer",
-            "description": "Effective `context_window` that the runtime would observe given\nthe current overrides and snapshot/factory defaults.",
+            "description": "Effective `context_window` of the entry's **default** model, given\nits overrides and the snapshot/factory defaults.",
             "minimum": 0
           },
           "effective_pricing": {
             "$ref": "#/components/schemas/LlmModelPricingDto",
-            "description": "Effective pricing."
+            "description": "Effective pricing of the entry's default model."
           },
           "effective_supports_vision": {
             "type": "boolean",
-            "description": "Effective vision flag."
+            "description": "Effective vision flag of the entry's default model."
           },
           "is_default": {
             "type": "boolean"
@@ -5971,17 +5971,17 @@
               "string",
               "null"
             ],
-            "description": "Cheaper/faster model for lightweight auxiliary calls — reserved, no\nruntime path consumes it yet. `None` when unconfigured."
+            "description": "Cheaper/faster model this entry uses for lightweight auxiliary\ncalls. Names one of `model_list`. `None` when unconfigured."
           },
           "model": {
             "type": "string"
           },
-          "model_candidates": {
+          "model_list": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/LlmModelSpecDto"
             },
-            "description": "Extra model ids this entry can serve (same provider + credentials).\nA session can be pinned to any of `[model] + model_candidates`; the\nchat header picker lists them under the entry. Empty for an entry\nthat offers only its default `model`."
+            "description": "Every model this entry serves, in picker order, each with its own\noverrides. Always contains `model`. Read-only here."
           },
           "name": {
             "type": "string"
@@ -5993,7 +5993,7 @@
               },
               {
                 "$ref": "#/components/schemas/LlmPricingOverrideDto",
-                "description": "Operator override for pricing fields. `None` = factory default."
+                "description": "The default model's pricing override. `None` = factory default."
               }
             ]
           },
@@ -6011,7 +6011,7 @@
               "boolean",
               "null"
             ],
-            "description": "Operator override for `supports_vision`. `None` = factory default."
+            "description": "The **default** model's `supports_vision` override. `None` =\nfactory default. Mirrors `model_list[default].supports_vision`;\noverrides for the entry's other models are file-edited only."
           }
         }
       },
@@ -6044,6 +6044,41 @@
           "output_per_1m_tokens": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "LlmModelSpecDto": {
+        "type": "object",
+        "description": "One model an entry serves, with the operator's per-model overrides.\nRead-only mirror of `baybo_config::LlmModelSpec` — `model_list` is\nedited in `baybo.json`, not through this API.",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "pricing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LlmPricingOverrideDto"
+              }
+            ]
+          },
+          "supports_vision": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         }
       },
@@ -6931,7 +6966,7 @@
               "integer",
               "null"
             ],
-            "description": "`context_window` override, or `null` to clear.",
+            "description": "`context_window` override for the default model, or `null` to clear.",
             "minimum": 0
           },
           "model": {
@@ -6948,7 +6983,7 @@
               },
               {
                 "$ref": "#/components/schemas/LlmPricingOverrideDto",
-                "description": "Pricing override, or `null` to clear."
+                "description": "Pricing override for the default model, or `null` to clear."
               }
             ]
           },
@@ -6971,7 +7006,7 @@
               "boolean",
               "null"
             ],
-            "description": "`supports_vision` override, or `null` to clear."
+            "description": "`supports_vision` override for the entry's **default** model, or\n`null` to clear. Lands in that model's `model_list` spec; the\nentry's other models are file-edited only."
           }
         }
       },

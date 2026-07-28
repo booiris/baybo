@@ -351,13 +351,14 @@ pub async fn build_managers(
     // cost lookup. The refresh loop (owned by the reloader below)
     // overlays live prices.
     cost_manager.merge_pricings(crate::reload::pricing_overlay(&built));
-    let pool = baybo_agent::LlmClientPool::with_candidates(
-        built.clients,
-        built.overrides,
-        built.entry_models,
-        config.default_llm.clone(),
-        config.agent.model_tiers.clone(),
-    )
+    let pool = baybo_agent::LlmClientPool::from_config(baybo_agent::LlmPoolConfig {
+        clients: built.clients,
+        overrides: built.overrides,
+        entry_models: built.entry_models,
+        lite: built.lite,
+        default_name: config.default_llm.clone(),
+        tier_map: config.agent.model_tiers.clone(),
+    })
     .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?;
     let llm_client = pool.default_client();
     let info = llm_client.model_info();
@@ -440,16 +441,8 @@ pub async fn build_managers(
 
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
-        stores.session_summary.clone(),
         stores.session_folder.clone(),
     ));
-
-    // Delete orphan summary directories under `state/sessions/` left by
-    // a background-summary pass that wrote `summary.md` but exited before
-    // recording its `session_summaries` row. Best-effort — logged at warn
-    // on failure, never blocks boot.
-    baybo_agent::compression::reap_orphan_summaries(session_manager.as_ref(), &workspace_paths)
-        .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 
@@ -864,11 +857,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // `initial_model` is the chat pick WITHIN that entry
                 // (`session.state.last_model`); `None` ⇒ entry default.
 
-                // `summary_state_dir` connects the compressor's
-                // fast-path to the background refresh runner's output.
-                // Without it the background passes still run and bill
-                // LLM, but their summaries never reach the hot path.
-                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
@@ -894,7 +882,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
-                    workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),
                     task_store: task_store.clone(),

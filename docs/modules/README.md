@@ -75,7 +75,6 @@ Bottom-up along the dependency graph:
 
 - [testing.md](../testing.md) — Test pyramid (unit / crate-level / cross-crate), `test-support` gating, fixture inventory, and the six conventions every new test should follow.
 - [background-notifications.md](../background-notifications.md) — Durable delivery of detached subagent and detached `Bash` results: grouping, buffering, transcript commit, active delivery, retries, passive fallback, `/stop`, and crash semantics.
-- [background-compression.md](../background-compression.md) — Async per-session summary maintenance; runs as an in-actor detached step on the parent's `AgentLoop`, attributing to the parent session. Trigger gates in `agent`, fast-path strategy + summary metadata in `context`, on-disk summary file under `<workspace>/state/sessions/<id>/`, `session_summaries` table in `storage`.
 
 ## Dependency Overview
 

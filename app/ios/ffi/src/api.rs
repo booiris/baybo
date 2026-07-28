@@ -190,9 +190,11 @@ pub struct LlmModelInfo {
     pub provider: String,
     /// The entry's default model id.
     pub model: String,
-    /// Extra model ids this entry can serve (same provider + credentials). A
-    /// session pins any of `[model] + model_candidates`; the picker lists them
-    /// under the entry. Empty for a single-model entry.
+    /// Every model id this entry can serve, flattened from the gateway's
+    /// `model_list` (which already includes `model`, so this list normally
+    /// contains it — `ModelCatalog.models(of:)` de-dupes). A session pins any
+    /// of them; the picker lists them under the entry. Empty only when the
+    /// gateway sent no list at all.
     pub model_candidates: Vec<String>,
     /// The entry's reasoning-effort override — one of
     /// `none`/`minimal`/`low`/`medium`/`high`/`xhigh`, or `None` for the

@@ -224,6 +224,31 @@ pub struct LlmModelPricingDto {
     pub cache_write_per_1m_tokens: Option<baybo_model::MicroUsd>,
 }
 
+/// One model an entry serves, with the operator's per-model overrides.
+/// Read-only mirror of `baybo_config::LlmModelSpec` — `model_list` is
+/// edited in `baybo.json`, not through this API.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LlmModelSpecDto {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<LlmPricingOverrideDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+}
+
+impl From<baybo_config::LlmModelSpec> for LlmModelSpecDto {
+    fn from(v: baybo_config::LlmModelSpec) -> Self {
+        Self {
+            model: v.model,
+            context_window: v.context_window,
+            pricing: v.pricing.map(LlmPricingOverrideDto::from),
+            supports_vision: v.supports_vision,
+        }
+    }
+}
+
 /// One row in `GET /v1/llm/models`. Carries both the raw config (so the
 /// edit form can populate "override or unset" toggles) and the
 /// **effective** values that result from layering overrides over the
@@ -233,14 +258,12 @@ pub struct LlmModelEntry {
     pub name: String,
     pub provider: String,
     pub model: String,
-    /// Extra model ids this entry can serve (same provider + credentials).
-    /// A session can be pinned to any of `[model] + model_candidates`; the
-    /// chat header picker lists them under the entry. Empty for an entry
-    /// that offers only its default `model`.
+    /// Every model this entry serves, in picker order, each with its own
+    /// overrides. Always contains `model`. Read-only here.
     #[serde(default)]
-    pub model_candidates: Vec<String>,
-    /// Cheaper/faster model for lightweight auxiliary calls — reserved, no
-    /// runtime path consumes it yet. `None` when unconfigured.
+    pub model_list: Vec<LlmModelSpecDto>,
+    /// Cheaper/faster model this entry uses for lightweight auxiliary
+    /// calls. Names one of `model_list`. `None` when unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lite_model: Option<String>,
     pub base_url: Option<String>,
@@ -252,19 +275,22 @@ pub struct LlmModelEntry {
     pub reasoning_effort: Option<String>,
     pub is_default: bool,
 
-    /// Operator override for `supports_vision`. `None` = factory default.
+    /// The **default** model's `supports_vision` override. `None` =
+    /// factory default. Mirrors `model_list[default].supports_vision`;
+    /// overrides for the entry's other models are file-edited only.
     pub supports_vision_override: Option<bool>,
-    /// Operator override for `context_window`. `None` = factory default.
+    /// The default model's `context_window` override. `None` = factory
+    /// default.
     pub context_window_override: Option<usize>,
-    /// Operator override for pricing fields. `None` = factory default.
+    /// The default model's pricing override. `None` = factory default.
     pub pricing_override: Option<LlmPricingOverrideDto>,
 
-    /// Effective `context_window` that the runtime would observe given
-    /// the current overrides and snapshot/factory defaults.
+    /// Effective `context_window` of the entry's **default** model, given
+    /// its overrides and the snapshot/factory defaults.
     pub effective_context_window: usize,
-    /// Effective vision flag.
+    /// Effective vision flag of the entry's default model.
     pub effective_supports_vision: bool,
-    /// Effective pricing.
+    /// Effective pricing of the entry's default model.
     pub effective_pricing: LlmModelPricingDto,
 }
 
@@ -297,13 +323,15 @@ pub struct UpdateLlmModelRequest {
     /// Reasoning-effort override, or `null` to clear.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub reasoning_effort: Option<Option<String>>,
-    /// `supports_vision` override, or `null` to clear.
+    /// `supports_vision` override for the entry's **default** model, or
+    /// `null` to clear. Lands in that model's `model_list` spec; the
+    /// entry's other models are file-edited only.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub supports_vision: Option<Option<bool>>,
-    /// `context_window` override, or `null` to clear.
+    /// `context_window` override for the default model, or `null` to clear.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub context_window: Option<Option<usize>>,
-    /// Pricing override, or `null` to clear.
+    /// Pricing override for the default model, or `null` to clear.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub pricing: Option<Option<LlmPricingOverrideDto>>,
     /// Set the literal API key in the vault (`llm.entry.<name>.api_key`).

@@ -165,11 +165,16 @@ async () => {
     }
 
     const markdown = turndown.turndown(article.content);
+    // Readability leaves every metadata field nullable *and* returns "" for a
+    // tag it found but that was empty, so both have to be excluded — a bare
+    // truthiness check hides that they are two different states.
+    const isNonEmpty = (v: string | null | undefined): boolean =>
+        v !== null && v !== undefined && v.length > 0;
     const header: string[] = [];
-    if (article.title) header.push(`# ${article.title}`);
-    if (article.byline) header.push(`*${article.byline}*`);
-    if (article.siteName) header.push(`Source: ${article.siteName}`);
-    if (article.excerpt) header.push(`> ${article.excerpt}`);
+    if (isNonEmpty(article.title)) header.push(`# ${article.title}`);
+    if (isNonEmpty(article.byline)) header.push(`*${article.byline}*`);
+    if (isNonEmpty(article.siteName)) header.push(`Source: ${article.siteName}`);
+    if (isNonEmpty(article.excerpt)) header.push(`> ${article.excerpt}`);
 
     const body = [...header, "", markdown.trim()].join("\n").trim();
 
@@ -196,12 +201,12 @@ function extractArticleFromCddmResult(
     //   "Script ran on page and returned:\n```json\n<JSON.stringify(value)>\n```"
     // We parse the embedded JSON value out and shape-check it.
     const r = result as CallToolResult;
-    if (r.isError) {
+    if (r.isError === true) {
         return { __error: `evaluate_script failed: ${stringifyContent(r.content)}` };
     }
     const text = stringifyContent(r.content);
     const fenced = text.match(/```(?:json)?\n([\s\S]*?)\n```/);
-    if (!fenced || !fenced[1]) {
+    if (fenced?.[1] === undefined) {
         return { __error: `unexpected evaluate_script response shape: ${text.slice(0, 200)}` };
     }
     let parsed: unknown;

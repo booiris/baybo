@@ -8,21 +8,21 @@
 /// session. Mirrors Claude Code's compaction prompt.
 pub(crate) const CONTINUATION_INTRO: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the\nearlier portion of the conversation.";
 
-/// Closing paragraph instructing the model to resume work directly,
-/// without acknowledging the summary or prefacing the reply.
-pub(crate) const CONTINUATION_FOOTER: &str = "Recent messages are preserved verbatim.\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
+/// Closing paragraph instructing the model to resume work directly, without
+/// acknowledging the summary or prefacing the reply.
+///
+/// Two variants because the claim about verbatim messages has to be true:
+/// the compaction keeps a recent slice when it fits, and drops it when the
+/// result would otherwise be no smaller than what it replaced.
+pub(crate) const CONTINUATION_FOOTER_WITH_SLICE: &str =
+    "The most recent messages are preserved verbatim below this summary.\n";
+pub(crate) const CONTINUATION_FOOTER: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
 
 /// Trailing user prompt appended to the full conversation handed to
 /// the summarizer LLM. The instruction forces a tool-free response
 /// shaped as `<analysis>...</analysis><summary>...</summary>`. We
 /// strip the `<analysis>` block entirely and keep the inner body of
-/// `<summary>` (tags removed); see [`parse_summary_response`].
-///
-/// Used by both compression entry points: the inline
-/// `summarize_or_truncate` path appends it as-is, and the
-/// background-summary path wraps it via `build_summary_prompt` with a
-/// prior-summary preamble + SIZE TARGET footer. Editing the
-/// analysis/summary contract must stay compatible with both call sites.
+/// `<summary>` (tags removed); see `parse_summary_response`.
 pub const SUMMARIZE_INSTRUCTION: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
@@ -32,6 +32,8 @@ pub const SUMMARIZE_INSTRUCTION: &str = r#"CRITICAL: Respond with TEXT ONLY. Do 
 
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
+
+The most recent messages may also be preserved verbatim below your summary. Do not reproduce them word for word — but do summarise them as instructed below regardless. The verbatim copy, when it is present, is a supplement to your summary, never a substitute for it.
 
 Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
 

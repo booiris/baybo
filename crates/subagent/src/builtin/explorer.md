@@ -11,7 +11,7 @@ description: |
   produce a plan (use planner) or mutate the workspace (use
   general-purpose, with the change spelled out in the brief).
 version: 0.1.0
-default_tier: fast
+default_tier: lite
 ---
 # Identity
 

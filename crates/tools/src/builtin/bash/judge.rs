@@ -16,6 +16,29 @@
 //! [`baybo_llm::extract_json_object`] (shared with the skill assessor); only an
 //! explicit `"safe"` is treated as safe, so a garbled `risk` field defaults to
 //! risky.
+//!
+//! # Which model judges, and the risk that carries
+//!
+//! Both judges run on the session entry's **lite** model
+//! (`ToolContext::lite_llm` ← `LlmClientPool::resolve_lite`), chosen by the
+//! operator for price. That is a deliberate, and asymmetric, trade:
+//!
+//! - [`judge_pre_exec`] deciding `safe` only means the command runs *without a
+//!   prompt* — still inside the sandbox. Bounded blast radius.
+//! - [`judge_post_fail`] deciding `sandbox_related && safe` re-runs the command
+//!   **on the host, outside the sandbox, with no approval** — the most
+//!   privileged automatic action in the codebase. Its input includes
+//!   `stdout_tail` / `stderr_tail`, i.e. whatever the failed program chose to
+//!   print, and the only defence is the prompt-injection paragraph in
+//!   [`POST_FAIL_SYSTEM`]. Resisting injection is exactly the capability that
+//!   degrades when the model gets smaller, and fail-closed protects against an
+//!   *unavailable* judge, not a *fooled* one.
+//!
+//! Two ways to narrow this without giving up the cost saving, if the trade ever
+//! needs revisiting: require the main model to confirm the privilege-granting
+//! verdict (the escalation is rare, so the saving barely moves), or close the
+//! `Unsandbox` path entirely when a lite model rendered the verdict, leaving
+//! lite able only to tighten. Neither is implemented; this is the owner's call.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -169,11 +192,28 @@ pub(crate) async fn judge_post_fail(
     }
 }
 
+/// Nudge sent on the one retry after a reply that wasn't a lone JSON
+/// object. Kept blunt: the model already has the schema in its system
+/// prompt, so the only new information is that its last attempt failed.
+const VERDICT_REPARSE_NUDGE: &str = r#"Your previous reply was not a single JSON object. Reply with ONLY the JSON object described above — no prose, no code fences, nothing else."#;
+
+/// Chars of a malformed reply carried into the log. Enough to tell a
+/// chatty preamble from a truncated stream without dumping the reply.
+const MALFORMED_REPLY_LOG_CHARS: usize = 200;
+
 /// Send the system+user pair at temperature 0 and parse the JSON verdict.
-/// Returns `None` on any provider error or unparseable reply (callers map
-/// `None` to their fail-closed branch). Records two trace events under
-/// `action`: a `Phase` with the round-trip duration and an `LlmCall`
-/// carrying the judge's input (the command context) and raw output.
+/// Returns `None` on a provider error, or on a reply that still isn't a
+/// lone JSON object after one corrective retry (callers map `None` to
+/// their fail-closed branch). Records a `Phase` with the round-trip
+/// duration plus one `LlmCall` per attempt under `action`.
+///
+/// The retry exists because these judges run on the entry's **lite**
+/// model, and "respond with ONE JSON object and nothing else" is exactly
+/// what a small model fumbles — with a fail-closed parse, every fumble is
+/// an approval prompt the user did not need to see. A provider error is
+/// deliberately NOT retried: `baybo_llm` already retries transient
+/// failures, and doubling that would just stretch the pause in front of
+/// the prompt.
 async fn run_judge(
     llm: &dyn BilledChat,
     events: &Arc<dyn ToolEventSink>,
@@ -181,40 +221,68 @@ async fn run_judge(
     system: &str,
     user: &str,
 ) -> Option<RawVerdict> {
-    let request = ChatRequest {
-        messages: vec![
-            ChatMessage::system(vec![ContentBlock::Text(system.to_string())]),
-            ChatMessage::agent_context(vec![ContentBlock::Text(user.to_string())]),
-        ],
-        temperature: Some(0.0),
-        tools: vec![],
-        reasoning_effort: None,
-    };
-    let outcome = {
-        let _timer = start_timer(events, action);
-        llm.chat(&request).await
-    };
-    let emit = |output: String| {
+    let mut messages = vec![
+        ChatMessage::system(vec![ContentBlock::Text(system.to_string())]),
+        ChatMessage::agent_context(vec![ContentBlock::Text(user.to_string())]),
+    ];
+    let emit = |input: &str, output: String| {
         events.emit(
             action,
             ToolEventPayload::LlmCall {
                 model: llm.model_info().id.clone(),
-                input: user.to_string(),
+                input: input.to_string(),
                 output,
             },
         );
     };
-    let reply = match outcome {
-        Ok(resp) => resp.response.content,
-        Err(e) => {
-            tracing::warn!(target: "baybo::tools::bash", error = %e, "bash risk judge call failed");
-            emit(format!("<error: {e}>"));
-            return None;
+    let _timer = start_timer(events, action);
+    for attempt in 0..2 {
+        let request = ChatRequest {
+            messages: messages.clone(),
+            temperature: Some(0.0),
+            tools: vec![],
+            reasoning_effort: None,
+        };
+        let reply = match llm.chat(&request).await {
+            Ok(resp) => resp.response.content,
+            Err(e) => {
+                tracing::warn!(target: "baybo::tools::bash", error = %e, "bash risk judge call failed");
+                emit(user, format!("<error: {e}>"));
+                return None;
+            }
+        };
+        emit(user, reply.clone());
+        if let Some(obj) = extract_json_object(&reply)
+            && let Ok(verdict) = serde_json::from_str::<RawVerdict>(obj)
+        {
+            return Some(verdict);
         }
-    };
-    emit(reply.clone());
-    let obj = extract_json_object(&reply)?;
-    serde_json::from_str::<RawVerdict>(obj).ok()
+        // Logged rather than swallowed: the rate at which the judge's
+        // reply fails to parse is the metric that decides whether the
+        // configured lite model is good enough for this job, and an
+        // unparseable verdict is otherwise indistinguishable from a
+        // genuinely risky one.
+        tracing::warn!(
+            target: "baybo::tools::bash",
+            attempt,
+            model = %llm.model_info().id,
+            reply = %truncate_for_log(&reply),
+            "bash risk judge reply was not a single JSON object",
+        );
+        messages.push(ChatMessage::assistant(vec![ContentBlock::Text(reply)]));
+        messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+            VERDICT_REPARSE_NUDGE.to_string(),
+        )]));
+    }
+    None
+}
+
+/// First [`MALFORMED_REPLY_LOG_CHARS`] chars of `s`, on a char boundary.
+fn truncate_for_log(s: &str) -> &str {
+    match s.char_indices().nth(MALFORMED_REPLY_LOG_CHARS) {
+        Some((cut, _)) => &s[..cut],
+        None => s,
+    }
 }
 
 /// Compiled once: the default rule set builds an Aho-Corasick matcher plus a
@@ -279,6 +347,81 @@ Respond with ONE JSON object and nothing else:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stub judge LLM plus a handle on the raw stub, so a test can see
+    /// exactly how many round-trips the retry loop made and what the
+    /// second one carried.
+    fn judge_stub(
+        replies: Vec<Result<&str, baybo_llm::LlmError>>,
+    ) -> (Arc<dyn BilledChat>, Arc<baybo_llm::test_support::StubLlm>) {
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
+        let stub = Arc::new(StubLlm::new());
+        for reply in replies {
+            match reply {
+                Ok(text) => stub.push_response(LlmResponse {
+                    content: text.to_string(),
+                    content_blocks: vec![],
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                    thinking: None,
+                }),
+                Err(e) => stub.push_response_err(e),
+            }
+        }
+        let chat = crate::test_support::unbilled_chat(BillableLlm::passthrough(
+            Arc::clone(&stub) as Arc<dyn LlmCompletion>
+        ));
+        (chat, stub)
+    }
+
+    async fn run(
+        replies: Vec<Result<&str, baybo_llm::LlmError>>,
+    ) -> (Option<RawVerdict>, Arc<baybo_llm::test_support::StubLlm>) {
+        let (llm, stub) = judge_stub(replies);
+        let events = crate::noop_event_sink();
+        let verdict = run_judge(llm.as_ref(), &events, "test_judge", "system", "user").await;
+        (verdict, stub)
+    }
+
+    /// The judges run on the entry's lite model, and "reply with ONE JSON
+    /// object and nothing else" is exactly what a small model fumbles.
+    /// Because the parse is fail-closed, every fumble that isn't retried
+    /// becomes an approval prompt the user did not need to see.
+    #[tokio::test]
+    async fn a_malformed_verdict_is_retried_once_and_the_retry_wins() {
+        let (verdict, stub) = run(vec![
+            Ok("Sure! Here is my assessment of the command:"),
+            Ok(r#"{"risk":"safe","rationale":"scratch dir"}"#),
+        ])
+        .await;
+        assert_eq!(parse_risk(&verdict.expect("retry parsed").risk), Risk::Safe);
+        let sent = stub.captured_requests();
+        assert_eq!(sent.len(), 2, "exactly one retry");
+        let retry = format!("{:?}", sent[1].messages);
+        assert!(
+            retry.contains("not a single JSON object"),
+            "the retry must tell the model what went wrong: {retry}"
+        );
+    }
+
+    /// One retry, not a loop: a model that cannot produce JSON must not
+    /// stall the approval prompt indefinitely.
+    #[tokio::test]
+    async fn a_second_malformed_verdict_fails_closed() {
+        let (verdict, stub) = run(vec![Ok("nope"), Ok("still nope")]).await;
+        assert!(verdict.is_none(), "fail closed after the retry");
+        assert_eq!(stub.captured_requests().len(), 2);
+    }
+
+    /// Provider errors already have a retry layer inside `baybo_llm`;
+    /// retrying here would just stretch the pause before the prompt.
+    #[tokio::test]
+    async fn a_provider_error_is_not_retried() {
+        let (verdict, stub) = run(vec![Err(baybo_llm::LlmError::Transient("boom".into()))]).await;
+        assert!(verdict.is_none());
+        assert_eq!(stub.captured_requests().len(), 1);
+    }
 
     #[test]
     fn parse_risk_only_safe_is_safe() {

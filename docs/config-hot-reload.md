@@ -7,7 +7,7 @@ This is the approved design for config hot-reload. It folds together what were o
 
 Apply a subset of `baybo.json` changes to a running gateway without a restart, honoring the contract in [`docs/modules/config.md`](modules/config.md) §"Reload semantics": an explicit hot-updatable whitelist, an atomic swap, validation rollback, and in-flight isolation.
 
-The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`, `pricing`, `context_window`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
+The headline win is **LLM identity** (`provider`, `model`, `model_list` — including its per-model `pricing` / `context_window` — `base_url`, `api_key`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
 
 ## Non-goals
 
@@ -69,12 +69,14 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 
 ### Pool handle + per-turn swap
 
-`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `crates/baybo/src/runtime.rs` — used for top-level, cron, subagent, and background-compression actors alike — plus the integration-test harness and `AgentLoop` unit tests).
+`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `crates/baybo/src/runtime.rs` — used for top-level, cron, and subagent actors alike — plus the integration-test harness and `AgentLoop` unit tests).
 
 `AgentLoop` resolves at **turn start** (not construction): `pool_handle.read().resolve(self.initial_llm)`, pinned for the whole turn (a turn may issue many LLM calls; they all use one model). When the resolved client differs from the current one **by pointer** (`Arc::ptr_eq`, *not* by model id — a reload always builds fresh `Arc<BillableLlm>`s, so this also catches a `base_url` / credential / `reasoning_effort` / `context_window` edit that kept the same model id; an unchanged pool returns the same `Arc`, so the common path stays a no-op), the loop:
 
 - swaps `self.llm_client` — in-tool side-LLM calls need no extra step: `ctx.llm` is bound per tool call from the active client (`BillableLlm::bind` → `BoundBilledLlm`, wrapped in `BilledChatRunner`; `crates/agent/src/runtime/tool_executor.rs`), so they bill the new model automatically,
 - calls `context_manager.set_active_model_context_window(new)` — load-bearing: a smaller replacement context would otherwise overflow because compression still gated on the old larger window.
+
+The loop's **lite** client (`resolve_lite`, driving the risk judges / page summary / title) is re-resolved on every turn *before* that pointer check, not inside it: the lite cascade can change while the main client does not — an entry gaining a `lite_model`, or `model_tiers.lite` being re-pointed — and the short-circuit would otherwise skip past it.
 
 The **tokenizer is deliberately not swapped**. `TiktokenTokenizer` is already an estimate and the `TokenCalibration` layer corrects drift against observed usage within a few turns; adding a mutable tokenizer surface to `ContextManager` isn't worth it.
 
@@ -157,7 +159,7 @@ Deferred (the orchestrator is bin-only, so these need bin-crate or end-to-end fi
 ## Related
 
 - [`docs/modules/config.md`](modules/config.md) §"Reload semantics" — the contract this honors; firmed up + linked here.
-- `crates/baybo/src/runtime.rs` — pool build (`with_tier_map`), boot CostManager seed (`merge_pricings`), the `wire_router` spawn closure. All re-run / re-wired on reload.
+- `crates/baybo/src/runtime.rs` — pool build (`LlmClientPool::from_config`), boot CostManager seed (`merge_pricings`), the `wire_router` spawn closure. All re-run / re-wired on reload.
 - `crates/baybo/src/reload.rs` — the reload orchestrator (`RuntimeConfigReloader`), pool rebuild (`build_pool_clients`), and the `fetch_overlay_for` refresh loop (`spawn_pricing_refresh`).
 - `crates/gateway/src/api/admin/llm.rs` — `update_model` / `set_default`; "restart required" → inline reload.
 - `crates/agent/src/runtime/billed_chat.rs` — cost lookup keyed by `model_info.id`, the reason the pricing re-seed is mandatory.

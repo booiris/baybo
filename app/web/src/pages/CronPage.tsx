@@ -559,7 +559,7 @@ export function CronPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       )}
@@ -568,7 +568,7 @@ export function CronPage() {
           and edit modals each render their own copy of this while open, since a
           banner painted here would sit under their overlay. */}
       {errorSlot === 'page' && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {mutationError}
         </div>
       )}
@@ -838,10 +838,10 @@ function CronDetailModal({
       onClick={onClose}
     >
       <div
-        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
           <div className="flex items-center gap-3 min-w-0">
             <h3 className="font-bold uppercase tracking-wider shrink-0">Cron Job Detail</h3>
             <code className="font-mono text-[0.9rem] bg-gray-100 px-2 py-0.5 rounded border border-black truncate">{job.id}</code>
@@ -885,9 +885,9 @@ function CronDetailModal({
             </button>
           </div>
         </header>
-        <div className="px-6 py-4 space-y-4">
+        <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
           {error && (
-            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
           )}
@@ -922,7 +922,7 @@ function CronDetailModal({
 
           <div>
             <label className={fieldLabel}>Prompt</label>
-            <div className="bg-gray-50 border-2 border-black rounded-md px-4 py-3 font-mono text-[0.9rem]">
+            <div className="bg-gray-50 border-2 border-black rounded-md px-4 py-3 font-mono text-[0.9rem] break-words">
               {job.prompt}
             </div>
           </div>
@@ -970,10 +970,10 @@ function CronEditModal({
       onClick={onClose}
     >
       <div
-        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-2xl w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 flex items-center justify-between gap-6 px-6 py-4 border-b-2 border-black">
           <div className="flex items-center gap-3 min-w-0">
             <h3 className="font-bold uppercase tracking-wider shrink-0">Edit Cron Job</h3>
             <code className="font-mono text-[0.9rem] bg-gray-100 px-2 py-0.5 rounded border border-black truncate">
@@ -990,9 +990,9 @@ function CronEditModal({
           </button>
         </header>
 
-        <div className="px-6 py-4 space-y-4">
+        <div className="px-6 py-4 space-y-4 overflow-y-auto min-h-0">
           {error && (
-            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
           )}
@@ -1128,7 +1128,7 @@ function CronEditModal({
           )}
         </div>
 
-        <footer className="flex items-center justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+        <footer className="shrink-0 flex items-center justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
           <span className="mr-auto text-[0.75rem] text-ink-soft font-mono">
             {changed.length === 0 ? 'No changes yet' : `Sends only: ${changed.join(', ')}`}
           </span>
@@ -1181,13 +1181,13 @@ function TrashConfirmModal({
       onClick={onCancel}
     >
       <div
-        className="max-w-md w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-md w-full bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 px-6 py-4 border-b-2 border-black">
           <h3 className="font-bold uppercase tracking-wider">Move to Recycle Bin</h3>
         </header>
-        <div className="px-6 py-4 space-y-3">
+        <div className="px-6 py-4 space-y-3 overflow-y-auto min-h-0">
           <p className="text-[0.95rem]">
             Move cron job{' '}
             <code className="font-mono text-[0.85rem] bg-gray-100 px-1 rounded border border-black">
@@ -1197,12 +1197,12 @@ function TrashConfirmModal({
             you can restore it from the Recycle Bin view.
           </p>
           {error && (
-            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem] break-words">
               {error}
             </div>
           )}
         </div>
-        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+        <footer className="shrink-0 flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
           <Button
             type="button"
             onClick={onCancel}

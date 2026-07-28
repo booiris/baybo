@@ -678,9 +678,7 @@ mod tests {
     use baybo_model::{ChannelType, CronJob, CronSchedule, CronStatus, User};
     use baybo_security::test_support::MemorySecretStore;
     use baybo_security::{EncryptionKey, LeakDetector, SecretVault};
-    use baybo_session::test_support::{
-        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-    };
+    use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -714,7 +712,6 @@ mod tests {
             let supervisor = AgentSupervisor::new(response_tx);
             let sessions = Arc::new(SessionManager::new(
                 Arc::new(MemorySessionStore::new()),
-                Arc::new(MemorySessionSummaryStore::new()),
                 Arc::new(MemorySessionFolderStore::new()),
             ));
 
@@ -990,7 +987,6 @@ mod tests {
     fn sessions() -> Arc<SessionManager> {
         Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         ))
     }

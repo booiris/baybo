@@ -6,6 +6,8 @@ export const zh: typeof en = {
     chat: {
       loadOlder: "加载更早的消息",
       preCompaction: "已压缩",
+      compacting: "正在压缩上下文…",
+      compacted: "上下文已压缩",
       loadingThread: "对话加载中…",
       loadingImage: "图片加载中…",
       tapToLoad: "点按加载图片",

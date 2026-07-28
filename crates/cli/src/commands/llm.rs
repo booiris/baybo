@@ -74,7 +74,7 @@ fn status(ctx: &CommandContext) -> Result<CommandOutput> {
             "model": entry.model,
             "api_key_env": entry.api_key_env,
             "base_url": entry.base_url,
-            "supports_vision": entry.supports_vision,
+            "supports_vision": entry.spec_for(&entry.model).and_then(|s| s.supports_vision),
             "reasoning_effort": entry.reasoning_effort,
             "is_default": is_default,
         }));
@@ -115,7 +115,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         .await,
         base_url: entry.base_url.clone(),
         model: entry.model.clone(),
-        supports_vision: entry.supports_vision,
+        supports_vision: entry.spec_for(&entry.model).and_then(|s| s.supports_vision),
         proxy: ctx.proxy_settings(),
         context_window: None,
         pricing: None,
@@ -318,7 +318,8 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
         options.push(format!(
             "vision       = {}",
             working
-                .supports_vision
+                .spec_for(&working.model)
+                .and_then(|s| s.supports_vision)
                 .map(|b| if b { "true" } else { "false" })
                 .unwrap_or("(provider default)")
         ));
@@ -439,8 +440,14 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                 1 => Some(true),
                 _ => Some(false),
             };
-            if new_vision != working.supports_vision {
-                working.supports_vision = new_vision;
+            // The flag is a fact about a model, so it lands on the default
+            // model's `model_list` spec, not on the entry.
+            if new_vision
+                != working
+                    .spec_for(&working.model)
+                    .and_then(|s| s.supports_vision)
+            {
+                working.default_spec_mut().supports_vision = new_vision;
                 changed.push("supports_vision");
             }
         }
@@ -719,7 +726,9 @@ async fn fetch_live_models(
         } else {
             entry.model.clone()
         },
-        supports_vision: entry.supports_vision,
+        // Catalog listing only — no billing, no completion, so the
+        // entry's per-model overrides are irrelevant here.
+        supports_vision: None,
         context_window: None,
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),

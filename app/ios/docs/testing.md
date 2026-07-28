@@ -106,10 +106,13 @@ Demo flags are only hermetic with it.
 
 ## CI
 
-CI (`.github/workflows/ci.yml`):
+CI (`.github/workflows/ci.yml`) — **both jobs are currently `if: false`, so
+nothing under `app/ios` is covered.** Run the four tiers above by hand and say
+so in the PR body; a green check means only that the rest of the workspace
+passed.
 
-- `ios-checks` (ubuntu, gating) runs the Rust and web tiers;
-- `ios-sim` (macos-26, gating build + unit tests, non-gating UI smokes) runs the
+- `ios-checks` (ubuntu) would run the Rust and web tiers;
+- `ios-sim` (macos-26, build + unit tests, non-gating UI smokes) would run the
   Swift half.
 
 Both are path-filtered — and the filter deliberately includes

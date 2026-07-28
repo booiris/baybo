@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::gateway_client::{
-    admin_addr_from_config, read_tui_token, try_connect_with_token, unreachable_gateway_error,
+    admin_addr_from_config, dial_failure_error, read_tui_token, try_connect_with_token,
 };
 use crate::runtime::{build_leak_detector, build_managers, force_exit_watchdog, wire_router};
 use crate::tracing_init::{TracingMode, init_tracing};
@@ -166,7 +166,7 @@ async fn run_via_gateway(
     let transport = Arc::new(
         try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id)
             .await
-            .map_err(|e| unreachable_gateway_error(admin_addr, &e.to_string()))?,
+            .map_err(|e| dial_failure_error(admin_addr, &e))?,
     );
     info!(%admin_addr, %session_id, "connected to gateway for one-shot prompt");
 

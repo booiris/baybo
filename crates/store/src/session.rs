@@ -97,7 +97,7 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<bool>;
 
     /// Set (or clear, with `None`) the session's per-session MODEL pick
-    /// within [`Self::set_last_llm`]'s entry — a `model_candidates` id.
+    /// within [`Self::set_last_llm`]'s entry — a `model_list` id.
     /// Same flat-column discipline as [`Self::set_last_llm`]: writes only
     /// the `last_model` column, leaving the JSON `data` blob alone. `get`
     /// patches `Session.state.last_model` from the column at read time.
@@ -280,9 +280,7 @@ pub trait SessionStore: Send + Sync {
     /// system row resurfaces on the next `load_active_session_messages`.
     ///
     /// Returns the ordinal of the FIRST newly-inserted row; `new_active`
-    /// lands contiguously, so `base + i` addresses row `i` — the
-    /// compression flow uses this to re-point `session_summaries.cursor`
-    /// at the fresh continuation-summary row after a fast-path apply.
+    /// lands contiguously, so `base + i` addresses row `i`.
     async fn apply_session_compaction(
         &self,
         session_id: &SessionId,
@@ -408,8 +406,8 @@ pub trait SessionStore: Send + Sync {
     /// Cheaper than [`Self::load_session_messages_with_supersede`] +
     /// walking: backed by a `COUNT(*)` + `EXISTS` against the partial
     /// `idx_session_messages_active` index, so message contents never
-    /// cross the wire. Used by anchor-lookup paths that only need to
-    /// translate a `session_summaries.cursor` into an in-memory index.
+    /// cross the wire. Used by paths that only need to translate a stored
+    /// ordinal into its position in the active set.
     async fn active_index_of_ordinal(
         &self,
         session_id: &SessionId,
@@ -421,17 +419,6 @@ pub trait SessionStore: Send + Sync {
     /// persisted active count to an in-memory transcript length
     /// without reading message contents.
     async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize>;
-
-    /// Active transcript with `ordinal <= up_to_ordinal`, in ordinal
-    /// order. Equivalent to filtering [`Self::load_active_session_messages`]
-    /// by ordinal but pushes the predicate into SQL so the row content
-    /// for newer ordinals never crosses the wire. Used by background
-    /// compression to load the snapshot pinned at trigger time.
-    async fn load_active_session_messages_up_to(
-        &self,
-        session_id: &SessionId,
-        up_to_ordinal: i64,
-    ) -> Result<Vec<ChatMessage>>;
 
     /// Reverse-paginated slice of the transcript for DISPLAY: at most
     /// `limit` rows whose `ordinal` is strictly below `before_ordinal`

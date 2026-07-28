@@ -9,9 +9,14 @@
 //! [`AuthedClient`] on the request.
 //!
 //! The admin listener co-hosts `/v1/channel-ws` and `/v1/blobs` for
-//! browser web chat tabs and direct device clients. Those routes are
-//! authenticated and tagged as [`AuthedClient::Web`] or
-//! [`AuthedClient::Device`] by [`crate::auth::admin`].
+//! browser web chat tabs, direct device clients, and the bundled TUI.
+//! [`require_channel_or_admin_token`] fronts them there: a live TUI
+//! channel token wins, anything else falls through to
+//! [`crate::auth::admin`], which tags the request [`AuthedClient::Web`]
+//! or [`AuthedClient::Device`]. Both credential shapes have to be
+//! admitted by one middleware because they land on the same router —
+//! and the web chat presents its admin bearer in the same `?token=`
+//! slot a channel token could occupy.
 //!
 //! The TUI token is minted by the gateway at startup, written to the
 //! secret vault under [`super::token::TUI_TOKEN_VAULT_KEY`], and
@@ -35,6 +40,7 @@
 
 use std::sync::Arc;
 
+use super::admin::AdminAuthState;
 use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
     TUI_CLIENT_LABEL,
@@ -229,6 +235,90 @@ pub async fn require_channel_auth(
             Err(status)
         }
     }
+}
+
+/// State for the routes the admin listener co-hosts with the loopback
+/// channel listener. Carries both credential worlds because both arrive
+/// on the same router.
+#[derive(Clone)]
+pub struct CoHostedAuthState {
+    channel: ChannelAuthState,
+    admin: AdminAuthState,
+}
+
+impl CoHostedAuthState {
+    pub fn new(channel: ChannelAuthState, admin: AdminAuthState) -> Self {
+        Self { channel, admin }
+    }
+}
+
+/// Apply [`require_channel_or_admin_token`] to a router. Companion to
+/// [`attach`], which guards the loopback listener with channel auth alone.
+pub fn attach_co_hosted<S>(router: axum::Router<S>, state: CoHostedAuthState) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(middleware::from_fn_with_state(
+        state,
+        require_channel_or_admin_token,
+    ))
+}
+
+/// Middleware for `/v1/channel-ws` + `/v1/blobs` on the admin listener:
+/// try the channel token table, then the admin/device bearer.
+///
+/// Only [`AuthedClient::Tui`] is admitted through the channel arm. The
+/// admin listener may bind a non-loopback interface, and this file's
+/// loopback-isolation argument does not cover that; subprocess and tool
+/// sidecars are handed the loopback listener's URL at spawn time and
+/// never need this one, so their tokens stay rejected here.
+pub async fn require_channel_or_admin_token(
+    State(state): State<CoHostedAuthState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    let path = req.uri().path().to_owned();
+    let has_tok_hdr = req.headers().contains_key(CHANNEL_TOKEN_HEADER);
+    let has_tok_query = has_query_token(req.uri().query());
+
+    // A channel-table miss is not a rejection here: the web chat's admin
+    // bearer arrives in the same `?token=` slot, so it has to reach admin
+    // auth rather than 401 on the way past.
+    let via_channel = match extract_token(&req) {
+        Ok(Some(token)) => resolve_token(&state.channel, &token)
+            .await
+            .ok()
+            .flatten()
+            .filter(|authed| matches!(authed, AuthedClient::Tui)),
+        _ => None,
+    };
+
+    let authed = match via_channel {
+        Some(authed) => {
+            tracing::debug!(%path, "co-hosted auth: accepted via TUI token");
+            if let Some(sanitised) = sanitise_uri(req.uri()) {
+                *req.uri_mut() = sanitised;
+            }
+            authed
+        }
+        None => match state.admin.authenticate_request(&mut req).await {
+            Ok(authed) => authed,
+            Err(status) => {
+                tracing::warn!(
+                    %path, %status,
+                    has_tok_hdr,
+                    has_tok_query,
+                    live_tokens = state.channel.tokens.len(),
+                    "co-hosted auth: neither a live TUI channel token nor a valid \
+                     admin/device bearer; rejecting",
+                );
+                return Err(status);
+            }
+        },
+    };
+
+    req.extensions_mut().insert(authed);
+    Ok(next.run(req).await)
 }
 
 /// Synchronously pull the presented token out of the request as an owned

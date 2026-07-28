@@ -1,7 +1,7 @@
 use baybo_config::{
     BayboConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig,
-    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, PermissionPolicy, ProxyConfig,
-    TelegramChannelConfig,
+    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, LlmModelSpec, PermissionPolicy,
+    ProxyConfig, TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -90,13 +90,10 @@ fn entry(name: &str) -> LlmEntry {
         name: name.into(),
         provider: "openai".into(),
         model: "gpt-4o-mini".into(),
-        model_candidates: Vec::new(),
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env: None,
         base_url: None,
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort: None,
     }
 }
@@ -123,6 +120,53 @@ fn empty_model_fails_validation() {
     c.llm[0].model = String::new();
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "llm[0].model"));
+}
+
+/// Caught in `validate()` rather than at client-build time, so a reload
+/// dry-run rejects the typo without constructing any client.
+#[test]
+fn lite_model_outside_model_list_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.llm[0].lite_model = Some("gpt-4o-nano".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].lite_model"));
+}
+
+#[test]
+fn lite_model_naming_a_listed_model_validates() {
+    let mut c = config_with_default_entry();
+    c.llm[0].model_list = vec![LlmModelSpec::bare("gpt-4o-nano")];
+    c.llm[0].lite_model = Some("gpt-4o-nano".into());
+    assert!(c.validate().is_ok());
+}
+
+/// The entry's own default model is always serveable, so naming it as
+/// the lite model is legal even with an empty `model_list`.
+///
+/// Load-bearing for first-run setup: `configure_llm_step` seeds
+/// `lite_model` to the entry's own model precisely so the knob is visible
+/// in the generated `baybo.json`, and it writes no `model_list` at all. If
+/// `models()` ever stopped prepending the default, every wizard-created
+/// config would fail to load.
+#[test]
+fn lite_model_may_name_the_entry_default() {
+    let mut c = config_with_default_entry();
+    c.llm[0].lite_model = Some(c.llm[0].model.clone());
+    assert!(c.validate().is_ok());
+}
+
+/// The admin `PUT` already rejects a zero window; the file path must
+/// too, or it accepts what the API refuses. A zero window is not inert —
+/// it collapses `compression_threshold * context_window` and zeroes
+/// WebFetch's summariser budget.
+#[test]
+fn zero_context_window_fails_validation() {
+    let mut c = config_with_default_entry();
+    let mut spec = LlmModelSpec::bare("gpt-4o-mini");
+    spec.context_window = Some(0);
+    c.llm[0].model_list = vec![spec];
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].model_list[0].context_window"));
 }
 
 #[test]
@@ -211,7 +255,7 @@ fn model_tier_mapping_to_unknown_entry_fails_validation() {
     let mut c = config_with_default_entry();
     c.agent
         .model_tiers
-        .insert(ModelTier::Fast, "missing".into());
+        .insert(ModelTier::Lite, "missing".into());
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "agent.model_tiers"));
 }
@@ -219,7 +263,7 @@ fn model_tier_mapping_to_unknown_entry_fails_validation() {
 #[test]
 fn model_tier_mapping_to_existing_entry_is_valid() {
     let mut c = config_with_default_entry();
-    c.agent.model_tiers.insert(ModelTier::Fast, "openai".into());
+    c.agent.model_tiers.insert(ModelTier::Lite, "openai".into());
     c.validate()
         .expect("model_tier pointing at a real llm entry is valid");
 }

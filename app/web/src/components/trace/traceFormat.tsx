@@ -23,6 +23,7 @@ import type {
   JobTrace,
   LifecycleState,
   LlmCallResult,
+  ReplayStep,
   SessionMessageRow,
   Span,
   SpanKindTag,
@@ -275,10 +276,10 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       return 'llm iteration';
     }
     case 'compression': {
-      // `trigger` (why) leads, `applied` (how) follows. A stored-summary or
-      // truncate compaction makes no LLM call, so it has no span and no token
-      // figures — it must still say what it did, because that spanless row IS
-      // the moment the model's input context changed.
+      // `trigger` (why) leads, `applied` (how) follows. A truncate compaction
+      // makes no LLM call, so it has no span and no token figures — it must
+      // still say what it did, because that spanless row is the compaction
+      // that discarded the most.
       const { trigger, applied } = step.kind;
       const parts: string[] = [];
       if (trigger != null) parts.push(trigger);
@@ -415,10 +416,31 @@ export function contentText(content: ContentBlock[]): string {
   return parts.join('\n');
 }
 
+/** The step kind that IS the conversation — the agent loop's own iterations. */
+const CONVERSATION_STEP_KIND: StepKindTag = 'llm_iteration';
+
+/** Step kinds that never constitute a job's own work: detached side passes
+ *  recorded under the turn they observe, each sending a prompt of its own. A
+ *  job left holding nothing else (its turn died before recording an iteration)
+ *  has no user input to show — not the side pass's template. */
+const SIDE_PASS_STEP_KINDS = new Set<StepKindTag>(['title_generation', 'progress_observer']);
+
+// Which steps speak for the job. "The job's first/last LLM span" does not:
+// title generation is spawned before the turn's first iteration and the
+// observer/a compaction land after its last, so a new session's job preview
+// showed the title prompt template instead of what the user asked. Prefer the
+// agent loop's steps; a job that has none (a standalone `/compact`) falls back
+// to the work it did do.
+function conversationSteps(trace: JobTrace): ReplayStep[] {
+  const own = trace.steps.filter((rs) => !SIDE_PASS_STEP_KINDS.has(rs.step.kind.kind));
+  const loop = own.filter((rs) => rs.step.kind.kind === CONVERSATION_STEP_KIND);
+  return loop.length > 0 ? loop : own;
+}
+
 // Derive the user-facing input that kicked off the job: the last message in
-// the *first* LLM call's input_messages whose `source` is 'user'.
+// the *first* conversation LLM call's input_messages whose `source` is 'user'.
 export function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string | null {
-  for (const rs of trace.steps) {
+  for (const rs of conversationSteps(trace)) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call') {
         const messages: ChatMessage[] = resolveInputMessages(
@@ -439,11 +461,12 @@ export function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): 
   return null;
 }
 
-// Derive the final output text of the job: the most recent LLM call's
-// output_content (walking steps/spans back-to-front).
+// Derive the final output text of the job: the most recent conversation LLM
+// call's output_content (walking steps/spans back-to-front).
 export function jobOutputText(trace: JobTrace): string | null {
-  for (let i = trace.steps.length - 1; i >= 0; i--) {
-    const rs = trace.steps[i];
+  const steps = conversationSteps(trace);
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const rs = steps[i];
     for (let j = rs.spans.length - 1; j >= 0; j--) {
       const span = rs.spans[j];
       const out = span.kind.kind === 'llm_call' ? span.kind.result?.output_content : undefined;

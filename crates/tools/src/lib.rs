@@ -264,16 +264,23 @@ pub struct ToolContext {
     /// real sink wire [`noop_event_sink`] so tool bodies never have
     /// to branch on `Option`.
     pub events: Arc<dyn ToolEventSink>,
-    /// Per-call billed-LLM handle for tools that need in-flow LLM
-    /// access (today: WebFetch's prompt-driven extraction). The agent
-    /// layer binds it to the current `(user, session, job, span)` so
-    /// `chat()` records cost against the running tool's span. `None`
-    /// when no LLM is wired (argv-mode boots, tests that don't
-    /// exercise the side LLM); tools must fail-closed by ignoring
-    /// their LLM-dependent code path.
-    pub llm: Option<Arc<dyn baybo_llm::BilledChat>>,
+    /// Per-call billed-LLM handle for tools that need in-flow LLM access
+    /// — WebFetch's prompt-driven extraction, the Bash risk judges. The
+    /// agent layer binds it to the current `(user, session, job, span)`
+    /// so `chat()` records cost against the running tool's span. `None`
+    /// when no LLM is wired (argv-mode boots, tests that don't exercise
+    /// the side LLM); tools must fail-closed by ignoring their
+    /// LLM-dependent code path.
+    ///
+    /// **This is the session entry's LITE model, not its chat model** —
+    /// every tool-side call is a one-shot classification or extraction,
+    /// so they all resolve through `LlmClientPool::resolve_lite`. It
+    /// equals the chat model only when no lite model is configured. A
+    /// tool that genuinely needs the session's own model would have to
+    /// have it plumbed separately; do not assume this is it.
+    pub lite_llm: Option<Arc<dyn baybo_llm::BilledChat>>,
     /// Tool-side access to user-managed secrets, bound by the agent layer
-    /// (mirrors [`Self::llm`]). `BashTool` uses it to resolve `secret_env`
+    /// (mirrors [`Self::lite_llm`]). `BashTool` uses it to resolve `secret_env`
     /// names to plaintext for child-process injection and to redact those
     /// values from the output; the `secret_*` tools use it to add / list /
     /// check. `None` when not wired (argv-mode boots, tests that don't
@@ -289,9 +296,7 @@ pub struct ToolContext {
     /// contract. `Read` records each file's fingerprint here; `Edit`
     /// (always) and `Write` (when overwriting an existing file) refuse to
     /// run unless the file was read and is unchanged since. `Some` **only
-    /// for the interactive agent loop** — system passes that legitimately
-    /// rewrite their own files without a prior read (the background-summary
-    /// pass over `summary.md`) and argv-mode / test call sites leave it
+    /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
     /// Runtime hook for detaching a slow command into the background.
@@ -343,7 +348,7 @@ impl ToolContext {
             approval: None,
             notifier: None,
             events: noop_event_sink(),
-            llm: None,
+            lite_llm: None,
             secrets: None,
             virtual_reads: None,
             read_tracker: None,

@@ -7,6 +7,13 @@
 //! cheap exploration", "this is a deep reasoning task") without knowing
 //! which specific `baybo.json` entry name happens to be bound to that
 //! tier in the current deployment. Mapping lives in config.
+//!
+//! [`ModelTier::Lite`] does double duty: it is also the process-wide
+//! fallback for the agent's auxiliary LLM calls when the resolved entry
+//! declares no `lite_model` of its own. Re-pointing it therefore moves
+//! both the cheap subagent tier and the risk judges / page summariser /
+//! title generator. An operator who wants them apart sets a per-entry
+//! `lite_model`, which outranks the tier.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +23,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
-    /// Cheapest tier — fast iteration, exploration, low-stakes work.
-    Fast,
+    /// Cheapest tier — fast iteration, exploration, low-stakes work,
+    /// and the fallback for auxiliary LLM calls.
+    ///
+    /// The `fast` alias is what this tier used to be called; a
+    /// `model_tiers` map deserializes its **keys** through this enum, so
+    /// dropping the alias would turn every config written before the
+    /// rename into a hard load failure.
+    #[serde(alias = "fast")]
+    Lite,
     /// Mid tier — general-purpose default.
     Balanced,
     /// Most capable tier — deep reasoning, code review, planning.
@@ -28,7 +42,7 @@ impl ModelTier {
     /// Stable lower-case label used in JSON / on-disk frontmatter.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Fast => "fast",
+            Self::Lite => "lite",
             Self::Balanced => "balanced",
             Self::Deep => "deep",
         }
@@ -37,17 +51,17 @@ impl ModelTier {
     /// Parse from a user-facing label. Case-insensitive.
     pub fn parse(label: &str) -> Option<Self> {
         match label.trim().to_ascii_lowercase().as_str() {
-            "fast" => Some(Self::Fast),
+            "lite" | "fast" => Some(Self::Lite),
             "balanced" | "default" | "mid" => Some(Self::Balanced),
             "deep" | "opus" | "max" => Some(Self::Deep),
             _ => None,
         }
     }
 
-    /// All three tiers in fast→deep order. Useful for config printers
+    /// All three tiers in lite→deep order. Useful for config printers
     /// and the `spawn_subagent` description renderer.
     pub fn all() -> [Self; 3] {
-        [Self::Fast, Self::Balanced, Self::Deep]
+        [Self::Lite, Self::Balanced, Self::Deep]
     }
 }
 
@@ -72,7 +86,7 @@ mod tests {
 
     #[test]
     fn parse_accepts_aliases_and_is_case_insensitive() {
-        assert_eq!(ModelTier::parse("Fast"), Some(ModelTier::Fast));
+        assert_eq!(ModelTier::parse("Lite"), Some(ModelTier::Lite));
         assert_eq!(ModelTier::parse(" BALANCED "), Some(ModelTier::Balanced));
         assert_eq!(ModelTier::parse("default"), Some(ModelTier::Balanced));
         assert_eq!(ModelTier::parse("opus"), Some(ModelTier::Deep));
@@ -82,8 +96,36 @@ mod tests {
 
     #[test]
     fn lowercase_labels_match_as_str() {
-        assert_eq!(ModelTier::Fast.as_str(), "fast");
+        assert_eq!(ModelTier::Lite.as_str(), "lite");
         assert_eq!(ModelTier::Balanced.as_str(), "balanced");
         assert_eq!(ModelTier::Deep.as_str(), "deep");
+    }
+
+    /// `fast` is the pre-rename spelling. It has to keep working in both
+    /// directions that read a label: on-disk subagent frontmatter goes
+    /// through `parse`, and `agent.model_tiers` deserializes its map
+    /// **keys** through serde — an unaliased rename would turn an
+    /// existing `baybo.json` into a config-load failure, not a warning.
+    #[test]
+    fn the_pre_rename_fast_spelling_still_resolves() {
+        assert_eq!(ModelTier::parse("fast"), Some(ModelTier::Lite));
+        assert_eq!(ModelTier::parse("FAST"), Some(ModelTier::Lite));
+        let from_json: ModelTier = serde_json::from_str(r#""fast""#).expect("alias deserializes");
+        assert_eq!(from_json, ModelTier::Lite);
+        let as_key: std::collections::HashMap<ModelTier, String> =
+            serde_json::from_str(r#"{"fast":"cheap-entry"}"#).expect("alias works as a map key");
+        assert_eq!(
+            as_key.get(&ModelTier::Lite).map(String::as_str),
+            Some("cheap-entry")
+        );
+    }
+
+    /// …but it is not what we write back out.
+    #[test]
+    fn lite_is_the_canonical_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ModelTier::Lite).expect("serialize"),
+            r#""lite""#
+        );
     }
 }

@@ -2,22 +2,21 @@
 //!
 //! The gateway exposes two listeners:
 //!
-//! * **Admin** — TCP, bearer-token authenticated. Hosts config,
-//!   status, jobs, cron, memory, traces, skills, tools, llm, and a
-//!   read-only channel list. Also co-hosts the web chat
-//!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
-//!   reach them over the public bind.
+//! * **Admin** — TCP on the configured bind, bearer-token
+//!   authenticated. Hosts config, status, jobs, cron, memory, traces,
+//!   skills, tools, llm, and a read-only channel list. Also co-hosts
+//!   `/v1/channel-ws` and `/v1/blobs/*`, guarded there by
+//!   [`crate::auth::channel::require_channel_or_admin_token`] — the
+//!   three clients that need those routes without loopback port
+//!   discovery are browser web chat (admin bearer), paired devices
+//!   (device bearer), and the bundled TUI (vault channel token).
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
 //!   channel-token authenticated against [`ChannelTokenTable`] (see
 //!   [`crate::channel_listener`] and [`crate::auth::channel`]). Hosts
-//!   the WebSocket endpoint
-//!   (`/v1/channel-ws`) for the TUI and subprocess sidecars (which
-//!   live on the same host and reach it via the discovered ephemeral
-//!   port). The admin listener co-hosts the same `/v1/channel-ws`
-//!   route under admin-bearer auth so browser-side web chat clients
-//!   can open the WS over the public bind without port discovery.
-//!   Session CRUD lives on the admin surface; the
-//!   router creates sessions lazily on first message frame.
+//!   `/v1/channel-ws` for subprocess and tool sidecars, which get their
+//!   token by env var and the port from `<workspace>/state/channel.port`.
+//!   Session CRUD lives on the admin surface; the router creates
+//!   sessions lazily on first message frame.
 //!
 //! [`AdminState`] and [`ChannelState`] split the old monolithic
 //! `ApiState` so each listener only sees the managers it needs. Both
@@ -307,30 +306,38 @@ fn build_admin_router(deps: &GatewayDeps) -> Router {
     let (admin_router, _admin_spec) = api::admin::v1_router_and_spec();
     let admin_router = admin_router.with_state(state);
 
-    // Browser/direct-device-facing `/v1/channel-ws` + `/v1/blobs`. Same handlers
-    // the loopback channel listener serves, but mounted here so the web chat page
-    // and direct device clients can reach them without discovering the ephemeral
-    // loopback port. The merged admin router below applies the admin/device bearer
-    // middleware to these routes too.
-    let channel_v1 = build_channel_v1_subrouter(WsChannelState::from_deps(deps));
-
     // TraceLayer goes *inside* the auth middleware so it sees the
-    // URI AFTER `require_admin_token` has stripped `?token=…`. If
-    // TraceLayer is on the outside it would log the raw URI (token
-    // and all) before auth rewrites it — tower middleware runs outer-
-    // to-inner, so "outer" = "logs first".
+    // URI AFTER the auth layer has stripped `?token=…`. If TraceLayer is
+    // on the outside it would log the raw URI (token and all) before auth
+    // rewrites it — tower middleware runs outer-to-inner, so "outer" =
+    // "logs first".
     let admin_router = Router::new()
         .merge(admin_router)
-        .merge(channel_v1)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_admin_token,
         ));
 
+    // Browser/direct-device-facing `/v1/channel-ws` + `/v1/blobs`, plus the
+    // bundled TUI. Same handlers the loopback channel listener serves, but
+    // mounted here so web chat, direct device clients and `baybo tui` reach
+    // them without discovering the ephemeral loopback port. It carries its
+    // own auth: these routes admit a TUI channel token as well as the
+    // admin/device bearer, which `require_admin_token` alone cannot do.
+    let channel_v1 = channel_auth::attach_co_hosted(
+        build_channel_v1_subrouter(WsChannelState::from_deps(deps))
+            .layer(TraceLayer::new_for_http()),
+        channel_auth::CoHostedAuthState::new(
+            channel_auth::ChannelAuthState::new(deps.channel_tokens.clone()),
+            auth_state,
+        ),
+    );
+
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .merge(admin_router)
+        .merge(channel_v1)
         .fallback(api::webui::serve)
         .layer(cors)
 }

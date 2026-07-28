@@ -32,7 +32,13 @@ impl TokenBudget {
 
     /// Whether the current token count exceeds the compression threshold.
     pub fn needs_compression(&self) -> bool {
-        self.current > (self.max_tokens as f64 * self.threshold) as usize
+        self.current > self.compression_ceiling()
+    }
+
+    /// The token count a compaction has to land at or below to have been
+    /// worth running: crossing it is what triggers the next one.
+    pub fn compression_ceiling(&self) -> usize {
+        (self.max_tokens as f64 * self.threshold) as usize
     }
 
     /// Update the tracked token count.

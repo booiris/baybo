@@ -1,24 +1,24 @@
 //! Channel TCP listener.
 //!
 //! Binds a loopback TCP socket (`127.0.0.1:<ephemeral>`), publishes
-//! the chosen port to `<workspace>/state/channel.port` so the TUI and
-//! sidecars can discover it, and serves the channel router built by
+//! the chosen port to `<workspace>/state/channel.port` so sidecars can
+//! discover it, and serves the channel router built by
 //! [`crate::server::build_channel_router`]. 127.0.0.1 is hardcoded —
 //! config cannot loosen it to `0.0.0.0`, so a fat-fingered bind
 //! address can't leak the channel listener to the network.
 //!
 //! Auth lives in the axum middleware [`crate::auth::channel`]: every
-//! caller — sidecar or bundled TUI — presents `x-baybo-channel-token`
-//! and the middleware looks the token up in [`ChannelTokenTable`].
-//! Sidecar tokens are minted at spawn time and handed to the child via
-//! env var; the TUI token is minted at gateway boot, written to the
-//! secret vault under `gateway.tui_token`, and read back by the TUI
-//! before it dials. Same-UID containment comes from the fact that both
-//! delivery channels are owned by the gateway UID (child env vars and
-//! the sqlite database holding the vault, kept owner-only by
-//! `baybo-storage`'s `DB_FILE_MODE`), so port-level exposure on loopback
-//! is not itself a threat — an attacker with the local UID has already
-//! won.
+//! caller presents `x-baybo-channel-token` and the middleware looks the
+//! token up in [`ChannelTokenTable`]. This listener serves subprocess
+//! and tool sidecars, whose tokens are minted at spawn time and handed
+//! to the child via env var. The bundled TUI holds a channel token too,
+//! but dials the admin listener's co-hosted `/v1/channel-ws` instead —
+//! it has a config-known address and needs no port-file discovery.
+//! Same-UID containment comes from the fact that both delivery channels
+//! are owned by the gateway UID (child env vars and the sqlite database
+//! holding the vault, kept owner-only by `baybo-storage`'s
+//! `DB_FILE_MODE`), so port-level exposure on loopback is not itself a
+//! threat — an attacker with the local UID has already won.
 //!
 //! Lifecycle:
 //! * `<workspace>/state/channel.port` is written `0o600` after bind

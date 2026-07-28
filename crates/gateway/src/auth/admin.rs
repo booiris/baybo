@@ -123,6 +123,12 @@ impl AdminAuthState {
         req: &mut Request<Body>,
     ) -> std::result::Result<AuthedClient, StatusCode> {
         let Some(presented) = extract_token(req) else {
+            tracing::warn!(
+                path = %req.uri().path(),
+                has_auth_hdr = req.headers().contains_key(axum::http::header::AUTHORIZATION),
+                has_device_hdr = req.headers().contains_key(DEVICE_ID_HEADER),
+                "admin auth: no Bearer header and no ?token= query; rejecting with 401",
+            );
             return Err(StatusCode::UNAUTHORIZED);
         };
         let device_id = device_id_claim(req.headers())?;
@@ -136,7 +142,14 @@ impl AdminAuthState {
                     .await?
             }
             None if is_admin_token => AuthedClient::Web,
-            None => return Err(StatusCode::UNAUTHORIZED),
+            None => {
+                tracing::warn!(
+                    path = %req.uri().path(),
+                    "admin auth: presented credential is not the admin token and no \
+                     device header accompanies it; rejecting with 401",
+                );
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         };
 
         if let Some(sanitised) = sanitise_uri(req.uri()) {
@@ -151,6 +164,11 @@ impl AdminAuthState {
         claimed_device_id: String,
     ) -> std::result::Result<AuthedClient, StatusCode> {
         let Some(device_store) = &self.device_store else {
+            tracing::warn!(
+                claimed_device_id = %claimed_device_id,
+                "admin auth: device header presented but this listener has no device \
+                 store wired; rejecting with 401",
+            );
             return Err(StatusCode::UNAUTHORIZED);
         };
         match device_store.lookup_approved_by_auth_token(presented).await {
@@ -165,7 +183,13 @@ impl AdminAuthState {
                 );
                 Err(StatusCode::UNAUTHORIZED)
             }
-            Ok(None) => Err(StatusCode::UNAUTHORIZED),
+            Ok(None) => {
+                tracing::warn!(
+                    claimed_device_id = %claimed_device_id,
+                    "admin auth: bearer matches no approved device row; rejecting with 401",
+                );
+                Err(StatusCode::UNAUTHORIZED)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "admin auth: device token lookup failed");
                 Err(StatusCode::UNAUTHORIZED)

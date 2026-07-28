@@ -279,7 +279,7 @@ mod tests {
         let loaded = reg.load_dir(dir.path());
         assert_eq!(loaded, 1);
         let scout = reg.get("scout").unwrap();
-        assert_eq!(scout.default_tier, Some(ModelTier::Fast));
+        assert_eq!(scout.default_tier, Some(ModelTier::Lite));
         assert!(scout.source_path.is_some());
     }
 

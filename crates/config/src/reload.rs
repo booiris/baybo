@@ -153,13 +153,10 @@ mod tests {
                 name: LlmEntryName::from("primary"),
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
-                model_candidates: Vec::new(),
+                model_list: Vec::new(),
                 lite_model: None,
                 api_key_env: None,
                 base_url: None,
-                supports_vision: None,
-                context_window: None,
-                pricing: None,
                 reasoning_effort: None,
             }],
             default_llm: LlmEntryName::from("primary"),
@@ -212,7 +209,7 @@ mod tests {
         let mut new = base();
         new.agent
             .model_tiers
-            .insert(ModelTier::Fast, LlmEntryName::from("primary"));
+            .insert(ModelTier::Lite, LlmEntryName::from("primary"));
         assert!(hot_reload_diff(&old, &new).is_ok());
     }
 

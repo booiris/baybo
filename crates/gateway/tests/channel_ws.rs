@@ -14,7 +14,10 @@ use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::{DEVICE_ID_HEADER, OWNER_USER_ID, WEB_OPERATOR_USER_ID};
+use baybo_gateway::auth::{
+    CHANNEL_TOKEN_HEADER, ClientIdentity, DEVICE_ID_HEADER, OWNER_USER_ID, TUI_CLIENT_LABEL,
+    WEB_OPERATOR_USER_ID,
+};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::{GatewayDeps, build_admin_router_for_tests};
 use baybo_gateway::test_support::build_test_deps;
@@ -181,6 +184,126 @@ async fn expect_idle_subscribe_state(
         other => panic!("expected SubscribeState, got {other:?}"),
     }
     frame
+}
+
+/// Dial exactly the way the bundled TUI does: the `x-baybo-channel-token`
+/// header, no `?token=` query, against the ADMIN listener. Every other test
+/// here presents the admin bearer via the query string, which is why nothing
+/// caught the admin listener swallowing `/v1/channel-ws` under bearer-only
+/// auth and 401-ing the TUI.
+async fn connect_register_with_channel_token(
+    port: u16,
+    channel_token: &str,
+    channel_type: ChannelType,
+) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let stream = TcpStream::connect(addr).await?;
+    let url = format!("ws://127.0.0.1:{port}/v1/channel-ws");
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert(CHANNEL_TOKEN_HEADER, HeaderValue::from_str(channel_token)?);
+    let (mut ws, _) = client_async(request, stream).await?;
+
+    let frame = Frame::Register {
+        token: String::new(),
+        channel_type,
+    };
+    ws.send(WsMessage::Binary(wire::encode(&frame)?)).await?;
+
+    let next = match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+        Ok(Some(Ok(msg))) => msg,
+        Ok(Some(Err(e))) => return Err(format!("ws read error: {e}").into()),
+        Ok(None) => return Err("peer closed before RegisterAck".into()),
+        Err(_) => return Err("RegisterAck timeout".into()),
+    };
+    match next {
+        WsMessage::Binary(bytes) => match wire::decode(&bytes)? {
+            Frame::RegisterAck { ok: true, .. } => Ok(ws),
+            Frame::RegisterAck { ok: false, reason } => {
+                Err(format!("RegisterAck rejected: {}", reason.unwrap_or_default()).into())
+            }
+            other => Err(format!("expected RegisterAck, got {other:?}").into()),
+        },
+        other => Err(format!("expected Binary RegisterAck, got {other:?}").into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_channel_token_attaches_over_the_admin_listener() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    // Mirrors what `baybo gateway start` registers before it publishes the
+    // token to the vault.
+    let handle = tg.deps.channel_tokens.mint(ClientIdentity {
+        pid: std::process::id(),
+        label: TUI_CLIENT_LABEL.to_string(),
+        bound_channel_type: None,
+    });
+
+    let mut client = connect_register_with_channel_token(port, handle.token(), ChannelType::tui())
+        .await
+        .expect("TUI channel-token handshake over the admin listener");
+
+    let tui_channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::tui())
+        .expect("tui channel installed");
+    assert_eq!(tui_channel.connection_count(), 1);
+
+    client.close(None).await.expect("close client");
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_listener_rejects_unknown_and_non_tui_channel_tokens() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let unknown = connect_register_with_channel_token(port, "deadbeef", ChannelType::tui())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        unknown.contains("401"),
+        "a token absent from the table must 401: {unknown}",
+    );
+
+    // Sidecar tokens are loopback-only: they live in the same table but must
+    // not authenticate over the admin bind, which may be a public interface.
+    let sidecar = tg.deps.channel_tokens.mint(ClientIdentity {
+        pid: std::process::id(),
+        label: "sidecar-telegram".to_string(),
+        bound_channel_type: Some(ChannelType::telegram().to_string()),
+    });
+    let refused =
+        connect_register_with_channel_token(port, sidecar.token(), ChannelType::telegram())
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        refused.contains("401"),
+        "a sidecar token must not authenticate on the admin listener: {refused}",
+    );
+
+    shutdown.trigger();
+    let _ = server_handle.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

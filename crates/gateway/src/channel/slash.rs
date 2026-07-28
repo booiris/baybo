@@ -175,17 +175,10 @@ mod tests {
             .await
             .unwrap();
         let session_store = Arc::new(SqliteSessionStore::new(pool.clone()));
-        let summary_store = Arc::new(baybo_storage::sqlite::SqliteSessionSummaryStore::new(
-            pool.clone(),
-        ));
         let folder_store = Arc::new(baybo_storage::sqlite::SqliteSessionFolderStore::new(
             pool.clone(),
         ));
-        let session_mgr = Arc::new(SessionManager::new(
-            session_store,
-            summary_store,
-            folder_store,
-        ));
+        let session_mgr = Arc::new(SessionManager::new(session_store, folder_store));
         let channel_store = Arc::new(SqliteChannelSessionStore::new(pool));
         ChannelSessionResolver::new(session_mgr, channel_store)
     }

@@ -28,6 +28,7 @@ const WIRE_KINDS = [
   "subscribe_state",
   "gap",
   "notice",
+  "status",
 ] as const satisfies readonly Frame["kind"][];
 
 /// Kinds native SYNTHESIZES for the webview (never on the wire): the sync /

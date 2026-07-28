@@ -115,13 +115,10 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: String::from("(unset)"),
-        model_candidates: Vec::new(),
+        model_list: Vec::new(),
         lite_model: None,
         api_key_env: api_key_env.clone(),
         base_url: base_url.clone(),
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort: None,
     };
 
@@ -172,15 +169,22 @@ async fn add_entry<P: Prompter>(
         name: name.clone().into(),
         provider: provider.clone(),
         model: model.clone(),
-        // The wizard configures one model at a time; operators add candidates
-        // by editing baybo.json (`model_candidates`) directly.
-        model_candidates: Vec::new(),
-        lite_model: None,
+        // The wizard configures one model at a time; operators add further
+        // models by editing baybo.json (`model_list`) directly.
+        model_list: Vec::new(),
+        // Seeded to the entry's own model, which makes it a behavioural
+        // no-op — `resolve_lite` hands back the entry's default client,
+        // exactly as it would with the field unset. It is written anyway
+        // because the alternative is invisible: `lite_model` is
+        // `skip_serializing_if = "Option::is_none"`, so an operator who
+        // never reads the module docs has no way to learn from their own
+        // config file that the auxiliary calls (the Bash risk judges,
+        // WebFetch's page summary, title generation) can be moved to a
+        // cheaper model. Present-and-inert is a knob they can find and
+        // edit; absent is a feature they never discover.
+        lite_model: Some(model.clone()),
         api_key_env,
         base_url,
-        supports_vision: None,
-        context_window: None,
-        pricing: None,
         reasoning_effort,
     };
 
@@ -243,9 +247,9 @@ async fn fetch_live_models(
         } else {
             entry.model.clone()
         },
-        supports_vision: entry.supports_vision,
         // Live model discovery doesn't bill anything and only needs
         // the catalog endpoint — leave overrides off for this path.
+        supports_vision: None,
         context_window: None,
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),

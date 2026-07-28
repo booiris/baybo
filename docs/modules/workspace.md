@@ -23,7 +23,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
   .key/            # not version-controlled: encryption.key (mode 0600)
-  state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile, sessions/<id>/summary.md
+  state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
   logs/            # not version-controlled: baybo.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
 ```
@@ -47,7 +47,6 @@ checkout rather than polluting the real user home.
 | singleton lock   | `<workspace.path>/state/baybo.lock`         |
 | channel port     | `<workspace.path>/state/channel.port`      |
 | browser profile  | `<workspace.path>/state/browser/profile/`  |
-| session summary state | `<workspace.path>/state/sessions/<session_id>/summary.md` (atomic write via `.tmp` sibling) |
 | uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
 | browser fonts    | `<workspace.path>/work/.fonts/`            |
 | tool-output spills | `<workspace.path>/work/.baybo-tool-spills/` |

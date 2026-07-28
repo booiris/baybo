@@ -132,25 +132,20 @@ pub async fn build_llm_client_for_entry(
     billing: CostHooks,
     proxy: Option<baybo_security::http::ProxySettings>,
 ) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
-    build_llm_client_for_entry_model(
-        entry,
-        &entry.model,
-        registry,
-        blob_store,
-        vault,
-        billing,
-        proxy,
-    )
-    .await
+    let spec = entry
+        .spec_for(&entry.model)
+        .unwrap_or_else(|| baybo_config::LlmModelSpec::bare(entry.model.clone()));
+    build_llm_client_for_entry_model(entry, &spec, registry, blob_store, vault, billing, proxy)
+        .await
 }
 
-/// [`build_llm_client_for_entry`] with an explicit model id — the entry's
-/// provider/credentials/overrides, but a different model. Backs the pool's
-/// per-candidate clients (`model_candidates`): same seam, only `model`
-/// differs. Passing `&entry.model` is exactly the default path.
+/// [`build_llm_client_for_entry`] for one specific model of the entry —
+/// the entry's provider/credentials, plus that model's own overrides.
+/// Backs every client in the pool: the entry's default model, the rest of
+/// its `model_list`, and its `lite_model`.
 pub async fn build_llm_client_for_entry_model(
     entry: &LlmEntry,
-    model: &str,
+    spec: &baybo_config::LlmModelSpec,
     registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn baybo_store::BlobStore>>,
     vault: Option<std::sync::Arc<baybo_security::SecretVault>>,
@@ -175,10 +170,10 @@ pub async fn build_llm_client_for_entry_model(
                 provider: entry.provider.clone(),
                 api_key,
                 base_url: entry.base_url.clone(),
-                model: model.to_string(),
-                supports_vision: entry.supports_vision,
-                context_window: entry.context_window,
-                pricing: entry.pricing,
+                model: spec.model.clone(),
+                supports_vision: spec.supports_vision,
+                context_window: spec.context_window,
+                pricing: spec.pricing,
                 reasoning_effort: entry.reasoning_effort.clone(),
                 vault,
                 proxy,

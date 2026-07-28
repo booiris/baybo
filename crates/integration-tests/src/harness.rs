@@ -33,6 +33,7 @@ use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use chrono::Utc;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -69,7 +70,7 @@ pub struct AgentTestHarness {
     pub token_calibration: Arc<baybo_context::TokenCalibration>,
     /// Session manager backing the wired `ContextManager`. Exposed so
     /// tests can pre-seed session messages or summary metadata before
-    /// driving the agent loop (e.g. compressor fast-path e2e coverage).
+    /// driving the agent loop.
     pub session_manager: Arc<baybo_agent::SessionManager>,
     /// Planning-checklist store shared by the registered `Task*` tools and the
     /// loop's per-turn reminder. Exposed so a task e2e can assert what the
@@ -187,7 +188,6 @@ pub struct AgentTestHarnessBuilder {
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
     workspace: Option<Arc<baybo_workspace::WorkspacePaths>>,
-    background_compression: bool,
     keep_recent: Option<usize>,
     /// Override for the stub LLM's `context_window`, which becomes the
     /// `ContextManager`'s budget cap after `AgentLoop::from_config`
@@ -206,6 +206,7 @@ pub struct AgentTestHarnessBuilder {
     /// fixture whose call blocks until cancelled) when `StubLlm`'s
     /// return-immediately contract doesn't fit.
     llm: Option<Arc<dyn LlmCompletion>>,
+    chat_gate: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -219,12 +220,12 @@ impl Default for AgentTestHarnessBuilder {
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
             workspace: None,
-            background_compression: false,
             keep_recent: None,
             model_context_window: None,
             compression_threshold: None,
             memory: None,
             llm: None,
+            chat_gate: None,
         }
     }
 }
@@ -274,19 +275,11 @@ impl AgentTestHarnessBuilder {
     }
 
     /// Override the workspace handle the `ContextManager` resolves
-    /// per-session paths through (`summary.md`, JSONL transcript).
-    /// Default: a workspace rooted at a non-existent path so the
-    /// fast-path always falls through.
+    /// per-session paths through (today: the JSONL transcript pointer
+    /// baked into a compaction's summary message). Default: a workspace
+    /// rooted at a non-existent path.
     pub fn with_workspace(mut self, workspace: Arc<baybo_workspace::WorkspacePaths>) -> Self {
         self.workspace = Some(workspace);
-        self
-    }
-
-    /// Wire the agent loop's detached background-compression pass. Off by
-    /// default because most tests use a deliberately fake workspace path and
-    /// should never spawn filesystem-writing background work.
-    pub fn with_background_compression(mut self) -> Self {
-        self.background_compression = true;
         self
     }
 
@@ -325,6 +318,20 @@ impl AgentTestHarnessBuilder {
     /// that blocks until its future is dropped, to test in-flight cancellation.
     pub fn with_llm(mut self, llm: Arc<dyn LlmCompletion>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Park the FIRST non-streaming `chat` (the compaction summariser is the
+    /// only caller in these suites) until `release` is notified, signalling
+    /// `entered` first so the test can act while the call is in flight. Later
+    /// calls pass straight through, so a test can hold one compaction and then
+    /// let the next one run normally.
+    ///
+    /// Wraps the harness's OWN stub rather than replacing it — `with_llm`
+    /// swaps the client out entirely, which would silently orphan
+    /// `harness.stub_llm` and every `push_*` the test made.
+    pub fn with_chat_gate(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.chat_gate = Some((entered, release));
         self
     }
 
@@ -388,7 +395,15 @@ impl AgentTestHarnessBuilder {
         // entry name + tokenizer so they stay consistent either way.
         let wired_llm: Arc<dyn baybo_llm::LlmCompletion> = match self.llm {
             Some(custom) => custom,
-            None => stub_llm.clone(),
+            None => match self.chat_gate {
+                Some((entered, release)) => Arc::new(GatedChat {
+                    inner: stub_llm.clone(),
+                    entered,
+                    release,
+                    held: std::sync::atomic::AtomicBool::new(false),
+                }),
+                None => stub_llm.clone(),
+            },
         };
         let mut tool_registry = ToolRegistry::new();
         for (tool, manifest) in self.tools {
@@ -413,13 +428,10 @@ impl AgentTestHarnessBuilder {
         memory_session_store.seed_session(&session);
         let session_store =
             Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
-        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn baybo_session::SessionSummaryStore>;
         let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
             as Arc<dyn baybo_session::SessionFolderStore>;
         let session_manager = Arc::new(baybo_agent::SessionManager::new(
             session_store,
-            summary_store,
             folder_store,
         ));
         let virtual_reads: Option<Arc<dyn baybo_tools::VirtualReadResolver>> =
@@ -444,14 +456,13 @@ impl AgentTestHarnessBuilder {
         // `TokenCalibration` keys observe and adjust identically.
         let stub_model_id = wired_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
-        // Non-existent root → fast-path read hits NotFound → falls
-        // through. No tempdir to clean up.
+        // Non-existent root: nothing under it is read in these tests, so
+        // there is no tempdir to clean up.
         let workspace = self.workspace.unwrap_or_else(|| {
             Arc::new(baybo_workspace::WorkspacePaths::new(PathBuf::from(
                 "/nonexistent-baybo-it-workspace",
             )))
         });
-        let background_workspace = self.background_compression.then(|| Arc::clone(&workspace));
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
         let token_calibration = Arc::new(baybo_context::TokenCalibration::new());
@@ -513,7 +524,6 @@ impl AgentTestHarnessBuilder {
             context_manager,
             max_iterations: 20,
             security_gateway: gateway.clone(),
-            workspace_paths: background_workspace,
             // Mirror what production wires so the `on_session_end` hook
             // (which loads the durable transcript via `SessionManager`) is
             // exercisable from tests instead of bailing at the `sessions`
@@ -597,3 +607,41 @@ fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore
 // Avoid unused-import lints when callers don't reference these types.
 #[allow(dead_code)]
 fn _typecheck_session(_: &User, _: &ChannelType) {}
+
+/// Wraps the harness's stub so the first non-streaming `chat` parks mid-flight.
+///
+/// Exists for one question no other fixture can ask: what happens to work
+/// already in flight when the turn is cancelled. Streaming calls pass straight
+/// through, so only the compaction summariser is held — and only once, so the
+/// test can go on to observe the compaction the next turn runs.
+struct GatedChat {
+    inner: Arc<StubLlm>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    held: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl LlmCompletion for GatedChat {
+    async fn chat(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmResponse> {
+        if !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_waiters();
+            self.release.notified().await;
+        }
+        self.inner.chat(request).await
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &baybo_llm::ChatRequest,
+    ) -> baybo_llm::Result<baybo_llm::LlmStream> {
+        self.inner.chat_stream(request).await
+    }
+
+    fn model_info(&self) -> &baybo_llm::ModelInfo {
+        self.inner.model_info()
+    }
+}

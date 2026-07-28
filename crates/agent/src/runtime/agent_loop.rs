@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
-use baybo_context::{ContextError, ContextManager};
+use baybo_context::ContextManager;
 use baybo_job::{JobInput, JobLifecycle, JobOutput};
 use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
@@ -459,12 +459,24 @@ pub struct AgentLoop {
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
     /// hot-reload takes effect on the next message.
     llm_client: Arc<BillableLlm>,
+    /// Auxiliary model for this turn, re-resolved alongside
+    /// [`Self::llm_client`]. Drives title generation and everything a
+    /// tool reaches through `ToolContext::lite_llm` (the Bash risk
+    /// judges, WebFetch's page summary). Equals `llm_client` when no
+    /// lite model is configured anywhere.
+    ///
+    /// Context compression and the progress observer deliberately stay
+    /// on `llm_client`: their input is the session transcript, i.e. the
+    /// exact prefix provider prompt-caching keeps warm, and that cache is
+    /// per-model — sending it to a second model turns every call into a
+    /// cold full-transcript read.
+    lite_client: Arc<BillableLlm>,
     /// Hot-swappable pool handle this loop re-resolves against per turn.
     llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
     /// actors); `Some` ⇒ a subagent's pinned entry name.
     initial_llm: Option<LlmEntryName>,
-    /// The model WITHIN `initial_llm`'s entry (a `model_candidates` id), or
+    /// The model WITHIN `initial_llm`'s entry (a `model_list` id), or
     /// `None` for the entry's default model. Paired with `initial_llm`
     /// through every re-resolve so a per-session model pick takes effect.
     initial_model: Option<String>,
@@ -479,14 +491,9 @@ pub struct AgentLoop {
     max_iterations: usize,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
-    /// Resolved workspace paths. Today only the background-summary
-    /// pass reads it (to write `summary.md`); other future system
-    /// work may want it too. `None` in tests that don't exercise such
-    /// passes.
-    workspace_paths: Option<Arc<baybo_workspace::WorkspacePaths>>,
-    /// Cross-session manager — used by passes that operate across
-    /// sessions (today: background summary, for transcript loads and
-    /// summary metadata writes). Distinct from the `SessionManager`
+    /// Cross-session manager — used by passes that operate across sessions
+    /// (the session-end memory write, the progress observer's durable
+    /// shadow, title generation). Distinct from the `SessionManager`
     /// plumbed inside `ContextManager` because that one is
     /// per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
@@ -510,28 +517,6 @@ pub struct AgentLoop {
     /// the first injection. With both starting at `0`, the throttle holds the
     /// reminder for the first [`TURNS_SINCE_WRITE`] turns of a session.
     last_reminder_turn: u64,
-    /// At-most-one handle for the in-actor background-summary pass. The
-    /// trigger gate ([`Self::maybe_run_background_compression`]) checks
-    /// it before spawning: a present, not-yet-finished handle means a
-    /// pass is already running for this session, so a second is skipped.
-    /// Detached (its own fresh `CancellationToken`, NOT derived from the
-    /// surrounding actor's token) so the idle reaper cancelling that
-    /// token can't kill an in-flight pass — mirrors
-    /// [`Self::spawn_session_end_write`].
-    bg_compression: Option<tokio::task::JoinHandle<()>>,
-    /// `up_to_ordinal` of the last pass that landed no `Edit`, published by
-    /// the detached pass itself (hence the shared cell).
-    ///
-    /// The summary *cursor* records what `summary.md` covers, so an
-    /// unproductive pass must not advance it. But the in-memory *anchor*
-    /// records how much new material has piled up since we last spent a pass
-    /// on this session, and we did spend one — it just came back empty.
-    /// Because the anchor is otherwise only ever synced from the cursor, an
-    /// unproductive pass advanced neither, leaving the diff gate satisfied and
-    /// the pass re-firing at the very next boundary. Syncing the anchor to the
-    /// attempted ordinal re-arms that gate on the same work-proportional terms
-    /// as a successful pass, with no wall-clock component.
-    bg_compression_unproductive_at: Arc<parking_lot::Mutex<Option<i64>>>,
     /// Once-per-actor title-generation guard. Durable `Session.title`
     /// prevents repeats after rehydration.
     title_generation: Option<tokio::task::JoinHandle<()>>,
@@ -566,11 +551,8 @@ pub struct AgentLoopConfig {
     pub context_manager: ContextManager,
     pub max_iterations: usize,
     pub security_gateway: Arc<SecurityGateway>,
-    /// Workspace paths. Used by the background-summary pass to write
-    /// on-disk `summary.md`.
-    pub workspace_paths: Option<Arc<baybo_workspace::WorkspacePaths>>,
-    /// Cross-session manager. Used by the background-summary pass for
-    /// transcript loads + summary metadata writes.
+    /// Cross-session manager. Used by the session-end memory write, the
+    /// progress observer's durable shadow, and title generation.
     pub sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory handle — one registered implementation, or
     /// `None` to disable the memory hooks (recall / `on_job_complete`).
@@ -615,20 +597,25 @@ impl AgentLoop {
             context_manager,
             max_iterations,
             security_gateway,
-            workspace_paths,
             sessions,
             memory,
             task_store,
             title_sink,
         } = config;
-        let (llm_client, _effective_name) = llm_pool
-            .read()
-            .resolve(initial_llm.as_ref(), initial_model.as_deref());
+        let (llm_client, lite_client) = {
+            let pool = llm_pool.read();
+            let (client, _effective_name) =
+                pool.resolve(initial_llm.as_ref(), initial_model.as_deref());
+            let (lite, _lite_name) =
+                pool.resolve_lite(initial_llm.as_ref(), initial_model.as_deref());
+            (client, lite)
+        };
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
 
         Self {
             llm_client,
+            lite_client,
             llm_pool,
             initial_llm,
             initial_model,
@@ -639,15 +626,12 @@ impl AgentLoop {
             max_iterations,
             security_gateway,
             error_handler: ErrorHandler::default(),
-            workspace_paths,
             sessions,
             memory,
             task_store,
             turn_counter: 0,
             last_task_management_turn: 0,
             last_reminder_turn: 0,
-            bg_compression: None,
-            bg_compression_unproductive_at: Arc::new(parking_lot::Mutex::new(None)),
             title_generation: None,
             title_sink,
             read_tracker: ReadTracker::default(),
@@ -735,6 +719,13 @@ impl AgentLoop {
         let pool = Arc::clone(&self.llm_pool.read());
         let (client, _name) =
             pool.resolve(self.initial_llm.as_ref(), self.initial_model.as_deref());
+        // Resolved unconditionally: the lite cascade can change without the
+        // main client changing (an entry gaining a `lite_model`, or the Lite
+        // tier being re-pointed), and the pointer check below would then
+        // short-circuit past it.
+        let (lite, _lite_name) =
+            pool.resolve_lite(self.initial_llm.as_ref(), self.initial_model.as_deref());
+        self.lite_client = lite;
         // Compare by pointer, not model id: a config reload swaps in a
         // fresh `Arc<BillableLlm>` even when the model id is unchanged
         // (a `base_url`, credential, `reasoning_effort`, or
@@ -1051,16 +1042,6 @@ impl AgentLoop {
 
             match outcome {
                 IterationOutcome::Final { outgoing } => {
-                    // End-of-job summary-refresh check. The activity
-                    // disjunct is satisfied by `job_done = true`;
-                    // the tokens / diff conjuncts still apply.
-                    self.maybe_run_background_compression(
-                        session,
-                        span_recorder,
-                        job_id,
-                        /* job_done */ true,
-                    )
-                    .await;
                     // Capture the memory write inputs and return them up to
                     // `run()` — the actual `spawn_job_complete_write` fires
                     // **after** `with_job` accepts the job, so a cancel-race
@@ -1084,17 +1065,6 @@ impl AgentLoop {
                         // anchor: the model just touched the list, so don't nag.
                         self.last_task_management_turn = self.turn_counter;
                     }
-
-                    // Tool results are now appended and durable, so this
-                    // tool-round boundary can spawn a detached background
-                    // summary as a Compression step under the current job.
-                    self.maybe_run_background_compression(
-                        session,
-                        span_recorder,
-                        job_id,
-                        /* job_done */ false,
-                    )
-                    .await;
 
                     // Observe only after a resolved tool round: the snapshot is
                     // coherent (no dangling tool_use) and never spawned for a
@@ -1305,7 +1275,11 @@ impl AgentLoop {
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
-        let llm_for_calls = Arc::clone(&self.llm_client);
+        // Tools get the LITE client: every consumer of the tool-layer
+        // side-LLM slot is an auxiliary call (the Bash risk judges,
+        // WebFetch's page summary), and none of them sends the session
+        // transcript, so there is no prompt cache to lose.
+        let llm_for_calls = Arc::clone(&self.lite_client);
         let registry_for_calls = Arc::clone(&self.tool_registry);
         // Promote the previous response's staged reads before this batch runs,
         // so a `Read` and an `Edit`/`Write` of the same file in THIS response
@@ -2548,9 +2522,7 @@ impl AgentLoop {
         );
         let model_id = runner.model_info.id.clone();
         // `needs_compression` mirrors `maybe_compress`'s gate, so we only
-        // report the phase when a pass will actually run; the `Compacted`
-        // end always follows the `Compacting` start (emitted even on a
-        // compress error) so the status line never dangles.
+        // report the phase when a pass will actually run.
         let compacting = self.context_manager.needs_compression(&model_id);
         if compacting {
             self.emit_status(delta_tx, session, TurnStatus::Compacting)
@@ -2559,10 +2531,13 @@ impl AgentLoop {
         let result = self
             .context_manager
             .maybe_compress(&model_id, |req, marker| async move {
-                runner.run(req, marker).await.map(|run| run.response)
+                runner.run(req, marker).await
             })
             .await;
-        if compacting {
+        // The `Compacted` end always follows the `Compacting` start so the
+        // status line never dangles — except on a cancel, where the compaction
+        // was abandoned and the turn is unwinding behind it.
+        if compacting && !cancel_token.is_cancelled() {
             self.emit_status(delta_tx, session, TurnStatus::Compacted)
                 .await;
         }
@@ -2581,12 +2556,12 @@ impl AgentLoop {
 
     /// Record a compaction that shrank the transcript without an LLM call.
     ///
-    /// The stored-summary and truncate stages never invoke the chat callback,
-    /// so `CompressionRunner` — which owns the step for the live-summary stage
-    /// — never runs for them. Without this the threshold trim that swaps in
-    /// `summary.md`, i.e. the moment the model's input context actually
-    /// changed, leaves no trace at all. The step carries no span by design:
-    /// there was no model round-trip to span.
+    /// The truncate fallback never invokes the chat callback, so
+    /// `CompressionRunner` — which owns the step for the live-summary path —
+    /// never runs for it. Without this, a compaction that fell back to
+    /// truncation leaves no trace at all, even though it is the one that
+    /// discarded the most. The step carries no span by design: there was no
+    /// model round-trip to span.
     async fn record_spanless_compaction(
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
@@ -2594,10 +2569,9 @@ impl AgentLoop {
         stage: baybo_context::CompressionStage,
     ) {
         let applied = match stage {
-            // The live-summary stage already recorded its own step around the
+            // The live-summary path already recorded its own step around the
             // LLM call; recording a second one here would double-count it.
             baybo_context::CompressionStage::LiveSummary => return,
-            baybo_context::CompressionStage::StoredSummary => CompressionApplied::StoredSummary,
             baybo_context::CompressionStage::Truncate => CompressionApplied::Truncate,
         };
         let kind = StepKind::Compression {
@@ -2866,7 +2840,7 @@ impl AgentLoop {
                 let outcome = self
                     .context_manager
                     .force_compress(&model_id, |req, marker| async move {
-                        runner.run(req, marker).await.map(|run| run.response)
+                        runner.run(req, marker).await
                     })
                     .await?;
                 if let baybo_context::CompressionOutcome::Compressed { stage } = &outcome {
@@ -2891,6 +2865,9 @@ impl AgentLoop {
                     baybo_context::CompressionOutcome::NoSavings => {
                         "Compression ran but produced no savings; kept the original.".to_string()
                     }
+                    baybo_context::CompressionOutcome::Cancelled => {
+                        "Compaction cancelled; the conversation is unchanged.".to_string()
+                    }
                 };
                 let output = JobOutput::Message {
                     content: vec![ContentBlock::Text(text.clone())],
@@ -2901,133 +2878,6 @@ impl AgentLoop {
             },
         )
         .await
-    }
-
-    /// Parent-side trigger gate + in-actor detached background-summary
-    /// spawn. Fires at iteration boundaries and on terminal-state
-    /// commit. When tokens and activity have crossed their thresholds
-    /// (see [`ContextManager::maybe_request_background_summary`]) it
-    /// `tokio::spawn`s a DETACHED background-summary pass attributed to
-    /// **this** (parent) session and recorded as `StepKind::Compression`
-    /// under the current turn job. Fire-and-forget: the user's turn never
-    /// blocks on it.
-    ///
-    /// `job_done = true` is passed at end-of-job (where the activity
-    /// disjunct is trivially satisfied); `false` at iteration boundaries
-    /// (where it relies on `tool_calls_since_anchor` exceeding the
-    /// threshold).
-    ///
-    /// **At-most-one** is enforced in-memory by [`Self::bg_compression`]:
-    /// if a pass is already running (handle present and not finished) we
-    /// skip rather than spawn a second. No durable in-flight flag.
-    ///
-    /// **Detached cancel token.** The pass gets a fresh
-    /// [`CancellationToken::new`] — NOT derived from the surrounding
-    /// actor's token — so the idle reaper cancelling that token can't
-    /// tear down an in-flight pass. Mirrors
-    /// [`Self::spawn_session_end_write`].
-    ///
-    /// **Anchor-cursor sync** lives in
-    /// `maybe_request_background_summary`: it reads
-    /// `session_summaries.cursor` and `sync_anchor_to_cursor`s the
-    /// in-memory anchor forward *before* measuring the anchor-relative
-    /// thresholds, so a session that crossed 50% once doesn't re-fire on
-    /// every later job.
-    async fn maybe_run_background_compression(
-        &mut self,
-        session: &Session,
-        span_recorder: &Arc<SpanRecorder>,
-        current_job_id: JobId,
-        job_done: bool,
-    ) {
-        // Subagents run a single spawned task to completion and are never
-        // resumed, so a precomputed `summary.md` — which only ever feeds a
-        // *future* inline compaction of the same session — can't pay off.
-        // Skip rather than spend an agentic Read/Edit loop (a runaway one when
-        // the model won't converge) on a summary nothing will read. Root
-        // User/Cron sessions still run it.
-        if is_subagent(session) {
-            return;
-        }
-
-        // At-most-one: a still-running pass blocks a second.
-        if let Some(handle) = self.bg_compression.as_ref()
-            && !handle.is_finished()
-        {
-            return;
-        }
-
-        // Charge the last unproductive pass to the diff gate before measuring
-        // it: that pass read the transcript up to this ordinal and produced
-        // nothing, so the material below it has already been paid for once.
-        // `sync_anchor_to_cursor` is monotonic and no-ops on an ordinal the
-        // transcript no longer carries.
-        let unproductive_at = self.bg_compression_unproductive_at.lock().take();
-        if let Some(ordinal) = unproductive_at {
-            self.context_manager.sync_anchor_to_cursor(ordinal).await;
-        }
-
-        let Some(payload) = self
-            .context_manager
-            .maybe_request_background_summary(job_done)
-            .await
-        else {
-            return;
-        };
-
-        // The pass writes on-disk `summary.md` + cross-session metadata,
-        // so both deps are required. Unwired only in test harnesses that
-        // don't exercise the pass — skip silently there.
-        let (Some(workspace_paths), Some(sessions)) =
-            (self.workspace_paths.clone(), self.sessions.clone())
-        else {
-            return;
-        };
-
-        // Pre-extract everything the 'static task needs — the spawned
-        // future cannot borrow `&self` / `&session`. The pass bills +
-        // traces against this session and the current turn job.
-        let session_id = session.id.clone();
-        let user_id = session.user.id.clone();
-        let llm_client = self.llm_client.clone();
-        let security_gateway = self.security_gateway.clone();
-        let tokenizer = Arc::clone(self.context_manager.tokenizer());
-        let model_info = self.llm_client.model_info().clone();
-        let recorder = Arc::clone(span_recorder);
-
-        // Fresh, never-cancelled token — NOT a child of the actor's
-        // token. The idle reaper cancels the actor token; deriving from
-        // it would let a reap mid-pass tear the summary down. Mirrors
-        // `spawn_session_end_write`.
-        let cancel_token = CancellationToken::new();
-        let unproductive_at = Arc::clone(&self.bg_compression_unproductive_at);
-        let attempted_ordinal = payload.up_to_ordinal;
-
-        let handle = tokio::spawn(async move {
-            let runner = crate::runtime::compression::BackgroundCompressionRunner {
-                llm_client,
-                security_gateway,
-                sessions,
-                workspace_paths,
-                tokenizer,
-                recorder,
-                model_info,
-                session_id,
-                user_id,
-                job_id: current_job_id,
-                cancel_token,
-            };
-            // A transient LLM failure is deliberately NOT charged here: it
-            // produced no work and the documented behaviour is to retry it
-            // freely on the next boundary.
-            if let Err(e) = runner.run(payload).await {
-                if matches!(e, ContextError::UnproductiveSummary(_)) {
-                    *unproductive_at.lock() = Some(attempted_ordinal);
-                }
-                warn!(error = %e, "background summary pass failed");
-            }
-        });
-        self.bg_compression = Some(handle);
     }
 
     /// One-shot conversation-title seed. Called at the **start** of
@@ -3089,9 +2939,9 @@ impl AgentLoop {
 
         let session_id = session.id.clone();
         let user_id = session.user.id.clone();
-        let llm_client = self.llm_client.clone();
+        let llm_client = self.lite_client.clone();
         let security_gateway = self.security_gateway.clone();
-        let model_info = self.llm_client.model_info().clone();
+        let model_info = self.lite_client.model_info().clone();
         let recorder = Arc::clone(span_recorder);
         let cancel_token = cancel_token.clone();
 
@@ -3123,11 +2973,19 @@ impl AgentLoop {
     }
 }
 
+/// Cap on the opening message handed to title generation. Naming a
+/// conversation never needs more than its first couple of paragraphs, and
+/// the message is unbounded user input — a pasted log as the first turn
+/// would otherwise be sent verbatim, which a small lite model may not even
+/// have the window for.
+const TITLE_QUESTION_MAX_CHARS: usize = 2_000;
+
 /// Extract the session's first genuine user question from the transcript:
 /// the first `MessageSource::User` row that actually carries text (a
 /// media-only opener — an uncaptioned image with no `Text` block — is
 /// skipped, so a session that opens with media then a real question still
 /// titles from the question). `None` when there is no text-bearing user row.
+/// Truncated to [`TITLE_QUESTION_MAX_CHARS`].
 fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
     messages
         .iter()
@@ -3144,17 +3002,39 @@ fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
                 .join("\n");
             let text = text.trim();
             if text.is_empty() {
-                None
-            } else {
-                Some(text.to_string())
+                return None;
             }
+            Some(match text.char_indices().nth(TITLE_QUESTION_MAX_CHARS) {
+                Some((cut, _)) => text[..cut].to_string(),
+                None => text.to_string(),
+            })
         })
 }
 
 #[cfg(test)]
 mod first_user_question_tests {
+    use super::TITLE_QUESTION_MAX_CHARS;
     use super::first_user_question;
     use baybo_model::{ChatMessage, ContentBlock};
+
+    /// The opener is unbounded user input; a pasted log must not ride
+    /// into the title prompt verbatim.
+    #[test]
+    fn a_long_opener_is_truncated() {
+        let long = "x".repeat(TITLE_QUESTION_MAX_CHARS * 3);
+        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
+        let q = first_user_question(&msgs).expect("text-bearing row");
+        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
+    }
+
+    /// Truncation slices on a char boundary, not a byte one.
+    #[test]
+    fn truncation_is_char_boundary_safe() {
+        let long = "\u{03b1}\u{03b2}\u{03b3}".repeat(TITLE_QUESTION_MAX_CHARS);
+        let msgs = vec![ChatMessage::user(vec![ContentBlock::Text(long)])];
+        let q = first_user_question(&msgs).expect("text-bearing row");
+        assert_eq!(q.chars().count(), TITLE_QUESTION_MAX_CHARS);
+    }
 
     #[test]
     fn picks_first_genuine_user_row_over_injected_and_assistant() {
@@ -3663,69 +3543,6 @@ mod session_end_gate_tests {
             TriggerSource::User,
             Some(lineage)
         )));
-    }
-}
-
-#[cfg(test)]
-mod bg_compression_at_most_one_tests {
-    //! Focused coverage of the at-most-one gate in
-    //! [`super::AgentLoop::maybe_run_background_compression`]:
-    //!
-    //! ```ignore
-    //! if let Some(handle) = self.bg_compression.as_ref()
-    //!     && !handle.is_finished() { return; }   // skip — pass already running
-    //! ```
-    //!
-    //! Wiring a full `AgentLoop` (LLM pool, tool registry/executor,
-    //! `ContextManager`, span recorder, …) into a unit test is
-    //! disproportionately heavy, so this asserts the load-bearing
-    //! predicate directly against real `tokio::task::JoinHandle`s — a
-    //! present, not-yet-finished handle blocks; a finished or absent one
-    //! lets the spawn through. The end-to-end "no second maintenance
-    //! session" behavior is covered in
-    //! `integration-tests/tests/background_compression_e2e.rs`.
-
-    use tokio::sync::oneshot;
-
-    /// Mirror of the gate: returns `true` when a NEW pass may be spawned.
-    fn may_spawn(handle: &Option<tokio::task::JoinHandle<()>>) -> bool {
-        !matches!(handle.as_ref(), Some(h) if !h.is_finished())
-    }
-
-    #[tokio::test]
-    async fn none_handle_allows_spawn() {
-        let handle: Option<tokio::task::JoinHandle<()>> = None;
-        assert!(may_spawn(&handle), "no in-flight pass ⇒ spawn allowed");
-    }
-
-    #[tokio::test]
-    async fn unfinished_handle_blocks_second_spawn() {
-        // A task parked on a oneshot stays unfinished until we release it.
-        let (tx, rx) = oneshot::channel::<()>();
-        let handle = Some(tokio::spawn(async move {
-            let _ = rx.await;
-        }));
-        assert!(
-            !may_spawn(&handle),
-            "an unfinished in-flight pass must block a second spawn"
-        );
-        // Release so the parked task can complete.
-        let _ = tx.send(());
-    }
-
-    #[tokio::test]
-    async fn finished_handle_allows_spawn() {
-        // Spawn a trivial task and await it so the handle is observably
-        // finished, then re-check via a fresh `is_finished()` read. We
-        // keep the awaited handle (await on `&mut`) so `may_spawn` can
-        // inspect the same, now-finished, handle.
-        let mut h = tokio::spawn(async {});
-        (&mut h).await.unwrap();
-        let handle = Some(h);
-        assert!(
-            may_spawn(&handle),
-            "a finished pass must not block the next spawn"
-        );
     }
 }
 

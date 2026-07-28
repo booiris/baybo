@@ -1708,9 +1708,7 @@ mod foreground_job_tests {
     //! the convert/escort plumbing it calls is exercised end-to-end by the
     //! integration suite.
     use super::*;
-    use baybo_session::test_support::{
-        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
-    };
+    use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
 
     fn test_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
@@ -1720,7 +1718,6 @@ mod foreground_job_tests {
     fn test_session_manager() -> Arc<SessionManager> {
         Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
-            Arc::new(MemorySessionSummaryStore::new()),
             Arc::new(MemorySessionFolderStore::new()),
         ))
     }

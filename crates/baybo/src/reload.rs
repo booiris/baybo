@@ -30,22 +30,24 @@ use tracing::{info, warn};
 use crate::boot;
 
 /// The built LLM clients for a config: one default-model client per entry,
-/// plus a client per `model_candidates` model, plus the per-entry pinnable
-/// model list — everything [`baybo_agent::LlmClientPool::with_candidates`]
-/// needs. `dropped` names entries whose DEFAULT client failed to build.
+/// plus a client per further `model_list` model, plus the per-entry pinnable
+/// model list and lite client — everything
+/// [`baybo_agent::LlmPoolConfig`] needs. `dropped` names entries whose
+/// DEFAULT client failed to build.
 pub(crate) struct BuiltPoolClients {
     pub clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
     pub overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
     pub entry_models: HashMap<LlmEntryName, Vec<String>>,
+    pub lite: HashMap<LlmEntryName, Arc<BillableLlm>>,
     pub dropped: Vec<LlmEntryName>,
 }
 
-/// Build every LLM client a config implies, concurrently: each entry's
-/// default model AND each of its `model_candidates`. Failure policy: a
+/// Build every LLM client a config implies, concurrently: one per
+/// `(entry, model)` across each entry's `models()`. Failure policy: a
 /// **default** entry whose default model fails to build is a hard error (the
 /// pool would be unusable); any other build failure (a non-default entry, or
-/// any candidate) is dropped with a `warn!`. Only models that actually built
-/// a client are pinnable, so `entry_models` lists just those.
+/// any non-default model) is dropped with a `warn!`. Only models that
+/// actually built a client are pinnable, so `entry_models` lists just those.
 pub(crate) async fn build_pool_clients(
     config: &BayboConfig,
     registry: &LlmProviderRegistry,
@@ -55,13 +57,13 @@ pub(crate) async fn build_pool_clients(
 ) -> anyhow::Result<BuiltPoolClients> {
     let proxy = boot::proxy_settings(config);
 
-    // One build job per (entry, model). `is_default` marks the entry's
-    // primary model (goes into `clients`); the rest are candidates
-    // (`overrides`). Candidates equal to the default model are skipped —
-    // the default client already covers them.
+    // One build job per (entry, model) across the entry's normalized
+    // `models()`. `is_default` marks the entry's primary model (goes into
+    // `clients`); the rest go to `overrides`. A model listed twice builds
+    // once.
     struct Job<'a> {
         entry: &'a baybo_config::LlmEntry,
-        model: String,
+        spec: baybo_config::LlmModelSpec,
         is_default: bool,
     }
     let jobs: Vec<Job<'_>> = config
@@ -69,22 +71,15 @@ pub(crate) async fn build_pool_clients(
         .iter()
         .flat_map(|entry| {
             let mut seen = std::collections::HashSet::new();
-            seen.insert(entry.model.clone());
-            let default = Job {
-                entry,
-                model: entry.model.clone(),
-                is_default: true,
-            };
-            let candidates = entry
-                .model_candidates
-                .iter()
-                .filter(move |m| seen.insert((*m).clone()))
-                .map(move |m| Job {
+            entry
+                .models()
+                .into_iter()
+                .filter(move |spec| seen.insert(spec.model.clone()))
+                .map(move |spec| Job {
                     entry,
-                    model: m.clone(),
-                    is_default: false,
-                });
-            std::iter::once(default).chain(candidates)
+                    is_default: spec.model == entry.model,
+                    spec,
+                })
         })
         .collect();
 
@@ -96,7 +91,7 @@ pub(crate) async fn build_pool_clients(
         async move {
             let r = boot::build_llm_client_for_entry_model(
                 job.entry,
-                &job.model,
+                &job.spec,
                 registry,
                 Some(blob),
                 Some(vault),
@@ -104,7 +99,7 @@ pub(crate) async fn build_pool_clients(
                 proxy,
             )
             .await;
-            (job.entry.name.clone(), job.model, job.is_default, r)
+            (job.entry.name.clone(), job.spec.model, job.is_default, r)
         }
     }))
     .await;
@@ -138,27 +133,31 @@ pub(crate) async fn build_pool_clients(
                     entry = %name,
                     model = %model,
                     error = %e,
-                    "failed to build LLM client for candidate model; it is unpickable until resolved"
+                    "failed to build LLM client for listed model; it is unpickable until resolved"
                 );
             }
         }
     }
 
-    // A candidate is only pinnable if its entry's default client also built.
-    // `entry_models[name] = [default] + surviving candidates`, in config order.
+    // A non-default model is only pinnable if its entry's default client
+    // also built. `entry_models[name]` follows `models()` order, which is
+    // the chat picker's order.
     let mut entry_models: HashMap<LlmEntryName, Vec<String>> = HashMap::new();
     for entry in &config.llm {
-        if let Some(client) = clients.get(&entry.name) {
-            let mut models = vec![client.model_info().id.clone()];
-            for candidate in &entry.model_candidates {
-                if candidate != &entry.model
-                    && candidate_ok
-                        .iter()
-                        .any(|(n, m)| n == &entry.name && m == candidate)
-                {
-                    models.push(candidate.clone());
-                }
-            }
+        if clients.contains_key(&entry.name) {
+            let mut seen = std::collections::HashSet::new();
+            let models: Vec<String> = entry
+                .models()
+                .into_iter()
+                .map(|spec| spec.model)
+                .filter(|model| seen.insert(model.clone()))
+                .filter(|model| {
+                    model == &entry.model
+                        || candidate_ok
+                            .iter()
+                            .any(|(n, m)| n == &entry.name && m == model)
+                })
+                .collect();
             entry_models.insert(entry.name.clone(), models);
         } else {
             // Entry's default failed → drop any candidates that built for it.
@@ -166,10 +165,53 @@ pub(crate) async fn build_pool_clients(
         }
     }
 
+    // `validate()` guarantees `lite_model` names one of the entry's own
+    // models, so the client already exists — this is a lookup, never a
+    // second build.
+    //
+    // A surviving entry that declares a lite model and hasn't got one is a
+    // HARD error, unlike a merely-unpickable `model_list` model. Strictness
+    // tracks observability, not importance: a dropped pickable model is
+    // visible the moment a user opens the picker, whereas a dropped lite
+    // has no symptom at all beyond the bill quietly staying at main-model
+    // rates. Client construction is local and offline, so this can only
+    // fire on a deterministic config error, never on provider flap.
+    let mut lite = HashMap::new();
+    for entry in &config.llm {
+        let Some(model) = entry.lite_model.as_deref() else {
+            continue;
+        };
+        // An entry whose own default failed is already dropped; chasing its
+        // lite would just be a secondary failure of a thing nobody can use.
+        let Some(default_client) = clients.get(&entry.name) else {
+            continue;
+        };
+        let client = if model == entry.model {
+            Some(default_client.clone())
+        } else {
+            overrides
+                .get(&(entry.name.clone(), model.to_string()))
+                .cloned()
+        };
+        match client {
+            Some(client) => {
+                lite.insert(entry.name.clone(), client);
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "llm entry {:?} declares lite_model {model:?} but no client for it was built; \
+                     it must name one of the entry's model_list models and that model must build",
+                    entry.name.as_str(),
+                ));
+            }
+        }
+    }
+
     Ok(BuiltPoolClients {
         clients,
         overrides,
         entry_models,
+        lite,
         dropped,
     })
 }
@@ -190,12 +232,21 @@ pub(crate) fn pricing_overlay(built: &BuiltPoolClients) -> HashMap<String, Model
         .collect()
 }
 
-/// `(provider, model)` pairs for the OpenRouter live-pricing refresh.
+/// `(provider, model)` pairs for the OpenRouter live-pricing refresh —
+/// every model of every entry, not just each entry's default. A model the
+/// refresh loop never asks about keeps its boot-time snapshot price
+/// forever, which used to silently apply to every non-default model.
 pub(crate) fn refresh_pairs(config: &BayboConfig) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
     config
         .llm
         .iter()
-        .map(|e| (e.provider.clone(), e.model.clone()))
+        .flat_map(|e| {
+            e.models()
+                .into_iter()
+                .map(move |spec| (e.provider.clone(), spec.model))
+        })
+        .filter(|pair| seen.insert(pair.clone()))
         .collect()
 }
 
@@ -306,13 +357,14 @@ impl LlmReloader {
         .map_err(|e| e.to_string())?;
         let overlay = pricing_overlay(&built);
         let dropped = built.dropped.clone();
-        let pool = LlmClientPool::with_candidates(
-            built.clients,
-            built.overrides,
-            built.entry_models,
-            new.default_llm.clone(),
-            new.agent.model_tiers.clone(),
-        )?;
+        let pool = LlmClientPool::from_config(baybo_agent::LlmPoolConfig {
+            clients: built.clients,
+            overrides: built.overrides,
+            entry_models: built.entry_models,
+            lite: built.lite,
+            default_name: new.default_llm.clone(),
+            tier_map: new.agent.model_tiers.clone(),
+        })?;
         let active_model = pool.default_client().model_info().id.clone();
         let mut entries: Vec<String> = pool
             .entry_names()
@@ -505,5 +557,69 @@ impl ConfigReloader for RuntimeConfigReloader {
             .await
             .map_err(ReloadError::LlmRebuild)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baybo_config::{LlmEntry, LlmModelSpec};
+
+    fn entry(name: &str, provider: &str, model: &str, list: Vec<LlmModelSpec>) -> LlmEntry {
+        LlmEntry {
+            name: LlmEntryName::from(name),
+            provider: provider.into(),
+            model: model.into(),
+            model_list: list,
+            lite_model: None,
+            api_key_env: None,
+            base_url: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn config_with(entries: Vec<LlmEntry>) -> BayboConfig {
+        let default = entries[0].name.clone();
+        BayboConfig {
+            llm: entries,
+            default_llm: default,
+            ..Default::default()
+        }
+    }
+
+    /// Every model gets live pricing, not just each entry's default —
+    /// a model the refresh loop never asks about keeps its boot-time
+    /// snapshot price forever.
+    #[test]
+    fn refresh_pairs_covers_every_model_of_every_entry() {
+        let cfg = config_with(vec![
+            entry(
+                "primary",
+                "openai",
+                "gpt-5",
+                vec![LlmModelSpec::bare("gpt-5-mini")],
+            ),
+            entry("alt", "anthropic", "claude-opus-4", vec![]),
+        ]);
+        let pairs = refresh_pairs(&cfg);
+        assert_eq!(
+            pairs,
+            vec![
+                ("openai".to_string(), "gpt-5".to_string()),
+                ("openai".to_string(), "gpt-5-mini".to_string()),
+                ("anthropic".to_string(), "claude-opus-4".to_string()),
+            ]
+        );
+    }
+
+    /// Two entries on the same provider+model must not queue the same
+    /// OpenRouter lookup twice.
+    #[test]
+    fn refresh_pairs_dedupes_across_entries() {
+        let cfg = config_with(vec![
+            entry("a", "openai", "gpt-5", vec![]),
+            entry("b", "openai", "gpt-5", vec![]),
+        ]);
+        assert_eq!(refresh_pairs(&cfg).len(), 1);
     }
 }

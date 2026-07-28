@@ -71,6 +71,37 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`) may opt into `#[serde(deny_unknown_fields)]` individually; today no section has. The root `BayboConfig` intentionally keeps permissive semantics.
 
+### LLM entries and `model_list`
+
+An `LlmEntry` splits into two halves that behave differently:
+
+- **The entry** owns what its models genuinely share: `provider`, `base_url`, `api_key_env`, and `reasoning_effort`. Effort sits here because it is a *preference*, not a fact about a model — a session's own thinking-level pick (`sessions.last_effort`) overrides it per request, and the provider clamps it to what the chosen model allows.
+- **`model_list`** owns per-model facts: `context_window`, `pricing`, `supports_vision`. Every item is an object `{model, context_window?, pricing?, supports_vision?}` — one shape, whether or not the model carries overrides.
+
+`model` names the entry's default. `LlmEntry::models()` normalizes with one rule — **prepend `model` when `model_list` doesn't already contain it** — so listing only the *extra* models is equivalent to listing the default first, and both resolve to `[default, …rest]`. An operator who lists the default explicitly keeps control of its position, and that order is the chat model picker's order.
+
+Effective value = the model's own spec field → the provider factory's per-model resolution (bundled OpenRouter snapshot, keyed by model slug) → a per-provider constant. An unset override is therefore already per-model-correct; the spec only exists for the cases the snapshot gets wrong.
+
+`lite_model` names one of the entry's models — the cheaper one used for the agent's **auxiliary** LLM calls. It is validated against `models()` in `validate()`, not at client-build time, so a stranded reference is rejected by a reload dry-run without constructing anything, and no separate client is ever built for it (it is by definition one of the entry's own models).
+
+Resolution, most specific first (`LlmClientPool::resolve_lite`):
+
+1. the resolved entry's own `lite_model` — same provider, same credentials, so nothing the user typed changes hands;
+2. otherwise `agent.model_tiers.lite`, that entry's **default** model — no second hop into *its* `lite_model`;
+3. otherwise the session's own client, i.e. the pre-`lite_model` behaviour.
+
+Step 3 is not optional. The Bash risk judges are fail-closed, so a "no lite configured" answer of `None` would silently turn the default `permission = auto` from "judge every destructive command" into "prompt on every destructive command".
+
+Which calls are auxiliary is decided by one rule: **an auxiliary call may use the lite model only if its input is not the session transcript.** The Bash risk judges (a command line), WebFetch's page summary (a fetched page), and title generation (one user message) qualify. Context compression and the progress observer do not — their input is the exact prefix provider prompt-caching keeps warm, and that cache is per-model, so moving them would trade a cache hit for a cold full-transcript read and can cost *more* than the model it saves.
+
+`baybo setup` / `baybo llm add` seed `lite_model` to the entry's **own** model. That is a behavioural no-op — resolution step 1 then hands back the entry's default client, exactly as an unset field would — written purely so the knob is visible: the field is `skip_serializing_if = "Option::is_none"`, so leaving it unset means an operator has no way to learn from their own config file that the auxiliary calls can be moved to a cheaper model. Editing it to a cheaper entry model is the intended next step.
+
+A `lite_model` is never added to the entry's pinnable set: it is what the runtime picks for itself, not a menu item. An operator who wants it in the chat picker lists it in `model_list` as well, and it is then built once and serves both roles.
+
+The entry-level `context_window` / `pricing` / `supports_vision` keys that predate `model_list` are simply **gone** — no tombstone field, no migration check. A config still carrying them parses, and the keys are ignored like any other unknown key (§"Unknown fields"); the affected models fall back to the factory's per-model resolution. This follows the repo rule against legacy-data migrations: remove the field and its consumers, leave the orphaned data inert.
+
+The `PUT /v1/llm/models/{name}` admin endpoint and `baybo llm edit` both address the **default** model's spec when they set one of the three (materialising it at the front of `model_list` if needed). Overrides for an entry's other models are config-file edits only.
+
 ### Secret handling
 
 Config does **not** store live secret values; it stores references:
@@ -84,8 +115,8 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 
 | Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
 | ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `llm`      | `Vec<LlmEntry>` + `default-llm: LlmEntryName` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, api_key_env?, base_url?, supports_vision?, context_window?, pricing?, reasoning_effort?}` record. `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
-| `agent`    | `AgentLoopConfig` (`max_iterations`) + `ContextManager`/`TokenBudget` (context budget, `keep_recent`) + subagent caps + tier map | Carries `max_iterations`, the context-window budget, `max_subagent_depth`, `max_subagents_per_root`, and `model_tiers` (`ModelTier` → `LlmEntryName`). Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s). |
+| `llm`      | `Vec<LlmEntry>` + `default-llm: LlmEntryName` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, model_list?, lite_model?, api_key_env?, base_url?, reasoning_effort?}` record — provider + credentials on the entry, per-model facts in `model_list`. See §"LLM entries and `model_list`". `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
+| `agent`    | `AgentLoopConfig` (`max_iterations`) + `ContextManager`/`TokenBudget` (context budget, `keep_recent`) + subagent caps + tier map | Carries `max_iterations`, the context-window budget, `max_subagent_depth`, `max_subagents_per_root`, and `model_tiers` (`ModelTier` → `LlmEntryName`; keys are `lite`/`balanced`/`deep`, with `fast` accepted as the pre-rename spelling of `lite`). **`model_tiers.lite` does double duty** — it is both `spawn_subagent`'s cheap tier and the fallback for auxiliary LLM calls, so re-pointing it moves both. An operator who wants them apart sets a per-entry `lite_model`, which outranks it. Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s). |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `baybo_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
@@ -141,6 +172,9 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `llm[i].name`                         | non-empty; unique within `llm`                       |
 | `llm[i].provider`                     | non-empty                                            |
 | `llm[i].model`                        | non-empty                                            |
+| `llm[i].model_list[j].model`          | non-empty                                            |
+| `llm[i].model_list[j].context_window` | if set, > 0 (a zero window collapses the compression threshold and the WebFetch summariser budget) |
+| `llm[i].lite_model`                   | if set, non-empty **and** names one of the entry's `models()` (default + `model_list`) |
 | `llm[i].base_url`                     | if set, scheme is `http://` or `https://`            |
 | `llm[i].api_key_env`                  | if set, valid env-var identifier                     |
 | `default-llm`                         | when `llm` is non-empty, must name an existing entry |

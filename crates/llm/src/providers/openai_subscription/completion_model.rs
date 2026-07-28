@@ -39,7 +39,7 @@ pub struct OpenAiSubscriptionCompletionModel {
     http: reqwest::Client,
     /// Shared per-credential refresh state. Every client built from the
     /// same vault credential — the entry's default model, each
-    /// `model_candidates` model, every hot-reload generation, every admin
+    /// `model_list` model, every hot-reload generation, every admin
     /// probe — resolves to the SAME coordinator, which is what makes the
     /// single-flight gate process-wide as the spec requires.
     refresh: Arc<RefreshCoordinator>,

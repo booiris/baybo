@@ -100,7 +100,7 @@ export function LoginScreen() {
         </p>
 
         {error && (
-          <div className="mt-4 p-3 border-2 border-err bg-err/10 text-err rounded-md text-sm font-bold shadow-brutal-xs">
+          <div className="mt-4 p-3 border-2 border-err bg-err/10 text-err rounded-md text-sm font-bold shadow-brutal-xs break-words">
             {error}
           </div>
         )}

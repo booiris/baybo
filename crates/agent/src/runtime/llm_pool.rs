@@ -6,10 +6,14 @@
 //! `resolve(Some(name))` returns that entry if present, otherwise the
 //! default with a `warn!` (stranded reference).
 //!
-//! Optional `model_tiers` (Fast / Balanced / Deep → entry name) lets
-//! `spawn_subagent` ask for "a fast model" without knowing which
+//! Optional `model_tiers` (Lite / Balanced / Deep → entry name) lets
+//! `spawn_subagent` ask for "a cheap model" without knowing which
 //! `baybo.json` entry happens to be wired to that tier. Unmapped tiers
 //! return `None` and the caller falls through to the pool default.
+//!
+//! [`LlmClientPool::resolve_lite`] resolves the agent's **auxiliary**
+//! model — the Bash risk judges, WebFetch's page summary, and title
+//! generation — through a three-step cascade documented on that method.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,15 +31,40 @@ use tracing::warn;
 /// never per-token. See `docs/config-hot-reload.md`.
 pub type LlmPoolHandle = Arc<parking_lot::RwLock<Arc<LlmClientPool>>>;
 
+/// Everything [`LlmClientPool::from_config`] needs. A struct rather than
+/// a positional argument list because three of the six fields are
+/// same-typed maps — at a call site their order is invisible.
+pub struct LlmPoolConfig {
+    /// Entry → its default-model client.
+    pub clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
+    /// (entry, model id) → client, for the entry's non-default models.
+    pub overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
+    /// Entry → the model ids a session may pin it to.
+    pub entry_models: HashMap<LlmEntryName, Vec<String>>,
+    /// Entry → its `lite_model` client, for entries that declare one.
+    pub lite: HashMap<LlmEntryName, Arc<BillableLlm>>,
+    /// `default-llm`; must be a key of `clients`.
+    pub default_name: LlmEntryName,
+    /// `agent.model_tiers`; every value must be a key of `clients`.
+    pub tier_map: HashMap<ModelTier, LlmEntryName>,
+}
+
 pub struct LlmClientPool {
     /// Entry → its DEFAULT-model client.
     clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
-    /// (entry, candidate model id) → client, for models other than the
-    /// entry's default. Pre-built at boot/reload from `model_candidates`.
+    /// (entry, model id) → client, for models other than the entry's
+    /// default. Pre-built at boot/reload from `model_list`.
     overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
-    /// Entry → every model id it can serve (`[default] + candidates` that
+    /// Entry → every model id it can serve (`[default] + model_list` that
     /// actually built a client). The pinnable set for validation.
+    /// Deliberately excludes `lite_model`: the lite client is what the
+    /// runtime picks for itself, not something a user pins. An operator
+    /// who wants it in the picker lists it in `model_list` too, and it is
+    /// then built once and serves both roles.
     entry_models: HashMap<LlmEntryName, Vec<String>>,
+    /// Entry → its `lite_model` client, absent when the entry declares
+    /// none. Kept out of `clients` / `overrides`, which both feed pinning.
+    lite: HashMap<LlmEntryName, Arc<BillableLlm>>,
     default_name: LlmEntryName,
     default_client: Arc<BillableLlm>,
     tier_map: HashMap<ModelTier, LlmEntryName>,
@@ -49,9 +78,10 @@ impl LlmClientPool {
         Self::with_tier_map(clients, default_name, HashMap::new())
     }
 
-    /// Construct a pool with a tier→entry-name lookup but NO candidate
-    /// models — each entry serves only its default model. `entry_models` is
-    /// derived from each client's own `model_info().id`.
+    /// Construct a pool with a tier→entry-name lookup but NO extra
+    /// models — each entry serves only its default model, and none has a
+    /// lite client. `entry_models` is derived from each client's own
+    /// `model_info().id`.
     pub fn with_tier_map(
         clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
         default_name: LlmEntryName,
@@ -61,27 +91,29 @@ impl LlmClientPool {
             .iter()
             .map(|(name, client)| (name.clone(), vec![client.model_info().id.clone()]))
             .collect();
-        Self::with_candidates(
+        Self::from_config(LlmPoolConfig {
             clients,
-            HashMap::new(),
+            overrides: HashMap::new(),
             entry_models,
+            lite: HashMap::new(),
             default_name,
             tier_map,
-        )
+        })
     }
 
-    /// The full constructor: default-model clients plus candidate-model
-    /// `overrides` and the per-entry pinnable-model list. Each value in
-    /// `tier_map` must already exist in `clients` — a stranded reference
-    /// would surface as a default-fallback every spawn, which is hard to
-    /// diagnose at runtime, so we reject it at boot.
-    pub fn with_candidates(
-        clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
-        overrides: HashMap<(LlmEntryName, String), Arc<BillableLlm>>,
-        entry_models: HashMap<LlmEntryName, Vec<String>>,
-        default_name: LlmEntryName,
-        tier_map: HashMap<ModelTier, LlmEntryName>,
-    ) -> Result<Self, String> {
+    /// The full constructor. Each value in `tier_map` must already exist
+    /// in `clients` — a stranded reference would surface as a
+    /// default-fallback every spawn, which is hard to diagnose at
+    /// runtime, so we reject it at boot.
+    pub fn from_config(config: LlmPoolConfig) -> Result<Self, String> {
+        let LlmPoolConfig {
+            clients,
+            overrides,
+            entry_models,
+            lite,
+            default_name,
+            tier_map,
+        } = config;
         let default_client = clients.get(&default_name).cloned().ok_or_else(|| {
             format!(
                 "default-llm {default_name:?} not present in client pool; configured entries: [{}]",
@@ -100,6 +132,7 @@ impl LlmClientPool {
             clients,
             overrides,
             entry_models,
+            lite,
             default_name,
             default_client,
             tier_map,
@@ -167,11 +200,48 @@ impl LlmClientPool {
                 warn!(
                     entry = %entry_name,
                     model = %model,
-                    "pinned model is not a configured candidate of the entry, falling back to the entry's default model"
+                    "pinned model is not a configured model of the entry, falling back to the entry's default model"
                 );
                 (base, entry_name)
             }
         }
+    }
+
+    /// Resolve the client for the agent's **auxiliary** calls — the Bash
+    /// risk judges, WebFetch's page summary, title generation. `name` /
+    /// `model` are the session's own pin, exactly as passed to
+    /// [`Self::resolve`].
+    ///
+    /// Three steps, most specific first:
+    ///
+    /// 1. the resolved entry's own `lite_model` (same provider, same
+    ///    credentials, so nothing the user typed changes hands);
+    /// 2. otherwise `model_tiers[Lite]`, that entry's **default** model —
+    ///    no second hop into *its* `lite_model`, because two levels of
+    ///    indirection are not debuggable from a config file;
+    /// 3. otherwise the session's own client, i.e. today's behaviour.
+    ///
+    /// Never `Option`: the judges are fail-closed (`judge.rs` maps a
+    /// missing LLM to an approval prompt), so an unconfigured deployment
+    /// returning "no lite" would silently turn `permission = auto` from
+    /// "judge every destructive command" into "prompt on every
+    /// destructive command". Owning the terminal fallback here is what
+    /// stops a call site from forgetting it.
+    pub(crate) fn resolve_lite(
+        &self,
+        name: Option<&LlmEntryName>,
+        model: Option<&str>,
+    ) -> (Arc<BillableLlm>, LlmEntryName) {
+        let (session_client, entry_name) = self.resolve(name, model);
+        if let Some(client) = self.lite.get(&entry_name) {
+            return (client.clone(), entry_name);
+        }
+        if let Some(tier_entry) = self.tier_map.get(&ModelTier::Lite)
+            && let Some(client) = self.clients.get(tier_entry)
+        {
+            return (client.clone(), tier_entry.clone());
+        }
+        (session_client, entry_name)
     }
 }
 
@@ -235,13 +305,14 @@ mod tests {
             LlmEntryName::from("primary"),
             vec!["model-primary".to_string(), "model-alt".to_string()],
         );
-        LlmClientPool::with_candidates(
+        LlmClientPool::from_config(LlmPoolConfig {
             clients,
             overrides,
             entry_models,
-            LlmEntryName::from("primary"),
-            HashMap::new(),
-        )
+            lite: HashMap::new(),
+            default_name: LlmEntryName::from("primary"),
+            tier_map: HashMap::new(),
+        })
         .unwrap()
     }
 
@@ -335,14 +406,138 @@ mod tests {
         clients.insert(LlmEntryName::from("primary"), stub_with_id("model-primary"));
         clients.insert(LlmEntryName::from("fast"), stub_with_id("model-fast"));
         let mut tiers = HashMap::new();
-        tiers.insert(ModelTier::Fast, LlmEntryName::from("fast"));
+        tiers.insert(ModelTier::Lite, LlmEntryName::from("fast"));
         let pool =
             LlmClientPool::with_tier_map(clients, LlmEntryName::from("primary"), tiers).unwrap();
         assert_eq!(
-            pool.resolve_tier(ModelTier::Fast),
+            pool.resolve_tier(ModelTier::Lite),
             Some(LlmEntryName::from("fast"))
         );
         assert!(pool.resolve_tier(ModelTier::Deep).is_none());
+    }
+
+    /// A pool where `primary` declares its own lite model and a separate
+    /// `cheap` entry is wired to the Lite tier — enough to exercise every
+    /// step of the cascade against each other.
+    fn lite_fixture(with_entry_lite: bool, with_tier: bool) -> LlmClientPool {
+        let mut clients = HashMap::new();
+        clients.insert(LlmEntryName::from("primary"), stub_with_id("model-primary"));
+        clients.insert(LlmEntryName::from("cheap"), stub_with_id("model-cheap"));
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            (LlmEntryName::from("primary"), "model-alt".to_string()),
+            stub_with_id("model-alt"),
+        );
+        let mut entry_models = HashMap::new();
+        entry_models.insert(
+            LlmEntryName::from("primary"),
+            vec!["model-primary".to_string(), "model-alt".to_string()],
+        );
+        entry_models.insert(LlmEntryName::from("cheap"), vec!["model-cheap".to_string()]);
+        let mut lite = HashMap::new();
+        if with_entry_lite {
+            lite.insert(LlmEntryName::from("primary"), stub_with_id("model-lite"));
+        }
+        let mut tier_map = HashMap::new();
+        if with_tier {
+            tier_map.insert(ModelTier::Lite, LlmEntryName::from("cheap"));
+        }
+        LlmClientPool::from_config(LlmPoolConfig {
+            clients,
+            overrides,
+            entry_models,
+            lite,
+            default_name: LlmEntryName::from("primary"),
+            tier_map,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_lite_prefers_the_entrys_own_lite_model() {
+        let pool = lite_fixture(true, true);
+        let (client, name) = pool.resolve_lite(None, None);
+        assert_eq!(client.model_info().id, "model-lite");
+        assert_eq!(name, "primary", "a per-entry lite stays inside its entry");
+    }
+
+    #[test]
+    fn resolve_lite_falls_back_to_the_lite_tier_entry() {
+        let pool = lite_fixture(false, true);
+        let (client, name) = pool.resolve_lite(None, None);
+        assert_eq!(client.model_info().id, "model-cheap");
+        assert_eq!(name, "cheap", "the tier hop changes the entry identity");
+    }
+
+    /// Terminal fallback. Returning "no lite" here would flip
+    /// `permission = auto` from judging to prompting on every
+    /// destructive command, so it must be the session's own client.
+    #[test]
+    fn resolve_lite_falls_back_to_the_session_client() {
+        let pool = lite_fixture(false, false);
+        let (client, name) = pool.resolve_lite(None, None);
+        assert_eq!(client.model_info().id, "model-primary");
+        assert_eq!(name, "primary");
+    }
+
+    /// The fallback follows the session's MODEL pin, not just its entry:
+    /// a session on a non-default model keeps that model for aux calls.
+    #[test]
+    fn resolve_lite_fallback_honours_a_pinned_non_default_model() {
+        let pool = lite_fixture(false, false);
+        let (client, _) =
+            pool.resolve_lite(Some(&LlmEntryName::from("primary")), Some("model-alt"));
+        assert_eq!(client.model_info().id, "model-alt");
+    }
+
+    /// The entry-level lite outranks the tier even when both are set —
+    /// otherwise configuring `lite_model` would have no effect.
+    #[test]
+    fn entry_lite_outranks_the_tier() {
+        let with_both = lite_fixture(true, true);
+        assert_eq!(
+            with_both.resolve_lite(None, None).0.model_info().id,
+            "model-lite"
+        );
+    }
+
+    /// The tier hop takes the target entry's DEFAULT model. Chasing that
+    /// entry's own `lite_model` would be a second level of indirection
+    /// no one can follow from a config file.
+    #[test]
+    fn the_tier_hop_does_not_chase_a_second_lite_model() {
+        let mut clients = HashMap::new();
+        clients.insert(LlmEntryName::from("primary"), stub_with_id("model-primary"));
+        clients.insert(LlmEntryName::from("cheap"), stub_with_id("model-cheap"));
+        let mut lite = HashMap::new();
+        // `cheap` declares a lite of its own; the hop must ignore it.
+        lite.insert(LlmEntryName::from("cheap"), stub_with_id("model-cheaper"));
+        let mut tier_map = HashMap::new();
+        tier_map.insert(ModelTier::Lite, LlmEntryName::from("cheap"));
+        let pool = LlmClientPool::from_config(LlmPoolConfig {
+            clients,
+            overrides: HashMap::new(),
+            entry_models: HashMap::new(),
+            lite,
+            default_name: LlmEntryName::from("primary"),
+            tier_map,
+        })
+        .unwrap();
+        assert_eq!(
+            pool.resolve_lite(None, None).0.model_info().id,
+            "model-cheap"
+        );
+    }
+
+    /// A lite model is the runtime's own pick, never a pinnable one.
+    #[test]
+    fn lite_models_are_not_pinnable() {
+        let pool = lite_fixture(true, true);
+        let ids = pool
+            .entry_model_ids(&LlmEntryName::from("primary"))
+            .expect("entry present");
+        assert_eq!(ids, ["model-primary", "model-alt"]);
+        assert!(!ids.iter().any(|m| m == "model-lite"));
     }
 
     #[test]

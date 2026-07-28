@@ -29,6 +29,13 @@ use crate::transport::{TransportEvent, TransportEventStream};
 /// receiver side backpressures the pump if the TUI stalls.
 const EVENT_CHAN_CAPACITY: usize = 64;
 
+/// Upgrade statuses that mean "live gateway, credential refused" rather
+/// than "broken handshake". They map to [`ChannelError::Unauthorized`]
+/// so the CLI prints the stale-token remedy instead of telling the user
+/// to start a gateway that is already running.
+const HTTP_UNAUTHORIZED: u16 = 401;
+const HTTP_FORBIDDEN: u16 = 403;
+
 /// WS-backed TUI transport. Owns a single live [`WsClient`] per TUI
 /// process — the TUI multiplexes all sessions over it.
 pub struct WsTransport {
@@ -76,6 +83,9 @@ impl WsTransport {
             // Handshake / protocol errors mean a gateway is alive
             // and we should surface the real reason instead.
             WsClientError::TcpDial(_) => ChannelError::NotReachable(format!("tui ws connect: {e}")),
+            WsClientError::WsUpgradeRejected {
+                status: HTTP_UNAUTHORIZED | HTTP_FORBIDDEN,
+            } => ChannelError::Unauthorized(format!("tui ws connect: {e}")),
             _ => ChannelError::Config(format!("tui ws connect: {e}")),
         })?;
         let client = Arc::new(client);

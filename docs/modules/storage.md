@@ -103,14 +103,12 @@ column `NULL` and are unaffected by the unique partial index.
 durable, other subsystems reference a transcript position *by value* (one `i64`)
 instead of copying message content:
 
-- `session_summaries.cursor` is the ordinal high-water mark of the last
-  successful summary pass.
 - trace `LlmCallInputs::Persisted { last_ordinal, .. }` records the slice an LLM
   call saw by ordinal rather than inlining it — keeps span storage constant per
   call instead of cloning a growing prefix every turn. See [trace.md](trace.md).
 
-**Compaction supersedes, it never deletes.** `/compact` and background
-summarisation both go through `apply_session_compaction(session, new_active)`,
+**Compaction supersedes, it never deletes.** A threshold compaction and
+`/compact` both go through `apply_session_compaction(session, new_active)`,
 which in one transaction (a) bulk-marks every currently-active row
 `superseded_by = <first new ordinal>`, then (b) appends `new_active` at the next
 contiguous ordinals, **each stamped `compaction_inserted = 1`**. `new_active` is
