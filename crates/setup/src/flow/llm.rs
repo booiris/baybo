@@ -172,7 +172,17 @@ async fn add_entry<P: Prompter>(
         // The wizard configures one model at a time; operators add further
         // models by editing baybo.json (`model_list`) directly.
         model_list: Vec::new(),
-        lite_model: None,
+        // Seeded to the entry's own model, which makes it a behavioural
+        // no-op — `resolve_lite` hands back the entry's default client,
+        // exactly as it would with the field unset. It is written anyway
+        // because the alternative is invisible: `lite_model` is
+        // `skip_serializing_if = "Option::is_none"`, so an operator who
+        // never reads the module docs has no way to learn from their own
+        // config file that the auxiliary calls (the Bash risk judges,
+        // WebFetch's page summary, title generation) can be moved to a
+        // cheaper model. Present-and-inert is a knob they can find and
+        // edit; absent is a feature they never discover.
+        lite_model: Some(model.clone()),
         api_key_env,
         base_url,
         reasoning_effort,
