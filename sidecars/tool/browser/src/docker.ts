@@ -393,8 +393,11 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     // "Container logs: (no logs)" diagnostic. Without --rm the container
     // sits in `Exited` state until we explicitly `docker rm` it, and
     // `docker logs` works fine. Cleanup is owned by `stop()` (success
-    // path), the catch block below (post-run failure path), and the
-    // next-boot `sweepStaleContainers()` (kill -9 the gateway path).
+    // path), the catch block below (post-run failure path), the watchdog's
+    // `recover()` (which replaces an unresponsive container), and the
+    // next-boot `sweepStaleContainers()` (kill -9 the gateway path). Every
+    // one of those owes a `describeDeadContainer` first — removing the
+    // container is what makes these logs unreachable.
     const runArgs = [
         "run",
         "-d",
@@ -613,12 +616,40 @@ function rejectColonInBindPath(path: string, label: string): void {
     }
 }
 
-async function fetchContainerLogs(containerName: string): Promise<string> {
+/** Log lines kept in a post-mortem. Smaller than the boot-failure dump: this
+ * one can fire up to once per recovery attempt. */
+const POST_MORTEM_TAIL_LINES = 40;
+
+/**
+ * Post-mortem for a container that is about to be removed.
+ *
+ * `docker run` deliberately omits `--rm` so a crashed container's logs stay
+ * fetchable — see the rationale in {@link spawnContainer}. Anything that
+ * removes a container therefore owes the operator this first, or the recovery
+ * that fixes the symptom also destroys the only evidence of the cause: an OOM
+ * that will recur every few minutes reads as bad luck instead of a container
+ * that needs more memory.
+ *
+ * Returned as one string so the caller emits one NDJSON line — the gateway's
+ * stderr drain budgets by line, and embedded newlines survive the round trip.
+ */
+export async function describeDeadContainer(containerName: string): Promise<string> {
+    const [exit, logs] = await Promise.all([
+        containerExitInfo(containerName),
+        fetchContainerLogs(containerName, POST_MORTEM_TAIL_LINES),
+    ]);
+    return `exit: ${exit}\nlast ${POST_MORTEM_TAIL_LINES} log lines:\n${logs}`;
+}
+
+async function fetchContainerLogs(
+    containerName: string,
+    tailLines = 60,
+): Promise<string> {
     try {
         // Without --rm on the container, logs are still attached even
         // after the container exits, so this works in both the
         // hung-but-alive and crashed-and-stopped cases.
-        const r = await exec("docker", ["logs", "--tail", "60", containerName], {
+        const r = await exec("docker", ["logs", "--tail", String(tailLines), containerName], {
             timeout: 5000,
         });
         const combined = `${r.stdout}${r.stderr}`.trim();

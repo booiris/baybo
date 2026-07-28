@@ -77,6 +77,7 @@ import {
   type DockerPhase,
   type DockerSpawnOptions,
   checkDockerAvailable,
+  describeDeadContainer,
   isPidAlive,
   probeCdpEndpoint,
   spawnContainer,
@@ -1012,7 +1013,16 @@ function dockerHealer(
       `in a few seconds.`,
     async recover() {
       const dead = getHandle();
-      log(`replacing unresponsive container ${dead.containerName}`);
+      // Before `stop()`, which force-removes and takes `docker logs` with it.
+      // Replacing the container fixes the symptom; without this it would also
+      // destroy the only evidence of the cause, so a container that OOMs every
+      // few minutes would read as bad luck instead of one that needs more
+      // memory. One NDJSON line — the gateway budgets stderr by line, and the
+      // embedded newlines survive the round trip.
+      logger.warn(
+        `container ${dead.containerName} is unresponsive; post-mortem before replacing it:\n` +
+          (await describeDeadContainer(dead.containerName)),
+      );
       await dead.stop();
       await sweepStaleContainers();
       const next = await spawnContainer(recoveryOpts);
