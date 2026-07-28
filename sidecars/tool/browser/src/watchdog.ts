@@ -55,6 +55,70 @@ const MAX_RECOVERY_ATTEMPTS = 3;
 const RECOVERY_RETRY_MS = 5_000;
 
 /**
+ * Ceiling on one repair attempt.
+ *
+ * NOT a cancellation — the healers call into docker and puppeteer, neither of
+ * which takes a signal, so the attempt keeps running in the background. It is
+ * a ceiling on how long *the loop* waits for one. Without it a repair that
+ * never returns does not merely fail: it parks `runOnce`, and since `start`
+ * awaits each tick serially, the watchdog stops existing. That converts a
+ * broken browser into a broken watchdog, which nothing outside can see.
+ */
+const REPAIR_TIMEOUT_MS = 180_000;
+
+/**
+ * How many consecutive ticks the "browser is busy" gate may defer before the
+ * watchdog probes anyway.
+ *
+ * The gate exists because live traffic is better evidence than a probe. But a
+ * wedged browser is *precisely* what produces a steady stream of calls that
+ * never succeed, so an unbounded gate would let the failure it exists to catch
+ * silence it. Forcing a pass costs one `list_pages` against a browser that is
+ * probably fine.
+ */
+const MAX_CONSECUTIVE_DEFERRALS = 3;
+
+/**
+ * The longest a single tick can legitimately take: a full unhealthy streak
+ * followed by a repair that runs to its ceiling and the probe that verifies it.
+ */
+const MAX_TICK_MS =
+    UNHEALTHY_PROBES * PROBE_TIMEOUT_MS +
+    RECHECK_DELAY_MS +
+    REPAIR_TIMEOUT_MS +
+    PROBE_TIMEOUT_MS;
+
+/**
+ * Silence longer than this means the loop is not running at all.
+ *
+ * See {@link BrowserWatchdog.isStalled} — this is the threshold that makes a
+ * wedged watchdog externally visible. Derived from the other constants rather
+ * than picked, so tightening a timeout cannot silently turn a healthy long
+ * repair into a false stall.
+ */
+const STALL_THRESHOLD_MS = PROBE_INTERVAL_MS + MAX_TICK_MS * 2;
+
+const TIMED_OUT = Symbol("watchdog-repair-timeout");
+
+/** Resolve to {@link TIMED_OUT} if `work` has not settled within `ms`. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(TIMED_OUT), ms);
+        timer.unref();
+        work.then(
+            (v) => {
+                clearTimeout(timer);
+                resolve(v);
+            },
+            (e: unknown) => {
+                clearTimeout(timer);
+                reject(e instanceof Error ? e : new Error(String(e)));
+            },
+        );
+    });
+}
+
+/**
  * Tracks whether the browser is being used, so the watchdog can stay out of
  * the way. Live traffic is better evidence of liveness than any synthetic
  * probe, and chrome-devtools-mcp serialises every tool call behind a single
@@ -179,6 +243,8 @@ export interface WatchdogDeps {
     sleep?: (ms: number) => Promise<void>;
     /** Injected for the same reason; defaults to {@link PROBE_TIMEOUT_MS}. */
     probeTimeoutMs?: number;
+    /** Injected for the same reason; defaults to {@link REPAIR_TIMEOUT_MS}. */
+    repairTimeoutMs?: number;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -190,16 +256,21 @@ export class BrowserWatchdog {
     readonly #deps: WatchdogDeps;
     readonly #sleep: (ms: number) => Promise<void>;
     readonly #probeTimeoutMs: number;
+    readonly #repairTimeoutMs: number;
     #recovering = false;
     #recoveryAttempts = 0;
     #reportedUnhealthy = false;
     #stopped = false;
     #tick: Promise<unknown> | null = null;
+    #repairInFlight: Promise<string | undefined> | null = null;
+    #deferrals = 0;
+    #lastTickAt: number | null = null;
 
     constructor(deps: WatchdogDeps) {
         this.#deps = deps;
         this.#sleep = deps.sleep ?? defaultSleep;
         this.#probeTimeoutMs = deps.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
+        this.#repairTimeoutMs = deps.repairTimeoutMs ?? REPAIR_TIMEOUT_MS;
     }
 
     /** True while the browser is known-broken and repair is in flight. */
@@ -220,9 +291,16 @@ export class BrowserWatchdog {
         // working — that phase is its own.
         if (!phase.isReady() && !this.#recovering) return "skipped";
         if (!healer.armed()) return "skipped";
+
         // Live traffic already proves the browser answers, and a probe would
-        // only queue behind it on chrome-devtools-mcp's tool mutex.
-        if (this.#inUse()) return "skipped";
+        // only queue behind it on chrome-devtools-mcp's tool mutex. Bounded,
+        // though: see MAX_CONSECUTIVE_DEFERRALS.
+        const forced = this.#deferrals >= MAX_CONSECUTIVE_DEFERRALS;
+        if (!forced && this.#inUse()) {
+            this.#deferrals += 1;
+            return "skipped";
+        }
+        this.#deferrals = 0;
 
         let reason = await this.#probeStreak();
 
@@ -231,8 +309,10 @@ export class BrowserWatchdog {
         // and repair is destructive (it SIGKILLs Chrome or replaces the
         // container). Traffic that started, or succeeded, during the streak is
         // stronger evidence than the probe that just failed, so yield to it and
-        // let the next tick decide against fresh state.
-        if (reason !== undefined && this.#inUse()) {
+        // let the next tick decide against fresh state. Skipped on a forced
+        // pass, or a steady stream of failing calls would defer here forever
+        // instead of at the gate above.
+        if (reason !== undefined && !forced && this.#inUse()) {
             log.debug(`probe failed (${reason}) but the browser is serving calls; deferring`);
             return "skipped";
         }
@@ -264,12 +344,7 @@ export class BrowserWatchdog {
         this.#recovering = true;
         phase.enterRecovering(healer.outageText(reason));
 
-        try {
-            await healer.recover();
-            reason = await this.#probe();
-        } catch (e) {
-            reason = errText(e);
-        }
+        reason = await this.#repair();
 
         if (reason === undefined) {
             this.#recovering = false;
@@ -293,6 +368,9 @@ export class BrowserWatchdog {
     }
 
     start(): void {
+        // Stamped before the first sleep so `isStalled` has a baseline; without
+        // it the loop would read as "never started" for the first interval.
+        this.#lastTickAt = Date.now();
         void (async () => {
             while (!this.#stopped) {
                 await this.#sleep(this.#retryDelayMs());
@@ -306,6 +384,7 @@ export class BrowserWatchdog {
                 this.#tick = tick;
                 await tick;
                 this.#tick = null;
+                this.#lastTickAt = Date.now();
             }
         })();
     }
@@ -313,6 +392,29 @@ export class BrowserWatchdog {
     /** Stop scheduling ticks. Does not interrupt one already running. */
     stop(): void {
         this.#stopped = true;
+    }
+
+    /**
+     * Whether the loop has gone quiet for longer than any legitimate tick.
+     *
+     * This is what makes a wedged watchdog *externally* visible, and it is the
+     * answer to "who watches the watchman". The gateway's reconciler probes
+     * with `tools/list`, which our proxy answers in-process from a static tool
+     * registry — it touches neither Chrome nor the watchdog. So a watchdog
+     * parked inside a repair that never returns looks perfectly healthy from
+     * outside, and nothing respawns the sidecar; meanwhile the phase is stuck
+     * off `ready`, so the agent is told to retry, forever.
+     *
+     * Failing `tools/list` once the loop has gone quiet converts that
+     * invisible state into the one failure the reconciler already handles: a
+     * probe error, a disconnect, and a respawn onto a clean boot. Belt and
+     * braces against the repair ceiling above — if that ceiling holds, this
+     * never fires.
+     */
+    isStalled(): boolean {
+        // Never started, or deliberately stopped (shutdown) — not a stall.
+        if (this.#stopped || this.#lastTickAt === null) return false;
+        return Date.now() - this.#lastTickAt > STALL_THRESHOLD_MS;
     }
 
     /**
@@ -339,6 +441,45 @@ export class BrowserWatchdog {
     #inUse(): boolean {
         const { activity } = this.#deps;
         return activity.busy || activity.msSinceLastCall() < PROBE_INTERVAL_MS;
+    }
+
+    /**
+     * One bounded repair attempt. Returns the failure reason, or undefined
+     * once a fresh probe confirms the browser is back.
+     */
+    async #repair(): Promise<string | undefined> {
+        if (this.#repairInFlight !== null) {
+            // A previous attempt blew its deadline and is still running.
+            // Starting a second would race two `spawnContainer` calls and leave
+            // an orphaned container behind, so count the attempt and wait.
+            return "a previous repair attempt is still running";
+        }
+
+        // Retained so the guard above can see it, and settled-with-a-value so
+        // dropping the await never surfaces as an unhandled rejection.
+        let attempt: Promise<string | undefined>;
+        try {
+            attempt = this.#deps.healer.recover().then(
+                () => undefined,
+                (e: unknown) => errText(e),
+            );
+        } catch (e) {
+            // A healer that threw synchronously never started any work, so
+            // there is nothing in flight to guard against — and the throw must
+            // not escape `runOnce`, whose contract is to report, not raise.
+            return errText(e);
+        }
+        this.#repairInFlight = attempt;
+        void attempt.finally(() => {
+            if (this.#repairInFlight === attempt) this.#repairInFlight = null;
+        });
+
+        const outcome = await withDeadline(attempt, this.#repairTimeoutMs);
+        if (outcome === TIMED_OUT) {
+            return `repair did not finish within ${this.#repairTimeoutMs}ms`;
+        }
+        if (outcome !== undefined) return outcome;
+        return await this.#probe();
     }
 
     /** Probe until one succeeds or the unhealthy streak is complete. */

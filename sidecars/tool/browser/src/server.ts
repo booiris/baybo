@@ -1136,7 +1136,23 @@ async function main(): Promise<void> {
     { name: "baybo-browser", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
+  // Assigned below; the handler closes over the binding so the watchdog can be
+  // built after the client it probes through.
+  let watchdog: BrowserWatchdog | null = null;
+
   proxy.setRequestHandler(ListToolsRequestSchema, async () => {
+    // The gateway's reconciler probes with exactly this request, and would
+    // otherwise get a healthy answer from the in-process registry no matter
+    // what state the watchdog is in — so a watchdog that stopped ticking is
+    // invisible, while the phase it left behind tells the agent to keep
+    // retrying. Failing here converts that into the one failure the reconciler
+    // already handles: disconnect, then respawn onto a clean boot.
+    if (watchdog?.isStalled() === true) {
+      throw new Error(
+        "browser watchdog has stopped ticking; the sidecar cannot vouch for the browser. " +
+          "Respawning is the recovery — see the baybo-browser-mcp lines in the gateway log.",
+      );
+    }
     const cddmTools = await cddmClient.listTools();
     const visible = cddmTools.tools.filter((t) => !BLOCKED_TOOLS.has(t.name));
     return { tools: [...visible, READ_PAGE_TOOL] };
@@ -1256,13 +1272,13 @@ async function main(): Promise<void> {
     healer = hostHealer(cddmClient, activity);
   }
 
-  const watchdog = new BrowserWatchdog({
+  watchdog = new BrowserWatchdog({
     healer,
     activity,
     phase: phaseGate,
     log: logger,
     giveUp: () => {
-      watchdog.stop();
+      watchdog?.stop();
       // Take the container down on the way out; otherwise every escalation
       // leaks one until the next boot's sweep notices. Bounded, because
       // exiting is the point — a wedged docker daemon must not prevent it.
@@ -1288,10 +1304,10 @@ async function main(): Promise<void> {
     // repair can be mid-`spawnContainer` here, and exiting under it would
     // orphan the container it is about to create. `quiesce` rides the same
     // 25s deadline as the rest of teardown.
-    watchdog.stop();
+    watchdog?.stop();
     log("shutting down");
     const closes: Array<Promise<unknown>> = [
-      watchdog.quiesce(),
+      watchdog?.quiesce() ?? Promise.resolve(),
       proxy.close().catch(() => undefined),
       cddmClient.close().catch(() => undefined),
       cddmServer.close().catch(() => undefined),

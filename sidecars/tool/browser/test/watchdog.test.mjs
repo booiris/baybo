@@ -80,17 +80,19 @@ function fakeHealer({ checks, recoveries = [], canEscalate = true, armed = true 
 }
 
 const TEST_PROBE_TIMEOUT_MS = 20;
+const TEST_REPAIR_TIMEOUT_MS = 30;
 
-function makeWatchdog(healer, { activity = idleActivity(), phase = phaseSpy() } = {}) {
+function makeWatchdog(healer, { activity = idleActivity(), phase = phaseSpy(), log = NOOP_LOG } = {}) {
     const gaveUp = [];
     const watchdog = new BrowserWatchdog({
         healer,
         activity,
         phase,
-        log: NOOP_LOG,
+        log,
         giveUp: (reason) => gaveUp.push(reason),
         sleep: () => Promise.resolve(),
         probeTimeoutMs: TEST_PROBE_TIMEOUT_MS,
+        repairTimeoutMs: TEST_REPAIR_TIMEOUT_MS,
     });
     return { watchdog, phase, activity, gaveUp };
 }
@@ -378,4 +380,77 @@ test("a healer that throws does not kill the loop", async () => {
 
     assert.equal(await watchdog.runOnce(), "recovering");
     assert.equal(phase.phase, "recovering", "the throw is absorbed as a failed recovery");
+});
+
+test("a repair that never returns does not park the loop", async () => {
+    // The wedge this whole layer exists to prevent: `runOnce` awaits
+    // `recover()`, and `start()` awaits each tick serially, so an unbounded
+    // repair stops the watchdog existing rather than failing one tick.
+    const healer = fakeHealer({ checks: [new Error("dead")] });
+    healer.recover = () => new Promise(() => {}); // never settles
+    const { watchdog, phase } = makeWatchdog(healer);
+
+    assert.equal(await watchdog.runOnce(), "recovering", "the tick returns instead of parking");
+    assert.equal(phase.phase, "recovering");
+});
+
+test("a timed-out repair is not started a second time concurrently", async () => {
+    // Two overlapping spawnContainer calls would leave an orphaned container
+    // that the next-boot sweep skips (its owner pid is still alive).
+    let started = 0;
+    const healer = fakeHealer({ checks: [new Error("dead")] });
+    healer.recover = () => {
+        started += 1;
+        return new Promise(() => {});
+    };
+    const { watchdog } = makeWatchdog(healer);
+
+    await watchdog.runOnce();
+    await watchdog.runOnce();
+    await watchdog.runOnce();
+    assert.equal(started, 1, `recover() must not be re-entered while one is in flight (got ${started})`);
+});
+
+test("a stuck repair still escalates rather than retrying forever", async () => {
+    const healer = fakeHealer({ checks: [new Error("dead")] });
+    healer.recover = () => new Promise(() => {});
+    const { watchdog, gaveUp } = makeWatchdog(healer);
+
+    for (let i = 0; i < 3; i += 1) await watchdog.runOnce();
+    assert.equal(gaveUp.length, 1, "the escalation ladder still reaches the gateway");
+});
+
+test("the busy gate cannot defer forever", async () => {
+    // A wedged browser is exactly what produces a steady stream of calls, so
+    // an unbounded "it's busy" gate would let the failure it exists to catch
+    // silence it.
+    const activity = idleActivity();
+    activity.begin(); // permanently in flight
+    const healer = fakeHealer({
+        checks: [new Error("dead"), new Error("dead"), null],
+        recoveries: [null],
+    });
+    const { watchdog } = makeWatchdog(healer, { activity });
+
+    const outcomes = [];
+    for (let i = 0; i < 6; i += 1) outcomes.push(await watchdog.runOnce());
+
+    assert.ok(
+        outcomes.includes("recovered"),
+        `the gate must yield eventually; got ${JSON.stringify(outcomes)}`,
+    );
+    assert.ok(healer.calls.check > 0, "and the probe must actually run");
+});
+
+test("isStalled is false before start and after stop", async () => {
+    // A watchdog that was never started, or was deliberately stopped during
+    // shutdown, must not fail tools/list and trigger a pointless respawn.
+    const healer = fakeHealer({ checks: [null] });
+    const { watchdog } = makeWatchdog(healer);
+
+    assert.equal(watchdog.isStalled(), false, "not started yet");
+    watchdog.start();
+    assert.equal(watchdog.isStalled(), false, "freshly started");
+    await watchdog.quiesce();
+    assert.equal(watchdog.isStalled(), false, "stopped deliberately");
 });
