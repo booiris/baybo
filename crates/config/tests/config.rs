@@ -142,6 +142,12 @@ fn lite_model_naming_a_listed_model_validates() {
 
 /// The entry's own default model is always serveable, so naming it as
 /// the lite model is legal even with an empty `model_list`.
+///
+/// Load-bearing for first-run setup: `configure_llm_step` seeds
+/// `lite_model` to the entry's own model precisely so the knob is visible
+/// in the generated `baybo.json`, and it writes no `model_list` at all. If
+/// `models()` ever stopped prepending the default, every wizard-created
+/// config would fail to load.
 #[test]
 fn lite_model_may_name_the_entry_default() {
     let mut c = config_with_default_entry();
