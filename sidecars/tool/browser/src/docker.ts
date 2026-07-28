@@ -54,6 +54,11 @@ export interface DockerSpawnOptions {
     webVncPort?: number;
     viewport: { width: number; height: number };
     onPhase: (p: DockerPhase) => void;
+    /**
+     * Refuse to build the image, failing fast instead. Set on the watchdog's
+     * repair path — see the `neverBuild` branch in `resolveImageTag`.
+     */
+    neverBuild?: boolean;
 }
 
 export interface DockerHandle {
@@ -71,6 +76,13 @@ const logDebug = logger.debug;
 // a build fails. Enough to carry the actual apt/network error without
 // re-dumping the whole (multi-thousand-line) transcript.
 const BUILD_STDERR_TAIL_LINES = 30;
+
+/**
+ * Ceiling on `docker build`. The log line above advertises 1-3 minutes; this is
+ * generous against that while still being finite, which is the whole point —
+ * an unbounded build on the watchdog's repair path takes the watchdog with it.
+ */
+const BUILD_TIMEOUT_MS = 15 * 60_000;
 
 export async function checkDockerAvailable(): Promise<
     { ok: true; serverVersion: string } | { ok: false; reason: string }
@@ -172,8 +184,21 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
     // the gateway's own stderr and thence baybo.log at INFO. We keep only
     // a trailing window and surface it if the build fails, so a broken
     // build stays diagnosable without the success-path flood.
+    // Every other docker call in this file goes through `exec(..., {timeout})`;
+    // this one is the longest-running of the set and was the only one unbounded.
+    // `spawn` ignores child_process's `timeout`, so the deadline has to ride an
+    // AbortSignal. A CLI blocked on a wedged daemon socket, or a BuildKit step
+    // waiting on a stalled registry, otherwise never returns at all.
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(), BUILD_TIMEOUT_MS);
+    deadline.unref();
+    try {
     await new Promise<void>((resolve, reject) => {
-        const child = spawn("docker", args, { stdio: ["ignore", "ignore", "pipe"] });
+        const child = spawn("docker", args, {
+            stdio: ["ignore", "ignore", "pipe"],
+            signal: abort.signal,
+            killSignal: "SIGKILL",
+        });
         const tail: string[] = [];
         let pending = "";
         child.stderr.on("data", (chunk: Buffer) => {
@@ -185,7 +210,13 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
                 if (tail.length > BUILD_STDERR_TAIL_LINES) tail.shift();
             }
         });
-        child.on("error", reject);
+        child.on("error", (e) => {
+            reject(
+                abort.signal.aborted
+                    ? new Error(`docker build exceeded ${BUILD_TIMEOUT_MS}ms and was killed`)
+                    : e,
+            );
+        });
         child.on("exit", (code) => {
             if (code === 0) {
                 resolve();
@@ -199,6 +230,9 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
             reject(new Error(`docker build exited ${code}${captured}`));
         });
     });
+    } finally {
+        clearTimeout(deadline);
+    }
     log(`image ${tag} built`);
 }
 
@@ -280,6 +314,18 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
     if (await imageExists(tag)) {
         logDebug(`image ${tag} already cached`);
         return tag;
+    }
+    if (opts.neverBuild === true) {
+        // The watchdog's repair path. A build here is minutes of work on the
+        // one code path that must stay responsive, and it is the wrong place
+        // for it: a first build belongs to boot. Failing fast hands the
+        // problem to the escalation ladder, which re-boots the sidecar — where
+        // building is legitimate and the transport is not yet anyone's
+        // dependency.
+        throw new Error(
+            `image ${tag} is not present and this is a recovery spawn, which does not build. ` +
+                `Restarting the sidecar will rebuild it.`,
+        );
     }
     try {
         await buildImage(opts.dockerDir, tag);
@@ -483,6 +529,9 @@ export async function probeCdpEndpoint(
     }
 }
 
+/** Per-attempt ceiling inside {@link waitForCdp}. */
+const CDP_PROBE_TIMEOUT_MS = 2_000;
+
 async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> {
     const deadline = Date.now() + 30_000;
     let lastErr = "(no probe yet)";
@@ -490,7 +539,10 @@ async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> 
     let pollCount = 0;
     while (Date.now() < deadline) {
         try {
-            await probeCdpEndpoint(cdpUrl);
+            // Without a signal this inherits undici's ~300s header timeout, so the
+            // 30s budget below would silently become five minutes against a
+            // container that accepts the connection and then never replies.
+            await probeCdpEndpoint(cdpUrl, AbortSignal.timeout(CDP_PROBE_TIMEOUT_MS));
             return;
         } catch (e) {
             lastErr = (e as Error).message;

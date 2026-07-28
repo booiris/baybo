@@ -977,6 +977,7 @@ function dockerHealer(
   cddmClient: Client,
   args: ServerArgs,
   opts: DockerSpawnOptions,
+  bootImageTag: string,
   getHandle: () => DockerHandle,
   setHandle: (h: DockerHandle) => void,
 ): BrowserHealer {
@@ -985,8 +986,19 @@ function dockerHealer(
   // `recovering` phase with `docker-building-image`, telling the agent its
   // browser is in "first-time setup, takes 1-3 minutes" when what actually
   // happened is a crash mid-session. Recovery reports to the log instead.
+  //
+  // `imageTag` is pinned to whatever boot actually resolved, which is not
+  // always the deterministic tag: when a boot build fails, `resolveImageTag`
+  // falls back to an older cached `baybo-browser:*`. Without pinning it here
+  // the deterministic tag stays absent from disk, so every single repair would
+  // re-enter the build — minutes of work on the one path that has to stay
+  // responsive. `neverBuild` is the backstop for the case where even the
+  // pinned image has since been pruned: fail fast and let escalation re-boot
+  // the sidecar, which is where a first build belongs.
   const recoveryOpts: DockerSpawnOptions = {
     ...opts,
+    imageTag: bootImageTag,
+    neverBuild: true,
     onPhase: (p) => logDebug(`recovery: ${p}`),
   };
   return {
@@ -1244,12 +1256,13 @@ async function main(): Promise<void> {
 
   let shuttingDown = false;
   let healer: BrowserHealer;
-  if (mode === "docker" && dockerOpts) {
+  if (mode === "docker" && dockerOpts && dockerHandle) {
     const opts = dockerOpts;
     healer = dockerHealer(
       cddmClient,
       args,
       opts,
+      dockerHandle.imageTag,
       () => {
         if (!dockerHandle) throw new Error("docker mode lost its container handle");
         return dockerHandle;
