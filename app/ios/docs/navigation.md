@@ -107,10 +107,18 @@ top-right).
 
 ### The composer pill
 
-The composer is ONE ChatGPT-style glass pill (inline plus picker on the left,
-in-field ink send circle on the right; at rest it holds a moderate width, and
-focus stretches it toward the screen edges — a small gutter stays — on the
-keyboard's beat).
+The composer is ONE ChatGPT-style glass pill (inline plus on the left, in-field
+ink send circle on the right; at rest it holds a moderate width, and focus
+stretches it toward the screen edges — a small gutter stays — on the keyboard's
+beat).
+
+The plus is a stock SwiftUI `Menu` with two flat entries (Photos → the
+`PhotosPicker`, Files → a `.fileImporter`) — stock, not a hand-rolled panel like
+`ModelMenuPanel`, which exists only because it needed three levels and trailing
+checkmarks. It stays INLINE in the one pill at its 46×48 frame: no satellite
+icon circles, and the `Menu` carries that frame explicitly because an
+unconstrained menu label grows greedily and eats the field beside it. What the
+menu stages is [attachments.md](attachments.md) § Outbound staging.
 
 Constraints: white tint only, no `.interactive()` shimmer on the field, the pill
 is BORDERLESS — a soft ink shadow carries its boundary over the blank at-rest

@@ -126,6 +126,71 @@ struct ChatStoreModelTests {
         #expect(store.notice != nil)
     }
 
+    /// And the line goes when the conversation does. Nothing but `leaveChat`
+    /// can retract a notice the STRIP did not raise — no tile names it — and
+    /// this store is cached resident (`AppStore`'s LRU), so before the store
+    /// retracted its own, "Model change failed" came back in red over the
+    /// composer on the next visit to the conversation.
+    @Test func aFailedPutsNoticeLeavesWithTheChat() async {
+        client.failSetModel(with: BayboError.Other(message: "boom"))
+        let store = makeStore(listed: true)
+
+        store.selectModel(entry: "gpt", model: "o3")
+        #expect(await waitUntil { store.notice != nil })
+
+        store.leaveChat()
+
+        #expect(store.notice == nil)
+    }
+
+    /// The half retraction cannot reach. The pill's PUT rides a serialized
+    /// chain that nothing cancels on leave, so backing out while it is queued
+    /// landed the failure line AFTER `leaveChat` had already taken the dock
+    /// back — and this store stays cached resident (`AppStore`'s LRU), so "Model
+    /// change failed" was there in red on the next visit. The revert is what
+    /// proves the catch actually ran: without it the missing line would be
+    /// vacuous.
+    @Test func aPutThatFailsAfterTheUserLeftRaisesNoLine() async {
+        client.failSetModel(with: BayboError.Other(message: "boom"))
+        let store = makeStore(listed: true)
+
+        store.selectModel(entry: "gpt", model: "o3")
+        store.leaveChat()
+
+        #expect(await waitUntil { self.client.setModelCalls == [self.call("gpt", "o3")] })
+        #expect(await waitUntil { store.modelPin == nil }, "the failure still reverts the pill")
+        #expect(store.notice == nil, "a line raised after the leave is refused, not stranded")
+    }
+
+    /// The gate lives on the PROPERTY, not on the three writers that happened to
+    /// need it, so a fourth one gets it without knowing it exists.
+    @Test func anyRaiseAgainstALeftChatIsRefused() {
+        let store = makeStore(listed: true)
+        store.leaveChat()
+
+        store.notice = "a line from some writer that has not been written yet"
+
+        #expect(store.notice == nil)
+    }
+
+    /// A conversation the user comes back to is open again, or the gate would
+    /// silence the notice line for the rest of the store's resident life. The
+    /// transcript webview being aimed here IS the reopen — it is what
+    /// `ChatScreen.onAppear` drives on every entry.
+    @Test func comingBackToTheChatLetsALineLandAgain() async {
+        client.failSetModel(with: BayboError.Other(message: "boom"))
+        let store = makeStore(listed: true)
+        store.leaveChat()
+
+        let bridge = TranscriptBridge(store: store)
+        store.attachBridge(bridge)
+        #expect(store.chatOpen)
+
+        store.selectModel(entry: "gpt", model: "o3")
+
+        #expect(await waitUntil { store.notice != nil })
+    }
+
     /// Failures revert to the last GATEWAY-ACKNOWLEDGED selection, never to the
     /// previous display value: with two picks failing back to back, the pill
     /// rests on the server's actual state (no pin), not the first failed pick.
@@ -321,5 +386,44 @@ struct ChatStoreModelTests {
         #expect(await waitUntil { store.modelPin == nil })
         #expect(store.modelPinModel == nil)
         #expect(store.notice != nil)
+    }
+
+    /// The draft-pin line is raised from the SEND path (`surfaceDraftPinFailure`),
+    /// not from the PUT's own catch — a third writer, and the same lifetime: it
+    /// must not be there on the next visit either.
+    @Test func aFailedDraftPinsNoticeLeavesWithTheChat() async {
+        client.failSetModel(with: BayboError.Other(message: "boom"))
+        let store = makeStore(listed: false)
+
+        store.selectModel(entry: "gpt", model: "o3")
+        store.send(text: "hello", attachments: [])
+        #expect(await waitUntil { store.notice != nil })
+
+        store.leaveChat()
+
+        #expect(store.notice == nil)
+    }
+
+    /// And the same writer's after-leave half: `surfaceDraftPinFailure` runs at
+    /// the TAIL of the send Task, so leaving mid-send lands it past the
+    /// retraction. The reverted pill proves the deferred line was armed and the
+    /// transmission proves the tail it hangs off was reached — without both, a
+    /// missing line says nothing.
+    @Test func aDraftPinThatFailsAfterTheUserLeftRaisesNoLine() async {
+        client.failSetModel(with: BayboError.Other(message: "boom"))
+        let store = makeStore(listed: false)
+
+        store.selectModel(entry: "gpt", model: "o3")
+        store.send(text: "hello", attachments: [])
+        store.leaveChat()
+
+        #expect(
+            await waitUntil {
+                client.callTimeline.contains("sendAfterConnect")
+                    || client.callTimeline.contains("send")
+            })
+        #expect(await waitUntil { store.modelPin == nil }, "the failure still reverts the pill")
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(store.notice == nil, "a line raised after the leave is refused, not stranded")
     }
 }
