@@ -3270,23 +3270,23 @@ function HideSessionModal({
       onClick={onCancel}
     >
       <div
-        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden max-h-full flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="px-6 py-4 border-b-2 border-black">
+        <header className="shrink-0 px-6 py-4 border-b-2 border-black">
           <h3 className="font-bold uppercase tracking-wider">Remove conversation</h3>
         </header>
-        <div className="px-6 py-4 space-y-3">
+        <div className="px-6 py-4 space-y-3 overflow-y-auto min-h-0">
           <p className="text-[0.95rem] leading-relaxed">
             Remove this conversation from your list?
           </p>
           {error ? (
-            <div className="bg-surface border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+            <div className="bg-surface border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem] break-words">
               {error}
             </div>
           ) : null}
         </div>
-        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+        <footer className="shrink-0 flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
           <button
             type="button"
             onClick={onCancel}
@@ -5643,8 +5643,8 @@ export function WorkStepView({ step }: { step: WorkStep }) {
   if (step.kind === 'status') {
     return (
       <div className="flex items-center gap-2 font-mono text-xs text-ink-soft">
-        <span className="select-none">⟳</span>
-        <span>{step.text}</span>
+        <span className="select-none shrink-0">⟳</span>
+        <span className="break-words [overflow-wrap:anywhere]">{step.text}</span>
       </div>
     );
   }
@@ -5654,7 +5654,7 @@ export function WorkStepView({ step }: { step: WorkStep }) {
     // bubble's prose styling — not the dim mono of the reasoning/tool steps —
     // so it reads as reply text when the block is expanded.
     return (
-      <div className="chat-prose text-ink">
+      <div className="chat-prose text-ink break-words">
         <MarkdownBody text={step.text ?? ''} />
       </div>
     );
@@ -5672,8 +5672,8 @@ export function WorkStepView({ step }: { step: WorkStep }) {
           : 'text-ink-soft';
     return (
       <div className={`flex items-start gap-2 font-mono text-xs ${color}`}>
-        <span className="select-none">△</span>
-        <span className="whitespace-pre-wrap">{step.text}</span>
+        <span className="select-none shrink-0">△</span>
+        <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{step.text}</span>
       </div>
     );
   }
@@ -5694,10 +5694,12 @@ export function WorkStepView({ step }: { step: WorkStep }) {
           : null;
   return (
     <div className="flex flex-col gap-0.5 font-mono text-xs">
-      <div className="flex items-center gap-1.5">
-        <span className="text-info">⏺</span>
-        <span className="font-bold text-ink">{step.tool}</span>
-        {step.toolLabel ? <span className="text-ink-soft">({step.toolLabel})</span> : null}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-info shrink-0">⏺</span>
+        <span className="font-bold text-ink break-words [overflow-wrap:anywhere]">{step.tool}</span>
+        {step.toolLabel ? (
+          <span className="text-ink-soft break-words [overflow-wrap:anywhere]">({step.toolLabel})</span>
+        ) : null}
         {/* A call parked on the approval card is NOT running — no spinner, or it
             would read as work in progress while nothing executes. */}
         {step.toolStatus === 'running' && !step.awaitingApproval ? (
@@ -5715,8 +5717,8 @@ export function WorkStepView({ step }: { step: WorkStep }) {
       </div>
       {step.toolSummary ? (
         <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
-          <span className="select-none">⎿</span>
-          <span className="whitespace-pre-wrap">{step.toolSummary}</span>
+          <span className="select-none shrink-0">⎿</span>
+          <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{step.toolSummary}</span>
         </div>
       ) : null}
     </div>
@@ -6138,17 +6140,19 @@ function ApprovalCard({
   return (
     <div className="border-2 border-black bg-white rounded-md shadow-brutal-sm p-3 flex flex-col gap-2">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-bold uppercase tracking-wider text-sm">
+        <span className="font-bold uppercase tracking-wider text-sm break-words [overflow-wrap:anywhere]">
           Approval needed: {approval.tool}
         </span>
-        <span className="text-ink-soft font-mono text-xs">{approval.callId.slice(0, 8)}</span>
+        <span className="text-ink-soft font-mono text-xs shrink-0">{approval.callId.slice(0, 8)}</span>
       </div>
       {approval.description ? (
-        <div className="text-sm font-mono text-ink-soft">{approval.description}</div>
+        <div className="text-sm font-mono text-ink-soft break-words [overflow-wrap:anywhere]">
+          {approval.description}
+        </div>
       ) : null}
       <ul className="text-sm font-mono flex flex-col gap-0.5">
         {approval.accesses.map((acc, i) => (
-          <li key={i} className="text-ink-soft">
+          <li key={i} className="text-ink-soft break-words [overflow-wrap:anywhere]">
             • {formatAccess(acc)}
           </li>
         ))}

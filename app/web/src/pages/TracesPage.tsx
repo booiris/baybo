@@ -390,7 +390,7 @@ export function TracesPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       )}

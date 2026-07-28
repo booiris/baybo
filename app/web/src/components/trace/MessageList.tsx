@@ -132,14 +132,14 @@ function ContentBlockView({
     );
   } else if ('Image' in block) {
     label = `image (${block.Image.mime_type})`;
-    body = <span className="font-mono text-[0.8rem]">blob: {block.Image.blob.blob_id}</span>;
+    body = <span className="font-mono text-[0.8rem] break-all">blob: {block.Image.blob.blob_id}</span>;
   } else if ('Audio' in block) {
     label = `audio (${block.Audio.mime_type})`;
-    body = <span className="font-mono text-[0.8rem]">blob: {block.Audio.blob.blob_id}</span>;
+    body = <span className="font-mono text-[0.8rem] break-all">blob: {block.Audio.blob.blob_id}</span>;
   } else if ('File' in block) {
     label = `file: ${block.File.filename}`;
     body = (
-      <span className="font-mono text-[0.8rem]">
+      <span className="font-mono text-[0.8rem] break-all">
         {block.File.mime_type} — blob: {block.File.blob.blob_id}
       </span>
     );
@@ -150,9 +150,9 @@ function ContentBlockView({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2 px-2 py-1 text-left text-[0.75rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer"
+        className="w-full flex items-center gap-2 px-2 py-1 text-left text-[0.75rem] font-bold uppercase tracking-wider text-ink-soft hover:text-ink cursor-pointer break-all"
       >
-        {open ? <RiArrowDownSLine /> : <RiArrowRightSLine />}
+        {open ? <RiArrowDownSLine className="shrink-0" /> : <RiArrowRightSLine className="shrink-0" />}
         {label}
       </button>
       {open && <div className="px-2 pb-2">{body}</div>}

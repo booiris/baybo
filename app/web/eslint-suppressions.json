@@ -90,7 +90,7 @@
       "count": 3
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 23
+      "count": 22
     }
   },
   "src/pages/TracesPage.tsx": {

@@ -179,7 +179,9 @@ export function SearchPanel({
     );
   }
   if (state.kind === 'failed') {
-    return <div className="text-center text-error text-xs py-6 font-mono px-2">{state.message}</div>;
+    return (
+      <div className="text-center text-err text-xs py-6 font-mono px-2 break-words">{state.message}</div>
+    );
   }
   if (state.groups.length === 0) {
     return (
