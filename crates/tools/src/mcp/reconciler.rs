@@ -27,11 +27,14 @@ const EMBEDDED_BACKOFF_MAX: Duration = Duration::from_secs(30);
 ///
 /// A child that exited answers immediately with a broken-pipe `Err`, but one
 /// that *hangs* — a wedged event loop, a sidecar blocked on a syscall — never
-/// answers at all. The probes run sequentially inside `tick`, so an unbounded
-/// await there doesn't just miss the hung server: it stalls reconciliation for
-/// every other MCP server behind it, including the user's `.mcp.json` entries.
-/// Treating a silent probe as death is safe — `disconnect_server` drops the
-/// transport, which kills the child, and the backoff schedule respawns it.
+/// answers at all, so an unbounded await would park the whole tick on it and
+/// stall the connect loop that follows, including the user's `.mcp.json`
+/// entries. Treating a silent probe as death is safe — `disconnect_server`
+/// drops the transport, which kills the child, and the backoff schedule
+/// respawns it.
+///
+/// The probes themselves run concurrently, so this is the ceiling for the
+/// whole probe phase rather than a per-server cost that accumulates.
 ///
 /// This bounds the *probe* only. `connect_server` below is still unbounded, so
 /// a first-boot browser sidecar that spends minutes building its docker image
@@ -205,31 +208,46 @@ impl McpReconciler {
                 .map(|e| e.entry.name.clone())
                 .collect()
         };
-        for name in probe_targets {
-            let peer = self.state.lock().get(&name).map(|c| c.session.peer());
-            if let Some(peer) = peer {
-                // Cheapest no-op: re-list tools. Returns Err on a
-                // dead transport (broken pipe to a stdio child that
-                // exited), and times out on one that hung instead.
-                let failure =
-                    match tokio::time::timeout(EMBEDDED_PROBE_TIMEOUT, peer.list_all_tools()).await
-                    {
-                        Ok(Ok(_)) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(_) => Some(format!(
-                            "no response within {}s",
-                            EMBEDDED_PROBE_TIMEOUT.as_secs()
-                        )),
-                    };
-                if let Some(error) = failure {
-                    tracing::warn!(
-                        server = %name,
-                        %error,
-                        "embedded mcp server probe failed; disconnecting and scheduling reconnect"
-                    );
-                    self.disconnect_server(&name).await;
-                    self.bump_backoff(&name);
-                }
+        // Probes run concurrently rather than one after another: they are
+        // independent, and each can burn the full `EMBEDDED_PROBE_TIMEOUT`
+        // before it answers. Sequentially that cost is additive and lands in
+        // front of the connect loop below — which also serves the user's
+        // `.mcp.json` entries — so N hung embedded servers would delay every
+        // user server's reconnect by N × the timeout.
+        //
+        // `join_all` (not `JoinSet`) keeps this on the reconciler's own task:
+        // the work is a network wait, not CPU, so there is nothing to gain
+        // from spawning, and staying single-task keeps the peers borrowed
+        // rather than forced to `'static`.
+        let probes = probe_targets.into_iter().filter_map(|name| {
+            // The lock is released before the future is ever polled — a
+            // `parking_lot` guard held across an await would not compile here
+            // and would deadlock the next tick if it did.
+            let peer = self.state.lock().get(&name).map(|c| c.session.peer())?;
+            Some(async move {
+                // Cheapest no-op: re-list tools. Returns Err on a dead
+                // transport (broken pipe to a stdio child that exited), and
+                // times out on one that hung instead.
+                let outcome = tokio::time::timeout(EMBEDDED_PROBE_TIMEOUT, peer.list_all_tools())
+                    .await
+                    .map(|r| r.map(|_| ()));
+                (name, probe_failure(outcome))
+            })
+        });
+
+        // Teardown is deliberately outside the concurrent phase: it mutates
+        // the shared state/backoff maps and unregisters tools, and doing it
+        // serially after every probe has answered keeps that ordering
+        // deterministic for the connect loop below.
+        for (name, failure) in futures::future::join_all(probes).await {
+            if let Some(error) = failure {
+                tracing::warn!(
+                    server = %name,
+                    %error,
+                    "embedded mcp server probe failed; disconnecting and scheduling reconnect"
+                );
+                self.disconnect_server(&name).await;
+                self.bump_backoff(&name);
             }
         }
 
@@ -390,6 +408,28 @@ impl McpReconciler {
     }
 }
 
+/// Reduce one liveness probe to "why it failed", or `None` if the server
+/// answered.
+///
+/// The two failure shapes are not interchangeable and the message says which:
+/// an `Err` means the transport is gone (the child exited and the pipe broke),
+/// while a timeout means the child is still there and simply stopped
+/// answering. Both cost the server its connection, but only the second is the
+/// wedged-sidecar case the timeout exists for, and an operator reading the log
+/// needs to tell them apart.
+fn probe_failure(
+    outcome: Result<Result<(), rmcp::ServiceError>, tokio::time::error::Elapsed>,
+) -> Option<String> {
+    match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!(
+            "no response within {}s",
+            EMBEDDED_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) -> u64 {
     let mut hasher = DefaultHasher::new();
     entry.name.hash(&mut hasher);
@@ -496,6 +536,41 @@ mod tests {
 
     fn names<I: IntoIterator<Item = &'static str>>(names: I) -> HashSet<String> {
         names.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn probe_failure_passes_a_live_server() {
+        assert!(probe_failure(Ok(Ok(()))).is_none());
+    }
+
+    /// A broken pipe and a wedged child both cost the server its connection,
+    /// but they are different diagnoses and the log line has to say which:
+    /// only the second is the case `EMBEDDED_PROBE_TIMEOUT` exists for.
+    #[test]
+    fn probe_failure_reports_a_dead_transport_verbatim() {
+        let reason = probe_failure(Ok(Err(rmcp::ServiceError::TransportClosed)))
+            .expect("a transport error is a probe failure");
+        assert_eq!(reason, "Transport closed");
+        assert!(
+            !reason.contains("no response"),
+            "an exited child must not be reported as a timeout: {reason}",
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_failure_reports_a_silent_server_as_a_timeout() {
+        // The wedged-sidecar case: the child is alive and simply never answers.
+        let elapsed = tokio::time::timeout(
+            Duration::ZERO,
+            std::future::pending::<Result<(), rmcp::ServiceError>>(),
+        )
+        .await
+        .expect_err("a pending future must time out");
+        let reason = probe_failure(Err(elapsed)).expect("a timeout is a probe failure");
+        assert_eq!(
+            reason,
+            format!("no response within {}s", EMBEDDED_PROBE_TIMEOUT.as_secs()),
+        );
     }
 
     #[test]
