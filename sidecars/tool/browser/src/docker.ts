@@ -35,6 +35,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { createLogger } from "./log.js";
+
 const exec = promisify(execFile);
 
 export type DockerPhase =
@@ -52,6 +54,11 @@ export interface DockerSpawnOptions {
     webVncPort?: number;
     viewport: { width: number; height: number };
     onPhase: (p: DockerPhase) => void;
+    /**
+     * Refuse to build the image, failing fast instead. Set on the watchdog's
+     * repair path — see the `neverBuild` branch in `resolveImageTag`.
+     */
+    neverBuild?: boolean;
 }
 
 export interface DockerHandle {
@@ -61,42 +68,21 @@ export interface DockerHandle {
     stop: () => Promise<void>;
 }
 
-const LOG_PREFIX = "[browser-mcp:docker]";
-
-const log = (msg: string): void => {
-    process.stderr.write(`${LOG_PREFIX} ${msg}\n`);
-};
-
-// Steady-state per-boot progress lines go out as NDJSON `debug` so the
-// gateway's MCP stderr drain (crates/tools/src/mcp/transport.rs) routes
-// them below the default INFO filter instead of forwarding them at INFO
-// like a plain-text line. Kept a one-liner rather than a shared module
-// because docker.ts is imported by server.ts — a back-import for the
-// helper would be a cycle.
-const logDebug = (msg: string): void => {
-    writeSidecarNdjson("debug", `${LOG_PREFIX} ${msg}`);
-};
-
-function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: string): void {
-    let line: string;
-    try {
-        line = `${JSON.stringify({ level, msg })}\n`;
-    } catch {
-        return;
-    }
-    try {
-        // MCP speaks JSON-RPC over stdout, so every log line — including
-        // NDJSON — must go to stderr where the gateway's drain reads it.
-        process.stderr.write(line);
-    } catch {
-        // EPIPE / closed stream — nothing useful to do from inside a logger.
-    }
-}
+const logger = createLogger("[browser-mcp:docker]");
+const log = logger.info;
+const logDebug = logger.debug;
 
 // How many trailing docker-build stderr lines to retain and surface when
 // a build fails. Enough to carry the actual apt/network error without
 // re-dumping the whole (multi-thousand-line) transcript.
 const BUILD_STDERR_TAIL_LINES = 30;
+
+/**
+ * Ceiling on `docker build`. The log line above advertises 1-3 minutes; this is
+ * generous against that while still being finite, which is the whole point —
+ * an unbounded build on the watchdog's repair path takes the watchdog with it.
+ */
+const BUILD_TIMEOUT_MS = 15 * 60_000;
 
 export async function checkDockerAvailable(): Promise<
     { ok: true; serverVersion: string } | { ok: false; reason: string }
@@ -141,15 +127,15 @@ export async function sweepStaleContainers(): Promise<void> {
         .filter((l) => l.length > 0);
     for (const line of lines) {
         const [name, pidStr] = line.split("\t");
-        if (!name) continue;
+        if (name === undefined || name.length === 0) continue;
         // `Number(pidStr)` returns NaN on partial parse; `parseInt("12abc",10)`
         // would silently truncate to 12 and falsely treat the container's
         // owner as still-alive when the label is corrupted.
-        const pid = pidStr ? Number(pidStr) : NaN;
+        const pid = pidStr !== undefined && pidStr.length > 0 ? Number(pidStr) : NaN;
         if (Number.isFinite(pid) && pid > 0 && isPidAlive(pid)) {
             continue;
         }
-        log(`sweep: removing stale container ${name} (owner pid=${pidStr || "?"} not alive)`);
+        log(`sweep: removing stale container ${name} (owner pid=${pidStr !== undefined && pidStr.length > 0 ? pidStr : "?"} not alive)`);
         try {
             await exec("docker", ["rm", "-f", name], { timeout: 5000 });
         } catch (e) {
@@ -198,11 +184,24 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
     // the gateway's own stderr and thence baybo.log at INFO. We keep only
     // a trailing window and surface it if the build fails, so a broken
     // build stays diagnosable without the success-path flood.
+    // Every other docker call in this file goes through `exec(..., {timeout})`;
+    // this one is the longest-running of the set and was the only one unbounded.
+    // `spawn` ignores child_process's `timeout`, so the deadline has to ride an
+    // AbortSignal. A CLI blocked on a wedged daemon socket, or a BuildKit step
+    // waiting on a stalled registry, otherwise never returns at all.
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(), BUILD_TIMEOUT_MS);
+    deadline.unref();
+    try {
     await new Promise<void>((resolve, reject) => {
-        const child = spawn("docker", args, { stdio: ["ignore", "ignore", "pipe"] });
+        const child = spawn("docker", args, {
+            stdio: ["ignore", "ignore", "pipe"],
+            signal: abort.signal,
+            killSignal: "SIGKILL",
+        });
         const tail: string[] = [];
         let pending = "";
-        child.stderr?.on("data", (chunk: Buffer) => {
+        child.stderr.on("data", (chunk: Buffer) => {
             pending += chunk.toString("utf8");
             const parts = pending.split("\n");
             pending = parts.pop() ?? "";
@@ -211,7 +210,13 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
                 if (tail.length > BUILD_STDERR_TAIL_LINES) tail.shift();
             }
         });
-        child.on("error", reject);
+        child.on("error", (e) => {
+            reject(
+                abort.signal.aborted
+                    ? new Error(`docker build exceeded ${BUILD_TIMEOUT_MS}ms and was killed`)
+                    : e,
+            );
+        });
         child.on("exit", (code) => {
             if (code === 0) {
                 resolve();
@@ -225,6 +230,9 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
             reject(new Error(`docker build exited ${code}${captured}`));
         });
     });
+    } finally {
+        clearTimeout(deadline);
+    }
     log(`image ${tag} built`);
 }
 
@@ -270,9 +278,9 @@ async function findCachedBayboBrowserImage(): Promise<
         .filter((l) => l.length > 0 && !l.startsWith("baybo-browser:<none>"));
     // `docker images` already returns rows ordered most-recent first.
     const first = lines[0];
-    if (!first) return undefined;
+    if (first === undefined) return undefined;
     const [tag, createdAt] = first.split("\t");
-    if (!tag || !createdAt) return undefined;
+    if (tag === undefined || createdAt === undefined || createdAt.length === 0) return undefined;
     const ageDays = parseDockerCreatedAtAgeDays(createdAt);
     if (ageDays === undefined) {
         log(`cached image ${tag} CreatedAt='${createdAt}' unparseable; assuming stale`);
@@ -296,7 +304,7 @@ function parseDockerCreatedAtAgeDays(createdAt: string): number | undefined {
 }
 
 async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
-    if (opts.imageTag) {
+    if (opts.imageTag !== undefined) {
         log(`using operator-supplied image tag ${opts.imageTag}; skipping build`);
         return opts.imageTag;
     }
@@ -306,6 +314,18 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
     if (await imageExists(tag)) {
         logDebug(`image ${tag} already cached`);
         return tag;
+    }
+    if (opts.neverBuild === true) {
+        // The watchdog's repair path. A build here is minutes of work on the
+        // one code path that must stay responsive, and it is the wrong place
+        // for it: a first build belongs to boot. Failing fast hands the
+        // problem to the escalation ladder, which re-boots the sidecar — where
+        // building is legitimate and the transport is not yet anyone's
+        // dependency.
+        throw new Error(
+            `image ${tag} is not present and this is a recovery spawn, which does not build. ` +
+                `Restarting the sidecar will rebuild it.`,
+        );
     }
     try {
         await buildImage(opts.dockerDir, tag);
@@ -347,7 +367,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     // anywhere near the docker CLI so the operator gets a clear message
     // instead of a `Mounts denied` / `invalid mode` error from docker.
     rejectColonInBindPath(opts.profileDir, "browser.profile_dir");
-    if (opts.fontDir) {
+    if (opts.fontDir !== undefined) {
         rejectColonInBindPath(opts.fontDir, "<workspace>/work/.fonts (font bind-mount source)");
     }
 
@@ -361,8 +381,11 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
 
     const containerName = `baybo-browser-${process.pid}-${randomBytes(3).toString("hex")}`;
     const viewport = `${opts.viewport.width}x${opts.viewport.height}`;
-    const uid = (typeof process.getuid === "function" ? process.getuid() : 1000) || 1000;
-    const gid = (typeof process.getgid === "function" ? process.getgid() : 1000) || 1000;
+    // NOT `(... ) || 1000`: uid 0 is falsy, so a gateway running as root used to
+    // publish `--user 1000:1000` and write the bind-mounted profile as the wrong
+    // owner. The fallback is only for a platform without getuid at all.
+    const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+    const gid = typeof process.getgid === "function" ? process.getgid() : 1000;
 
     // We deliberately do NOT pass `--rm` here. If Chrome (or anything in
     // the entrypoint) crashes on startup, an `--rm` container deletes
@@ -370,8 +393,11 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     // "Container logs: (no logs)" diagnostic. Without --rm the container
     // sits in `Exited` state until we explicitly `docker rm` it, and
     // `docker logs` works fine. Cleanup is owned by `stop()` (success
-    // path), the catch block below (post-run failure path), and the
-    // next-boot `sweepStaleContainers()` (kill -9 the gateway path).
+    // path), the catch block below (post-run failure path), the watchdog's
+    // `recover()` (which replaces an unresponsive container), and the
+    // next-boot `sweepStaleContainers()` (kill -9 the gateway path). Every
+    // one of those owes a `describeDeadContainer` first — removing the
+    // container is what makes these logs unreachable.
     const runArgs = [
         "run",
         "-d",
@@ -396,7 +422,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
         "-p",
         "127.0.0.1::9223",
     ];
-    if (opts.fontDir) {
+    if (opts.fontDir !== undefined) {
         runArgs.push("-v", `${opts.fontDir}:/data/fonts:ro`);
     }
     // Browser-based VNC observability via noVNC + websockify on
@@ -479,12 +505,35 @@ async function readPublishedCdpUrl(containerName: string): Promise<string> {
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
     const v4 = lines.find((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
-    if (!v4) {
+    if (v4 === undefined) {
         throw new Error(`docker port returned no IPv4 mapping (got: ${stdout.trim()})`);
     }
     const port = v4.split(":").pop();
     return `http://127.0.0.1:${port}`;
 }
+
+/**
+ * One CDP liveness probe.
+ *
+ * `/json/version` is the cheapest thing Chrome's DevTools HTTP interface
+ * serves and needs no CDP session, so it can run on an idle timer without
+ * touching chrome-devtools-mcp's tool mutex — which is what makes it usable
+ * as the watchdog's steady-state health check, not just a boot gate.
+ *
+ * Resolves when Chrome answers; throws with a short reason otherwise.
+ */
+export async function probeCdpEndpoint(
+    cdpUrl: string,
+    signal?: AbortSignal,
+): Promise<void> {
+    const res = await fetch(`${cdpUrl}/json/version`, signal !== undefined ? { signal } : {});
+    if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+    }
+}
+
+/** Per-attempt ceiling inside {@link waitForCdp}. */
+const CDP_PROBE_TIMEOUT_MS = 2_000;
 
 async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> {
     const deadline = Date.now() + 30_000;
@@ -493,9 +542,11 @@ async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> 
     let pollCount = 0;
     while (Date.now() < deadline) {
         try {
-            const res = await fetch(`${cdpUrl}/json/version`);
-            if (res.ok) return;
-            lastErr = `HTTP ${res.status}`;
+            // Without a signal this inherits undici's ~300s header timeout, so the
+            // 30s budget below would silently become five minutes against a
+            // container that accepts the connection and then never replies.
+            await probeCdpEndpoint(cdpUrl, AbortSignal.timeout(CDP_PROBE_TIMEOUT_MS));
+            return;
         } catch (e) {
             lastErr = (e as Error).message;
         }
@@ -507,7 +558,7 @@ async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> 
         pollCount += 1;
         if (pollCount % 4 === 0) {
             const status = await containerStatus(containerName);
-            if (status && status !== "running" && status !== "created") {
+            if (status !== undefined && status !== "running" && status !== "created") {
                 containerExitedEarly = true;
                 lastErr = `container exited early (state=${status})`;
                 break;
@@ -565,12 +616,40 @@ function rejectColonInBindPath(path: string, label: string): void {
     }
 }
 
-async function fetchContainerLogs(containerName: string): Promise<string> {
+/** Log lines kept in a post-mortem. Smaller than the boot-failure dump: this
+ * one can fire up to once per recovery attempt. */
+const POST_MORTEM_TAIL_LINES = 40;
+
+/**
+ * Post-mortem for a container that is about to be removed.
+ *
+ * `docker run` deliberately omits `--rm` so a crashed container's logs stay
+ * fetchable — see the rationale in {@link spawnContainer}. Anything that
+ * removes a container therefore owes the operator this first, or the recovery
+ * that fixes the symptom also destroys the only evidence of the cause: an OOM
+ * that will recur every few minutes reads as bad luck instead of a container
+ * that needs more memory.
+ *
+ * Returned as one string so the caller emits one NDJSON line — the gateway's
+ * stderr drain budgets by line, and embedded newlines survive the round trip.
+ */
+export async function describeDeadContainer(containerName: string): Promise<string> {
+    const [exit, logs] = await Promise.all([
+        containerExitInfo(containerName),
+        fetchContainerLogs(containerName, POST_MORTEM_TAIL_LINES),
+    ]);
+    return `exit: ${exit}\nlast ${POST_MORTEM_TAIL_LINES} log lines:\n${logs}`;
+}
+
+async function fetchContainerLogs(
+    containerName: string,
+    tailLines = 60,
+): Promise<string> {
     try {
         // Without --rm on the container, logs are still attached even
         // after the container exits, so this works in both the
         // hung-but-alive and crashed-and-stopped cases.
-        const r = await exec("docker", ["logs", "--tail", "60", containerName], {
+        const r = await exec("docker", ["logs", "--tail", String(tailLines), containerName], {
             timeout: 5000,
         });
         const combined = `${r.stdout}${r.stderr}`.trim();

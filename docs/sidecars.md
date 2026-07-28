@@ -40,6 +40,34 @@ Thin wrapper around Google's [`chrome-devtools-mcp`](https://github.com/ChromeDe
 
 **Auto-fontconfig**: `<workspace>/work/.fonts/` is always pinned as a Chrome fontconfig `<dir>` (synthesised temp `fonts.conf` + `FONTCONFIG_FILE` env). Drop a CJK / icon font there and Chrome picks it up next restart. macOS no-op (Chrome uses Core Text).
 
+### Browser watchdog (`src/watchdog.ts`)
+
+Two layers supervise the browser, because one process death and one browser death are different events.
+
+The **gateway** owns the process: `McpReconciler` (`crates/tools/src/mcp/reconciler.rs`) probes every embedded MCP server on a 5s tick and respawns a child whose stdio pipe broke, with 500ms→30s backoff. That probe is a `tools/list`, bounded by `EMBEDDED_PROBE_TIMEOUT` so a *hung* child can't stall reconciliation for every other MCP server behind it in the same sequential loop.
+
+The **sidecar** owns the browser, because the gateway structurally cannot see it: our proxy answers `tools/list` in-process, so Chrome can be gone for hours while the MCP server looks perfectly healthy and every `browser/*` call returns "Could not connect to Chrome". The watchdog probes the browser itself every 30s and follows one detect → repair → escalate ladder, with per-mode behaviour plugged in via `BrowserHealer`:
+
+| mode | liveness probe | repair |
+| --- | --- | --- |
+| `host` | `list_pages` through CDDM | SIGKILL a hung Chrome (found via the profile's `SingletonLock` target), clear stale `Singleton*` locks, let CDDM relaunch |
+| `docker` | `GET <cdpUrl>/json/version` | force-remove the container, sweep, respawn, repoint `args.browserUrl` at the new ephemeral port |
+| `cdp_url` | `GET <cdpUrl>/json/version` | none — the operator owns that Chrome; report and keep probing |
+
+Load-bearing details:
+
+- **It stands down when the browser is in use.** Live traffic proves liveness better than a probe, and CDDM serialises every tool call behind one mutex — a probe fired mid-call would queue behind it and then time out against a healthy browser. In `host` mode it also stays idle until the first tool call, because CDDM launches Chrome lazily and probing from boot would force a Chrome the operator may never use into memory.
+- **Two consecutive failed probes** are required before repair runs. Docker recovery is destructive (the container, and every tab open in it, is replaced), so one transient loopback error must not trigger it.
+- **`recover()` proves itself** with an end-to-end call rather than resolving optimistically — a respawned container whose CDP port answers can still be unreachable through the puppeteer connection CDDM has cached.
+- **Escalation is `process.exit(1)`.** After 3 failed recoveries the sidecar exits (stopping its container first) and lets the reconciler respawn it, which re-runs the full boot sequence — lock clearing, container sweep, Chrome install. Full re-initialisation already exists at boot and doesn't need a second implementation inside the watchdog. `cdp_url` mode never escalates: exiting would crash-loop against the reconciler while fixing nothing.
+- **The phase flips off `ready` during repair**, which is what makes `GuardingTransport` answer an agent's `tools/call` with the healer's own outage text instead of letting a raw puppeteer `Target closed` reach the model. The wording is per-mode (`BrowserHealer.outageText`) because the honest answer differs — two modes are restarting the browser, `cdp_url` is only waiting for someone else to. The docker respawn deliberately runs with its own `onPhase` that logs rather than assigning `state.phase`: reusing the boot callback would overwrite `recovering` with `docker-building-image` and tell the agent its browser is in first-time setup when what actually happened is a mid-session crash.
+- **An outage is logged once, not once per tick.** The gateway's stderr drain demotes everything past `MCP_STDERR_INFO_LINE_BUDGET` (300 lines/spawn) to `debug!`, so a `cdp_url` outage that logged every cycle would silence this sidecar's real warnings for the rest of the process.
+- **Shutdown quiesces the watchdog** rather than just setting a flag. A docker repair can be several minutes long (`docker rm` → image resolve → `docker run` → CDP wait), and exiting under it would orphan the container `spawnContainer` is about to create — the next-boot sweep skips containers whose owner pid is still alive, so nothing would ever reclaim it.
+
+**Chrome install is retried** (4 attempts, 15s/30s/45s backoff) before `phase` goes to the terminal `failed`. A boot that landed in a network blip used to wedge `browser/*` until the operator restarted the gateway, and `failed` is the one phase the watchdog can't help with — there is no browser to probe.
+
+**Editing CDDM interaction — two traps.** CDDM caches the browser in a *module-level* singleton guarded on `browser?.connected` alone: on a cache hit it returns the cached instance and discards every argument. So (a) mutating `args.browserUrl` only lands once the old connection has actually dropped, which is why docker recovery force-removes the container first, and (b) never switch *modes* (launched ↔ connected) at runtime — the guard ignores mode entirely and would hand back the wrong browser. Reaching for CDDM's `closeBrowser` to force the issue does not work either: it isn't exported from the package entry, and a deep import gets inlined by esbuild as a second module instance with its own singleton (the `bayboResolveCddm` plugin only externalises the exact specifier `chrome-devtools-mcp`).
+
 ### Security trade-offs (deliberate)
 
 Shape what the agent can be safely told to do — not bugs but load-bearing:
@@ -60,6 +88,6 @@ Opt-in via `browser.docker.enable=true`. Spawns a debian-slim container running 
 
 **Sandbox in docker mode**: `browser.sandbox` is ignored — the container is the trust boundary; Chrome runs `--no-sandbox` because the slim base ships no SUID `chrome-sandbox`. Tightening would require a custom seccomp profile + a base image with the helper installed.
 
-**Container lifecycle**: one container per Baybo process, named `baybo-browser-<pid>-<rand6>`, labelled `baybo.role=browser-sidecar` + `baybo.pid=<pid>`. `docker run` is **not** invoked with `--rm` (so a startup crash leaves logs fetchable via `docker logs`). Cleanup: success-path `stop()` (`docker stop -t 5` + `docker rm -f`), failure-path force-remove, and the next-boot `sweepStaleContainers()` for `kill -9` cases. Inside the container Chrome listens on loopback only (Chrome 134+ silently ignores `--remote-debugging-address=0.0.0.0` for DNS-rebinding protection); a `socat 0.0.0.0:9223 → 127.0.0.1:9222` relay forwards the published port. CDP publishes on `127.0.0.1::9223` (ephemeral host port).
+**Container lifecycle**: one container per Baybo process at a time (the watchdog replaces it on death), named `baybo-browser-<pid>-<rand6>`, labelled `baybo.role=browser-sidecar` + `baybo.pid=<pid>`. `docker run` is **not** invoked with `--rm` (so a startup crash leaves logs fetchable via `docker logs`). Cleanup: success-path `stop()` (`docker stop -t 5` + `docker rm -f`), failure-path force-remove, and the next-boot `sweepStaleContainers()` for `kill -9` cases. Inside the container Chrome listens on loopback only (Chrome 134+ silently ignores `--remote-debugging-address=0.0.0.0` for DNS-rebinding protection); a `socat 0.0.0.0:9223 → 127.0.0.1:9222` relay forwards the published port. CDP publishes on `127.0.0.1::9223` (ephemeral host port).
 
 **Profile portability**: `browser.profile_dir` is bind-mounted at `/data/profile`; container runs `--user $(id -u):$(id -g)` so files round-trip cleanly between host-headless and docker modes under the same operator UID.
