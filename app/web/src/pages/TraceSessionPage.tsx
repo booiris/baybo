@@ -825,32 +825,6 @@ function TranscriptPanel({ messageLog }: { messageLog: SessionMessageRow[] }) {
   );
 }
 
-// ── Breadcrumb (orientation for the right-hand detail) ───────────────
-
-interface Crumb {
-  label: string;
-  onClick?: () => void;
-}
-
-function Breadcrumb({ crumbs }: { crumbs: Crumb[] }) {
-  return (
-    <div className="shrink-0 flex items-center gap-1 flex-wrap px-4 py-2 border-b-2 border-black bg-canvas font-mono text-[0.7rem] text-ink-soft">
-      {crumbs.map((c, i) => (
-        <span key={i} className="inline-flex items-center gap-1 min-w-0">
-          {i > 0 && <span className="text-ink-soft/50">›</span>}
-          {c.onClick ? (
-            <button type="button" onClick={c.onClick} className="hover:text-ink hover:underline cursor-pointer truncate max-w-[160px]">
-              {c.label}
-            </button>
-          ) : (
-            <span className="truncate max-w-[160px]">{c.label}</span>
-          )}
-        </span>
-      ))}
-    </div>
-  );
-}
-
 // ── Interjection index ───────────────────────────────────────────────
 
 // Precomputed lookup over a session's transcript so the per-span interjection
@@ -1400,65 +1374,49 @@ export function TraceSessionPage() {
       ? summaryTokens(activeJobSummary)
       : null;
 
-  // Breadcrumb: session › Job #i › [step] › [span].
-  const crumbs: Crumb[] = [{ label: `Session ${overview.session_id.slice(0, 10)}` }];
-  if (activeJobSummary) {
-    crumbs.push({ label: `Job #${activeJobIndex + 1}`, onClick: () => handleSelectJob(activeJobId) });
-  }
-  const spanStepId = selectedSpan
-    ? findSpan(activeJobTrace, selectedSpan.id)?.stepId ?? null
-    : selectedStepRs?.step.id ?? null;
-  if (spanStepId) {
-    const rs = findStep(activeJobTrace, spanStepId);
-    if (rs) {
-      crumbs.push({
-        label: stepVisual(rs.step.kind.kind).label,
-        onClick: () => handleSelectStep(activeJobId, rs.step.id),
-      });
-    }
-  }
-  if (selectedSpan) {
-    crumbs.push({ label: spanVisual(selectedSpan.kind.kind).label });
-  }
-
   return (
     <div className="flex flex-col h-full overflow-hidden bg-canvas">
-      <div className="p-5 shrink-0 flex items-center gap-4 bg-canvas border-b-[3px] border-black z-10">
+      {/* One row, never two: the metadata sits beside the title rather than under
+          it, and carries no `flex-wrap` — the session id is the only shrinkable
+          item, so a narrow window truncates the id instead of growing the bar
+          and stealing height from the tree. */}
+      <div className="px-5 py-2 shrink-0 flex items-center gap-3 bg-canvas border-b-[3px] border-black z-10">
         <IconButton onClick={() => navigate(-1)} aria-label="Go back">
           <RiArrowLeftLine />
         </IconButton>
-        <div className="flex-1 min-w-0">
-          <h2 className="text-[1.4rem] font-bold uppercase -tracking-[0.05em] leading-tight">TRACE DETAILS</h2>
-          <div className="text-ink-soft text-[0.85rem] font-mono truncate flex items-center gap-3 flex-wrap">
-            <span className="inline-flex items-center gap-1">
-              <RiCpuLine /> Session: {overview.session_id}
-            </span>
-            <span>
-              {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
-            </span>
-            {activeJobSummary && activeTokens && (
-              <span className="inline-flex items-center gap-2">
-                <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
-                  {overview.jobs.length === 1 ? 'Tokens' : `Job #${activeJobIndex + 1}`}
-                </span>
-                <span className="text-ink">↑ {activeTokens.inputTotal.toLocaleString()}</span>
-                <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
-                <span className="text-ink-soft">• {formatDuration(jobDurationMs(activeJobSummary, activeJobTrace))}</span>
+        <h2 className="shrink-0 text-[1.1rem] font-bold uppercase -tracking-[0.04em] leading-none">
+          Trace details
+        </h2>
+        <div className="flex-1 min-w-0 overflow-hidden flex items-center gap-3 text-ink-soft text-[0.8rem] font-mono">
+          <span className="inline-flex items-center gap-1 min-w-0">
+            <RiCpuLine className="shrink-0" />
+            <span className="truncate">{overview.session_id}</span>
+          </span>
+          <span className="shrink-0">
+            {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
+          </span>
+          {activeJobSummary && activeTokens && (
+            <span className="shrink-0 inline-flex items-center gap-2">
+              <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
+                {overview.jobs.length === 1 ? 'Tokens' : `Job #${activeJobIndex + 1}`}
               </span>
-            )}
-            {polling && !isMock && (
-              <span className="text-info inline-flex items-center gap-1 font-bold">
-                <RiLoader4Line className="animate-spin" /> live
-              </span>
-            )}
-          </div>
+              <span className="text-ink">↑ {activeTokens.inputTotal.toLocaleString()}</span>
+              <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
+              <span className="text-ink-soft">• {formatDuration(jobDurationMs(activeJobSummary, activeJobTrace))}</span>
+            </span>
+          )}
+          {polling && !isMock && (
+            <span className="shrink-0 text-info inline-flex items-center gap-1 font-bold">
+              <RiLoader4Line className="animate-spin" /> live
+            </span>
+          )}
         </div>
         <Button
           onClick={handleManualRefresh}
           disabled={overviewLoading || isMock}
-          className="!py-2 !px-3 !text-[0.85rem] h-9 gap-1.5"
+          className="shrink-0 !py-1.5 !px-3 !text-[0.8rem] h-8 gap-1.5"
         >
-          <RiRefreshLine className="text-lg shrink-0" /> Refresh
+          <RiRefreshLine className="text-base shrink-0" /> Refresh
         </Button>
       </div>
 
@@ -1506,7 +1464,6 @@ export function TraceSessionPage() {
         />
 
         <aside className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
-          <Breadcrumb crumbs={crumbs} />
           {selectedSpan ? (
             <SpanDetailPanel
               span={selectedSpan}
