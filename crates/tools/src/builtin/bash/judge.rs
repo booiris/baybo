@@ -16,6 +16,29 @@
 //! [`baybo_llm::extract_json_object`] (shared with the skill assessor); only an
 //! explicit `"safe"` is treated as safe, so a garbled `risk` field defaults to
 //! risky.
+//!
+//! # Which model judges, and the risk that carries
+//!
+//! Both judges run on the session entry's **lite** model
+//! (`ToolContext::lite_llm` ← `LlmClientPool::resolve_lite`), chosen by the
+//! operator for price. That is a deliberate, and asymmetric, trade:
+//!
+//! - [`judge_pre_exec`] deciding `safe` only means the command runs *without a
+//!   prompt* — still inside the sandbox. Bounded blast radius.
+//! - [`judge_post_fail`] deciding `sandbox_related && safe` re-runs the command
+//!   **on the host, outside the sandbox, with no approval** — the most
+//!   privileged automatic action in the codebase. Its input includes
+//!   `stdout_tail` / `stderr_tail`, i.e. whatever the failed program chose to
+//!   print, and the only defence is the prompt-injection paragraph in
+//!   [`POST_FAIL_SYSTEM`]. Resisting injection is exactly the capability that
+//!   degrades when the model gets smaller, and fail-closed protects against an
+//!   *unavailable* judge, not a *fooled* one.
+//!
+//! Two ways to narrow this without giving up the cost saving, if the trade ever
+//! needs revisiting: require the main model to confirm the privilege-granting
+//! verdict (the escalation is rare, so the saving barely moves), or close the
+//! `Unsandbox` path entirely when a lite model rendered the verdict, leaving
+//! lite able only to tighten. Neither is implemented; this is the owner's call.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};

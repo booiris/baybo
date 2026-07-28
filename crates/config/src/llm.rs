@@ -96,6 +96,15 @@ pub struct LlmEntry {
     /// Entry-level rather than per-model because it is a preference, not
     /// a fact about a model: a session's own thinking-level pick
     /// (`sessions.last_effort`) overrides it per request.
+    ///
+    /// Known limitation: because it is entry-level and baked into each
+    /// client at construction, [`Self::lite_model`]'s client inherits it,
+    /// and the auxiliary call sites pass no per-request effort — so an
+    /// `openai-subscription` entry set to `"high"` runs its risk judges at
+    /// high effort, partly undoing the point of a lite model. There is no
+    /// per-model override; the only remedy is lowering the entry default
+    /// for every session. Affects that provider alone — nothing else reads
+    /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
