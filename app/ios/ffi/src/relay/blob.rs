@@ -5,13 +5,15 @@
 //! ride URL-shaped tunnel messages (`GET/POST /v1/blobs`) instead of the
 //! previous bespoke blob protocol.
 
+use std::path::Path;
+
 use device_proto::noise::StaticKeypair;
 use serde::Deserialize;
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
 
 use super::pairing::load_paired_record;
-use super::tunnel::{BLOB_REQUEST_ID, body_frames, dial_tunnel_leg};
+use super::tunnel::{BLOB_REQUEST_ID, LegIo, body_frame, body_frames, dial_tunnel_leg};
 use crate::blob_helper;
 use crate::core::{TunnelHeader, TunnelRequest, TunnelResponse};
 use crate::gateway_api::{GatewayBlobClient, PATH_BLOBS};
@@ -132,9 +134,66 @@ async fn upload_bytes_over_tunnel(
     expected_hex: &str,
     deck_card: Option<&str>,
 ) -> Result<String, String> {
+    let size = bytes.len() as u64;
+    let mut leg = open_upload_leg(mime_type, expected_hex, size, deck_card).await?;
+    for frame in body_frames(BLOB_REQUEST_ID, bytes) {
+        leg.send(&frame).await?;
+    }
+    finish_upload(leg, expected_hex).await
+}
+
+async fn upload_file(
+    path: String,
+    mime_type: String,
+    deck_card: Option<String>,
+    progress: blob_helper::ProgressSink,
+) -> Result<String, String> {
+    let source = Path::new(&path);
+    let digest = blob_helper::hash_upload_file(source).await?;
+    upload_file_over_tunnel(source, &mime_type, &digest, deck_card.as_deref(), progress).await
+}
+
+async fn upload_file_over_tunnel(
+    source: &Path,
+    mime_type: &str,
+    digest: &blob_helper::FileDigest,
+    deck_card: Option<&str>,
+    progress: blob_helper::ProgressSink,
+) -> Result<String, String> {
+    // The head declares the digest, so the file is hashed BEFORE a byte of it
+    // is dialed for — hence the second read here rather than one streaming pass.
+    let ticker = blob_helper::UploadTicker::new(progress, digest.len);
+    let tee = blob_helper::UploadCacheTee::open(&digest.hex).await;
+    let mut reader = blob_helper::UploadReader::open(
+        source,
+        digest.len,
+        crate::core::MAX_TUNNEL_CHUNK,
+        ticker.clone(),
+        tee.clone(),
+    )
+    .await?;
+    let mut leg = open_upload_leg(mime_type, &digest.hex, digest.len, deck_card).await?;
+    let mut offset = 0u64;
+    while let Some(chunk) = reader.next_chunk().await? {
+        let len = chunk.len() as u64;
+        leg.send(&body_frame(BLOB_REQUEST_ID, offset, digest.len, chunk))
+            .await?;
+        offset += len;
+    }
+    ticker.finish();
+    let blob_id = finish_upload(leg, &digest.hex).await?;
+    tee.publish().await;
+    Ok(blob_id)
+}
+
+async fn open_upload_leg(
+    mime_type: &str,
+    expected_hex: &str,
+    size: u64,
+    deck_card: Option<&str>,
+) -> Result<LegIo, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    let size = bytes.len() as u64;
     let mut leg =
         dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
@@ -157,11 +216,10 @@ async fn upload_bytes_over_tunnel(
         body_len: Some(size),
     })
     .await?;
+    Ok(leg)
+}
 
-    for frame in body_frames(BLOB_REQUEST_ID, bytes) {
-        leg.send(&frame).await?;
-    }
-
+async fn finish_upload(mut leg: LegIo, expected_hex: &str) -> Result<String, String> {
     let head = leg.expect_response_head(BLOB_REQUEST_ID).await?;
     let body = leg
         .collect_response_body(BLOB_REQUEST_ID, head.body_len)
@@ -199,6 +257,16 @@ impl GatewayBlobClient for super::GatewayApi {
         deck_card: Option<String>,
     ) -> impl std::future::Future<Output = Result<String, String>> + Send + '_ {
         async move { upload_bytes(bytes, mime_type, deck_card).await }
+    }
+
+    fn upload_blob_file(
+        &self,
+        path: String,
+        mime_type: String,
+        deck_card: Option<String>,
+        progress: blob_helper::ProgressSink,
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send + '_ {
+        async move { upload_file(path, mime_type, deck_card, progress).await }
     }
 
     fn download_blob(

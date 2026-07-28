@@ -16,6 +16,18 @@ use crate::core::blob_id_sha256_hex;
 
 const BLOB_CACHE_SUBDIR: &str = "baybo-blob-cache";
 const UPLOAD_PART_SUFFIX: &str = "upload.part";
+
+/// Hard cap on one blob, the same 100 MiB the gateway enforces
+/// (`baybo_store::blob::MAX_BLOB_BYTES`) and Swift mirrors
+/// (`ChatStore.maxAttachmentBytes`). Restated rather than imported: pulling
+/// `baybo-store` in would link sqlite into the phone for one integer.
+pub(crate) const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024;
+
+/// How much of a file one read pulls — the digest pass and the direct leg's
+/// body chunks. The relay leg reads in `MAX_TUNNEL_CHUNK` instead, which is
+/// its frame ceiling, not a read size.
+pub(crate) const FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 static UPLOAD_PART_COUNTER: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PART_SWEEP: OnceCell<()> = OnceCell::const_new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
@@ -87,38 +99,307 @@ pub(crate) fn bytes_sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-async fn cache_uploaded_bytes(expected_hex: &str, bytes: &[u8]) -> Result<(), String> {
+/// The cache entry a just-uploaded blob should land in, or `None` when it is
+/// already cached and there is nothing to write.
+async fn upload_cache_entry(expected_hex: &str) -> Result<Option<BlobCacheEntry>, String> {
     if !is_sha256_hex(expected_hex) {
         return Err("invalid blob cache digest".into());
     }
     let entry = cache_entry_for_hex(expected_hex.to_owned()).await?;
-    let cache_lock = cache_lock(&entry);
-    let guard = cache_lock.lock().await;
-    let result: Result<(), String> = async {
-        if cache_exists(&entry).await {
-            return Ok(());
-        }
-
-        let upload_part_path = upload_part_path(&entry);
-        if let Err(e) = tokio::fs::write(&upload_part_path, bytes).await {
-            let _ = tokio::fs::remove_file(&upload_part_path).await;
-            return Err(format!("write cached blob: {e}"));
-        }
-        if let Err(e) = tokio::fs::rename(&upload_part_path, entry.path()).await {
-            let _ = tokio::fs::remove_file(&upload_part_path).await;
-            return Err(format!("rename cached blob: {e}"));
-        }
-        Ok(())
+    if cache_exists(&entry).await {
+        return Ok(None);
     }
-    .await;
+    Ok(Some(entry))
+}
+
+/// Publish a filled part file under its digest name, so the file the user just
+/// sent answers "ready" instead of offering a download arrow. The rename is the
+/// only step a reader can observe, so no reader ever sees a partial blob; the
+/// per-digest lock keeps it from racing a concurrent download's own rename.
+/// A part that does not get renamed is removed either way.
+async fn publish_upload_part(entry: &BlobCacheEntry, part_path: &Path) -> Result<(), String> {
+    let cache_lock = cache_lock(entry);
+    let guard = cache_lock.lock().await;
+    let renamed = if cache_exists(entry).await {
+        Ok(false)
+    } else {
+        tokio::fs::rename(part_path, entry.path())
+            .await
+            .map(|()| true)
+            .map_err(|e| format!("rename cached blob: {e}"))
+    };
     drop(guard);
-    forget_cache_lock_if_idle(&entry, &cache_lock);
-    result
+    forget_cache_lock_if_idle(entry, &cache_lock);
+    if !matches!(renamed, Ok(true)) {
+        let _ = tokio::fs::remove_file(part_path).await;
+    }
+    renamed.map(|_| ())
+}
+
+async fn cache_uploaded_bytes(expected_hex: &str, bytes: &[u8]) -> Result<(), String> {
+    let Some(entry) = upload_cache_entry(expected_hex).await? else {
+        return Ok(());
+    };
+    let part_path = upload_part_path(&entry);
+    if let Err(e) = tokio::fs::write(&part_path, bytes).await {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Err(format!("write cached blob: {e}"));
+    }
+    publish_upload_part(&entry, &part_path).await
 }
 
 pub(crate) async fn cache_uploaded_bytes_best_effort(expected_hex: &str, bytes: &[u8]) {
     if let Err(e) = cache_uploaded_bytes(expected_hex, bytes).await {
         log::warn!("cache uploaded blob: {e}");
+    }
+}
+
+/// Mirrors a streaming upload's body bytes into the cache as they go, and
+/// publishes them once the upload is confirmed.
+///
+/// A tee off the body pass, never a copy of the source afterwards: a copy is a
+/// THIRD independent read, so a file that is still being written (an in-flight
+/// screen recording, an iCloud item syncing a new version) would land under a
+/// digest that is not its own. Nothing evicts from this directory and no reader
+/// re-hashes, so one such entry serves wrong bytes for that digest forever. The
+/// teed bytes are hashed as they are written and the part file is published only
+/// if that digest is the name it would take.
+///
+/// Best effort throughout: a cache failure costs the user a re-download, never
+/// the upload they just made.
+#[derive(Clone)]
+pub(crate) struct UploadCacheTee(Arc<tokio::sync::Mutex<Option<TeePart>>>);
+
+struct TeePart {
+    entry: BlobCacheEntry,
+    part_path: PathBuf,
+    file: Option<tokio::fs::File>,
+    hasher: Sha256,
+}
+
+impl Drop for TeePart {
+    fn drop(&mut self) {
+        // A part outlives its tee only when the upload failed or its task was
+        // cancelled, and nothing sweeps this directory until the next process
+        // start. Blocking `unlink` because a `Drop` cannot await.
+        let _ = std::fs::remove_file(&self.part_path);
+    }
+}
+
+impl UploadCacheTee {
+    pub(crate) async fn open(expected_hex: &str) -> Self {
+        let part = match open_tee_part(expected_hex).await {
+            Ok(part) => part,
+            Err(e) => {
+                log::warn!("cache uploaded blob: {e}");
+                None
+            }
+        };
+        Self(Arc::new(tokio::sync::Mutex::new(part)))
+    }
+
+    /// An inert tee, for readers that are not feeding an upload.
+    #[cfg(test)]
+    fn off() -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(None)))
+    }
+
+    /// Mirror one body chunk. A write failure retires the tee: the upload runs
+    /// on, the blob simply does not end up cached.
+    async fn write(&self, chunk: &[u8]) {
+        let mut slot = self.0.lock().await;
+        let Some(part) = slot.as_mut() else {
+            return;
+        };
+        let Some(file) = part.file.as_mut() else {
+            return;
+        };
+        if let Err(e) = file.write_all(chunk).await {
+            log::warn!("cache uploaded blob: write part: {e}");
+            slot.take();
+            return;
+        }
+        part.hasher.update(chunk);
+    }
+
+    /// The upload is confirmed: publish what streamed through, under the digest
+    /// of those very bytes.
+    pub(crate) async fn publish(&self) {
+        let Some(part) = self.0.lock().await.take() else {
+            return;
+        };
+        if let Err(e) = publish_tee_part(part).await {
+            log::warn!("cache uploaded blob: {e}");
+        }
+    }
+}
+
+async fn open_tee_part(expected_hex: &str) -> Result<Option<TeePart>, String> {
+    let Some(entry) = upload_cache_entry(expected_hex).await? else {
+        return Ok(None);
+    };
+    let part_path = upload_part_path(&entry);
+    let file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|e| format!("create part: {e}"))?;
+    Ok(Some(TeePart {
+        entry,
+        part_path,
+        file: Some(file),
+        hasher: Sha256::new(),
+    }))
+}
+
+async fn publish_tee_part(mut part: TeePart) -> Result<(), String> {
+    if let Some(mut file) = part.file.take() {
+        file.flush().await.map_err(|e| format!("flush part: {e}"))?;
+    }
+    let actual_hex = hex::encode(std::mem::take(&mut part.hasher).finalize());
+    if actual_hex != part.entry.expected_hex() {
+        return Err("uploaded blob cache digest mismatch".into());
+    }
+    publish_upload_part(&part.entry, &part.part_path).await
+}
+
+/// A file's content digest and byte length.
+#[derive(Debug)]
+pub(crate) struct FileDigest {
+    pub(crate) hex: String,
+    pub(crate) len: u64,
+}
+
+/// Hash `path` and measure it, rejecting an over-cap file before any network
+/// work. Both upload legs read the file TWICE — once here, once for the body —
+/// because the relay head must declare `Content-SHA256` before the first body
+/// byte leaves.
+pub(crate) async fn hash_upload_file(path: &Path) -> Result<FileDigest, String> {
+    hash_upload_file_capped(path, MAX_BLOB_BYTES).await
+}
+
+async fn hash_upload_file_capped(path: &Path, cap: u64) -> Result<FileDigest, String> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("read attachment: {e}"))?;
+    if !meta.is_file() {
+        return Err("attachment is not a file".into());
+    }
+    if meta.len() > cap {
+        return Err(over_cap_message(cap));
+    }
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open attachment: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; FILE_READ_CHUNK_BYTES];
+    let mut len = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read attachment: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        // The stat above is a snapshot; a file still being written outgrows it.
+        if len > cap {
+            return Err(over_cap_message(cap));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(FileDigest {
+        hex: hex::encode(hasher.finalize()),
+        len,
+    })
+}
+
+fn over_cap_message(cap: u64) -> String {
+    format!("attachment is larger than the {cap} byte limit")
+}
+
+/// An upload's [`ProgressTicker`], shared between the body reader and the call
+/// that owns the request.
+///
+/// Shared because the reader cannot report the end: reqwest stops polling the
+/// body the instant the declared `Content-Length` is written, so the direct
+/// leg's reader never sees its own EOF. Whoever knows the bytes are up calls
+/// [`Self::finish`].
+#[derive(Clone)]
+pub(crate) struct UploadTicker(Arc<Mutex<ProgressTicker>>);
+
+impl UploadTicker {
+    pub(crate) fn new(progress: ProgressSink, total: u64) -> Self {
+        Self(Arc::new(Mutex::new(ProgressTicker::new(
+            progress,
+            Some(total),
+            0,
+        ))))
+    }
+
+    fn advance(&self, n: usize) {
+        self.0.lock().advance(n);
+    }
+
+    pub(crate) fn finish(&self) {
+        self.0.lock().finish();
+    }
+}
+
+/// Sequential body chunks for a streaming upload, ticking the same rate-limited
+/// [`ProgressTicker`] the download path uses and teeing every chunk into the
+/// blob cache.
+///
+/// Reads exactly the length [`hash_upload_file`] measured: that is what both
+/// legs declared as their content length, and a file that shrank underneath us
+/// would otherwise leave the body one frame short forever.
+pub(crate) struct UploadReader {
+    file: tokio::fs::File,
+    remaining: u64,
+    chunk_bytes: usize,
+    ticker: UploadTicker,
+    tee: UploadCacheTee,
+}
+
+impl UploadReader {
+    pub(crate) async fn open(
+        path: &Path,
+        total: u64,
+        chunk_bytes: usize,
+        ticker: UploadTicker,
+        tee: UploadCacheTee,
+    ) -> Result<Self, String> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| format!("open attachment: {e}"))?;
+        Ok(Self {
+            file,
+            remaining: total,
+            chunk_bytes,
+            ticker,
+            tee,
+        })
+    }
+
+    /// The next body chunk, `None` once the declared length has been read.
+    pub(crate) async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let want = self.remaining.min(self.chunk_bytes as u64) as usize;
+        let mut buf = vec![0u8; want];
+        let n = self
+            .file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read attachment: {e}"))?;
+        if n == 0 {
+            return Err("attachment changed while uploading".into());
+        }
+        buf.truncate(n);
+        self.remaining -= n as u64;
+        self.tee.write(&buf).await;
+        self.ticker.advance(n);
+        Ok(Some(buf))
     }
 }
 
@@ -364,7 +645,7 @@ pub(crate) async fn hash_existing_part(entry: &BlobCacheEntry) -> Result<(Sha256
         Err(e) => return Err(format!("open part for resume: {e}")),
     };
     let mut total = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; FILE_READ_CHUNK_BYTES];
     loop {
         let n = file
             .read(&mut buf)
@@ -531,6 +812,244 @@ mod tests {
         let mut ticker = ProgressTicker::with_interval(None, Some(10), 0, Duration::ZERO);
         assert!(!ticker.advance(10));
         ticker.finish();
+    }
+
+    /// A scratch file nobody else can collide with: the cache dir is global and
+    /// nextest runs each test in its own process.
+    async fn scratch_file(tag: &str, bytes: &[u8]) -> PathBuf {
+        let nonce = UPLOAD_PART_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("baybo-upload-{tag}-{}-{nonce}", std::process::id()));
+        tokio::fs::write(&path, bytes).await.expect("seed file");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_files_digest_and_length_match_its_bytes() {
+        let bytes = vec![7u8; FILE_READ_CHUNK_BYTES * 2 + 13];
+        let path = scratch_file("digest", &bytes).await;
+
+        let digest = hash_upload_file(&path).await.expect("hash");
+
+        assert_eq!(digest.hex, bytes_sha256_hex(&bytes));
+        assert_eq!(digest.len, bytes.len() as u64);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// The cap is enforced before any network work, so an over-cap pick costs
+    /// the user nothing but the stat.
+    #[tokio::test]
+    async fn an_over_cap_file_is_refused_by_its_size() {
+        let path = scratch_file("overcap", &[1u8; 64]).await;
+
+        let err = hash_upload_file_capped(&path, 32)
+            .await
+            .expect_err("over cap");
+
+        assert_eq!(err, "attachment is larger than the 32 byte limit");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_file_exactly_at_the_cap_still_uploads() {
+        let bytes = vec![3u8; 32];
+        let path = scratch_file("atcap", &bytes).await;
+
+        let digest = hash_upload_file_capped(&path, 32).await.expect("hash");
+
+        assert_eq!(digest.len, 32);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_fails_before_anything_is_opened() {
+        let path = std::env::temp_dir().join("baybo-upload-does-not-exist");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let err = hash_upload_file(&path).await.expect_err("missing");
+
+        assert!(err.starts_with("read attachment: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_not_an_attachment() {
+        let err = hash_upload_file(&std::env::temp_dir())
+            .await
+            .expect_err("directory");
+        assert_eq!(err, "attachment is not a file");
+    }
+
+    /// The upload's ticks ride the SAME 100ms limiter as a download: three
+    /// chunks read, but only the opening and closing ticks cross the FFI.
+    #[tokio::test]
+    async fn an_upload_reads_the_declared_length_and_rate_limits_its_ticks() {
+        let bytes: Vec<u8> = (0..25u8).collect();
+        let path = scratch_file("reader", &bytes).await;
+        let sink = Arc::new(RecordingProgress::default());
+
+        let ticker = UploadTicker::new(
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
+            bytes.len() as u64,
+        );
+        let mut reader = UploadReader::open(
+            &path,
+            bytes.len() as u64,
+            10,
+            ticker.clone(),
+            UploadCacheTee::off(),
+        )
+        .await
+        .expect("open");
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = reader.next_chunk().await.expect("chunk") {
+            chunks.push(chunk);
+        }
+        ticker.finish();
+
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [10, 10, 5]);
+        assert_eq!(chunks.concat(), bytes);
+        assert_eq!(
+            sink.ticks.lock().as_slice(),
+            [(0, Some(25)), (25, Some(25))]
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// A body one frame short would hang the relay leg waiting for `last`, and
+    /// make the direct leg's declared Content-Length a lie.
+    #[tokio::test]
+    async fn a_file_that_shrank_under_the_upload_is_an_error() {
+        let path = scratch_file("shrank", &[9u8; 8]).await;
+        let mut reader = UploadReader::open(
+            &path,
+            64,
+            8,
+            UploadTicker::new(None, 64),
+            UploadCacheTee::off(),
+        )
+        .await
+        .expect("open");
+
+        reader.next_chunk().await.expect("first chunk");
+        let err = reader.next_chunk().await.expect_err("truncated");
+
+        assert_eq!(err, "attachment changed while uploading");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Content no other test in this process can produce, so the cache entry it
+    /// hashes to is this test's alone.
+    fn unique_bytes(tag: &str) -> Vec<u8> {
+        let nonce = UPLOAD_PART_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("baybo-{tag}-{}-{nonce}", std::process::id()).into_bytes()
+    }
+
+    /// Everything in the cache dir named for `hex` — the published entry plus
+    /// any part file left lying around.
+    async fn cache_files_for(hex: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(mut dir) = tokio::fs::read_dir(blob_cache_dir()).await else {
+            return names;
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(hex) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Drain a whole file through a reader teeing into `tee`, as an upload's
+    /// body pass does.
+    async fn stream_body(path: &Path, len: u64, tee: UploadCacheTee) {
+        let mut reader = UploadReader::open(path, len, 8, UploadTicker::new(None, len), tee)
+            .await
+            .expect("open");
+        while reader.next_chunk().await.expect("chunk").is_some() {}
+    }
+
+    /// The upload cache's whole point: the file the user just sent must answer
+    /// "ready" instead of showing a download arrow.
+    #[tokio::test]
+    async fn a_streamed_upload_lands_in_the_cache_under_its_digest() {
+        let bytes = unique_bytes("upload-file-cache");
+        let source = scratch_file("cachesrc", &bytes).await;
+        let digest = hash_upload_file(&source).await.expect("hash");
+        let entry = cache_entry_for_hex(digest.hex.clone())
+            .await
+            .expect("cache entry");
+
+        let tee = UploadCacheTee::open(&digest.hex).await;
+        stream_body(&source, digest.len, tee.clone()).await;
+        tee.publish().await;
+
+        assert_eq!(
+            tokio::fs::read(entry.path()).await.expect("cached"),
+            bytes,
+            "what went on the wire is what lands"
+        );
+        assert_eq!(
+            cache_files_for(&digest.hex).await,
+            std::slice::from_ref(&digest.hex)
+        );
+        let _ = tokio::fs::remove_file(entry.path()).await;
+        let _ = tokio::fs::remove_file(&source).await;
+    }
+
+    /// A file that changes under the upload — an in-progress screen recording,
+    /// an iCloud item syncing a new version — must never publish an entry whose
+    /// content is not what its name claims. Nothing evicts from this directory
+    /// and no reader re-hashes, so one poisoned entry would serve wrong bytes
+    /// for that digest to every consumer, forever.
+    #[tokio::test]
+    async fn a_source_that_changes_mid_upload_publishes_no_cache_entry() {
+        let original = unique_bytes("upload-midflight");
+        let source = scratch_file("midflight", &original).await;
+        let digest = hash_upload_file(&source).await.expect("hash");
+        let entry = cache_entry_for_hex(digest.hex.clone())
+            .await
+            .expect("cache entry");
+
+        let tee = UploadCacheTee::open(&digest.hex).await;
+        let rewritten = unique_bytes("upload-midflight-rewritten").repeat(4);
+        assert!(
+            rewritten.len() > original.len(),
+            "grew, as a recording does"
+        );
+        tokio::fs::write(&source, &rewritten)
+            .await
+            .expect("rewrite");
+        stream_body(&source, digest.len, tee.clone()).await;
+        tee.publish().await;
+
+        assert!(
+            !cache_exists(&entry).await,
+            "an entry whose bytes are not its digest must never be published"
+        );
+        assert_eq!(
+            cache_files_for(&digest.hex).await,
+            Vec::<String>::new(),
+            "and its part file must not be left behind"
+        );
+        let _ = tokio::fs::remove_file(&source).await;
+    }
+
+    /// An upload that fails never calls `publish`, and its part file must not
+    /// survive the attempt: this directory is swept only at process start.
+    #[tokio::test]
+    async fn an_upload_that_never_publishes_leaves_no_part_behind() {
+        let bytes = unique_bytes("upload-abandoned");
+        let source = scratch_file("abandoned", &bytes).await;
+        let digest = hash_upload_file(&source).await.expect("hash");
+
+        let tee = UploadCacheTee::open(&digest.hex).await;
+        stream_body(&source, digest.len, tee.clone()).await;
+        drop(tee);
+
+        assert_eq!(cache_files_for(&digest.hex).await, Vec::<String>::new());
+        let _ = tokio::fs::remove_file(&source).await;
     }
 
     #[tokio::test]

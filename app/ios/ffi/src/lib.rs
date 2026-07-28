@@ -887,6 +887,44 @@ impl BayboClient {
         .await
     }
 
+    /// Upload a picked file by PATH, streamed off disk: the bytes never cross
+    /// the FFI, and a 100 MiB attachment is never held whole in memory. Over-cap
+    /// files are refused before any network work. Otherwise identical to
+    /// [`Self::blob_upload_bytes`] — same route, same content-addressed
+    /// `blob_id`, and the file lands in the blob cache so the message it rides
+    /// on renders without a round-trip.
+    ///
+    /// `progress` observes the byte count while it streams; pass `None` when
+    /// nobody is watching.
+    pub async fn blob_upload_file(
+        self: Arc<Self>,
+        path: String,
+        mime_type: String,
+        progress: Option<Arc<dyn BlobProgress>>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::upload_file(&client, path, mime_type, None, progress).await
+        })
+        .await
+    }
+
+    /// [`Self::blob_upload_file`] for a file a user picked inside a deck card —
+    /// stamped `deck:<card_id>` like [`Self::deck_blob_upload_bytes`].
+    pub async fn deck_blob_upload_file(
+        self: Arc<Self>,
+        path: String,
+        mime_type: String,
+        card_id: String,
+        progress: Option<Arc<dyn BlobProgress>>,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            let client = self.gateway_client()?;
+            gateway_api::upload_file(&client, path, mime_type, Some(card_id), progress).await
+        })
+        .await
+    }
+
     /// Fetch an attachment `blob_id` for display over the active binding's blob
     /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
