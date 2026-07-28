@@ -173,6 +173,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `llm[i].provider`                     | non-empty                                            |
 | `llm[i].model`                        | non-empty                                            |
 | `llm[i].model_list[j].model`          | non-empty                                            |
+| `llm[i].model_list[j].context_window` | if set, > 0 (a zero window collapses the compression threshold and the WebFetch summariser budget) |
 | `llm[i].lite_model`                   | if set, non-empty **and** names one of the entry's `models()` (default + `model_list`) |
 | `llm[i].base_url`                     | if set, scheme is `http://` or `https://`            |
 | `llm[i].api_key_env`                  | if set, valid env-var identifier                     |

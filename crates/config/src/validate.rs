@@ -73,6 +73,17 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
                     "must be non-empty",
                 ));
             }
+            // `PUT /v1/llm/models/{name}` already rejects this; without the
+            // same rule here the file path accepts what the API refuses,
+            // and a zero window is not inert — it collapses the compression
+            // threshold (`compression_threshold * 0`) and zeroes WebFetch's
+            // summariser budget.
+            if spec.context_window == Some(0) {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.model_list[{j}].context_window"),
+                    "must be > 0 (omit the field to use the provider default)",
+                ));
+            }
         }
         if let Some(lite) = &entry.lite_model {
             if lite.trim().is_empty() {
