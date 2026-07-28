@@ -114,8 +114,10 @@ export function postLayout(entries: LayoutEntry[]): void {
   post({ type: "layout", entries });
 }
 
-/// A card asked to pick a blob (`deck.pickBlob`): native presents the photo
-/// picker, uploads the choice, and answers via `deckShell.pickResult`.
+/// A card asked to pick a blob (`deck.pickBlob`): native presents a picker,
+/// uploads the choice, and answers via `deckShell.pickResult`. `accept` is the
+/// shell-normalized mime-glob list (`normalizeAccept`), or null for "no
+/// constraint" — native elects the photo library or the file browser from it.
 export function postPick(id: string, cardId: string, accept: string | null): void {
   post({ type: "pick", id, cardId, accept });
 }
