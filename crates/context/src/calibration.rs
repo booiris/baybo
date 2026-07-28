@@ -18,6 +18,24 @@
 //! State is in-memory and per-process. After a few main-call samples
 //! the ratio stabilises; cold start or an unobserved model uses 1.0
 //! (raw estimate).
+//!
+//! **Text only.** The loop corrects the drift between *our* tokenizer and
+//! the provider's, which is a statement about text. A media price — an
+//! image's tiles, a PDF's pages, a voice note's seconds — is the
+//! provider's own arithmetic over a probed fact, not a tokenizer output,
+//! and `ContextManager::count_tokens` adds it beside the calibrated
+//! estimate rather than through it. Both directions matter and both were
+//! measured: as the denominator of a sample the ceiling drives every
+//! observation to the [`SAMPLE_RATIO_MIN`] clamp (see the test below), and
+//! as something the ratio multiplies it stops being a ceiling.
+//!
+//! A sample is refused only when the ceiling is big enough to swamp the
+//! signal — `ContextManager::media_is_small_enough_to_sample`, whose
+//! bound and its load-bearing premise are documented on
+//! `media_share_admits_sample`. Refusing every media-bearing transcript is
+//! not the neutral choice it looks like: one image in message 1 would then
+//! suppress the sample for the life of the session and leave the whole
+//! text history on the identity ratio.
 
 use std::collections::HashMap;
 
@@ -188,6 +206,33 @@ mod tests {
         cal.observe(MODEL, 1_000, 100_000);
         let r = cal.ratio(MODEL).unwrap();
         assert!((r - 1.3).abs() < 1e-9, "got {r}");
+    }
+
+    /// Why `record_call_actual` refuses a media-bearing sample, run
+    /// against the real store. The session is the realistic one: 5,000
+    /// tokens of chat plus one small `.md`, whose ceiling is 17,529 —
+    /// raw 22,529 against a provider actual of 5,500. Every sample lands
+    /// on the [`SAMPLE_RATIO_MIN`] clamp, so the EMA walks the ratio to
+    /// the floor and takes the ceiling down with it.
+    #[test]
+    fn a_ceiling_fed_in_as_a_sample_walks_the_ratio_to_the_floor() {
+        const RAW_WITH_CEILING: usize = 22_529;
+        const MEDIA_CEILING: usize = 17_529;
+        const PROVIDER_ACTUAL: usize = 5_500;
+
+        let cal = TokenCalibration::new();
+        for _ in 0..8 {
+            cal.observe(MODEL, RAW_WITH_CEILING, PROVIDER_ACTUAL);
+        }
+        let ratio = cal.ratio(MODEL).unwrap();
+        assert!((ratio - 0.5288).abs() < 1e-4, "got {ratio}");
+
+        // The ceiling is no longer one: a full inlined document really
+        // costs the provider 17,374 tokens.
+        assert_eq!(cal.adjust(MODEL, MEDIA_CEILING), 9_270);
+        // And plain text on the same model is deflated with it — 40,002
+        // tokens of CJK transcript, no attachment in sight.
+        assert_eq!(cal.adjust(MODEL, 40_002), 21_154);
     }
 
     #[test]

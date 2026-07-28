@@ -444,6 +444,8 @@ fn file_block(digest_char: char, token: &str, filename: &str) -> ContentBlock {
         filename: filename.to_string(),
         mime_type: "application/pdf".into(),
         duration_ms: None,
+        page_count: None,
+        size_bytes: None,
     }
 }
 
@@ -598,6 +600,8 @@ async fn multimodal_tool_images_are_injected_as_a_followup_user_row() {
             },
             mime_type: "image/png".into(),
             filename: None,
+            width: None,
+            height: None,
         }],
     ));
     let manifest = tool.manifest();

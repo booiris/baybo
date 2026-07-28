@@ -41,6 +41,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+# `render_inlined_document`: the tokenizer's bound has to be checked
+# against the string the LLM layer really delivers, not a reconstruction.
+baybo-llm = { workspace = true, features = ["test-support"] }
 # Pulls the in-memory `MemorySessionStore` / `MemorySessionSummaryStore`
 # fakes the context unit tests build their `SessionManager` from.
 baybo-session = { workspace = true, features = ["test-support"] }

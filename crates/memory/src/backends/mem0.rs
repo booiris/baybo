@@ -1683,6 +1683,8 @@ mod tests {
                 },
                 mime_type: "image/png".into(),
                 filename: None,
+                width: None,
+                height: None,
             },
             ContentBlock::Text("world".into()),
         ];

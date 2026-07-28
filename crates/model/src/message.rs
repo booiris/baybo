@@ -18,6 +18,24 @@ pub enum ContentBlock {
         mime_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// Pixel width and height, the only honest price input the context
+        /// budget has for an image. Providers cut an image into tiles of a
+        /// fixed PIXEL size and bill per tile, so byte count is not a
+        /// stand-in: a 12000x9000 flat render sits under the 5 MiB payload
+        /// cap and costs 49,536 tokens where a 4096-px ceiling charged
+        /// 9,288.
+        ///
+        /// **Server-derived, never client-declared**, from
+        /// [`baybo_llm::media_probe::image_dimensions`] — a header parse,
+        /// not a decode. `None` for a vector image, a raster format the
+        /// probe cannot read, or a row persisted before the fields existed;
+        /// the budget then charges the delivery cap, which the delivery
+        /// path's own probe makes a real ceiling by stubbing anything
+        /// pricier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
     },
     Audio {
         blob: BlobRef,
@@ -42,6 +60,33 @@ pub enum ContentBlock {
         /// `None` when unknown or not a video.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u32>,
+        /// Pages, for a PDF the model may receive as a native document.
+        /// Providers bill such a document per PAGE, so this is the only
+        /// honest price input the context budget has — byte count is not a
+        /// stand-in for it (measured across three producers, real documents
+        /// run 10 to 4,007 bytes per page).
+        ///
+        /// **Server-derived, never client-declared.** Set by whoever ingests
+        /// the blob, from the bytes, via
+        /// [`baybo_llm::media_probe::pdf_page_count`]. `None` when the file
+        /// is not a PDF, when it did not parse, or for rows persisted before
+        /// the field existed — the budget then charges the delivery cap
+        /// rather than guessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_count: Option<u32>,
+        /// Byte length of the blob, for a file the model receives as
+        /// inlined prompt text. Those bytes ARE the prompt, so this is the
+        /// price input for that arm the way `page_count` is for a PDF —
+        /// without it the budget can only charge the delivery cap, and a
+        /// 400-byte `.md` was billed 17,529 tokens.
+        ///
+        /// **Server-derived, never client-declared**, from
+        /// [`crate::BlobRef`]'s stored metadata rather than from anything
+        /// on the wire. `None` for rows persisted before the field existed
+        /// or when the blob could not be stat'd — the budget then falls
+        /// back to the delivery cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_bytes: Option<u32>,
     },
     /// A tool invocation emitted by the assistant. Stored in conversation
     /// history so subsequent LLM calls see their own prior tool calls.
@@ -586,6 +631,48 @@ mod tests {
             ContentBlock::ToolResult { meta, .. } => assert!(meta.is_none()),
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    /// A `File` row written before the price inputs existed is the common case
+    /// in any live transcript, and the budget reads both fields on every count
+    /// — so the stored form has to keep loading, and a `None` has to stay off
+    /// the wire so already-written rows stay byte-stable.
+    #[test]
+    fn legacy_file_block_without_price_inputs_deserializes_to_none() {
+        let legacy = r#"{"File":{"blob":{"blob_id":"sha256:aa.tok"},"filename":"report.pdf","mime_type":"application/pdf"}}"#;
+        let block: ContentBlock = serde_json::from_str(legacy).unwrap();
+        match &block {
+            ContentBlock::File {
+                page_count,
+                size_bytes,
+                duration_ms,
+                filename,
+                ..
+            } => {
+                assert_eq!(*page_count, None);
+                assert_eq!(*size_bytes, None);
+                assert_eq!(*duration_ms, None);
+                assert_eq!(filename, "report.pdf");
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&block).unwrap(), legacy);
+    }
+
+    #[test]
+    fn probed_price_inputs_round_trip() {
+        let block = ContentBlock::File {
+            blob: BlobRef {
+                blob_id: "sha256:aa.tok".into(),
+            },
+            filename: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            duration_ms: None,
+            page_count: Some(12),
+            size_bytes: Some(4_096),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(serde_json::from_str::<ContentBlock>(&json).unwrap(), block);
     }
 
     /// Every `MessageSource` variant. The exhaustive `match` makes adding a

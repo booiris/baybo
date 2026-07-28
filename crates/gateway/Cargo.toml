@@ -117,6 +117,9 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 baybo-gateway = { workspace = true, features = ["test-support"] }
+# `media_probe::fixture`: the ingest probes must be proven against PDFs and
+# containers that really parse.
+baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
 baybo-config = { workspace = true }
