@@ -351,13 +351,14 @@ pub async fn build_managers(
     // cost lookup. The refresh loop (owned by the reloader below)
     // overlays live prices.
     cost_manager.merge_pricings(crate::reload::pricing_overlay(&built));
-    let pool = baybo_agent::LlmClientPool::with_candidates(
-        built.clients,
-        built.overrides,
-        built.entry_models,
-        config.default_llm.clone(),
-        config.agent.model_tiers.clone(),
-    )
+    let pool = baybo_agent::LlmClientPool::from_config(baybo_agent::LlmPoolConfig {
+        clients: built.clients,
+        overrides: built.overrides,
+        entry_models: built.entry_models,
+        lite: built.lite,
+        default_name: config.default_llm.clone(),
+        tier_map: config.agent.model_tiers.clone(),
+    })
     .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?;
     let llm_client = pool.default_client();
     let info = llm_client.model_info();

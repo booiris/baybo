@@ -209,7 +209,7 @@ mod tests {
         let mut new = base();
         new.agent
             .model_tiers
-            .insert(ModelTier::Fast, LlmEntryName::from("primary"));
+            .insert(ModelTier::Lite, LlmEntryName::from("primary"));
         assert!(hot_reload_diff(&old, &new).is_ok());
     }
 

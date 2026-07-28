@@ -26,7 +26,7 @@ use crate::{
 /// Binds a [`baybo_llm::BillableLlm`] to a throwaway system
 /// [`Attribution`](baybo_llm::Attribution) and exposes it as a
 /// [`BilledChat`] — bridges tests that drive `LlmCompletion` stubs into
-/// the per-call `ctx.llm` slot WebFetch (and any future tool) reads
+/// the per-call `ctx.lite_llm` slot WebFetch (and any future tool) reads
 /// from. Pass a [`BillableLlm::passthrough`](baybo_llm::BillableLlm::passthrough)
 /// client so its no-op recorder reports `cost_micros: MicroUsd::ZERO`;
 /// budget assertions belong in agent-crate tests.

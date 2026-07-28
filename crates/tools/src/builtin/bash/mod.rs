@@ -1825,7 +1825,7 @@ impl BashTool {
         ctx: &ToolContext,
         sandboxed: bool,
     ) -> crate::Result<()> {
-        let decision = match ctx.llm.as_deref() {
+        let decision = match ctx.lite_llm.as_deref() {
             Some(llm) => judge_pre_exec(llm, &ctx.events, command, cwd, sandboxed).await,
             // No judge wired (argv mode / tests): fall back to requiring
             // approval, matching the non-auto destructive gate.
@@ -1882,7 +1882,7 @@ impl BashTool {
         extra_env: &[(String, String)],
         ctx: &ToolContext,
     ) -> crate::Result<SandboxEscapeDecision> {
-        let Some(llm) = ctx.llm.as_deref() else {
+        let Some(llm) = ctx.lite_llm.as_deref() else {
             return Ok(SandboxEscapeDecision::Prompt(
                 "risk judge unavailable — approval required for sandbox escape".to_string(),
             ));
@@ -3377,7 +3377,7 @@ mod tests {
     async fn escalate_noop_on_success() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(V_SAFE)); // present but must not be consulted
+        ctx.lite_llm = Some(judge_llm(V_SAFE)); // present but must not be consulted
         let ok = crate::SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
@@ -3450,7 +3450,7 @@ mod tests {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let mut ctx = ctx_with_approval(None, gate.clone());
-        ctx.llm = Some(judge_llm(V_UNRELATED));
+        ctx.lite_llm = Some(judge_llm(V_UNRELATED));
         let (out, note) = tool
             .escalate_if_failed(
                 "true",
@@ -3475,7 +3475,7 @@ mod tests {
     async fn escalate_runs_unsandboxed_when_safe() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(V_SAFE));
+        ctx.lite_llm = Some(judge_llm(V_SAFE));
         // `true` exits 0 unsandboxed, so a flip from the seeded exit 1 proves
         // the re-run happened.
         let (out, note) = tool
@@ -3499,7 +3499,7 @@ mod tests {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let mut ctx = ctx_with_approval(None, gate);
-        ctx.llm = Some(judge_llm(V_RISKY));
+        ctx.lite_llm = Some(judge_llm(V_RISKY));
         let (out, note) = tool
             .escalate_if_failed(
                 "true",
@@ -3521,7 +3521,7 @@ mod tests {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let mut ctx = ctx_with_approval(None, gate);
-        ctx.llm = Some(judge_llm(V_RISKY));
+        ctx.lite_llm = Some(judge_llm(V_RISKY));
         let (out, note) = tool
             .escalate_if_failed(
                 "true",
@@ -3542,7 +3542,7 @@ mod tests {
     async fn escalate_risky_kept_when_unattended() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None); // no approval handle (cron / subagent)
-        ctx.llm = Some(judge_llm(V_RISKY));
+        ctx.lite_llm = Some(judge_llm(V_RISKY));
         let (out, note) = tool
             .escalate_if_failed(
                 "true",
@@ -3570,7 +3570,7 @@ mod tests {
         // on the snapshot it was handed, not re-read the now-swapped permission.
         let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(V_SAFE));
+        ctx.lite_llm = Some(judge_llm(V_SAFE));
         let (out, note) = tool
             .escalate_if_failed(
                 "true",
@@ -3594,7 +3594,7 @@ mod tests {
     async fn pre_exec_gate_proceeds_when_safe() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
+        ctx.lite_llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
         tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx, true)
             .await
             .expect("safe destructive command proceeds without approval");
@@ -3616,7 +3616,7 @@ mod tests {
     async fn risk_judge_records_llm_call_input_output_and_duration() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
+        ctx.lite_llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
         let events = Arc::new(RecordingEventSink::default());
         ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
 
@@ -3649,7 +3649,7 @@ mod tests {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let events = Arc::new(RecordingEventSink::default());
         let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(V_UNRELATED));
+        ctx.lite_llm = Some(judge_llm(V_UNRELATED));
         ctx.secrets = Some(Arc::new(StubSecrets) as Arc<dyn crate::SecretAccess>);
         ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
 
@@ -3724,7 +3724,7 @@ mod tests {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let mut ctx = ctx_with_approval(None, gate);
-        ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
+        ctx.lite_llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
         let err = tool
             .pre_exec_gate("rm -rf src", None, &ctx, true)
             .await
@@ -3736,7 +3736,7 @@ mod tests {
     async fn pre_exec_gate_errors_when_unattended_and_risky() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None); // no approval handle
-        ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
+        ctx.lite_llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
         let err = tool
             .pre_exec_gate("rm -rf src", None, &ctx, true)
             .await
@@ -3748,7 +3748,7 @@ mod tests {
     async fn pre_exec_gate_without_llm_requires_approval() {
         let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
-        let ctx = ctx_with_approval(None, gate); // ctx.llm = None → fail-closed prompt
+        let ctx = ctx_with_approval(None, gate); // ctx.lite_llm = None → fail-closed prompt
         tool.pre_exec_gate("rm -rf x", None, &ctx, true)
             .await
             .expect("no judge → prompt, approval granted → proceed");
@@ -3761,7 +3761,7 @@ mod tests {
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FakeExecSandbox::new());
         let mut ctx = ctx_with_approval(Some(sandbox), Arc::clone(&gate));
-        ctx.llm = Some(judge_llm(
+        ctx.lite_llm = Some(judge_llm(
             r#"{"risk":"risky","rationale":"would delete source"}"#,
         ));
 
@@ -4724,7 +4724,7 @@ mod tests {
         });
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let mut ctx = ctx_with_approval(Some(sandbox), gate.clone());
-        ctx.llm = Some(judge_llm(V_UNRELATED));
+        ctx.lite_llm = Some(judge_llm(V_UNRELATED));
 
         let out = BashTool::for_test()
             .with_permission(auto_permission())

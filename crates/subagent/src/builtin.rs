@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn explorer_defaults_to_fast_tier() {
         let p = all().into_iter().find(|p| p.name == "explorer").unwrap();
-        assert_eq!(p.default_tier, Some(ModelTier::Fast));
+        assert_eq!(p.default_tier, Some(ModelTier::Lite));
     }
 
     #[test]

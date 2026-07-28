@@ -1,8 +1,12 @@
 # Lite model for auxiliary LLM calls — implementation plan
 
-**Status:** designed, not started. Two PRs, in order. PR 1 (`model_list`) is a config-schema
-refactor that lands on `master` alone; PR 2 (lite) builds on it and cannot ship first — its
-context-window clamp reads a per-model `context_window` that only PR 1 makes correct.
+**Status:** PR 1 (`model_list`) merged as `3ef4c4cd`. PR 2 (lite) implemented on
+`feat/lite-model`. Kept as the record of why each decision was made; §7 lists the three places the
+implementation diverged from the plan. The surviving design lives in
+[`docs/modules/config.md`](../modules/config.md) §"LLM entries and `model_list`".
+
+PR 2 could not ship first: its WebFetch input clamp reads a per-model `context_window`, which only
+PR 1 makes correct.
 
 Today every auxiliary LLM call in the process runs on the **session's active chat model**: the
 Bash risk judges, WebFetch's page summariser, and title generation all bind the same
@@ -276,3 +280,34 @@ comment to say that.
   effort; the only remedy is changing the entry default for every session. Affects that provider
   only — nothing else reads the field.
 - **`model_tiers[Lite]` is shared** between the lite fallback and subagent tier selection (§3.3).
+
+---
+
+## 7. Amendments found while implementing
+
+Three places where the code does not match the plan above. Each is a decision the plan got wrong,
+not a shortcut.
+
+**A1 — there is no separate lite client build.** §3.2 planned a third `Role::Lite` build job with
+dedup rules for "lite equals the default" and "lite is already in `model_list`". Both are moot:
+`validate()` requires `lite_model` to name one of the entry's own models (PR 1), so by the time
+`build_pool_clients` runs, that client has *already* been built as either the default or a listed
+model. Assembling `BuiltPoolClients::lite` is a lookup into `clients` / `overrides`, never a
+build. Two knock-on simplifications the plan asked for and no longer needs:
+
+- `pricing_overlay` needs no new chain — every lite client is already in `clients` or `overrides`.
+- `refresh_pairs` needs no new entries — `models()` already covers the lite model.
+
+D12's hard failure survives, but it is now a guard rather than a live path: it can only fire when
+one model of an entry fails to build while its default succeeds, which requires a factory that
+rejects a specific model id. The *real* protection against a stranded `lite_model` is `validate()`.
+
+**A2 — `LlmClientPool::with_candidates` became `from_config(LlmPoolConfig)`.** Adding `lite`
+would have made it six positional parameters, three of them same-typed maps — invisible ordering
+at the call site, which is exactly what the repo rule about `XxxConfig` structs exists for.
+
+**A3 — `refresh_active_llm` resolves the lite client unconditionally**, before the
+`Arc::ptr_eq` short-circuit on the main client. The plan filed lite under "same
+pointer check"; that is wrong. The lite cascade can change while the main client does not — an
+entry gaining a `lite_model`, or `model_tiers[Lite]` being re-pointed — and the short-circuit
+would skip straight past it. The extra work on the unchanged path is one map lookup.

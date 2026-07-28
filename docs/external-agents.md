@@ -71,7 +71,7 @@ spawn_subagent({
 
   // Backend selection:
   "backend": "claude",       // or "codex" | "gemini" | "baybo" (default)
-  "model_tier": "fast",      // baybo backend only; fast|balanced|deep
+  "model_tier": "lite",      // baybo backend only; lite|balanced|deep
 
   // Optional:
   "background": false,

@@ -3,7 +3,7 @@
 //! [`BoundBilledLlm`](baybo_llm::BoundBilledLlm) is the billing
 //! chokepoint — it runs gate → call → record and returns the *raw*
 //! provider response. [`BilledChatRunner`] is the agent-side decorator a
-//! tool's `ctx.llm` resolves to: on top of a bound call it adds the
+//! tool's `ctx.lite_llm` resolves to: on top of a bound call it adds the
 //! security steps the tool path needs — sanitize the response, then
 //! **reveal** session placeholders so the tool sees plaintext for its
 //! own API call (mirroring `ToolExecutor`'s reveal of `tool_use` args).

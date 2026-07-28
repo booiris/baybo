@@ -48,7 +48,7 @@ The tool is registered by the runtime wiring code (`crates/baybo/src/runtime.rs`
 **Tool parameters** (`subagent_type`, `description`, `prompt` required):
 
 - `backend` — `"baybo"` (default, full in-process baybo agent) or `"claude"` / `"codex"` / `"gemini"` (one-shot external CLI backends; see [`../external-agents.md`](../external-agents.md)). Parsed via `SubagentBackend` / `ExternalAgentKind`.
-- `model_tier` — `fast` / `balanced` / `deep`; precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="baybo"`.
+- `model_tier` — `lite` / `balanced` / `deep` (`fast` is still accepted as the pre-rename spelling of `lite`); precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="baybo"`.
 - `background` — when `true`, returns a dispatch ack immediately and surfaces the child's final result as an out-of-band notification on the parent's next turn.
 - `on_timeout` — `"background"` (default) or `"kill"`: what to do when a foreground spawn from a user-facing session is still running after the fixed 2-minute foreground wait (`SUBAGENT_FOREGROUND_WAIT`). `background` detaches it (handle now, notification on terminal); `kill` cancels it. Ignored when `background=true`. Parsed via `OnTimeout`.
 - `group` — barrier cohort name. Subagents sharing a `group` (spawned together in one turn) are forced background-from-start and deliver a single merged notification only once they all finish; the spawner namespaces the cohort by the dispatching turn's job id (`BackgroundNotificationGroup::cohort_key`).
@@ -66,7 +66,7 @@ One file per profile under `<workspace>/agents/` — no directory-per-profile ce
 
 ### Built-in profiles
 
-Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) and surfaced through `builtin::all()` → `register_builtins`: **`general-purpose`** (the catch-all), **`explorer`** (default tier `fast`), **`planner`** and **`reviewer`** (default tier `deep`). Built-ins are stamped `ArtifactSource::Inline` / `TrustLevel::Trusted`; a bundled profile that fails to parse logs an error and is skipped rather than crashing boot. Workspace profiles registered later with the same name override a built-in.
+Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) and surfaced through `builtin::all()` → `register_builtins`: **`general-purpose`** (the catch-all), **`explorer`** (default tier `lite`), **`planner`** and **`reviewer`** (default tier `deep`). Built-ins are stamped `ArtifactSource::Inline` / `TrustLevel::Trusted`; a bundled profile that fails to parse logs an error and is skipped rather than crashing boot. Workspace profiles registered later with the same name override a built-in.
 
 ## Constraints
 
