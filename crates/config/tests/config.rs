@@ -155,6 +155,20 @@ fn lite_model_may_name_the_entry_default() {
     assert!(c.validate().is_ok());
 }
 
+/// The admin `PUT` already rejects a zero window; the file path must
+/// too, or it accepts what the API refuses. A zero window is not inert —
+/// it collapses `compression_threshold * context_window` and zeroes
+/// WebFetch's summariser budget.
+#[test]
+fn zero_context_window_fails_validation() {
+    let mut c = config_with_default_entry();
+    let mut spec = LlmModelSpec::bare("gpt-4o-mini");
+    spec.context_window = Some(0);
+    c.llm[0].model_list = vec![spec];
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "llm[0].model_list[0].context_window"));
+}
+
 #[test]
 fn bad_base_url_fails_validation() {
     let mut c = config_with_default_entry();

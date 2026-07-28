@@ -95,16 +95,6 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// of input rather than degrade.
 const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
 
-/// Fraction of the answering model's context window the page body may
-/// occupy. The rest absorbs the system prompt, the caller's own prompt,
-/// the reply, and the slack between our byte estimate and the provider's
-/// real tokenizer.
-const SUMMARY_INPUT_WINDOW_FRACTION: usize = 2;
-
-/// Bytes per token assumed when converting a context window into a byte
-/// budget. Deliberately pessimistic — English prose runs ~4, but a page
-/// of CJK or dense markup runs closer to 1.
-const SUMMARY_BYTES_PER_TOKEN: usize = 2;
 /// Threshold below which a `prompt` is ignored even when an LLM is
 /// wired in. Short pages fit comfortably in the agent's own context;
 /// burning a side-LLM call to summarise <2 KB of text is almost always
@@ -610,13 +600,16 @@ Usage notes:
 }
 
 /// Bytes of page body the summariser may be handed, given the model that
-/// will answer: [`MAX_SUMMARY_INPUT_BYTES`] narrowed to a fraction of that
-/// model's own context window. A model with a big window keeps the flat
+/// will answer.
+///
+/// The byte budget is the model's context window **as a number**: at the
+/// ~2 bytes per token a page of dense markup or CJK runs, that spends
+/// about half the window, leaving the rest for the system prompt, the
+/// caller's prompt, the reply, and the slack between this estimate and the
+/// provider's real tokenizer. A model with a big window keeps the flat
 /// ceiling; a small one gets a page it can actually read.
 fn summary_input_budget(model: &baybo_llm::ModelInfo) -> usize {
-    let from_window = model.context_window.saturating_mul(SUMMARY_BYTES_PER_TOKEN)
-        / SUMMARY_INPUT_WINDOW_FRACTION;
-    MAX_SUMMARY_INPUT_BYTES.min(from_window)
+    MAX_SUMMARY_INPUT_BYTES.min(model.context_window)
 }
 
 /// Run the side LLM with the fixed extraction system prompt and the user's
@@ -866,13 +859,18 @@ mod tests {
         assert_eq!(budget, 8_000);
     }
 
-    /// A model advertising no window at all must not yield a zero budget
-    /// that silently summarises an empty page.
+    /// The narrowed budget must still clear `SUMMARY_MIN_CHARS`, or the
+    /// clamp would starve exactly the pages the summariser exists for:
+    /// anything shorter is returned raw, so a budget below that threshold
+    /// means every summarised page is truncated on arrival.
     #[test]
-    fn summary_budget_is_monotonic_in_the_window() {
-        let small = super::summary_input_budget(&model_info_with_window(4_000));
-        let large = super::summary_input_budget(&model_info_with_window(64_000));
-        assert!(small < large);
+    fn the_narrowed_budget_still_clears_the_summarise_threshold() {
+        // The smallest window any provider default advertises.
+        let budget = super::summary_input_budget(&model_info_with_window(8_000));
+        assert!(
+            budget > SUMMARY_MIN_CHARS,
+            "budget {budget} <= min chars {SUMMARY_MIN_CHARS}"
+        );
     }
 
     fn model_info_with_window(context_window: usize) -> baybo_llm::ModelInfo {
