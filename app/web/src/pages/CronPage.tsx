@@ -559,7 +559,7 @@ export function CronPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       )}
@@ -568,7 +568,7 @@ export function CronPage() {
           and edit modals each render their own copy of this while open, since a
           banner painted here would sit under their overlay. */}
       {errorSlot === 'page' && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {mutationError}
         </div>
       )}
@@ -887,7 +887,7 @@ function CronDetailModal({
         </header>
         <div className="px-6 py-4 space-y-4">
           {error && (
-            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
           )}
@@ -922,7 +922,7 @@ function CronDetailModal({
 
           <div>
             <label className={fieldLabel}>Prompt</label>
-            <div className="bg-gray-50 border-2 border-black rounded-md px-4 py-3 font-mono text-[0.9rem]">
+            <div className="bg-gray-50 border-2 border-black rounded-md px-4 py-3 font-mono text-[0.9rem] break-words">
               {job.prompt}
             </div>
           </div>
@@ -992,7 +992,7 @@ function CronEditModal({
 
         <div className="px-6 py-4 space-y-4">
           {error && (
-            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
               {error}
             </div>
           )}
@@ -1197,7 +1197,7 @@ function TrashConfirmModal({
             you can restore it from the Recycle Bin view.
           </p>
           {error && (
-            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+            <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem] break-words">
               {error}
             </div>
           )}

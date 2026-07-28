@@ -336,7 +336,7 @@ export function LogsPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       )}
@@ -465,13 +465,13 @@ function LogDetailModal({ entry, onClose }: { entry: LogEntry; onClose: () => vo
         onClick={(e) => e.stopPropagation()}
       >
         <header className="flex items-center justify-between px-6 py-4 border-b-2 border-black">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             <span
-              className={`inline-flex items-center px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${className}`}
+              className={`inline-flex items-center px-2.5 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs shrink-0 ${className}`}
             >
               {entry.level}
             </span>
-            <code className="font-mono text-[0.9rem]">{entry.target}</code>
+            <code className="font-mono text-[0.9rem] break-all">{entry.target}</code>
           </div>
           <button
             type="button"

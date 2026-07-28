@@ -129,7 +129,7 @@ function LlmCallDetail({ span, messageLog }: { span: Span; messageLog: SessionMe
               <div className="text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">Emitted tool calls</div>
               {result.tool_calls.map((tc) => (
                 <div key={tc.id} className="border-2 border-black rounded-md p-2 bg-canvas font-mono text-[0.8rem]">
-                  <div className="text-ink-soft">
+                  <div className="text-ink-soft break-all">
                     {tc.id} → <span className="text-brand font-bold">{tc.name}</span>
                   </div>
                   <pre className="mt-1 whitespace-pre-wrap break-all">{JSON.stringify(tc.arguments, null, 2)}</pre>
@@ -169,7 +169,7 @@ function ToolCallDetail({
       {childId != null && <SubagentLink childId={childId} onDrillIn={onDrillIn} />}
       <section>
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Tool</h4>
-        <div className="font-mono text-[0.95rem] font-bold">{begin.tool_name}</div>
+        <div className="font-mono text-[0.95rem] font-bold break-all">{begin.tool_name}</div>
         {begin.triggered_by && (
           <button
             type="button"
@@ -358,7 +358,7 @@ function ToolEventRow({ action, payload }: { action: string; payload: ToolEventP
     <div className="space-y-1 font-mono text-[0.85rem]">
       <div className="flex items-baseline justify-between gap-3">
         <span className="break-all">{action}</span>
-        <span className="font-bold shrink-0">{payload.model}</span>
+        <span className="font-bold break-all text-right">{payload.model}</span>
       </div>
       <details>
         <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
@@ -572,7 +572,7 @@ function StepDetail({
       <div className="flex-1 overflow-y-scroll p-5 space-y-6">
         <section>
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Summary</h4>
-          <div className="font-mono text-[0.85rem] text-ink-soft">{stepSummaryText(step, spans)}</div>
+          <div className="font-mono text-[0.85rem] text-ink-soft break-all">{stepSummaryText(step, spans)}</div>
         </section>
 
         {failureReason && (
@@ -1375,7 +1375,7 @@ export function TraceSessionPage() {
   if (error && !overview) {
     return (
       <div className="p-5">
-        <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+        <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
           {error}
         </div>
       </div>
