@@ -35,6 +35,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { createLogger } from "./log.js";
+
 const exec = promisify(execFile);
 
 export type DockerPhase =
@@ -61,37 +63,9 @@ export interface DockerHandle {
     stop: () => Promise<void>;
 }
 
-const LOG_PREFIX = "[browser-mcp:docker]";
-
-const log = (msg: string): void => {
-    process.stderr.write(`${LOG_PREFIX} ${msg}\n`);
-};
-
-// Steady-state per-boot progress lines go out as NDJSON `debug` so the
-// gateway's MCP stderr drain (crates/tools/src/mcp/transport.rs) routes
-// them below the default INFO filter instead of forwarding them at INFO
-// like a plain-text line. Kept a one-liner rather than a shared module
-// because docker.ts is imported by server.ts — a back-import for the
-// helper would be a cycle.
-const logDebug = (msg: string): void => {
-    writeSidecarNdjson("debug", `${LOG_PREFIX} ${msg}`);
-};
-
-function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: string): void {
-    let line: string;
-    try {
-        line = `${JSON.stringify({ level, msg })}\n`;
-    } catch {
-        return;
-    }
-    try {
-        // MCP speaks JSON-RPC over stdout, so every log line — including
-        // NDJSON — must go to stderr where the gateway's drain reads it.
-        process.stderr.write(line);
-    } catch {
-        // EPIPE / closed stream — nothing useful to do from inside a logger.
-    }
-}
+const logger = createLogger("[browser-mcp:docker]");
+const log = logger.info;
+const logDebug = logger.debug;
 
 // How many trailing docker-build stderr lines to retain and surface when
 // a build fails. Enough to carry the actual apt/network error without
@@ -141,15 +115,15 @@ export async function sweepStaleContainers(): Promise<void> {
         .filter((l) => l.length > 0);
     for (const line of lines) {
         const [name, pidStr] = line.split("\t");
-        if (!name) continue;
+        if (name === undefined || name.length === 0) continue;
         // `Number(pidStr)` returns NaN on partial parse; `parseInt("12abc",10)`
         // would silently truncate to 12 and falsely treat the container's
         // owner as still-alive when the label is corrupted.
-        const pid = pidStr ? Number(pidStr) : NaN;
+        const pid = pidStr !== undefined && pidStr.length > 0 ? Number(pidStr) : NaN;
         if (Number.isFinite(pid) && pid > 0 && isPidAlive(pid)) {
             continue;
         }
-        log(`sweep: removing stale container ${name} (owner pid=${pidStr || "?"} not alive)`);
+        log(`sweep: removing stale container ${name} (owner pid=${pidStr !== undefined && pidStr.length > 0 ? pidStr : "?"} not alive)`);
         try {
             await exec("docker", ["rm", "-f", name], { timeout: 5000 });
         } catch (e) {
@@ -202,7 +176,7 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
         const child = spawn("docker", args, { stdio: ["ignore", "ignore", "pipe"] });
         const tail: string[] = [];
         let pending = "";
-        child.stderr?.on("data", (chunk: Buffer) => {
+        child.stderr.on("data", (chunk: Buffer) => {
             pending += chunk.toString("utf8");
             const parts = pending.split("\n");
             pending = parts.pop() ?? "";
@@ -270,9 +244,9 @@ async function findCachedBayboBrowserImage(): Promise<
         .filter((l) => l.length > 0 && !l.startsWith("baybo-browser:<none>"));
     // `docker images` already returns rows ordered most-recent first.
     const first = lines[0];
-    if (!first) return undefined;
+    if (first === undefined) return undefined;
     const [tag, createdAt] = first.split("\t");
-    if (!tag || !createdAt) return undefined;
+    if (tag === undefined || createdAt === undefined || createdAt.length === 0) return undefined;
     const ageDays = parseDockerCreatedAtAgeDays(createdAt);
     if (ageDays === undefined) {
         log(`cached image ${tag} CreatedAt='${createdAt}' unparseable; assuming stale`);
@@ -296,7 +270,7 @@ function parseDockerCreatedAtAgeDays(createdAt: string): number | undefined {
 }
 
 async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
-    if (opts.imageTag) {
+    if (opts.imageTag !== undefined) {
         log(`using operator-supplied image tag ${opts.imageTag}; skipping build`);
         return opts.imageTag;
     }
@@ -347,7 +321,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     // anywhere near the docker CLI so the operator gets a clear message
     // instead of a `Mounts denied` / `invalid mode` error from docker.
     rejectColonInBindPath(opts.profileDir, "browser.profile_dir");
-    if (opts.fontDir) {
+    if (opts.fontDir !== undefined) {
         rejectColonInBindPath(opts.fontDir, "<workspace>/work/.fonts (font bind-mount source)");
     }
 
@@ -361,8 +335,11 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
 
     const containerName = `baybo-browser-${process.pid}-${randomBytes(3).toString("hex")}`;
     const viewport = `${opts.viewport.width}x${opts.viewport.height}`;
-    const uid = (typeof process.getuid === "function" ? process.getuid() : 1000) || 1000;
-    const gid = (typeof process.getgid === "function" ? process.getgid() : 1000) || 1000;
+    // NOT `(... ) || 1000`: uid 0 is falsy, so a gateway running as root used to
+    // publish `--user 1000:1000` and write the bind-mounted profile as the wrong
+    // owner. The fallback is only for a platform without getuid at all.
+    const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+    const gid = typeof process.getgid === "function" ? process.getgid() : 1000;
 
     // We deliberately do NOT pass `--rm` here. If Chrome (or anything in
     // the entrypoint) crashes on startup, an `--rm` container deletes
@@ -396,7 +373,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
         "-p",
         "127.0.0.1::9223",
     ];
-    if (opts.fontDir) {
+    if (opts.fontDir !== undefined) {
         runArgs.push("-v", `${opts.fontDir}:/data/fonts:ro`);
     }
     // Browser-based VNC observability via noVNC + websockify on
@@ -479,11 +456,31 @@ async function readPublishedCdpUrl(containerName: string): Promise<string> {
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
     const v4 = lines.find((l) => /^\d+\.\d+\.\d+\.\d+:\d+$/.test(l));
-    if (!v4) {
+    if (v4 === undefined) {
         throw new Error(`docker port returned no IPv4 mapping (got: ${stdout.trim()})`);
     }
     const port = v4.split(":").pop();
     return `http://127.0.0.1:${port}`;
+}
+
+/**
+ * One CDP liveness probe.
+ *
+ * `/json/version` is the cheapest thing Chrome's DevTools HTTP interface
+ * serves and needs no CDP session, so it can run on an idle timer without
+ * touching chrome-devtools-mcp's tool mutex — which is what makes it usable
+ * as the watchdog's steady-state health check, not just a boot gate.
+ *
+ * Resolves when Chrome answers; throws with a short reason otherwise.
+ */
+export async function probeCdpEndpoint(
+    cdpUrl: string,
+    signal?: AbortSignal,
+): Promise<void> {
+    const res = await fetch(`${cdpUrl}/json/version`, signal !== undefined ? { signal } : {});
+    if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+    }
 }
 
 async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> {
@@ -493,9 +490,8 @@ async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> 
     let pollCount = 0;
     while (Date.now() < deadline) {
         try {
-            const res = await fetch(`${cdpUrl}/json/version`);
-            if (res.ok) return;
-            lastErr = `HTTP ${res.status}`;
+            await probeCdpEndpoint(cdpUrl);
+            return;
         } catch (e) {
             lastErr = (e as Error).message;
         }
@@ -507,7 +503,7 @@ async function waitForCdp(cdpUrl: string, containerName: string): Promise<void> 
         pollCount += 1;
         if (pollCount % 4 === 0) {
             const status = await containerStatus(containerName);
-            if (status && status !== "running" && status !== "created") {
+            if (status !== undefined && status !== "running" && status !== "created") {
                 containerExitedEarly = true;
                 lastErr = `container exited early (state=${status})`;
                 break;

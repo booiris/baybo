@@ -43,10 +43,13 @@
 // - The env vars themselves are NOT a public interface; setting them
 //   directly works in development but isn't documented or supported.
 
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname as osHostname, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { createMcpServer } from "chrome-devtools-mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -72,12 +75,21 @@ import type { CreateMcpServerArgs } from "chrome-devtools-mcp";
 import {
   type DockerHandle,
   type DockerPhase,
+  type DockerSpawnOptions,
   checkDockerAvailable,
   isPidAlive,
+  probeCdpEndpoint,
   spawnContainer,
   sweepStaleContainers,
 } from "./docker.js";
+import { createLogger, errText } from "./log.js";
 import { READ_PAGE_TOOL, handleReadPage } from "./read_page.js";
+import {
+  BrowserActivity,
+  BrowserWatchdog,
+  type BrowserHealer,
+  type PhaseGate,
+} from "./watchdog.js";
 
 // CDDM tools we hide from the agent's tool list. Lighthouse audits are
 // slow and rarely useful for browsing; WebMCP only fires on pages that
@@ -102,7 +114,12 @@ function proxyToolError(text: string): CallToolResult {
 
 type ServerArgs = CreateMcpServerArgs;
 
-type InstallPhase = "installing" | "ready" | "failed" | DockerPhase;
+// `recovering` is the watchdog's phase: the browser was ready, stopped
+// answering, and repair is in flight. It matters because `GuardingTransport`
+// gates on `phase !== "ready"` — without a phase to flip to, an agent calling
+// a browser tool mid-restart would get a raw puppeteer "Target closed"
+// instead of an actionable "retry in a few seconds".
+type InstallPhase = "installing" | "ready" | "failed" | "recovering" | DockerPhase;
 
 interface InstallState {
   phase: InstallPhase;
@@ -115,8 +132,8 @@ interface InstallState {
 // fontconfig's FONTCONFIG_FILE. macOS Chrome uses Core Text and ignores
 // fontconfig — the override is a no-op there.
 function applyFontconfigOverride(): void {
-  const raw = process.env["BAYBO_BROWSER_EXTRA_FONT_DIRS"];
-  if (!raw) return;
+  const raw = envValue("BAYBO_BROWSER_EXTRA_FONT_DIRS");
+  if (raw === undefined) return;
   const dirs = raw.split(":").filter((d) => d.length > 0);
   if (dirs.length === 0) return;
 
@@ -149,22 +166,41 @@ function applyFontconfigOverride(): void {
 }
 
 function parseViewport(raw: string | undefined): { width: number; height: number } | undefined {
-  if (!raw) return undefined;
+  if (raw === undefined) return undefined;
   const m = raw.match(/^(\d+)x(\d+)$/);
   if (!m) {
-    process.stderr.write(`[browser-mcp] BAYBO_BROWSER_VIEWPORT '${raw}' is not WxH; ignoring\n`);
+    logger.warn(`BAYBO_BROWSER_VIEWPORT '${raw}' is not WxH; ignoring`);
     return undefined;
   }
   return { width: Number(m[1]), height: Number(m[2]) };
 }
 
+/**
+ * An env var's value, or `undefined` when it is unset **or empty**.
+ *
+ * Empty is a deliberate "not configured" sentinel on this interface, not an
+ * accident: the sidecar's own test harness passes
+ * `BAYBO_BROWSER_DOCKER_CDP_URL: ""` to force the host-headless path. Routing
+ * every read through one helper keeps that convention in a single place
+ * instead of re-deriving it at each truthiness check — where the difference
+ * between "unset" and "set to empty" is invisible.
+ */
+function envValue(name: string): string | undefined {
+  const raw = process.env[name];
+  return raw !== undefined && raw.length > 0 ? raw : undefined;
+}
+
 function xdgCacheHome(): string {
-  const xdg = process.env["XDG_CACHE_HOME"];
-  return xdg && xdg.length > 0 ? xdg : join(homedir(), ".cache");
+  return envValue("XDG_CACHE_HOME") ?? join(homedir(), ".cache");
 }
 
 function defaultProfileDir(): string {
   return join(xdgCacheHome(), "baybo", "browser", "profile");
+}
+
+/** The Chrome user-data dir, however the operator configured it. */
+function resolvedProfileDir(): string {
+  return envValue("BAYBO_BROWSER_PROFILE_DIR") ?? defaultProfileDir();
 }
 
 function defaultChromeCacheDir(): string {
@@ -178,36 +214,11 @@ function defaultChromeCacheDir(): string {
   return join(xdgCacheHome(), "baybo", "browser", "chrome");
 }
 
-const LOG_PREFIX = "[browser-mcp]";
+const logger = createLogger("[browser-mcp]");
+const log = logger.info;
+const logDebug = logger.debug;
 
-const log = (msg: string): void => {
-  process.stderr.write(`${LOG_PREFIX} ${msg}\n`);
-};
-
-// Steady-state per-boot progress lines go out as NDJSON `debug` so the
-// gateway's MCP stderr drain (crates/tools/src/mcp/transport.rs) routes
-// them below the default INFO filter instead of forwarding them at INFO
-// like a plain-text line. The tiny helper is mirrored in docker.ts (which
-// server.ts imports — a shared module would be a back-import cycle).
-const logDebug = (msg: string): void => {
-  writeSidecarNdjson("debug", `${LOG_PREFIX} ${msg}`);
-};
-
-function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: string): void {
-  let line: string;
-  try {
-    line = `${JSON.stringify({ level, msg })}\n`;
-  } catch {
-    return;
-  }
-  try {
-    // MCP speaks JSON-RPC over stdout, so every log line — including
-    // NDJSON — must go to stderr where the gateway's drain reads it.
-    process.stderr.write(line);
-  } catch {
-    // EPIPE / closed stream — nothing useful to do from inside a logger.
-  }
-}
+const execFileAsync = promisify(execFile);
 
 /**
  * Synchronous fast path: if a Chrome is already on disk (operator
@@ -222,8 +233,8 @@ function writeSidecarNdjson(level: "debug" | "info" | "warn" | "error", msg: str
  * `baybo.json:browser.chrome_path` only.
  */
 async function findExistingChrome(): Promise<string | null> {
-  const pinned = process.env["BAYBO_BROWSER_CHROME_PATH"];
-  if (pinned && pinned.length > 0) {
+  const pinned = envValue("BAYBO_BROWSER_CHROME_PATH");
+  if (pinned !== undefined) {
     if (existsSync(pinned)) {
       log(`using configured Chrome: ${pinned}`);
       return pinned;
@@ -238,7 +249,7 @@ async function findExistingChrome(): Promise<string | null> {
   mkdirSync(cacheDir, { recursive: true });
 
   const platform = detectBrowserPlatform();
-  if (!platform) {
+  if (platform === undefined) {
     throw new Error(
       "@puppeteer/browsers detectBrowserPlatform returned null — unsupported OS/arch combo. " +
         "Set baybo.json:browser.chrome_path to a Chrome binary you have available.",
@@ -264,7 +275,7 @@ async function findExistingChrome(): Promise<string | null> {
 async function installChromeInBackground(state: InstallState): Promise<string> {
   const cacheDir = defaultChromeCacheDir();
   const platform = detectBrowserPlatform();
-  if (!platform) {
+  if (platform === undefined) {
     throw new Error("@puppeteer/browsers: unsupported platform for auto-install");
   }
   log(`no Chrome in ${cacheDir}; resolving Chrome for Testing 'stable' buildId for ${platform}`);
@@ -300,10 +311,10 @@ async function installChromeInBackground(state: InstallState): Promise<string> {
 }
 
 function buildArgs(executablePath: string | undefined): ServerArgs {
-  const userDataDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const userDataDir = resolvedProfileDir();
   mkdirSync(userDataDir, { recursive: true });
 
-  const viewport = parseViewport(process.env["BAYBO_BROWSER_VIEWPORT"]);
+  const viewport = parseViewport(envValue("BAYBO_BROWSER_VIEWPORT"));
 
   // Chrome's renderer sandbox is on by default. The Rust profile
   // builder sets BAYBO_BROWSER_NO_SANDBOX=1 when `baybo.json:browser.sandbox`
@@ -435,7 +446,7 @@ class GuardingTransport {
     let text: string;
     switch (this.state.phase) {
       case "installing": {
-        const buildSuffix = this.state.buildId
+        const buildSuffix = this.state.buildId !== undefined
           ? ` (Chrome for Testing buildId=${this.state.buildId})`
           : "";
         text =
@@ -462,6 +473,11 @@ class GuardingTransport {
         text =
           `Browser container is up; waiting for Chrome's DevTools endpoint to come online. ` +
           `Please retry this tool call in a few seconds.`;
+        break;
+      case "recovering":
+        // Written by the watchdog via `BrowserHealer.outageText` — the honest
+        // wording differs per mode, so it is not synthesised here.
+        text = this.state.error ?? "Browser is temporarily unavailable. Please retry shortly.";
         break;
       case "ready":
         // Race between phase flip and the next intercepted call — let it
@@ -518,7 +534,7 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
   // (different hostname) or a crashed previous host Chrome (PID dead).
   // Live-PID-on-this-hostname locks are left alone so a real conflict
   // still surfaces.
-  const profileDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const profileDir = resolvedProfileDir();
   try {
     mkdirSync(profileDir, { recursive: true });
     clearStaleChromeLocks(profileDir);
@@ -534,7 +550,7 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
     state.error = e instanceof Error ? e.message : String(e);
   }
 
-  if (initialPath) {
+  if (initialPath !== null) {
     state.phase = "ready";
   } else if (state.phase !== "failed") {
     state.phase = "installing";
@@ -543,21 +559,52 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
   const args = buildArgs(initialPath ?? undefined);
 
   if (state.phase === "installing") {
-    void installChromeInBackground(state).then(
-      (exe) => {
-        args.executablePath = exe;
-        state.phase = "ready";
-        state.percent = 100;
-        log("Chrome ready; browser tools are live");
-      },
-      (err: unknown) => {
-        state.phase = "failed";
-        state.error = err instanceof Error ? err.message : String(err);
-        log(`Chrome install failed: ${state.error}`);
-      },
-    );
+    void installChromeWithRetry(state, args);
   }
   return args;
+}
+
+/**
+ * Chrome-download attempts before the sidecar declares the install failed.
+ *
+ * A single attempt used to be the whole policy: a boot that landed in a
+ * network blip set `phase = "failed"` and nothing ever retried, so
+ * `browser/*` stayed dead until the operator noticed and restarted the
+ * gateway. `failed` is also the one phase the watchdog can't help with —
+ * there is no browser to probe — so the retry has to live here.
+ */
+const CHROME_INSTALL_ATTEMPTS = 4;
+
+/** Linear backoff base between install attempts (15s, 30s, 45s). */
+const CHROME_INSTALL_RETRY_BASE_MS = 15_000;
+
+async function installChromeWithRetry(state: InstallState, args: ServerArgs): Promise<void> {
+  for (let attempt = 1; attempt <= CHROME_INSTALL_ATTEMPTS; attempt += 1) {
+    try {
+      const exe = await installChromeInBackground(state);
+      args.executablePath = exe;
+      state.phase = "ready";
+      state.percent = 100;
+      state.error = undefined;
+      log("Chrome ready; browser tools are live");
+      return;
+    } catch (e) {
+      const reason = errText(e);
+      if (attempt === CHROME_INSTALL_ATTEMPTS) {
+        state.phase = "failed";
+        state.error = reason;
+        logger.error(`Chrome install failed after ${attempt} attempts: ${reason}`);
+        return;
+      }
+      const delayMs = CHROME_INSTALL_RETRY_BASE_MS * attempt;
+      state.percent = 0;
+      logger.warn(
+        `Chrome install attempt ${attempt}/${CHROME_INSTALL_ATTEMPTS} failed (${reason}); ` +
+          `retrying in ${Math.round(delayMs / 1000)}s`,
+      );
+      await sleep(delayMs);
+    }
+  }
 }
 
 /**
@@ -654,6 +701,74 @@ function clearStaleChromeLocks(profileDir: string): void {
   }
 }
 
+const CHROME_PROCESS_NAME_RE = /chrom(e|ium)/i;
+
+/**
+ * Positively identify a pid as a Chrome-family process.
+ *
+ * Deliberately the mirror image of {@link isLikelyChromeProcess}, which
+ * answers "should we *respect* this lock" and therefore assumes Chrome when it
+ * can't tell. Killing needs the opposite default: an unverifiable pid must
+ * never be signalled, or a stale lock whose pid was recycled onto an unrelated
+ * process would get that process killed. macOS has no `/proc` at all, so
+ * inheriting the permissive default there would make the kill a coin flip —
+ * hence the `ps` fallback rather than a bare `catch { return true }`.
+ */
+async function isConfirmedChromeProcess(pid: number): Promise<boolean> {
+  try {
+    return CHROME_PROCESS_NAME_RE.test(readFileSync(`/proc/${pid}/comm`, "utf8").trim());
+  } catch {
+    // No /proc (macOS) or the process vanished — ask ps before giving up.
+  }
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "comm=", "-p", String(pid)], {
+      timeout: 2_000,
+    });
+    // macOS ps prints the full executable path; Linux prints the bare name.
+    return CHROME_PROCESS_NAME_RE.test(basename(stdout.trim()));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * PID of the Chrome currently holding this profile, when it is alive, on this
+ * host, and confirmed to be Chrome.
+ *
+ * `SingletonLock` is a symlink to `<hostname>-<pid>`, and that target is the
+ * only handle we have on a Chrome that CDDM launched: it launches with
+ * `pipe: true`, so there is no `DevToolsActivePort` file and no CDP port to
+ * find the process by.
+ */
+async function lockedChromePid(profileDir: string): Promise<number | undefined> {
+  let target: string;
+  try {
+    target = readlinkSync(join(profileDir, "SingletonLock"));
+  } catch {
+    return undefined;
+  }
+  const m = target.match(/^(.+)-(\d+)$/);
+  if (!m) return undefined;
+  if (m[1] !== osHostname()) return undefined;
+  const pid = Number(m[2]);
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (!isPidAlive(pid)) return undefined;
+  return (await isConfirmedChromeProcess(pid)) ? pid : undefined;
+}
+
+/** Poll a pid out of existence, so the lock clear that follows sees it gone. */
+async function waitForPidToExit(pid: number, budgetMs: number): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await sleep(100);
+  }
+  return !isPidAlive(pid);
+}
+
+/** How long to wait for a SIGKILLed Chrome to leave the process table. */
+const CHROME_KILL_GRACE_MS = 3_000;
+
 function removeChromeLock(lockPath: string): boolean {
   try {
     unlinkSync(lockPath);
@@ -672,7 +787,7 @@ function dockerDirPath(): string {
 }
 
 function pickFirstExistingDir(raw: string | undefined): string | undefined {
-  if (!raw) return undefined;
+  if (raw === undefined) return undefined;
   for (const d of raw.split(":").filter((s) => s.length > 0)) {
     try {
       if (statSync(d).isDirectory()) return d;
@@ -686,6 +801,8 @@ function pickFirstExistingDir(raw: string | undefined): string | undefined {
 interface DockerSpawnOutcome {
   args: ServerArgs;
   handle: DockerHandle;
+  /** Retained so the watchdog can respawn an identical container. */
+  opts: DockerSpawnOptions;
 }
 
 /**
@@ -717,9 +834,9 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
   // and gets whatever Chrome stable was current at build time. No host-
   // side Chrome version lookup needed — the only network call is the
   // initial `wget` inside the Dockerfile, which docker handles.
-  const operatorImageTag = process.env["BAYBO_BROWSER_DOCKER_IMAGE_TAG"] || undefined;
+  const operatorImageTag = envValue("BAYBO_BROWSER_DOCKER_IMAGE_TAG");
 
-  const profileDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const profileDir = resolvedProfileDir();
   // Belt-and-braces: the entrypoint inside the container also clears
   // stale locks, but doing it host-side first means the bind-mounted
   // /data/profile already looks clean to Chrome on first launch (avoids
@@ -732,20 +849,18 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
     log(`profile dir prep failed: ${(e as Error).message}`);
   }
 
-  const handle = await spawnContainer({
+  const opts: DockerSpawnOptions = {
     dockerDir: dockerDirPath(),
     imageTag: operatorImageTag,
     profileDir,
-    fontDir: pickFirstExistingDir(process.env["BAYBO_BROWSER_EXTRA_FONT_DIRS"]),
-    webVncPort: parseVncPort(
-      process.env["BAYBO_BROWSER_DOCKER_WEB_VNC_PORT"],
-      "WEB_VNC_PORT",
-    ),
-    viewport: parseViewport(process.env["BAYBO_BROWSER_VIEWPORT"]) ?? { width: 1920, height: 1080 },
+    fontDir: pickFirstExistingDir(envValue("BAYBO_BROWSER_EXTRA_FONT_DIRS")),
+    webVncPort: parseVncPort(envValue("BAYBO_BROWSER_DOCKER_WEB_VNC_PORT"), "WEB_VNC_PORT"),
+    viewport: parseViewport(envValue("BAYBO_BROWSER_VIEWPORT")) ?? { width: 1920, height: 1080 },
     onPhase: (p) => {
       state.phase = p;
     },
-  });
+  };
+  const handle = await spawnContainer(opts);
 
   // CDDM ignores `headless` in connect-mode; set false anyway so the
   // boot summary reads correctly and the operator's mental model
@@ -753,11 +868,192 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
   const args = buildArgs(undefined);
   args.browserUrl = handle.cdpUrl;
   args.headless = false;
-  return { args, handle };
+  return { args, handle, opts };
+}
+
+// ---------------------------------------------------------------------
+// Watchdog wiring
+// ---------------------------------------------------------------------
+
+/**
+ * The cheapest chrome-devtools-mcp call that actually touches the browser.
+ * It resolves CDDM's `getContext()` — which is where a crashed Chrome gets
+ * relaunched (`ensureBrowserLaunched` re-launches whenever
+ * `browser.connected` is false) and a dropped CDP session gets reconnected —
+ * then returns the page list without navigating anything.
+ *
+ * CDDM never throws out of a tool handler; a failure comes back as
+ * `isError` with the message in a text block, so it has to be re-thrown to
+ * read as a failed probe.
+ */
+const CDDM_LIST_PAGES_TOOL = "list_pages";
+
+/** Ceiling on the end-to-end call each `recover()` uses to prove itself. */
+const RECOVERY_CALL_TIMEOUT_MS = 30_000;
+
+/** Ceiling on container cleanup when the watchdog gives up and exits. */
+const ESCALATION_CLEANUP_TIMEOUT_MS = 15_000;
+
+function firstText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  for (const block of content as unknown[]) {
+    if (typeof block !== "object" || block === null) continue;
+    const { type, text } = block as { type?: unknown; text?: unknown };
+    if (type !== "text" || typeof text !== "string") continue;
+    const trimmed = text.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+  return "";
+}
+
+async function assertBrowserAnswers(client: Client, signal?: AbortSignal): Promise<void> {
+  const res = await client.callTool(
+    { name: CDDM_LIST_PAGES_TOOL, arguments: {} },
+    undefined,
+    signal !== undefined ? { signal } : undefined,
+  );
+  if (res.isError === true) {
+    const detail = firstText(res.content);
+    throw new Error(
+      detail.length > 0 ? detail : `${CDDM_LIST_PAGES_TOOL} reported an error`,
+    );
+  }
+}
+
+function hostHealer(cddmClient: Client, activity: BrowserActivity): BrowserHealer {
+  return {
+    mode: "host",
+    canEscalate: true,
+    // CDDM launches Chrome lazily on the first tool call, so before then
+    // there is nothing to watch — and probing would force a Chrome the
+    // operator may never use into memory on every boot.
+    armed: () => activity.everCalled,
+    check: (signal) => assertBrowserAnswers(cddmClient, signal),
+    outageText: (reason) =>
+      `Browser stopped responding (${reason}) and is being restarted automatically. Any pages ` +
+      `that were open are gone — re-navigate once it is back. Please retry this tool call in a ` +
+      `few seconds.`,
+    async recover() {
+      const profileDir = resolvedProfileDir();
+
+      // A Chrome that *hung* is worse than one that died: puppeteer keeps
+      // reporting `browser.connected === true`, so CDDM's own relaunch never
+      // fires (`ensureBrowserLaunched` returns early on that flag) and every
+      // tool call parks on the wedged process indefinitely. Killing it is
+      // what turns the hang into the crash CDDM already knows how to recover
+      // from. We only get here after consecutive probes went unanswered on an
+      // otherwise idle browser, so there is no live work to lose.
+      const hung = await lockedChromePid(profileDir);
+      if (hung !== undefined) {
+        log(`killing unresponsive Chrome (pid=${hung}) holding ${profileDir}`);
+        try {
+          process.kill(hung, "SIGKILL");
+          if (!(await waitForPidToExit(hung, CHROME_KILL_GRACE_MS))) {
+            // Still in the process table (typically not yet reaped). The lock
+            // clear below leaves a live-looking pid's lock alone, so this
+            // attempt will fail and the next one — by which point it is gone —
+            // will succeed.
+            log(`Chrome pid=${hung} still present after SIGKILL; retrying on the next tick`);
+          }
+        } catch (e) {
+          log(`could not kill Chrome pid=${hung}: ${errText(e)}`);
+        }
+      }
+
+      // Whether Chrome died on its own or we just killed it, the `Singleton*`
+      // lock it left behind is what stops the relaunch: Chrome refuses to
+      // start on a locked profile and CDDM surfaces that as "The browser is
+      // already running for <dir>". The boot path clears these once; nothing
+      // did so after a mid-run crash until now.
+      clearStaleChromeLocks(profileDir);
+
+      // Performs the relaunch and proves it took.
+      await assertBrowserAnswers(cddmClient, AbortSignal.timeout(RECOVERY_CALL_TIMEOUT_MS));
+    },
+  };
+}
+
+function dockerHealer(
+  cddmClient: Client,
+  args: ServerArgs,
+  opts: DockerSpawnOptions,
+  getHandle: () => DockerHandle,
+  setHandle: (h: DockerHandle) => void,
+): BrowserHealer {
+  // The boot `opts` reports progress by assigning `state.phase`, which is
+  // right at boot and wrong here: it would overwrite the watchdog's
+  // `recovering` phase with `docker-building-image`, telling the agent its
+  // browser is in "first-time setup, takes 1-3 minutes" when what actually
+  // happened is a crash mid-session. Recovery reports to the log instead.
+  const recoveryOpts: DockerSpawnOptions = {
+    ...opts,
+    onPhase: (p) => logDebug(`recovery: ${p}`),
+  };
+  return {
+    mode: "docker",
+    canEscalate: true,
+    armed: () => true,
+    check: (signal) => probeCdpEndpoint(getHandle().cdpUrl, signal),
+    outageText: (reason) =>
+      `Browser container stopped responding (${reason}) and is being replaced automatically. Any ` +
+      `pages that were open are gone — re-navigate once it is back. Please retry this tool call ` +
+      `in a few seconds.`,
+    async recover() {
+      const dead = getHandle();
+      log(`replacing unresponsive container ${dead.containerName}`);
+      await dead.stop();
+      await sweepStaleContainers();
+      const next = await spawnContainer(recoveryOpts);
+      setHandle(next);
+      // CDDM re-reads `serverArgs.browserUrl` inside getContext() on every
+      // tool call, so repointing it here is all it takes for the next
+      // connection to find the replacement container — whose published port
+      // is a fresh ephemeral one, hence the mutation rather than a reuse.
+      //
+      // This only lands because the old connection is already gone. CDDM
+      // caches the browser in a module-level singleton guarded on
+      // `browser?.connected` alone: on a cache hit it returns the cached
+      // instance and discards every argument, including a changed
+      // browserUrl. Force-removing the container above is what drops that
+      // connection and makes the next `ensureBrowserConnected` honour the new
+      // URL. Two corollaries for anyone editing this: never try to switch
+      // *modes* (launched ↔ connected) at runtime — the guard ignores mode
+      // entirely and would hand back the wrong browser — and don't reach for
+      // CDDM's `closeBrowser` to force the issue: it isn't exported from the
+      // package entry, and a deep import would be inlined by esbuild as a
+      // second module instance with its own singleton, silently doing nothing.
+      args.browserUrl = next.cdpUrl;
+      log(`container replaced: ${next.containerName} at ${next.cdpUrl}`);
+      // A container whose CDP port answers can still be unreachable through
+      // the puppeteer connection CDDM has cached, so prove the whole path
+      // rather than trusting the port probe.
+      await assertBrowserAnswers(cddmClient, AbortSignal.timeout(RECOVERY_CALL_TIMEOUT_MS));
+    },
+  };
+}
+
+function cdpUrlHealer(cdpUrl: string): BrowserHealer {
+  return {
+    mode: "cdp_url",
+    // We don't own this Chrome — `browser.docker.cdp_url` is the operator's
+    // "I'm managing the browser" escape hatch. Exiting would crash-loop
+    // against the gateway's reconciler while fixing nothing, and CDDM
+    // reconnects on its own once the operator's Chrome is back. So: report,
+    // keep probing, never restart.
+    canEscalate: false,
+    armed: () => true,
+    check: (signal) => probeCdpEndpoint(cdpUrl, signal),
+    // Deliberately does not promise a restart: nothing here can deliver one.
+    outageText: (reason) =>
+      `The externally-managed Chrome at ${cdpUrl} is not answering (${reason}). Baybo does not ` +
+      `manage that browser (it is configured via browser.docker.cdp_url), so it cannot restart ` +
+      `it — whoever runs it has to bring it back. Baybo reconnects automatically once it does.`,
+    recover: () => Promise.resolve(),
+  };
 }
 
 function parseVncPort(raw: string | undefined, label: string): number | undefined {
-  if (!raw) return undefined;
+  if (raw === undefined) return undefined;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1 || n > 65535) {
     log(`BAYBO_BROWSER_DOCKER_${label} '${raw}' is not a valid TCP port; ignoring`);
@@ -768,13 +1064,14 @@ function parseVncPort(raw: string | undefined, label: string): number | undefine
 
 async function main(): Promise<void> {
   const state: InstallState = { phase: "installing", percent: 0 };
-  const dockerCdpUrl = process.env["BAYBO_BROWSER_DOCKER_CDP_URL"];
+  const dockerCdpUrl = envValue("BAYBO_BROWSER_DOCKER_CDP_URL");
   const dockerEnable = process.env["BAYBO_BROWSER_DOCKER_ENABLE"] === "1";
   let dockerHandle: DockerHandle | null = null;
+  let dockerOpts: DockerSpawnOptions | null = null;
   let args: ServerArgs;
   let mode: "cdp_url" | "docker" | "host";
 
-  if (dockerCdpUrl) {
+  if (dockerCdpUrl !== undefined) {
     log(`docker.cdp_url set; connecting to existing CDP at ${dockerCdpUrl}`);
     args = buildArgs(undefined);
     args.browserUrl = dockerCdpUrl;
@@ -800,6 +1097,7 @@ async function main(): Promise<void> {
       const outcome = await trySpawnDocker(state);
       args = outcome.args;
       dockerHandle = outcome.handle;
+      dockerOpts = outcome.opts;
       state.phase = "ready";
       mode = "docker";
       // The container name + image tag are folded into the single
@@ -843,6 +1141,28 @@ async function main(): Promise<void> {
     const visible = cddmTools.tools.filter((t) => !BLOCKED_TOOLS.has(t.name));
     return { tools: [...visible, READ_PAGE_TOOL] };
   });
+  // Every call that reaches CDDM is recorded, so the watchdog can stand down
+  // while the agent is actively browsing: real traffic proves the browser
+  // answers better than any probe, and CDDM serialises tool calls behind one
+  // mutex, so a probe fired mid-call would queue and then time out against a
+  // perfectly healthy browser. Rejections that never touch the browser
+  // (unknown page id, blocked tool) deliberately don't count.
+  const activity = new BrowserActivity();
+  const throughCddm = async <T>(run: () => Promise<T>): Promise<T> => {
+    activity.begin();
+    let ok = false;
+    try {
+      const result = await run();
+      // CDDM never throws out of a tool handler — a dead browser comes back
+      // as `isError` with the message in a text block — so the flag, not the
+      // absence of a throw, is what says the browser actually answered.
+      ok = (result as { isError?: unknown }).isError !== true;
+      return result;
+    } finally {
+      activity.end(ok);
+    }
+  };
+
   proxy.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (req.params.name === READ_PAGE_TOOL.name) {
       const raw = req.params.arguments ?? {};
@@ -854,7 +1174,7 @@ async function main(): Promise<void> {
             "to find the page id and pass it in.",
         );
       }
-      return await handleReadPage(cddmClient, { pageId: pageIdRaw });
+      return await throughCddm(() => handleReadPage(cddmClient, { pageId: pageIdRaw }));
     }
     if (BLOCKED_TOOLS.has(req.params.name)) {
       return proxyToolError(
@@ -862,19 +1182,21 @@ async function main(): Promise<void> {
           `It was hidden from tools/list — do not invoke it.`,
       );
     }
-    return await cddmClient.callTool({
-      name: req.params.name,
-      arguments: req.params.arguments,
-    });
+    return await throughCddm(() =>
+      cddmClient.callTool({
+        name: req.params.name,
+        arguments: req.params.arguments,
+      }),
+    );
   });
 
   const realTransport = new StdioServerTransport();
   const transport = new GuardingTransport(realTransport, state);
   await proxy.connect(transport as unknown as StdioServerTransport);
 
-  const chromeArgList = args.chromeArg && args.chromeArg.length > 0 ? args.chromeArg.join(",") : "";
-  const viewportStr = args.viewport ? `${args.viewport.width}x${args.viewport.height}` : "<chrome default>";
-  const target = args.browserUrl
+  const chromeArgList = args.chromeArg !== undefined && args.chromeArg.length > 0 ? args.chromeArg.join(",") : "";
+  const viewportStr = args.viewport !== undefined ? `${args.viewport.width}x${args.viewport.height}` : "<chrome default>";
+  const target = args.browserUrl !== undefined
     ? `browserUrl=${args.browserUrl}`
     : `executable=${args.executablePath ?? "<pending install>"}`;
   const dockerStr = dockerHandle
@@ -884,10 +1206,73 @@ async function main(): Promise<void> {
     `chrome-devtools-mcp ready: mode=${mode}${dockerStr} userDataDir=${args.userDataDir} ${target} ` +
       `viewport=${viewportStr} headless=${args.headless} ` +
       `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
-      `telemetry=off page_id_routing=${args.experimentalPageIdRouting ? "on" : "off"} ` +
+      `telemetry=off page_id_routing=${args.experimentalPageIdRouting === true ? "on" : "off"} ` +
       `install_state=${state.phase} extra_tools=read_page ` +
       `disabled_categories=emulation,performance,extensions disabled_tools=${[...BLOCKED_TOOLS].join(",")}`,
   );
+
+  // Browser liveness watchdog. The gateway's McpReconciler already respawns
+  // this process when its stdio pipe breaks, but a dead Chrome behind a live
+  // sidecar is invisible to that probe — see watchdog.ts for the split.
+  const phaseGate: PhaseGate = {
+    isReady: () => state.phase === "ready",
+    enterRecovering: (reason) => {
+      state.phase = "recovering";
+      state.error = reason;
+    },
+    markReady: () => {
+      state.phase = "ready";
+      state.error = undefined;
+    },
+  };
+
+  let shuttingDown = false;
+  let healer: BrowserHealer;
+  if (mode === "docker" && dockerOpts) {
+    const opts = dockerOpts;
+    healer = dockerHealer(
+      cddmClient,
+      args,
+      opts,
+      () => {
+        if (!dockerHandle) throw new Error("docker mode lost its container handle");
+        return dockerHandle;
+      },
+      (next) => {
+        // A replacement that lands after teardown began would otherwise be
+        // orphaned: shutdown has already snapshotted the old handle, and the
+        // next-boot sweep skips containers whose owner pid is still alive.
+        if (shuttingDown) {
+          log(`discarding container ${next.containerName} spawned during shutdown`);
+          void next.stop();
+          return;
+        }
+        dockerHandle = next;
+      },
+    );
+  } else if (mode === "cdp_url" && dockerCdpUrl !== undefined) {
+    healer = cdpUrlHealer(dockerCdpUrl);
+  } else {
+    healer = hostHealer(cddmClient, activity);
+  }
+
+  const watchdog = new BrowserWatchdog({
+    healer,
+    activity,
+    phase: phaseGate,
+    log: logger,
+    giveUp: () => {
+      watchdog.stop();
+      // Take the container down on the way out; otherwise every escalation
+      // leaks one until the next boot's sweep notices. Bounded, because
+      // exiting is the point — a wedged docker daemon must not prevent it.
+      const cleanup = dockerHandle ? dockerHandle.stop() : Promise.resolve();
+      void Promise.race([cleanup, sleep(ESCALATION_CLEANUP_TIMEOUT_MS)]).then(() => {
+        process.exit(1);
+      });
+    },
+  });
+  watchdog.start();
 
   // Cap shutdown at the docker stop timeout (5s graceful + slack for
   // `docker rm`) so a hung container can't pin the gateway's reload
@@ -896,12 +1281,17 @@ async function main(): Promise<void> {
   // `docker stop` even sent SIGTERM, leaving the container running and
   // the next-boot sweep responsible for cleanup.
   const SHUTDOWN_TIMEOUT_MS = 25_000;
-  let shuttingDown = false;
   const shutdown = (): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Stop scheduling first, then wait out any tick already running: a docker
+    // repair can be mid-`spawnContainer` here, and exiting under it would
+    // orphan the container it is about to create. `quiesce` rides the same
+    // 25s deadline as the rest of teardown.
+    watchdog.stop();
     log("shutting down");
     const closes: Array<Promise<unknown>> = [
+      watchdog.quiesce(),
       proxy.close().catch(() => undefined),
       cddmClient.close().catch(() => undefined),
       cddmServer.close().catch(() => undefined),
@@ -910,13 +1300,13 @@ async function main(): Promise<void> {
       // dockerHandle.stop already swallows its own errors.
       closes.push(dockerHandle.stop());
     }
-    const watchdog = new Promise<void>((resolve) => {
+    const deadline = new Promise<void>((resolve) => {
       setTimeout(() => {
-        log(`shutdown watchdog fired after ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`);
+        log(`shutdown deadline hit after ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`);
         resolve();
       }, SHUTDOWN_TIMEOUT_MS).unref();
     });
-    void Promise.race([Promise.allSettled(closes).then(() => undefined), watchdog]).then(() => {
+    void Promise.race([Promise.allSettled(closes).then(() => undefined), deadline]).then(() => {
       process.exit(0);
     });
   };
@@ -925,7 +1315,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e: unknown) => {
-  const msg = e instanceof Error ? e.message : String(e);
-  process.stderr.write(`[browser-mcp] fatal: ${msg}\n`);
+  logger.error(`fatal: ${errText(e)}`);
   process.exit(1);
 });

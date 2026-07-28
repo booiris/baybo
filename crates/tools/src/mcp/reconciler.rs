@@ -23,6 +23,26 @@ const TICK_INTERVAL: Duration = Duration::from_secs(5);
 const EMBEDDED_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const EMBEDDED_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Ceiling on the per-server liveness probe below.
+///
+/// A child that exited answers immediately with a broken-pipe `Err`, but one
+/// that *hangs* — a wedged event loop, a sidecar blocked on a syscall — never
+/// answers at all. The probes run sequentially inside `tick`, so an unbounded
+/// await there doesn't just miss the hung server: it stalls reconciliation for
+/// every other MCP server behind it, including the user's `.mcp.json` entries.
+/// Treating a silent probe as death is safe — `disconnect_server` drops the
+/// transport, which kills the child, and the backoff schedule respawns it.
+///
+/// This bounds the *probe* only. `connect_server` below is still unbounded, so
+/// a first-boot browser sidecar that spends minutes building its docker image
+/// or downloading Chrome before connecting its stdio transport continues to
+/// serialise the loop. That one is deliberately left alone: the timeout that
+/// would fix it is indistinguishable from a legitimately slow first boot, and
+/// the real fix is for the sidecar to connect its transport first and spawn the
+/// container in the background, the way the host path already backgrounds the
+/// Chrome download behind `GuardingTransport`.
+const EMBEDDED_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Connected {
     session: McpServerSession,
     identity_hash: u64,
@@ -190,11 +210,21 @@ impl McpReconciler {
             if let Some(peer) = peer {
                 // Cheapest no-op: re-list tools. Returns Err on a
                 // dead transport (broken pipe to a stdio child that
-                // exited).
-                if let Err(e) = peer.list_all_tools().await {
+                // exited), and times out on one that hung instead.
+                let failure =
+                    match tokio::time::timeout(EMBEDDED_PROBE_TIMEOUT, peer.list_all_tools()).await
+                    {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(e)) => Some(e.to_string()),
+                        Err(_) => Some(format!(
+                            "no response within {}s",
+                            EMBEDDED_PROBE_TIMEOUT.as_secs()
+                        )),
+                    };
+                if let Some(error) = failure {
                     tracing::warn!(
                         server = %name,
-                        error = %e,
+                        %error,
                         "embedded mcp server probe failed; disconnecting and scheduling reconnect"
                     );
                     self.disconnect_server(&name).await;

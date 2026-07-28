@@ -103,10 +103,29 @@ const result = await build({
   plugins: [bayboResolveCddm],
   logLevel: "info",
 });
+// Test-only second output. `dist/bundle.mjs` is an entrypoint, not a library —
+// it has no exports a unit test can reach — and `node --test` can't import the
+// `.ts` sources on the Node 20 floor this package supports. So the watchdog's
+// state machine is emitted once more, unminified and importable, under
+// `dist/test/`. The gateway's build.rs only ever picks up `dist/bundle.mjs`
+// plus the `baybo.auxAssets` paths, so this never ships.
+const testResult = await build({
+  entryPoints: ["src/watchdog.ts"],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  outfile: "dist/test/watchdog.mjs",
+  minify: false,
+  sourcemap: false,
+  logLevel: "warning",
+});
+
 const ms = Date.now() - start;
 console.log(
-  `bundled in ${ms}ms (${result.warnings.length} warnings, ${result.errors.length} errors)`,
+  `bundled in ${ms}ms (${result.warnings.length + testResult.warnings.length} warnings, ` +
+    `${result.errors.length + testResult.errors.length} errors)`,
 );
-if (result.errors.length > 0) {
+if (result.errors.length > 0 || testResult.errors.length > 0) {
   process.exit(1);
 }
