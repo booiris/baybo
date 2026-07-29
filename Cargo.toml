@@ -128,6 +128,21 @@ lofty = "0.22"
 mp3-duration = "0.1"
 mp4 = "0.14"
 matroska = "0.30"
+# PDF page count (a native PDF is billed per PAGE, so the count is the only
+# honest price input). A real parser, not a `/Type /Page` scan: PDF 1.5 packs
+# page objects into Flate-compressed object streams, where a byte scan of a
+# 64-page document finds zero. Default features are off — they pull three
+# date-time crates and rayon for document *authoring*, which this never does.
+lopdf = { version = "0.44", default-features = false }
+# Image pixel dimensions (a provider tiles an image by PIXELS and bills per
+# tile, so a byte cap bounds nothing). Header parser, not a decoder: it reads
+# the few bytes that carry width/height and never allocates a frame buffer, and
+# it has no dependencies of its own. Covers every raster MIME the delivery path
+# accepts — PNG, JPEG, GIF, WebP, HEIF/HEIC.
+imagesize = "0.13"
+# Test-only: builds the compressed object stream the PDF page-count probe has
+# to see through. Already in the tree under `lopdf` / `lofty`.
+flate2 = "1"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"

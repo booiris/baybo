@@ -1,11 +1,11 @@
 import SwiftUI
 import UIKit
 
-/// The hand-rolled destructive confirm — the pairing screen's stop-and-decide
-/// grammar folded onto one floating paper plate: bold mono title, soft mono
+/// The hand-rolled stop-and-decide confirm — the pairing screen's grammar
+/// folded onto one floating paper plate: bold mono title, soft mono
 /// hint, the practiced Cancel | commit pill row. Ink dims the field (never
-/// black, never blur — glass stays rationed to the composer surfaces); red
-/// appears exactly once, as the same outline pill that summoned the dialog.
+/// black, never blur — glass stays rationed to the composer surfaces); the
+/// commit is a single outline pill, red on a destructive action (`commitTint`).
 ///
 /// Hand-rolled on purpose: the stock `.confirmationDialog` left its
 /// `isPresented` binding latched true after a scrim dismiss inside the
@@ -30,7 +30,12 @@ struct ConfirmDialog: View {
     /// user must see before committing (a cron group's delete counts the
     /// execution records it will clear). Nil for a body that takes no argument.
     var bodyArg: String?
-    let destructiveKey: String
+    let commitKey: String
+    /// The commit pill's outline. Red is the destructive token and this dialog
+    /// is where the design system spends it — so a stop-and-decide that is NOT
+    /// destructive (the per-session resync) takes ink instead, rather than
+    /// teaching the field that red means "a dialog".
+    var commitTint: Color = Theme.err
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
@@ -109,9 +114,9 @@ struct ConfirmDialog: View {
                     Haptics.tap()
                     onConfirm()
                 } label: {
-                    Text(verbatim: lang.t(destructiveKey))
+                    Text(verbatim: lang.t(commitKey))
                 }
-                .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
+                .buttonStyle(OutlinePillButtonStyle(color: commitTint))
             }
             .padding(.top, 22)
         }

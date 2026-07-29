@@ -74,6 +74,16 @@ impl GatewayBlobClient for ActiveGatewayClient {
         forward!(self, c => c.upload_blob(bytes, mime_type, deck_card))
     }
 
+    async fn upload_blob_file(
+        &self,
+        path: String,
+        mime_type: String,
+        deck_card: Option<String>,
+        progress: crate::blob_helper::ProgressSink,
+    ) -> Result<String, String> {
+        forward!(self, c => c.upload_blob_file(path, mime_type, deck_card, progress))
+    }
+
     async fn download_blob(
         &self,
         blob_id: String,

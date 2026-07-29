@@ -11,7 +11,7 @@ import { installMemoryLocalStorage } from '../../test/memoryStorage';
 // send/delete callbacks, inline edit (save on Enter, revert on Esc), and the
 // pause banner + bulk resume. dnd-kit pointer drag does not work in jsdom, so
 // reorder is covered by the store's unit test, not here. See
-// docs/todo/web-unit-tests.md.
+// docs/web-unit-tests.md.
 
 const SID = 'sess-1';
 const KEY = `baybo.queue.${SID}`;

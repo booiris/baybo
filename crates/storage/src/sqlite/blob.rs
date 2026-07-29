@@ -204,6 +204,16 @@ fn now_unix() -> i64 {
 /// PDF without consulting the sqlite metadata. Returns `""` when the
 /// MIME type isn't in the table — anything we don't recognise lands
 /// without a suffix rather than guessing wrong.
+///
+/// **Frozen persistence format, not a lookup table.** [`blob_path`]
+/// names a payload `<sha256><ext>`, so adding, removing or retargeting a
+/// single entry renames the path of every blob already written under that
+/// MIME and orphans its bytes — an edit here is a data migration, and
+/// `delete` unlinking a payload a live row still resolved to is how that
+/// was learned. The gateway's user-facing `attachment<ext>` synthesis
+/// keeps its own freely-growable table (`display_extension` in
+/// `channel/route.rs`) precisely so a cosmetic addition can never reach
+/// this one; do not merge them.
 fn mime_extension(mime: &str) -> &'static str {
     // Strip parameters (`image/jpeg; charset=utf-8`) and lowercase
     // before lookup so casing / params don't change the on-disk path.
@@ -575,7 +585,7 @@ impl BlobStore for SqliteBlobStore {
             // on-disk file by content addressing; deleting one
             // capability must not yank the file out from under the
             // other. Confirm the path is unreferenced before unlinking.
-            if affected > 0 && !self.any_live_for_path(hex, ext).await.unwrap_or(false) {
+            if affected > 0 && !self.path_may_be_shared(blob_id, hex, ext).await {
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -594,6 +604,28 @@ impl BlobStore for SqliteBlobStore {
 }
 
 impl SqliteBlobStore {
+    /// [`Self::any_live_for_path`] with its failure mode pinned to the
+    /// safe answer. A guard query can fail for reasons that say nothing
+    /// about who references the path — a busy database under WAL
+    /// contention, an exhausted pool, a poisoned connection — and
+    /// reading that as "unreferenced" unlinks bytes a live row still
+    /// resolves to, which no later call can undo. An unanswerable guard
+    /// therefore leaks the payload instead: recoverable, and visible in
+    /// the log.
+    async fn path_may_be_shared(&self, blob_id: &str, hex: &str, ext: &'static str) -> bool {
+        match self.any_live_for_path(hex, ext).await {
+            Ok(shared) => shared,
+            Err(e) => {
+                tracing::warn!(
+                    blob_id = %redacted_blob_id(blob_id),
+                    error = %e,
+                    "blob shared-path check failed; payload left on disk",
+                );
+                true
+            }
+        }
+    }
+
     /// Return `true` if some other live blob row resolves to the same
     /// on-disk path (i.e. shares this `(hex, mime_extension)` pair).
     /// Used by [`BlobStore::delete`] before unlinking a payload so a
@@ -1000,9 +1032,26 @@ mod tests {
         assert_eq!(got, b"opaque");
     }
 
+    #[tokio::test]
+    async fn octet_stream_keeps_its_bare_on_disk_name() {
+        // The extension table is the on-disk layout: `application/
+        // octet-stream` has always landed at the bare `<hex>` name, and
+        // every blob a running deployment already holds sits there.
+        // Teaching it a suffix would rename the path out from under them.
+        let (store, dir) = build().await;
+        let blob = store
+            .put(b"opaque bytes", "application/octet-stream", None)
+            .await
+            .unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let shard = dir.path().join("blobs").join(&hex[..2]);
+        assert!(shard.join(hex).exists(), "payload must stay at <hex>");
+        assert_eq!(store.get(&blob.blob_id).await.unwrap(), b"opaque bytes");
+    }
+
     #[test]
     fn mime_extension_table_is_case_and_param_tolerant() {
-        // Lookup must ignore casing and `;`-suffixed parameters.
         assert_eq!(mime_extension("image/jpeg"), ".jpg");
         assert_eq!(mime_extension("IMAGE/JPEG"), ".jpg");
         assert_eq!(mime_extension("image/jpeg; charset=binary"), ".jpg");
@@ -1010,6 +1059,112 @@ mod tests {
         assert_eq!(mime_extension("application/pdf"), ".pdf");
         assert_eq!(mime_extension("video/mp4"), ".mp4");
         assert_eq!(mime_extension("application/x-not-known"), "");
+    }
+
+    /// The table is the on-disk layout, and arbitrary-file upload makes
+    /// every one of these MIMEs routine where they used to be rare. Every
+    /// one maps to `""` today, so every blob already stored under one sits
+    /// at the bare `<sha256>` name; teaching any of them a suffix renames a
+    /// path that exists on real disks. The place to add them is the
+    /// gateway's display table.
+    #[test]
+    fn arbitrary_file_picks_stay_unsuffixed_on_disk() {
+        for mime in [
+            "application/octet-stream",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/yaml",
+            "application/x-yaml",
+            "text/yaml",
+            "text/x-yaml",
+            "application/toml",
+            "text/x-toml",
+            "application/x-7z-compressed",
+            "application/vnd.rar",
+            "application/x-rar-compressed",
+        ] {
+            assert_eq!(mime_extension(mime), "", "{mime} must stay unsuffixed");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_a_payload_another_live_row_resolves_to() {
+        // Two mimes that both map to `""` put the same content at one
+        // path. Deleting either capability must leave the file for the
+        // survivor — unlinking it would strand a live row's bytes.
+        let (store, dir) = build().await;
+        let first = store
+            .put(b"shared", "application/octet-stream", None)
+            .await
+            .unwrap();
+        let second = store
+            .put(b"shared", "application/x-baybo-foo", None)
+            .await
+            .unwrap();
+        let hex_with_token = first.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir.path().join("blobs").join(&hex[..2]).join(hex);
+        assert!(path.exists(), "both puts share one payload");
+
+        store.delete(&first.blob_id).await.unwrap();
+        assert!(path.exists(), "survivor's payload must not be unlinked");
+        assert_eq!(store.get(&second.blob_id).await.unwrap(), b"shared");
+
+        // Last capability gone → the payload goes with it.
+        store.delete(&second.blob_id).await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_the_payload_when_the_shared_path_guard_errors() {
+        // The guard runs a query, and a query can fail for reasons that
+        // say nothing about who references the path. Failing open
+        // ("nobody else holds it") unlinks a live row's bytes; this
+        // pins the opposite. Forced with a same-digest sibling row
+        // whose `mime_type` is stored as a BLOB — the guard's
+        // `row.get::<_, String>` rejects it, so the guard returns a real
+        // StorageError out of the real call, no test-only seam.
+        let (store, dir) = build().await;
+        let blob = store.put(b"guarded", "text/plain", None).await.unwrap();
+        let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();
+        let hex = hex_with_token.split_once('.').map(|(h, _)| h).unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}.txt"));
+        assert!(path.exists(), "payload landed");
+
+        let sibling_id = format!("{SHA256_PREFIX}{hex}.{}", "e".repeat(32));
+        let now = now_unix();
+        store
+            .pool
+            .interact("test.blobs.unreadable_mime", move |conn| {
+                conn.execute(
+                    "INSERT INTO blobs (blob_id, mime_type, size, read_token, created_at, last_accessed_at) \
+                     VALUES (?1, ?2, 0, NULL, ?3, ?3)",
+                    rusqlite::params![sibling_id, vec![0xffu8, 0xfe], now],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store.delete(&blob.blob_id).await.unwrap();
+        assert!(
+            path.exists(),
+            "an unanswerable guard must leave the payload on disk",
+        );
+        // …and the guard really was erroring, not quietly answering
+        // "shared": the deleted row is gone, so this is the same range
+        // the delete-time call saw.
+        assert!(store.any_live_for_path(hex, ".txt").await.is_err());
+        // The capability itself is still revoked.
+        assert!(matches!(
+            store.get(&blob.blob_id).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

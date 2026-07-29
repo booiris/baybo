@@ -84,25 +84,41 @@ final class AppStore: ObservableObject {
     /// list/compose/push resets it to `[.session(id)]`; one opened from the
     /// archived screen appends, so the pop chain runs chat → archived → list.
     ///
+    /// This is where "the user LEFT a conversation" is decided, for everything
+    /// that has to end when they do.
+    ///
     /// Popping the last conversation off the stack stops chat audio: a track
     /// playing over the list — with no visible card to control it — reads as
     /// a bug, not a feature. The path only changes on navigation, so
     /// lock-screen/background playback while parked IN a chat is untouched.
     /// (`ChatScreen.onDisappear` can't be this hook: it also fires under
-    /// fullScreenCovers like the image viewer.)
+    /// fullScreenCovers like the image viewer.) Each conversation the change
+    /// dropped also reclaims its composer's staged strip, and for the same
+    /// reason: `ComposerView` is docked in a `.safeAreaInset` that a cover
+    /// tears down and puts back.
     @Published var chatPath: [ChatRoute] = [] {
         didSet {
-            if Self.hasSession(oldValue) && !Self.hasSession(chatPath) {
+            let open = Self.sessionIds(chatPath)
+            let left = Self.sessionIds(oldValue).subtracting(open)
+            guard !left.isEmpty else { return }
+            if open.isEmpty {
                 AudioPlayerCenter.shared.stop()
+            }
+            for sessionId in left {
+                chatStores[sessionId]?.leaveChat()
             }
         }
     }
 
-    private static func hasSession(_ path: [ChatRoute]) -> Bool {
-        path.contains { route in
-            if case .session = route { return true }
-            return false
+    /// The conversations a path holds open. Their difference across a change is
+    /// exactly the set the user just left — a cover or a sheet over a chat
+    /// changes no route, so it names nobody.
+    static func sessionIds(_ path: [ChatRoute]) -> Set<String> {
+        var ids: Set<String> = []
+        for route in path {
+            if case .session(let sessionId) = route { ids.insert(sessionId) }
         }
+        return ids
     }
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
@@ -121,6 +137,9 @@ final class AppStore: ObservableObject {
     @Published var confirmDeleteSession: String?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
+    /// The session the list's long-press resync is asking to confirm, same host
+    /// and reasons — and the only one of these whose commit is not destructive.
+    @Published var confirmResyncSession: String?
     /// Job id → name, learned from the scheduled-jobs list. See
     /// `rememberCronJobTitles`.
     @Published private(set) var cronJobTitles: [String: String] = [:]
@@ -942,6 +961,22 @@ final class AppStore: ObservableObject {
         withAnimation(ConfirmDialog.enterMotion) {
             confirmDeleteCronGroup = PendingCronGroupDelete(jobId: jobId, memberIds: memberIds)
         }
+    }
+
+    /// Raise the resync confirm for a long-pressed row.
+    func promptResync(_ sessionId: String) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmResyncSession = sessionId
+        }
+    }
+
+    /// Rebuild one conversation's transcript from the gateway, after the confirm
+    /// — the per-session escape hatch ([docs/transcript.md]). Nothing here is a
+    /// server call: it discards this device's local rendering and lets the cold
+    /// path re-derive it, so the store it materialises is the one the next visit
+    /// would have opened anyway.
+    func requestResync(_ sessionId: String) {
+        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
     }
 
     /// Archive or unarchive, optimistically: the row moves lists at once and

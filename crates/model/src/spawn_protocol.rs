@@ -401,6 +401,8 @@ mod tests {
                     },
                     mime_type: "image/png".into(),
                     filename: None,
+                    width: None,
+                    height: None,
                 },
                 ContentBlock::Thinking {
                     id: None,

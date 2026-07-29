@@ -958,6 +958,8 @@ mod tests {
                     },
                     mime_type: "image/png".into(),
                     filename: None,
+                    width: None,
+                    height: None,
                 },
             ]),
             status: SubagentExitStatus::Completed,

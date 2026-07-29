@@ -139,9 +139,17 @@ iOS's on-device cache of rendered rows plus the cursor, written atomically;
 a pure cache — never a source of truth.
 _Avoid_: local store, offline database
 
-**Channel universe**:
-The disjoint session sets owned by the `http` (web) and `device` (iOS)
-channels; sessions never cross between them.
+**Owner channel**:
+The single channel (`ChannelType::OWNER`) every owner-facing transcript
+surface — web and iOS — registers on: one session set, one transcript
+pool, one identity. The surfaces differ only at the auth boundary (an
+admin bearer vs an approved device token, plus the device store for
+pairing and push); past it nothing distinguishes them, so a conversation
+is one thread on however many screens and both clients run the same
+**Sync** loop over it.
+_Avoid_: channel universe, `http` / `device` (the retired per-surface
+channels — a one-time collapse re-tagged every pre-merge session and cron
+job `owner`, so no row carries them any more)
 
 ## Relationships
 
@@ -200,6 +208,10 @@ channels; sessions never cross between them.
   surfaces ("Live plane", "Signal plane"). The Signal plane is not a fourth
   data plane — it names the fire-and-forget accelerator role for the list
   UI (`SessionActivity`, APNs); its frames are Ephemeral-plane data.
+- "**channel universe**" named the disjoint `http` (web) and `device`
+  (iOS) session sets a conversation could not cross between. The collapse
+  onto the **Owner channel** deleted the concept, not just the words:
+  there is one pool, and which surface wrote a row is no longer a scope.
 - "**snapshot**" always means a State-plane REPLACE; the retired
   `WorkSnapshot` / `PendingApprovalsSnapshot` frames were its old per-frame
   on-subscribe delivery (now the single **SubscribeState**). The TUI's

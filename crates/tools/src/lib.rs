@@ -928,6 +928,8 @@ mod multi_modal_text_tests {
             },
             mime_type: "image/png".into(),
             filename: None,
+            width: None,
+            height: None,
         }
     }
 
@@ -970,6 +972,8 @@ mod multi_modal_text_tests {
                 filename: "x".into(),
                 mime_type: "application/pdf".into(),
                 duration_ms: None,
+                page_count: None,
+                size_bytes: None,
             },
             img(),
         ];

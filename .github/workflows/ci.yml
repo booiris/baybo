@@ -104,8 +104,14 @@ jobs:
           # crates/{wire,device-proto,model} and remote-host/ — so a root-crate
           # change can break the iOS build without touching app/ios at all.
           # Miss those prefixes and the iOS gate has a hole exactly where the
-          # gateway/app wire contract lives.
-          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/)'
+          # gateway/app wire contract lives. docs/openapi.json is here for the
+          # same reason, one hop further out: the transcript bundle's
+          # restSentinel.ts pins `TranscriptRowItem` to app/web's generated
+          # schema, which is generated from that spec — so a gateway-side rename
+          # of a `ChatTranscriptItem` field must reach this job. Note nothing
+          # gates the freshness of app/web's committed schema against the spec;
+          # its `gen:api` overwrites it in the runner and diffs nothing.
+          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/|docs/openapi\.json)'
           if changed "$IOS_DEPS"; then
             echo "ios=true" >> "$GITHUB_OUTPUT"
           else
@@ -186,37 +192,41 @@ jobs:
   # tests had never run anywhere but a laptop) and `app/ios/web` is its own pnpm
   # workspace (`packages: []`, so the root `frontend` job never adopts it).
   #
-  # Split by what actually needs a Mac. ~2/3 of the iOS suite — the Rust core and
-  # the transcript bundle — is plain Linux work, so it runs at 1x here; only the
-  # Swift/Xcode half pays the 10x macOS multiplier.
+  # Three jobs, split by what each one costs, because cost is what decides which
+  # of them run: the transcript bundle needs neither Rust nor a Mac (`ios-web`,
+  # ~2 min at 1x, ON), the app's own cargo workspace needs Rust but no Mac
+  # (`ios-core`, 1x but slow, OFF), and only the Swift/Xcode half needs a Mac
+  # (`ios-sim`, 10x, OFF). While the latter two are off, nothing under app/ios
+  # is covered except the transcript bundle — say so in the PR body rather than
+  # letting a green tick imply more.
   # ---------------------------------------------------------------------------
 
-  # TEMPORARILY DISABLED — the iOS suite was eating too much CI budget.
-  # To restore, put the original gate back:
-  #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
-  # This is the cheap half (Linux, 1x). The expensive half is `ios-sim` below.
-  ios-checks:
-    name: iOS core (rust + transcript bundle)
+  # The cheapest third of the iOS suite: no Rust toolchain, no Mac, ~2 min on a
+  # 1x runner. It was originally disabled as collateral damage — it shared a job
+  # with the cargo half below, which is what actually ate the budget.
+  #
+  # It also carries the two compile-time drift sentinels, which is why running
+  # it matters beyond this bundle: `src/wireSentinel.ts` pins the hand-written
+  # frame mirrors to the ts-rs contract in crates/wire, and `src/restSentinel.ts`
+  # pins `TranscriptRowItem` to the gateway's `ChatTranscriptItem` via
+  # docs/openapi.json. Both are `tsc --noEmit` assertions with no runtime
+  # component, so this job is the only thing anywhere that evaluates them.
+  # OFF ONLY BECAUSE THE ACTIONS QUOTA IS EXHAUSTED — not because it is slow, not
+  # because it is flaky, and not for the reason the two jobs below are off. This
+  # is the cheap one. To turn it back on, replace the `if: false` with the gate
+  # kept below it; nothing else needs changing.
+  #
+  # What stays unenforced meanwhile: both `tsc --noEmit` sentinels. Neither has a
+  # runtime component, so no other job anywhere evaluates them — a PR that adds a
+  # field to `ChatTranscriptItem` and forgets the iOS mirror goes green.
+  ios-web:
+    name: iOS transcript bundle (lint + test + build)
     needs: changes
     runs-on: ubuntu-latest
     if: false
+    # if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
     steps:
       - uses: actions/checkout@v4
-      # No toolchain file under app/ios — rustup walks UP to the root
-      # rust-toolchain.toml, so this is the same channel as every other job.
-      # cache-workspaces is not optional: app/ios has its own target dir and
-      # shares nothing with the root workspace's cache.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-workspaces: app/ios
-      - uses: taiki-e/install-action@nextest
-      - run: cargo fmt --all --check
-        working-directory: app/ios
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-        working-directory: app/ios
-      - run: cargo nextest run --workspace --locked
-        working-directory: app/ios
-
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -237,11 +247,41 @@ jobs:
       # folds, and the cross-session bridge isolation.
       - run: pnpm test
         working-directory: app/ios/web
-      # `pnpm build` is `tsc --noEmit && vite build`, which is what enforces
-      # web/src/wireSentinel.ts — the compile-time pin of the hand-written frame
-      # mirrors against the ts-rs contract. Until now nothing but a laptop ran it.
+      # `pnpm build` is `tsc --noEmit && vite build`, and the typecheck is the
+      # point: it is what evaluates both drift sentinels.
       - run: pnpm build
         working-directory: app/ios/web
+
+  # STILL DISABLED — this half is what exhausted the Actions budget: a cold
+  # `cargo clippy --all-targets --all-features` plus `nextest` over app/ios's
+  # own ~286-crate workspace, which shares no cache with the root one, is
+  # ~15-25 min of 1x runner per cold PR (the setup-rust-toolchain cache only
+  # helps once the key is warm, and it re-cold-starts on any Cargo.lock or
+  # toolchain move). Turning it back on means paying that on every PR that
+  # touches app/ios/, crates/{wire,device-proto,model}/ or remote-host/.
+  # To restore, put the original gate back:
+  #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+  ios-core:
+    name: iOS core (rust)
+    needs: changes
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain file under app/ios — rustup walks UP to the root
+      # rust-toolchain.toml, so this is the same channel as every other job.
+      # cache-workspaces is not optional: app/ios has its own target dir and
+      # shares nothing with the root workspace's cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: app/ios
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all --check
+        working-directory: app/ios
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        working-directory: app/ios
+      - run: cargo nextest run --workspace --locked
+        working-directory: app/ios
 
   ios-sim:
     name: iOS app (build + unit tests; UI smokes non-gating)

@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// The Deck tab's engine: transport (FFI over the active leg), the local
 /// mirror for instant offline paint, live-push handling with the
@@ -70,9 +71,69 @@ final class DeckStore: ObservableObject {
         let blobId: String
         let contentType: String
         let size: Int64
-        /// Synthesized (`photo.<ext>`) — PhotosPicker exposes no filename.
-        let name: String?
+        /// The file's real name for a file pick; synthesized (`photo.<ext>`)
+        /// for a photo pick, which exposes none.
+        let name: String
     }
+
+    /// Which native picker `deck.pickBlob` is presenting. A mode, not two
+    /// Bools: SwiftUI cannot bind two presentation modifiers to one flag, and
+    /// the two legs settle differently — `PhotosPicker` has no cancel callback
+    /// (a cancel is INFERRED from a dismissal with nothing chosen), while
+    /// `.fileImporter` reports one.
+    enum PickerMode: Equatable {
+        case idle
+        case photos
+        /// The document browser, restricted to the `accept` list's types.
+        case files([UTType])
+
+        var isFiles: Bool {
+            if case .files = self { return true }
+            return false
+        }
+
+        /// Never empty — an empty `allowedContentTypes` would make every file
+        /// unselectable, so a mode carrying no types falls back to "any file".
+        var fileTypes: [UTType] {
+            if case .files(let types) = self, !types.isEmpty { return types }
+            return [DeckStore.anyFileType]
+        }
+    }
+
+    /// `deck.pickBlob({accept})` grammar — mime globs, the `<input accept>`
+    /// convention, arriving from the shell as a canonical comma-joined token
+    /// list. Mirrors `normalizeAccept` in `web/src/deck/state.ts`: each side of
+    /// the bridge owns one parser, neither owns a second copy.
+    private enum Accept {
+        static let separator: Character = ","
+        static let typeSeparator: Character = "/"
+        static let wildcard = "*"
+        static let imageType = "image"
+    }
+
+    private struct AcceptToken {
+        let type: String
+        let subtype: String
+    }
+
+    /// The gateway's own fallback for an unidentifiable upload
+    /// (`DEFAULT_BLOB_MIME`, `crates/gateway/src/channel/blobs.rs`).
+    static let defaultBlobMime = "application/octet-stream"
+
+    /// "Any file" for the document browser. `public.data` rather than
+    /// `public.item` so a package (a directory wearing a file's face) can't be
+    /// picked — the upload streams a path and would fail on one.
+    nonisolated static let anyFileType = UTType.data
+
+    /// The supertype each `type/*` glob widens to. `application/*` has no
+    /// honest UTType supertype; `public.data` is the closest superset.
+    private static let wildcardTypes: [String: UTType] = [
+        "image": .image,
+        "video": .movie,
+        "audio": .audio,
+        "text": .text,
+        "application": anyFileType,
+    ]
 
     /// Mirrored from the shell's edit mode so the native header can show Done.
     @Published var editMode = false
@@ -86,22 +147,31 @@ final class DeckStore: ObservableObject {
     /// The recycle bin, most recently deleted first (server order).
     @Published private(set) var recycle: [RecycledCard] = []
 
-    /// Drives the native photo picker's presentation (`deck.pickBlob`). The
-    /// picker is a single shared surface — one pick at a time; a concurrent
+    /// Drives the native picker's presentation (`deck.pickBlob`), and which one.
+    /// The picker is a single shared surface — one pick at a time; a concurrent
     /// request is rejected `busy` rather than queued (a picker popping up
     /// seconds later reads as a ghost dialog).
-    @Published var pickerActive = false
-    /// The in-flight pick (id + card). Non-nil ⇒ a pick is presenting OR
-    /// uploading — the slot stays busy across the whole flow so a second
-    /// request is rejected `busy`, not accepted mid-upload. Cleared only when
-    /// the pick settles (`settlePick`), never conditioned on delivery.
-    private var activePick: (id: String, cardId: String)?
-    /// True once a photo was chosen (upload underway). Distinguishes a
+    @Published var pickerMode: PickerMode = .idle
+    /// The in-flight pick (id + card + the leg it was elected for). Non-nil ⇒ a
+    /// pick is presenting OR uploading — the slot stays busy across the whole
+    /// flow so a second request is rejected `busy`, not accepted mid-upload.
+    /// Cleared only when the pick settles (`settlePick`), never conditioned on
+    /// delivery.
+    ///
+    /// The leg is recorded HERE and not read back off `pickerMode`, because
+    /// `pickerMode` is presentation state: SwiftUI clears it at dismissal, and a
+    /// leg's cancel signal can arrive after that — by which time the mode may
+    /// even have been re-elected by a later pick the cancel has no claim on.
+    private var activePick: (id: String, cardId: String, mode: PickerMode)?
+    /// True once something was chosen (upload underway). Distinguishes a
     /// dismissal-after-selection (not a cancel) from a dismissal-with-no-choice
-    /// (a cancel) in `pickerDismissed`.
+    /// (a cancel) in `photosPickerDismissed`.
     private var pickChosen = false
     /// The last pick outcome, for tests (the real result rides the bridge).
-    private(set) var lastPickResult: (id: String, ok: Bool, error: String?)?
+    private(set) var lastPickResult: (id: String, ok: Bool, refJSON: String?, error: String?)?
+    /// How many times a pick has settled, for tests: the contract is EXACTLY
+    /// once per request, across both legs, and only a count can show it.
+    private(set) var pickSettleCount = 0
 
     /// A blob materialized on disk and awaiting the system share sheet
     /// (`deck.shareBlob`). Presented by `DeckScreen`; cleared when dismissed.
@@ -291,63 +361,185 @@ final class DeckStore: ObservableObject {
 
     // MARK: pick (deck.pickBlob)
 
-    /// A card asked to pick a blob. Present the picker unless one is already up
-    /// (then reject `busy`). Every request terminates in exactly one
-    /// resolve/reject via `settlePick`.
+    /// A card asked to pick a blob. Present the picker its `accept` list elects
+    /// unless one is already up (then reject `busy`). Every request terminates
+    /// in exactly one resolve/reject via `settlePick`.
     func requestPick(id: String, cardId: String, accept: String?) {
         guard activePick == nil else {
             settlePick(id: id, ok: false, refJSON: nil, error: "busy")
             return
         }
-        _ = accept  // advisory in v1 (photo library); reserved for file types.
-        activePick = (id, cardId)
-        pickerActive = true
+        let mode = Self.electPicker(accept: accept)
+        activePick = (id, cardId, mode)
+        pickerMode = mode
     }
 
-    /// A photo was chosen: mark the pick as chosen (so the dismissal that
+    /// Elect the picker for an `accept` list. An all-image list — or none at
+    /// all — keeps the photo library, which is what every card authored before
+    /// `accept` was honored got and must keep getting (the API is
+    /// additive-only). Anything else opens the file browser restricted to the
+    /// matching types.
+    static func electPicker(accept: String?) -> PickerMode {
+        let tokens = parseAccept(accept)
+        guard tokens.contains(where: { $0.type != Accept.imageType }) else { return .photos }
+        var types: [UTType] = []
+        for token in tokens {
+            for type in contentTypes(for: token) where !types.contains(type) {
+                types.append(type)
+            }
+        }
+        return .files(types)
+    }
+
+    /// Split the shell's canonical list back into tokens, re-validating rather
+    /// than trusting it — the bridge body is untyped JS.
+    private static func parseAccept(_ accept: String?) -> [AcceptToken] {
+        guard let accept else { return [] }
+        var tokens: [AcceptToken] = []
+        for raw in accept.split(separator: Accept.separator) {
+            let piece = raw.trimmingCharacters(in: .whitespaces).lowercased()
+            let parts = piece.split(
+                separator: Accept.typeSeparator, omittingEmptySubsequences: false)
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { continue }
+            tokens.append(AcceptToken(type: String(parts[0]), subtype: String(parts[1])))
+        }
+        return tokens
+    }
+
+    /// The content types one token admits. An unresolvable concrete mime
+    /// contributes nothing — if that leaves the whole list empty, `fileTypes`
+    /// widens to any file rather than presenting a browser where nothing can be
+    /// selected.
+    private static func contentTypes(for token: AcceptToken) -> [UTType] {
+        guard token.subtype == Accept.wildcard else {
+            return UTType(mimeType: "\(token.type)\(Accept.typeSeparator)\(token.subtype)")
+                .map { [$0] } ?? []
+        }
+        if token.type == Accept.wildcard { return [anyFileType] }
+        return wildcardTypes[token.type].map { [$0] } ?? []
+    }
+
+    /// Something was chosen: mark the pick as chosen (so the dismissal that
     /// follows is a no-op, not a spurious cancel) and return the pending id —
     /// but KEEP the slot busy so a second request during the upload is rejected
     /// `busy`, not accepted. The caller (the `DeckScreen` view, which owns the
-    /// `PhotosPickerItem`) loads the bytes and hands them to `finishPick`; the
-    /// engine stays free of the PhotosUI type. `nil` if no pick is active.
+    /// `PhotosPickerItem` / the picked URL) hands the choice to `finishPick` /
+    /// `finishFilePick`; the engine stays free of the PhotosUI type. `nil` if no
+    /// pick is active.
     func consumePick() -> (id: String, cardId: String)? {
         guard let pick = activePick else { return nil }
         pickChosen = true
-        return pick
+        return (pick.id, pick.cardId)
     }
 
-    /// The picker dismissed. Only a dismissal with NOTHING chosen is a cancel;
-    /// a dismissal AFTER a selection (`pickChosen`) leaves the upload running.
-    /// Deferred one runloop turn so a selection landing in the same tick (which
-    /// sets `pickChosen` first) wins the race.
-    func pickerDismissed() {
+    /// The PHOTO picker dismissed. Only a dismissal with NOTHING chosen is a
+    /// cancel; a dismissal AFTER a selection (`pickChosen`) leaves the upload
+    /// running. `PhotosPicker` has no cancel callback — this inference IS its
+    /// cancel signal, which is why the file leg keeps its own.
+    ///
+    /// The settle is deferred one runloop turn AND pinned to the id that was in
+    /// flight at the dismissal. Both halves carry weight: `DeckScreen` claims a
+    /// selection synchronously from the same binding write that delivers it, so
+    /// every choice `PhotosPicker` reports before returning to the runloop is
+    /// already marked chosen when the deferred check runs; and a pick that only
+    /// starts inside that window carries a DIFFERENT id this settle can no
+    /// longer reach, whichever leg it belongs to.
+    func photosPickerDismissed() {
+        // Mode-guarded: both presentations bind to one mode, so a stray
+        // set(false) from the leg that ISN'T up must not tear the other down.
+        guard pickerMode == .photos else { return }
+        pickerMode = .idle
+        guard let id = activePick?.id else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self, let pick = self.activePick, !self.pickChosen else { return }
-            self.settlePick(id: pick.id, ok: false, refJSON: nil, error: "cancelled")
+            guard let self, self.activePick?.id == id, !self.pickChosen else { return }
+            self.settlePick(id: id, ok: false, refJSON: nil, error: "cancelled")
         }
     }
 
+    /// The FILE browser dismissed. It reports cancellation explicitly
+    /// (`filePickCancelled`), so its dismissal means nothing beyond dropping the
+    /// presentation — no inference, no deferral, no cancel.
+    func filePickerDismissed() {
+        guard pickerMode.isFiles else { return }
+        pickerMode = .idle
+    }
+
+    /// The file browser reported a cancel. Guarded on the leg that OWNS the
+    /// active pick — the file counterpart of the photo leg's id pin: neither
+    /// may settle a pick it doesn't own. `pickerMode` cannot serve as that
+    /// guard, because SwiftUI writes `isPresented` false and calls
+    /// `onCancellation` in an order it picks: by the time this runs the
+    /// accompanying `filePickerDismissed` may already have idled the mode, or a
+    /// later pick may already have re-elected it. The `pickChosen` guard is
+    /// belt to the framework's braces: a completion and a cancellation are
+    /// exclusive, and a settle after the upload started would answer a promise
+    /// twice.
+    func filePickCancelled() {
+        filePickerDismissed()
+        guard let pick = activePick, pick.mode.isFiles, !pickChosen else { return }
+        settlePick(id: pick.id, ok: false, refJSON: nil, error: "cancelled")
+    }
+
     /// Upload the loaded photo bytes and resolve the card's promise with a ref.
-    /// `data == nil` means the transfer failed. Size-checked BEFORE upload. The
-    /// upload carries `cardId` so the gateway stamps the blob `deck:<cardId>`
-    /// (card purge reclaims it) rather than the immortal `device:*`.
+    /// `data == nil` means the transfer failed.
     func finishPick(id: String, cardId: String, data: Data?, mime: String) {
         guard let data else {
             settlePick(id: id, ok: false, refJSON: nil, error: "load failed")
             return
         }
-        guard data.count <= ChatStore.maxAttachmentBytes else {
+        uploadPick(
+            id: id, byteCount: Int64(data.count), mime: mime,
+            name: Self.synthesizedName(mime: mime)
+        ) { client in
+            try await client.deckBlobUploadBytes(bytes: data, mimeType: mime, cardId: cardId)
+        }
+    }
+
+    /// Upload a picked FILE by path — streamed off disk, so a 100 MiB pick is
+    /// never held in memory — and resolve the card's promise with a ref carrying
+    /// the file's real name. `url == nil` means the picker handed back nothing.
+    func finishFilePick(id: String, cardId: String, url: URL?) {
+        guard let url else {
+            settlePick(id: id, ok: false, refJSON: nil, error: "load failed")
+            return
+        }
+        let file = ScopedFile(url)
+        guard let byteCount = Self.fileByteCount(url) else {
+            settlePick(id: id, ok: false, refJSON: nil, error: "load failed")
+            return
+        }
+        let mime = Self.fileMime(url)
+        uploadPick(
+            id: id, byteCount: byteCount, mime: mime, name: url.lastPathComponent
+        ) { client in
+            // `file` rides the closure so the security scope outlives this
+            // frame — the upload reads the path long after the picker returned.
+            try await client.deckBlobUploadFile(
+                path: file.url.path, mimeType: mime, cardId: cardId, progress: nil)
+        }
+    }
+
+    /// The shared tail of both legs: cap check → upload → ref → settle. Only
+    /// the load and the presentation differ. The upload carries `cardId` so the
+    /// gateway stamps the blob `deck:<cardId>` (card purge reclaims it) rather
+    /// than the immortal `device:*`.
+    private func uploadPick(
+        id: String,
+        byteCount: Int64,
+        mime: String,
+        name: String,
+        upload: @escaping (any BayboClientProtocol) async throws -> String
+    ) {
+        guard byteCount <= Int64(ChatStore.maxAttachmentBytes) else {
             settlePick(id: id, ok: false, refJSON: nil, error: "too large")
             return
         }
         Task { [weak self] in
             guard let self else { return }
             do {
-                let blobId = try await self.client.deckBlobUploadBytes(
-                    bytes: data, mimeType: mime, cardId: cardId)
+                let blobId = try await upload(self.client)
                 let ref = PickRef(
-                    blobId: blobId, contentType: mime, size: Int64(data.count),
-                    name: Self.synthesizedName(mime: mime))
+                    blobId: blobId, contentType: mime, size: byteCount, name: name)
                 if let json = try? JSONEncoder().encode(ref),
                     let text = String(data: json, encoding: .utf8)
                 {
@@ -369,8 +561,22 @@ final class DeckStore: ObservableObject {
             activePick = nil
             pickChosen = false
         }
-        lastPickResult = (id, ok, error)
+        lastPickResult = (id, ok, refJSON, error)
+        pickSettleCount += 1
         bridge?.deliverPickResult(id: id, ok: ok, refJSON: refJSON, error: error)
+    }
+
+    private static func fileByteCount(_ url: URL) -> Int64? {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+        else { return nil }
+        return Int64(size)
+    }
+
+    private static func fileMime(_ url: URL) -> String {
+        let type =
+            (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+            ?? UTType(filenameExtension: url.pathExtension)
+        return type?.preferredMIMEType ?? defaultBlobMime
     }
 
     private static func synthesizedName(mime: String) -> String {
@@ -669,6 +875,27 @@ final class DeckStore: ObservableObject {
             payload: info.payload,
             error: info.error
         )
+    }
+}
+
+/// Holds a picked file's security-scoped access open for as long as the upload
+/// needs it. `.fileImporter` hands back a URL the app may only read while the
+/// scope is open — without it an iCloud item reads as empty — and the streaming
+/// upload keeps reading long after the picker callback returned. RAII rather
+/// than a paired stop call because the upload has three exits (cap refusal,
+/// success, failure) and a missed stop leaks a sandbox extension for the life
+/// of the process.
+private final class ScopedFile {
+    let url: URL
+    private let scoped: Bool
+
+    init(_ url: URL) {
+        self.url = url
+        scoped = url.startAccessingSecurityScopedResource()
+    }
+
+    deinit {
+        if scoped { url.stopAccessingSecurityScopedResource() }
     }
 }
 

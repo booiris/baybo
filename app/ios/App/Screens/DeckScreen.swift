@@ -19,7 +19,9 @@ private struct DeckContent: View {
     @ObservedObject var deck: DeckStore
     let host: DeckHost
     @ObservedObject private var lang = Lang.shared
-    /// The photo the `deck.pickBlob` picker returned (nil until chosen).
+    /// The photo the `deck.pickBlob` picker returned — cleared the moment the
+    /// choice is claimed (`photoSelection`), so the picker opens clean and the
+    /// same photo picked twice is delivered twice.
     @State private var pickedItem: PhotosPickerItem?
 
     var body: some View {
@@ -56,29 +58,57 @@ private struct DeckContent: View {
         } message: {
             Text(verbatim: lang.t("deck.deleteBody"))
         }
-        // `deck.pickBlob`: a card asked for a photo. One picker at a time
-        // (DeckStore's `activePick`); selection uploads and resolves the card's
-        // promise, dismissal-with-no-choice cancels it.
-        .photosPicker(isPresented: $deck.pickerActive, selection: $pickedItem, matching: .images)
-        .onChange(of: pickedItem) { _, item in
-            guard let item, let pick = deck.consumePick() else {
-                pickedItem = nil
-                return
-            }
-            pickedItem = nil
-            Task {
-                let mime = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
-                let data = (try? await item.loadTransferable(type: Data.self)) ?? nil
-                deck.finishPick(id: pick.id, cardId: pick.cardId, data: data, mime: mime)
-            }
-        }
-        .onChange(of: deck.pickerActive) { _, active in
-            if !active { deck.pickerDismissed() }
-        }
+        // `deck.pickBlob`: a card asked for a blob. One picker at a time
+        // (DeckStore's `activePick`), and the card's `accept` elects which —
+        // so the two presentations bind to the same mode, never to each other.
+        .photosPicker(
+            isPresented: Binding(
+                get: { deck.pickerMode == .photos },
+                set: { if !$0 { deck.photosPickerDismissed() } }
+            ),
+            selection: photoSelection, matching: .images
+        )
+        .fileImporter(
+            isPresented: Binding(
+                get: { deck.pickerMode.isFiles },
+                set: { if !$0 { deck.filePickerDismissed() } }
+            ),
+            allowedContentTypes: deck.pickerMode.fileTypes,
+            allowsMultipleSelection: false,
+            onCompletion: { result in
+                guard let pick = deck.consumePick() else { return }
+                deck.finishFilePick(
+                    id: pick.id, cardId: pick.cardId, url: (try? result.get())?.first)
+            },
+            // Unlike PhotosPicker, the file browser says so — no inference.
+            onCancellation: { deck.filePickCancelled() }
+        )
         // `deck.shareBlob`: a materialized blob awaiting the system share sheet.
         .sheet(item: $deck.shareItem) { item in
             ShareSheet(url: item.url)
         }
+    }
+
+    /// The photo picker's selection, taken through a binding SETTER rather than
+    /// watched with `onChange`. `PhotosPicker` writes the selection and clears
+    /// `isPresented` on one synchronous dismissal path, and only a setter runs
+    /// on it: an `onChange` lands in the next update pass, which the dismissal's
+    /// deferred cancel inference is not guaranteed to lose to — that race drops
+    /// the chosen photo and rejects the card's promise as cancelled. Claiming
+    /// the pick here makes it an ordering instead of a race.
+    private var photoSelection: Binding<PhotosPickerItem?> {
+        Binding(
+            get: { pickedItem },
+            set: { item in
+                pickedItem = nil
+                guard let item, let pick = deck.consumePick() else { return }
+                Task {
+                    let mime = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
+                    let data = (try? await item.loadTransferable(type: Data.self)) ?? nil
+                    deck.finishPick(id: pick.id, cardId: pick.cardId, data: data, mime: mime)
+                }
+            }
+        )
     }
 
     private var header: some View {

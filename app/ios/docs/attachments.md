@@ -1,6 +1,6 @@
 # Attachments: files, images, audio, video
 
-*How the transcript renders, downloads, and opens attachment payloads — the file card and its QuickLook preview, the image viewer and its size mirror, the native audio engine, and the video tile/player. Governs `app/ios/App/Screens/ImageViewer.swift`, `app/ios/App/Screens/VideoPlayerScreen.swift`, `app/ios/App/Core/AudioPlayerCenter.swift`, the `FilePreviewSheet` / blob-cache plumbing in `app/ios/App/Core/`, and the `AttachmentImage` / `AttachmentAudio` / `AttachmentVideo` cards in `app/ios/web/src/`.*
+*How the transcript renders, downloads, and opens attachment payloads — the file card and its QuickLook preview, the image viewer and its size mirror, the native audio engine, and the video tile/player — plus how the composer stages an OUTBOUND one. Governs `app/ios/App/Screens/ImageViewer.swift`, `app/ios/App/Screens/VideoPlayerScreen.swift`, `app/ios/App/Core/AudioPlayerCenter.swift`, the `FilePreviewSheet` / blob-cache plumbing in `app/ios/App/Core/`, the staging half of `app/ios/App/Screens/ComposerView.swift`, and the `AttachmentImage` / `AttachmentAudio` / `AttachmentVideo` cards in `app/ios/web/src/`.*
 
 ## File attachments
 
@@ -95,7 +95,7 @@ The ENGINE is native — `AudioPlayerCenter` (`app/ios/App/Core/AudioPlayerCente
 
 Native rather than an in-webview `<audio>` because the bytes never cross the bridge as base64, AVAudioSession `.playback` means the ringer switch can't silence it, and — with `UIBackgroundModes: audio` (`app/ios/project.yml`) + Now Playing + remote commands — a track keeps playing through lock/background with Control Center transport while the user stays IN the chat.
 
-Backing out to the chat LIST stops it (`AppStore.chatPath`'s didSet, when the last `.session` route leaves the stack — **NOT** `ChatScreen.onDisappear`, which also fires under fullScreenCovers like the image viewer): audio with no visible card to control it reads as a bug.
+Backing out to the chat LIST stops it (`AppStore.chatPath`'s didSet, when the last `.session` route leaves the stack — **NOT** `ChatScreen.onDisappear`, which also fires under fullScreenCovers like the image viewer): audio with no visible card to control it reads as a bug. The composer's staged strip is reclaimed off that same didSet, for that same reason — see [The strip belongs to the SESSION](#the-strip-belongs-to-the-session-not-to-the-composer-frame).
 
 Playback runs off the materialised preview file (`materializePreviewFile` — AVPlayer sniffs the container by extension). Starting a track stops the previous one and tells its card `stopped`; a card mounting mid-playback resyncs via `queryAudioState`; `resetChatStores` (logout/rebind) stops the player outright.
 
@@ -139,3 +139,80 @@ Poster/play materialisations coalesce in-flight per target path (`previewMateria
 ### Reserved ratio
 
 The poster's natural size is recorded into the same `ImageDimsStore`/`imageDims` mirror keyed by blob digest, so a re-opened thread reserves the tile's ratio from the first paint; the ratio is clamped to [3:4, 16:9] (`clampVideoRatio`) and the cover-fit poster absorbs the clamp as a crop.
+
+## Outbound staging (the composer)
+
+*The other direction: how a pick becomes a `WireAttachment`. Everything above is what the transcript does with one that has already landed.*
+
+### Two pickers behind one `+`
+
+The composer's `+` opens `AttachMenuPanel` (hand-rolled, overlaid on the dock with its scrim over the transcript — see [navigation.md](navigation.md) § The composer pill) with **Photos** (`PhotosPicker`, `matching: .images`) and **Files** (`.fileImporter`, no type restriction). Both are MULTI-select; the strip holds at most `ChatStore.maxStagedAttachments` (10) and the over-cap picks raise the composer notice.
+
+**The panel owns no staging state.** It is presented by `ChatScreen` while both pickers stay modifiers on `ComposerView` — their selection cap reads the strip's free slots and their results feed `ComposerStaging` directly — so a row tap travels down as an `AttachSource` request (`AttachMenu.pick`) and the picker answering it clears the request as it dismisses.
+
+That count is a **UI limit, not a wire cap** — it bounds thumbnails, uploads and strip tiles, and the gateway enforces its own per-message attachment cap independently (`MAX_MESSAGE_BATCH_ATTACHMENTS`, which the singular `Frame::Message` path validates too). The BYTE cap is separate and is the gateway's: `ChatStore.maxAttachmentBytes` mirrors `MAX_BLOB_BYTES` (100 MiB) and there is exactly one of it.
+
+### A Files URL is security-scoped
+
+**Wrap every read of a `fileImporter` URL in `startAccessingSecurityScopedResource()` / `stopAccessingSecurityScopedResource()`** — the size probe and the upload each take their own balanced bracket (the upload's has to span the `await`, and a retry re-acquires). Miss it and an iCloud / Files-provider document reads as silently EMPTY: no error, no bytes, a zero-length blob on the wire.
+
+The size comes from `URLResourceValues.fileSize` **before** anything is read, so an over-cap pick is refused without materialising 100 MiB to find out.
+
+### The mime decides everything downstream
+
+- A Files pick's mime is `UTType(filenameExtension:)?.preferredMIMEType`. When the OS can't name the extension, a short map of unambiguously-UTF-8 ones (`rs`, `toml`, `yml`, `log`, `env`, …) sends `text/plain` — `crates/llm` only inlines a text-like mime, so an octet-stream `.rs` reaches the model as a placeholder instead of its source. Anything that might be binary keeps `application/octet-stream`.
+- A photo's is the **magic-byte sniff first** (JPEG / PNG / GIF / WebP / the HEIF `ftyp` brands), with the picker item's `supportedContentTypes` filling in only for bytes the sniff can't name. `supportedContentTypes` lists what the item CAN be delivered as and `loadTransferable` promises nothing about returning the first entry — when PhotosUI transcodes for compatibility, the declared type and the bytes that actually arrived disagree, and the mime is what the gateway stores and what the provider is handed.
+- **The wire KIND is derived from that mime, never from which picker the file came through** (`StagedAttachment.kind(forMime:)`): an image picked in Files is still `image`, `audio/*` is `audio`, and everything else — INCLUDING `video/*`, which has no kind of its own — is `file`.
+
+This is also why the file tile middle-truncates its name (`.truncationMode(.middle)`): the extension has to stay visible, because the mime it implies is what decides whether the model can read the file at all.
+
+### Everything uploads off a path
+
+**Every** staged pick uploads with `blob_upload_file(path, mime, progress)` — the bytes never cross the FFI, so a 100 MiB attachment is never held whole in memory. A Files pick already has a path; a photo does not (PhotosUI hands over a `Data`), so its bytes are **spooled to `<tmp>/baybo-compose/<run id>/<pick id>.<ext>`** at staging and the tile keeps only that file. Holding the `Data` on the item instead — which is what a retry would need — is ten full-size encoded picks alive for as long as the strip is up, on top of ten decoded thumbnails: a foreground jetsam on realistic ProRAW/panorama picks. The thumbnail is decoded **downsampled through ImageIO** off the spooled file (`CGImageSourceCreateThumbnailAtIndex`, 256px) rather than with `UIImage(data:)`, which would keep the encoded bytes alive behind the image.
+
+### The strip belongs to the SESSION, not to the composer frame
+
+`ComposerStaging` is owned by `ChatStore` (`store.staging`), and the reclamation hangs off **`AppStore.chatPath`** — the same signal that stops chat audio, and for the same reason (`ChatStore.leaveChat`, called for every session the path change dropped).
+
+**`ComposerView.onDisappear` cannot be that hook.** The composer is docked in `ChatScreen`'s `.safeAreaInset`, and every `fullScreenCover` the chat presents — the image viewer, the video player — tears that content down and puts it straight back. Reclaiming there meant a user with three photos mid-upload who tapped an image in the transcript came back to an *empty* strip with the typed text still in the field: three uploads cancelled, three spools unlinked, no notice, and a send that shipped the message MINUS its attachments — precisely what the failed-upload blocker exists to prevent. (The abandoned uploads still complete and mint permanent orphan blobs; nothing sweeps chat blobs.) A `.sheet` — QuickLook, the share sheet, the message index — leaves the presenter on screen and fires no teardown at all, but the fix does not depend on knowing which is which: no presentation changes a route, so none of them can name a conversation as left.
+
+The demo seed (`-baybo-demo-compose`) is planted in `ComposerStaging.init` rather than on the composer's appear for the same reason: seeded per FRAME, it silently refilled the strip a cover had just emptied — the bug's own fixture hiding it.
+
+### The spool is owned, not deleted
+
+A spool belongs to a **`SpoolFile`, which unlinks it in `deinit`** — there is no "delete the file" call anywhere in the composer, and a Files pick carries no `SpoolFile` at all (the user's own document, never ours). That ownership answers two questions at once:
+
+- **When does an abandoned strip's disk go back?** When the tiles do — on send, on the ✕, and when the user leaves the conversation (`ChatStore.leaveChat` → `ComposerStaging.clear()`), so backing out of a chat with five picks staged reclaims all five. Dropping the `ChatStore` itself (LRU eviction, logout's `resetChatStores`) reclaims the same way, one reference further out. Nothing else can: the name is a UUID nothing will ever ask for again, unlike the digest-keyed `baybo-preview` / `baybo-deck-share` caches, which are bounded by the number of distinct blobs and hit again on re-open. A leftover here is pure dead weight, up to 100 MiB of it per pick.
+- **What if the upload is still reading it?** Then the upload is holding the same `SpoolFile` (`upload` keeps `source` on its frame for the whole call), and the file outlives the tile by exactly that long. Unlinking on removal instead raced the Rust side's **two opens** — the hash pass, then the body reader — so a ✕ tapped mid-upload either failed the upload with a read error or, landing after both opens, let it silently succeed.
+
+**A kill, a crash or a jetsam runs no `deinit`**, so `StagedAttachment.sweepAbandonedSpools()` runs once at launch (`BayboApp`) and deletes every spool directory except this run's. Per-RUN directories are what make that safe without bookkeeping: everything this process spools is inside the one child the sweep skips, so it can never reach a file a live upload is reading.
+
+### Removing a tile cancels its work
+
+`ComposerStaging.remove` cancels the pick's `work` handle (its PhotosUI delivery, or its upload) instead of yanking the file out from under it, and **every terminal effect is conditional on the tile still being in the strip** — the state write (`update` no-ops on a missing id) *and* the failure notice (`publishNotice`). Without the second, a ✕ on a spinning tile still put "Send failed: request timed out" in the dock seconds later, for an attachment the user could no longer see; the same went for a photo that failed to load or came back over-cap after its tile was gone.
+
+**A notice the strip published is also RETRACTED when its tile leaves** (`noticeOwner` → `retractNotice`). The ✕ is the action that red line offers, so taking it has to silence it — otherwise "Send failed: …" sat over an empty strip until the user dismissed it by hand. The send gate's own line goes through the same owner (`noteBlocked` names the tile holding the message up), and `clear()` retracts whatever is left, so leaving and re-entering a chat can't show a line about a pick that no longer exists. The retraction is conditional on the published text still being the one on the dock: `notice` belongs to the whole screen — a model failure and a failed approval land on it too — and a ✕ may only take back what the strip put there.
+
+Cancellation stops a photo's `loadTransferable`, but **not an upload already on the wire**: the generated UniFFI async binding has no cancellation hook, so `blob_upload_file` runs to completion regardless. A pick removed mid-upload therefore still mints its blob on the gateway, and nothing sweeps chat blobs — that orphan is permanent. What cancellation buys is that the result reaches neither the strip nor the notice line; plumbing a real abort would have to start in `ffi/`.
+
+`ChatStore.maxConcurrentUploads` (2) bounds how many run at once — the rest sit `queued`. Ten in parallel is ten sockets on one uplink and ten 100ms progress tickers hopping to the main actor, which defeats the coalescing the tick interval exists to provide.
+
+**That budget counts what is on the WIRE, not what is on the strip.** Because a removed tile's upload keeps streaming (above), `staged.filter(isUploading)` under-counts by exactly the zombies: stage four with two removed mid-flight and the first completion saw an empty strip, released BOTH queued picks, and ran three uploads at once — each with its own 100ms ticker still hopping to the main actor. `uploadsInFlight` is incremented by `pumpUploads` and decremented by the same task after its call returns.
+
+Progress presents exactly like a download does: an indeterminate spinner with the **byte counter beside it as the real progress** (`884 KB / 2.3 MB`), on the tile's second line.
+
+### Send gating, and the retry
+
+Staged picks count as a draft, so an attachment-only send works with an empty field. Send is **gated** while anything is still on its way to the gateway and **blocked** while anything FAILED — a failed pick carries no blob, and shipping the message without it would drop the user's file in silence.
+
+**A pick takes its slot in the strip the moment it is ADMITTED**, in the `queued` state, not when its bytes finish arriving — `StagedAttachment.blocker` reads the strip, so a pick still inside `loadTransferable` has to be in it. Appending only after that `await` meant a send fired mid-batch saw neither an uploading nor a failed item: it shipped with whichever refs happened to be ready, cleared the strip, and the rest of the batch landed as ghost tiles on the *next* message.
+
+With multi-select, "remove it and pick again" is not a cure, so **a failed tile retries on tap** (its ✕ still removes it) — re-reading the file the `Source` points at. The retry is *claimed* (`claimRetry`) on the current array element before any await, because two taps in one frame both read the same render snapshot and would otherwise mint two blobs on the gateway and race over which one the message references.
+
+### An attachment-only send still gets a chat-list preview
+
+The gateway's `last_message_preview` is `None` for a media-only turn, and `merge` keeps a local preview over a nil remote one — so `SessionIndex.recordUserSend` describes the attachments itself (the filenames, or the count when nothing is named), run through the same `previewText` truncation as every other capture. `userText` is left alone: it is the bold line's fallback until the title pass runs, and a filename names no conversation.
+
+### Known gap: outbound `duration_ms`
+
+`WireAttachment.duration_ms` — what the audio card's resting meta line and the video tile's chip read — is always `None` on a send: the FFI's `AttachmentRef` record (`app/ios/ffi/src/api.rs`) has no such field, and `From<AttachmentRef> for WireAttachment` hardcodes it. A user can now attach an `m4a` or an `mp4`, so probing it locally (`AVURLAsset`) is worth doing — but it needs the FFI record to carry it first, or the optimistic bubble would show a length that vanishes the moment the row comes back from a sync.

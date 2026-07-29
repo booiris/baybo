@@ -548,6 +548,7 @@ pub(crate) async fn split_content(
                 blob,
                 mime_type,
                 filename,
+                ..
             } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
@@ -586,6 +587,10 @@ pub(crate) async fn split_content(
                 filename,
                 mime_type,
                 duration_ms,
+                // Server-derived pricing inputs; the wire's own `size` is
+                // the sender's word for it and neither is echoed back.
+                page_count: _,
+                size_bytes: _,
             } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
@@ -636,7 +641,7 @@ async fn stat_attachment(
                 blob_id: meta.blob_id,
                 mime_type: mime_override.unwrap_or(meta.mime_type),
                 size,
-                filename,
+                filename: normalized_filename(filename),
                 duration_ms,
             })
         }
@@ -647,13 +652,25 @@ async fn stat_attachment(
     }
 }
 
+/// Clients fall back on an *absent* filename, never on an empty one, so a
+/// blank name renders a titleless card. `File` blocks persisted before the
+/// gateway synthesised a name carry `""`, and an image/audio block can
+/// carry `Some("")` from any sidecar that filled the field in — both heal
+/// here, on the one path every kind shares.
+fn normalized_filename(filename: Option<String>) -> Option<String> {
+    filename
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_or_install_channel;
     use baybo_channels::wire::Frame;
     use baybo_channels::{AgentEvent, AgentOutput, ChannelRegistry, NoticeLevel};
-    use baybo_model::ChannelType;
+    use baybo_model::{ChannelType, ContentBlock};
     use baybo_storage::test_support::MemoryBlobStore;
+    use baybo_store::blob::BlobStore;
     use std::sync::Arc;
 
     /// A pooled type (`http`/`device`) resolves to the pre-installed shared
@@ -816,5 +833,65 @@ mod tests {
             }
             other => panic!("expected a notice frame, got {other:?}"),
         }
+    }
+
+    /// A blank stored name is not a name: clients fall back on an absent
+    /// filename, never on `""`, so an empty one renders a titleless card.
+    /// The heal covers every kind, not just `File`.
+    #[tokio::test]
+    async fn blank_attachment_name_normalises_for_every_kind() {
+        let blobs = MemoryBlobStore::new();
+        let image = blobs.put(b"png", "image/png", None).await.expect("put");
+        let audio = blobs.put(b"ogg", "audio/ogg", None).await.expect("put");
+        let file = blobs
+            .put(b"pdf", "application/pdf", None)
+            .await
+            .expect("put");
+        let blocks = vec![
+            ContentBlock::Image {
+                blob: image,
+                mime_type: "image/png".to_owned(),
+                filename: Some("   ".to_owned()),
+                width: None,
+                height: None,
+            },
+            ContentBlock::Audio {
+                blob: audio,
+                mime_type: "audio/ogg".to_owned(),
+                filename: Some(String::new()),
+                duration_ms: None,
+            },
+            ContentBlock::File {
+                blob: file,
+                filename: String::new(),
+                mime_type: "application/pdf".to_owned(),
+                duration_ms: None,
+                page_count: None,
+                size_bytes: None,
+            },
+        ];
+
+        let (_text, attachments) = super::split_content(&blocks, &blobs).await;
+        assert_eq!(attachments.len(), 3);
+        for att in &attachments {
+            assert_eq!(att.filename, None, "{:?} kept a blank name", att.kind);
+        }
+    }
+
+    /// Normalisation must not eat a genuine name on the way out.
+    #[tokio::test]
+    async fn real_attachment_name_passes_through() {
+        let blobs = MemoryBlobStore::new();
+        let image = blobs.put(b"png", "image/png", None).await.expect("put");
+        let blocks = vec![ContentBlock::Image {
+            blob: image,
+            mime_type: "image/png".to_owned(),
+            filename: Some("holiday.png".to_owned()),
+            width: None,
+            height: None,
+        }];
+
+        let (_text, attachments) = super::split_content(&blocks, &blobs).await;
+        assert_eq!(attachments[0].filename.as_deref(), Some("holiday.png"));
     }
 }

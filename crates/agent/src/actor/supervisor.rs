@@ -367,10 +367,7 @@ impl AgentSupervisor {
     /// Per reaped session: send `AgentMessage::ActorStop` to the actor's
     /// mailbox. The actor's `run` loop matches `ActorStop`, trips its
     /// `actor_token`, and exits; the `ActorRegistryGuard` then removes the
-    /// entry from `self.actors` on drop. A detached background-summary
-    /// pass on that actor's loop survives the reap by design — it runs on
-    /// its own fresh token, not a child of `actor_token` (see
-    /// [`crate::runtime::agent_loop::AgentLoop::maybe_run_background_compression`]).
+    /// entry from `self.actors` on drop.
     ///
     /// Returns the number of `ActorStop` sends attempted. Idle sessions
     /// that were not registered (cron / maintenance / subagent

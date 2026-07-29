@@ -85,6 +85,17 @@ pub(crate) trait GatewayBlobClient {
         deck_card: Option<String>,
     ) -> impl Future<Output = Result<String, String>> + Send + '_;
 
+    /// Path-based twin of [`Self::upload_blob`] for a file the user picked: the
+    /// bytes are streamed off disk, so a 100 MiB attachment never crosses the
+    /// FFI nor sits in memory whole. `progress` ticks while the body flows.
+    fn upload_blob_file(
+        &self,
+        path: String,
+        mime_type: String,
+        deck_card: Option<String>,
+        progress: crate::blob_helper::ProgressSink,
+    ) -> impl Future<Output = Result<String, String>> + Send + '_;
+
     fn download_blob(
         &self,
         blob_id: String,
@@ -971,6 +982,18 @@ pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
     deck_card: Option<String>,
 ) -> Result<String, String> {
     client.upload_blob(bytes, mime_type, deck_card).await
+}
+
+pub(crate) async fn upload_file<C: GatewayBlobClient + Sync>(
+    client: &C,
+    path: String,
+    mime_type: String,
+    deck_card: Option<String>,
+    progress: crate::blob_helper::ProgressSink,
+) -> Result<String, String> {
+    client
+        .upload_blob_file(path, mime_type, deck_card, progress)
+        .await
 }
 
 pub(crate) async fn download_blob_bytes<C: GatewayBlobClient + Sync>(

@@ -365,7 +365,9 @@ you need to know the moment you start listening" (subscribe), history is
   (`route.rs:294-309`). Scope the patch broadcast to `session.channel`, and
   reject `Subscribe` for sessions outside the connection's channel — the WS
   layer then enforces the same universe boundary the REST layer already does
-  (`load_scoped_chat_session`, `chat.rs:1658-1675`).
+  (`load_scoped_chat_session`, `chat.rs:1658-1675`). (The two universes were
+  later collapsed into one `owner` pool — see *Superseded* under the
+  non-goals; the scoping stayed, now around the single pool.)
 
 ### The one client algorithm
 
@@ -388,6 +390,14 @@ On reconnect and on `Gap(None)`, clients additionally refetch the session
 list and folders — the list/folder plane has no cursor, so pull-on-reconnect
 is its only loss recovery (web's current one-shot bootstrap gains a reconnect
 refetch).
+
+The cursor rule itself — max-wins plus the rebase-dirty freeze — is *one*
+module written twice, because the two clients are separate pnpm workspace
+roots: `app/ios/web/src/transcript/cursor.ts` and
+`app/web/src/pages/chat/syncCursor.ts` are byte-identical past their `//`
+headers, and `app/web/src/pages/chat/mathDelimiters.port.test.ts` fails if one
+is edited without the other. Port a change to both; a freeze that holds on only
+one client is exactly the permanent hole it exists to close.
 
 Consequences per client:
 
@@ -500,6 +510,15 @@ Subscribe scoping fix); server-side read cursors / cross-device unread (future
 feature); Signal-style per-device mailboxes (baybo's server holds plaintext
 transcripts, so pull-from-truth is strictly better than ack-and-delete
 queues); changing blob transfer or pairing.
+
+**Superseded (post-cut-over):** the first non-goal no longer holds. The
+`http` and `device` channels were collapsed into the one
+`ChannelType::OWNER` pool — web and iOS share one session set, and the
+surfaces differ only at the auth boundary — so the scoping this proposal
+hardened now fences that single pool instead of two. Nothing else here
+moves: both surfaces already ran the one client algorithm above, which is
+what made the collapse cheap. See [`CONTEXT.md`](CONTEXT.md) → *Owner
+channel*.
 
 ## Migration — clean cut, no compatibility
 

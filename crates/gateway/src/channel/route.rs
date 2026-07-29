@@ -19,6 +19,7 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, RouterInbound};
 use baybo_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, SessionId, User};
+use baybo_store::BlobStore;
 use chrono::Utc;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -38,6 +39,10 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 /// frames are control JSON/MessagePack plus blob references, so 256 KiB is enough
 /// for legitimate batched text while bounding decode memory.
 const MAX_CHANNEL_WS_FRAME_BYTES: usize = 256 * 1024;
+
+/// Stem of the name synthesised for a file attachment that arrives
+/// without one; the mime's extension is appended.
+const NAMELESS_ATTACHMENT_STEM: &str = "attachment";
 
 pub fn routes() -> Router<WsChannelState> {
     Router::new()
@@ -379,6 +384,29 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 sub.unsubscribe(sidecar.connection_id(), &session_id);
             }
             Frame::Message(wire_msg) => {
+                if let Err(reason) = validate_message(&wire_msg) {
+                    tracing::warn!(
+                        %channel_type,
+                        attachments = wire_msg.attachments.len(),
+                        reason = %reason,
+                        "dropping invalid channel-ws message",
+                    );
+                    if let Err(e) = sidecar
+                        .send_frame(Frame::Notice {
+                            session_id: wire_msg.session_id.clone(),
+                            user_id: wire_msg.user_id.clone(),
+                            level: "error".to_string(),
+                            text: reason,
+                            transient: false,
+                            mid_turn: Some(false),
+                            durable_id: None,
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "send message rejection notice failed");
+                    }
+                    continue;
+                }
                 let Some(incoming) =
                     build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
                 else {
@@ -542,6 +570,18 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
     }
 }
 
+/// Cap the attachments on a singular [`Frame::Message`]. The batch path
+/// caps its aggregate, but a multi-select composer can stage an
+/// unbounded count on one message, which never reaches that validator.
+fn validate_message(msg: &WireMessage) -> Result<(), String> {
+    if msg.attachments.len() > MAX_MESSAGE_BATCH_ATTACHMENTS {
+        return Err(format!(
+            "message exceeds {MAX_MESSAGE_BATCH_ATTACHMENTS} attachments",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_message_batch(messages: &[WireMessage]) -> Result<(), String> {
     if messages.len() > MAX_MESSAGE_BATCH_MESSAGES {
         return Err(format!(
@@ -692,7 +732,12 @@ async fn build_inbound_message(
         name: None,
         channel: channel_type.clone(),
     };
-    let content = wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
+    let content = wire_to_content_blocks(
+        wire_msg.content,
+        wire_msg.attachments,
+        state.blob_store.as_ref(),
+    )
+    .await;
     Some(IncomingMessage {
         message: AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -912,7 +957,11 @@ async fn enforce_pairing(
 /// agent-facing `Vec<ContentBlock>`. Empty text drops the leading
 /// `Text` block so a "media-only" message doesn't carry a phantom
 /// empty string.
-fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> Vec<ContentBlock> {
+async fn wire_to_content_blocks(
+    content: String,
+    attachments: Vec<WireAttachment>,
+    blob_store: &dyn BlobStore,
+) -> Vec<ContentBlock> {
     let mut blocks = Vec::with_capacity(attachments.len() + usize::from(!content.is_empty()));
     if !content.is_empty() {
         blocks.push(ContentBlock::Text(content));
@@ -922,32 +971,235 @@ fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> 
             blob_id: att.blob_id,
         };
         blocks.push(match att.kind {
-            AttachmentKind::Image => ContentBlock::Image {
-                blob,
-                mime_type: att.mime_type,
-                filename: att.filename,
-            },
-            AttachmentKind::Audio => ContentBlock::Audio {
-                blob,
-                mime_type: att.mime_type,
-                filename: att.filename,
-                duration_ms: att.duration_ms,
-            },
-            AttachmentKind::File => ContentBlock::File {
-                blob,
-                filename: att.filename.unwrap_or_default(),
-                mime_type: att.mime_type,
-                duration_ms: att.duration_ms,
-            },
+            AttachmentKind::Image => {
+                // Server-derived like the audio duration below: a provider
+                // tiles an image by its PIXEL grid and bills per tile, so
+                // the dimensions are the price and the payload's byte
+                // count bounds nothing.
+                let (width, height) = probe_image_dimensions(blob_store, &blob.blob_id)
+                    .await
+                    .unzip();
+                ContentBlock::Image {
+                    blob,
+                    mime_type: att.mime_type,
+                    filename: att.filename,
+                    width,
+                    height,
+                }
+            }
+            AttachmentKind::Audio => {
+                // Server-derived, overriding the wire: the context budget
+                // charges audio per second, and a client-declared length
+                // would let a caller under-price its own upload. The wire
+                // value survives only as the display fallback for a
+                // container we can't read.
+                let duration_ms = probe_audio_duration_ms(blob_store, &blob.blob_id)
+                    .await
+                    .or(att.duration_ms);
+                ContentBlock::Audio {
+                    blob,
+                    mime_type: att.mime_type,
+                    filename: att.filename,
+                    duration_ms,
+                }
+            }
+            AttachmentKind::File => {
+                let page_count =
+                    probe_pdf_page_count(blob_store, &blob.blob_id, &att.mime_type).await;
+                // Server-derived like the page count, and for the same
+                // reason: a text-like file is delivered as inlined prompt
+                // text, so its bytes ARE its price. `att.size` is the
+                // client's claim about the same blob and is not used.
+                let size_bytes = stat_blob_size(blob_store, &blob.blob_id).await;
+                ContentBlock::File {
+                    filename: file_display_name(att.filename.as_deref(), &att.mime_type),
+                    blob,
+                    mime_type: att.mime_type,
+                    duration_ms: att.duration_ms,
+                    page_count,
+                    size_bytes,
+                }
+            }
         });
     }
     blocks
+}
+
+/// Byte length of a stored blob, straight off the metadata row. The wire
+/// carries a `size` too, but it is the sender's word for it and the
+/// context budget spends the number.
+async fn stat_blob_size(blob_store: &dyn BlobStore, blob_id: &str) -> Option<u32> {
+    match blob_store.stat(blob_id).await {
+        Ok(meta) => u32::try_from(meta.size).ok(),
+        Err(e) => {
+            tracing::debug!(%blob_id, error = %e, "attachment stat failed; size unknown");
+            None
+        }
+    }
+}
+
+/// Read a blob for probing, refusing anything the delivery path would
+/// reject on size. `stat` first so an oversize payload is never pulled
+/// into memory.
+///
+/// `max_bytes` is the DELIVERY cap of the arm being probed, not a shared
+/// worst case: above it the LLM layer always stubs the block, so a fact
+/// recovered from those bytes would be a price charged for something that
+/// costs the stub. Reading the wider of the two caps charged an 8-16 MiB
+/// PDF its full page price for a block that can never be delivered.
+async fn probe_bytes(blob_store: &dyn BlobStore, blob_id: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    match blob_store.stat(blob_id).await {
+        Ok(meta) if meta.size <= max_bytes => {}
+        Ok(meta) => {
+            tracing::debug!(%blob_id, size = meta.size, limit = max_bytes, "attachment too large to probe");
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(%blob_id, error = %e, "attachment stat failed; skipping probe");
+            return None;
+        }
+    }
+    blob_store.get(blob_id).await.ok()
+}
+
+/// Pages in an inbound PDF, probed here because ingest is the one moment
+/// the bytes are in hand and the `ContentBlock` that outlives them is all
+/// the context budget ever sees. A provider bills a native document per
+/// PAGE, and byte count is not a stand-in — measured, real documents run
+/// 10 to 4,007 bytes per page.
+async fn probe_pdf_page_count(
+    blob_store: &dyn BlobStore,
+    blob_id: &str,
+    mime_type: &str,
+) -> Option<u32> {
+    if !baybo_llm::delivers_pdf_document(mime_type) {
+        return None;
+    }
+    let bytes = probe_bytes(
+        blob_store,
+        blob_id,
+        baybo_llm::MAX_PDF_DOCUMENT_BYTES as u64,
+    )
+    .await?;
+    // `spawn_blocking`: a whole-payload parse is CPU-bound, and a panic
+    // inside it surfaces as a `JoinError` instead of unwinding the reactor.
+    tokio::task::spawn_blocking(move || baybo_llm::media_probe::pdf_page_count(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn probe_audio_duration_ms(blob_store: &dyn BlobStore, blob_id: &str) -> Option<u32> {
+    let bytes = probe_bytes(
+        blob_store,
+        blob_id,
+        baybo_llm::MAX_AUDIO_DOCUMENT_BYTES as u64,
+    )
+    .await?;
+    tokio::task::spawn_blocking(move || baybo_llm::media_probe::audio_duration_ms(&bytes))
+        .await
+        .ok()
+        .flatten()
+        .filter(|ms| *ms > 0)
+}
+
+/// Pixel dimensions of an inbound image, probed here for the same reason
+/// the page count is: a provider bills an image per tile of its pixel
+/// grid, and the `ContentBlock` that outlives the bytes is all the
+/// context budget ever sees.
+async fn probe_image_dimensions(blob_store: &dyn BlobStore, blob_id: &str) -> Option<(u32, u32)> {
+    let bytes = probe_bytes(
+        blob_store,
+        blob_id,
+        baybo_llm::MAX_IMAGE_DOCUMENT_BYTES as u64,
+    )
+    .await?;
+    tokio::task::spawn_blocking(move || baybo_llm::media_probe::image_dimensions(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A `File` block's filename is the only label the transcript card has,
+/// and the clients fall back on an *absent* name, not on an empty one —
+/// so a nameless or blank inbound attachment is named here rather than
+/// stored as `""` and rendered as a titleless card.
+fn file_display_name(filename: Option<&str>, mime_type: &str) -> String {
+    match filename.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => name.to_owned(),
+        None => format!("{NAMELESS_ATTACHMENT_STEM}{}", display_extension(mime_type)),
+    }
+}
+
+/// Extension for the synthesised name above, or `""` for a MIME we can't
+/// label.
+///
+/// **Deliberately its own table, not `SqliteBlobStore`'s private
+/// `mime_extension`.** That one is the frozen on-disk blob layout, where
+/// adding an entry renames already-stored payloads; this one only
+/// decorates a label a user reads, so it grows freely as new file pickers
+/// show up. Merging them would turn every cosmetic addition into a data
+/// migration — the duplication is the point.
+fn display_extension(mime_type: &str) -> &'static str {
+    let bare = mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/heic" => ".heic",
+        "image/heif" => ".heif",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "audio/ogg" | "audio/opus" => ".ogg",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/m4a" => ".m4a",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "audio/flac" => ".flac",
+        "audio/silk" => ".silk",
+        "video/mp4" => ".mp4",
+        "video/webm" => ".webm",
+        "video/quicktime" => ".mov",
+        "video/x-matroska" => ".mkv",
+        "application/pdf" => ".pdf",
+        "application/zip" => ".zip",
+        "application/json" => ".json",
+        "application/x-tar" => ".tar",
+        "application/gzip" | "application/x-gzip" => ".gz",
+        "application/x-7z-compressed" => ".7z",
+        "application/vnd.rar" | "application/x-rar-compressed" => ".rar",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => ".docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => ".xlsx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => ".pptx",
+        "application/octet-stream" => ".bin",
+        "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => ".yaml",
+        "application/toml" | "text/x-toml" => ".toml",
+        "text/plain" => ".txt",
+        "text/html" => ".html",
+        "text/csv" => ".csv",
+        "text/markdown" => ".md",
+        _ => "",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use baybo_channels::wire::AttachmentKind;
+    use baybo_llm::media_probe::fixture;
+    use baybo_storage::test_support::MemoryBlobStore;
+
+    /// The probes `stat` before they read, so a blob that was never
+    /// uploaded simply yields no measurement — which is what these
+    /// naming / ordering cases want.
+    fn no_blobs() -> MemoryBlobStore {
+        MemoryBlobStore::new()
+    }
 
     fn att(kind: AttachmentKind, mime: &str, filename: Option<&str>) -> WireAttachment {
         WireAttachment {
@@ -960,32 +1212,243 @@ mod tests {
         }
     }
 
-    #[test]
-    fn text_only_yields_single_text_block() {
-        let blocks = wire_to_content_blocks("hi".into(), Vec::new());
+    #[tokio::test]
+    async fn text_only_yields_single_text_block() {
+        let blocks = wire_to_content_blocks("hi".into(), Vec::new(), &no_blobs()).await;
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "hi"));
     }
 
-    #[test]
-    fn empty_text_with_attachments_skips_leading_text() {
+    async fn stored(store: &MemoryBlobStore, mime: &str, bytes: &[u8]) -> WireAttachment {
+        let blob = store.put(bytes, mime, None).await.expect("put");
+        WireAttachment {
+            kind: if mime.starts_with("audio/") {
+                AttachmentKind::Audio
+            } else {
+                AttachmentKind::File
+            },
+            blob_id: blob.blob_id,
+            mime_type: mime.into(),
+            size: bytes.len() as u32,
+            filename: Some("upload".into()),
+            duration_ms: None,
+        }
+    }
+
+    /// Ingest is the one moment the bytes are in hand, and the block that
+    /// outlives them is all the context budget ever sees. A PDF's page
+    /// count is what a provider bills, so it is measured here rather than
+    /// guessed downstream from a byte count that spans 10 to 4,007 bytes
+    /// per page.
+    #[tokio::test]
+    async fn an_inbound_pdf_carries_its_probed_page_count() {
+        let store = no_blobs();
+        for pages in [1usize, 13, 200] {
+            let att = stored(
+                &store,
+                "application/pdf",
+                &baybo_llm::media_probe::fixture::object_stream(pages),
+            )
+            .await;
+            let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+            match &blocks[0] {
+                ContentBlock::File { page_count, .. } => {
+                    assert_eq!(*page_count, Some(pages as u32))
+                }
+                other => panic!("expected File, got {other:?}"),
+            }
+        }
+    }
+
+    /// A text-like file is delivered as inlined prompt text, so its byte
+    /// count is its price. Without it every such block was charged the
+    /// full 16 KiB delivery cap — 17,529 tokens for a 400-byte `.md`, and
+    /// six of them tripped compaction on a 128k window on their own. The
+    /// wire's own `size` is the sender's claim and is not what is stored.
+    #[tokio::test]
+    async fn an_inbound_file_carries_its_stored_byte_size() {
+        let store = no_blobs();
+        let body = b"# notes\nnothing much here\n";
+        let mut att = stored(&store, "text/markdown", body).await;
+        att.size = 999_999;
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::File { size_bytes, .. } => {
+                assert_eq!(*size_bytes, Some(body.len() as u32))
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    /// A blob that was never uploaded cannot be stat'd, and the budget
+    /// then falls back to the delivery cap rather than to a guess.
+    #[tokio::test]
+    async fn an_unstorable_file_carries_no_byte_size() {
+        let blocks = wire_to_content_blocks(
+            String::new(),
+            vec![att(AttachmentKind::File, "text/markdown", Some("a.md"))],
+            &no_blobs(),
+        )
+        .await;
+        match &blocks[0] {
+            ContentBlock::File { size_bytes, .. } => assert_eq!(*size_bytes, None),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    /// A provider tiles an image by its PIXEL grid, so the dimensions are
+    /// the price. Every case here is a fraction of a megabyte, which is
+    /// why the payload cap the image arm already had bounded nothing: a
+    /// 12000x9000 render costs 49,536 tokens against a 9,288 ceiling.
+    #[tokio::test]
+    async fn an_inbound_image_carries_its_probed_dimensions() {
+        let store = no_blobs();
+        for (w, h) in [(3024u32, 4032u32), (12000, 9000)] {
+            let mut att = stored(&store, "image/png", &fixture::png(w, h)).await;
+            att.kind = AttachmentKind::Image;
+            let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+            match &blocks[0] {
+                ContentBlock::Image { width, height, .. } => {
+                    assert_eq!((*width, *height), (Some(w), Some(h)))
+                }
+                other => panic!("expected Image, got {other:?}"),
+            }
+        }
+    }
+
+    /// Nothing to measure — a vector image, or a blob that was never
+    /// uploaded — leaves the fields unset, and the budget then charges the
+    /// delivery cap rather than a guess.
+    #[tokio::test]
+    async fn an_unmeasurable_image_carries_no_dimensions() {
+        let store = no_blobs();
+        let mut svg = stored(&store, "image/svg+xml", br#"<svg width="9"/>"#).await;
+        svg.kind = AttachmentKind::Image;
+        let missing = att(AttachmentKind::Image, "image/png", Some("gone.png"));
+        for att in [svg, missing] {
+            let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+            match &blocks[0] {
+                ContentBlock::Image { width, height, .. } => {
+                    assert_eq!((*width, *height), (None, None))
+                }
+                other => panic!("expected Image, got {other:?}"),
+            }
+        }
+    }
+
+    /// A payload the delivery path will always stub is not worth probing:
+    /// the number would be a price charged for a block that costs the
+    /// text stub. The probe budget is each arm's OWN delivery cap, not the
+    /// wider of the two — an 8-16 MiB PDF was charged its full page price
+    /// for a block that can never be delivered.
+    #[tokio::test]
+    async fn a_payload_over_its_own_delivery_cap_is_not_probed() {
+        // Padded in FRONT of the header, which every lopdf entry point
+        // skips, so the document still parses at any size.
+        let padded = |bytes: usize| {
+            let doc = fixture::classic(3);
+            let mut out = vec![b'\n'; bytes - doc.len()];
+            out.extend_from_slice(&doc);
+            out
+        };
+        let store = no_blobs();
+        let over = padded(baybo_llm::MAX_PDF_DOCUMENT_BYTES + 1);
+        assert!(
+            over.len() < baybo_llm::MAX_AUDIO_DOCUMENT_BYTES,
+            "the shared 16 MiB budget would still have probed this"
+        );
+        assert_eq!(baybo_llm::media_probe::pdf_page_count(&over), Some(3));
+
+        let att = stored(&store, "application/pdf", &over).await;
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::File { page_count, .. } => assert_eq!(*page_count, None),
+            other => panic!("expected File, got {other:?}"),
+        }
+
+        // …and one exactly at the cap still is.
+        let att = stored(
+            &store,
+            "application/pdf",
+            &padded(baybo_llm::MAX_PDF_DOCUMENT_BYTES),
+        )
+        .await;
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::File { page_count, .. } => assert_eq!(*page_count, Some(3)),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_pdf_file_carries_no_page_count() {
+        let store = no_blobs();
+        let att = stored(&store, "application/zip", b"PK\x03\x04").await;
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::File { page_count, .. } => assert_eq!(*page_count, None),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    /// The wire's `duration_ms` is a client claim and the budget charges
+    /// audio per second, so ingest overrides it with the bytes' own
+    /// answer. Here the client under-claims by 136 seconds.
+    #[tokio::test]
+    async fn an_inbound_voice_note_is_measured_not_taken_at_its_word() {
+        let store = no_blobs();
+        let mut att = stored(
+            &store,
+            "audio/wav",
+            &baybo_llm::media_probe::fixture::wav(137),
+        )
+        .await;
+        att.duration_ms = Some(1_000);
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::Audio { duration_ms, .. } => assert_eq!(*duration_ms, Some(137_000)),
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    /// An unreadable container keeps the client's value for the card's
+    /// label; the budget treats a duration it cannot vouch for as unknown
+    /// anyway, because delivery re-probes before sending.
+    #[tokio::test]
+    async fn an_unreadable_container_falls_back_to_the_wire_value() {
+        let store = no_blobs();
+        let mut att = stored(&store, "audio/ogg", b"not really ogg").await;
+        att.duration_ms = Some(4_200);
+        let blocks = wire_to_content_blocks(String::new(), vec![att], &store).await;
+        match &blocks[0] {
+            ContentBlock::Audio { duration_ms, .. } => assert_eq!(*duration_ms, Some(4_200)),
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_text_with_attachments_skips_leading_text() {
         let blocks = wire_to_content_blocks(
             String::new(),
             vec![att(AttachmentKind::Image, "image/png", None)],
-        );
+            &no_blobs(),
+        )
+        .await;
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Image { .. }));
     }
 
-    #[test]
-    fn text_and_attachments_appear_in_order() {
+    #[tokio::test]
+    async fn text_and_attachments_appear_in_order() {
         let blocks = wire_to_content_blocks(
             "look".into(),
             vec![
                 att(AttachmentKind::Audio, "audio/wav", None),
                 att(AttachmentKind::File, "application/pdf", Some("a.pdf")),
             ],
-        );
+            &no_blobs(),
+        )
+        .await;
         assert_eq!(blocks.len(), 3);
         assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "look"));
         assert!(matches!(&blocks[1], ContentBlock::Audio { .. }));
@@ -1000,6 +1463,123 @@ mod tests {
             }
             other => panic!("expected File block, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn nameless_file_attachment_is_named_from_its_mime() {
+        for wire_name in [None, Some(""), Some("   ")] {
+            let blocks = wire_to_content_blocks(
+                String::new(),
+                vec![att(AttachmentKind::File, "application/pdf", wire_name)],
+                &no_blobs(),
+            )
+            .await;
+            match &blocks[0] {
+                ContentBlock::File { filename, .. } => assert_eq!(filename, "attachment.pdf"),
+                other => panic!("expected File block, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn display_table_names_arbitrary_file_picks() {
+        // These MIMEs map to `""` in the frozen on-disk table on
+        // purpose; the user-facing name is where they get a suffix.
+        for (mime, expected) in [
+            ("application/octet-stream", "attachment.bin"),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "attachment.docx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "attachment.xlsx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "attachment.pptx",
+            ),
+            ("application/yaml", "attachment.yaml"),
+            ("text/x-yaml", "attachment.yaml"),
+            ("application/toml", "attachment.toml"),
+            ("text/x-toml", "attachment.toml"),
+            ("application/x-7z-compressed", "attachment.7z"),
+            ("application/vnd.rar", "attachment.rar"),
+            ("application/x-rar-compressed", "attachment.rar"),
+            ("application/json", "attachment.json"),
+            ("APPLICATION/JSON; charset=utf-8", "attachment.json"),
+        ] {
+            let blocks = wire_to_content_blocks(
+                String::new(),
+                vec![att(AttachmentKind::File, mime, None)],
+                &no_blobs(),
+            )
+            .await;
+            match &blocks[0] {
+                ContentBlock::File { filename, .. } => assert_eq!(filename, expected, "{mime}"),
+                other => panic!("expected File block, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nameless_file_of_unknown_mime_keeps_a_bare_stem() {
+        let blocks = wire_to_content_blocks(
+            String::new(),
+            vec![att(
+                AttachmentKind::File,
+                "application/x-not-known",
+                Some(""),
+            )],
+            &no_blobs(),
+        )
+        .await;
+        match &blocks[0] {
+            ContentBlock::File { filename, .. } => assert_eq!(filename, "attachment"),
+            other => panic!("expected File block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_file_name_passes_through_untouched() {
+        let blocks = wire_to_content_blocks(
+            String::new(),
+            vec![att(
+                AttachmentKind::File,
+                "application/octet-stream",
+                Some("quarterly.numbers"),
+            )],
+            &no_blobs(),
+        )
+        .await;
+        match &blocks[0] {
+            ContentBlock::File { filename, .. } => assert_eq!(filename, "quarterly.numbers"),
+            other => panic!("expected File block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn singular_message_rejects_over_cap_attachments() {
+        let mut msg = WireMessage {
+            content: "ok".to_string(),
+            session_id: SessionId::from("s1"),
+            user_id: "u".to_string(),
+            channel_type: ChannelType::from("http"),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: baybo_channels::MessageRole::User,
+            ordinal: None,
+        };
+        msg.attachments = vec![
+            att(AttachmentKind::File, "application/pdf", Some("a.pdf"));
+            MAX_MESSAGE_BATCH_ATTACHMENTS
+        ];
+        assert!(validate_message(&msg).is_ok());
+
+        msg.attachments
+            .push(att(AttachmentKind::File, "application/pdf", Some("a.pdf")));
+        assert!(validate_message(&msg).is_err());
     }
 
     #[test]

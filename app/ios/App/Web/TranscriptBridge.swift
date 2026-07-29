@@ -18,6 +18,18 @@ final class TranscriptBridge: NSObject, ObservableObject {
     weak var webView: WKWebView?
     private var ready = false
     private var pending: [String] = []
+    /// Which conversation the mounted page is rendering. Held here rather than
+    /// read off `store` because `store` is weak: the LRU can evict and
+    /// deallocate a session's store while its transcript is still the page in
+    /// the webview, and `<Transcript>` is keyed on the session id — so a
+    /// re-entry that re-inits the SAME id does not remount the React tree, and
+    /// a resync that skipped the reload here would leave the stale rows up.
+    private(set) var shownSessionId: String?
+    /// Refuse mirror writes until the rebuilt page is up. The outgoing
+    /// document's `pagehide` flushes its debounced `persist`, which would write
+    /// back the very state the resync just deleted — and `deliverInit` would
+    /// then restore it.
+    private var discardPersist = false
     private var lastBottomInset = Int.min
     private var composerTop: CGFloat?
     /// Mirror of the web transcript's `showJump` state — drives the native
@@ -43,6 +55,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
 
     init(store: ChatStore) {
         self.store = store
+        shownSessionId = store.sessionId
         super.init()
         store.attachBridge(self)
     }
@@ -50,27 +63,34 @@ final class TranscriptBridge: NSObject, ObservableObject {
     func retarget(to newStore: ChatStore) {
         if store === newStore {
             newStore.attachBridge(self)
-            return
+        } else {
+            // A DIFFERENT store for the same conversation (the LRU evicted this
+            // session's store and re-opening minted a fresh one) keeps the very
+            // same React tree — `<Transcript>` is keyed on `sessionId`, so `init`
+            // re-renders nothing and the outline effect never re-fires. Clearing
+            // the index there would blank it with nothing left to re-post it.
+            let sameSession = store?.sessionId == newStore.sessionId
+            if let old = store {
+                call("flushPersist", "")
+                old.detachBridge(self)
+            }
+            store = newStore
+            // Hiding here can pause WebKit rAF and strand the `shown` callback.
+            contentVisible = true
+            deliverInit()
+            newStore.attachBridge(self)
+            lastBottomInset = Int.min
+            pushBottomInset()
+            jumpVisible = false
+            if !sameSession { resetOutline() }
         }
-        // A DIFFERENT store for the same conversation (the LRU evicted this
-        // session's store and re-opening minted a fresh one) keeps the very
-        // same React tree — `<Transcript>` is keyed on `sessionId`, so `init`
-        // re-renders nothing and the outline effect never re-fires. Clearing
-        // the index there would blank it with nothing left to re-post it.
-        let sameSession = store?.sessionId == newStore.sessionId
-        if let old = store {
-            call("flushPersist", "")
-            old.detachBridge(self)
-        }
-        store = newStore
-        // Hiding here can pause WebKit rAF and strand the `shown` callback.
-        contentVisible = true
-        deliverInit()
-        newStore.attachBridge(self)
-        lastBottomInset = Int.min
-        pushBottomInset()
-        jumpVisible = false
-        if !sameSession { resetOutline() }
+        // Last, so the re-seeded bubbles land at the tail — where an optimistic
+        // send always sits — behind whatever the attach just flushed. Skipped
+        // while the page is still loading: those calls would only queue in
+        // `pending`, and the `ready` that flushes them re-seeds again — the same
+        // work twice, arriving before the web side has committed the first pass
+        // and can recognise it.
+        if ready { newStore.replayUnconfirmedSends(to: self) }
     }
 
     /// ONE webview serves every conversation, so an index left behind renders
@@ -83,6 +103,33 @@ final class TranscriptBridge: NSObject, ObservableObject {
         outlineLoadingOlder = false
         outlineAvailable = false
         outlineHereId = nil
+    }
+
+    /// Rebuild the page from scratch — the second half of `ChatStore.resync`,
+    /// taken only when the mounted page is that session's. Any other session's
+    /// resync needs no reload: its next open re-inits under a different key and
+    /// remounts the React tree with the mirror already gone.
+    ///
+    /// The same load `TranscriptHost.init` performs, so every piece of
+    /// in-memory web state dies with the document: the rows, the sync cursor,
+    /// and above all the live latches (an open work block, `turnActive`, the
+    /// streaming buffer). A "reset yourself" bridge message is deliberately NOT
+    /// what this is — it could only clear the state we thought to enumerate,
+    /// and state that was not cleared when it should have been is exactly what
+    /// the hatch exists to escape.
+    ///
+    /// The leg is untouched: this session stays subscribed, so frames keep
+    /// arriving through the reload (they buffer in `pending` and flush after
+    /// the fresh `init`).
+    func rebuildIfShowing(_ sessionId: String) {
+        guard shownSessionId == sessionId else { return }
+        guard let webView, let url = TranscriptSchemeHandler.indexURL else { return }
+        discardPersist = true
+        ready = false
+        // Buffered calls target a document about to be destroyed — and one of
+        // them may be an `init` carrying the mirror we just threw away.
+        pending.removeAll()
+        webView.load(URLRequest(url: url))
     }
 
     func detachCurrent(_ leaving: ChatStore) {
@@ -264,6 +311,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
 
     private func deliverInit() {
         guard let store else { return }
+        shownSessionId = store.sessionId
         let restored = TranscriptStore.read(sessionId: store.sessionId)
         // The in-app language override (falls back to the device language) —
         // the same source the native chrome renders from, so the two can't
@@ -334,6 +382,8 @@ final class TranscriptBridge: NSObject, ObservableObject {
     }
 }
 
+extension TranscriptBridge: TranscriptSurface {}
+
 // MARK: - Web → native
 
 extension TranscriptBridge: WKScriptMessageHandler {
@@ -365,6 +415,11 @@ extension TranscriptBridge: WKScriptMessageHandler {
             jumpVisible = false
             resetOutline()
             contentVisible = store?.listed == false
+            // After the flush, so the live frames that arrived during the load
+            // keep their arrival order and the re-seeded bubbles land at the
+            // tail — where an optimistic send always sits.
+            store?.replayUnconfirmedSends(to: self)
+            discardPersist = false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
             contentVisible = true
@@ -381,6 +436,10 @@ extension TranscriptBridge: WKScriptMessageHandler {
                 store?.markRead(ordinal: ordinal)
             }
         case "persist":
+            // A resync rebuild is in flight: this is the outgoing document's
+            // `pagehide` flush, and honouring it would restore the mirror the
+            // hatch just deleted, with exactly the state being thrown away.
+            if discardPersist { break }
             // Persist is async and may arrive after the bridge retargets.
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,
                 let state = body["state"],

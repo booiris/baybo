@@ -1,5 +1,7 @@
 //! Direct blob transfer over the authenticated REST client.
 
+use std::path::Path;
+
 use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::Digest;
@@ -9,6 +11,11 @@ use crate::blob_helper;
 use crate::gateway_api::{GatewayBlobClient, PATH_BLOBS};
 
 use super::INVALID_TOKEN_CODE;
+
+#[derive(Deserialize)]
+struct BlobIdResp {
+    blob_id: String,
+}
 
 #[allow(clippy::manual_async_fn)]
 impl GatewayBlobClient for super::DirectHttp {
@@ -39,10 +46,6 @@ impl GatewayBlobClient for super::DirectHttp {
             if !resp.status().is_success() {
                 return Err(format!("upload failed: HTTP {}", resp.status().as_u16()));
             }
-            #[derive(Deserialize)]
-            struct BlobIdResp {
-                blob_id: String,
-            }
             let parsed: BlobIdResp = resp
                 .json()
                 .await
@@ -53,6 +56,16 @@ impl GatewayBlobClient for super::DirectHttp {
         }
     }
 
+    fn upload_blob_file(
+        &self,
+        path: String,
+        mime_type: String,
+        deck_card: Option<String>,
+        progress: blob_helper::ProgressSink,
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send + '_ {
+        async move { upload_file_with_client(self, path, mime_type, deck_card, progress).await }
+    }
+
     fn download_blob(
         &self,
         blob_id: String,
@@ -60,6 +73,66 @@ impl GatewayBlobClient for super::DirectHttp {
     ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_ {
         async move { download_blob_with_client(self, blob_id, progress).await }
     }
+}
+
+async fn upload_file_with_client(
+    http: &super::DirectHttp,
+    path: String,
+    mime_type: String,
+    deck_card: Option<String>,
+    progress: blob_helper::ProgressSink,
+) -> Result<String, String> {
+    let source = Path::new(&path);
+    let digest = blob_helper::hash_upload_file(source).await?;
+    let ticker = blob_helper::UploadTicker::new(progress, digest.len);
+    let tee = blob_helper::UploadCacheTee::open(&digest.hex).await;
+    let reader = blob_helper::UploadReader::open(
+        source,
+        digest.len,
+        blob_helper::FILE_READ_CHUNK_BYTES,
+        ticker.clone(),
+        tee.clone(),
+    )
+    .await?;
+    let body = reqwest::Body::wrap_stream(futures_util::stream::try_unfold(
+        reader,
+        |mut reader| async move {
+            match reader.next_chunk().await? {
+                Some(chunk) => Ok::<_, String>(Some((bytes::Bytes::from(chunk), reader))),
+                None => Ok(None),
+            }
+        },
+    ));
+    // A wrapped stream declares no length, and reqwest would fall back to
+    // chunked transfer-encoding — which the gateway's body limit reads as an
+    // undeclared size.
+    let mut req = http
+        .client()
+        .post(http.url(PATH_BLOBS))
+        .header(reqwest::header::CONTENT_TYPE, mime_type)
+        .header(reqwest::header::CONTENT_LENGTH, digest.len)
+        .body(body);
+    if let Some(card_id) = &deck_card {
+        req = req.header(crate::gateway_api::HEADER_DECK_CARD, card_id);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("could not reach Baybo: {e}"))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(INVALID_TOKEN_CODE.into());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("upload failed: HTTP {}", resp.status().as_u16()));
+    }
+    ticker.finish();
+    let parsed: BlobIdResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode blob id: {e}"))?;
+    blob_helper::ensure_blob_id_matches(&digest.hex, &parsed.blob_id)?;
+    tee.publish().await;
+    Ok(parsed.blob_id)
 }
 
 pub(crate) async fn download_blob_bytes(
@@ -157,6 +230,74 @@ mod tests {
         }
     }
 
+    /// What one upload request actually put on the wire.
+    struct RecordedUpload {
+        content_length: Option<usize>,
+        content_type: Option<String>,
+        transfer_encoding: Option<String>,
+        deck_card: Option<String>,
+        body: Vec<u8>,
+    }
+
+    /// Accept ONE `POST /v1/blobs`, answer with `blob_id`, and hand back the
+    /// request it saw.
+    async fn serve_upload_once(
+        blob_id: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<RecordedUpload>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = vec![0u8; 16 * 1024];
+            let head_end = loop {
+                let n = sock.read(&mut buf).await.expect("read request");
+                assert!(n > 0, "client closed before the request head");
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+            let header = |name: &str| {
+                let prefix = format!("{name}: ");
+                head.lines()
+                    .find_map(|line| line.strip_prefix(prefix.as_str()))
+                    .map(|value| value.trim().to_string())
+            };
+            let content_length = header("content-length").and_then(|v| v.parse::<usize>().ok());
+            let mut body = raw[head_end..].to_vec();
+            while content_length.is_some_and(|len| body.len() < len) {
+                let n = sock.read(&mut buf).await.expect("read body");
+                assert!(n > 0, "client closed mid-body");
+                body.extend_from_slice(&buf[..n]);
+            }
+            let payload = format!(r#"{{"blob_id":"{blob_id}"}}"#);
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write head");
+            sock.write_all(payload.as_bytes())
+                .await
+                .expect("write body");
+            sock.flush().await.expect("flush");
+            let _ = tx.send(RecordedUpload {
+                content_length,
+                content_type: header("content-type"),
+                transfer_encoding: header("transfer-encoding"),
+                deck_card: header(crate::gateway_api::HEADER_DECK_CARD),
+                body,
+            });
+        });
+        (format!("http://{addr}"), rx)
+    }
+
     /// Serve `body` once over HTTP/1.1, honouring a `Range: bytes=N-` header
     /// with a 206 so the resume path is exercised for real. Returns the base URL.
     async fn serve_once(body: Vec<u8>) -> String {
@@ -220,6 +361,86 @@ mod tests {
         format!("baybo-progress-{tag}-{nonce}")
             .repeat(8)
             .into_bytes()
+    }
+
+    /// A picked file on disk, several read chunks long, that no other test can
+    /// collide with.
+    async fn scratch_upload(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let bytes = fresh_body(tag).await.repeat(600);
+        assert!(bytes.len() > blob_helper::FILE_READ_CHUNK_BYTES * 2);
+        let path =
+            std::env::temp_dir().join(format!("baybo-direct-upload-{tag}-{}", std::process::id()));
+        tokio::fs::write(&path, &bytes).await.expect("seed file");
+        (path, bytes)
+    }
+
+    /// The streaming leg's contract in one pass: an explicit `Content-Length`
+    /// (never chunked, which the gateway's body limit reads as an undeclared
+    /// size), the bytes verbatim across several chunks, ticks that open and
+    /// close on the real byte count, and — the part that decides whether the
+    /// message renders or shows a download arrow — the source file landed in
+    /// the blob cache under its digest.
+    #[tokio::test]
+    async fn a_streamed_upload_declares_its_length_and_caches_what_it_sent() {
+        let (path, bytes) = scratch_upload("streamed").await;
+        let total = bytes.len() as u64;
+        let blob_id = blob_id_for(&bytes);
+        let (base_url, recorded) = serve_upload_once(blob_id.clone()).await;
+        let sink = Arc::new(RecordingProgress::default());
+
+        let got = upload_file_with_client(
+            &http_for(base_url),
+            path.to_string_lossy().into_owned(),
+            "application/pdf".into(),
+            None,
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
+        )
+        .await
+        .expect("upload");
+
+        assert_eq!(got, blob_id);
+        let seen = recorded.await.expect("recorded");
+        assert_eq!(seen.content_length, Some(bytes.len()));
+        assert_eq!(
+            seen.transfer_encoding, None,
+            "a declared length, not chunked"
+        );
+        assert_eq!(seen.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(seen.deck_card, None, "a chat upload stamps no card");
+        assert_eq!(seen.body, bytes);
+
+        let ticks = sink.ticks.lock().clone();
+        assert_eq!(ticks.first().copied(), Some((0, Some(total))));
+        assert_eq!(ticks.last().copied(), Some((total, Some(total))));
+        assert!(
+            blob_helper::is_cached(&blob_id).await,
+            "the file just sent must read as ready"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// A deck picker's upload carries the card stamp, so card purge reclaims it.
+    #[tokio::test]
+    async fn a_streamed_deck_upload_stamps_its_card() {
+        let (path, bytes) = scratch_upload("deck").await;
+        let (base_url, recorded) = serve_upload_once(blob_id_for(&bytes)).await;
+
+        upload_file_with_client(
+            &http_for(base_url),
+            path.to_string_lossy().into_owned(),
+            "image/png".into(),
+            Some("card-1".into()),
+            None,
+        )
+        .await
+        .expect("upload");
+
+        assert_eq!(
+            recorded.await.expect("recorded").deck_card.as_deref(),
+            Some("card-1")
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

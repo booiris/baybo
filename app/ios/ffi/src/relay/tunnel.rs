@@ -348,16 +348,23 @@ pub(crate) fn body_frames(
     let mut offset = 0u64;
     body.chunks(crate::core::MAX_TUNNEL_CHUNK)
         .map(move |chunk| {
-            let chunk_len = chunk.len() as u64;
-            let frame = TunnelRequest::Body {
-                request_id,
-                offset,
-                data: chunk.to_vec(),
-                last: offset + chunk_len >= size,
-            };
-            offset += chunk_len;
+            let frame = body_frame(request_id, offset, size, chunk.to_vec());
+            offset += chunk.len() as u64;
             frame
         })
+}
+
+/// One body frame — the streaming twin of [`body_frames`], for a body that
+/// arrives a chunk at a time instead of as one slice. Both spell the `last`
+/// rule here, so a streamed body and a buffered one frame identically.
+pub(crate) fn body_frame(request_id: u64, offset: u64, size: u64, data: Vec<u8>) -> TunnelRequest {
+    let last = offset + data.len() as u64 >= size;
+    TunnelRequest::Body {
+        request_id,
+        offset,
+        data,
+        last,
+    }
 }
 
 /// The `Content-Length`-shaped declaration for a request body: `None` for an
@@ -594,6 +601,23 @@ mod tests {
             frames.size_hint(),
             (3, Some(3)),
             "the other three are still unbuilt"
+        );
+    }
+
+    /// A streamed body (the file upload) frames identically to a buffered one:
+    /// `last` is set by where the chunk ENDS, not by who built it.
+    #[test]
+    fn a_streamed_chunk_is_last_only_when_it_closes_the_declared_size() {
+        let mid = body_frame(4, 0, 10, vec![1u8; 6]);
+        let end = body_frame(4, 6, 10, vec![1u8; 4]);
+
+        assert!(
+            matches!(mid, TunnelRequest::Body { last: false, .. }),
+            "{mid:?}"
+        );
+        assert!(
+            matches!(end, TunnelRequest::Body { last: true, .. }),
+            "{end:?}"
         );
     }
 

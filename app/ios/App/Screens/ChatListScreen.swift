@@ -171,7 +171,7 @@ struct ChatListScreen: View {
     }
 
     /// An ordinary conversation: tap opens it; trailing swipe archives / deletes,
-    /// leading swipe pins.
+    /// leading swipe pins, long-press rebuilds the transcript.
     @ViewBuilder private func chatRow(_ row: SessionRow) -> some View {
         Button {
             appStore.openSession(row.id)
@@ -213,6 +213,19 @@ struct ChatListScreen: View {
                     systemImage: row.pinned ? "pin.slash.fill" : "pin.fill")
             }
             .tint(Theme.ink)
+        }
+        // Long-press: the per-session resync ([docs/transcript.md]). It belongs
+        // on the LIST — the conversation need not be opened first, and it is a
+        // session-level operation like the swipes beside it — but not ON a
+        // swipe: those three are the everyday verbs, and a fourth would crowd
+        // them for something reached once a year. A context menu also has room
+        // to say what the action means, which a swipe glyph does not.
+        .contextMenu {
+            Button {
+                appStore.promptResync(row.id)
+            } label: {
+                Label(lang.t("list.resync"), systemImage: "arrow.clockwise")
+            }
         }
     }
 

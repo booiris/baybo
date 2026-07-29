@@ -1,6 +1,6 @@
 # The transcript webview
 
-_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/ios/web/src/` (`bridge.ts`, `Transcript.tsx`, `mathDelimiters.ts`, `wireSentinel.ts`)._
+_The single reused transcript `WKWebView` and everything that feeds it: `BayboClient`/`ChatStore` lifecycle, the native ⇄ web bridge, keyboard insets, markdown/LaTeX rendering, and the message index. Governs `app/ios/App/Core/TranscriptHost.swift`, `app/ios/App/Web/TranscriptBridge.swift`, `app/ios/App/Web/TranscriptWebView.swift`, `app/ios/App/Core/ChatStore.swift`, `app/ios/App/Core/MessageOutline.swift`, `app/ios/App/Screens/MessageIndexSheet.swift`, and `app/ios/web/src/` (`bridge.ts`, `Transcript.tsx`, `mathDelimiters.ts`, `wireSentinel.ts`, `restSentinel.ts`)._
 
 ## BayboClient and store lifecycle
 
@@ -76,6 +76,80 @@ Isolation is enforced on the WEB side because the webview is shared:
   now on screen;
 - **(c)** `key={sessionId}` fully resets the React tree (`Transcript.tsx` has no module
   state; blob object URLs are revoked on unmount).
+
+### Per-session resync (the escape hatch)
+
+A device once rendered a session with a whole span of conversation missing that a
+freshly installed simulator rendered correctly off the same server data — live
+state accumulated across a compaction. `ChatStore.resync(transcript:)` is the
+hatch (not the fix): it puts one conversation back into the state a COLD OPEN
+would produce, by re-running the cold path rather than by adding a second
+synchronisation routine.
+
+**It is reached from the CHAT LIST** — a row's long-press context menu, behind a
+`ConfirmDialog` (`AppStore.promptResync` → `requestResync`). The header capsule's
+`ModelMenuPanel` carried it first and no longer does: the list needs no
+conversation opened first, does not depend on `ModelCatalog` having loaded, and
+already owns the other session-level operations (archive / delete / pin). The
+confirm is the one in `RootView` that does not wear red (`commitTint: Theme.ink`)
+— nothing is taken away — but it still asks, because the thread blanks under a
+reader who may be mid-way through it and there is no undo the way archive has one.
+
+Two steps: **delete the mirror** (`SessionIndex.dropTranscriptMirror` — the row
+stays), then **reload the page IF the webview is standing on that session**
+(`TranscriptBridge.rebuildIfShowing` → the same `webView.load(indexURL)`
+`TranscriptHost.init` runs). The reload is the point: a `reset` bridge message
+could only clear the state we thought to enumerate, and state that was *not*
+cleared when it should have been is the bug being escaped — so the document dies
+instead, taking the rows, the cursor and every live latch (open work block,
+`turnActive`, the streaming buffer) with it. The rebuilt page then does its own
+baseline pull (`sync` with `sinceOrdinal: null`).
+
+The condition is what the list entry point adds, and it is not an optimisation.
+From the list most sessions have no page to reload and their next open IS the
+cold path. But the chat the user just backed out of still holds the mounted
+document, and re-entering it takes `retarget`'s same-session early return — the
+live React tree, rows and all — so *that* page has to die now or the hatch reads
+as a no-op. The bridge decides, from `shownSessionId`: a stored value, **not**
+`store?.sessionId`, because the LRU can evict and deallocate that store while its
+transcript is still on screen, and `<Transcript key={sessionId}>` does not remount
+when the same id is re-inited.
+
+Three things the hatch must NOT break, and how:
+
+- **The outbox.** Queued sends live in `OutboxStore`, a sibling file — untouched.
+  But their optimistic BUBBLES live in the thread that was just thrown away, and
+  the gateway has no row to bring a queued send back from; a `failed` one would
+  also lose the red dot, its only retry affordance (the payload lives in the web
+  row). `ChatStore.replayUnconfirmedSends` re-seeds them, oldest first, with
+  `sendFailed` for the failed ones — see
+  [sync-and-outbox.md](sync-and-outbox.md#the-re-seed-runs-on-every-mount) for why
+  it runs on EVERY mount rather than only after a resync.
+- **The mirror coming back from the dead.** The outgoing document's `pagehide`
+  flushes its debounced `persist`, which lands *after* the delete and would write
+  the discarded state straight back — `deliverInit` would then restore it and the
+  hatch would silently do nothing. `TranscriptBridge` drops `persist` writes from
+  `rebuildIfShowing()` until the fresh `ready`.
+- **Pending approvals.** Native and frame-derived; a sync page carries rows, not
+  prompts. Dropping one leaves a gate nobody can answer until it self-denies, so
+  `resync` leaves the queue alone.
+
+The LEG is untouched — no unsubscribe, no redial. An in-flight turn keeps running
+and its frames keep arriving through the reload (they buffer in the bridge's
+`pending` and flush after the fresh `init`), so the rebuilt thread shows that
+turn's TAIL only: there is no fresh `SubscribeState` to reconstruct its opening
+work block, and no durable row for it yet either. Its terminal `message` lands
+authoritatively, and the block fills back in on the next sync after the turn
+persists.
+
+Feedback is the composer's notice line ("Rebuilding this chat from the server…"),
+raised by `resync` and retracted by the rebuild's own sync answer — a blanking
+transcript is ambiguous on a slow link. Reached from the list it lands on the
+NEXT visit, which is when the rebuild is actually visible; a store the user has
+already left refuses the write (`chatOpen`) and gets no banner, having rebuilt its
+page immediately instead. It cannot strand: any later writer takes ownership of
+the line (`ChatStore.notice`'s setter clears the flag), and the visit retracts it
+(`leaveChat`).
 
 ### Reparenting, prewarm, detach
 
@@ -166,13 +240,30 @@ frame while following.
 
 One signal covers keyboard, composer growth, and the notice line.
 
-## Wire-type sentinel
+## Wire-type sentinels
+
+Two compile-time pins, both type-only, both enforced by `pnpm build` (`ios-web` in CI is
+the only place they are ever evaluated):
 
 `app/ios/web/src/wireSentinel.ts` (and `app/web/src/api/wireSentinel.ts` for the web chat)
 pin the hand-written frame mirrors to the ts-rs-generated contract
-(`sidecars/sdk/channel-ts/src/generated/`) at compile time — a wire-side rename/retype
-fails `pnpm build`. `bigint`→`number` is mapped (this bundle receives JSON, not the SDK's
-msgpack).
+(`sidecars/sdk/channel-ts/src/generated/`) — a wire-side rename/retype fails the build.
+`bigint`→`number` is mapped (this bundle receives JSON, not the SDK's msgpack).
+
+`app/ios/web/src/restSentinel.ts` does the same for `TranscriptRowItem`, the shape the
+`sync_page` / `history_page` rows arrive in. That one is not a ts-rs type — the ffi passes
+each row through as an untouched `serde_json::Value`, so what lands here is the gateway's
+utoipa DTO `ChatTranscriptItem`, which `scripts/check-ts-bindings.sh` does not cover.
+The sentinel reads `app/web`'s generated schema across the project boundary (type-only,
+so `tsc` follows the path and no bundler or pnpm resolution is involved) rather than
+generating a second byte-identical copy here — a second copy would be a second thing to
+regenerate, i.e. a new drift surface inside the gate built to close one. It asserts
+assignability BOTH ways: every generated key must be mirrored (an addition nobody reads
+yet is invisible otherwise — how `turn_complete` sat unused for months) and every
+mirrored key must still exist. Two deliberate
+exemptions, both explained in the file: `Option<T>` fields carry
+`skip_serializing_if = "Option::is_none"`, so their `null` never rides the wire, and
+`ChatAttachment` stringifies the wire's `AttachmentKind` enum.
 
 ## Transcript rendering
 
@@ -183,6 +274,14 @@ streaming (rAF-coalesced; the web app only applies markdown on finalize).
 `reasoning` / `tool_started` / `tool_completed` / transient-notice frames fold into a
 per-turn collapsible work block ("思考中" card → "思考了 Xs ›"); answer text interrupted by
 more work settles into the block as a prose step.
+
+A reconstructed row's own judgements are read, not re-derived: a `/stop`ped turn's block
+carries `cancelled` and its closed card says so ("已取消 · 思考了 Xs") instead of reading as
+an ordinary completion — the live block learns it only when the reconstruction reconciles
+in, so either side carrying it cancels the card. A reloaded notice keeps its
+`notice_level` (the same warn/error ramp a folded notice step uses), and a persisted tool
+step with no `tool_status` stays NEUTRAL — the old "ok" default painted every
+result-less call green.
 
 ### Timestamps
 

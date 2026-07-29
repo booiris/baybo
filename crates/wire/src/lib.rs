@@ -190,8 +190,9 @@ pub const MAX_MESSAGE_BATCH_MESSAGES: usize = 64;
 /// [`Frame::Messages`] batch.
 pub const MAX_MESSAGE_BATCH_TEXT_BYTES: usize = 64 * 1024;
 
-/// Maximum aggregate attachments allowed across one inbound [`Frame::Messages`]
-/// batch. Attachments carry blob IDs, not bytes; this caps fan-out and downstream
+/// Maximum attachments allowed on one inbound message — aggregate across a
+/// [`Frame::Messages`] batch, and per-message on a singular [`Frame::Message`].
+/// Attachments carry blob IDs, not bytes; this caps fan-out and downstream
 /// per-message conversion work.
 pub const MAX_MESSAGE_BATCH_ATTACHMENTS: usize = 64;
 

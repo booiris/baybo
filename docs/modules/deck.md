@@ -180,8 +180,9 @@ surface. `MAX_BLOB_BYTES` (100 MiB) lives in `baybo-store::blob` as the single
 shared cap.
 
 A card does four things with blobs: **display** an image, let the user **upload**
-a photo, **share** a produced file back to the user, and — service-side —
-**fetch/store/read** bytes ref-first.
+a photo or a file, **share** a produced file back to the user, and — service-side
+— **fetch/store/read** bytes ref-first. Note the asymmetry: it can take in any
+file, and can only ever *render* an image.
 
 ### Service `ctx` — ref-first (bytes stay off bun's stdio where they can)
 
@@ -269,34 +270,98 @@ if one is ever wanted; making the *cache* honor the full id is the wrong lever
 
 ### Upload — native picker, ref over the port
 
-`deck.pickBlob({accept}) → Promise<{blobId, contentType, size, name?}>` runs
-card → shell → bridge → a native SwiftUI `PhotosPicker` (photo library) →
-`blobUploadBytes` → the ref resolves back. Bytes never cross the port; the card
-passes the `blobId` as a plain string into a following `deck.call` for its
-service to consume, and/or into `deck.blobUrl` to display it. The mime comes from
-`supportedContentTypes.first?.preferredMIMEType`, the byte count is pre-checked
-against the shared 100 MiB cap, and `name` is synthesized from the mime
-(`PhotosPicker` exposes none).
+`deck.pickBlob({accept}) → Promise<{blobId, contentType, size, name}>` runs
+card → shell → bridge → a native picker → a `deck:<card_id>`-stamped upload →
+the ref resolves back. Bytes never cross the port; the card passes the `blobId`
+as a plain string into a following `deck.call` for its service to consume,
+and/or into `deck.blobUrl` to display it — **if it is an image**, the only kind
+a card can render (see the display limit below).
+
+**`accept` is a mime-glob list**, the `<input accept>` convention (`"image/*"`,
+`"application/pdf"`, `"*/*"`), passed as a string or an array. The **shell** is
+the single normalizer (`normalizeAccept`, `web/src/deck/state.ts`): a card sends
+whatever it was authored with, anything unparseable degrades to `null`, and
+native receives one canonical comma-joined token list which
+`DeckStore.electPicker` re-parses against its own mirror of the grammar. Two
+parsers, one per side of the bridge, neither with a second copy.
+
+**The list elects the picker.** All-image — or absent — presents the photo
+library (`PhotosPicker`, `matching: .images`): that is what every card authored
+before `accept` was honored gets today, and the additive-only discipline (§The
+SDK) means the no-accept floor can never change under it. Any non-image token
+presents `.fileImporter` restricted to the matching `UTType`s — `type/*` widens
+to the tree's supertype, and `*/*` (or a mime iOS can't resolve) to
+`public.data`, never `public.item`, since a package is a directory the streaming
+upload cannot read.
+
+The two presentations bind to one `DeckStore.PickerMode`
+(`.idle` / `.photos` / `.files([UTType])`), not two Bools — SwiftUI cannot bind
+two presentation modifiers to the same flag. Their **cancel signals stay
+structurally separate**: `PhotosPicker` has no cancel callback, so a cancel is
+INFERRED from a dismissal with nothing chosen, deferred one runloop turn so a
+selection landing in the same tick wins the race; `.fileImporter` reports
+`onCancellation` outright and needs no inference (its dismissal means nothing
+beyond dropping the presentation). Only the tail is shared — cap check →
+upload → ref → settle.
+
+The photo leg loads the bytes and uploads them (`deck_blob_upload_bytes`); the
+file leg never holds them. It keeps the picked URL's **security-scoped access**
+open for the whole upload (RAII, not a paired stop — without it an iCloud item
+reads as empty, and the upload has three exits), sizes the file off disk against
+the shared 100 MiB cap, and streams it by PATH (`deck_blob_upload_file`), so a
+100 MiB pick costs no memory. `contentType` comes from the item's UTType, with
+the gateway's own `application/octet-stream` as the honest fallback. `name` is
+the file's REAL name for a file pick and synthesized (`photo.<ext>`) for a photo
+pick, which exposes none — either way it is always present.
 
 Two contracts the UI enforces. **One pick at a time**: a single `activePick`
 slot, held from selection all the way through the upload — a concurrent
 `pickBlob` gets an immediate typed `busy` (never a queued picker popping up
-seconds later as a ghost dialog), a dismissal with no selection resolves
-`cancelled`, and every request settles exactly once. **The shell's call/pick
-correlation is generation-guarded**: each pending entry pins the `MessagePort`
-it was made on, a result is delivered only to that same tile generation, and an
-iframe reload/removal purges the card's pending entries — otherwise a spec-change
+seconds later as a ghost dialog), a cancel resolves `cancelled`, and every
+request settles exactly once, whichever leg it took. A `busy` rejection carries
+a *different* id, so settling it must never free the pick it was rejected
+against. **The shell's call/pick correlation is generation-guarded**
+(`PendingRegistry`): each pending entry pins the `MessagePort` it was made on, a
+result is delivered only to that same tile generation, and an iframe
+reload/removal purges the card's pending entries — otherwise a spec-change
 reload (whose minutes-long `pickBlob` window makes it routine) would resolve the
 wrong promise and then silently eat the new generation's real answer.
 
 A picker upload is stamped `deck:<card_id>`, the same identity a card's service
 produces — so it is **reclaimed at purge** alongside the card's other blobs. The
-device sends the card id on an `x-baybo-deck-card` header (`deck_blob_upload_bytes`
-FFI); the gateway's device-upload arm honors it (`device_upload_identity` in
+device sends the card id on an `x-baybo-deck-card` header (the
+`deck_blob_upload_bytes` / `deck_blob_upload_file` FFIs); the gateway's
+device-upload arm honors it (`device_upload_identity` in
 `crates/gateway/src/channel/blobs.rs`) in place of the plain `device:<id>` marker.
-The card id is unforgeable by card JS (it comes from the shell's port→card map,
-threaded as `DeckStore.activePick.cardId`); the gateway does not validate the
-card exists, since the identity is a GC/diagnostic marker, never an access gate.
+Without that stamp the blob would be an immortal `device:*` orphan — purge-time
+reclamation is the only sweeper there is. The card id is unforgeable by card JS
+(it comes from the shell's port→card map, threaded as
+`DeckStore.activePick.cardId`); the gateway does not validate the card exists,
+since the identity is a GC/diagnostic marker, never an access gate.
+
+**A card cannot DISPLAY a non-image blob.** The card CSP is
+`default-src 'none'` with `img-src data: baybo-transcript:` as its only
+affordance, and `deck.blobUrl` exists purely to feed an `<img src>`. A picked
+PDF / CSV / zip has exactly two destinations: the card's own service, via
+`deck.call({blobId})`, and back to the user, via `deck.shareBlob`. Pointing an
+`<img>` at one yields a broken image, not a viewer. Note also that the 8 MiB cap
+in §Display is a **display** ceiling only — arbitrary-file picking widens the
+population of blobs that store fine and never display.
+
+**The two trains can skew, and there is no handshake.** §The SDK argues the two
+SDK halves are safe to ship on different trains because neither speaks to the
+other; `accept` is the first place that stops being the whole story. `SKILL.md`
+(what the authoring agent reads) ships inside the gateway binary; `sdkCard.js`
+and `DeckStore` ship inside the iOS app, which updates on its own schedule. A
+card authored against the new `SKILL.md` calling
+`pickBlob({accept: "application/pdf"})` on an **older app** silently gets the
+photo library — wrong behavior, not a failure, and the card sees a perfectly
+ordinary image ref. Nothing detects this: `sdkCard.js` is not an input to
+`spec_hash` (that is manifest + openapi + service.js + card.html) and is not
+covered by `SDK_VERSION` (the service-side preamble's stamp), so no fleet
+re-gate is forced and none would help. The mitigation is the compat floor
+above — a card that must work on both trains should validate the
+`contentType` it gets back rather than trusting `accept`.
 
 ### Share
 
@@ -339,9 +404,7 @@ opaquely, `SNAPSHOT_MAX_BYTES` is unaffected.
 
 Deferred: in-card video/audio playback (`media-src` + range-request scheme
 serving, which forces chunked `didReceive`); in-card fullscreen preview
-(ImageViewer / QuickLook); a streaming `blob_upload_file(path)` FFI so a large
-pick isn't read into memory before upload; arbitrary-file picking (`fileImporter`,
-not just the photo library); bounding a cache-*miss* display download before it
+(ImageViewer / QuickLook); bounding a cache-*miss* display download before it
 materializes; web deck parity for blobs.
 
 ## iOS client

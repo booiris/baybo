@@ -78,6 +78,8 @@ pub async fn adapt_call_result(
                         blob: BlobRef { blob_id },
                         mime_type: mime,
                         filename: None,
+                        width: None,
+                        height: None,
                     });
                 }
                 None => {
@@ -163,6 +165,8 @@ async fn decode_image(
         blob: blob_ref,
         mime_type: mime.to_string(),
         filename: None,
+        width: None,
+        height: None,
     })
 }
 

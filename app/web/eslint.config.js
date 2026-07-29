@@ -3,13 +3,13 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
 // Static-analysis gate for the dashboard. The vitest suite exercises pure
-// reducers and never renders (see docs/todo/web-unit-tests.md), so a whole
+// reducers and never renders (see docs/web-unit-tests.md), so a whole
 // class of *wiring* bugs — a value that isn't a real boolean used in a
 // condition, a condition whose outcome is constant — is invisible to it and to
 // `tsc`. `!isCollapsed` where `isCollapsed` is an imported function (the cron
 // block that shipped blank, 2026-07-17) type-checks and passes every test; the
 // two type-aware rules below reject it. Scope: `src` only — config files carry
-// no such logic. See docs/todo/web-unit-tests.md for the suite + roadmap.
+// no such logic. See docs/web-unit-tests.md for the suite + roadmap.
 export default tseslint.config(
   { ignores: ['dist', 'node_modules', 'src/api/schema.d.ts'] },
   {

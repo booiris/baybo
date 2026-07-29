@@ -500,6 +500,14 @@ export function ChatPage() {
   // Per-session view buckets keyed by session_id. `currentView` is
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
+  // Latest buckets, readable from the sync loop — which must NOT re-create on
+  // every transcript change: `runSyncSession`'s identity gates the open /
+  // reconnect / tick sync effects, so a `views` dependency would pull on every
+  // rendered row.
+  const viewsRef = useRef<Partial<Record<string, SessionView>>>({});
+  useEffect(() => {
+    viewsRef.current = views;
+  }, [views]);
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
   // Row keys that get a `CompactionDivider` rendered *before* them (see
   // `compactionDividerKeys`), recomputed when the thread or its boundaries move.
@@ -839,8 +847,9 @@ export function ChatPage() {
 
   /** The one forward-recovery pull (docs/sync-protocol.md "The one client
    *  algorithm"): session open, reconnect, gap nudge and the safety tick
-   *  all land here. `since = cursor` (absent on a fresh view → baseline
-   *  REPLACE); a rebased response also REPLACEs and dirties the cursor. */
+   *  all land here. `since = syncSince(cursor, thread)` (absent on a fresh
+   *  view, or on one the cursor doesn't cover → baseline REPLACE); a rebased
+   *  response also REPLACEs and dirties the cursor. */
   const runSyncSession = useCallback(
     (sid: string): Promise<void> => {
       const inFlight = syncInFlightRef.current.get(sid);
@@ -872,13 +881,15 @@ export function ChatPage() {
       };
       const task = (async () => {
         const before = cursorsRef.current.get(sid) ?? INITIAL_CURSOR;
-        const baseline = before.cursor === null;
+        const view = viewsRef.current[sid];
+        const since = syncSince(before.cursor, view === undefined ? [] : view.transcript);
+        const baseline = since === null;
         try {
           const { data, error } = await client.GET('/v1/chat/sessions/{session_id}/sync', {
             params: {
               path: { session_id: sid },
               query: {
-                ...(before.cursor === null ? {} : { since_ordinal: before.cursor }),
+                ...(since === null ? {} : { since_ordinal: since }),
                 limit: baseline ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT,
               },
             },
@@ -910,7 +921,7 @@ export function ChatPage() {
             const view = prev[sid] ?? EMPTY_VIEW;
             const transcript = replace
               ? applySyncReplace(view.transcript, pageRows, unconfirmed, view.turn)
-              : applySyncMerge(view.transcript, pageRows);
+              : applySyncMerge(view.transcript, pageRows, view.compactionPoints);
             return {
               ...prev,
               [sid]: {
@@ -1753,8 +1764,11 @@ export function ChatPage() {
             ...cur,
             // Fold at the seam: a turn longer than one page comes back as two
             // `work` items (the older page's tail-of-turn half above the current
-            // thread's head-of-turn half). One turn must stay one card.
-            transcript: foldAdjacentWork([...newRows, ...cur.transcript]),
+            // thread's head-of-turn half). One turn must stay one card — but a
+            // pair straddling a compaction boundary is two turns, kept apart so
+            // the divider lands between them (a backfill page carries no
+            // `compaction_points`; the session-level set is the view's).
+            transcript: foldAdjacentWork([...newRows, ...cur.transcript], cur.compactionPoints),
             oldestOrdinal: newOldest,
             hasMore: data.has_more,
             olderLoading: false,
@@ -4553,6 +4567,24 @@ function workRowOrdinal(key: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/** The `since_ordinal` the next sync may present: the cursor, unless the thread
+ *  is not a PREFIX of it. A difference answers rows strictly `> since` and
+ *  `applySyncMerge` appends every row it doesn't already hold, so a page that
+ *  OVERLAPS the rendered thread welds that whole span onto the BOTTOM instead of
+ *  placing it by ordinal. The cursor is a COVERAGE watermark, and the scroll-up
+ *  prepend (`loadOlder`) renders rows without advancing it, so hand such a view
+ *  the baseline REPLACE — the path a fresh tab proves correct. Rows with no
+ *  `m`/`w` ordinal (an optimistic send, a live work block) are not durable
+ *  coverage and never trip it. Mirrors iOS `syncSince`. */
+export function syncSince(cursor: number | null, transcript: TranscriptRow[]): number | null {
+  if (cursor === null) return null;
+  for (const row of transcript) {
+    const ordinal = workRowOrdinal(row.key);
+    if (ordinal !== null && ordinal > cursor) return null;
+  }
+  return cursor;
+}
+
 /** Identity of a work step for dedup when fusing two work blocks. A tool step
  *  keys by its call id (both the live and reconstructed shapes now carry it); a
  *  call with no id keys by what it DID (label + status + summary, NUL-separated
@@ -4640,6 +4672,29 @@ function sameContinuingTurn(prev: TranscriptRow): boolean {
   return prev.workComplete === false;
 }
 
+/** Whether a compaction boundary sits between two work blocks' ordinals — the
+ *  server breaks a work block at a watermark, so the two halves are DIFFERENT
+ *  turns (compaction is a turn boundary) and a fused card would swallow the row
+ *  `compactionDividerKeys` draws the seam before. Both halves must carry a
+ *  durable `w<ordinal>` key; a live block (no ordinal) straddles nothing.
+ *
+ *  Kept alongside `sameContinuingTurn`, which subsumes it only for a watermark
+ *  ONE reconstruction window straddled: that split flushes the pre-compaction
+ *  half `turn_complete: true` and the turn-complete guard refuses on its own. A
+ *  watermark falling in the GAP between two pages is split by neither window, so
+ *  the head is an ordinary cut-off (`false`) block — this is the only guard that
+ *  refuses there. Mirrors iOS `crossesCompaction`. */
+function crossesCompaction(
+  prev: TranscriptRow,
+  next: TranscriptRow,
+  compactionPoints: { ordinal: number; at: string }[],
+): boolean {
+  const a = workRowOrdinal(prev.key);
+  const b = workRowOrdinal(next.key);
+  if (a === null || b === null) return false;
+  return compactionPoints.some((p) => a < p.ordinal && p.ordinal <= b);
+}
+
 /** Whether the older-page load must be kicked off programmatically because the
  *  loaded transcript doesn't overflow its scroll viewport (so no `onScroll`
  *  event — the scroll-up trigger — can ever fire). True only when there is more
@@ -4698,12 +4753,23 @@ export function compactionDividerKeys(
 /** Collapse each adjacent same-turn work pair in an assembled row list.
  *  Idempotent — a healthy list has no adjacency — so it's safe to run at each
  *  seam where two independently-reconstructed pages are stitched: the scroll-up
- *  prepend (`loadOlder`) and the forward-sync merge (`applySyncMerge`). */
-export function foldAdjacentWork(rows: TranscriptRow[]): TranscriptRow[] {
+ *  prepend (`loadOlder`) and the forward-sync merge (`applySyncMerge`). Two
+ *  blocks straddling a `compactionPoints` boundary are never fused — a mid-turn
+ *  compaction's pre-/post halves are distinct turns with the divider between. */
+export function foldAdjacentWork(
+  rows: TranscriptRow[],
+  compactionPoints: { ordinal: number; at: string }[] = [],
+): TranscriptRow[] {
   const out: TranscriptRow[] = [];
   for (const r of rows) {
     const prev = out.length > 0 ? out[out.length - 1] : undefined;
-    if (r.kind === 'work' && prev !== undefined && prev.kind === 'work' && sameContinuingTurn(prev)) {
+    if (
+      r.kind === 'work' &&
+      prev !== undefined &&
+      prev.kind === 'work' &&
+      sameContinuingTurn(prev) &&
+      !crossesCompaction(prev, r, compactionPoints)
+    ) {
       out[out.length - 1] = foldWork(prev, r);
       continue;
     }
@@ -4719,9 +4785,14 @@ export function foldAdjacentWork(rows: TranscriptRow[]): TranscriptRow[] {
  *  turn this client was watching live replaces the matching open block
  *  (same start) instead of duplicating it, and a final assistant row
  *  lands in the trailing streaming bubble when the live final frame was
- *  lost. Rows arrive ascending and strictly above the cursor, so plain
- *  append preserves order. */
-export function applySyncMerge(prev: TranscriptRow[], page: TranscriptRow[]): TranscriptRow[] {
+ *  lost. Rows arrive ascending, and plain append preserves order only
+ *  because the page EXTENDS the thread — `syncSince` refuses a difference
+ *  the thread is not a prefix of. */
+export function applySyncMerge(
+  prev: TranscriptRow[],
+  page: TranscriptRow[],
+  compactionPoints: { ordinal: number; at: string }[],
+): TranscriptRow[] {
   if (page.length === 0) return prev;
   const next = prev.slice();
   let changed = false;
@@ -4792,8 +4863,9 @@ export function applySyncMerge(prev: TranscriptRow[], page: TranscriptRow[]): Tr
   }
   // Same seam as the scroll-up prepend, forward: when the cursor fell mid-turn,
   // the already-rendered thread's trailing work half meets this page's leading
-  // half. Fold so the straddled turn stays one card (no-op on a healthy thread).
-  return changed ? foldAdjacentWork(next) : prev;
+  // half. Fold so the straddled turn stays one card (no-op on a healthy thread),
+  // but never across a compaction boundary — those halves are two turns.
+  return changed ? foldAdjacentWork(next, compactionPoints) : prev;
 }
 
 /** REPLACE the thread with a baseline / rebased page, then re-overlay
