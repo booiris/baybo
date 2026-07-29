@@ -9,7 +9,7 @@ import { installMemoryLocalStorage } from '../../test/memoryStorage';
 // pure-function suites can't reach: the synchronous `queuesRef` composition
 // (resume = clearPause then popTop in one tick), the empty-queue pause
 // collapse (`normalize`), FIFO order, localStorage persistence, and the
-// cross-tab `storage` listener. See docs/todo/web-unit-tests.md.
+// cross-tab `storage` listener. See docs/web-unit-tests.md.
 
 const SID = 'sess-1';
 const KEY = `baybo.queue.${SID}`;
