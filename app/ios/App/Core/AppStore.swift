@@ -137,6 +137,9 @@ final class AppStore: ObservableObject {
     @Published var confirmDeleteSession: String?
     /// The cron group a swipe-delete is asking to confirm, same host and reasons.
     @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
+    /// The session the list's long-press resync is asking to confirm, same host
+    /// and reasons — and the only one of these whose commit is not destructive.
+    @Published var confirmResyncSession: String?
     /// Job id → name, learned from the scheduled-jobs list. See
     /// `rememberCronJobTitles`.
     @Published private(set) var cronJobTitles: [String: String] = [:]
@@ -958,6 +961,22 @@ final class AppStore: ObservableObject {
         withAnimation(ConfirmDialog.enterMotion) {
             confirmDeleteCronGroup = PendingCronGroupDelete(jobId: jobId, memberIds: memberIds)
         }
+    }
+
+    /// Raise the resync confirm for a long-pressed row.
+    func promptResync(_ sessionId: String) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmResyncSession = sessionId
+        }
+    }
+
+    /// Rebuild one conversation's transcript from the gateway, after the confirm
+    /// — the per-session escape hatch ([docs/transcript.md]). Nothing here is a
+    /// server call: it discards this device's local rendering and lets the cold
+    /// path re-derive it, so the store it materialises is the one the next visit
+    /// would have opened anyway.
+    func requestResync(_ sessionId: String) {
+        chatStore(for: sessionId).resync(transcript: transcriptHost?.bridge)
     }
 
     /// Archive or unarchive, optimistically: the row moves lists at once and

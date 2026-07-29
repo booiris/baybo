@@ -549,6 +549,15 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    /// Drop one conversation's transcript mirror while KEEPING its row — the
+    /// per-session resync escape hatch (`ChatStore.resync`). Every other mirror
+    /// delete here means the conversation itself is gone; this one means the
+    /// opposite: the conversation stays and its local rendering is thrown away
+    /// so the cold-open path can rebuild it from the gateway.
+    func dropTranscriptMirror(sessionId: String) {
+        TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+    }
+
     func pendingMutation(for sessionId: String) -> PendingMutation? {
         pendingMutations[sessionId]
     }

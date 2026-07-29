@@ -26,7 +26,13 @@ Width knob: `ModelMenuPanel.panelWidth` (232).
 
 Three levels replace in place, sub-levels headed by a back row:
 
-1. **Entries by name** — trailing ✓ on the effective entry, no chevron.
+1. **Entries by name** — trailing ✓ on the effective entry, no chevron. Nothing
+   else: the **per-session resync** briefly sat here below a hairline and now
+   lives on the chat row's long-press menu
+   ([transcript.md](transcript.md#per-session-resync-the-escape-hatch)). It never
+   had anything to do with the model, and the capsule is hidden while
+   `ModelCatalog` has no entries — a first run that has never reached
+   `GET /v1/llm/models` could not reach it at all.
 2. **That entry's models** (`model` + `model_list`, ✓ on the effective model) plus, below a hairline, the **Thinking** row — subtitled with the entry's current level and carrying the panel's one trailing `›`.
 3. **The levels** — `none/minimal/low/medium/high/xhigh` (`crates/llm` registry contract).
 

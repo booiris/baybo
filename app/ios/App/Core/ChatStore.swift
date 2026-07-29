@@ -33,6 +33,19 @@ final class BlobProgressForwarder: BlobProgress, @unchecked Sendable {
     }
 }
 
+/// The slice of the shared transcript webview the resync path drives
+/// (`TranscriptBridge` is the only conformer). A protocol because both callers
+/// reach it from OUTSIDE a chat visit — the list's long-press menu, and the
+/// bridge's own mount edges — where the store may hold no bridge at all, and
+/// because the re-seeded bubbles' order and failed state are the contract worth
+/// pinning without standing up a `WKWebView`.
+@MainActor
+protocol TranscriptSurface: AnyObject {
+    func userSent(msgId: String, text: String, attachments: [AttachmentRef])
+    func sendFailed(_ msgId: String)
+    func rebuildIfShowing(_ sessionId: String)
+}
+
 /// The chat screen's connection state machine + send path — the native owner of
 /// everything the webview's reconnect effect used to do (App.tsx 903-984).
 ///
@@ -126,10 +139,19 @@ final class ChatStore: ObservableObject {
         get { noticeLine }
         set {
             guard chatOpen || newValue == nil else { return }
+            // Whoever writes next OWNS the line: a resync banner the user
+            // dismissed, or a dial cleared, must not be retracted a second time
+            // (by then the line belongs to someone else).
+            resyncNoticeOpen = false
             noticeLine = newValue
         }
     }
     @Published private var noticeLine: String?
+    /// Whether the dock's line is still the resync banner. Set right after the
+    /// raise; the banner announces a rebuild, so the rebuild's own sync answer
+    /// is what takes it back (`retractResyncNotice`) — it is never left to
+    /// expire on a timer, and `leaveChat` retracts it like any other line.
+    private var resyncNoticeOpen = false
     /// Whether this conversation is the one the user is in — the property every
     /// notice write consults. A store exists because a conversation is being
     /// opened, so it starts true; `leaveChat` ends the visit; `attachBridge`
@@ -486,6 +508,81 @@ final class ChatStore: ObservableObject {
     private func retractNotice() {
         guard notice != nil else { return }
         notice = nil
+    }
+
+    // MARK: - Resync (the per-session escape hatch)
+
+    /// Throw this conversation's local state away and let the COLD-OPEN path
+    /// rebuild it from the gateway. Deliberately not a new synchronisation
+    /// routine: a freshly installed device renders the same session correctly
+    /// off the same server data, so the reconstruction known to be right is the
+    /// one a first open runs — no mirror on disk, a page with no memory, one
+    /// baseline sync. Two steps, and nothing else:
+    ///
+    /// 1. delete the mirror, so `deliverInit` has nothing to restore;
+    /// 2. reload the page — but ONLY if the webview is standing on this
+    ///    conversation right now (`rebuildIfShowing`), so every in-memory latch
+    ///    (an open work block, `turnActive`, the streaming buffer) dies with the
+    ///    document rather than being enumerated and cleared. It is the entry
+    ///    point that makes step 2 conditional: reached from the chat list, this
+    ///    session usually has no page to reload, and the cold open its next
+    ///    visit runs IS the rebuild. Reached for the chat the user just backed
+    ///    out of, re-entering would reuse the live React tree (`retarget`'s
+    ///    same-session early return) and show rows the mirror no longer has —
+    ///    so that page has to die now. `transcript` is nil only before the
+    ///    webview has booted at all.
+    ///
+    /// What it does NOT touch: the leg (this session stays subscribed, so an
+    /// in-flight turn keeps running and lands its terminal message on the
+    /// rebuilt thread), the send outbox (queued and failed sends are re-seeded
+    /// onto the rebuilt page by `replayUnconfirmedSends`), and the pending
+    /// approvals — those are native, frame-derived, and unanswerable if
+    /// dropped: the gate would deny itself five minutes later with the user
+    /// never asked.
+    func resync(transcript: (any TranscriptSurface)?) {
+        index.dropTranscriptMirror(sessionId: sessionId)
+        notice = Lang.shared.t("chat.resyncing")
+        resyncNoticeOpen = true
+        transcript?.rebuildIfShowing(sessionId)
+    }
+
+    /// The rebuild's rows are back — take the banner down. Announcing a rebuild
+    /// and then leaving the line up once it finished would make the dock lie.
+    private func retractResyncNotice() {
+        guard resyncNoticeOpen else { return }
+        notice = nil
+    }
+
+    /// Re-seed the optimistic bubbles for sends the outbox still owns. The
+    /// gateway has no row for a queued send, so no sync can bring one back:
+    /// without this the user's unsent message silently disappears, and a
+    /// `failed` one loses the red dot that is its ONLY retry affordance (the
+    /// retry payload lives in the web row).
+    ///
+    /// Run on EVERY mount edge (`ready` and every bridge attach), never behind a
+    /// "a resync just happened" latch. A latch only covers the hatch; the bubbles
+    /// go missing whenever the thread the page mounts from is older than the
+    /// outbox — a jetsam between the send and the debounced mirror write, a
+    /// session whose mirror was never written, a rebased page that dropped the
+    /// row. Running it always is safe because the re-seed is IDEMPOTENT: the
+    /// webview keys a user bubble by its `platform_msg_id` and drops a
+    /// `userSent` for a row it already holds, so a mirror that carries the
+    /// bubble takes this as a no-op and only a thread missing it gains one.
+    func replayUnconfirmedSends(to transcript: any TranscriptSurface) {
+        for entry in unconfirmedSends() {
+            transcript.userSent(
+                msgId: entry.platformMsgId, text: entry.text,
+                attachments: entry.attachments.map(Self.toAttachmentRef))
+            if entry.state == .failed { transcript.sendFailed(entry.platformMsgId) }
+        }
+    }
+
+    /// The outbox's entries oldest first, so the re-seeded bubbles come back in
+    /// the order they were sent. Not `private`: `replayUnconfirmedSends` is its
+    /// only production caller, but a test pins the ordering (the outbox is a
+    /// dictionary — `entries()` has none) without standing up a webview.
+    func unconfirmedSends() -> [OutboxEntry] {
+        outbox.entries().sorted { $0.createdAt < $1.createdAt }
     }
 
     // MARK: - Bridge lifecycle
@@ -954,6 +1051,7 @@ final class ChatStore: ObservableObject {
             // bubble intact); otherwise the guard would stay set forever and
             // the connEpoch sync after the first send would be a no-op until
             // reload.
+            retractResyncNotice()
             pushSynthesizedFrame([
                 "kind": "sync_page",
                 "rows": [],
@@ -971,6 +1069,7 @@ final class ChatStore: ObservableObject {
                     sessionId: sessionId, sinceOrdinal: sinceOrdinal, limit: limit)
                 reconcileOutboxAfterSync(frameJson: frame)
                 pushFrame(frame)
+                retractResyncNotice()
             } catch {
                 NSLog("baybo: sync: %@", bayboErrorText(error))
                 // Unwind the webview's in-flight sync guard so the next trigger

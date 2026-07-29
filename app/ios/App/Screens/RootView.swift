@@ -62,7 +62,7 @@ struct RootView: View {
                 ConfirmDialog(
                     titleKey: "connected.logout",
                     bodyKey: "connected.logoutConfirm",
-                    destructiveKey: "connected.logout",
+                    commitKey: "connected.logout",
                     onCancel: dismissLogoutConfirm,
                     onConfirm: {
                         dismissLogoutConfirm()
@@ -78,13 +78,33 @@ struct RootView: View {
                 ConfirmDialog(
                     titleKey: "list.deleteConfirmTitle",
                     bodyKey: "list.deleteConfirmBody",
-                    destructiveKey: "list.delete",
+                    commitKey: "list.delete",
                     onCancel: dismissDeleteConfirm,
                     onConfirm: {
                         dismissDeleteConfirm()
                         withAnimation {
                             store.requestDelete(sessionId)
                         }
+                    }
+                )
+                .zIndex(1)
+            }
+
+            // The resync is the one commit here that takes nothing away — the
+            // gateway is authoritative and the outbox is untouched — so it is
+            // the one that does not wear red. It still stops and asks: it blanks
+            // a thread the reader may be mid-way through, and there is no undo
+            // for it the way archive and pin have one.
+            if let sessionId = store.confirmResyncSession {
+                ConfirmDialog(
+                    titleKey: "list.resyncConfirmTitle",
+                    bodyKey: "list.resyncConfirmBody",
+                    commitKey: "list.resync",
+                    commitTint: Theme.ink,
+                    onCancel: dismissResyncConfirm,
+                    onConfirm: {
+                        dismissResyncConfirm()
+                        store.requestResync(sessionId)
                     }
                 )
                 .zIndex(1)
@@ -99,7 +119,7 @@ struct RootView: View {
                     titleKey: "cronJobs.deleteConfirmTitle",
                     bodyKey: "cronJobs.deleteConfirmBody",
                     bodyArg: pending.name,
-                    destructiveKey: "list.delete",
+                    commitKey: "list.delete",
                     onCancel: dismissDeleteCronJobConfirm,
                     onConfirm: {
                         dismissDeleteCronJobConfirm()
@@ -120,7 +140,7 @@ struct RootView: View {
                     titleKey: "list.deleteGroupConfirmTitle",
                     bodyKey: "list.deleteGroupConfirmBody",
                     bodyArg: String(pending.memberIds.count),
-                    destructiveKey: "list.delete",
+                    commitKey: "list.delete",
                     onCancel: dismissDeleteCronGroupConfirm,
                     onConfirm: {
                         dismissDeleteCronGroupConfirm()
@@ -146,6 +166,12 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissResyncConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmResyncSession = nil
         }
     }
 
