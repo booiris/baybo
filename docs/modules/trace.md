@@ -6,9 +6,9 @@ The `trace` crate is the home for the four-tier observability model: domain type
 
 The `TraceStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the sqlite implementation, shuttling rows without depending on `baybo-trace` (it converts in its tests only). `impl From<baybo_store::StorageError> for TraceError` bridges errors at the call sites.
 
-Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
+Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `turn` is: **Turn manages state, Trace manages content.**
 
-The hierarchy is `Session > Job > Step > Span (+ SpanEvent)` — see `session.md` for the top two layers and `job.md` for state-machine details. Trace covers the bottom two plus events.
+The hierarchy is `Session > Turn > Step > Span (+ SpanEvent)` — see `session.md` for the top two layers and `turn.md` for state-machine details. Trace covers the bottom two plus events.
 
 ## Design Decisions
 
@@ -115,12 +115,12 @@ The model-facing payload is still capped at
 `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES` and any full value
 is content-addressed in the tool-spill directory; `output_truncated_from`
 retains the uncapped serialized length. `QueryApi::replay` resolves references
-server-side, while the per-job web endpoint leaves them compact and
+server-side, while the per-turn web endpoint leaves them compact and
 `resolveToolCallOutput` resolves them against the overview's one transcript log.
 
 ### Single-table persistence
 
-Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
+Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
 
 The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
@@ -153,7 +153,7 @@ spans live directly under the **parent** session and their `last_ordinal` /
 `prefix_len` are recorded against the parent's own transcript. Hydration reads
 each session's own log: `replay` passes the replayed `session_id` straight to
 `hydrate_persisted_trace_data`, while `load_trace_overview` returns that same
-session's message log and `load_job_trace` leaves `Persisted` pointers intact for
+session's message log and `load_turn_trace` leaves `Persisted` pointers intact for
 the web client to resolve via `hydratePersistedInput` against it. Every session
 resolves to itself.
 
@@ -180,20 +180,20 @@ an LLM or tool request goes out. There is no deferred/background write path.
 ### Recovery
 
 `baybo_agent::recovery` closes half-open trace rows left by dropped execution.
-At boot, `recover_orphaned_traces_and_jobs` walks non-terminal jobs from the
+At boot, `recover_orphaned_traces_and_turns` walks non-terminal turns from the
 prior process, closes pending spans/steps at the last observed child activity,
-and cancels the job as `SystemCrash`. It also asks `TraceStore` for unfinished
-steps so detached work under already-terminal jobs (title generation,
-title generation, progress observer) is closed without reopening or cancelling
-the owning job. While the process is still alive, `recover_panicked_actor_session`
-performs the same repair for the panicked session's active turn jobs, using the
-actor task's crash time as the close time.
+and cancels the turn as `SystemCrash`. It also asks `TraceStore` for unfinished
+steps so detached work under already-terminal turns (title generation, progress
+observer) is closed without reopening or cancelling the owning turn. While the
+process is still alive, `recover_panicked_actor_session` performs the same repair
+for the panicked session's active chat turns, using the actor task's crash time
+as the close time.
 
 ## Constraints
 
-- Depends on `baybo-job` (for `CancelReason`) and `baybo-model` (for `JobId`, `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
+- Depends on `baybo-turn` (for `CancelReason`) and `baybo-model` (for `TurnId`, `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
-- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
+- Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Turn > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - Trace deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete-everywhere-but-cron_jobs))
 - `SpanRecorder` holds locks only for short critical sections, never across `await`
 - `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-trace = { workspace = true, features = ["test-support"] }`.
@@ -202,8 +202,8 @@ actor task's crash time as the close time.
 
 | Module    | Role                                                                                                                         |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `job`     | Job manages state, Trace manages content; linked via `JobId`; `partial_artifacts: Vec<SpanId>` references trace spans         |
-| `agent`   | Constructs and shares one `SpanRecorder` per session; uses `JobLifecycle` and `SpanRecorder` together as sibling facades       |
+| `turn`    | Turn manages state, Trace manages content; linked via `TurnId`; `partial_artifacts: Vec<SpanId>` references trace spans       |
+| `agent`   | Constructs and shares one `SpanRecorder` per session; uses `TurnLifecycle` and `SpanRecorder` together as sibling facades      |
 | `store`   | Owns the `TraceStore` trait + its `StepRow` / `SpanRow` / `SpanEventRow` DTOs and `StorageError`; this crate converts rich types ↔ rows |
 | `storage` | Provides the sqlite implementation of `TraceStore` (from `baybo-store`), shuttling rows; depends on `baybo-trace` only as a dev-dependency |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |

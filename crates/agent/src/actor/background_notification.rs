@@ -1,4 +1,4 @@
-//! Durable delivery pipeline for terminal background-job results.
+//! Durable delivery pipeline for terminal background-turn results.
 //!
 //! The pipeline has two stages that may coexist:
 //!
@@ -12,8 +12,8 @@
 //! durability boundary explicit and keeps the main actor loop about routing.
 
 use baybo_channels::OutgoingMessage;
-use baybo_job::JobInput;
 use baybo_model::{BackgroundNotificationDelivery, ContentBlock, PendingBackgroundResult};
+use baybo_turn::TurnInput;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
@@ -578,8 +578,8 @@ impl AgentActor {
     }
 
     async fn drive_background_notification_turn(&mut self, content: Vec<ContentBlock>) {
-        // The persisted/public job kind retains its historical name for data
-        // compatibility; this path now covers every background-job kind. Its
+        // The persisted/public turn kind retains its historical name for data
+        // compatibility; this path now covers every background-turn kind. Its
         // delta sink exposes reasoning, tool progress, and answer prose before
         // the canonical final Message.
         let response_tx = self.volatile.response_tx.clone();
@@ -593,7 +593,7 @@ impl AgentActor {
         self.volatile.agent_loop.set_notification_cue(true);
         let result = self
             .run_agent_loop(
-                JobInput::SubagentNotification { content },
+                TurnInput::SubagentNotification { content },
                 None,
                 Some(response_tx),
                 None,

@@ -1,7 +1,7 @@
 //! Agent-side wiring for the compaction LLM call.
 //!
 //! `baybo-context` deliberately doesn't know about `SpanRecorder`,
-//! `CostManager`, or `JobId` — those are agent-layer concerns, so
+//! `CostManager`, or `TurnId` — those are agent-layer concerns, so
 //! `ContextManager::maybe_compress` takes a chat callback and the caller
 //! injects all of that cross-cutting machinery without polluting the
 //! context crate. [`CompressionRunner`] is that injection: it bundles
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use baybo_context::ContextError;
 use baybo_llm::{Attribution, BillableLlm, LlmResponse, ModelInfo};
-use baybo_model::{JobId, SessionId};
+use baybo_model::{SessionId, TurnId};
 use baybo_trace::{
     CompressionApplied, CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult,
     SpanRecorder, StepKind,
@@ -34,7 +34,7 @@ const MAX_COMPACTION_ATTEMPTS: usize = 2;
 
 /// Agent-side dependencies needed to execute the compression LLM call:
 /// trace recorder, cost ledger, the LLM client, and the identity /
-/// cancel context that pin the call to a specific job + session.
+/// cancel context that pin the call to a specific turn + session.
 pub(crate) struct CompressionRunner {
     pub(crate) llm_client: Arc<BillableLlm>,
     pub(crate) recorder: Arc<SpanRecorder>,
@@ -45,7 +45,7 @@ pub(crate) struct CompressionRunner {
     /// tricked by prompt injection in the messages it's summarizing
     /// could leak secret-like text into persisted state.
     pub(crate) security_gateway: Arc<SecurityGateway>,
-    pub(crate) job_id: JobId,
+    pub(crate) turn_id: TurnId,
     pub(crate) user_id: String,
     pub(crate) session_id: SessionId,
     pub(crate) model_info: ModelInfo,
@@ -75,7 +75,7 @@ impl CompressionRunner {
             llm_client,
             recorder,
             security_gateway,
-            job_id,
+            turn_id,
             user_id,
             session_id,
             model_info,
@@ -86,11 +86,11 @@ impl CompressionRunner {
         // `cancel_ctx` borrows the token for span/step outcome classification;
         // the loop body needs its own handle to race the provider call.
         let cancel = cancel_token.clone();
-        let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
+        let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));
         let recorder_inner = Arc::clone(&recorder);
         crate::runtime::scope::with_step(
             recorder.as_ref(),
-            job_id,
+            turn_id,
             StepKind::Compression {
                 trigger: Some(trigger),
                 // The callback is only reached by the live-summary path; the
@@ -121,7 +121,7 @@ impl CompressionRunner {
                     let result = crate::runtime::scope::with_llm_span(
                         recorder_inner.as_ref(),
                         &step,
-                        job_id,
+                        turn_id,
                         begin,
                         cancel_ctx,
                         |span| {
@@ -136,7 +136,7 @@ impl CompressionRunner {
                                 let bound = llm_client.bind(Attribution {
                                     user_id,
                                     session_id,
-                                    job_id,
+                                    turn_id,
                                     span_id: span.span_id,
                                     reason: baybo_llm::CallReason::Compression,
                                 });

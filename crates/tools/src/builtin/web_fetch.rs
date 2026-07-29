@@ -4,7 +4,7 @@
 //! side-LLM extraction path fires when ALL three hold: a `prompt` is
 //! supplied, [`ToolContext::llm`] is populated (the agent layer binds
 //! a per-call [`BilledChat`] handle to the running
-//! `(user, session, job, span)` so cost lands in `cost_records`
+//! `(user, session, turn, span)` so cost lands in `cost_records`
 //! against the WebFetch tool span), AND the extracted text is at
 //! least `SUMMARY_MIN_CHARS` long. Smaller pages fit in the agent's
 //! own context, so the text is returned verbatim — a side-LLM call
@@ -16,7 +16,7 @@
 //! per-tool cap documented in `docs/modules/security.md`. LLM input is capped
 //! independently at 96 KiB so a giant page can't blow the side LLM's context.
 //! The gateway applies a final cap on top of this; injection scanning and
-//! `<tool_output>` wrapping are also the gateway's job — this tool just
+//! `<tool_output>` wrapping are also the gateway's turn — this tool just
 //! returns the extracted (or summarised) text.
 //!
 //! HTML bodies are run through `dom_smoothie` — a Rust port of

@@ -1,6 +1,6 @@
 //! Admin TCP bearer-token auth.
 //!
-//! The admin listener hosts config / status / jobs / cron / memory /
+//! The admin listener hosts config / status / turns / cron / memory /
 //! traces / skills / tools / llm, chat REST, and the co-hosted channel
 //! WS/blob routes. The admin bearer stored in the secret vault under
 //! `gateway.admin_token` guards ordinary Web requests. When

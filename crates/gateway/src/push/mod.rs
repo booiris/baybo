@@ -1,6 +1,6 @@
 //! A-side push dispatcher.
 //!
-//! Subscribes to the `JobLifecycle` broadcast bus and, for each
+//! Subscribes to the `TurnLifecycle` broadcast bus and, for each
 //! **successfully-completed real user turn** (`phase == Completed`,
 //! `kind == UserChat` — which excludes Cron / Compact / Spawned /
 //! SubagentNotification) **on the `owner` chat pool**, encrypts a short
@@ -10,7 +10,7 @@
 //! is real on the lock screen while C and Apple see only ciphertext.
 //!
 //! The reply's persisted ordinal rides the `Completed` event
-//! ([`JobPhase::Completed { reply_ordinal }`](baybo_job::JobPhase)); the
+//! ([`TurnPhase::Completed { reply_ordinal }`](baybo_turn::TurnPhase)); the
 //! dispatcher reads exactly that row (no read-after-write poll). A completion
 //! with no ordinal — a non-message output, or a reply whose store write failed
 //! — has no durable row to preview, so it is **not pushed** at all.
@@ -37,11 +37,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use base64::Engine;
-use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase};
 use baybo_model::{ContentBlock, Role, SessionId};
 use baybo_security::SecretVault;
 use baybo_session::SessionManager;
 use baybo_store::{DeviceRow, DeviceStatus, DeviceStore, SessionStore};
+use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnPhase};
 use device_proto::aead;
 use device_proto::delegation;
 use parking_lot::Mutex;
@@ -393,7 +393,7 @@ pub struct PushDispatcher {
     /// dependency — same class as `registered` / `push_counter`.
     ///
     /// The count is a full session-list read plus an unread scan, and it runs
-    /// on the single task that also drains the job-lifecycle bus. That bus is
+    /// on the single task that also drains the turn-lifecycle bus. That bus is
     /// bounded and a lagged reader *drops* pushes, so paying the scan on every
     /// completed turn would let a burst (a cron sweep, a batch of finishing
     /// turns) turn "the badge is a beat stale" into "the reply push never
@@ -524,33 +524,33 @@ impl PushDispatcher {
     /// is *not* a conversation is a private workspace nobody would open.
     /// Everything else (compaction, subagents, their notifications) is
     /// machinery, not a message.
-    pub fn should_dispatch(ev: &JobLifecycleEvent) -> bool {
-        matches!(ev.phase, JobPhase::Completed { .. })
+    pub fn should_dispatch(ev: &TurnLifecycleEvent) -> bool {
+        matches!(ev.phase, TurnPhase::Completed { .. })
             && matches!(
                 ev.kind,
-                JobInputKind::UserChat | JobInputKind::Cron | JobInputKind::CronNotification
+                TurnInputKind::UserChat | TurnInputKind::Cron | TurnInputKind::CronNotification
             )
     }
 
     /// Dispatch on the completed edge of a real user turn. The reply's ordinal
-    /// rides the event, so there's no per-job cursor to track on other edges.
-    pub async fn handle_event(&self, ev: &JobLifecycleEvent) {
+    /// rides the event, so there's no per-turn cursor to track on other edges.
+    pub async fn handle_event(&self, ev: &TurnLifecycleEvent) {
         if Self::should_dispatch(ev) {
             self.dispatch_completed(ev).await;
         }
     }
 
-    async fn dispatch_completed(&self, ev: &JobLifecycleEvent) {
+    async fn dispatch_completed(&self, ev: &TurnLifecycleEvent) {
         // `handle_event` only calls this on a Completed edge; the reply ordinal
         // rides that variant. No ordinal → no durable reply row to preview
         // (a Structured completion, or a failed reply write) → don't push at all.
-        let JobPhase::Completed {
+        let TurnPhase::Completed {
             reply_ordinal: Some(reply_ordinal),
         } = &ev.phase
         else {
             tracing::debug!(
                 session = %ev.session_id,
-                job = %ev.job_id,
+                turn = %ev.turn_id,
                 "push: completed turn has no durable reply row; not pushing"
             );
             return;
@@ -590,7 +590,7 @@ impl PushDispatcher {
         // delivery pushes (as a `CronNotification`). Pushing here as well would
         // buzz the phone twice for one scheduled task, with the deep link
         // pointing at a session the user cannot even open.
-        if ev.kind == JobInputKind::Cron && !session.trigger.is_cron_conversation() {
+        if ev.kind == TurnInputKind::Cron && !session.trigger.is_cron_conversation() {
             tracing::debug!(
                 session = %ev.session_id,
                 "push: one-shot cron fire pushes from its origin conversation; not pushing here"
@@ -666,7 +666,7 @@ impl PushDispatcher {
     }
 
     /// Dispatch on a tool call parking at the approval gate — the second push
-    /// source, fed by [`approval::ApprovalPushRelay`] rather than the job
+    /// source, fed by [`approval::ApprovalPushRelay`] rather than the turn
     /// lifecycle bus (nothing terminal has happened; that is the point).
     pub async fn dispatch_approval(&self, push: &approval::ApprovalPush) {
         let session = match self.session_manager.get(&push.session_id).await {
@@ -1162,14 +1162,14 @@ fn relay_url_to_http_base(relay_url: &str) -> String {
 /// through unobserved.
 pub fn spawn<F>(
     dispatcher: Arc<PushDispatcher>,
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
     mut approvals: approval::ApprovalPushStream,
     shutdown: F,
 ) -> JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut events = job_lifecycle.subscribe_lifecycle_events();
+    let mut events = turn_lifecycle.subscribe_lifecycle_events();
     // A closed approval stream disables its arm rather than ending the task:
     // completed-turn pushes are a separate, independently-useful feature and
     // must survive the approval relay going away.
@@ -1204,13 +1204,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_model::JobId;
+    use baybo_model::TurnId;
 
-    fn event(phase: JobPhase, kind: JobInputKind) -> JobLifecycleEvent {
-        JobLifecycleEvent {
-            job_id: JobId::new(),
+    fn event(phase: TurnPhase, kind: TurnInputKind) -> TurnLifecycleEvent {
+        TurnLifecycleEvent {
+            turn_id: TurnId::new(),
             session_id: SessionId::from("s1"),
-            parent_job_id: None,
+            parent_turn_id: None,
             phase,
             kind,
         }
@@ -1267,12 +1267,12 @@ mod tests {
         // be a conversation once the session is loaded), and the delivery of a
         // one-shot fire's result into the conversation that scheduled it.
         for kind in [
-            JobInputKind::UserChat,
-            JobInputKind::Cron,
-            JobInputKind::CronNotification,
+            TurnInputKind::UserChat,
+            TurnInputKind::Cron,
+            TurnInputKind::CronNotification,
         ] {
             assert!(PushDispatcher::should_dispatch(&event(
-                JobPhase::Completed {
+                TurnPhase::Completed {
                     reply_ordinal: None
                 },
                 kind,
@@ -1280,12 +1280,12 @@ mod tests {
         }
         // Machinery, not messages.
         for kind in [
-            JobInputKind::Compact,
-            JobInputKind::Spawned,
-            JobInputKind::SubagentNotification,
+            TurnInputKind::Compact,
+            TurnInputKind::Spawned,
+            TurnInputKind::SubagentNotification,
         ] {
             assert!(!PushDispatcher::should_dispatch(&event(
-                JobPhase::Completed {
+                TurnPhase::Completed {
                     reply_ordinal: None
                 },
                 kind,
@@ -1293,12 +1293,12 @@ mod tests {
         }
         // Non-terminal edges, and failed / cancelled turns, don't buzz.
         assert!(!PushDispatcher::should_dispatch(&event(
-            JobPhase::Started,
-            JobInputKind::UserChat,
+            TurnPhase::Started,
+            TurnInputKind::UserChat,
         )));
         assert!(!PushDispatcher::should_dispatch(&event(
-            JobPhase::Failed,
-            JobInputKind::UserChat,
+            TurnPhase::Failed,
+            TurnInputKind::UserChat,
         )));
     }
 

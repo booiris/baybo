@@ -235,10 +235,10 @@ impl SessionStore for SqliteSessionStore {
             .lineage
             .as_ref()
             .map(|l| l.parent_session_id.as_str().to_string());
-        let parent_job = session
+        let parent_turn = session
             .lineage
             .as_ref()
-            .map(|l| l.parent_job_id.to_string());
+            .map(|l| l.parent_turn_id.to_string());
         let parent_span = session
             .lineage
             .as_ref()
@@ -265,7 +265,7 @@ impl SessionStore for SqliteSessionStore {
             .interact("sessions.save", move |conn| {
                 conn.execute(
                     "INSERT INTO sessions \
-                     (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
+                     (id, root_session_id, trigger_kind, parent_session_id, parent_turn_id, \
                       parent_span_id, lineage_kind, created_at, last_active, \
                       hidden, pinned, archived, channel, data) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13) \
@@ -273,7 +273,7 @@ impl SessionStore for SqliteSessionStore {
                        root_session_id = excluded.root_session_id, \
                        trigger_kind = excluded.trigger_kind, \
                        parent_session_id = excluded.parent_session_id, \
-                       parent_job_id = excluded.parent_job_id, \
+                       parent_turn_id = excluded.parent_turn_id, \
                        parent_span_id = excluded.parent_span_id, \
                        lineage_kind = excluded.lineage_kind, \
                        created_at = excluded.created_at, \
@@ -284,7 +284,7 @@ impl SessionStore for SqliteSessionStore {
                         root_id,
                         trigger_kind,
                         parent_session,
-                        parent_job,
+                        parent_turn,
                         parent_span,
                         lineage_kind,
                         created_us,
@@ -1823,7 +1823,7 @@ mod tests {
             "state": {},
             "root_session_id": "good-1",
             "trigger": {"kind": "user"},
-            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "unknown_kind"}
+            "lineage": {"parent_session_id": "good-1", "parent_turn_id": "turn-x", "kind": "unknown_kind"}
         }"#;
         assert!(
             serde_json::from_str::<Session>(bad_blob).is_err(),

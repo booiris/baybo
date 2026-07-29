@@ -9,8 +9,8 @@ pub mod test_support;
 // import them from `baybo_store` directly, not via this adapter.
 use baybo_store::{
     AgentProfileStore, BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore,
-    CostStore, CronStore, DeckCardStore, DeviceStore, JobStore, MessageSearchStore, SecretStore,
-    SessionFolderStore, SessionStore, SkillRiskStore, TaskStore, TraceStore,
+    CostStore, CronStore, DeckCardStore, DeviceStore, MessageSearchStore, SecretStore,
+    SessionFolderStore, SessionStore, SkillRiskStore, TaskStore, TraceStore, TurnStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -29,7 +29,7 @@ pub struct Store {
     pub trace: std::sync::Arc<dyn TraceStore>,
     pub secret: std::sync::Arc<dyn SecretStore>,
     pub cost: std::sync::Arc<dyn CostStore>,
-    pub job: std::sync::Arc<dyn JobStore>,
+    pub turn: std::sync::Arc<dyn TurnStore>,
     pub cron: std::sync::Arc<dyn CronStore>,
     pub risk: std::sync::Arc<dyn SkillRiskStore>,
     pub channel_session: std::sync::Arc<dyn ChannelSessionStore>,
@@ -78,7 +78,7 @@ impl Store {
             trace: std::sync::Arc::new(sqlite::SqliteTraceStore::new(pool.clone())),
             secret: std::sync::Arc::new(sqlite::SqliteSecretStore::new(pool.clone())),
             cost: std::sync::Arc::new(sqlite::SqliteCostStore::new(pool.clone())),
-            job: std::sync::Arc::new(sqlite::SqliteJobStore::new(pool.clone())),
+            turn: std::sync::Arc::new(sqlite::SqliteJobStore::new(pool.clone())),
             cron: std::sync::Arc::new(sqlite::SqliteCronStore::new(pool.clone())),
             risk: std::sync::Arc::new(sqlite::SqliteSkillRiskStore::new(pool.clone())),
             channel_session: std::sync::Arc::new(sqlite::SqliteChannelSessionStore::new(

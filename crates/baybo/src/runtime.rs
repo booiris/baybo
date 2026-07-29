@@ -32,7 +32,6 @@ use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_config::{BayboConfig, LlmEntryName};
 use baybo_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use baybo_cost::{CostManager, SpendingLimits};
-use baybo_job::JobLifecycle;
 use baybo_llm::BillableLlm;
 use baybo_memory::Memory;
 use baybo_security::{LeakDetectionRule, LeakDetector};
@@ -42,6 +41,7 @@ use baybo_storage::Store;
 use baybo_tools::ToolRegistry;
 use baybo_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use baybo_trace::{SpanRecorder, TraceEventStream};
+use baybo_turn::TurnLifecycle;
 use baybo_workspace::WorkspaceManager;
 use regex::Regex;
 use tokio::sync::mpsc;
@@ -90,7 +90,7 @@ pub fn build_leak_detector(
 /// Open the project's sqlite store just far enough to build a
 /// [`SecretVault`]. Used by the gateway's vault-only subcommands so
 /// they don't have to pay the cost of a full [`build_managers`] call
-/// (job recovery, cron scheduler, tool registry, etc.) to read or
+/// (turn recovery, cron scheduler, tool registry, etc.) to read or
 /// rotate a token.
 pub async fn build_secret_vault(config: &BayboConfig) -> anyhow::Result<Arc<SecretVault>> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
@@ -122,13 +122,13 @@ pub async fn build_bot_registry_deps(
 pub struct ManagerGraph {
     pub config: Arc<BayboConfig>,
     pub session_manager: Arc<SessionManager>,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
-    /// Deferred supervisor handle for the background-job manager (built
+    /// Deferred supervisor handle for the background-turn manager (built
     /// with the `tool_executor`, before the supervisor exists). `wire_router`
     /// sets it once the supervisor is built so command escorts can route.
     pub bg_supervisor_slot: Arc<std::sync::OnceLock<AgentSupervisor>>,
@@ -201,7 +201,7 @@ pub struct ManagerGraph {
 
     /// Process-wide parent token for `AgentActor`s. Bridged to the
     /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
-    /// cascades down through every actor's per-job cancel tree.
+    /// cascades down through every actor's per-turn cancel tree.
     pub actor_parent_token: CancellationToken,
 
     /// Fan-out limiter shared between `spawn_subagent` (reserves at
@@ -444,16 +444,16 @@ pub async fn build_managers(
         stores.session_folder.clone(),
     ));
 
-    let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
+    let turn_lifecycle = Arc::new(TurnLifecycle::new(stores.turn.clone()));
 
     // Crash recovery: roll forward orphan trace rows (steps/spans left
     // `Pending` because their `with_step` future was dropped before
-    // close) and the surrounding non-terminal jobs. `ended_at` is
+    // close) and the surrounding non-terminal turns. `ended_at` is
     // backfilled from observed activity, not boot wall-clock.
     // Best-effort — errors warn but never block boot.
-    baybo_agent::recovery::recover_orphaned_traces_and_jobs(
+    baybo_agent::recovery::recover_orphaned_traces_and_turns(
         stores.trace.clone(),
-        Arc::clone(&job_lifecycle),
+        Arc::clone(&turn_lifecycle),
     )
     .await;
 
@@ -641,7 +641,7 @@ pub async fn build_managers(
         });
     }
 
-    // Background-job sink for "Bash timeout → background". The manager
+    // Background-turn sink for "Bash timeout → background". The manager
     // routes completion notifications via the supervisor, which is built
     // further down, so it holds it behind a `OnceLock` set right after.
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
@@ -716,7 +716,7 @@ pub async fn build_managers(
     Ok(ManagerGraph {
         config,
         session_manager,
-        job_lifecycle,
+        turn_lifecycle,
         cron_scheduler,
         security_gateway,
         bg_supervisor_slot,
@@ -784,7 +784,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
     let supervisor = AgentSupervisor::new(response_tx);
-    // Hand the now-built supervisor to the background-job manager so its
+    // Hand the now-built supervisor to the background-turn manager so its
     // escorts can route completion notifications back to parent sessions.
     let _ = graph.bg_supervisor_slot.set(supervisor.clone());
 
@@ -811,7 +811,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let tool_executor = Arc::clone(&graph.tool_executor);
         let trace_store = graph.stores.trace.clone();
         let task_store = graph.stores.task.clone();
-        let job_lifecycle = Arc::clone(&graph.job_lifecycle);
+        let turn_lifecycle = Arc::clone(&graph.turn_lifecycle);
         let security_gateway = Arc::clone(&graph.security_gateway);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
@@ -900,7 +900,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     user_id: session.user.id.clone(),
                     channel: session.channel.clone(),
                     response_tx: response_tx.clone(),
-                    job_lifecycle: Arc::clone(&job_lifecycle),
+                    turn_lifecycle: Arc::clone(&turn_lifecycle),
                     trace_store: trace_store.clone(),
                 };
                 let actor = AgentActor::from_parts(
@@ -908,7 +908,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     baybo_agent::state::VolatileResources {
                         agent_loop,
                         response_tx,
-                        job_lifecycle: Arc::clone(&job_lifecycle),
+                        turn_lifecycle: Arc::clone(&turn_lifecycle),
                         span_recorder,
                         actor_token,
                         supervisor: Some(supervisor_for_spawn.clone()),
@@ -944,12 +944,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     );
 
     // Turn-state projector: the single producer of the web chat's live
-    // turn-activity signal. It subscribes to job lifecycle start + terminal
+    // turn-activity signal. It subscribes to turn lifecycle start + terminal
     // events and, on each transition, broadcasts the session's current
-    // `TurnState` recomputed from the job store. See
+    // `TurnState` recomputed from the turn store. See
     // `spawn_turn_state_projector`.
     baybo_agent::supervisor::spawn_turn_state_projector(
-        Arc::clone(&graph.job_lifecycle),
+        Arc::clone(&graph.turn_lifecycle),
         Arc::clone(&graph.session_manager),
         supervisor.response_tx().clone(),
         graph.actor_parent_token.clone(),
@@ -983,7 +983,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 supervisor: supervisor.clone(),
                 dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
                 cost_manager: Arc::clone(&cost_manager),
-                job_lifecycle: Arc::clone(&graph.job_lifecycle),
+                turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
                 actor_parent_token: graph.actor_parent_token.clone(),
                 external_agents: Arc::clone(&external_agents),
                 llm_pool: Arc::clone(&llm_pool),
@@ -1003,7 +1003,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         security_gateway: Arc::clone(&graph.security_gateway),
         cost_manager: Arc::clone(&cost_manager),
         actor_spawner: spawn_actor_for,
-        job_lifecycle: Arc::clone(&graph.job_lifecycle),
+        turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),

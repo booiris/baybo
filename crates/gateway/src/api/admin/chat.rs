@@ -775,24 +775,24 @@ pub struct ChatSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
     /// The cron job whose fire this conversation is, for the clients that
-    /// collapse a job's fires into one chat-list row (a **cron group** — a
+    /// collapse a turn's fires into one chat-list row (a **cron group** — a
     /// derived view, never a `session_folders` row; see `docs/cron-groups.md`).
     /// `None` for a user session, and for the one-shot fire workspaces the list
     /// never returns anyway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_job_id: Option<String>,
-    /// The label for that group: the job's **live** title while the job exists
+    /// The label for that group: the turn's **live** title while the turn exists
     /// (so a rename propagates with no rewrite of any session), falling back to
-    /// the title snapshotted onto the fire at mint once the job is deleted.
-    /// `None` only when both are unavailable — a pre-snapshot fire whose job is
+    /// the title snapshotted onto the fire at mint once the turn is deleted.
+    /// `None` only when both are unavailable — a pre-snapshot fire whose turn is
     /// gone; clients leave those rows flat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_job_title: Option<String>,
     /// Whether this row's **cron group** is pinned to the top of the chat list.
-    /// Read off the live job (`cron_jobs.pinned`), so every fire of the job
+    /// Read off the live turn (`cron_jobs.pinned`), so every fire of the turn
     /// carries the same value and the client folds it into the one group row —
     /// exactly as it already does for `cron_job_title`. The group is a view, so
-    /// the bit necessarily dies with the job: a tombstone group (job deleted,
+    /// the bit necessarily dies with the turn: a tombstone group (turn deleted,
     /// history kept) is always unpinned. `false` for a non-cron row.
     #[serde(default)]
     pub cron_group_pinned: bool,
@@ -1111,11 +1111,11 @@ fn cron_group_id(session: &Session) -> Option<&str> {
 
 /// What a live cron job contributes to its group's chat-list row.
 struct CronGroupMeta {
-    /// The job's current title. `None` when it has none (a pre-title row) — the
+    /// The turn's current title. `None` when it has none (a pre-title row) — the
     /// group then falls back to the fire's snapshot. NOT a reason to drop the
-    /// job from the map: it still carries `pinned`.
+    /// turn from the map: it still carries `pinned`.
     title: Option<String>,
-    /// Whether the user pinned this job's group (`cron_jobs.pinned`).
+    /// Whether the user pinned this turn's group (`cron_jobs.pinned`).
     pinned: bool,
 }
 
@@ -1124,7 +1124,7 @@ struct CronGroupMeta {
 /// failed read degrades to an empty map rather than failing the list — every
 /// group then falls back to its tombstone name and reads as unpinned.
 ///
-/// An untitled job stays IN the map with `title: None`. It used to be filtered
+/// An untitled turn stays IN the map with `title: None`. It used to be filtered
 /// out wholesale, which was harmless while the title was all this carried — but
 /// it also carries the pin now, and dropping the row would silently unpin the
 /// group of any job that has no title.
@@ -1159,22 +1159,22 @@ async fn live_cron_job_meta(
 /// which outlives its job via the fire's title snapshot, is always unpinned).
 fn cron_group_pinned(session: &Session, live: &HashMap<String, CronGroupMeta>) -> bool {
     cron_group_id(session)
-        .and_then(|job_id| live.get(job_id))
+        .and_then(|turn_id| live.get(turn_id))
         .is_some_and(|meta| meta.pinned)
 }
 
-/// The label for this row's cron group: the job's **live** title, so a rename
+/// The label for this row's cron group: the turn's **live** title, so a rename
 /// propagates to every client on the next list fetch without rewriting a single
 /// session; falling back to the title snapshotted onto the fire at mint, which
-/// answers the one question the live lookup cannot — *the job is gone; what was
+/// answers the one question the live lookup cannot — *the turn is gone; what was
 /// this history called?*
 ///
 /// `None` when both are unavailable (a fire minted before the snapshot existed,
-/// whose job has since been deleted). Clients leave such a row flat rather than
+/// whose turn has since been deleted). Clients leave such a row flat rather than
 /// inventing a name — the population is self-limiting.
 fn cron_group_label(session: &Session, live: &HashMap<String, CronGroupMeta>) -> Option<String> {
-    let job_id = cron_group_id(session)?;
-    live.get(job_id)
+    let turn_id = cron_group_id(session)?;
+    live.get(turn_id)
         .and_then(|meta| meta.title.clone())
         .or_else(|| session.trigger.cron_job_title().map(str::to_owned))
 }
@@ -1319,7 +1319,7 @@ async fn build_history_page(
     // message-timestamp start (the worst case is the pre-existing split).
     let active_turn_started = if before_ordinal.is_none() {
         state
-            .job_lifecycle
+            .turn_lifecycle
             .active_turn_started_at(sid)
             .await
             .ok()
@@ -1501,15 +1501,15 @@ async fn sync_difference(
     };
     let attachment_map = transcript_attachments(&raw, state.blob_store.as_ref()).await;
     // Durable rows only — the in-flight turn's live steps are the
-    // `SubscribeState` bundle's job, NOT sync's. But we DO align the trailing
+    // `SubscribeState` bundle's turn, NOT sync's. But we DO align the trailing
     // in-flight turn's reconstructed work block to the active turn's
-    // `started_at` (one indexed job read): a mid-turn difference reconstructs
+    // `started_at` (one indexed turn read): a mid-turn difference reconstructs
     // that turn's persisted tool rows into a partial `work` block, and without
     // the alignment its `w<ordinal>`/start wouldn't match the live
     // (SubscribeState-opened) block — the client would render TWO blocks for
     // one turn. Aligning the start lets the client reconcile them into one.
     let active_turn_started = state
-        .job_lifecycle
+        .turn_lifecycle
         .active_turn_started_at(sid)
         .await
         .ok()
@@ -2530,7 +2530,7 @@ async fn create_or_load_chat_session(
 /// sessions, memory, and cost all live under one owner identity — so past the
 /// auth boundary the chat REST layer no longer distinguishes them, and new
 /// rows carry `owner`, not a per-surface tag. Shared with the cron routes,
-/// whose jobs are scoped the same way. (`_authed` is retained for call-site
+/// whose turns are scoped the same way. (`_authed` is retained for call-site
 /// symmetry; the surface no longer changes the channel.)
 pub(crate) fn chat_list_channel(_authed: Option<&AuthedClient>) -> ChannelType {
     ChannelType::owner()
@@ -3185,7 +3185,7 @@ fn reconstruct_transcript_with_attachments(
         work.ordinal = Some(last_ordinal);
     }
     // When a turn is still in flight, align this trailing block's start with
-    // the live `TurnState`'s `started_at` (the job start instant) rather than
+    // the live `TurnState`'s `started_at` (the turn start instant) rather than
     // the first message's timestamp. Both are computed from
     // `active_turn_started_at`, so they match exactly — which is what lets a
     // reloading tab *reopen* this block on the next `turn_state{active}`
@@ -3920,7 +3920,7 @@ mod tests {
     fn reconstruct_in_flight_turn_aligns_work_start_with_live_turn_state() {
         // An in-flight turn (tool call persisted, no final answer yet). With an
         // active turn, the trailing work block must start at the live
-        // TurnState instant (ts(9), the job start) — NOT the user message's
+        // TurnState instant (ts(9), the turn start) — NOT the user message's
         // timestamp (ts(2)) — so a reloading tab reopens THIS block on the
         // next `turn_state{active}` (start-match) instead of opening a second.
         let tail = vec![

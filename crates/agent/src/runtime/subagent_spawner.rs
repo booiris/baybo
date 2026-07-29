@@ -3,16 +3,16 @@ use std::time::Duration;
 
 use baybo_channels::{AgentOutput, IncomingMessage, Message};
 use baybo_cost::CostManager;
-use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use baybo_llm::TokenUsage;
 use baybo_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_DISPATCH_YIELD_GUIDANCE, ChannelType, ChatMessage,
-    ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata, OnTimeout,
+    ContentBlock, ExternalAgentKind, Lineage, LineageKind, MessageMetadata, OnTimeout,
     PendingBackgroundResult, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
     SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind,
-    User,
+    TurnId, User,
 };
 use baybo_session::SessionManager;
+use baybo_turn::{CancelReason, TurnInput, TurnLifecycle, TurnOutput};
 use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use futures::StreamExt;
@@ -57,7 +57,7 @@ pub struct SubagentSpawnerConfig {
     pub supervisor: AgentSupervisor,
     pub dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     pub cost_manager: Arc<CostManager>,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub actor_parent_token: CancellationToken,
     pub external_agents: Arc<ExternalAgentRegistry>,
     pub llm_pool: LlmPoolHandle,
@@ -76,7 +76,7 @@ pub struct ActorSubagentSpawner {
     supervisor: AgentSupervisor,
     dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     cost_manager: Arc<CostManager>,
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
     actor_parent_token: CancellationToken,
     external_agents: Arc<ExternalAgentRegistry>,
     llm_pool: LlmPoolHandle,
@@ -91,7 +91,7 @@ impl ActorSubagentSpawner {
             supervisor,
             dispatch_limiter,
             cost_manager,
-            job_lifecycle,
+            turn_lifecycle,
             actor_parent_token,
             external_agents,
             llm_pool,
@@ -103,7 +103,7 @@ impl ActorSubagentSpawner {
             supervisor,
             dispatch_limiter,
             cost_manager,
-            job_lifecycle,
+            turn_lifecycle,
             actor_parent_token,
             external_agents,
             llm_pool,
@@ -129,7 +129,7 @@ impl baybo_subagent::SubagentSpawner for ActorSubagentSpawner {
         if let Err(e) = self
             .handle_subagent_spawn(
                 parent.session_id,
-                parent.job_id,
+                parent.turn_id,
                 parent.span_id,
                 parent.cancel_token,
                 request,
@@ -149,7 +149,7 @@ impl ActorSubagentSpawner {
     async fn handle_subagent_spawn(
         &self,
         parent_session_id: SessionId,
-        parent_job_id: JobId,
+        parent_turn_id: TurnId,
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
         request: SubagentSpawnRequest,
@@ -161,14 +161,14 @@ impl ActorSubagentSpawner {
         // tool reserved a slot before sending the envelope.
         let fan_out_root = request.fan_out_root.clone();
         // Namespace a grouped spawn's cohort tag by the dispatching turn's
-        // `job_id` (see `BackgroundNotificationGroup::cohort_key`). The agent
-        // loop counts the member into the same job-scoped cohort, so reusing a
+        // `turn_id` (see `BackgroundNotificationGroup::cohort_key`). The agent
+        // loop counts the member into the same turn-scoped cohort, so reusing a
         // group name in a later turn opens a fresh cohort instead of extending
         // a prior turn's still-draining one. No-op for ungrouped spawns.
         let mut request = request;
         if let Some(group) = request.group.take() {
             request.group = Some(baybo_model::BackgroundNotificationGroup::cohort_key(
-                parent_job_id,
+                parent_turn_id,
                 &group,
             ));
         }
@@ -192,7 +192,7 @@ impl ActorSubagentSpawner {
             SubagentBackend::Baybo => {
                 self.spawn_baybo_subagent(
                     parent,
-                    parent_job_id,
+                    parent_turn_id,
                     parent_span_id,
                     parent_actor_token,
                     request,
@@ -203,7 +203,7 @@ impl ActorSubagentSpawner {
             SubagentBackend::External { external_kind } => {
                 self.spawn_external_subagent(
                     parent,
-                    parent_job_id,
+                    parent_turn_id,
                     parent_span_id,
                     parent_actor_token,
                     request,
@@ -221,7 +221,7 @@ impl ActorSubagentSpawner {
     async fn spawn_baybo_subagent(
         &self,
         parent: Session,
-        parent_job_id: JobId,
+        parent_turn_id: TurnId,
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
         request: SubagentSpawnRequest,
@@ -231,7 +231,7 @@ impl ActorSubagentSpawner {
         let child_session = match self
             .resolve_child_session(
                 &parent,
-                parent_job_id,
+                parent_turn_id,
                 parent_span_id,
                 &request,
                 baybo_model::SubagentBackendKind::Baybo,
@@ -251,7 +251,7 @@ impl ActorSubagentSpawner {
         // terminal past us. Background spawns subscribe inside their detached
         // task instead — see the `if background` arm — so this receiver is
         // consumed only on the foreground paths below.
-        let terminal_rx = self.job_lifecycle.subscribe_lifecycle_events();
+        let terminal_rx = self.turn_lifecycle.subscribe_lifecycle_events();
 
         let now = Utc::now();
         let incoming = IncomingMessage {
@@ -298,7 +298,7 @@ impl ActorSubagentSpawner {
 
         // Background subagents — and convertible foreground ones, which
         // may outlive the dispatching turn once they convert — must
-        // outlive the parent's per-job cancel scope: the job that emitted
+        // outlive the parent's per-turn cancel scope: the turn that emitted
         // `spawn_subagent` ends as soon as the tool returns, so anchoring
         // the child to that token would tear it down immediately. The
         // process-wide `actor_parent_token` is the right ancestor —
@@ -340,7 +340,7 @@ impl ActorSubagentSpawner {
                     result_tx,
                 )
                 .await;
-            let job_lifecycle = Arc::clone(&self.job_lifecycle);
+            let turn_lifecycle = Arc::clone(&self.turn_lifecycle);
             let supervisor = self.supervisor.clone();
             let parent_id_for_task = parent.id.clone();
             let fan_out_root_for_task = fan_out_root.clone();
@@ -348,11 +348,11 @@ impl ActorSubagentSpawner {
             tokio::spawn(async move {
                 // Subscribe before feeding the prompt so a child that exits
                 // quickly can't slip its terminal past us.
-                let terminal_rx = job_lifecycle.subscribe_lifecycle_events();
+                let terminal_rx = turn_lifecycle.subscribe_lifecycle_events();
                 let result = if let Err(e) = mailbox
                     .send(AgentMessage::SubagentSpawned {
                         initial_message: Box::new(incoming),
-                        parent_job_id,
+                        parent_turn_id,
                     })
                     .await
                 {
@@ -364,7 +364,7 @@ impl ActorSubagentSpawner {
                         terminal_rx,
                         mailbox,
                         actor_token,
-                        job_lifecycle,
+                        turn_lifecycle,
                     )
                     .await
                 };
@@ -389,7 +389,7 @@ impl ActorSubagentSpawner {
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {
                 initial_message: Box::new(incoming),
-                parent_job_id,
+                parent_turn_id,
             })
             .await
         {
@@ -401,16 +401,16 @@ impl ActorSubagentSpawner {
         // Foreground dispatch under the shared wait/convert/kill policy. The
         // terminal future is the Baybo actor's terminal observer; the policy
         // (block for nested, or wait-then-convert/kill for a user parent) is
-        // backend-agnostic and lives in `run_foreground_job`.
+        // backend-agnostic and lives in `run_foreground_turn`.
         let fut = await_subagent_terminal(
             child_session_id.clone(),
             output_rx,
             terminal_rx,
             mailbox,
             actor_token.clone(),
-            Arc::clone(&self.job_lifecycle),
+            Arc::clone(&self.turn_lifecycle),
         );
-        tokio::spawn(run_foreground_job(
+        tokio::spawn(run_foreground_turn(
             ForegroundJob {
                 user_facing,
                 on_timeout,
@@ -438,7 +438,7 @@ impl ActorSubagentSpawner {
     async fn spawn_external_subagent(
         &self,
         parent: Session,
-        parent_job_id: JobId,
+        parent_turn_id: TurnId,
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
         request: SubagentSpawnRequest,
@@ -458,7 +458,7 @@ impl ActorSubagentSpawner {
         let child_session = match self
             .resolve_child_session(
                 &parent,
-                parent_job_id,
+                parent_turn_id,
                 parent_span_id,
                 &request,
                 baybo_model::SubagentBackendKind::External(kind),
@@ -491,7 +491,7 @@ impl ActorSubagentSpawner {
         // process-wide token so they outlive the dispatching turn (claude/codex
         // runs are long; a converted one keeps running past the turn that
         // spawned it). A non-convertible foreground run stays on the parent's
-        // per-job token (cancelled at the foreground-wait mark, or ends with the
+        // per-turn token (cancelled at the foreground-wait mark, or ends with the
         // turn). Mirrors the Baybo backend's anchoring.
         let user_facing = parent_supports_background(&parent);
         // Non-user parents can't deliver a background notification, so an
@@ -508,12 +508,12 @@ impl ActorSubagentSpawner {
         };
         let child_session_id = child_session.id.clone();
         let session_manager = Arc::clone(&self.session_manager);
-        let job_ctx = ExternalJobCtx {
-            lifecycle: Arc::clone(&self.job_lifecycle),
+        let turn_ctx = ExternalJobCtx {
+            lifecycle: Arc::clone(&self.turn_lifecycle),
             cost_manager: Arc::clone(&self.cost_manager),
             user_id: child_session.user.id.clone(),
             trigger_kind: child_session.trigger.kind(),
-            parent_job_id,
+            parent_turn_id,
         };
         let limiter_for_task = Arc::clone(&self.dispatch_limiter);
         let external_request = ExternalAgentRequest {
@@ -542,13 +542,13 @@ impl ActorSubagentSpawner {
             let group = request.group.clone();
             let fan_out_root_for_task = fan_out_root.clone();
             tokio::spawn(async move {
-                let result = run_external_agent_job(
+                let result = run_external_agent_turn(
                     agent,
                     kind,
                     external_request,
                     child_session_id.clone(),
                     session_manager,
-                    job_ctx,
+                    turn_ctx,
                 )
                 .await;
                 escort_background_terminal(
@@ -571,18 +571,18 @@ impl ActorSubagentSpawner {
         // user parent gets the same foreground-wait → convert-to-background
         // behaviour as the Baybo backend; a nested/cron parent blocks until the
         // run finishes (or hits `EXTERNAL_SUBAGENT_TIMEOUT`). The cancel token
-        // is the foreground job's `child_token` so a `/stop` or `Kill`-timeout
+        // is the foreground turn's `child_token` so a `/stop` or `Kill`-timeout
         // reaches the in-flight subprocess.
         let child_token = external_request.cancel.clone();
-        let fut = run_external_agent_job(
+        let fut = run_external_agent_turn(
             agent,
             kind,
             external_request,
             child_session_id.clone(),
             Arc::clone(&session_manager),
-            job_ctx,
+            turn_ctx,
         );
-        tokio::spawn(run_foreground_job(
+        tokio::spawn(run_foreground_turn(
             ForegroundJob {
                 user_facing,
                 on_timeout: request.on_timeout,
@@ -655,7 +655,7 @@ impl ActorSubagentSpawner {
     async fn resolve_child_session(
         &self,
         parent: &Session,
-        parent_job_id: JobId,
+        parent_turn_id: TurnId,
         parent_span_id: SpanId,
         request: &SubagentSpawnRequest,
         backend: baybo_model::SubagentBackendKind,
@@ -689,7 +689,7 @@ impl ActorSubagentSpawner {
             };
             let lineage = Lineage {
                 parent_session_id: parent.id.clone(),
-                parent_job_id,
+                parent_turn_id,
                 parent_span_id: Some(parent_span_id),
                 kind: LineageKind::Subagent,
             };
@@ -782,7 +782,7 @@ async fn escort_background_terminal(
     release_reserved_slot(limiter.as_ref(), fan_out_root);
 }
 
-/// Everything [`run_foreground_job`] needs that isn't the terminal future.
+/// Everything [`run_foreground_turn`] needs that isn't the terminal future.
 struct ForegroundJob {
     /// Whether the parent can host the background-conversion notification
     /// turn ([`Session::supports_background_jobs`]). A non-user parent blocks
@@ -799,7 +799,7 @@ struct ForegroundJob {
     /// The parent turn's cancel scope. A convertible child is anchored to the
     /// process-wide token (so it survives the dispatching turn once it
     /// converts), so the parent's `/stop` does NOT cascade to it during the
-    /// foreground window. `run_foreground_job` watches this to cancel a
+    /// foreground window. `run_foreground_turn` watches this to cancel a
     /// still-foreground child when the parent turn is stopped, so a stopped
     /// turn can't leave a subagent running on to convert and notify.
     parent_cancel: CancellationToken,
@@ -814,12 +814,12 @@ struct ForegroundJob {
 ///
 /// A non-user parent blocks until terminal (no timer). A user-facing parent
 /// waits up to [`SUBAGENT_FOREGROUND_WAIT`]; on overrun it either converts the
-/// still-running job to background (acking now, escorting its eventual
+/// still-running turn to background (acking now, escorting its eventual
 /// terminal as a notification turn) or force-cancels it, per `on_timeout`. The
 /// future is pinned and resumed across the `select!` boundary so it is never
 /// polled to completion twice.
-async fn run_foreground_job(
-    job: ForegroundJob,
+async fn run_foreground_turn(
+    turn: ForegroundJob,
     fut: impl std::future::Future<Output = SubagentResult>,
     supervisor: AgentSupervisor,
     session_manager: Arc<baybo_session::SessionManager>,
@@ -836,7 +836,7 @@ async fn run_foreground_job(
         parent_cancel,
         result_tx,
         fan_out_root,
-    } = job;
+    } = turn;
     tokio::pin!(fut);
 
     if !user_facing {
@@ -1041,48 +1041,48 @@ fn validate_resume_session(
     Ok(())
 }
 
-/// Job-lifecycle metadata for an external subagent run. The child
-/// session needs its own `Spawned` job for the trace browser to
-/// surface it — `list_session_summaries` drops zero-job sessions and
+/// Turn-lifecycle metadata for an external subagent run. The child
+/// session needs its own `Spawned` turn for the trace browser to
+/// surface it — `list_session_summaries` drops zero-turn sessions and
 /// `get_trace` 404s on them.
 struct ExternalJobCtx {
-    lifecycle: Arc<JobLifecycle>,
+    lifecycle: Arc<TurnLifecycle>,
     cost_manager: Arc<CostManager>,
     user_id: String,
     trigger_kind: TriggerKind,
-    parent_job_id: JobId,
+    parent_turn_id: TurnId,
 }
 
-/// Wrap [`run_external_agent`] in a `Spawned` job so the external
+/// Wrap [`run_external_agent`] in a `Spawned` turn so the external
 /// subagent's child session is visible/inspectable in the trace
 /// browser, mirroring how the in-process Baybo backend's actor creates
-/// a job per turn. The terminal `SubagentExitStatus` maps onto the
-/// job's terminal transition (Completed→complete, Failed→fail,
+/// a turn per turn. The terminal `SubagentExitStatus` maps onto the
+/// turn's terminal transition (Completed→complete, Failed→fail,
 /// Timeout→cancel(SubagentTimeout), Cancelled→cancel(ParentCancelled)).
 ///
-/// Uses the `JobLifecycle` primitives directly rather than
-/// `scope::with_job` because `with_job` collapses every non-success
+/// Uses the `TurnLifecycle` primitives directly rather than
+/// `scope::with_turn` because `with_turn` collapses every non-success
 /// exit into `fail()`; the subagent contract needs the distinct
 /// `SubagentTimeout` / `ParentCancelled` cancel reasons preserved.
 /// Terminal-race transitions (operator cancel landing as the run
 /// completes) surface as `InvalidTransition`, swallowed via `let _`.
-async fn run_external_agent_job(
+async fn run_external_agent_turn(
     agent: Arc<dyn ExternalAgent>,
     kind: ExternalAgentKind,
     request: ExternalAgentRequest,
     child_session_id: SessionId,
     session_manager: Arc<baybo_session::SessionManager>,
-    job_ctx: ExternalJobCtx,
+    turn_ctx: ExternalJobCtx,
 ) -> SubagentResult {
     let cancel = request.cancel.clone();
     let initial_prompt = vec![ContentBlock::Text(request.task.clone())];
-    let job = match job_ctx
+    let turn = match turn_ctx
         .lifecycle
-        .start_job(
+        .start_turn(
             child_session_id.clone(),
-            job_ctx.trigger_kind,
-            JobInput::Spawned { initial_prompt },
-            Some(job_ctx.parent_job_id),
+            turn_ctx.trigger_kind,
+            TurnInput::Spawned { initial_prompt },
+            Some(turn_ctx.parent_turn_id),
         )
         .await
     {
@@ -1092,21 +1092,24 @@ async fn run_external_agent_job(
                 child_session_id,
                 final_content: None,
                 status: SubagentExitStatus::Failed {
-                    reason: format!("start subagent job: {e}"),
+                    reason: format!("start subagent turn: {e}"),
                 },
             };
         }
     };
-    // Register the cancel token so an operator-issued job cancel trips
+    // Register the cancel token so an operator-issued turn cancel trips
     // the run, then move Pending → InProgress.
-    let _cancel_guard = job_ctx.lifecycle.register_running(job.id, cancel);
-    if let Err(e) = job_ctx.lifecycle.start(&job.id).await {
-        let _ = job_ctx.lifecycle.fail(&job.id, format!("start: {e}")).await;
+    let _cancel_guard = turn_ctx.lifecycle.register_running(turn.id, cancel);
+    if let Err(e) = turn_ctx.lifecycle.start(&turn.id).await {
+        let _ = turn_ctx
+            .lifecycle
+            .fail(&turn.id, format!("start: {e}"))
+            .await;
         return SubagentResult {
             child_session_id,
             final_content: None,
             status: SubagentExitStatus::Failed {
-                reason: format!("start subagent job: {e}"),
+                reason: format!("start subagent turn: {e}"),
             },
         };
     }
@@ -1119,10 +1122,10 @@ async fn run_external_agent_job(
     // without charging the operator's budget. No span tree exists, so
     // the record is keyed to a nil span id.
     if let Some(usage) = token_usage {
-        job_ctx.cost_manager.record_external_tokens(
-            &job_ctx.user_id,
-            job.session_id.clone(),
-            job.id,
+        turn_ctx.cost_manager.record_external_tokens(
+            &turn_ctx.user_id,
+            turn.session_id.clone(),
+            turn.id,
             SpanId::default(),
             baybo_llm::CallReason::Chat,
             &format!("{} (external agent)", kind.as_str()),
@@ -1136,12 +1139,12 @@ async fn run_external_agent_job(
     match &result.status {
         SubagentExitStatus::Completed => {
             let content = result.final_content.clone().unwrap_or_default();
-            let _ = job_ctx
+            let _ = turn_ctx
                 .lifecycle
                 .complete(
-                    &job.id,
+                    &turn.id,
                     // Subagent (Spawned) output — not a user turn, never pushed.
-                    JobOutput::Message {
+                    TurnOutput::Message {
                         content,
                         ordinal: None,
                     },
@@ -1149,18 +1152,18 @@ async fn run_external_agent_job(
                 .await;
         }
         SubagentExitStatus::Failed { reason } => {
-            let _ = job_ctx.lifecycle.fail(&job.id, reason.clone()).await;
+            let _ = turn_ctx.lifecycle.fail(&turn.id, reason.clone()).await;
         }
         SubagentExitStatus::Timeout => {
-            let _ = job_ctx
+            let _ = turn_ctx
                 .lifecycle
-                .cancel(&job.id, CancelReason::SubagentTimeout, vec![])
+                .cancel(&turn.id, CancelReason::SubagentTimeout, vec![])
                 .await;
         }
         SubagentExitStatus::Cancelled => {
-            let _ = job_ctx
+            let _ = turn_ctx
                 .lifecycle
-                .cancel(&job.id, CancelReason::ParentCancelled, vec![])
+                .cancel(&turn.id, CancelReason::ParentCancelled, vec![])
                 .await;
         }
     }
@@ -1170,8 +1173,8 @@ async fn run_external_agent_job(
 
 /// Drives the agent stream → persists transcript turns, captures the
 /// terminal status, and returns any `Usage` the agent reported (for
-/// the caller to log into `cost_records`). Stays job-agnostic;
-/// [`run_external_agent_job`] owns the surrounding job lifecycle.
+/// the caller to log into `cost_records`). Stays turn-agnostic;
+/// [`run_external_agent_turn`] owns the surrounding turn lifecycle.
 async fn run_external_agent(
     agent: Arc<dyn ExternalAgent>,
     kind: ExternalAgentKind,
@@ -1238,7 +1241,7 @@ async fn run_external_agent(
             }
             Some(Ok(ExternalAgentEvent::Usage(usage))) => {
                 // Logged into cost_records (cost $0, tokens only) by
-                // run_external_agent_job after the stream closes.
+                // run_external_agent_turn after the stream closes.
                 token_usage = Some(usage);
             }
             Some(Ok(ExternalAgentEvent::ResumeKey(key))) => {
@@ -1483,7 +1486,7 @@ mod external_agent_cap_tests {
 #[cfg(test)]
 mod resume_validation_tests {
     use super::*;
-    use baybo_model::{ChannelType, JobId, SessionState, SpanId, TriggerSource, User};
+    use baybo_model::{ChannelType, SessionState, SpanId, TriggerSource, TurnId, User};
     use chrono::Utc;
 
     fn mk_parent(id: &str) -> Session {
@@ -1518,7 +1521,7 @@ mod resume_validation_tests {
         let mut s = mk_parent(id);
         s.lineage = Some(Lineage {
             parent_session_id: SessionId::from(parent_id),
-            parent_job_id: JobId::default(),
+            parent_turn_id: TurnId::default(),
             parent_span_id: Some(SpanId::default()),
             kind,
         });
@@ -1545,7 +1548,7 @@ mod resume_validation_tests {
         // reach it.
         let mut cron = mk_parent("cr");
         cron.trigger = TriggerSource::Cron {
-            cron_job_id: "job-1".into(),
+            cron_job_id: "turn-1".into(),
             origin_session_id: None,
             conversation: false,
             job_title: None,
@@ -1702,8 +1705,8 @@ mod resume_validation_tests {
 }
 
 #[cfg(test)]
-mod foreground_job_tests {
-    //! Backend-agnostic foreground-wait policy ([`run_foreground_job`]), shared
+mod foreground_turn_tests {
+    //! Backend-agnostic foreground-wait policy ([`run_foreground_turn`]), shared
     //! by the Baybo and External backends. The terminal future is faked here;
     //! the convert/escort plumbing it calls is exercised end-to-end by the
     //! integration suite.
@@ -1730,7 +1733,7 @@ mod foreground_job_tests {
         }
     }
 
-    fn job(
+    fn turn(
         user_facing: bool,
         on_timeout: OnTimeout,
         child_token: CancellationToken,
@@ -1750,11 +1753,11 @@ mod foreground_job_tests {
         }
     }
 
-    fn spawn_job(
+    fn spawn_turn(
         j: ForegroundJob,
         fut: impl std::future::Future<Output = SubagentResult> + Send + 'static,
     ) {
-        tokio::spawn(run_foreground_job(
+        tokio::spawn(run_foreground_turn(
             j,
             fut,
             test_supervisor(),
@@ -1769,8 +1772,8 @@ mod foreground_job_tests {
     #[tokio::test(start_paused = true)]
     async fn passes_through_when_fut_completes_in_time() {
         let (tx, rx) = oneshot::channel();
-        spawn_job(
-            job(true, OnTimeout::Background, CancellationToken::new(), tx),
+        spawn_turn(
+            turn(true, OnTimeout::Background, CancellationToken::new(), tx),
             async { completed("the answer") },
         );
         let result = rx.await.expect("result");
@@ -1786,8 +1789,8 @@ mod foreground_job_tests {
         let (tx, rx) = oneshot::channel();
         // Never resolves on its own → forces the foreground-wait timeout, which
         // paused time auto-advances to.
-        spawn_job(
-            job(true, OnTimeout::Background, CancellationToken::new(), tx),
+        spawn_turn(
+            turn(true, OnTimeout::Background, CancellationToken::new(), tx),
             std::future::pending::<SubagentResult>(),
         );
         let ack = rx.await.expect("conversion ack");
@@ -1817,7 +1820,7 @@ mod foreground_job_tests {
                 status: SubagentExitStatus::Cancelled,
             }
         };
-        spawn_job(job(true, OnTimeout::Kill, token.clone(), tx), fut);
+        spawn_turn(turn(true, OnTimeout::Kill, token.clone(), tx), fut);
         let result = rx.await.expect("timeout result");
         assert!(matches!(result.status, SubagentExitStatus::Timeout));
         assert!(token.is_cancelled(), "the kill cancelled the run's token");
@@ -1834,8 +1837,8 @@ mod foreground_job_tests {
             gate2.notified().await;
             completed("nested done")
         };
-        spawn_job(
-            job(false, OnTimeout::Background, CancellationToken::new(), tx),
+        spawn_turn(
+            turn(false, OnTimeout::Background, CancellationToken::new(), tx),
             fut,
         );
         // Well past the foreground wait, still no conversion ack (no timer).
@@ -1858,12 +1861,12 @@ mod foreground_job_tests {
         let child_token = CancellationToken::new();
         let observe = child_token.clone();
         let check = child_token.clone();
-        let mut j = job(true, OnTimeout::Background, child_token, tx);
+        let mut j = turn(true, OnTimeout::Background, child_token, tx);
         let parent_cancel = CancellationToken::new();
         j.parent_cancel = parent_cancel.clone();
         // The terminal resolves only once the child is cancelled — a real
         // convertible child is not reached by the parent's own cancel scope.
-        spawn_job(j, async move {
+        spawn_turn(j, async move {
             observe.cancelled().await;
             SubagentResult {
                 child_session_id: SessionId::from("child"),

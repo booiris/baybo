@@ -308,7 +308,7 @@ The loop enforces this with a per-response `tokio::sync::Semaphore` sized to `MA
 
 ### Output control
 
-Tool output should prefer structured `Json`, use `LargeText` for long text with truncation, and be sanitized before entering Job or Trace.
+Tool output should prefer structured `Json`, use `LargeText` for long text with truncation, and be sanitized before entering Turn or Trace.
 
 ### Per-tool events
 

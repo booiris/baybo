@@ -126,7 +126,7 @@ pub enum AgentEvent {
     /// Coarse turn-phase transition for a transient status line (today:
     /// context compaction start/end). Channels show a spinner/banner and
     /// clear it on the matching end; surfaces without one drop it.
-    Status(TurnStatus),
+    Status(StatusPhase),
     /// Final, canonical assistant response for the turn.
     Message(OutgoingMessage),
     /// Out-of-band notice addressed to the user.
@@ -175,9 +175,9 @@ pub enum AgentEvent {
     TaskList(Vec<baybo_model::Task>),
     /// Whether a turn (an agent-loop run producing this session's reply)
     /// is in flight. An idempotent snapshot, not an edge. Every emission
-    /// is derived from one truth — a non-terminal turn-kind job in the job
+    /// is derived from one truth — a non-terminal turn-kind turn in the turn
     /// store: the turn-state projector recomputes and broadcasts on each
-    /// job lifecycle transition (the `Pending → InProgress` start edge and
+    /// turn lifecycle transition (the `Pending → InProgress` start edge and
     /// the terminal edges — covering success, error, cancel and crash),
     /// and the gateway derives one snapshot on every WS Subscribe, so a
     /// late-joining client (new tab, reconnect) learns about a turn whose
@@ -213,7 +213,7 @@ pub enum ToolStatus {
 /// Responding, …) can extend this. Presentation-only — flattened to a
 /// lower-case string on the wire (`Frame::Status.phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnStatus {
+pub enum StatusPhase {
     /// Context compaction (summarisation) has started — the turn paused
     /// to shrink the transcript before the next LLM call.
     Compacting,

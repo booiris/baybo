@@ -78,7 +78,7 @@ Because that gate is per-provider, the ESTIMATE caps at the ceiling rather than 
 
 ### Error handling
 
-Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Job monitoring can mark long-running calls as `Stuck`.
+Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.
 
 ## Constraints
 

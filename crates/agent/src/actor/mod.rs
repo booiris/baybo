@@ -17,12 +17,12 @@ use crate::runtime::agent_loop::{InterjectionSource, UserInterjectionInput};
 use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
-use baybo_job::JobInput;
 use baybo_model::{
     ContentBlock, ControlEventKind, ExecutionOutcome, LlmEntryName, PendingBackgroundResult,
     PendingCronResult,
 };
 use baybo_session::SessionMessageAppendOutcome;
+use baybo_turn::TurnInput;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -74,7 +74,7 @@ pub enum AgentMessage {
     /// (the gateway never batches a slash command).
     UserInputBatch(Vec<IncomingMessage>),
     /// A cron job fired. Runs in this (fresh, isolated) session; `delivery`
-    /// decides where the reply goes. `title` names the job in the notification
+    /// decides where the reply goes. `title` names the turn in the notification
     /// a non-reply outcome (failure, or a run that produced nothing) reports.
     CronTrigger {
         job_id: String,
@@ -83,20 +83,20 @@ pub enum AgentMessage {
         delivery: CronDelivery,
     },
     /// A one-shot cron fire finished, and its result belongs in **this**
-    /// conversation (the one that scheduled the job). Handled at a turn
+    /// conversation (the one that scheduled the turn). Handled at a turn
     /// boundary with **no inference**: the actor appends the framed result as
     /// an assistant row, dispatches it, and resolves the delivery ledger. See
     /// [`AgentActor::handle_cron_result_ready`].
     CronResultReady(Box<PendingCronResult>),
     /// A subagent was spawned. Carries the initial prompt assembled by
-    /// `Router::handle_subagent_spawn` and the parent's `JobId` for
-    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`;
-    /// the job records the child session's root trigger as its `origin`
+    /// `Router::handle_subagent_spawn` and the parent's `TurnId` for
+    /// lineage. The child actor runs `agent_loop.run` with `TurnInput::Spawned`;
+    /// the turn records the child session's root trigger as its `origin`
     /// (subagents inherit the parent's trigger — cron / system — via
     /// `create_spawned_session`), with no payload/trigger pairing constraint.
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
-        parent_job_id: baybo_model::JobId,
+        parent_turn_id: baybo_model::TurnId,
     },
     /// A detached subagent or `Bash` command reached a terminal state. The
     /// completion enters `session.state.background_notifications`, where it
@@ -138,7 +138,7 @@ pub enum CronDelivery {
     Channel,
     /// Nowhere, from this session. A **one-shot** fire's session is transient
     /// and invisible; its result is delivered into the conversation that
-    /// scheduled the job (as a `CronResultReady` there), so dispatching here
+    /// scheduled the turn (as a `CronResultReady` there), so dispatching here
     /// too would notify the user twice.
     OriginSession,
 }
@@ -427,7 +427,7 @@ impl AgentActor {
             // so seal their cohorts: membership is now final and the barrier
             // (and its timeout) can fire.
             self.seal_background_notification_groups().await;
-            // Surface buffered background-job results as their own turn once
+            // Surface buffered background-turn results as their own turn once
             // nothing higher-priority remains queued.
             self.maybe_start_background_notification(&mailbox).await;
         }
@@ -471,7 +471,7 @@ impl AgentActor {
                         // is empty when opened and never announced itself. Report
                         // it where the fire lives — but only for a fire that OWNS
                         // its conversation: a one-shot's failure is reported into
-                        // the conversation that scheduled it, off this job's
+                        // the conversation that scheduled it, off this turn's
                         // terminal lifecycle edge.
                         if matches!(delivery, CronDelivery::Channel) {
                             self.report_cron_outcome(&title, true, &e.to_string()).await;
@@ -484,10 +484,10 @@ impl AgentActor {
             }
             AgentMessage::SubagentSpawned {
                 initial_message,
-                parent_job_id,
+                parent_turn_id,
             } => {
                 if let Err(e) = self
-                    .handle_subagent_spawned(*initial_message, parent_job_id)
+                    .handle_subagent_spawned(*initial_message, parent_turn_id)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -518,10 +518,10 @@ impl AgentActor {
     }
 
     /// Run the agent loop. Terminal-state notification is published by
-    /// `JobLifecycle` itself on the broadcast bus
+    /// `TurnLifecycle` itself on the broadcast bus
     /// (`subscribe_lifecycle_events`); the actor no longer emits a
     /// piggy-back signal on the response channel. Used by every
-    /// handler that delegates job lifecycle to `agent_loop.run`
+    /// handler that delegates turn lifecycle to `agent_loop.run`
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
     /// the loop's response on `Ok`; caller is responsible for sending
     /// it to the response channel.
@@ -532,8 +532,8 @@ impl AgentActor {
     /// `baybo-context` and the loop just iterates.
     async fn run_agent_loop(
         &mut self,
-        job_input: JobInput,
-        parent_job_id: Option<baybo_model::JobId>,
+        turn_input: TurnInput,
+        parent_turn_id: Option<baybo_model::TurnId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
         // Set to whether this turn ended via cancellation (`/stop` / shutdown),
@@ -545,13 +545,13 @@ impl AgentActor {
         // for every other turn. See `dispatch_cron_prompt`.
         notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<OutgoingMessage> {
-        let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
+        let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
-        // tripped via the job cancel) apart from a genuine failure.
+        // tripped via the turn cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();
         // The actor emits no `TurnState`: both edges are projected from the
-        // job store by `spawn_turn_state_projector` — the start edge from
-        // this turn's job `start()` (`Pending → InProgress`) inside
+        // turn store by `spawn_turn_state_projector` — the start edge from
+        // this turn's turn `start()` (`Pending → InProgress`) inside
         // `agent_loop.run`, the end edge from its terminal transition. So
         // chat turn-activity has a single producer sourced from the one
         // truth, and the per-`Subscribe` snapshot can't disagree with it.
@@ -560,10 +560,10 @@ impl AgentActor {
             .agent_loop
             .run(
                 &mut self.durable.session,
-                job_input,
-                &self.volatile.job_lifecycle,
+                turn_input,
+                &self.volatile.turn_lifecycle,
                 &self.volatile.span_recorder,
-                parent_job_id,
+                parent_turn_id,
                 delta_tx,
                 turn_token.clone(),
                 interjections,
@@ -600,7 +600,7 @@ impl AgentActor {
         // user `/stop` (or shutdown) as info, not a page-worthy error. The
         // token check is the one discriminator that also covers the untyped
         // cancellation errors on this path (agent-loop-cancelled, and the
-        // `scope.rs` job-cancelled / already-terminal strings).
+        // `scope.rs` turn-cancelled / already-terminal strings).
         match result {
             Err(e) if cancelled => Err(e.context(TurnCancelled)),
             other => other,
@@ -609,7 +609,7 @@ impl AgentActor {
 
     /// Dispatch a fired cron job through the agent loop.
     ///
-    /// The cron fire mints a Cron-rooted session, so the job records
+    /// The cron fire mints a Cron-rooted session, so the turn records
     /// `origin = Cron`. The content the LLM sees is framed + appended by
     /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
     /// so the model treats it as a task to perform now rather than a live
@@ -619,7 +619,7 @@ impl AgentActor {
     /// out through this session's own channel — the session *is* the
     /// conversation the user reads. A one-shot's session is transient and
     /// invisible, so nothing goes out here: its result is picked up off this
-    /// job's terminal lifecycle edge (by the router's cron waiter) and
+    /// turn's terminal lifecycle edge (by the router's cron waiter) and
     /// delivered into the conversation that scheduled it.
     async fn dispatch_cron_prompt(
         &mut self,
@@ -628,7 +628,7 @@ impl AgentActor {
         title: &str,
         delivery: CronDelivery,
     ) -> anyhow::Result<()> {
-        let job_input = JobInput::Cron {
+        let turn_input = TurnInput::Cron {
             action_payload: serde_json::json!({
                 "cron_job_id": job_id,
                 "prompt": prompt,
@@ -644,14 +644,14 @@ impl AgentActor {
         let silence =
             matches!(delivery, CronDelivery::Channel).then(baybo_tools::NotifySilence::new);
         let response = self
-            .run_agent_loop(job_input, None, None, None, None, silence.clone())
+            .run_agent_loop(turn_input, None, None, None, None, silence.clone())
             .await?;
         let silenced = silence.as_ref().is_some_and(|s| s.requested());
         match delivery {
             CronDelivery::OriginSession => {}
             CronDelivery::Channel if silenced => {
                 // `report_nothing`: this fire notifies no one. Push was already
-                // skipped (its job completed with no reply ordinal) and we
+                // skipped (its turn completed with no reply ordinal) and we
                 // dispatch nothing here, so no activity pulse fires; hide the
                 // fire's own conversation so it leaves no empty row in the list.
                 // The reply row and transcript survive — nothing is deleted.
@@ -702,7 +702,7 @@ impl AgentActor {
     /// A real row rather than a `Notice`, because the two are not equivalent
     /// where it counts: a row survives a reload, is read back by the model on a
     /// follow-up turn, raises the conversation's unread badge, and — riding a
-    /// `CronNotification` job's `Completed { reply_ordinal }` edge — pushes to
+    /// `CronNotification` turn's `Completed { reply_ordinal }` edge — pushes to
     /// the user's phone. A notice does none of those. So every fire outcome
     /// produces exactly one notification row, whichever kind of fire it was.
     ///
@@ -724,7 +724,7 @@ impl AgentActor {
     }
 
     /// Append `content` as this session's cron-notification row, open a
-    /// `CronNotification` job so its `Completed { reply_ordinal }` edge drives
+    /// `CronNotification` turn so its `Completed { reply_ordinal }` edge drives
     /// push off the durable row, and dispatch it to the channel. Returns the
     /// persisted ordinal.
     ///
@@ -753,22 +753,22 @@ impl AgentActor {
             return Ok(SessionMessageAppendOutcome::Existing { ordinal });
         }
 
-        let job_lifecycle = Arc::clone(&self.volatile.job_lifecycle);
+        let turn_lifecycle = Arc::clone(&self.volatile.turn_lifecycle);
         let origin = self.durable.session.trigger.kind();
-        let append_outcome = crate::runtime::scope::with_job(
-            &job_lifecycle,
+        let append_outcome = crate::runtime::scope::with_turn(
+            &turn_lifecycle,
             // Not a cancellable turn: the append is one store write with
             // nothing to interrupt. The token is never tripped.
             CancellationToken::new(),
-            crate::runtime::scope::JobSpec {
+            crate::runtime::scope::TurnSpec {
                 session_id: session_id.clone(),
                 origin,
-                input: JobInput::CronNotification {
+                input: TurnInput::CronNotification {
                     content: content.clone(),
                 },
-                parent_job_id: None,
+                parent_turn_id: None,
             },
-            |_job_id| async {
+            |_turn_id| async {
                 let append_outcome = self
                     .volatile
                     .agent_loop
@@ -783,7 +783,7 @@ impl AgentActor {
                     ));
                 };
                 Ok((
-                    baybo_job::JobOutput::Message {
+                    baybo_turn::TurnOutput::Message {
                         content: content.clone(),
                         ordinal: Some(ordinal),
                     },
@@ -813,7 +813,7 @@ impl AgentActor {
     }
 
     /// Deliver a finished one-shot cron fire's result into **this**
-    /// conversation — the one that scheduled the job. Runs at a turn boundary
+    /// conversation — the one that scheduled the turn. Runs at a turn boundary
     /// with **no inference**: the fire already did the thinking, in its own
     /// isolated session, and re-deriving anything here would cost a second LLM
     /// call and let the model decide to stay quiet about a reminder the user
@@ -901,7 +901,7 @@ impl AgentActor {
         );
     }
 
-    /// The notification's content: a header naming the job, the fire's own
+    /// The notification's content: a header naming the turn, the fire's own
     /// reply text (or a per-outcome fallback), and any media the fire
     /// produced.
     async fn build_cron_notification(&self, pending: &PendingCronResult) -> Vec<ContentBlock> {
@@ -924,7 +924,7 @@ impl AgentActor {
         content
     }
 
-    /// The fire's reply, read from its own session at the ordinal the job's
+    /// The fire's reply, read from its own session at the ordinal the turn's
     /// `Completed` edge carried: its text (joined), plus any non-text blocks
     /// (images, files) so nothing the fire produced is dropped on the way
     /// over. An unreadable or absent row yields empty text, which
@@ -1054,7 +1054,7 @@ impl AgentActor {
         // message sent during a `/skill` turn is served as the next turn.
         let response = self
             .run_agent_loop(
-                JobInput::UserChat { content },
+                TurnInput::UserChat { content },
                 None,
                 Some(response_tx),
                 None,
@@ -1072,7 +1072,7 @@ impl AgentActor {
     /// leading ones are appended ahead of the turn, the last becomes the
     /// turn's user content — so the stored transcript stays faithful to
     /// what the user actually sent; `merge_for_llm` collapses the
-    /// consecutive rows into one message for the provider call. The job
+    /// consecutive rows into one message for the provider call. The turn
     /// record carries the combined content for provenance. One reply
     /// answers the batch. Slash messages never reach here — they are split
     /// out as their own turns by the caller.
@@ -1092,7 +1092,7 @@ impl AgentActor {
         combined.extend(last.message.content.iter().cloned());
         // Append every message as its own row ahead of the turn (the last
         // included) so the loop iterates the current context; the combined
-        // content rides in `JobInput` for the job record only.
+        // content rides in `TurnInput` for the turn record only.
         for incoming in batch {
             self.volatile
                 .agent_loop
@@ -1116,7 +1116,7 @@ impl AgentActor {
         let mut stopped = false;
         let result = self
             .run_agent_loop(
-                JobInput::UserChat { content: combined },
+                TurnInput::UserChat { content: combined },
                 None,
                 Some(response_tx),
                 Some(&mut interjections),
@@ -1292,14 +1292,14 @@ impl AgentActor {
         sent_at: chrono::DateTime<chrono::Utc>,
         platform_msg_id: String,
     ) -> anyhow::Result<()> {
-        // `compact_now` mints its own maintenance job and returns a control
+        // `compact_now` mints its own maintenance turn and returns a control
         // notice; it does not emit a chat reply from the actor itself.
         let text = self
             .volatile
             .agent_loop
             .compact_now(
                 &mut self.durable.session,
-                &self.volatile.job_lifecycle,
+                &self.volatile.turn_lifecycle,
                 &self.volatile.span_recorder,
                 None,
                 self.volatile.actor_token.child_token(),
@@ -1348,13 +1348,13 @@ impl AgentActor {
     }
 
     /// Run the agent loop for a subagent-spawned session. Distinct from
-    /// `handle_user_input` because the JobInput must be `Spawned` (not
-    /// `UserChat`) so `JobLifecycle::start_job`'s allowed-for check
+    /// `handle_user_input` because the TurnInput must be `Spawned` (not
+    /// `UserChat`) so `TurnLifecycle::start_turn`'s allowed-for check
     /// passes regardless of the inherited trigger kind.
     async fn handle_subagent_spawned(
         &mut self,
         incoming: IncomingMessage,
-        parent_job_id: baybo_model::JobId,
+        parent_turn_id: baybo_model::TurnId,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
@@ -1364,10 +1364,10 @@ impl AgentActor {
             .await?;
         let response = self
             .run_agent_loop(
-                JobInput::Spawned {
+                TurnInput::Spawned {
                     initial_prompt: content,
                 },
-                Some(parent_job_id),
+                Some(parent_turn_id),
                 Some(response_tx),
                 None,
                 None,

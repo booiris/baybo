@@ -9,8 +9,8 @@
 //!
 //! Core ships the trait, its value types, and a [`NoopMemory`] default that
 //! does nothing; there is no real implementation here. The agent loop drives it
-//! through three hooks — a synchronous [`Memory::recall`] at job start and on
-//! each interjection, and the fire-and-forget [`Memory::on_job_complete`] /
+//! through three hooks — a synchronous [`Memory::recall`] at turn start and on
+//! each interjection, and the fire-and-forget [`Memory::on_turn_complete`] /
 //! [`Memory::on_session_end`] events — plus the tools the impl contributes via
 //! [`Memory::tools`].
 //!
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_llm::Attribution;
-use baybo_model::{ChatMessage, ContentBlock, JobId, SessionId};
+use baybo_model::{ChatMessage, ContentBlock, SessionId, TurnId};
 use baybo_tools::{Tool, ToolManifest};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
@@ -42,20 +42,20 @@ pub use error::MemoryError;
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
 /// Per-call context the core builds for every [`Memory`] call. Carries the
-/// real `(user, session, job)` this operation belongs to, plus the trace
+/// real `(user, session, turn)` this operation belongs to, plus the trace
 /// recorder and the enclosing `MemoryRecall` / `MemoryWrite` step.
 ///
 /// An impl that makes billed LLM sub-calls runs each through
 /// [`MemoryContext::scoped_llm_call`], which opens an `LlmCall` span **under the
 /// memory step** and hands back an [`Attribution`] bound to that span — so the
 /// spend the call records lands on a real span attributed to the real
-/// user/session/job, never an orphaned id. The same `(user, session, job)` ids
-/// (via [`Self::session_id`] / [`Self::job_id`]) are what an impl keys its own
-/// per-session / per-job de-duplication off.
+/// user/session/turn, never an orphaned id. The same `(user, session, turn)` ids
+/// (via [`Self::session_id`] / [`Self::turn_id`]) are what an impl keys its own
+/// per-session / per-turn de-duplication off.
 pub struct MemoryContext {
     user_id: String,
     session_id: SessionId,
-    job_id: JobId,
+    turn_id: TurnId,
     recorder: Arc<SpanRecorder>,
     step: StepHandle,
 }
@@ -67,14 +67,14 @@ impl MemoryContext {
     pub fn new(
         user_id: String,
         session_id: SessionId,
-        job_id: JobId,
+        turn_id: TurnId,
         recorder: Arc<SpanRecorder>,
         step: StepHandle,
     ) -> Self {
         Self {
             user_id,
             session_id,
-            job_id,
+            turn_id,
             recorder,
             step,
         }
@@ -88,13 +88,13 @@ impl MemoryContext {
         &self.session_id
     }
 
-    pub fn job_id(&self) -> JobId {
-        self.job_id
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
     }
 
     /// Record a billed LLM sub-call as an `LlmCall` span under this operation's
     /// memory step, so the spend it records attributes to a **real** span (and
-    /// the real user/session/job), not an orphaned id. The closure receives the
+    /// the real user/session/turn), not an orphaned id. The closure receives the
     /// [`Attribution`] bound to that span — bind your billed client with it,
     /// make the call, and return its [`LlmCallResult`] (token usage, for the
     /// span) alongside your value. Mirrors the agent loop's own LLM-span
@@ -119,7 +119,7 @@ impl MemoryContext {
         let attribution = Attribution {
             user_id: self.user_id.clone(),
             session_id: self.session_id.clone(),
-            job_id: self.job_id,
+            turn_id: self.turn_id,
             span_id: span.span_id,
             reason: baybo_llm::CallReason::Memory,
         };
@@ -134,7 +134,7 @@ impl MemoryContext {
             .recorder
             .end_span(
                 span,
-                self.job_id,
+                self.turn_id,
                 SpanFinalize::LlmCall(call_result),
                 outcome,
             )
@@ -160,9 +160,9 @@ pub struct RecalledMemory {
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Synchronous query: the memories relevant to `query`. Called inline at
-    /// job start and on each interjection, so it sits on the critical path —
+    /// turn start and on each interjection, so it sits on the critical path —
     /// the impl must keep it fast. De-duplication against memories already
-    /// surfaced in this session/job is INTERNAL to the impl (keyed off `ctx`);
+    /// surfaced in this session/turn is INTERNAL to the impl (keyed off `ctx`);
     /// because one impl is a process singleton, that state survives actor
     /// reap/rehydration for free. The core injects exactly what is returned and
     /// performs no de-duplication of its own.
@@ -176,7 +176,7 @@ pub trait Memory: Send + Sync {
     /// mid-turn interjections; `final_output` is the assistant's last turn. The
     /// impl decides what (if anything) to extract and store — the core makes no
     /// assumptions and never treats the whole output as a memory.
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         ctx: &MemoryContext,
         user_input: &[ContentBlock],
@@ -212,7 +212,7 @@ impl Memory for NoopMemory {
         Ok(Vec::new())
     }
 
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         _ctx: &MemoryContext,
         _user_input: &[ContentBlock],
@@ -231,7 +231,7 @@ impl Memory for NoopMemory {
 }
 
 /// Recall-only wrapper: forwards `recall` + `tools` to the inner backend but
-/// no-ops the write hooks (`on_job_complete` / `on_session_end`). Wired into
+/// no-ops the write hooks (`on_turn_complete` / `on_session_end`). Wired into
 /// `baybo`'s runtime only under the `bench-readonly-memory` feature, so the
 /// memory benchmark can drive the real agent end-to-end (recall + tools live)
 /// without QA turns writing into — and polluting — the recall scope. NOT a
@@ -257,7 +257,7 @@ impl Memory for ReadOnlyMemory {
         self.0.recall(ctx, query).await
     }
 
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         _ctx: &MemoryContext,
         _user_input: &[ContentBlock],

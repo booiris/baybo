@@ -19,7 +19,7 @@
 //!
 //! This module provides only the spawn primitive. Lifecycle
 //! management (restart policy, back-off, plugin manifest loading, …)
-//! is the supervisor's job ([`crate::sidecar::SidecarSupervisor`]).
+//! is the supervisor's turn ([`crate::sidecar::SidecarSupervisor`]).
 
 use tokio::process::{Child, Command};
 

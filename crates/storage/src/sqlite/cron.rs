@@ -104,7 +104,7 @@ impl From<&CronJob> for Unmoved {
 }
 
 /// The `(deleted_at, pinned, data)` triple each job query lifts out of a row.
-type JobRow = (Option<i64>, i64, String);
+type TurnRow = (Option<i64>, i64, String);
 
 /// Columns every execution query selects; [`execution_from_row`] takes the
 /// `status` (index 5) and `data` (index 6) columns out of that list.
@@ -137,7 +137,7 @@ fn serialize_execution(exec: &CronExecution) -> Result<String> {
         .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
-fn decode_jobs(rows: Vec<JobRow>) -> Result<Vec<CronJob>> {
+fn decode_jobs(rows: Vec<TurnRow>) -> Result<Vec<CronJob>> {
     rows.iter()
         .map(|(deleted_us, pinned, data)| job_from_row(*deleted_us, *pinned, data))
         .collect()
@@ -145,7 +145,7 @@ fn decode_jobs(rows: Vec<JobRow>) -> Result<Vec<CronJob>> {
 
 /// Lift the `(deleted_at, pinned, data)` triple out of a row selected with
 /// [`JOB_COLS`].
-fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
+fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
     Ok((
         row.get::<_, Option<i64>>(4)?,
         row.get::<_, i64>(5)?,
@@ -182,7 +182,7 @@ impl CronStore for SqliteCronStore {
 
     async fn get(&self, job_id: &str) -> Result<Option<CronJob>> {
         let job_id = job_id.to_string();
-        let row: Option<JobRow> = self
+        let row: Option<TurnRow> = self
             .pool
             .interact("cron.get", move |conn| {
                 Ok(conn

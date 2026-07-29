@@ -11,7 +11,7 @@
 //!    and exchanges the resulting authorization code for tokens.
 //!  - [`refresh`] — exchanges a refresh_token for a fresh bundle.
 //!
-//! All three return [`OAuthTokenBundle`]; persistence is the caller's job
+//! All three return [`OAuthTokenBundle`]; persistence is the caller's turn
 //! (via [`super::token_store::VaultTokenStore::save`]).
 
 use std::io::{self, Read, Write};

@@ -6,9 +6,9 @@
 //!   used by the trace browser table. Typed via [`TraceSessionSummary`]
 //!   so the OpenAPI/ts-rs surface picks it up.
 //! * `GET /v1/traces/{session_id}` — session overview: the full
-//!   `session_messages` log + job summaries (no step/span tree).
-//!   The client lazily fetches each job's tree via the third endpoint.
-//! * `GET /v1/traces/{session_id}/jobs/{job_id}` — per-job step/span
+//!   `session_messages` log + turn summaries (no step/span tree).
+//!   The client lazily fetches each turn's tree via the third endpoint.
+//! * `GET /v1/traces/{session_id}/turns/{turn_id}` — per-turn step/span
 //!   tree. Spans carry `LlmCallInputs::Persisted` (by ordinal) and
 //!   `ToolCallOutput::Persisted` (by `tool_use_id`) references unresolved;
 //!   the client resolves them against the message log it already has from the
@@ -40,7 +40,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_traces))
         .routes(routes!(get_trace))
-        .routes(routes!(get_job_trace))
+        .routes(routes!(get_turn_trace))
 }
 
 #[utoipa::path(
@@ -95,7 +95,7 @@ async fn list_traces(
     responses(
         (
             status = 200,
-            description = "Per-session trace overview: session_messages log + job summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            description = "Per-session trace overview: session_messages log + turn summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
@@ -115,19 +115,19 @@ async fn get_trace(
         .await
         .map_err(|e| GatewayError::Trace(e.to_string()))?;
 
-    if overview.jobs.is_empty() {
+    if overview.turns.is_empty() {
         return Err(GatewayError::NotFound(format!("trace {session_id}")));
     }
 
-    let jobs: Vec<serde_json::Value> = overview
-        .jobs
+    let turns: Vec<serde_json::Value> = overview
+        .turns
         .iter()
         .map(|j| {
             let s = &j.summary;
             json!({
-                "job_id": s.id.to_string(),
+                "turn_id": s.id.to_string(),
                 "session_id": s.session_id.as_str(),
-                "job_status_kind": s.status.kind().as_snake_case(),
+                "turn_status_kind": s.status.kind().as_snake_case(),
                 "created_at": s.created_at,
                 "started_at": s.started_at,
                 "ended_at": s.ended_at,
@@ -142,57 +142,57 @@ async fn get_trace(
     Ok(Json(json!({
         "session_id": overview.session_id.as_str(),
         "session_messages": overview.session_messages,
-        "jobs": jobs,
+        "turns": turns,
         "supersede_watermark": overview.supersede_watermark,
     })))
 }
 
 #[utoipa::path(
     get,
-    path = "/traces/{session_id}/jobs/{job_id}",
+    path = "/traces/{session_id}/turns/{turn_id}",
     tag = "traces",
     params(
-        ("session_id" = String, Path, description = "Session id this job belongs to (or inherits from); used for route scoping only"),
-        ("job_id" = String, Path, description = "Job id whose step/span tree to fetch"),
+        ("session_id" = String, Path, description = "Session id this turn belongs to (or inherits from); used for route scoping only"),
+        ("turn_id" = String, Path, description = "Turn id whose step/span tree to fetch"),
     ),
     responses(
         (
             status = 200,
-            description = "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
+            description = "Per-turn step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
-        (status = 400, description = "Invalid job id", body = ErrorBody),
+        (status = 400, description = "Invalid turn id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 404, description = "No such job", body = ErrorBody),
+        (status = 404, description = "No such turn", body = ErrorBody),
     )
 )]
-async fn get_job_trace(
+async fn get_turn_trace(
     State(state): State<AdminState>,
-    Path((_session_id, job_id)): Path<(String, String)>,
+    Path((_session_id, turn_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let parsed_job: baybo_model::JobId = job_id
+    let parsed_turn: baybo_model::TurnId = turn_id
         .parse()
-        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
-    let job_trace = state
+        .map_err(|e| GatewayError::BadRequest(format!("invalid turn id: {e}")))?;
+    let turn_trace = state
         .query_api
-        .load_job_trace(&parsed_job)
+        .load_turn_trace(&parsed_turn)
         .await
         .map_err(|e| GatewayError::Trace(e.to_string()))?;
 
-    let steps: Vec<serde_json::Value> = job_trace
+    let steps: Vec<serde_json::Value> = turn_trace
         .steps
         .iter()
         .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
         .collect();
 
     Ok(Json(json!({
-        "job_id": job_trace.job.id.to_string(),
-        "session_id": job_trace.job.session_id.as_str(),
-        "job_status_kind": job_trace.job.status.kind().as_snake_case(),
-        "created_at": job_trace.job.created_at,
-        "started_at": job_trace.job.started_at,
-        "ended_at": job_trace.job.ended_at,
+        "turn_id": turn_trace.turn.id.to_string(),
+        "session_id": turn_trace.turn.session_id.as_str(),
+        "turn_status_kind": turn_trace.turn.status.kind().as_snake_case(),
+        "created_at": turn_trace.turn.created_at,
+        "started_at": turn_trace.turn.started_at,
+        "ended_at": turn_trace.turn.ended_at,
         "steps": steps,
     })))
 }

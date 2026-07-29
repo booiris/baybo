@@ -4,7 +4,7 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use super::time;
 use baybo_model::{CallReason, CostRecord, CostSummary, TimeRange};
-use baybo_model::{JobId, MicroUsd, SessionId, SpanId};
+use baybo_model::{MicroUsd, SessionId, SpanId, TurnId};
 use baybo_store::StorageError;
 use baybo_store::cost::{CostGroupBucket, CostGroupKey, CostStore, Result as CostResult};
 
@@ -23,7 +23,7 @@ impl CostStore for SqliteCostStore {
     async fn record(&self, record: &CostRecord) -> CostResult<()> {
         let user_id = record.user_id.clone();
         let session_id = record.session_id.as_str().to_string();
-        let job_id = record.job_id.to_string();
+        let turn_id = record.turn_id.to_string();
         let span_id = record.span_id.to_string();
         let reason = record.reason.to_token().into_owned();
         let model = record.model.clone();
@@ -37,13 +37,13 @@ impl CostStore for SqliteCostStore {
             .interact("cost.record", move |conn| {
                 conn.execute(
                     "INSERT INTO cost_records \
-                     (user_id, session_id, job_id, span_id, reason, model, input_tokens, output_tokens, \
+                     (user_id, session_id, turn_id, span_id, reason, model, input_tokens, output_tokens, \
                       cached_input_tokens, cache_creation_input_tokens, cost_usd, timestamp) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         user_id,
                         session_id,
-                        job_id,
+                        turn_id,
                         span_id,
                         reason,
                         model,
@@ -68,7 +68,7 @@ impl CostStore for SqliteCostStore {
             .pool
             .interact("cost.query_user", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, job_id, span_id, reason, model, input_tokens, \
+                    "SELECT user_id, session_id, turn_id, span_id, reason, model, input_tokens, \
                             output_tokens, cached_input_tokens, cache_creation_input_tokens, \
                             cost_usd, timestamp \
                      FROM cost_records \
@@ -142,19 +142,19 @@ impl CostStore for SqliteCostStore {
             .await
     }
 
-    async fn query_session_by_job(
+    async fn query_session_by_turn(
         &self,
         session_id: &SessionId,
     ) -> CostResult<Vec<CostGroupBucket>> {
         let session_id = session_id.as_str().to_string();
         self.pool
-            .interact("cost.query_session_by_job", move |conn| {
+            .interact("cost.query_session_by_turn", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT COALESCE(SUM(cost_usd), 0), \
                             COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
                             COALESCE(SUM(cached_input_tokens), 0), \
-                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), job_id \
-                     FROM cost_records WHERE session_id = ?1 GROUP BY job_id",
+                            COALESCE(SUM(cache_creation_input_tokens), 0), COUNT(*), turn_id \
+                     FROM cost_records WHERE session_id = ?1 GROUP BY turn_id",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![session_id], bucket_from_aggregate_row)?
@@ -216,7 +216,7 @@ impl CostStore for SqliteCostStore {
             .pool
             .interact("cost.query_records_in_range", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, job_id, span_id, reason, model, input_tokens, \
+                    "SELECT user_id, session_id, turn_id, span_id, reason, model, input_tokens, \
                             output_tokens, cached_input_tokens, cache_creation_input_tokens, \
                             cost_usd, timestamp \
                      FROM cost_records \
@@ -232,11 +232,11 @@ impl CostStore for SqliteCostStore {
         raws.into_iter().map(raw_to_cost_record).collect()
     }
 
-    async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
-        let job_id = job_id.to_string();
+    async fn query_turn(&self, turn_id: &TurnId) -> CostResult<CostSummary> {
+        let turn_id = turn_id.to_string();
         let summary = self
             .pool
-            .interact("cost.query_job", move |conn| {
+            .interact("cost.query_turn", move |conn| {
                 Ok(conn
                     .query_row(
                         "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
@@ -244,8 +244,8 @@ impl CostStore for SqliteCostStore {
                                 COALESCE(SUM(cached_input_tokens), 0), \
                                 COALESCE(SUM(cache_creation_input_tokens), 0), \
                                 COUNT(*) \
-                         FROM cost_records WHERE job_id = ?1",
-                        rusqlite::params![job_id],
+                         FROM cost_records WHERE turn_id = ?1",
+                        rusqlite::params![turn_id],
                         summary_from_aggregate_row,
                     )
                     .optional()?)
@@ -283,7 +283,7 @@ fn summary_from_aggregate_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostS
 struct RawCostRow {
     user_id: String,
     session_id: String,
-    job_id: String,
+    turn_id: String,
     span_id: String,
     reason: Option<String>,
     model: String,
@@ -299,7 +299,7 @@ fn raw_cost_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCostRow> {
     Ok(RawCostRow {
         user_id: row.get(0)?,
         session_id: row.get(1)?,
-        job_id: row.get(2)?,
+        turn_id: row.get(2)?,
         span_id: row.get(3)?,
         reason: row.get(4)?,
         model: row.get(5)?,
@@ -332,10 +332,10 @@ fn raw_to_cost_record(raw: RawCostRow) -> CostResult<CostRecord> {
     Ok(CostRecord {
         user_id: raw.user_id,
         session_id: SessionId::from(raw.session_id),
-        job_id: raw
-            .job_id
-            .parse::<JobId>()
-            .map_err(|e| StorageError::Storage(format!("decode job_id: {e}")))?,
+        turn_id: raw
+            .turn_id
+            .parse::<TurnId>()
+            .map_err(|e| StorageError::Storage(format!("decode turn_id: {e}")))?,
         span_id: raw
             .span_id
             .parse::<SpanId>()
@@ -360,7 +360,7 @@ mod tests {
         CostRecord {
             user_id: user_id.to_string(),
             session_id: SessionId::from("sess-1"),
-            job_id: JobId::new(),
+            turn_id: TurnId::new(),
             span_id: SpanId::new(),
             reason: CallReason::Chat,
             model: "gpt-4".to_string(),
@@ -470,30 +470,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_session_by_job_groups_per_job() {
+    async fn query_session_by_turn_groups_per_turn() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
         let store = SqliteCostStore::new(pool);
-        let job_a = JobId::new();
-        let job_b = JobId::new();
-        for (job, cost) in [(job_a, 0.10), (job_a, 0.20), (job_b, 0.40)] {
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        for (turn, cost) in [(turn_a, 0.10), (turn_a, 0.20), (turn_b, 0.40)] {
             let mut rec = test_record("u1", usd(cost));
-            rec.job_id = job;
+            rec.turn_id = turn;
             store.record(&rec).await.unwrap();
         }
         let buckets = store
-            .query_session_by_job(&SessionId::from("sess-1"))
+            .query_session_by_turn(&SessionId::from("sess-1"))
             .await
             .unwrap();
         assert_eq!(buckets.len(), 2);
-        let a = buckets.iter().find(|b| b.key == job_a.to_string()).unwrap();
+        let a = buckets
+            .iter()
+            .find(|b| b.key == turn_a.to_string())
+            .unwrap();
         assert_eq!(a.summary.record_count, 2);
         assert_eq!(a.summary.total_cost_usd, usd(0.30));
         assert!(
             store
-                .query_session_by_job(&SessionId::from("other"))
+                .query_session_by_turn(&SessionId::from("other"))
                 .await
                 .unwrap()
                 .is_empty()

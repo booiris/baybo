@@ -97,14 +97,14 @@ All read-only, all re-scan the filesystem per call:
 | `GET /api/benches` | `BenchInfo[]` — home cards |
 | `GET /api/benches/:bench` | `BenchDetail` — info + runs + standing |
 | `GET /api/benches/:bench/runs/:run_key` | `RunDetail` — summary + items (`run_key` = results filename stem) |
-| `GET /api/benches/:bench/trace?trace=&messages=` | `{session_id, session_messages, jobs}` (reshaped) |
+| `GET /api/benches/:bench/trace?trace=&messages=` | `{session_id, session_messages, turns}` (reshaped) |
 | `GET /api/benches/:bench/file?path=` | raw artifact; `path` may be `<file>#<instance>` to extract a SWE patch from a predictions `.jsonl` |
 | `GET /api/search?q=` | `SearchHit[]` across all runs (capped, logged) |
 
 Trace files are treated as **opaque JSON** (the gateway's stance): the
-backend only reshapes the envelope (`{session, jobs}` + `{messages}` →
-`{session_id, session_messages, jobs}`) so the ported viewer types line
-up — `jobs[i].steps` is already the viewer's `ReplayStep[]`.
+backend only reshapes the envelope (`{session, turns}` + `{messages}` →
+`{session_id, session_messages, turns}`) so the ported viewer types line
+up — `turns[i].steps` is already the viewer's `ReplayStep[]`.
 
 `trace`/`file` paths are client-supplied but constrained by `safe_join`:
 the relative path is rejected if it is absolute or contains `..`, and

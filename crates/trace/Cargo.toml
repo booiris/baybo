@@ -12,7 +12,7 @@ test-support = []
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -708,7 +708,7 @@ impl Tool for BashTool {
             let argv0 = first_token(&command).unwrap_or("?");
             return Err(ToolError::InvalidParams(format!(
                 "Refusing to run `{argv0}` against a file via Bash. Use the right tool \
-                 for the job:\n\
+                 for the turn:\n\
                  - Reading content: `Read` (with `offset`/`limit` for head- and \
                    tail-style slices).\n\
                  - In-place file edits: `Edit` (exact-string replacement, fail-fast \
@@ -1029,7 +1029,7 @@ pub fn detached_group_dir(background_output_dir: &Path) -> PathBuf {
 
 /// Record a detached unsandboxed command's process group so a future boot can
 /// reap it if this process dies without unwinding. Best-effort; a write
-/// failure just forgoes the crash-safety net for this one job.
+/// failure just forgoes the crash-safety net for this one turn.
 pub fn record_detached_group(dir: &Path, handle_id: &str, pgid: i32, command: &str) {
     let record = PersistedDetachedGroup {
         pgid,
@@ -1132,7 +1132,7 @@ enum DetachedOutcome {
 }
 
 /// Run a command on the detached path: spawn it live, stream stdout/stderr
-/// to per-job files, and wait up to the foreground budget. If it finishes
+/// to per-turn files, and wait up to the foreground budget. If it finishes
 /// in time, return the normal result; if it overruns, hand the still-running
 /// child to the [`BackgroundJobSink`] and return a "moved to background"
 /// notice. Returns `Ok(None)` when the command couldn't be detached (sandbox
@@ -1247,7 +1247,7 @@ async fn run_detached(
                 );
                 " Secret environment variables were injected; background output files and completion tails are stored raw and are not secret-redacted."
             };
-            let job = DetachedCommand {
+            let turn = DetachedCommand {
                 handle_id: handle_id.clone(),
                 session_id: ctx.session_id.clone(),
                 command: command.to_string(),
@@ -1256,7 +1256,7 @@ async fn run_detached(
                 stdout_path,
                 stderr_path,
             };
-            let returned = sink.detach_command(job).await;
+            let returned = sink.detach_command(turn).await;
             Ok(Some(ToolOutput::Text(format!(
                 "Command still running after {timeout:?}; moved to the background as `{returned}`. \
                  Output is streaming to `{display_path}` (Read it for progress). You'll get a \
@@ -1426,7 +1426,7 @@ fn is_file_tool_redirect(command: &str) -> bool {
 /// things the agent would otherwise be missing:
 ///
 /// 1. The extended-help inventory (hidden subcommands like `cost`,
-///    `log`, `session`, `job`, `cron`, `config`). See
+///    `log`, `session`, `turn`, `cron`, `config`). See
 ///    `baybo_cli::cli::ENV_HELP_AGENT` for the reader contract.
 /// 2. The same config file the running gateway is using. Reads
 ///    `BAYBO_CONFIG_PATH` from the parent process when set, falls
@@ -2660,7 +2660,7 @@ mod tests {
         for cmd in [
             "baybo status --live | jq .",
             "cd /tmp && baybo cost show",
-            "for i in 1 2; do baybo job list; done",
+            "for i in 1 2; do baybo turn list; done",
         ] {
             let out = inject_baybo_env_with(cmd, c.as_os_str());
             assert!(
@@ -3328,14 +3328,14 @@ mod tests {
 
     #[async_trait]
     impl crate::BackgroundJobSink for RecordingSink {
-        async fn detach_command(&self, mut job: crate::DetachedCommand) -> String {
-            job.child.start_kill();
-            let _ = job.child.wait().await;
-            for t in job.copy_tasks.drain(..) {
+        async fn detach_command(&self, mut turn: crate::DetachedCommand) -> String {
+            turn.child.start_kill();
+            let _ = turn.child.wait().await;
+            for t in turn.copy_tasks.drain(..) {
                 let _ = t.await;
             }
-            let handle = job.handle_id.clone();
-            *self.seen.lock() = Some((handle.clone(), job.command.clone()));
+            let handle = turn.handle_id.clone();
+            *self.seen.lock() = Some((handle.clone(), turn.command.clone()));
             handle
         }
     }
@@ -3989,7 +3989,7 @@ mod tests {
         use std::time::{Duration as Dur, SystemTime};
         let dir = std::env::temp_dir().join(format!("baybo-prune-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("job.out");
+        let f = dir.join("turn.out");
         std::fs::write(&f, b"x").unwrap();
 
         // Cutoff in the past → the just-written file is newer → kept.

@@ -7,7 +7,7 @@
 //!
 //! **Automatic hooks** (the core's recall / write path):
 //! - **`recall`**: `POST /api/v1/search/find` with `{query, top_k}`.
-//! - **`on_job_complete`**: `POST /api/v1/sessions/{ctx.session_id}/messages`
+//! - **`on_turn_complete`**: `POST /api/v1/sessions/{ctx.session_id}/messages`
 //!   ×2 (user + assistant). The server accumulates session state for the
 //!   eventual commit.
 //! - **`on_session_end`**: `POST /api/v1/sessions/{ctx.session_id}/commit`,
@@ -70,7 +70,7 @@ pub struct OpenVikingTimeouts {
     /// down OpenViking server degrades the turn to "no recalled context"
     /// instead of stalling the user up to the full `http` budget.
     pub recall: Duration,
-    /// Background-write budget for `on_job_complete` / `on_session_end`.
+    /// Background-write budget for `on_turn_complete` / `on_session_end`.
     /// Detached on the runtime root, so the user never waits;
     /// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
     /// (LLM-backed), which can be slow under load — give it a generous ceiling.
@@ -797,7 +797,7 @@ impl Memory for OpenVikingMemory {
         }
     }
 
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         ctx: &MemoryContext,
         user_input: &[ContentBlock],
@@ -813,14 +813,14 @@ impl Memory for OpenVikingMemory {
         if !user_text.is_empty()
             && let Err(e) = self.add_message(user_id, sid, "user", &user_text).await
         {
-            debug!(error = %e, "openviking on_job_complete user msg failed");
+            debug!(error = %e, "openviking on_turn_complete user msg failed");
         }
         if !assistant_text.is_empty()
             && let Err(e) = self
                 .add_message(user_id, sid, "assistant", &assistant_text)
                 .await
         {
-            debug!(error = %e, "openviking on_job_complete assistant msg failed");
+            debug!(error = %e, "openviking on_turn_complete assistant msg failed");
         }
         Ok(())
     }

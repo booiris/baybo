@@ -6,7 +6,7 @@
 by side against the same manager graph:
 
 1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
-   operator controls (config, jobs, cron, traces, skills, tools,
+   operator controls (config, turns, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
    dashboard and the `/v1/deck/*` live-card family
@@ -71,7 +71,7 @@ admin-bearer-authed `/v1/channel-ws` + `/v1/blobs` subrouter so the
 browser dashboard can chat over the public admin bind without a second
 credential.
 Both listeners share the same manager graph (`SessionManager`,
-`JobLifecycle`, …). The channel listener hosts `/v1/channel-ws` and
+`TurnLifecycle`, …). The channel listener hosts `/v1/channel-ws` and
 `/v1/blobs`; the router sees a single `IncomingMessage` stream
 regardless of whether a frame came from the TUI, a sidecar, or a web
 chat tab. The per-type [`baybo_channels::Channel`] each connection
@@ -303,7 +303,7 @@ approvals — a resubscribe re-delivers the full card set in the
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
 Route handlers call the manager `pub async fn` methods directly
-(`SessionManager`, `JobLifecycle`, `CronScheduler`,
+(`SessionManager`, `TurnLifecycle`, `CronScheduler`,
 `TraceStore`, `SkillRegistry`, `ToolRegistry`) and serialise into DTOs
 defined in `crates/gateway/src/api/dto.rs`. CLI handler output is not
 reused — those are built around `CommandContext` + `OutputFormat` and
@@ -312,13 +312,13 @@ module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
 `api/dto.rs` is also the **only** place in the workspace that depends
-on `utoipa`. Domain crates (`baybo-model`, `baybo-job`, `baybo-cron`,
+on `utoipa`. Domain crates (`baybo-model`, `baybo-turn`, `baybo-cron`,
 `baybo-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
 no `#[schema(...)]` attributes leaking into them. The gateway defines
 a mirror type for every domain type that appears on the wire and
 provides `From<Domain>` conversions; handlers build DTOs at the seam
 via `.map(DomainDto::from)`. Mirror types keep their bare name
-(`Job`, `CronJob`, `ChannelType`, …) so the generated
+(`Turn`, `CronJob`, `ChannelType`, …) so the generated
 OpenAPI schemas — and the TypeScript types downstream — are stable
 across the refactor. Adding a field to a domain type now requires an
 explicit edit in `dto.rs` to surface it on HTTP; that's a feature, not
@@ -559,9 +559,9 @@ PUT    /v1/config                       { path, value } → 200 { path, written_
 DELETE /v1/config                       { path } → 200 { path, written_to, requires_restart }
 
 POST   /v1/config/reload               re-read config; hot fields applied live → 200 ReloadOutcome
-GET    /v1/jobs                         ?session=&status=&limit=&cursor=  (cursor pagination)
-GET    /v1/jobs/:id
-POST   /v1/jobs/:id/cancel
+GET    /v1/turns                        ?session=&status=&limit=&cursor=  (cursor pagination)
+GET    /v1/turns/:id
+POST   /v1/turns/:id/cancel
 GET    /v1/background-jobs              long-running background job list
 
 GET    /v1/cron                         ?deleted=  live jobs; deleted=true serves the recycle bin
@@ -574,8 +574,8 @@ POST   /v1/cron/:id/resume              status → enabled, next trigger recompu
 POST   /v1/cron/:id/restore             out of the recycle bin, with the status it was deleted with
 
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
-GET    /v1/traces/:session_id           session overview (message log + job summaries)
-GET    /v1/traces/:session_id/jobs/:job_id   per-job step/span tree
+GET    /v1/traces/:session_id           session overview (message log + turn summaries)
+GET    /v1/traces/:session_id/turns/:turn_id  per-turn step/span tree
 
 GET    /v1/skills
 GET    /v1/tools
@@ -736,7 +736,7 @@ The full frame set (see `crates/wire/src/lib.rs`):
 - **State plane (server → client):** `SubscribeState { session_id,
   as_of_ordinal?, turn, work_steps, pending_approvals, tasks }` — the
   one atomic REPLACE bundle sent per Subscribe: turn activity (from the
-  job store), the in-flight work block's buffered steps, the
+  turn store), the in-flight work block's buffered steps, the
   authoritative pending-approval card set (one atomic queue read), and
   the planning checklist, stamped with the session's newest persisted
   ordinal. Staleness of the turn/work halves is judged by turn identity
@@ -760,8 +760,8 @@ The full frame set (see `crates/wire/src/lib.rs`):
   show a transient banner/spinner on the start edge and clear it on the
   matching end, surfaces without one drop it),
   `TurnState { active, started_at? }` (is a turn in flight). Both edges
-  are projected from the job store by `spawn_turn_state_projector`
-  (subscribed to the job lifecycle bus, which carries the `start` edge
+  are projected from the turn store by `spawn_turn_state_projector`
+  (subscribed to the turn lifecycle bus, which carries the `start` edge
   and the terminal edges); a late joiner learns the in-flight turn from
   the `SubscribeState` bundle instead. Streaming clients (TUI / web)
   render these live; clients without a partial surface drop them.
@@ -836,7 +836,7 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 ## Runtime Assembly
 
 `start` builds the full manager graph — `SessionManager`,
-`JobLifecycle`, `CronScheduler`, `TraceStore`,
+`TurnLifecycle`, `CronScheduler`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
 `llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
@@ -910,9 +910,9 @@ subcommands use it for the same reason.
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
-  `SessionManager`, `JobLifecycle`, `CronScheduler` and
+  `SessionManager`, `TurnLifecycle`, `CronScheduler` and
   friends directly; there are no side-channel writes that bypass
-  Trace/Job observability.
+  Trace/Turn observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
   the per-workspace lock on `<workspace>/state/baybo.lock`. `baybo tui` is a
   `/v1/channel-ws` client (see [`tui.md`](./tui.md)) and **does not**
@@ -987,7 +987,7 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs,deck}.rs
+│   │       └── {status,config,turns,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs,deck}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
@@ -1000,7 +1000,7 @@ crates/gateway/
     ├── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
     ├── chat_api.rs              # /v1/chat/* web-chat session + token-mint surface
     ├── device_channel_ws.rs     # device-token auth on /v1/channel-ws against the real ChannelServer
-    ├── jobs_pagination.rs       # /v1/jobs cursor pagination + filters
+    ├── turns_pagination.rs      # /v1/turns cursor pagination + filters
     ├── llm_endpoint.rs          # /v1/llm* models/default/usage surface
     ├── logs_endpoint.rs         # /v1/logs + /v1/logs/stream SSE
     └── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
@@ -1025,7 +1025,7 @@ at runtime and stored in the per-workspace vault.
 
 ## Collaboration
 
-- **agent** — provides `SessionManager`, `JobLifecycle`, `CronScheduler`,
+- **agent** — provides `SessionManager`, `TurnLifecycle`, `CronScheduler`,
   `SecurityGateway`, `service::{ShutdownSignal,
   TaskTracker}` used by the server's graceful shutdown path.
 - **channels** — the `Channel` / `Connection` / `SessionEvent` handles,

@@ -21,7 +21,7 @@ use crate::{Memory, MemoryContext, RecalledMemory, Result};
 pub struct RecordingMemory {
     canned_recall: Mutex<Vec<RecalledMemory>>,
     recall_queries: Mutex<Vec<Vec<ContentBlock>>>,
-    job_completions: Mutex<Vec<(Vec<ContentBlock>, Vec<ContentBlock>)>>,
+    turn_completions: Mutex<Vec<(Vec<ContentBlock>, Vec<ContentBlock>)>>,
     session_ends: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
@@ -50,13 +50,13 @@ impl RecordingMemory {
         self.recall_queries.lock().clone()
     }
 
-    pub fn job_complete_count(&self) -> usize {
-        self.job_completions.lock().len()
+    pub fn turn_complete_count(&self) -> usize {
+        self.turn_completions.lock().len()
     }
 
-    /// The `(user_input, final_output)` pairs passed to each `on_job_complete`.
-    pub fn job_completions(&self) -> Vec<(Vec<ContentBlock>, Vec<ContentBlock>)> {
-        self.job_completions.lock().clone()
+    /// The `(user_input, final_output)` pairs passed to each `on_turn_complete`.
+    pub fn turn_completions(&self) -> Vec<(Vec<ContentBlock>, Vec<ContentBlock>)> {
+        self.turn_completions.lock().clone()
     }
 
     pub fn session_end_count(&self) -> usize {
@@ -80,13 +80,13 @@ impl Memory for RecordingMemory {
         Ok(self.canned_recall.lock().clone())
     }
 
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         _ctx: &MemoryContext,
         user_input: &[ContentBlock],
         final_output: &[ContentBlock],
     ) -> Result<()> {
-        self.job_completions
+        self.turn_completions
             .lock()
             .push((user_input.to_vec(), final_output.to_vec()));
         Ok(())

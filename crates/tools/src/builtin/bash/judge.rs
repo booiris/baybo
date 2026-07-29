@@ -259,7 +259,7 @@ async fn run_judge(
         }
         // Logged rather than swallowed: the rate at which the judge's
         // reply fails to parse is the metric that decides whether the
-        // configured lite model is good enough for this job, and an
+        // configured lite model is good enough for this turn, and an
         // unparseable verdict is otherwise indistinguishable from a
         // genuinely risky one.
         tracing::warn!(

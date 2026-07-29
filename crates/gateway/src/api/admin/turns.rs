@@ -1,4 +1,4 @@
-//! `/v1/jobs` endpoints.
+//! `/v1/turns` endpoints.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -7,15 +7,15 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::api::dto::{BackgroundJob, BackgroundJobsResponse, ErrorBody, Job, ListResponse};
+use crate::api::dto::{BackgroundJob, BackgroundJobsResponse, ErrorBody, ListResponse, Turn};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
 pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
-        .routes(routes!(list_jobs))
-        .routes(routes!(get_job))
-        .routes(routes!(cancel_job))
+        .routes(routes!(list_turns))
+        .routes(routes!(get_turn))
+        .routes(routes!(cancel_turn))
         .routes(routes!(list_background_jobs))
 }
 
@@ -31,10 +31,10 @@ const MAX_PAGE_LIMIT: usize = 500;
 #[derive(Debug, Deserialize, IntoParams)]
 struct ListJobsParams {
     /// Restrict to a single session. Hits the per-session index in
-    /// the store instead of scanning the full jobs table.
+    /// the store instead of scanning the full turns table.
     session: Option<String>,
     /// Restrict to one terminal/in-flight status discriminator.
-    /// Snake-case, matching `JobStatusKind` (`pending`, `in_progress`,
+    /// Snake-case, matching `TurnStatusKind` (`pending`, `in_progress`,
     /// `stuck`, `cancelled`, `failed`, `completed`).
     status: Option<String>,
     /// Maximum items to return. Defaults to 50; capped at 500.
@@ -43,15 +43,15 @@ struct ListJobsParams {
     cursor: Option<String>,
 }
 
-fn parse_status(s: &str) -> Result<baybo_job::JobStatusKind> {
-    use baybo_job::JobStatusKind;
+fn parse_status(s: &str) -> Result<baybo_turn::TurnStatusKind> {
+    use baybo_turn::TurnStatusKind;
     match s {
-        "pending" => Ok(JobStatusKind::Pending),
-        "in_progress" => Ok(JobStatusKind::InProgress),
-        "stuck" => Ok(JobStatusKind::Stuck),
-        "cancelled" => Ok(JobStatusKind::Cancelled),
-        "failed" => Ok(JobStatusKind::Failed),
-        "completed" => Ok(JobStatusKind::Completed),
+        "pending" => Ok(TurnStatusKind::Pending),
+        "in_progress" => Ok(TurnStatusKind::InProgress),
+        "stuck" => Ok(TurnStatusKind::Stuck),
+        "cancelled" => Ok(TurnStatusKind::Cancelled),
+        "failed" => Ok(TurnStatusKind::Failed),
+        "completed" => Ok(TurnStatusKind::Completed),
         other => Err(GatewayError::BadRequest(format!(
             "invalid status filter: {other:?}"
         ))),
@@ -60,20 +60,20 @@ fn parse_status(s: &str) -> Result<baybo_job::JobStatusKind> {
 
 #[utoipa::path(
     get,
-    path = "/jobs",
-    tag = "jobs",
+    path = "/turns",
+    tag = "turns",
     params(ListJobsParams),
     responses(
-        (status = 200, description = "Paginated jobs", body = inline(ListResponse<Job>)),
+        (status = 200, description = "Paginated turns", body = inline(ListResponse<Turn>)),
         (status = 400, description = "Invalid query parameters", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 500, description = "Job store error", body = ErrorBody),
+        (status = 500, description = "Turn store error", body = ErrorBody),
     )
 )]
-async fn list_jobs(
+async fn list_turns(
     State(state): State<AdminState>,
     Query(params): Query<ListJobsParams>,
-) -> Result<Json<ListResponse<Job>>> {
+) -> Result<Json<ListResponse<Turn>>> {
     let status = params.status.as_deref().map(parse_status).transpose()?;
     let limit = params
         .limit
@@ -86,32 +86,32 @@ async fn list_jobs(
         None => 0,
     };
 
-    let (page_jobs, total) = match params.session {
+    let (page_turns, total) = match params.session {
         // Session-scoped lists stay a per-session load (bounded by that
-        // session's job count) with in-memory paging.
+        // session's turn count) with in-memory paging.
         Some(sid) => {
             let sid = baybo_model::SessionId::from(sid);
-            let mut jobs = state
-                .job_lifecycle
+            let mut turns = state
+                .turn_lifecycle
                 .list_by_session(&sid, status)
                 .await
-                .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
-            let total = jobs.len();
+                .map_err(|e: baybo_turn::TurnError| GatewayError::Turn(e.to_string()))?;
+            let total = turns.len();
             if offset >= total {
                 return Ok(Json(ListResponse::new(Vec::new())));
             }
-            let page: Vec<_> = jobs.drain(offset..).take(limit).collect();
+            let page: Vec<_> = turns.drain(offset..).take(limit).collect();
             (page, total)
         }
         // The unscoped list pages in SQL — a page never materialises
-        // the whole jobs table.
+        // the whole turns table.
         None => state
-            .job_lifecycle
+            .turn_lifecycle
             .list_page(status, limit, offset)
             .await
-            .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?,
+            .map_err(|e: baybo_turn::TurnError| GatewayError::Turn(e.to_string()))?,
     };
-    let page: Vec<_> = page_jobs.into_iter().map(Job::from).collect();
+    let page: Vec<_> = page_turns.into_iter().map(Turn::from).collect();
     let next_cursor = if offset + page.len() < total {
         Some((offset + page.len()).to_string())
     } else {
@@ -148,62 +148,65 @@ async fn list_background_jobs(State(state): State<AdminState>) -> Json<Backgroun
 
 #[utoipa::path(
     get,
-    path = "/jobs/{id}",
-    tag = "jobs",
+    path = "/turns/{id}",
+    tag = "turns",
     params(
-        ("id" = String, Path, description = "Job id"),
+        ("id" = String, Path, description = "Turn id"),
     ),
     responses(
-        (status = 200, description = "Job record", body = Job),
-        (status = 400, description = "Invalid job id", body = ErrorBody),
+        (status = 200, description = "Turn record", body = Turn),
+        (status = 400, description = "Invalid turn id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
     )
 )]
-async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
-    let job_id: baybo_model::JobId = id
+async fn get_turn(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Turn>> {
+    let turn_id: baybo_model::TurnId = id
         .parse()
-        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
-    let job = state
-        .job_lifecycle
-        .get(&job_id)
+        .map_err(|e| GatewayError::BadRequest(format!("invalid turn id: {e}")))?;
+    let turn = state
+        .turn_lifecycle
+        .get(&turn_id)
         .await
-        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?
-        .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
-    Ok(Json(Job::from(job)))
+        .map_err(|e: baybo_turn::TurnError| GatewayError::Turn(e.to_string()))?
+        .ok_or_else(|| GatewayError::NotFound(format!("turn {id}")))?;
+    Ok(Json(Turn::from(turn)))
 }
 
 #[utoipa::path(
     post,
-    path = "/jobs/{id}/cancel",
-    tag = "jobs",
+    path = "/turns/{id}/cancel",
+    tag = "turns",
     params(
-        ("id" = String, Path, description = "Job id"),
+        ("id" = String, Path, description = "Turn id"),
     ),
     responses(
-        (status = 200, description = "Cancelled job record", body = Job),
-        (status = 400, description = "Invalid job id", body = ErrorBody),
+        (status = 200, description = "Cancelled turn record", body = Turn),
+        (status = 400, description = "Invalid turn id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 500, description = "Cancel failed", body = ErrorBody),
     )
 )]
-async fn cancel_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
-    let job_id: baybo_model::JobId = id
+async fn cancel_turn(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<Turn>> {
+    let turn_id: baybo_model::TurnId = id
         .parse()
-        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
+        .map_err(|e| GatewayError::BadRequest(format!("invalid turn id: {e}")))?;
     // Operator-initiated cancel; partial-artifact rollup belongs on the
     // recovery scan, not the admin endpoint.
     state
-        .job_lifecycle
-        .cancel(&job_id, baybo_job::CancelReason::OperatorCancel, vec![])
+        .turn_lifecycle
+        .cancel(&turn_id, baybo_turn::CancelReason::OperatorCancel, vec![])
         .await
-        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
-    let job = state
-        .job_lifecycle
-        .get(&job_id)
+        .map_err(|e: baybo_turn::TurnError| GatewayError::Turn(e.to_string()))?;
+    let turn = state
+        .turn_lifecycle
+        .get(&turn_id)
         .await
-        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?
-        .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
-    Ok(Json(Job::from(job)))
+        .map_err(|e: baybo_turn::TurnError| GatewayError::Turn(e.to_string()))?
+        .ok_or_else(|| GatewayError::NotFound(format!("turn {id}")))?;
+    Ok(Json(Turn::from(turn)))
 }

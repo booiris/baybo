@@ -164,7 +164,7 @@ const BACKUP_SECRETS_FILE: &str = "secrets.sql";
 /// the `secrets` rows as they stand.
 ///
 /// Deliberately **not** a copy of the database. Rotation touches one table;
-/// everything else — transcripts, traces, jobs — is untouched, so copying it
+/// everything else — transcripts, traces, turns — is untouched, so copying it
 /// would mean hundreds of megabytes per rotation for no recovery value. These
 /// two files are jointly sufficient and individually useless, which is also why
 /// they live in one directory.

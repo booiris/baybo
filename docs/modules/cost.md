@@ -47,7 +47,7 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 
 | Module    | Role                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------- |
-| `model`   | Provides `MicroUsd`, `SessionId`, `JobId`, `SpanId`                                                                  |
+| `model`   | Provides `MicroUsd`, `SessionId`, `TurnId`, `SpanId`                                                                 |
 | `llm`     | Provides `ModelPricing` (rates per 1M tokens) and the `LlmCallGuard` closure shape `cost_call_guard` adapts to       |
 | `agent`   | Gates `Router` ingress with `check`; binds per-call `Attribution` so `BillableLlm`'s recorder lands spend on the right span; records subscription-billed external-agent runs via `record_external_tokens` |
 | `baybo` (runtime) | Constructs one `CostManager` per process (`runtime.rs`), awaits `hydrate` before any actor can spawn, and wires `cost_hooks` into every `BillableLlm` |

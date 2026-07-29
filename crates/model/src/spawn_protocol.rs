@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ContentBlock, JobId, ModelTier, SessionId, SpanId, SubagentBackend};
+use crate::{ContentBlock, ModelTier, SessionId, SpanId, SubagentBackend, TurnId};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
@@ -108,7 +108,7 @@ pub struct SubagentSpawnRequest {
     pub model_tier: Option<ModelTier>,
     /// Fire-and-forget mode. When `true` the router surfaces a handle
     /// id and parents the child's wait task on the parent actor's
-    /// token rather than the parent job's token, so the child outlives
+    /// token rather than the parent turn's token, so the child outlives
     /// the dispatching turn and escorts its result back later.
     #[serde(default)]
     pub background: bool,
@@ -149,7 +149,7 @@ pub struct SubagentSpawnRequest {
 #[derive(Debug, Clone)]
 pub struct SubagentParentContext {
     pub session_id: SessionId,
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     /// Parent's `ToolCall(spawn_subagent)` span id — recorded on the
     /// child's `Lineage` so trace viewers can hop from the parent's
     /// tool span to the child session.
@@ -207,6 +207,13 @@ pub struct PendingBackgroundResult {
 }
 
 /// Which kind of background job a [`PendingBackgroundResult`] reports.
+///
+/// The tag key stays `job`: this is a **background job**, not the turn entity,
+/// and the tag is a persisted discriminator. `PendingBackgroundResult` rides
+/// inside `Session.background_notifications.pending_background_results`, so
+/// retagging it would make any session holding a buffered result fail to
+/// deserialize whole — and the session-list decoder drops undecodable rows with
+/// a warning, which would take a live conversation out of the user's list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "job", rename_all = "snake_case")]
 pub enum BackgroundJobKind {
@@ -430,5 +437,28 @@ mod tests {
             status: SubagentExitStatus::Timeout,
         };
         assert!(r.to_tool_result_text().contains("timeout"));
+    }
+
+    /// The persisted tag key for a background job is `job`, not `turn`.
+    ///
+    /// `PendingBackgroundResult` is serialized inside `Session`, so a retag
+    /// makes every session holding a buffered background result undecodable —
+    /// and the session-list decoder drops such rows with a warning, silently
+    /// removing a live conversation from the user's list. Pinned against a
+    /// literal blob rather than a round-trip, because a round-trip agrees with
+    /// itself no matter which key it uses.
+    #[test]
+    fn background_job_kind_keeps_its_persisted_tag() {
+        let stored = r#"{"job":"subagent","child_session_id":"c1","subagent_type":"researcher"}"#;
+        let decoded: BackgroundJobKind =
+            serde_json::from_str(stored).expect("a session persisted before the Turn rename");
+        assert!(matches!(decoded, BackgroundJobKind::Subagent { .. }));
+
+        let reserialized = serde_json::to_value(&decoded).expect("serialize");
+        assert_eq!(
+            reserialized.get("job").and_then(|v| v.as_str()),
+            Some("subagent")
+        );
+        assert!(reserialized.get("turn").is_none());
     }
 }

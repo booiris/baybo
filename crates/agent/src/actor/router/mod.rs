@@ -34,9 +34,9 @@ use crate::actor::mailbox::MailboxSender;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::security::SecurityGateway;
 use baybo_cost::CostManager;
-use baybo_job::JobLifecycle;
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
+use baybo_turn::TurnLifecycle;
 
 /// Live, atomically-updatable rate-limit knobs, shared between the
 /// `Router`'s [`RateLimiter`] (reader) and the config-reload
@@ -174,9 +174,9 @@ pub struct Router {
     cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
     actor_spawner: ActorSpawner,
-    /// Job lifecycle handle — subscribe to terminal-event broadcasts and
+    /// Turn lifecycle handle — subscribe to terminal-event broadcasts and
     /// reconcile via the store on broadcast lag.
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
     /// Delivery ledger for one-shot cron results: the cron waiter stamps a
     /// fire's outcome here, and `run()` scans it at boot to re-drive results
     /// that never reached their conversation.
@@ -188,7 +188,7 @@ pub struct Router {
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
-    /// process shutdown cascades into every in-flight job.
+    /// process shutdown cascades into every in-flight turn.
     actor_parent_token: CancellationToken,
 }
 
@@ -202,7 +202,7 @@ pub struct RouterConfig {
     pub security_gateway: Arc<SecurityGateway>,
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     /// Delivery ledger for one-shot cron results — see [`Router::cron_store`].
     pub cron_store: Arc<dyn CronStore>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
@@ -225,7 +225,7 @@ impl Router {
             security_gateway,
             cost_manager,
             actor_spawner,
-            job_lifecycle,
+            turn_lifecycle,
             cron_store,
             cron_trigger_rx,
             actor_parent_token,
@@ -239,7 +239,7 @@ impl Router {
             cost_manager,
             rate_limiter: RateLimiter::new(rate_limit),
             actor_spawner,
-            job_lifecycle,
+            turn_lifecycle,
             cron_store,
             cron_trigger_rx: Some(cron_trigger_rx),
             actor_parent_token,

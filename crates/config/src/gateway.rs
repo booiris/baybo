@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// The gateway runs two listeners:
 ///
 /// * **Admin** on TCP (`bind_address`:`port`) with bearer-token auth
-///   for the REST surface (config / status / jobs / cron / memory /
+///   for the REST surface (config / status / turns / cron / memory /
 ///   traces / skills / tools / llm and a read-only channel list) and
 ///   channel-token auth for the co-hosted `/v1/channel-ws` upgrade.
 ///   The TUI and the browser-side web chat page both dial this same

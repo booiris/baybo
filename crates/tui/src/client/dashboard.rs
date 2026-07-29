@@ -40,8 +40,8 @@ impl DashboardProvider for TuiDashboardProvider {
                 ],
             ),
             ViewKind::Skills => ("Skills", vec!["NAME".into()]),
-            ViewKind::Jobs => (
-                "Jobs",
+            ViewKind::Turns => (
+                "Turns",
                 vec![
                     "ID".into(),
                     "SESSION".into(),

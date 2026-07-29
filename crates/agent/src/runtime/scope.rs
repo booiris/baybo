@@ -12,7 +12,7 @@
 //! `LifecycleOutcome::Cancelled { reason }` and `Failed { reason }`
 //! are distinct terminal states with distinct downstream semantics
 //! (replay / cost-attribution UIs treat them differently — see
-//! `baybo_trace::outcome` and `baybo_job::CancelReason`). Callers that
+//! `baybo_trace::outcome` and `baybo_turn::CancelReason`). Callers that
 //! run inside a cancellable scope pass `Some((token, reason))`; on
 //! `Err` the helper checks `token.is_cancelled()` and records the
 //! body's exit as `Cancelled { reason }` instead of `Failed`. Callers
@@ -30,27 +30,27 @@
 
 use std::future::Future;
 
-use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
-use baybo_model::{JobId, ParallelGroup, SessionId, TriggerKind};
+use baybo_model::{ParallelGroup, SessionId, TriggerKind, TurnId};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind,
     SpanRecorder, StepHandle, StepKind,
 };
+use baybo_turn::{CancelReason, TurnInput, TurnLifecycle, TurnOutput};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-/// Inputs needed to create a new `Job`. Bundled into a struct so
-/// [`with_job`] can own the full `start_job → start → body → complete/fail`
+/// Inputs needed to create a new `Turn`. Bundled into a struct so
+/// [`with_turn`] can own the full `start_turn → start → body → complete/fail`
 /// lifecycle without ballooning its parameter list — production callers
-/// must go through [`with_job`], not `JobLifecycle::start_job` directly,
+/// must go through [`with_turn`], not `TurnLifecycle::start_turn` directly,
 /// so the cancel state machine can't be skipped.
-pub(crate) struct JobSpec {
+pub(crate) struct TurnSpec {
     pub session_id: SessionId,
-    /// The owning session's root trigger — recorded on the job as its
+    /// The owning session's root trigger — recorded on the turn as its
     /// `origin`, independent of `input`.
     pub origin: TriggerKind,
-    pub input: JobInput,
-    pub parent_job_id: Option<JobId>,
+    pub input: TurnInput,
+    pub parent_turn_id: Option<TurnId>,
 }
 
 /// Optional cancel context. When the body returns `Err` and the token
@@ -85,7 +85,7 @@ fn outcome_on_err<E: std::fmt::Display>(e: &E, cancel: CancelContext<'_>) -> Lif
 /// `Failed { reason: e.to_string() }`.
 pub(crate) async fn with_step<F, Fut, T>(
     rec: &SpanRecorder,
-    job_id: JobId,
+    turn_id: TurnId,
     kind: StepKind,
     cancel: CancelContext<'_>,
     body: F,
@@ -94,7 +94,7 @@ where
     F: FnOnce(StepHandle) -> Fut,
     Fut: Future<Output = anyhow::Result<(LifecycleOutcome, T)>>,
 {
-    let step = rec.begin_step(job_id, kind).await?;
+    let step = rec.begin_step(turn_id, kind).await?;
     let result = body(step.clone()).await;
     let outcome = match &result {
         Ok((o, _)) => o.clone(),
@@ -111,25 +111,25 @@ where
     result.map(|(_, v)| v)
 }
 
-/// Own a full `Job` lifecycle: create the row via `start_job`,
+/// Own a full `Turn` lifecycle: create the row via `start_turn`,
 /// register the cancellation token, transition `Pending → InProgress`,
 /// run the body, then `complete` on success or `fail` on error.
 ///
 /// Production callers must go through this helper rather than calling
-/// `JobLifecycle::start_job` directly, so the cancel state machine
+/// `TurnLifecycle::start_turn` directly, so the cancel state machine
 /// (token registry + InProgress transition + cancel-race windows
 /// below) can't be skipped. Tests inside the agent crate may still
-/// use `start_job` directly to construct fixtures in arbitrary states.
+/// use `start_turn` directly to construct fixtures in arbitrary states.
 ///
-/// Body returns `(JobOutput, T)` on success: the helper writes the
+/// Body returns `(TurnOutput, T)` on success: the helper writes the
 /// output via `complete`, and `T` flows back to the caller.
-/// `JobLifecycle::complete` / `fail` / `cancel` themselves publish
+/// `TurnLifecycle::complete` / `fail` / `cancel` themselves publish
 /// terminal events on the broadcast bus; this helper does not need
 /// to fire any extra notification.
 ///
 /// ## Cancel-race handling
 ///
-/// `JobLifecycle::cancel` first trips the registered token, *then*
+/// `TurnLifecycle::cancel` first trips the registered token, *then*
 /// flips the row to `Cancelled`. Three windows are handled:
 /// 1. cancel arrives before `start()` → start() succeeds (Pending →
 ///    InProgress is allowed even on a cancelled token; the body's
@@ -141,65 +141,70 @@ where
 /// 3. cancel arrives between body returning Ok and `complete()`'s
 ///    write → complete() returns InvalidTransition; helper turns
 ///    that into Err so the caller doesn't dispatch the response.
-pub(crate) async fn with_job<F, Fut, T>(
-    lifecycle: &JobLifecycle,
+pub(crate) async fn with_turn<F, Fut, T>(
+    lifecycle: &TurnLifecycle,
     cancel_token: CancellationToken,
-    spec: JobSpec,
+    spec: TurnSpec,
     body: F,
 ) -> anyhow::Result<T>
 where
-    F: FnOnce(JobId) -> Fut,
-    Fut: Future<Output = anyhow::Result<(JobOutput, T)>>,
+    F: FnOnce(TurnId) -> Fut,
+    Fut: Future<Output = anyhow::Result<(TurnOutput, T)>>,
 {
-    let job = lifecycle
-        .start_job(spec.session_id, spec.origin, spec.input, spec.parent_job_id)
+    let turn = lifecycle
+        .start_turn(
+            spec.session_id,
+            spec.origin,
+            spec.input,
+            spec.parent_turn_id,
+        )
         .await?;
-    let job_id = job.id;
-    let _cancel_guard = lifecycle.register_running(job_id, cancel_token.clone());
+    let turn_id = turn.id;
+    let _cancel_guard = lifecycle.register_running(turn_id, cancel_token.clone());
 
-    if let Err(e) = lifecycle.start(&job_id).await {
-        // Pending row exists from start_job; mark Failed so it doesn't
+    if let Err(e) = lifecycle.start(&turn_id).await {
+        // Pending row exists from start_turn; mark Failed so it doesn't
         // leak as forever-Pending.
         lifecycle
-            .fail(&job_id, format!("start failed: {e}"))
+            .fail(&turn_id, format!("start failed: {e}"))
             .await
             .ok();
         return Err(e.into());
     }
 
-    let result = body(job_id).await;
+    let result = body(turn_id).await;
 
     match result {
         Ok((output, value)) => {
             if cancel_token.is_cancelled() {
-                warn!(job_id = %job_id, "cancel observed after body returned Ok; suppressing complete");
-                return Err(anyhow::anyhow!("job cancelled mid-flight"));
+                warn!(turn_id = %turn_id, "cancel observed after body returned Ok; suppressing complete");
+                return Err(anyhow::anyhow!("turn cancelled mid-flight"));
             }
-            match lifecycle.complete(&job_id, output).await {
+            match lifecycle.complete(&turn_id, output).await {
                 Ok(()) => Ok(value),
                 Err(e) => {
-                    warn!(error = %e, job_id = %job_id, "complete() rejected; treating as cancelled");
-                    Err(anyhow::anyhow!("job already terminal: {e}"))
+                    warn!(error = %e, turn_id = %turn_id, "complete() rejected; treating as cancelled");
+                    Err(anyhow::anyhow!("turn already terminal: {e}"))
                 }
             }
         }
         Err(e) => {
             if cancel_token.is_cancelled() {
-                // The token may have been cancelled BEFORE this job's row
+                // The token may have been cancelled BEFORE this turn's row
                 // existed (e.g. `/stop` tripping a child's pre-dispatch token),
                 // so the row can still be InProgress here, not Cancelled.
                 // `cancel` is idempotent on a terminal row (it preserves the
                 // canceller's original reason) and flips an InProgress row to
                 // Cancelled — so it both avoids `fail()`'s InvalidTransition and
-                // stops a pre-job-window row leaking as forever-InProgress.
+                // stops a pre-turn-window row leaking as forever-InProgress.
                 lifecycle
-                    .cancel(&job_id, CancelReason::ParentCancelled, Vec::new())
+                    .cancel(&turn_id, CancelReason::ParentCancelled, Vec::new())
                     .await
                     .ok();
                 return Err(e);
             }
-            if let Err(fe) = lifecycle.fail(&job_id, e.to_string()).await {
-                warn!(error = %fe, "failed to mark job failed");
+            if let Err(fe) = lifecycle.fail(&turn_id, e.to_string()).await {
+                warn!(error = %fe, "failed to mark turn failed");
             }
             Err(e)
         }
@@ -222,7 +227,7 @@ where
 pub(crate) async fn with_span<F, Fut, T>(
     rec: &SpanRecorder,
     step: &StepHandle,
-    job_id: JobId,
+    turn_id: TurnId,
     kind: SpanKind,
     parallel_group: Option<ParallelGroup>,
     cancel: CancelContext<'_>,
@@ -242,7 +247,7 @@ where
                 (SpanFinalize::Empty, outcome, Err(e))
             }
         };
-    if let Err(close_err) = rec.end_span(span, job_id, finalize, outcome).await {
+    if let Err(close_err) = rec.end_span(span, turn_id, finalize, outcome).await {
         match &value_result {
             Ok(_) => warn!(error = %close_err, "end_span failed on success path"),
             Err(orig) => {
@@ -271,7 +276,7 @@ where
 pub(crate) async fn with_llm_span<F, Fut, T>(
     rec: &SpanRecorder,
     step: &StepHandle,
-    job_id: JobId,
+    turn_id: TurnId,
     begin: LlmCallBegin,
     cancel: CancelContext<'_>,
     body: F,
@@ -296,7 +301,7 @@ where
         Err(e) => outcome_on_err(e, cancel),
     };
     let finalize = SpanFinalize::LlmCall(call_result);
-    if let Err(close_err) = rec.end_span(span, job_id, finalize, outcome).await {
+    if let Err(close_err) = rec.end_span(span, turn_id, finalize, outcome).await {
         match &value_result {
             Ok(_) => warn!(error = %close_err, "end_llm_span failed on success path"),
             Err(orig) => {

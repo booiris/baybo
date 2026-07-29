@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_channels::{AgentEvent, AgentOutput, TurnStatus};
+use baybo_channels::{AgentEvent, AgentOutput, StatusPhase};
 use baybo_integration_tests::AgentTestHarness;
 use baybo_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use baybo_model::MicroUsd;
@@ -104,13 +104,13 @@ async fn compression_call_records_cost_with_matching_span_id() {
         "expected 3 cost records (turn1, compression, turn2); got: {records:#?}"
     );
 
-    // Find a Compression step in any of the recorded jobs. There
+    // Find a Compression step in any of the recorded turns. There
     // should be exactly one across the test run.
-    let job_ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.job_id).collect();
+    let turn_ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.turn_id).collect();
     let mut compression_steps = Vec::new();
-    for job_id in &job_ids {
+    for turn_id in &turn_ids {
         let steps: Vec<baybo_trace::Step> = trace_store
-            .list_steps_by_job(job_id)
+            .list_steps_by_turn(turn_id)
             .await
             .unwrap()
             .into_iter()
@@ -246,14 +246,14 @@ async fn compaction_reports_compacting_then_compacted_status() {
     let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
         status_phases(&turn2),
-        vec![TurnStatus::Compacting, TurnStatus::Compacted],
+        vec![StatusPhase::Compacting, StatusPhase::Compacted],
         "turn 2 must report Compacting then Compacted, got {turn2:?}"
     );
 
     harness.shutdown().await;
 }
 
-fn status_phases(outputs: &[AgentOutput]) -> Vec<TurnStatus> {
+fn status_phases(outputs: &[AgentOutput]) -> Vec<StatusPhase> {
     outputs
         .iter()
         .filter_map(|o| match &o.event {
@@ -303,22 +303,22 @@ async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
     );
     assert_eq!(
         status_phases(&turn2),
-        vec![TurnStatus::Compacting, TurnStatus::Compacted],
+        vec![StatusPhase::Compacting, StatusPhase::Compacted],
         "the status pair must still bracket a failed compaction"
     );
 
     let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
     let mut truncate_steps = Vec::new();
     let mut summariser_spans = 0usize;
-    for job_id in harness
-        .job_lifecycle
+    for turn_id in harness
+        .turn_lifecycle
         .list(None)
         .await
         .unwrap()
         .iter()
         .map(|j| j.id)
     {
-        for row in trace_store.list_steps_by_job(&job_id).await.unwrap() {
+        for row in trace_store.list_steps_by_turn(&turn_id).await.unwrap() {
             let step = baybo_trace::Step::from_row(row).unwrap();
             let StepKind::Compression { applied, .. } = step.kind else {
                 continue;
@@ -378,15 +378,15 @@ async fn a_non_retriable_summariser_failure_is_not_retried() {
 
     let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
     let mut summariser_spans = 0usize;
-    for job_id in harness
-        .job_lifecycle
+    for turn_id in harness
+        .turn_lifecycle
         .list(None)
         .await
         .unwrap()
         .iter()
         .map(|j| j.id)
     {
-        for row in trace_store.list_steps_by_job(&job_id).await.unwrap() {
+        for row in trace_store.list_steps_by_turn(&turn_id).await.unwrap() {
             let step = baybo_trace::Step::from_row(row).unwrap();
             if !matches!(
                 step.kind,
@@ -473,15 +473,15 @@ async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
 
     // Exactly what `handle_stop` does.
     let turns = harness
-        .job_lifecycle
-        .list_active_turns_by_session(&harness.session.id)
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&harness.session.id)
         .await
         .expect("list active turns");
     assert!(!turns.is_empty(), "a turn must be in flight to cancel");
-    for job in &turns {
+    for turn in &turns {
         harness
-            .job_lifecycle
-            .cancel(&job.id, baybo_job::CancelReason::UserStopped, vec![])
+            .turn_lifecycle
+            .cancel(&turn.id, baybo_turn::CancelReason::UserStopped, vec![])
             .await
             .expect("cancel the in-flight turn");
     }
@@ -502,7 +502,7 @@ async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
         "nothing may be dropped either — a cancel must not truncate"
     );
     assert!(
-        !status_phases(&cancelled_turn).contains(&TurnStatus::Compacted),
+        !status_phases(&cancelled_turn).contains(&StatusPhase::Compacted),
         "the compaction was abandoned, so it must not report Compacted"
     );
 

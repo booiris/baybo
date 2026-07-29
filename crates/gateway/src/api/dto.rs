@@ -2,7 +2,7 @@
 //!
 //! Every type that appears in an admin-API response lives here and
 //! derives [`utoipa::ToSchema`] so `crate::openapi` can emit a spec
-//! matching the wire format. Domain types in `baybo-model`, `baybo-job`,
+//! matching the wire format. Domain types in `baybo-model`, `baybo-turn`,
 //! `baybo-cron`, `baybo-tools` deliberately stay free of utoipa so
 //! changes over there don't silently reshape the HTTP surface — every
 //! field crossing the API boundary has an explicit DTO mirror plus a
@@ -18,7 +18,7 @@
 //!
 //! **v1 stability:** the v1 surface is in active development and has
 //! no published external consumers yet. Breaking shape changes
-//! (e.g. the `JobStatus` `kind`/`reason`/`cancel_reason` envelope
+//! (e.g. the `TurnStatus` `kind`/`reason`/`cancel_reason` envelope
 //! introduced with the trace redesign) land directly on `/v1/*`
 //! without a parallel `/v2/*`. Once an external consumer is on the
 //! record we'll switch to additive-only changes here.
@@ -110,7 +110,7 @@ pub struct StatusResponse {
     pub version: String,
     pub bind_address: String,
     pub sessions: usize,
-    pub jobs_in_flight: usize,
+    pub turns_in_flight: usize,
 }
 
 /// One in-flight background job (detached subagent or `Bash` command),
@@ -498,17 +498,17 @@ impl From<UpdateCronRequest> for baybo_cron::CronJobPatch {
     }
 }
 
-// ── Job ──────────────────────────────────────────────────────────────
+// ── Turn ──────────────────────────────────────────────────────────────
 
-/// Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
+/// Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload
 /// the domain enum carries (cancel reason, partial-artifact span IDs);
 /// the wire shape collapses inner-variant content into `Option`-typed
 /// fields so HTTP clients can decode without needing the full Rust
 /// enum machinery.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub struct JobStatus {
-    pub kind: JobStatusKind,
+pub struct TurnStatus {
+    pub kind: TurnStatusKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,7 +519,7 @@ pub struct JobStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobStatusKind {
+pub enum TurnStatusKind {
     Pending,
     InProgress,
     Stuck,
@@ -528,53 +528,52 @@ pub enum JobStatusKind {
     Completed,
 }
 
-impl From<baybo_job::JobStatusKind> for JobStatusKind {
-    fn from(v: baybo_job::JobStatusKind) -> Self {
+impl From<baybo_turn::TurnStatusKind> for TurnStatusKind {
+    fn from(v: baybo_turn::TurnStatusKind) -> Self {
         match v {
-            baybo_job::JobStatusKind::Pending => Self::Pending,
-            baybo_job::JobStatusKind::InProgress => Self::InProgress,
-            baybo_job::JobStatusKind::Stuck => Self::Stuck,
-            baybo_job::JobStatusKind::Cancelled => Self::Cancelled,
-            baybo_job::JobStatusKind::Failed => Self::Failed,
-            baybo_job::JobStatusKind::Completed => Self::Completed,
+            baybo_turn::TurnStatusKind::Pending => Self::Pending,
+            baybo_turn::TurnStatusKind::InProgress => Self::InProgress,
+            baybo_turn::TurnStatusKind::Stuck => Self::Stuck,
+            baybo_turn::TurnStatusKind::Cancelled => Self::Cancelled,
+            baybo_turn::TurnStatusKind::Failed => Self::Failed,
+            baybo_turn::TurnStatusKind::Completed => Self::Completed,
         }
     }
 }
 
-impl From<JobStatusKind> for baybo_job::JobStatusKind {
-    fn from(v: JobStatusKind) -> Self {
+impl From<TurnStatusKind> for baybo_turn::TurnStatusKind {
+    fn from(v: TurnStatusKind) -> Self {
         match v {
-            JobStatusKind::Pending => Self::Pending,
-            JobStatusKind::InProgress => Self::InProgress,
-            JobStatusKind::Stuck => Self::Stuck,
-            JobStatusKind::Cancelled => Self::Cancelled,
-            JobStatusKind::Failed => Self::Failed,
-            JobStatusKind::Completed => Self::Completed,
+            TurnStatusKind::Pending => Self::Pending,
+            TurnStatusKind::InProgress => Self::InProgress,
+            TurnStatusKind::Stuck => Self::Stuck,
+            TurnStatusKind::Cancelled => Self::Cancelled,
+            TurnStatusKind::Failed => Self::Failed,
+            TurnStatusKind::Completed => Self::Completed,
         }
     }
 }
 
-impl From<baybo_job::JobStatus> for JobStatus {
-    fn from(v: baybo_job::JobStatus) -> Self {
-        let kind = JobStatusKind::from(v.kind());
+impl From<baybo_turn::TurnStatus> for TurnStatus {
+    fn from(v: baybo_turn::TurnStatus) -> Self {
+        let kind = TurnStatusKind::from(v.kind());
         match v {
-            baybo_job::JobStatus::Pending
-            | baybo_job::JobStatus::InProgress
-            | baybo_job::JobStatus::Completed => Self {
+            baybo_turn::TurnStatus::Pending
+            | baybo_turn::TurnStatus::InProgress
+            | baybo_turn::TurnStatus::Completed => Self {
                 kind,
                 reason: None,
                 cancel_reason: None,
                 partial_artifacts: Vec::new(),
             },
-            baybo_job::JobStatus::Stuck { reason } | baybo_job::JobStatus::Failed { reason } => {
-                Self {
-                    kind,
-                    reason: Some(reason),
-                    cancel_reason: None,
-                    partial_artifacts: Vec::new(),
-                }
-            }
-            baybo_job::JobStatus::Cancelled {
+            baybo_turn::TurnStatus::Stuck { reason }
+            | baybo_turn::TurnStatus::Failed { reason } => Self {
+                kind,
+                reason: Some(reason),
+                cancel_reason: None,
+                partial_artifacts: Vec::new(),
+            },
+            baybo_turn::TurnStatus::Cancelled {
                 reason,
                 partial_artifacts,
             } => Self {
@@ -590,10 +589,10 @@ impl From<baybo_job::JobStatus> for JobStatus {
     }
 }
 
-/// Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
+/// Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobInputKind {
+pub enum TurnInputKind {
     UserChat,
     Cron,
     CronNotification,
@@ -602,30 +601,30 @@ pub enum JobInputKind {
     SubagentNotification,
 }
 
-impl From<baybo_job::JobInputKind> for JobInputKind {
-    fn from(v: baybo_job::JobInputKind) -> Self {
+impl From<baybo_turn::TurnInputKind> for TurnInputKind {
+    fn from(v: baybo_turn::TurnInputKind) -> Self {
         match v {
-            baybo_job::JobInputKind::UserChat => Self::UserChat,
-            baybo_job::JobInputKind::Cron => Self::Cron,
-            baybo_job::JobInputKind::CronNotification => Self::CronNotification,
-            baybo_job::JobInputKind::Compact => Self::Compact,
-            baybo_job::JobInputKind::Spawned => Self::Spawned,
-            baybo_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
+            baybo_turn::TurnInputKind::UserChat => Self::UserChat,
+            baybo_turn::TurnInputKind::Cron => Self::Cron,
+            baybo_turn::TurnInputKind::CronNotification => Self::CronNotification,
+            baybo_turn::TurnInputKind::Compact => Self::Compact,
+            baybo_turn::TurnInputKind::Spawned => Self::Spawned,
+            baybo_turn::TurnInputKind::SubagentNotification => Self::SubagentNotification,
         }
     }
 }
 
-/// Wire mirror of a job's origin (the owning session's root trigger,
+/// Wire mirror of a turn's origin (the owning session's root trigger,
 /// [`baybo_model::TriggerKind`]).
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobOrigin {
+pub enum TurnOrigin {
     User,
     Cron,
     Spawned,
 }
 
-impl From<baybo_model::TriggerKind> for JobOrigin {
+impl From<baybo_model::TriggerKind> for TurnOrigin {
     fn from(v: baybo_model::TriggerKind) -> Self {
         match v {
             baybo_model::TriggerKind::User => Self::User,
@@ -635,19 +634,19 @@ impl From<baybo_model::TriggerKind> for JobOrigin {
     }
 }
 
-/// Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
+/// Wire mirror of [`baybo_turn::Turn`]. Inner shape reflects the new
 /// state machine (Q6) — `final_result` replaces `output`/`error`,
 /// `emitted_span_ids` replaces `trace_span_id`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct Job {
+pub struct Turn {
     pub id: String,
     pub session_id: String,
-    pub parent_job_id: Option<String>,
-    /// What payload fed the job (display-only projection of the input).
-    pub input_kind: JobInputKind,
+    pub parent_turn_id: Option<String>,
+    /// What payload fed the turn (display-only projection of the input).
+    pub input_kind: TurnInputKind,
     /// The owning session's root trigger.
-    pub origin: JobOrigin,
-    pub status: JobStatus,
+    pub origin: TurnOrigin,
+    pub status: TurnStatus,
     #[schema(value_type = Option<Object>)]
     pub final_result: Option<serde_json::Value>,
     pub emitted_span_ids: Vec<String>,
@@ -656,12 +655,12 @@ pub struct Job {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
-impl From<baybo_job::Job> for Job {
-    fn from(v: baybo_job::Job) -> Self {
+impl From<baybo_turn::Turn> for Turn {
+    fn from(v: baybo_turn::Turn) -> Self {
         Self {
             id: v.id.to_string(),
             session_id: v.session_id.to_string(),
-            parent_job_id: v.parent_job_id.map(|p| p.to_string()),
+            parent_turn_id: v.parent_turn_id.map(|p| p.to_string()),
             input_kind: v.input_kind().into(),
             origin: v.origin.into(),
             status: v.status.into(),
@@ -733,7 +732,7 @@ pub struct CronJob {
     pub id: String,
     pub user_id: String,
     pub channel: ChannelType,
-    /// Short human name for the job. Empty for rows created before the field
+    /// Short human name for the turn. Empty for rows created before the field
     /// existed — clients fall back to the prompt.
     pub title: String,
     pub schedule: CronSchedule,
@@ -935,9 +934,9 @@ impl From<SessionKind> for baybo_query::SessionKind {
 #[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct TracesListQuery {
-    /// Filter on the latest job's status (snake_case enum).
+    /// Filter on the latest turn's status (snake_case enum).
     #[serde(default)]
-    pub status: Option<JobStatusKind>,
+    pub status: Option<TurnStatusKind>,
     /// Inclusive lower bound on `last_active`.
     #[serde(default)]
     pub since: Option<DateTime<Utc>>,
@@ -973,13 +972,13 @@ pub struct TraceSessionSummary {
     pub session_id: String,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
-    /// `None` when the session has no jobs (those rows are filtered
+    /// `None` when the session has no turns (those rows are filtered
     /// out, but the type stays Option to keep the wire shape stable
     /// if the policy ever flips).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_job_status: Option<JobStatus>,
+    pub latest_turn_status: Option<TurnStatus>,
     pub kind: SessionKind,
-    pub job_count: usize,
+    pub turn_count: usize,
     pub span_count: usize,
     pub input_tokens: usize,
     pub output_tokens: usize,
@@ -993,9 +992,9 @@ impl From<baybo_query::SessionSummary> for TraceSessionSummary {
             session_id: v.session_id.to_string(),
             created_at: v.created_at,
             last_active: v.last_active,
-            latest_job_status: v.latest_job_status.map(Into::into),
+            latest_turn_status: v.latest_turn_status.map(Into::into),
             kind: v.kind.into(),
-            job_count: v.job_count,
+            turn_count: v.turn_count,
             span_count: v.span_count,
             input_tokens: v.input_tokens,
             output_tokens: v.output_tokens,

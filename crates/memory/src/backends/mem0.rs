@@ -6,7 +6,7 @@
 //!
 //! **Automatic hooks** (the core's recall / write path):
 //! - **`recall`**: `POST /v2/memories/search/` with `{filters, rerank, top_k}`.
-//! - **`on_job_complete`**: `POST /v1/memories/` with `{messages, user_id, agent_id}`.
+//! - **`on_turn_complete`**: `POST /v1/memories/` with `{messages, user_id, agent_id}`.
 //! - **`on_session_end`**: no-op (Mem0 has no session concept; extraction is
 //!   immediate on `add`).
 //!
@@ -86,13 +86,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// per-request budget short so an unreachable Mem0 endpoint does not stall
 /// boot up to `HTTP_TIMEOUT` (mirrors openviking's `HEALTH_TIMEOUT`).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Recall is on the **critical path** (job start + each interjection), so
+/// Recall is on the **critical path** (turn start + each interjection), so
 /// the agent loop waits inline for it. Cap the request well below
 /// `HTTP_TIMEOUT` so a slow / down Mem0 endpoint degrades the turn to "no
 /// recalled context" instead of stalling the user up to 30 s before the
 /// first model token.
 const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Background-write budget for `on_job_complete`. Detached on the runtime
+/// Background-write budget for `on_turn_complete`. Detached on the runtime
 /// root, so the user never waits; Mem0's server-side fact-extraction is
 /// LLM-backed and can be slow under load, so give it a generous ceiling.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -684,7 +684,7 @@ impl Memory for Mem0Memory {
         }
     }
 
-    async fn on_job_complete(
+    async fn on_turn_complete(
         &self,
         ctx: &MemoryContext,
         user_input: &[ContentBlock],
@@ -708,7 +708,7 @@ impl Memory for Mem0Memory {
             }
             Err(e) => {
                 self.inner.record_failure();
-                warn!(error = %e, "mem0 on_job_complete failed");
+                warn!(error = %e, "mem0 on_turn_complete failed");
                 Ok(())
             }
         }

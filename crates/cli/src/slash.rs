@@ -6,8 +6,8 @@ use baybo_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
-    LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, LlmCmd, LogCmd,
+    McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd, TurnCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -72,7 +72,7 @@ impl CliSlashHandler {
             llm: self.ctx.llm.clone(),
             workspace: self.ctx.workspace.clone(),
             session: self.ctx.session.clone(),
-            job: self.ctx.job.clone(),
+            turn: self.ctx.turn.clone(),
             cron: self.ctx.cron.clone(),
             trace: self.ctx.trace.clone(),
             query_api: self.ctx.query_api.clone(),
@@ -114,7 +114,7 @@ impl SlashHandler for CliSlashHandler {
             }
             let slash = format!("/{name}");
             // Hidden subcommands (the `BAYBO_HELP_AGENT` extended-help
-            // bucket: `config`, `log`, `session`, `job`, `cron`, `cost`)
+            // bucket: `config`, `log`, `session`, `turn`, `cron`, `cost`)
             // still own their slot — claim it in `seen` so a workspace
             // skill with the same name can't slip into the menu — but
             // skip the display row so the chat-completion list stays
@@ -153,7 +153,7 @@ impl SlashHandler for CliSlashHandler {
     }
 
     async fn handle(&self, raw: &str) -> SlashOutcome {
-        // Bare `/skills`, `/jobs`, `/sessions` (no args)
+        // Bare `/skills`, `/turns`, `/sessions` (no args)
         // open the corresponding dashboard view in TUI-capable adapters;
         // adapters that don't support views treat this as a no-op.
         if let Some(kind) = dashboard_shortcut(raw) {
@@ -197,7 +197,7 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
     };
     match cmd.as_str() {
         "skills" => Some(ViewKind::Skills),
-        "jobs" => Some(ViewKind::Jobs),
+        "turns" => Some(ViewKind::Turns),
         "sessions" => Some(ViewKind::Sessions),
         _ => None,
     }
@@ -241,10 +241,10 @@ enum DispatchError {
 ///   hold the dispatcher task open forever (DoS). See the adversarial
 ///   review on this surface.
 ///
-/// Read-only inspection (config show/get, skills, session, job, cron,
+/// Read-only inspection (config show/get, skills, session, turn, cron,
 /// cost, log non-follow, status, doctor, etc.) plus the mutating
 /// commands that already require `--yes` (`config set/unset`, `pair
-/// approve/revoke`, `job cancel`, …) are allowed.
+/// approve/revoke`, `turn cancel`, …) are allowed.
 fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
     match cmd {
         // Process-lifecycle: never slash.
@@ -337,8 +337,8 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             | SessionCmd::History { .. }
             | SessionCmd::Export { .. } => Ok(()),
         },
-        Commands::Job { cmd } => match cmd {
-            JobCmd::List { .. } | JobCmd::Show { .. } | JobCmd::Cancel { .. } => Ok(()),
+        Commands::Turn { cmd } => match cmd {
+            TurnCmd::List { .. } | TurnCmd::Show { .. } | TurnCmd::Cancel { .. } => Ok(()),
         },
         Commands::Cron { cmd } => match cmd {
             CronCmd::List | CronCmd::Show { .. } => Ok(()),
@@ -593,7 +593,7 @@ mod tests {
     fn slash_admissible_accepts_read_only_inspection() {
         // Spot-check the non-error arms so a future variant rename or
         // accidental whitelist tighten-up doesn't lock operators out.
-        use crate::cli::{JobCmd, LogCmd, SessionCmd, SkillsCmd};
+        use crate::cli::{LogCmd, SessionCmd, SkillsCmd, TurnCmd};
         assert!(slash_admissible(&Commands::Doctor).is_ok());
         assert!(
             slash_admissible(&Commands::Status { live: false }).is_ok()
@@ -626,8 +626,8 @@ mod tests {
             .is_ok()
         );
         assert!(
-            slash_admissible(&Commands::Job {
-                cmd: JobCmd::List { status: None }
+            slash_admissible(&Commands::Turn {
+                cmd: TurnCmd::List { status: None }
             })
             .is_ok()
         );

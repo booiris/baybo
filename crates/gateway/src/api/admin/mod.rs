@@ -1,4 +1,4 @@
-//! Admin surface (TCP + bearer token). Hosts config/status/jobs/cron/
+//! Admin surface (TCP + bearer token). Hosts config/status/turns/cron/
 //! traces/skills/tools/llm, a read-only channel list, and the web chat
 //! REST surface.
 
@@ -9,7 +9,6 @@ pub mod chat;
 pub mod config;
 pub mod cron;
 pub mod deck;
-pub mod jobs;
 pub mod llm;
 pub mod logs;
 pub mod push;
@@ -17,6 +16,7 @@ pub mod skills;
 pub mod status;
 pub mod tools;
 pub mod traces;
+pub mod turns;
 
 use axum::Router;
 use baybo_model::LlmEntryName;
@@ -82,12 +82,13 @@ pub(crate) fn validate_llm_model(
 #[openapi(
     info(
         title = "Baybo Admin API",
-        description = "TCP + bearer-token surface: config, jobs, cron, traces, skills, tools, channels, LLM."
+        description = "TCP + bearer-token surface: config, turns, cron, traces, skills, tools, channels, LLM."
     ),
     tags(
         (name = "status", description = "Gateway process status"),
         (name = "config", description = "Read and mutate on-disk BayboConfig"),
-        (name = "jobs", description = "Async operation tracking"),
+        (name = "turns", description = "Agent turn tracking"),
+        (name = "jobs", description = "In-flight background jobs"),
         (name = "cron", description = "Scheduled prompts / tool calls"),
         (name = "traces", description = "Per-session trace export"),
         (name = "analytics", description = "Aggregated cost / session activity dashboards"),
@@ -114,7 +115,7 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
     let v1 = OpenApiRouter::new()
         .merge(status::routes())
         .merge(config::routes())
-        .merge(jobs::routes())
+        .merge(turns::routes())
         .merge(cron::routes())
         .merge(traces::routes())
         .merge(analytics::routes())

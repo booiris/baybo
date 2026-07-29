@@ -19,7 +19,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Memory { cmd } => commands::memory::handle(ctx, cmd).await,
         Commands::ExternalAgent { cmd } => commands::external_agent::handle(ctx, cmd).await,
         Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,
-        Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,
+        Commands::Turn { cmd } => commands::turn::handle(ctx, cmd).await,
         Commands::Cron { cmd } => commands::cron::handle(ctx, cmd).await,
         Commands::Log { cmd } => commands::log::handle(ctx, cmd).await,
         Commands::Cost { cmd } => commands::cost::handle(ctx, cmd).await,

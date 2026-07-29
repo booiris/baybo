@@ -3,7 +3,7 @@
 //! The gateway exposes two listeners:
 //!
 //! * **Admin** — TCP on the configured bind, bearer-token
-//!   authenticated. Hosts config, status, jobs, cron, memory, traces,
+//!   authenticated. Hosts config, status, turns, cron, memory, traces,
 //!   skills, tools, llm, and a read-only channel list. Also co-hosts
 //!   `/v1/channel-ws` and `/v1/blobs/*`, guarded there by
 //!   [`crate::auth::channel::require_channel_or_admin_token`] — the
@@ -35,7 +35,7 @@ use baybo_agent::supervisor::AgentSupervisor;
 use baybo_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_config::BayboConfig;
-use baybo_job::JobLifecycle;
+use baybo_turn::TurnLifecycle;
 
 use crate::reload::ConfigReloader;
 use axum::Router;
@@ -75,7 +75,7 @@ pub struct GatewayDeps {
     pub config_path: Option<PathBuf>,
     pub runtime_config: RuntimeGatewayConfig,
     pub session_manager: Arc<SessionManager>,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
@@ -132,13 +132,13 @@ pub struct AdminState {
     pub config: Arc<BayboConfig>,
     pub config_path: Option<PathBuf>,
     pub session_manager: Arc<SessionManager>,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub trace_store: Arc<dyn TraceStore>,
     pub cost_store: Arc<dyn baybo_cost::CostStore>,
     /// Full-text search over transcript prose (`docs/search.md`). A direct
     /// store rather than a `QueryApi` method: `QueryApi` composes the analytics
-    /// surface (session / job / span / cost), and search shares none of its
+    /// surface (session / turn / span / cost), and search shares none of its
     /// error shape or its callers.
     pub message_search: Arc<dyn baybo_store::MessageSearchStore>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
@@ -185,7 +185,7 @@ impl AdminState {
     pub(crate) fn from_deps(deps: &GatewayDeps) -> Self {
         let query_api = Arc::new(baybo_query::QueryApi::new(
             deps.session_manager.store(),
-            Arc::clone(&deps.job_lifecycle),
+            Arc::clone(&deps.turn_lifecycle),
             deps.stores.trace.clone(),
             deps.stores.cost.clone(),
         ));
@@ -193,7 +193,7 @@ impl AdminState {
             config: Arc::clone(&deps.config),
             config_path: deps.config_path.clone(),
             session_manager: Arc::clone(&deps.session_manager),
-            job_lifecycle: Arc::clone(&deps.job_lifecycle),
+            turn_lifecycle: Arc::clone(&deps.turn_lifecycle),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
             trace_store: Arc::clone(&deps.stores.trace),
             cost_store: Arc::clone(&deps.stores.cost),

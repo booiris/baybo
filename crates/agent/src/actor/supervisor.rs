@@ -22,7 +22,7 @@ pub struct ActorHandle {
 /// Per-parent record of one in-flight background job — a background subagent
 /// or a detached `Bash` command — enough for `/stop` to enumerate it (cancel
 /// it, report what it was doing) and for the idle reaper to know the parent has
-/// outstanding work, without a job-store lineage walk. Keyed by the child
+/// outstanding work, without a turn-store lineage walk. Keyed by the child
 /// session id (subagents) or the `bg-…` handle (commands) in the registry.
 #[derive(Clone)]
 pub struct InFlightJob {
@@ -36,8 +36,8 @@ pub struct InFlightJob {
     /// stored explicitly to display and to look up by.
     pub handle: String,
     /// The child actor's cancellation token (created at dispatch, before the
-    /// child's job row exists). `/stop` cancels this directly so a background
-    /// subagent dispatched-but-not-yet-running is still stopped — a job-store
+    /// child's turn row exists). `/stop` cancels this directly so a background
+    /// subagent dispatched-but-not-yet-running is still stopped — a turn-store
     /// lookup would miss it in that window and let it run to completion.
     pub cancel_token: CancellationToken,
 }
@@ -206,7 +206,7 @@ impl AgentSupervisor {
     /// subagents), cancels the token (the escort kills the child), and removes
     /// the entry, which doubles as the suppress signal (the escort finds its
     /// entry gone and drops delivery). Returns the dropped info, or `None` if
-    /// no such job is in flight for this parent.
+    /// no such turn is in flight for this parent.
     pub fn cancel_in_flight_background(
         &self,
         parent_session_id: &SessionId,
@@ -506,41 +506,41 @@ pub fn spawn_idle_reaper(
 /// Spawn the per-process turn-state projector — the **sole** producer of
 /// the web chat's `Frame::TurnState`.
 ///
-/// Both edges are derived here from the one source of truth (the job
-/// store) rather than emitted by the actor: every job lifecycle
+/// Both edges are derived here from the one source of truth (the turn
+/// store) rather than emitted by the actor: every turn lifecycle
 /// transition publishes on
-/// [`baybo_job::JobLifecycle::subscribe_lifecycle_events`] (the
+/// [`baybo_turn::TurnLifecycle::subscribe_lifecycle_events`] (the
 /// `Pending → InProgress` start edge and the three terminal edges), and on
 /// each one we recompute the session's
-/// [`baybo_job::JobLifecycle::active_turn_started_at`] and broadcast the
+/// [`baybo_turn::TurnLifecycle::active_turn_started_at`] and broadcast the
 /// current value through the same `response_tx` → channel fan-out the
 /// actor's own output uses. The gateway's per-`Subscribe` snapshot reads
 /// the *same* `active_turn_started_at` — so the live start broadcast, the
 /// live end broadcast, and the join-time snapshot all agree by
 /// construction, and the actor never touches `TurnState` at all.
 ///
-/// Recompute-is-truth keeps this robust to *which* job's transition fired
+/// Recompute-is-truth keeps this robust to *which* turn's transition fired
 /// it: the turn itself or a child-session subagent just means "recompute this
 /// session now", and the broadcast is whatever is currently true — never a
 /// stale "X started/ended". A `Lagged` drop is harmless: the next event
 /// recomputes, and the Subscribe snapshot covers a client that joined during
 /// the gap.
 pub fn spawn_turn_state_projector(
-    job_lifecycle: Arc<baybo_job::JobLifecycle>,
+    turn_lifecycle: Arc<baybo_turn::TurnLifecycle>,
     sessions: Arc<SessionManager>,
     response_tx: mpsc::Sender<AgentOutput>,
     cancel_token: CancellationToken,
 ) -> JoinHandle<()> {
     // Subscribe synchronously, before the spawn returns, so no lifecycle
     // event published after this call can slip through unobserved.
-    let mut events = job_lifecycle.subscribe_lifecycle_events();
+    let mut events = turn_lifecycle.subscribe_lifecycle_events();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
                 recv = events.recv() => match recv {
                     Ok(ev) => {
-                        project_turn_state(&job_lifecycle, &sessions, &response_tx, &ev.session_id)
+                        project_turn_state(&turn_lifecycle, &sessions, &response_tx, &ev.session_id)
                             .await
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -554,17 +554,17 @@ pub fn spawn_turn_state_projector(
     })
 }
 
-/// Recompute one session's turn activity from the job store and broadcast
+/// Recompute one session's turn activity from the turn store and broadcast
 /// the current `TurnState`. The Subscribe-time snapshot
 /// (`gateway::channel::route`) reads the same `active_turn_started_at`
 /// directly, so a freshly-joined tab and a live broadcast never disagree.
 async fn project_turn_state(
-    job_lifecycle: &baybo_job::JobLifecycle,
+    turn_lifecycle: &baybo_turn::TurnLifecycle,
     sessions: &SessionManager,
     response_tx: &mpsc::Sender<AgentOutput>,
     session_id: &SessionId,
 ) {
-    let started_at = match job_lifecycle.active_turn_started_at(session_id).await {
+    let started_at = match turn_lifecycle.active_turn_started_at(session_id).await {
         Ok(started_at) => started_at,
         Err(e) => {
             warn!(%session_id, error = %e, "turn-state projector: recompute failed");
@@ -871,7 +871,7 @@ mod tests {
         // `/stop` drains the registry; afterwards each child reads as
         // not-in-flight, so its wait task suppresses the terminal delivery. The
         // drained entries carry the child's cancel token so `/stop` can stop a
-        // subagent that hasn't created its job row yet (the pre-job window).
+        // subagent that hasn't created its turn row yet (the pre-turn window).
         let sup = make_supervisor();
         let id = SessionId::from("parent");
         let c1 = SessionId::from("child-1");

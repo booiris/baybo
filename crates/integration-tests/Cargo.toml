@@ -29,7 +29,7 @@ baybo-channels = { workspace = true }
 baybo-context = { workspace = true }
 baybo-cost = { workspace = true, features = ["test-support"] }
 baybo-cron = { workspace = true, features = ["test-support"] }
-baybo-job = { workspace = true, features = ["test-support"] }
+baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-memory = { workspace = true, features = ["test-support"] }
 baybo-model = { workspace = true }

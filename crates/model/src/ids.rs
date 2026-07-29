@@ -1,12 +1,12 @@
-//! Strongly-typed identifiers used across the trace / job / session layers.
+//! Strongly-typed identifiers used across the trace / turn / session layers.
 //!
 //! `SessionId` is a caller-supplied opaque string (see `session.md` for the
-//! naming conventions). `JobId`, `StepId`, `SpanId`, and `CostRecordId` are
+//! naming conventions). `TurnId`, `StepId`, `SpanId`, and `CostRecordId` are
 //! ULIDs — 26-char Crockford base32, time-sortable, and rendered as their
 //! canonical string form whenever they cross a serialization boundary.
 //!
 //! Every newtype is distinct at the type level so the compiler rejects
-//! `fn load_job(id: SpanId)` calls. Use the explicit constructors and
+//! `fn load_turn(id: SpanId)` calls. Use the explicit constructors and
 //! conversions; raw `Ulid` does not coerce.
 
 use std::fmt;
@@ -109,7 +109,7 @@ macro_rules! ulid_newtype {
         $(#[$meta])*
         // Ord/PartialOrd come from the inner Ulid: ULIDs sort by
         // generation time first, then random tail — so a tuple key like
-        // `(created_at, JobId)` gives a deterministic tie-break when
+        // `(created_at, TurnId)` gives a deterministic tie-break when
         // two ids share a microsecond `created_at`.
         #[derive(
             Debug,
@@ -171,8 +171,8 @@ macro_rules! ulid_newtype {
 }
 
 ulid_newtype! {
-    /// Identifier for a `Job` — one externally-triggered unit of work.
-    JobId
+    /// Identifier for a `Turn` — one externally-triggered unit of work.
+    TurnId
 }
 
 ulid_newtype! {
@@ -242,16 +242,16 @@ mod tests {
     #[test]
     fn ulid_newtypes_are_distinct_types() {
         // Compile-time check — construction returns the right type.
-        let _: JobId = JobId::new();
+        let _: TurnId = TurnId::new();
         let _: StepId = StepId::new();
         let _: SpanId = SpanId::new();
     }
 
     #[test]
     fn ulid_newtype_round_trips_via_string() {
-        let id = JobId::new();
+        let id = TurnId::new();
         let s = id.to_string();
-        let parsed: JobId = s.parse().unwrap();
+        let parsed: TurnId = s.parse().unwrap();
         assert_eq!(parsed, id);
     }
 
@@ -265,8 +265,8 @@ mod tests {
 
     #[test]
     fn freshly_generated_ulid_newtypes_are_unique() {
-        let a = JobId::new();
-        let b = JobId::new();
+        let a = TurnId::new();
+        let b = TurnId::new();
         assert_ne!(a, b);
     }
 

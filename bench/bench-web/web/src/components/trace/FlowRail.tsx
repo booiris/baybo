@@ -119,8 +119,8 @@ function buildFlowSteps(trace: BenchTrace): FlowStep[] {
     }
   }
 
-  for (const job of trace.jobs) {
-    for (const { step, spans } of job.steps) {
+  for (const turn of trace.turns) {
+    for (const { step, spans } of turn.steps) {
       if (step.kind.kind === 'llm_iteration') {
         for (const s of spans) {
           if (s.kind.kind === 'llm_call') {

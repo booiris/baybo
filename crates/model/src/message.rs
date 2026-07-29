@@ -232,7 +232,7 @@ pub enum MessageSource {
     /// framing tag out of the content.
     Cron,
     /// A one-shot cron job's result, delivered into the conversation that
-    /// created the job. A `Role::Assistant` row the agent appended **without
+    /// created the turn. A `Role::Assistant` row the agent appended **without
     /// running inference** (see the actor's `CronResultReady` handler): the
     /// fire ran in its own isolated session and this row carries its reply
     /// framed with a scheduled-task header. The only assistant-role source
@@ -367,7 +367,7 @@ impl ChatMessage {
     }
 
     /// A one-shot cron fire's result, appended to the conversation that created
-    /// the job — the **only** constructor that marks a row
+    /// the turn — the **only** constructor that marks a row
     /// [`MessageSource::CronNotification`].
     ///
     /// `Role::Assistant`, but produced with no inference of its own: the actor's
@@ -497,7 +497,7 @@ impl ChatMessage {
     /// `true` when this row's prose belongs in the full-text index: everything
     /// a human authored or an agent said, across every session — a subagent's
     /// own run and a cron fire's are as searchable as a chat. Scope is the
-    /// caller's job, off `message_fts.channel`; see `docs/search.md`.
+    /// caller's turn, off `message_fts.channel`; see `docs/search.md`.
     ///
     /// What stays out is text nobody composed as a turn: the system prompt and
     /// skill reminders and `<system-reminder>` blocks

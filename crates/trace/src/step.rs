@@ -1,19 +1,19 @@
 //! `Step` — one iteration of the agent loop, or one logical
 //! work-unit (compression / memory / skill-selection / subagent).
 
-use baybo_model::{JobId, StepId};
+use baybo_model::{StepId, TurnId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::outcome::{LifecycleOutcome, LifecycleState};
 
-/// One step in a job's life. Owns 1+ child `Span`s (in the spans table,
-/// keyed by `step_id`). Steps under a job carry no `parallel_group`
+/// One step in a turn's life. Owns 1+ child `Span`s (in the spans table,
+/// keyed by `step_id`). Steps under a turn carry no `parallel_group`
 /// (unlike spans) and are ordered purely by `started_at`. Their
 /// wall-clock intervals are normally disjoint, but not guaranteed to be:
 /// the detached progress-observer step is `tokio::spawn`ed at an iteration
 /// boundary and runs concurrently with the next `LlmIteration`, so its
-/// interval can overlap a sibling under the same job. Don't assume
+/// interval can overlap a sibling under the same turn. Don't assume
 /// non-overlapping step intervals — recovery closes each step
 /// independently and the trace UI orders by `started_at` / keys by id.
 ///
@@ -23,14 +23,14 @@ use crate::outcome::{LifecycleOutcome, LifecycleState};
 /// pairing.
 ///
 /// **Storage coupling:** the `steps` table in `baybo-storage` derives its
-/// indexed `job_id` / `started_at` columns from this struct's serialized
-/// JSON via `json_extract(data, '$.job_id')` (and `'$.started_at'`). Those
+/// indexed `turn_id` / `started_at` columns from this struct's serialized
+/// JSON via `json_extract(data, '$.turn_id')` (and `'$.started_at'`). Those
 /// field names are load-bearing — renaming them or adding a container
-/// `#[serde(rename_all)]` silently breaks `list_steps_by_job` and ordering.
+/// `#[serde(rename_all)]` silently breaks `list_steps_by_turn` and ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub id: StepId,
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     pub kind: StepKind,
     pub started_at: DateTime<Utc>,
     /// Set once every child span (including parallel ones) has ended.
@@ -144,16 +144,21 @@ impl StepKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepHandle {
     pub step_id: StepId,
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     pub kind: StepKind,
     pub started_at: DateTime<Utc>,
 }
 
 impl StepHandle {
-    pub fn new(step_id: StepId, job_id: JobId, kind: StepKind, started_at: DateTime<Utc>) -> Self {
+    pub fn new(
+        step_id: StepId,
+        turn_id: TurnId,
+        kind: StepKind,
+        started_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             step_id,
-            job_id,
+            turn_id,
             kind,
             started_at,
         }
@@ -167,7 +172,7 @@ mod tests {
     fn fresh_step(kind: StepKind) -> Step {
         Step {
             id: StepId::new(),
-            job_id: JobId::new(),
+            turn_id: TurnId::new(),
             kind,
             started_at: Utc::now(),
             ended_at: None,
@@ -207,7 +212,7 @@ mod tests {
     fn step_handle_is_constructible() {
         let h = StepHandle::new(
             StepId::new(),
-            JobId::new(),
+            TurnId::new(),
             StepKind::LlmIteration,
             Utc::now(),
         );

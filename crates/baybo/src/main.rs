@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     // Completion, Gateway, None are all handled above). Argv mode builds
     // only the lightweight inspection set (skills, tools, channels,
     // workspace, optional LLM). It opens storage for BlobStore-backed
-    // tool metadata, but avoids the full manager graph and job recovery.
+    // tool metadata, but avoids the full manager graph and turn recovery.
     init_tracing(TracingMode::Stdout);
 
     let cmd = cli.command.expect("non-command branches handled above");
@@ -234,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if needs_query_graph(&cmd) {
         // Monitoring commands (`status --live`, `cost show`, `log session`,
-        // `session`, `job`, `cron`) need the heavier domain graph that
+        // `session`, `turn`, `cron`) need the heavier domain graph that
         // argv-mode skips by default. Build the smallest set that lets
         // those handlers (and the auto-derived `QueryApi`) work, without
         // dragging in actors, supervisors, or LLM-side dependencies.
@@ -248,7 +248,9 @@ async fn main() -> anyhow::Result<()> {
                 stores.session.clone(),
                 stores.session_folder.clone(),
             )))
-            .job(Arc::new(baybo_job::JobLifecycle::new(stores.job.clone())))
+            .turn(Arc::new(baybo_turn::TurnLifecycle::new(
+                stores.turn.clone(),
+            )))
             .trace(stores.trace.clone())
             .cost_store(stores.cost.clone());
         let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(1);
@@ -311,7 +313,7 @@ fn needs_skills(cmd: &Commands) -> bool {
     matches!(cmd, Commands::Skills { .. } | Commands::Status { .. })
 }
 
-/// Subcommands that read `ctx.session` / `ctx.job` / `ctx.trace` /
+/// Subcommands that read `ctx.session` / `ctx.turn` / `ctx.trace` /
 /// `ctx.cron` (and therefore the auto-derived `ctx.query_api`).
 ///
 /// Argv mode skips these by default to keep `baybo skills list` /
@@ -327,7 +329,7 @@ fn needs_query_graph(cmd: &Commands) -> bool {
         Commands::Status { live } => *live,
         Commands::Cost { .. }
         | Commands::Session { .. }
-        | Commands::Job { .. }
+        | Commands::Turn { .. }
         | Commands::Cron { .. } => true,
         _ => false,
     }

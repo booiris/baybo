@@ -9,7 +9,7 @@
 //! * `/stop` — listed for completion, but `PassThrough`: it forwards to
 //!   the agent runtime, where the `Router` cancels the in-flight turn +
 //!   subagents out-of-band (the TUI can't reach those handles).
-//! * `/skills`, `/jobs`, `/memory`, `/sessions` — dashboard shortcuts;
+//! * `/skills`, `/turns`, `/memory`, `/sessions` — dashboard shortcuts;
 //!   the admin-only views render an "admin surface" footer.
 //!
 //! Tool approvals are resolved through the modal keybindings (a/A/d);
@@ -77,7 +77,7 @@ impl SlashHandler for TuiSlashHandler {
 fn dashboard_shortcut(name: &str) -> Option<ViewKind> {
     match name {
         "skills" => Some(ViewKind::Skills),
-        "jobs" => Some(ViewKind::Jobs),
+        "turns" => Some(ViewKind::Turns),
         "sessions" => Some(ViewKind::Sessions),
         _ => None,
     }
@@ -103,7 +103,7 @@ fn help_text() -> String {
          \n\
          Tool approvals are resolved from the modal (a / A / d).\n\
          \n\
-         Admin commands (status, config, jobs, skills, tools,\n\
+         Admin commands (status, config, turns, skills, tools,\n\
          sessions, …) are reached via the `baybo` CLI and are not\n\
          reachable from the TUI.\n",
     )
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn dashboard_shortcut_matches_known_views() {
         assert_eq!(dashboard_shortcut("skills"), Some(ViewKind::Skills));
-        assert_eq!(dashboard_shortcut("jobs"), Some(ViewKind::Jobs));
+        assert_eq!(dashboard_shortcut("turns"), Some(ViewKind::Turns));
         assert_eq!(dashboard_shortcut("sessions"), Some(ViewKind::Sessions));
         // `memory` retired with the CLI `baybo memory` family.
         assert_eq!(dashboard_shortcut("memory"), None);

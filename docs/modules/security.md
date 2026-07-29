@@ -212,7 +212,7 @@ Security only decides allow/deny. It does not execute network access. There is n
 
 - Primitives crate — no session/channel/storage dependencies
 - Trace records only sanitized span begin/finalize payloads (`ToolCallBegin.params`, `LlmCallResult`, `ToolCallResult`) — including tool-call arguments
-- Job `input/output` stores sanitized versions only
+- Turn `input/output` stores sanitized versions only
 - Structured logs must not print `SecretValue` directly; reveal warnings log only a SHA-256 fingerprint prefix
 - Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
 - Plaintext at egress is permitted only at four points: the tool executor's post-reveal `params_revealed` into `tool_registry.execute`, `reveal_llm_response` on tool-side LLM replies (`billed_chat`), `SecretAccess::resolve_env` for child-process env injection, and deck's host-mediated `ctx.fetch` reveal (`crates/deck/src/host.rs` — URL/header/body placeholders revealed at egress, audit-logged with card id + host); stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
@@ -226,5 +226,5 @@ Security only decides allow/deny. It does not execute network access. There is n
 |--------|------|
 | `channels` | Input messages go to `agent::security::SecurityGateway` first |
 | `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic |
-| `trace` / `job` | Receive only sanitized payloads and placeholders |
+| `trace` / `turn` | Receive only sanitized payloads and placeholders |
 | `store` / `storage` | `baybo-store` defines the `SecretStore` trait; `baybo-storage` provides the sqlite implementation |

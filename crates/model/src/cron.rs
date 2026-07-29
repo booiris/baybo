@@ -277,7 +277,7 @@ impl CronJobPatch {
 ///
 /// On restart, `Pending` executions are re-dispatched (they crashed
 /// between record and send). `Dispatched` executions are left to the
-/// Job system's `Stuck` recovery.
+/// Turn system's `Stuck` recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {

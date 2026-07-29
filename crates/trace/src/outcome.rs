@@ -18,7 +18,7 @@
 //! via [`LifecycleStateRepr`], so on-disk JSON blobs round-trip without
 //! a schema migration.
 
-use baybo_job::CancelReason;
+use baybo_turn::CancelReason;
 use serde::{Deserialize, Serialize};
 
 /// Terminal outcome of a `Step` or `Span`. Constructed only at
@@ -31,7 +31,7 @@ pub enum LifecycleOutcome {
     /// Errored during execution. `reason` is human-readable.
     Failed { reason: String },
     /// Interrupted before completion. `reason` is the same `CancelReason`
-    /// taxonomy used at the job level.
+    /// taxonomy used at the turn level.
     Cancelled { reason: CancelReason },
 }
 

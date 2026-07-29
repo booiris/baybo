@@ -2,13 +2,13 @@ import { useSearchParams } from 'react-router-dom';
 import type { components } from './schema';
 import type {
   ChatMessage,
-  JobTrace,
   LifecycleState,
   Span,
   Step,
   StepKind,
-  TraceJobSummary,
   TraceOverview,
+  TraceTurnSummary,
+  TurnTrace,
 } from '../types/trace';
 
 type LogEntry = components['schemas']['LogEntry'];
@@ -69,9 +69,9 @@ export const MOCK_LOGS = import.meta.env.DEV ? generateMockLogs(200) : [];
 
 // --- Traces Mock Data ---
 
-function makeJobStatus(
-  kind: components['schemas']['JobStatusKind'],
-): components['schemas']['JobStatus'] {
+function makeTurnStatus(
+  kind: components['schemas']['TurnStatusKind'],
+): components['schemas']['TurnStatus'] {
   if (kind === 'cancelled') {
     return { kind, cancel_reason: 'user_preempt', partial_artifacts: [] };
   }
@@ -84,7 +84,7 @@ function makeJobStatus(
 function generateMockSummaries(count: number): TraceSessionSummary[] {
   const out: TraceSessionSummary[] = [];
   const now = Date.now();
-  const statuses: components['schemas']['JobStatusKind'][] = [
+  const statuses: components['schemas']['TurnStatusKind'][] = [
     'in_progress',
     'completed',
     'failed',
@@ -116,9 +116,9 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
         .substring(2, 8)}`,
       created_at: created.toISOString(),
       last_active: lastActive.toISOString(),
-      latest_job_status: makeJobStatus(status),
+      latest_turn_status: makeTurnStatus(status),
       kind,
-      job_count: Math.floor(Math.random() * 4) + 1,
+      turn_count: Math.floor(Math.random() * 4) + 1,
       span_count: Math.floor(Math.random() * 60) + 1,
       input_tokens: Math.floor(Math.random() * 80_000),
       output_tokens: Math.floor(Math.random() * 40_000),
@@ -211,7 +211,7 @@ export const MOCK_BACKGROUND_JOBS: components['schemas']['BackgroundJobsResponse
 // produce the exact `AnalyticsResponse` shape from the OpenAPI schema
 // without having a parallel TS interface to keep in sync.
 
-// --- Session detail (full Job→Step→Span tree) ---
+// --- Session detail (full Turn→Step→Span tree) ---
 
 let mockIdCounter = 0;
 function mid(prefix: string): string {
@@ -220,7 +220,7 @@ function mid(prefix: string): string {
 }
 
 function step(
-  jobId: string,
+  turnId: string,
   kind: StepKind,
   started: Date,
   ended: Date | null,
@@ -228,7 +228,7 @@ function step(
 ): Step {
   return {
     id: mid('step'),
-    job_id: jobId,
+    turn_id: turnId,
     kind,
     started_at: started.toISOString(),
     ended_at: ended?.toISOString() ?? null,
@@ -323,13 +323,13 @@ function interjectMsg(text: string): ChatMessage {
   return { role: 'user', content: [{ Text: text }], source: 'user_interjection' };
 }
 
-// Shared mock fixture: builds one job's worth of steps/spans + the
+// Shared mock fixture: builds one turn's worth of steps/spans + the
 // session_messages log it would have produced. Kept module-private so
-// the overview and job-trace mocks stay in lock-step. Cached per
+// the overview and turn-trace mocks stay in lock-step. Cached per
 // session id so successive calls return stable ids (the page issues
-// overview + job fetches separately).
+// overview + turn fetches separately).
 interface MockSessionFixture {
-  jobs: JobTrace[];
+  turns: TurnTrace[];
   overview: TraceOverview;
 }
 const mockFixtures = new Map<string, MockSessionFixture>();
@@ -339,14 +339,14 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   if (cached) return cached;
 
   const t0 = Date.now() - 5 * 60 * 1000;
-  const job1 = mid('job');
+  const turn1 = mid('turn');
 
   // Step 1: the compaction — the transcript crossed its token threshold and the
   // turn blocked on one summarizer call before continuing.
   const bgStarted = new Date(t0);
   const bgEnded = new Date(t0 + 80);
   const bgStep = step(
-    job1,
+    turn1,
     { kind: 'compression', trigger: 'threshold', applied: 'live_summary' },
     bgStarted,
     bgEnded,
@@ -368,7 +368,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   // row it records, the compaction that discarded the most would be invisible.
   const trimAt = new Date(t0 + 90);
   const trimStep = step(
-    job1,
+    turn1,
     { kind: 'compression', trigger: 'forced', applied: 'truncate' },
     trimAt,
     new Date(t0 + 92),
@@ -377,7 +377,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   // Step 2: LLM iteration with parallel tool calls
   const it1Start = new Date(t0 + 100);
   const it1End = new Date(t0 + 1600);
-  const it1Step = step(job1, { kind: 'llm_iteration' }, it1Start, it1End);
+  const it1Step = step(turn1, { kind: 'llm_iteration' }, it1Start, it1End);
   const it1Llm = llmSpan(
     it1Step.id,
     'claude-sonnet-4-6',
@@ -435,7 +435,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   // Step 3: final LLM iteration (response)
   const it2Start = new Date(t0 + 1700);
   const it2End = new Date(t0 + 2400);
-  const it2Step = step(job1, { kind: 'llm_iteration' }, it2Start, it2End);
+  const it2Step = step(turn1, { kind: 'llm_iteration' }, it2Start, it2End);
   const it2Llm = llmSpan(
     it2Step.id,
     'claude-sonnet-4-6',
@@ -474,10 +474,10 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   const startedAt = new Date(t0).toISOString();
   const endedAt = new Date(t0 + 2400).toISOString();
 
-  const job1Trace: JobTrace = {
-    job_id: job1,
+  const turn1Trace: TurnTrace = {
+    turn_id: turn1,
     session_id: sessionId,
-    job_status_kind: 'completed',
+    turn_status_kind: 'completed',
     created_at: createdAt,
     started_at: startedAt,
     ended_at: endedAt,
@@ -489,10 +489,10 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     ],
   };
 
-  const job1Summary: TraceJobSummary = {
-    job_id: job1,
+  const turn1Summary: TraceTurnSummary = {
+    turn_id: turn1,
     session_id: sessionId,
-    job_status_kind: 'completed',
+    turn_status_kind: 'completed',
     created_at: createdAt,
     started_at: startedAt,
     ended_at: endedAt,
@@ -502,19 +502,19 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     cache_creation_input_tokens: 38,
   };
 
-  // Second job: a FAILED turn — a single-span memory-recall step (deep-links
+  // Second turn: a FAILED one — a single-span memory-recall step (deep-links
   // straight to its span) followed by an LLM iteration whose `run_bash` tool
-  // call fails, failing the step and the job. Exercises the failure-path
+  // call fails, failing the step and the turn. Exercises the failure-path
   // auto-expand, the red roll-up badge, and the Step detail panel.
-  const job2 = mid('job');
+  const turn2 = mid('turn');
   const t1 = t0 + 60_000;
-  const j2Created = new Date(t1 - 200).toISOString();
-  const j2Started = new Date(t1).toISOString();
-  const j2Ended = new Date(t1 + 1400).toISOString();
+  const turn2Created = new Date(t1 - 200).toISOString();
+  const turn2Started = new Date(t1).toISOString();
+  const turn2Ended = new Date(t1 + 1400).toISOString();
 
   const recallStart = new Date(t1);
   const recallEnd = new Date(t1 + 120);
-  const recallStep = step(job2, { kind: 'memory_recall' }, recallStart, recallEnd);
+  const recallStep = step(turn2, { kind: 'memory_recall' }, recallStart, recallEnd);
   const recallTool = toolSpan(
     recallStep.id,
     'recall_memory',
@@ -528,7 +528,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
 
   const it3Start = new Date(t1 + 150);
   const it3End = new Date(t1 + 1400);
-  const it3Step = step(job2, { kind: 'llm_iteration' }, it3Start, it3End, {
+  const it3Step = step(turn2, { kind: 'llm_iteration' }, it3Start, it3End, {
     outcome: 'failed',
     reason: 'tool run_bash failed',
   });
@@ -569,26 +569,26 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     spawnEnd,
   );
 
-  const job2Trace: JobTrace = {
-    job_id: job2,
+  const turn2Trace: TurnTrace = {
+    turn_id: turn2,
     session_id: sessionId,
-    job_status_kind: 'failed',
-    created_at: j2Created,
-    started_at: j2Started,
-    ended_at: j2Ended,
+    turn_status_kind: 'failed',
+    created_at: turn2Created,
+    started_at: turn2Started,
+    ended_at: turn2Ended,
     steps: [
       { step: recallStep, spans: [recallTool] },
       { step: it3Step, spans: [it3Llm, spawnSpan, failTool] },
     ],
   };
 
-  const job2Summary: TraceJobSummary = {
-    job_id: job2,
+  const turn2Summary: TraceTurnSummary = {
+    turn_id: turn2,
     session_id: sessionId,
-    job_status_kind: 'failed',
-    created_at: j2Created,
-    started_at: j2Started,
-    ended_at: j2Ended,
+    turn_status_kind: 'failed',
+    created_at: turn2Created,
+    started_at: turn2Started,
+    ended_at: turn2Ended,
     input_tokens: 300,
     output_tokens: 40,
     cached_input_tokens: 180,
@@ -599,8 +599,8 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     session_id: sessionId,
     // Mock spans use `LlmCallInputs::Inline`, so the transcript log isn't
     // needed for message rendering. We seed one mid-turn interjection row
-    // (created between iteration 1 and the final response, inside job 1's
-    // window) so the sidebar / job-summary interjection markers light up.
+    // (created between iteration 1 and the final response, inside turn 1's
+    // window) so the sidebar / turn-summary interjection markers light up.
     session_messages: [
       {
         ordinal: 1,
@@ -609,11 +609,11 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         message: interjectMsg('Actually, also tell me the package name.'),
       },
     ],
-    jobs: [job1Summary, job2Summary],
+    turns: [turn1Summary, turn2Summary],
     supersede_watermark: null,
   };
 
-  const fixture: MockSessionFixture = { jobs: [job1Trace, job2Trace], overview };
+  const fixture: MockSessionFixture = { turns: [turn1Trace, turn2Trace], overview };
   mockFixtures.set(sessionId, fixture);
   return fixture;
 }
@@ -622,9 +622,9 @@ export function getMockTraceOverview(sessionId: string): TraceOverview {
   return buildMockSession(sessionId).overview;
 }
 
-export function getMockJobTrace(sessionId: string, jobId: string): JobTrace | null {
+export function getMockTurnTrace(sessionId: string, turnId: string): TurnTrace | null {
   const fx = buildMockSession(sessionId);
-  return fx.jobs.find((j) => j.job_id === jobId) ?? null;
+  return fx.turns.find((t) => t.turn_id === turnId) ?? null;
 }
 
 

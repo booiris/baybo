@@ -60,7 +60,7 @@ const TB2_RUN: &str = r#"{
 }"#;
 
 const TRACE_JSON: &str =
-    r#"{"session": "s1", "jobs": [{"job": {"id": "j1", "session_id": "s1"}, "steps": []}]}"#;
+    r#"{"session": "s1", "turns": [{"turn": {"id": "j1", "session_id": "s1"}, "steps": []}]}"#;
 
 const MESSAGES_JSON: &str = r#"{"session": "s1", "messages": [{"ordinal": 0, "superseded_by": null,
   "created_at": "2026-01-01T00:00:00Z",
@@ -360,6 +360,6 @@ mod api {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["session_id"], "s1");
         assert_eq!(v["session_messages"].as_array().unwrap().len(), 1);
-        assert_eq!(v["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(v["turns"].as_array().unwrap().len(), 1);
     }
 }

@@ -85,7 +85,7 @@ init_tracing(File { log_dir, leak_detector })
 runtime::build_managers(config, config_path, shutdown, leak_detector, embedded_mcp_servers)
   │   ── config_path feeds the hot-reload orchestrator; `None` disables reload
   │   ── Store::open at <workspace>/state/storage.db
-  │   ── SessionManager / JobLifecycle / CronScheduler / SecurityGateway
+  │   ── SessionManager / TurnLifecycle / CronScheduler / SecurityGateway
   │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / BillableLlm / CostManager
   │   ── McpReconciler::spawn (re-reads <workspace>/config/.mcp.json on a tick)
   │
@@ -99,7 +99,7 @@ GatewayServer + ChannelServer bound; tokio::select! { admin, channel, router, sh
 
 `tui_cmd::run` instead reads the per-start TUI token from the vault, opens a `WsTransport` against the gateway's admin listener (which co-hosts the `/v1/channel-ws` upgrade; no port-file discovery), and runs the `TuiAdapter` until shutdown — it does **not** build a manager graph of its own.
 
-The actor-spawner closure handed to `Router::from_config` via `RouterConfig::actor_spawner` captures clones of all `Arc`-shared state (LLM pool, tool + skill registries, tool executor, trace and task stores, job lifecycle, security gateway, tokenizer, trace event stream, token calibration, session manager, subagent registry, workspace paths, supervisor, memory, title sink, plus max-iterations / compression-threshold / keep-recent). Any new actor-level dependency must be added to the capture list in `runtime::wire_router`.
+The actor-spawner closure handed to `Router::from_config` via `RouterConfig::actor_spawner` captures clones of all `Arc`-shared state (LLM pool, tool + skill registries, tool executor, trace and task stores, turn lifecycle, security gateway, tokenizer, trace event stream, token calibration, session manager, subagent registry, workspace paths, supervisor, memory, title sink, plus max-iterations / compression-threshold / keep-recent). Any new actor-level dependency must be added to the capture list in `runtime::wire_router`.
 
 ## Error handling at boot
 
@@ -133,6 +133,6 @@ Neither is future work — both the `McpReconciler` and `install_channels` run a
 | Module | Role |
 |--------|------|
 | `config` | Provides `BayboConfig` and section types. `boot` consumes them. |
-| `agent` | Consumes `SecurityGateway`, `SessionManager`, `JobLifecycle`, `CostManager`, `SecretVault`, etc. assembled by `runtime::build_managers`. |
+| `agent` | Consumes `SecurityGateway`, `SessionManager`, `TurnLifecycle`, `CostManager`, `SecretVault`, etc. assembled by `runtime::build_managers`. |
 | `llm`, `context`, `security` | Each exposes the constructor that a `boot::to_*` or `boot::build_*` function targets. |
 | Other crates | Never called from `boot` directly; they are assembled by `runtime` after `boot` has produced the required primitives. |

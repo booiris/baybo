@@ -7,7 +7,7 @@ The `storage` crate is the **sqlite adapter**: it implements every `*Store` trai
 Its job is:
 
 - Implement every `*Store` trait from `baybo-store` (`SessionStore`,
-  `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`,
+  `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `TurnStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
   `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`,
@@ -15,7 +15,7 @@ Its job is:
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-job` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Job` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
+Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-turn` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Turn` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
 
 ## Design Decisions
 
@@ -42,14 +42,14 @@ Consequences worth knowing:
 
 ### All store traits live in the ports crate
 
-Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `JobStore` and `TraceStore` — trade in **row DTOs** (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Job` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-job` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal jobs. Both traits also expose aggregate queries that answer list-surface questions without shipping `data` blobs: `TraceStore::trace_counts_by_job` (a job's step/span counts) and `JobStore::session_job_stats` (per-session job count + latest job's `status_kind`, one grouped query).
+Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `TurnStore` and `TraceStore` — trade in **row DTOs** (`TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Turn` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-turn` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal turns. Both traits also expose aggregate queries that answer list-surface questions without shipping `data` blobs: `TraceStore::trace_counts_by_turn` (a turn's step/span counts) and `TurnStore::session_turn_stats` (per-session turn count + latest turn's `status_kind`, one grouped query).
 
 ```
 sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
 sqlite/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
 sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
-sqlite/job.rs             → impl JobStore                             (trait from baybo-store; rows ↔ Job via baybo-job)
+sqlite/turn.rs            → impl TurnStore                            (trait from baybo-store; rows ↔ Turn via baybo-turn)
 sqlite/cost.rs            → impl CostStore                            (trait from baybo-store)
 sqlite/cron.rs            → impl CronStore                            (trait from baybo-store; sqlite adapter handles JSON serialization)
 sqlite/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel from baybo-store)
@@ -248,7 +248,7 @@ Table schemas are created centrally in `SqlitePool::init_db()`, but each Store s
 
 ### JSON field strategy
 
-Fields difficult to fully structure (`SessionState.extra`, `Job.input` / `Job.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
+Fields difficult to fully structure (`SessionState.extra`, `Turn.input` / `Turn.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
 ### Transaction boundaries
 
@@ -272,7 +272,7 @@ What makes the tombstone safe is that the filter lives in SQL, not in Rust: `lis
 
 ## Constraints
 
-- Normal dependencies are just `baybo-store` (trait contracts + row/DTO types) and `baybo-model` (domain types) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-job` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
+- Normal dependencies are just `baybo-store` (trait contracts + row/DTO types) and `baybo-model` (domain types) — no domain crate; reverse edges from any domain crate back to `baybo-storage` do not exist. `baybo-turn` / `baybo-trace` are `dev-dependencies` only (round-trip tests)
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 
@@ -282,7 +282,7 @@ What makes the tombstone safe is that the filter lives in SQL, not in Rust: `lis
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `storage` (self)                         | Provides sqlite implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
 | `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
-| `model` / `trace` / `job`                | Provide domain types the sqlite impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
+| `model` / `trace` / `turn`               | Provide domain types the sqlite impls round-trip (`trace` / `turn` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
 | `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `baybo-store`); `storage` does **not** depend on `session` |
-| `agent`                                  | Injects stores into managers (JobLifecycle, etc.); re-exports SessionManager |
+| `agent`                                  | Injects stores into managers (TurnLifecycle, etc.); re-exports SessionManager |

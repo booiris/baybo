@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type {
   ChatMessage,
-  JobTrace,
   LlmCallResult,
   ReplayStep,
   Span,
   Step,
   StepKind,
+  TurnTrace,
 } from '../../types/trace';
-import { compressionTokens, jobInputText, jobOutputText, stepSummaryText } from './traceFormat';
+import { compressionTokens, stepSummaryText, turnInputText, turnOutputText } from './traceFormat';
 
 const T0 = '2026-01-01T00:00:00.000Z';
 const T1 = '2026-01-01T00:00:01.000Z';
@@ -32,7 +32,7 @@ function llmSpan(result: LlmCallResult): Span {
 function step(kind: StepKind): Step {
   return {
     id: 'step-1',
-    job_id: 'job-1',
+    turn_id: 'turn-1',
     kind,
     started_at: T0,
     ended_at: T1,
@@ -106,7 +106,7 @@ describe('stepSummaryText — compression', () => {
   });
 });
 
-describe('jobInputText / jobOutputText — meta steps riding the turn', () => {
+describe('turnInputText / turnOutputText — meta steps riding the turn', () => {
   const TITLE_PROMPT =
     'You are titling a brand-new conversation from the user\'s first message.\n\nUser\'s first message:\n<user_message>\nwhat broke the build?\n</user_message>';
 
@@ -132,18 +132,18 @@ describe('jobInputText / jobOutputText — meta steps riding the turn', () => {
 
   function replayStep(id: string, kind: StepKind, spans: Span[]): ReplayStep {
     return {
-      step: { id, job_id: 'job-1', kind, started_at: T0, ended_at: T1, outcome: { outcome: 'ok' } },
+      step: { id, turn_id: 'turn-1', kind, started_at: T0, ended_at: T1, outcome: { outcome: 'ok' } },
       spans,
     };
   }
 
-  function trace(steps: ReplayStep[]): JobTrace {
-    return { job_id: 'job-1', session_id: 'sess-1', job_status_kind: 'completed', steps };
+  function trace(steps: ReplayStep[]): TurnTrace {
+    return { turn_id: 'turn-1', session_id: 'sess-1', turn_status_kind: 'completed', steps };
   }
 
   // The title pass is spawned before the turn's first iteration, so its step
-  // sorts first — reading "the job's first LLM span" showed the prompt template
-  // in the job list and the job-summary panel instead of the actual question.
+  // sorts first — reading "the turn's first LLM span" showed the prompt template
+  // in the turn list and the turn-summary panel instead of the actual question.
   it('skips a leading title_generation step and reads the real question', () => {
     const t = trace([
       replayStep('s0', { kind: 'title_generation' }, [
@@ -153,12 +153,12 @@ describe('jobInputText / jobOutputText — meta steps riding the turn', () => {
         inlineLlmSpan('b', [userMsg('what broke the build?')], 'The lint job failed.'),
       ]),
     ]);
-    expect(jobInputText(t, [])).toBe('what broke the build?');
-    expect(jobOutputText(t)).toBe('The lint job failed.');
+    expect(turnInputText(t, [])).toBe('what broke the build?');
+    expect(turnOutputText(t)).toBe('The lint job failed.');
   });
 
   // The observer and a compaction land AFTER the reply, so the trailing-span
-  // read surfaced a progress notice / summary as the job's answer.
+  // read surfaced a progress notice / summary as the turn's answer.
   it('skips trailing progress_observer and compression steps for the output', () => {
     const t = trace([
       replayStep('s0', { kind: 'llm_iteration' }, [
@@ -171,31 +171,31 @@ describe('jobInputText / jobOutputText — meta steps riding the turn', () => {
         inlineLlmSpan('c', [userMsg('summarize the transcript')], 'Earlier: CI triage.'),
       ]),
     ]);
-    expect(jobInputText(t, [])).toBe('what broke the build?');
-    expect(jobOutputText(t)).toBe('The lint job failed.');
+    expect(turnInputText(t, [])).toBe('what broke the build?');
+    expect(turnOutputText(t)).toBe('The lint job failed.');
   });
 
   // A standalone `/compact` has no agent-loop step at all — its compaction is
-  // the only thing the job did, so it still gets shown rather than blanked.
-  it('falls back to the job own work when there is no llm_iteration', () => {
+  // the only thing the turn did, so it still gets shown rather than blanked.
+  it('falls back to the turn own work when there is no llm_iteration', () => {
     const t = trace([
       replayStep('s0', { kind: 'compression', trigger: 'forced' }, [
         inlineLlmSpan('a', [userMsg('summarize the transcript')], 'Earlier: CI triage.'),
       ]),
     ]);
-    expect(jobInputText(t, [])).toBe('summarize the transcript');
-    expect(jobOutputText(t)).toBe('Earlier: CI triage.');
+    expect(turnInputText(t, [])).toBe('summarize the transcript');
+    expect(turnOutputText(t)).toBe('Earlier: CI triage.');
   });
 
   // A turn that died before recording an iteration leaves the title step alone
-  // in the job. The fallback must NOT reach for it — that is the template again.
+  // in the turn. The fallback must NOT reach for it — that is the template again.
   it('reports nothing rather than falling back to a lone side pass', () => {
     const t = trace([
       replayStep('s0', { kind: 'title_generation' }, [
         inlineLlmSpan('a', [userMsg(TITLE_PROMPT)], 'Build failure triage'),
       ]),
     ]);
-    expect(jobInputText(t, [])).toBeNull();
-    expect(jobOutputText(t)).toBeNull();
+    expect(turnInputText(t, [])).toBeNull();
+    expect(turnOutputText(t)).toBeNull();
   });
 });

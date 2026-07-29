@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use baybo_model::{JobId, SpanId, StepId};
+use baybo_model::{SpanId, StepId, TurnId};
 use baybo_store::trace::Result;
 use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 use parking_lot::Mutex;
@@ -42,12 +42,12 @@ impl TraceStore for MemoryTraceStore {
         Ok(self.steps.lock().get(step_id).cloned())
     }
 
-    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>> {
+    async fn list_steps_by_turn(&self, turn_id: &TurnId) -> Result<Vec<StepRow>> {
         Ok(self
             .steps
             .lock()
             .values()
-            .filter(|r| Step::from_row((*r).clone()).is_ok_and(|s| &s.job_id == job_id))
+            .filter(|r| Step::from_row((*r).clone()).is_ok_and(|s| &s.turn_id == turn_id))
             .cloned()
             .collect())
     }
@@ -95,13 +95,13 @@ impl TraceStore for MemoryTraceStore {
             .collect())
     }
 
-    async fn list_spans_by_job(&self, job_id: &JobId) -> Result<Vec<SpanRow>> {
+    async fn list_spans_by_turn(&self, turn_id: &TurnId) -> Result<Vec<SpanRow>> {
         let step_ids: std::collections::HashSet<StepId> = self
             .steps
             .lock()
             .values()
             .filter_map(|r| Step::from_row(r.clone()).ok())
-            .filter(|s| &s.job_id == job_id)
+            .filter(|s| &s.turn_id == turn_id)
             .map(|s| s.id)
             .collect();
         let mut spans: Vec<(chrono::DateTime<chrono::Utc>, SpanRow)> = self
@@ -119,13 +119,13 @@ impl TraceStore for MemoryTraceStore {
         Ok(spans.into_iter().map(|(_, r)| r).collect())
     }
 
-    async fn trace_counts_by_job(&self, job_id: &JobId) -> Result<(usize, usize)> {
+    async fn trace_counts_by_turn(&self, turn_id: &TurnId) -> Result<(usize, usize)> {
         let step_ids: std::collections::HashSet<StepId> = self
             .steps
             .lock()
             .values()
             .filter_map(|r| Step::from_row(r.clone()).ok())
-            .filter(|s| &s.job_id == job_id)
+            .filter(|s| &s.turn_id == turn_id)
             .map(|s| s.id)
             .collect();
         let spans = self

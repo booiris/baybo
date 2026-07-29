@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use baybo_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
+use baybo_model::{CallReason, MicroUsd, SessionId, SpanId, TurnId};
 use futures::stream::{Stream, StreamExt};
 
 use crate::guard::{BillableLlm, LlmCallGuard};
@@ -34,7 +34,7 @@ pub const SYSTEM_USER_ID: &str = "system";
 pub struct Attribution {
     pub user_id: String,
     pub session_id: SessionId,
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     pub span_id: SpanId,
     /// Why this call was made. Recorded onto every `cost_records` row so
     /// spend is groupable by purpose. See [`CallReason`].
@@ -45,14 +45,14 @@ impl Attribution {
     /// Attribution for platform-internal spend that no end user
     /// triggered. `component` names the subsystem (e.g.
     /// `"skill-assessor"`) and becomes the `session_id` suffix so its
-    /// spend stays independently filterable. A fresh job/span is minted
+    /// spend stays independently filterable. A fresh turn/span is minted
     /// per call — callers that bind once at startup get one stable pair
     /// for the process lifetime, which is the intended grouping.
     pub fn system(component: &str) -> Self {
         Self {
             user_id: SYSTEM_USER_ID.to_string(),
             session_id: SessionId::from(format!("system:{component}")),
-            job_id: JobId::new(),
+            turn_id: TurnId::new(),
             span_id: SpanId::new(),
             reason: CallReason::System,
         }

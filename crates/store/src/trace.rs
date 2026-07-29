@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use baybo_model::{JobId, SpanId, StepId};
+use baybo_model::{SpanId, StepId, TurnId};
 
 use crate::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Persistence row for a trace `Step`. The full `Step` is serialized into
-/// `data`; the backend derives its queryable columns (`job_id`,
+/// `data`; the backend derives its queryable columns (`turn_id`,
 /// `started_at`) from that JSON. `baybo-trace` owns the `Step` <-> row
 /// conversion (`Step::to_row` / `Step::from_row`).
 #[derive(Debug, Clone)]
@@ -39,24 +39,24 @@ pub struct SpanEventRow {
 pub trait TraceStore: Send + Sync {
     async fn save_step(&self, step: &StepRow) -> Result<()>;
     async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>>;
-    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>>;
+    async fn list_steps_by_turn(&self, turn_id: &TurnId) -> Result<Vec<StepRow>>;
     /// List steps that still need trace recovery: either the step row itself is
     /// open, or at least one child span is open. Recovery uses this to find
-    /// detached trace work under jobs that are already terminal.
+    /// detached trace work under turns that are already terminal.
     async fn list_unfinished_steps(&self) -> Result<Vec<StepRow>>;
 
     async fn save_span(&self, span: &SpanRow) -> Result<()>;
     async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>>;
     async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<SpanRow>>;
-    /// Every span under a job's steps in one query, ordered by
-    /// `started_at`. Tree assemblers (job trace, replay) use this
+    /// Every span under a turn's steps in one query, ordered by
+    /// `started_at`. Tree assemblers (turn trace, replay) use this
     /// instead of a `list_spans_by_step` round-trip per step.
-    async fn list_spans_by_job(&self, job_id: &JobId) -> Result<Vec<SpanRow>>;
-    /// Count a job's `(steps, spans)` without materialising any `data`
+    async fn list_spans_by_turn(&self, turn_id: &TurnId) -> Result<Vec<SpanRow>>;
+    /// Count a turn's `(steps, spans)` without materialising any `data`
     /// blobs. List/status surfaces need only the numbers — span blobs
     /// can run to hundreds of KB each, so counting via the list
     /// methods is prohibitively expensive.
-    async fn trace_counts_by_job(&self, job_id: &JobId) -> Result<(usize, usize)>;
+    async fn trace_counts_by_turn(&self, turn_id: &TurnId) -> Result<(usize, usize)>;
 
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()>;
     async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>>;

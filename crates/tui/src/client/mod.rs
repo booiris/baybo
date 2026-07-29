@@ -2,7 +2,7 @@
 //!
 //! The TUI reaches the gateway's channel WebSocket endpoint exclusively
 //! — messages, deltas, notices, and tool approvals all travel over a
-//! single [`WsClient`]. Admin-shaped resources (skills, jobs, memory,
+//! single [`WsClient`]. Admin-shaped resources (skills, turns, memory,
 //! sessions CRUD) live on the admin TCP surface and are only reachable
 //! through the `baybo` CLI.
 //!

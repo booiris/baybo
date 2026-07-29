@@ -10,7 +10,7 @@ members = [
     "crates/workspace",
     "crates/context",
     "crates/session",
-    "crates/job",
+    "crates/turn",
     "crates/memory",
     "crates/cost",
     "crates/query",
@@ -69,7 +69,7 @@ baybo-tools = { path = "crates/tools" }
 baybo-workspace = { path = "crates/workspace", default-features = false }
 baybo-context = { path = "crates/context" }
 baybo-session = { path = "crates/session" }
-baybo-job = { path = "crates/job" }
+baybo-turn = { path = "crates/turn" }
 baybo-memory = { path = "crates/memory" }
 baybo-cost = { path = "crates/cost" }
 baybo-query = { path = "crates/query" }

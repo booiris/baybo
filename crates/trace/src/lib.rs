@@ -1,8 +1,8 @@
 //! Trace types, row conversions, and span lifecycle — see
 //! `docs/modules/trace.md` for the design.
 //!
-//! Hierarchy: `Session > Job > Step > Span (+ SpanEvent)`. `Session`
-//! lives in `baybo-model`; `Job` lives in `baybo-job`; this crate owns
+//! Hierarchy: `Session > Turn > Step > Span (+ SpanEvent)`. `Session`
+//! lives in `baybo-model`; `Turn` lives in `baybo-turn`; this crate owns
 //! `Step`, `Span`, `SpanEvent`, the `SpanRecorder` persistence
 //! orchestrator, and the row conversions that persist them.
 //!

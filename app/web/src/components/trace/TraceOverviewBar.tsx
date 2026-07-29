@@ -3,12 +3,12 @@
  * glance header: a clickable sequence minimap (one cell per step/span across the
  * whole session, colour-coded by kind, red for failures), token totals, wall-
  * clock, and per-tool call counts. Clicking a cell selects that node and scrolls
- * the tree to it. Aggregates from job summaries (tokens, always available) plus
- * whatever job step-trees have loaded (cells, counts, tools).
+ * the tree to it. Aggregates from turn summaries (tokens, always available) plus
+ * whatever turn step-trees have loaded (cells, counts, tools).
  */
 import { useMemo, useState } from 'react';
 import { RiArrowDownSLine, RiArrowRightSLine } from 'react-icons/ri';
-import type { JobTrace, LifecycleState, TraceJobSummary, TraceOverview } from '../../types/trace';
+import type { LifecycleState, TraceOverview, TraceTurnSummary, TurnTrace } from '../../types/trace';
 import type { TraceGroup } from './traceFormat';
 import {
   formatDuration,
@@ -29,7 +29,7 @@ const MAX_CELLS = 800;
 
 interface Cell {
   key: string;
-  jobId: string;
+  turnId: string;
   stepId: string;
   spanId: string | null;
   cellClass: string;
@@ -49,14 +49,14 @@ function isFail(outcome: LifecycleState['outcome']): boolean {
   return outcome === 'failed' || outcome === 'cancelled';
 }
 
-function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace>): Aggregate {
+function buildAggregate(overview: TraceOverview, turnTraces: Map<string, TurnTrace>): Aggregate {
   const cells: Cell[] = [];
   const tools = new Map<string, number>();
   let stepCount = 0;
   let spanCount = 0;
 
-  for (const job of overview.jobs) {
-    const trace = jobTraces.get(job.job_id);
+  for (const turn of overview.turns) {
+    const trace = turnTraces.get(turn.turn_id);
     if (!trace) continue;
     for (const rs of trace.steps) {
       stepCount += 1;
@@ -74,7 +74,7 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
           }
           cells.push({
             key: span.id,
-            jobId: job.job_id,
+            turnId: turn.turn_id,
             stepId: rs.step.id,
             spanId: span.id,
             cellClass: failed ? 'bg-err' : v.cell,
@@ -96,7 +96,7 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
         const single = rs.spans.length === 1 ? rs.spans[0] : null;
         cells.push({
           key: rs.step.id,
-          jobId: job.job_id,
+          turnId: turn.turn_id,
           stepId: rs.step.id,
           spanId: single ? single.id : null,
           cellClass: failed ? 'bg-err' : v.cell,
@@ -113,13 +113,13 @@ function buildAggregate(overview: TraceOverview, jobTraces: Map<string, JobTrace
 }
 
 // Wall-clock across the session: earliest start → latest end, using `now` as the
-// upper bound while any job is still running (so it doesn't under-report or
-// vanish mid-session, matching the header's live per-job duration).
-function overallDuration(jobs: TraceJobSummary[]): number | null {
+// upper bound while any turn is still running (so it doesn't under-report or
+// vanish mid-session, matching the header's live per-turn duration).
+function overallDuration(turns: TraceTurnSummary[]): number | null {
   let minS = Infinity;
   let maxE = -Infinity;
   let running = false;
-  for (const j of jobs) {
+  for (const j of turns) {
     if (j.started_at == null) continue;
     minS = Math.min(minS, new Date(j.started_at).getTime());
     if (j.ended_at != null) maxE = Math.max(maxE, new Date(j.ended_at).getTime());
@@ -142,8 +142,8 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
 
 export function TraceOverviewBar({
   overview,
-  jobTraces,
-  loadingJobs,
+  turnTraces,
+  loadingTurns,
   highlight,
   onHighlight,
   selectedSpanId,
@@ -152,27 +152,27 @@ export function TraceOverviewBar({
   onSelectStep,
 }: {
   overview: TraceOverview;
-  jobTraces: Map<string, JobTrace>;
-  loadingJobs: Set<string>;
+  turnTraces: Map<string, TurnTrace>;
+  loadingTurns: Set<string>;
   /** Legend group to highlight; non-matching cells dim. `null` = no highlight. */
   highlight: TraceGroup | null;
   onHighlight: (g: TraceGroup | null) => void;
   selectedSpanId: string | null;
   selectedStepId: string | null;
-  onSelectSpan: (jobId: string, spanId: string) => void;
-  onSelectStep: (jobId: string, stepId: string) => void;
+  onSelectSpan: (turnId: string, spanId: string) => void;
+  onSelectStep: (turnId: string, stepId: string) => void;
 }) {
   const [open, setOpen] = useState(true);
 
   const { cells, stepCount, spanCount, toolCounts } = useMemo(
-    () => buildAggregate(overview, jobTraces),
-    [overview, jobTraces],
+    () => buildAggregate(overview, turnTraces),
+    [overview, turnTraces],
   );
 
   const tokens = useMemo(() => {
     let input = 0;
     let output = 0;
-    for (const j of overview.jobs) {
+    for (const j of overview.turns) {
       const t = summaryTokens(j);
       input += t.inputTotal;
       output += t.output;
@@ -180,14 +180,14 @@ export function TraceOverviewBar({
     return { input, output };
   }, [overview]);
 
-  const dur = overallDuration(overview.jobs);
+  const dur = overallDuration(overview.turns);
   const failCells = cells.filter((c) => c.failed);
   const renderCells = cells.length > MAX_CELLS ? cells.slice(0, MAX_CELLS) : cells;
   const hidden = cells.length - renderCells.length;
 
   const jump = (c: Cell) => {
-    if (c.spanId != null) onSelectSpan(c.jobId, c.spanId);
-    else onSelectStep(c.jobId, c.stepId);
+    if (c.spanId != null) onSelectSpan(c.turnId, c.spanId);
+    else onSelectStep(c.turnId, c.stepId);
     scrollToAnchor(`[data-step-id="${c.stepId}"]`, 'center');
   };
 
@@ -202,15 +202,15 @@ export function TraceOverviewBar({
           {open ? <RiArrowDownSLine /> : <RiArrowRightSLine />}
           Trace overview
         </button>
-        <Stat label="jobs" value={String(overview.jobs.length)} />
+        <Stat label="turns" value={String(overview.turns.length)} />
         <Stat label="steps" value={String(stepCount)} />
         <Stat label="spans" value={String(spanCount)} />
         <Stat label="↑" value={formatTok(tokens.input)} />
         <Stat label="↓" value={formatTok(tokens.output)} />
         {dur !== null && <Stat label="dur" value={formatDuration(dur)} />}
         {failCells.length > 0 && <Stat label="fail" value={String(failCells.length)} accent="text-err" />}
-        {loadingJobs.size > 0 && (
-          <span className="text-[0.62rem] font-mono text-ink-soft italic">loading {loadingJobs.size}…</span>
+        {loadingTurns.size > 0 && (
+          <span className="text-[0.62rem] font-mono text-ink-soft italic">loading {loadingTurns.size}…</span>
         )}
       </div>
 

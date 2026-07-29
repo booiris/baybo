@@ -1,5 +1,5 @@
 //! Binary entry for `baybo setup`. Runs ahead of `boot::load_config`
-//! because the wizard's job is to create the workspace + key +
+//! because the wizard's turn is to create the workspace + key +
 //! `baybo.json` that the rest of the binary expects.
 
 use baybo_setup::{SetupOutcome, TtyPrompter};

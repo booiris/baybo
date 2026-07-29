@@ -696,54 +696,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/jobs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_jobs"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/jobs/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_job"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/jobs/{id}/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["cancel_job"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/llm": {
         parameters: {
             query?: never;
@@ -1000,16 +952,64 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/traces/{session_id}/jobs/{job_id}": {
+    "/v1/traces/{session_id}/turns/{turn_id}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["get_job_trace"];
+        get: operations["get_turn_trace"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_turns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/turns/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_turn"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/turns/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_turn"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1324,26 +1324,26 @@ export interface components {
             created_at: string;
             /**
              * @description Whether this row's **cron group** is pinned to the top of the chat list.
-             *     Read off the live job (`cron_jobs.pinned`), so every fire of the job
+             *     Read off the live turn (`cron_jobs.pinned`), so every fire of the turn
              *     carries the same value and the client folds it into the one group row —
              *     exactly as it already does for `cron_job_title`. The group is a view, so
-             *     the bit necessarily dies with the job: a tombstone group (job deleted,
+             *     the bit necessarily dies with the turn: a tombstone group (turn deleted,
              *     history kept) is always unpinned. `false` for a non-cron row.
              */
             cron_group_pinned?: boolean;
             /**
              * @description The cron job whose fire this conversation is, for the clients that
-             *     collapse a job's fires into one chat-list row (a **cron group** — a
+             *     collapse a turn's fires into one chat-list row (a **cron group** — a
              *     derived view, never a `session_folders` row; see `docs/cron-groups.md`).
              *     `None` for a user session, and for the one-shot fire workspaces the list
              *     never returns anyway.
              */
             cron_job_id?: string | null;
             /**
-             * @description The label for that group: the job's **live** title while the job exists
+             * @description The label for that group: the turn's **live** title while the turn exists
              *     (so a rename propagates with no rewrite of any session), falling back to
-             *     the title snapshotted onto the fire at mint once the job is deleted.
-             *     `None` only when both are unavailable — a pre-snapshot fire whose job is
+             *     the title snapshotted onto the fire at mint once the turn is deleted.
+             *     `None` only when both are unavailable — a pre-snapshot fire whose turn is
              *     gone; clients leave those rows flat.
              */
             cron_job_title?: string | null;
@@ -1728,7 +1728,7 @@ export interface components {
             status: components["schemas"]["CronStatus"];
             timezone: string;
             /**
-             * @description Short human name for the job. Empty for rows created before the field
+             * @description Short human name for the turn. Empty for rows created before the field
              *     existed — clients fall back to the prompt.
              */
             title: string;
@@ -1853,55 +1853,6 @@ export interface components {
              */
             session_ids: string[];
         };
-        /**
-         * @description Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
-         *     state machine (Q6) — `final_result` replaces `output`/`error`,
-         *     `emitted_span_ids` replaces `trace_span_id`.
-         */
-        Job: {
-            /** Format: date-time */
-            created_at: string;
-            emitted_span_ids: string[];
-            /** Format: date-time */
-            ended_at?: string | null;
-            final_result?: Record<string, never> | null;
-            id: string;
-            /** @description What payload fed the job (display-only projection of the input). */
-            input_kind: components["schemas"]["JobInputKind"];
-            /** @description The owning session's root trigger. */
-            origin: components["schemas"]["JobOrigin"];
-            parent_job_id?: string | null;
-            session_id: string;
-            /** Format: date-time */
-            started_at?: string | null;
-            status: components["schemas"]["JobStatus"];
-        };
-        /**
-         * @description Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
-         * @enum {string}
-         */
-        JobInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification";
-        /**
-         * @description Wire mirror of a job's origin (the owning session's root trigger,
-         *     [`baybo_model::TriggerKind`]).
-         * @enum {string}
-         */
-        JobOrigin: "user" | "cron" | "spawned";
-        /**
-         * @description Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
-         *     the domain enum carries (cancel reason, partial-artifact span IDs);
-         *     the wire shape collapses inner-variant content into `Option`-typed
-         *     fields so HTTP clients can decode without needing the full Rust
-         *     enum machinery.
-         */
-        JobStatus: {
-            cancel_reason?: string | null;
-            kind: components["schemas"]["JobStatusKind"];
-            partial_artifacts?: string[];
-            reason?: string | null;
-        };
-        /** @enum {string} */
-        JobStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";
         /**
          * @description Envelope for list endpoints. `next_cursor` is opaque — clients
          *     pass it back as `?cursor=` to fetch the next page, and treat
@@ -2322,8 +2273,8 @@ export interface components {
         /** @description Minimal gateway health/status payload. */
         StatusResponse: {
             bind_address: string;
-            jobs_in_flight: number;
             sessions: number;
+            turns_in_flight: number;
             version: string;
         };
         /**
@@ -2336,14 +2287,14 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             input_tokens: number;
-            job_count: number;
             kind: components["schemas"]["SessionKind"];
             /** Format: date-time */
             last_active: string;
-            latest_job_status?: null | components["schemas"]["JobStatus"];
+            latest_turn_status?: null | components["schemas"]["TurnStatus"];
             output_tokens: number;
             session_id: string;
             span_count: number;
+            turn_count: number;
         };
         /**
          * @description Envelope for `GET /v1/traces`. Carries `total` for "Showing X of N"
@@ -2359,6 +2310,55 @@ export interface components {
          * @enum {string}
          */
         TranscriptItemKind: "message" | "work" | "notice";
+        /**
+         * @description Wire mirror of [`baybo_turn::Turn`]. Inner shape reflects the new
+         *     state machine (Q6) — `final_result` replaces `output`/`error`,
+         *     `emitted_span_ids` replaces `trace_span_id`.
+         */
+        Turn: {
+            /** Format: date-time */
+            created_at: string;
+            emitted_span_ids: string[];
+            /** Format: date-time */
+            ended_at?: string | null;
+            final_result?: Record<string, never> | null;
+            id: string;
+            /** @description What payload fed the turn (display-only projection of the input). */
+            input_kind: components["schemas"]["TurnInputKind"];
+            /** @description The owning session's root trigger. */
+            origin: components["schemas"]["TurnOrigin"];
+            parent_turn_id?: string | null;
+            session_id: string;
+            /** Format: date-time */
+            started_at?: string | null;
+            status: components["schemas"]["TurnStatus"];
+        };
+        /**
+         * @description Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
+         * @enum {string}
+         */
+        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification";
+        /**
+         * @description Wire mirror of a turn's origin (the owning session's root trigger,
+         *     [`baybo_model::TriggerKind`]).
+         * @enum {string}
+         */
+        TurnOrigin: "user" | "cron" | "spawned";
+        /**
+         * @description Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload
+         *     the domain enum carries (cancel reason, partial-artifact span IDs);
+         *     the wire shape collapses inner-variant content into `Option`-typed
+         *     fields so HTTP clients can decode without needing the full Rust
+         *     enum machinery.
+         */
+        TurnStatus: {
+            cancel_reason?: string | null;
+            kind: components["schemas"]["TurnStatusKind"];
+            partial_artifacts?: string[];
+            reason?: string | null;
+        };
+        /** @enum {string} */
+        TurnStatusKind: "pending" | "in_progress" | "stuck" | "cancelled" | "failed" | "completed";
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;
@@ -4086,7 +4086,7 @@ export interface operations {
                             status: components["schemas"]["CronStatus"];
                             timezone: string;
                             /**
-                             * @description Short human name for the job. Empty for rows created before the field
+                             * @description Short human name for the turn. Empty for rows created before the field
                              *     existed — clients fall back to the prompt.
                              */
                             title: string;
@@ -4919,198 +4919,6 @@ export interface operations {
             };
         };
     };
-    list_jobs: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Restrict to a single session. Hits the per-session index in
-                 *     the store instead of scanning the full jobs table.
-                 */
-                session?: string | null;
-                /**
-                 * @description Restrict to one terminal/in-flight status discriminator.
-                 *     Snake-case, matching `JobStatusKind` (`pending`, `in_progress`,
-                 *     `stuck`, `cancelled`, `failed`, `completed`).
-                 */
-                status?: string | null;
-                /** @description Maximum items to return. Defaults to 50; capped at 500. */
-                limit?: number | null;
-                /** @description Opaque cursor from a previous response's `next_cursor`. */
-                cursor?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Paginated jobs */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        items: {
-                            /** Format: date-time */
-                            created_at: string;
-                            emitted_span_ids: string[];
-                            /** Format: date-time */
-                            ended_at?: string | null;
-                            final_result?: Record<string, never> | null;
-                            id: string;
-                            /** @description What payload fed the job (display-only projection of the input). */
-                            input_kind: components["schemas"]["JobInputKind"];
-                            /** @description The owning session's root trigger. */
-                            origin: components["schemas"]["JobOrigin"];
-                            parent_job_id?: string | null;
-                            session_id: string;
-                            /** Format: date-time */
-                            started_at?: string | null;
-                            status: components["schemas"]["JobStatus"];
-                        }[];
-                        next_cursor?: string | null;
-                    };
-                };
-            };
-            /** @description Invalid query parameters */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Job store error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    get_job: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Job id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Job record */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Job"];
-                };
-            };
-            /** @description Invalid job id */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    cancel_job: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Job id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Cancelled job record */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Job"];
-                };
-            };
-            /** @description Invalid job id */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Cancel failed */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     get_llm: {
         parameters: {
             query?: never;
@@ -5651,8 +5459,8 @@ export interface operations {
     list_traces: {
         parameters: {
             query?: {
-                /** @description Filter on the latest job's status (snake_case enum). */
-                status?: components["schemas"]["JobStatusKind"];
+                /** @description Filter on the latest turn's status (snake_case enum). */
+                status?: components["schemas"]["TurnStatusKind"];
                 /** @description Inclusive lower bound on `last_active`. */
                 since?: string;
                 /** @description Exclusive upper bound on `last_active`. */
@@ -5709,7 +5517,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Per-session trace overview: session_messages log + job summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace overview: session_messages log + turn summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5738,21 +5546,21 @@ export interface operations {
             };
         };
     };
-    get_job_trace: {
+    get_turn_trace: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Session id this job belongs to (or inherits from); used for route scoping only */
+                /** @description Session id this turn belongs to (or inherits from); used for route scoping only */
                 session_id: string;
-                /** @description Job id whose step/span tree to fetch */
-                job_id: string;
+                /** @description Turn id whose step/span tree to fetch */
+                turn_id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`. */
+            /** @description Per-turn step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5761,7 +5569,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description Invalid job id */
+            /** @description Invalid turn id */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -5779,8 +5587,200 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description No such job */
+            /** @description No such turn */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_turns: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Restrict to a single session. Hits the per-session index in
+                 *     the store instead of scanning the full turns table.
+                 */
+                session?: string | null;
+                /**
+                 * @description Restrict to one terminal/in-flight status discriminator.
+                 *     Snake-case, matching `TurnStatusKind` (`pending`, `in_progress`,
+                 *     `stuck`, `cancelled`, `failed`, `completed`).
+                 */
+                status?: string | null;
+                /** @description Maximum items to return. Defaults to 50; capped at 500. */
+                limit?: number | null;
+                /** @description Opaque cursor from a previous response's `next_cursor`. */
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paginated turns */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** Format: date-time */
+                            created_at: string;
+                            emitted_span_ids: string[];
+                            /** Format: date-time */
+                            ended_at?: string | null;
+                            final_result?: Record<string, never> | null;
+                            id: string;
+                            /** @description What payload fed the turn (display-only projection of the input). */
+                            input_kind: components["schemas"]["TurnInputKind"];
+                            /** @description The owning session's root trigger. */
+                            origin: components["schemas"]["TurnOrigin"];
+                            parent_turn_id?: string | null;
+                            session_id: string;
+                            /** Format: date-time */
+                            started_at?: string | null;
+                            status: components["schemas"]["TurnStatus"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Invalid query parameters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Turn store error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_turn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Turn id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Turn record */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Turn"];
+                };
+            };
+            /** @description Invalid turn id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_turn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Turn id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled turn record */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Turn"];
+                };
+            };
+            /** @description Invalid turn id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Cancel failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

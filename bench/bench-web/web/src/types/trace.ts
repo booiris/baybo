@@ -3,8 +3,8 @@
  * the wire. Ported verbatim from the gateway dashboard
  * (`web/src/types/trace.ts`) — the bench `trace.json` / `messages.json`
  * files ARE this serialization, so the viewer renders them unchanged.
- * The bench-web backend reshapes the file envelope (`{session, jobs}` +
- * `{messages}`) into `{session_id, session_messages, jobs}` to match
+ * The bench-web backend reshapes the file envelope (`{session, turns}` +
+ * `{messages}`) into `{session_id, session_messages, turns}` to match
  * `TraceOverview` below.
  *
  * Keep in sync with `crates/trace/src/{step,span,event,outcome}.rs` and
@@ -50,7 +50,7 @@ export type StepKindTag = StepKind['kind'];
 
 export interface Step {
   id: string;
-  job_id: string;
+  turn_id: string;
   kind: StepKind;
   started_at: string;
   ended_at?: string | null;
@@ -237,7 +237,7 @@ export interface SpanEvent {
 
 // ── Replay (per-session export wire shape) ────────────────────────────
 
-export type JobStatusKind =
+export type TurnStatusKind =
   | 'pending'
   | 'in_progress'
   | 'stuck'
@@ -250,7 +250,7 @@ export interface ReplayStep {
   spans: Span[];
 }
 
-// ── Trace overview / per-job split (matches baybo_query) ──────────────
+// ── Trace overview / per-turn split (matches baybo_query) ─────────────
 
 export interface SessionMessageRow {
   ordinal: number;
@@ -259,10 +259,10 @@ export interface SessionMessageRow {
   message: ChatMessage;
 }
 
-export interface TraceJobSummary {
-  job_id: string;
+export interface TraceTurnSummary {
+  turn_id: string;
   session_id: string;
-  job_status_kind: JobStatusKind;
+  turn_status_kind: TurnStatusKind;
   created_at: string;
   started_at?: string | null;
   ended_at?: string | null;
@@ -275,13 +275,13 @@ export interface TraceJobSummary {
 export interface TraceOverview {
   session_id: string;
   session_messages: SessionMessageRow[];
-  jobs: TraceJobSummary[];
+  turns: TraceTurnSummary[];
 }
 
-export interface JobTrace {
-  job_id: string;
+export interface TurnTrace {
+  turn_id: string;
   session_id: string;
-  job_status_kind: JobStatusKind;
+  turn_status_kind: TurnStatusKind;
   created_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;

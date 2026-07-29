@@ -105,11 +105,11 @@ pub struct WsChannelState {
     /// client's `Frame::TaskList` snapshot, so a reload / reconnect / view-cache
     /// eviction recovers the durable list without waiting for the next turn.
     pub task_store: Arc<dyn TaskStore>,
-    /// Job registry. Read on `Subscribe` to derive the client's
+    /// Turn registry. Read on `Subscribe` to derive the client's
     /// `Frame::TurnState` snapshot (is a turn in flight, since when) —
     /// the live `TurnState` broadcasts cover connected clients; this
     /// covers the late joiner who missed them.
-    pub job_lifecycle: Arc<baybo_job::JobLifecycle>,
+    pub turn_lifecycle: Arc<baybo_turn::TurnLifecycle>,
     /// Internal HTTP dispatcher state for relay API-tunnel forwarding.
     pub tunnel_http: TunnelHttpState,
     /// Recent-window dedup for sidecar-supplied
@@ -149,7 +149,7 @@ impl WsChannelState {
             device_leg_registry: Arc::new(DashMap::new()),
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
-            job_lifecycle: Arc::clone(&deps.job_lifecycle),
+            turn_lifecycle: Arc::clone(&deps.turn_lifecycle),
             tunnel_http: TunnelHttpState {
                 admin: crate::server::AdminState::from_deps(deps),
                 auth: AdminAuthState::new(deps.admin_token.clone())

@@ -20,7 +20,6 @@ import {
 import type {
   ChatMessage,
   ContentBlock,
-  JobTrace,
   LifecycleState,
   LlmCallResult,
   ReplayStep,
@@ -29,7 +28,8 @@ import type {
   SpanKindTag,
   Step,
   StepKindTag,
-  TraceJobSummary,
+  TraceTurnSummary,
+  TurnTrace,
 } from '../../types/trace';
 import { resolveInputMessages } from '../../types/trace';
 
@@ -321,19 +321,19 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
   }
 }
 
-// ── Job-level token / duration / io helpers ──────────────────────────
+// ── Turn-level token / duration / io helpers ─────────────────────────
 
-// Total job execution time. Prefers the backend's `started_at`/`ended_at`
+// Total turn execution time. Prefers the backend's `started_at`/`ended_at`
 // (covers setup, teardown, and gaps that fall outside any step) and falls
-// back to deriving from step timestamps for older traces. For in-flight jobs
+// back to deriving from step timestamps for older traces. For in-flight turns
 // we use `now` as the upper bound so the counter keeps ticking.
-export function jobDurationMs(
-  job: { started_at?: string | null; ended_at?: string | null },
-  trace: JobTrace | undefined,
+export function turnDurationMs(
+  turn: { started_at?: string | null; ended_at?: string | null },
+  trace: TurnTrace | undefined,
 ): number | null {
-  if (job.started_at != null) {
-    const start = new Date(job.started_at).getTime();
-    const end = job.ended_at != null ? new Date(job.ended_at).getTime() : Date.now();
+  if (turn.started_at != null) {
+    const start = new Date(turn.started_at).getTime();
+    const end = turn.ended_at != null ? new Date(turn.ended_at).getTime() : Date.now();
     return Math.max(0, end - start);
   }
   if (!trace) return null;
@@ -356,14 +356,14 @@ export function jobDurationMs(
   return Math.max(0, end - minStart);
 }
 
-// Time the job sat in queue before execution started. Only meaningful when
-// both timestamps are present; null for legacy traces or jobs never started.
-export function jobQueuedMs(job: { created_at?: string | null; started_at?: string | null }): number | null {
-  if (job.created_at == null || job.started_at == null) return null;
-  return Math.max(0, new Date(job.started_at).getTime() - new Date(job.created_at).getTime());
+// Time the turn sat in queue before execution started. Only meaningful when
+// both timestamps are present; null for legacy traces or turns never started.
+export function turnQueuedMs(turn: { created_at?: string | null; started_at?: string | null }): number | null {
+  if (turn.created_at == null || turn.started_at == null) return null;
+  return Math.max(0, new Date(turn.started_at).getTime() - new Date(turn.created_at).getTime());
 }
 
-export interface JobTokenTotals {
+export interface TurnTokenTotals {
   input: number;
   output: number;
   cached: number;
@@ -371,7 +371,7 @@ export interface JobTokenTotals {
   inputTotal: number;
 }
 
-export function summaryTokens(summary: TraceJobSummary): JobTokenTotals {
+export function summaryTokens(summary: TraceTurnSummary): TurnTokenTotals {
   return {
     input: summary.input_tokens,
     output: summary.output_tokens,
@@ -382,9 +382,9 @@ export function summaryTokens(summary: TraceJobSummary): JobTokenTotals {
   };
 }
 
-// Derive token totals from a loaded JobTrace's spans. Used when we have the
+// Derive token totals from a loaded TurnTrace's spans. Used when we have the
 // full step/span tree; otherwise prefer `summaryTokens`.
-export function traceTokens(trace: JobTrace): JobTokenTotals {
+export function traceTokens(trace: TurnTrace): TurnTokenTotals {
   let input = 0;
   let output = 0;
   let cached = 0;
@@ -419,27 +419,27 @@ export function contentText(content: ContentBlock[]): string {
 /** The step kind that IS the conversation — the agent loop's own iterations. */
 const CONVERSATION_STEP_KIND: StepKindTag = 'llm_iteration';
 
-/** Step kinds that never constitute a job's own work: detached side passes
+/** Step kinds that never constitute a turn's own work: detached side passes
  *  recorded under the turn they observe, each sending a prompt of its own. A
- *  job left holding nothing else (its turn died before recording an iteration)
+ *  turn left holding nothing else (it died before recording an iteration)
  *  has no user input to show — not the side pass's template. */
 const SIDE_PASS_STEP_KINDS = new Set<StepKindTag>(['title_generation', 'progress_observer']);
 
-// Which steps speak for the job. "The job's first/last LLM span" does not:
+// Which steps speak for the turn. "The turn's first/last LLM span" does not:
 // title generation is spawned before the turn's first iteration and the
-// observer/a compaction land after its last, so a new session's job preview
+// observer/a compaction land after its last, so a new session's turn preview
 // showed the title prompt template instead of what the user asked. Prefer the
-// agent loop's steps; a job that has none (a standalone `/compact`) falls back
+// agent loop's steps; a turn that has none (a standalone `/compact`) falls back
 // to the work it did do.
-function conversationSteps(trace: JobTrace): ReplayStep[] {
+function conversationSteps(trace: TurnTrace): ReplayStep[] {
   const own = trace.steps.filter((rs) => !SIDE_PASS_STEP_KINDS.has(rs.step.kind.kind));
   const loop = own.filter((rs) => rs.step.kind.kind === CONVERSATION_STEP_KIND);
   return loop.length > 0 ? loop : own;
 }
 
-// Derive the user-facing input that kicked off the job: the last message in
+// Derive the user-facing input that kicked off the turn: the last message in
 // the *first* conversation LLM call's input_messages whose `source` is 'user'.
-export function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string | null {
+export function turnInputText(trace: TurnTrace, messageLog: SessionMessageRow[]): string | null {
   for (const rs of conversationSteps(trace)) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call') {
@@ -461,9 +461,9 @@ export function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): 
   return null;
 }
 
-// Derive the final output text of the job: the most recent conversation LLM
+// Derive the final output text of the turn: the most recent conversation LLM
 // call's output_content (walking steps/spans back-to-front).
-export function jobOutputText(trace: JobTrace): string | null {
+export function turnOutputText(trace: TurnTrace): string | null {
   const steps = conversationSteps(trace);
   for (let i = steps.length - 1; i >= 0; i--) {
     const rs = steps[i];

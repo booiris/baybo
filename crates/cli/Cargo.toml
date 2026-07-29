@@ -22,7 +22,7 @@ baybo-config = { workspace = true }
 baybo-gateway = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-cost = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 baybo-pairing = { workspace = true }
 baybo-query = { workspace = true }
 baybo-skills = { workspace = true }

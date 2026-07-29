@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
-use baybo_model::{JobId, SpanId, StepId};
+use baybo_model::{SpanId, StepId, TurnId};
 use baybo_store::trace::Result;
 use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 
@@ -58,14 +58,14 @@ impl TraceStore for SqliteTraceStore {
             .await
     }
 
-    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>> {
-        let job_id = job_id.to_string();
+    async fn list_steps_by_turn(&self, turn_id: &TurnId) -> Result<Vec<StepRow>> {
+        let turn_id = turn_id.to_string();
         self.pool
-            .interact("trace.list_steps_by_job", move |conn| {
+            .interact("trace.list_steps_by_turn", move |conn| {
                 let mut stmt = conn
-                    .prepare("SELECT id, data FROM steps WHERE job_id = ?1 ORDER BY started_at")?;
+                    .prepare("SELECT id, data FROM steps WHERE turn_id = ?1 ORDER BY started_at")?;
                 let rows = stmt
-                    .query_map(rusqlite::params![job_id], |row| {
+                    .query_map(rusqlite::params![turn_id], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -168,17 +168,17 @@ impl TraceStore for SqliteTraceStore {
             .await
     }
 
-    async fn list_spans_by_job(&self, job_id: &JobId) -> Result<Vec<SpanRow>> {
-        let job_id = job_id.to_string();
+    async fn list_spans_by_turn(&self, turn_id: &TurnId) -> Result<Vec<SpanRow>> {
+        let turn_id = turn_id.to_string();
         self.pool
-            .interact("trace.list_spans_by_job", move |conn| {
+            .interact("trace.list_spans_by_turn", move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT sp.id, sp.data FROM spans sp \
                      JOIN steps st ON sp.step_id = st.id \
-                     WHERE st.job_id = ?1 ORDER BY sp.started_at",
+                     WHERE st.turn_id = ?1 ORDER BY sp.started_at",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![job_id], |row| {
+                    .query_map(rusqlite::params![turn_id], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -194,15 +194,15 @@ impl TraceStore for SqliteTraceStore {
             .await
     }
 
-    async fn trace_counts_by_job(&self, job_id: &JobId) -> Result<(usize, usize)> {
-        let job_id = job_id.to_string();
+    async fn trace_counts_by_turn(&self, turn_id: &TurnId) -> Result<(usize, usize)> {
+        let turn_id = turn_id.to_string();
         self.pool
-            .interact("trace.trace_counts_by_job", move |conn| {
+            .interact("trace.trace_counts_by_turn", move |conn| {
                 let (steps, spans): (i64, i64) = conn.query_row(
-                    "SELECT (SELECT COUNT(*) FROM steps WHERE job_id = ?1), \
+                    "SELECT (SELECT COUNT(*) FROM steps WHERE turn_id = ?1), \
                             (SELECT COUNT(*) FROM spans WHERE step_id IN \
-                                 (SELECT id FROM steps WHERE job_id = ?1))",
-                    rusqlite::params![job_id],
+                                 (SELECT id FROM steps WHERE turn_id = ?1))",
+                    rusqlite::params![turn_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 Ok((steps as usize, spans as usize))
@@ -300,10 +300,10 @@ mod tests {
     };
     use chrono::Utc;
 
-    fn make_step(job_id: JobId) -> Step {
+    fn make_step(turn_id: TurnId) -> Step {
         Step {
             id: StepId::new(),
-            job_id,
+            turn_id,
             kind: StepKind::LlmIteration,
             started_at: Utc::now(),
             ended_at: None,
@@ -364,7 +364,7 @@ mod tests {
             .await
             .unwrap();
         let store = SqliteTraceStore::new(pool);
-        let s = make_step(JobId::new());
+        let s = make_step(TurnId::new());
         store.save_step(&s.to_row().unwrap()).await.unwrap();
         let loaded = Step::from_row(store.load_step(&s.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(loaded.id, s.id);
@@ -377,8 +377,8 @@ mod tests {
             .await
             .unwrap();
         let store = SqliteTraceStore::new(pool);
-        let job_id = JobId::new();
-        let step = make_step(job_id);
+        let turn_id = TurnId::new();
+        let step = make_step(turn_id);
         store.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let llm = make_llm_span(step.id);
@@ -391,47 +391,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_steps_by_job_filters_via_generated_column() {
-        // Exercises the `steps.job_id` VIRTUAL column
-        // (`json_extract(data, '$.job_id')`) — the lookup path the
+    async fn list_steps_by_turn_filters_via_generated_column() {
+        // Exercises the `steps.turn_id` VIRTUAL column
+        // (`json_extract(data, '$.turn_id')`) — the lookup path the
         // round-trip/load tests don't touch. Guards against a schema
-        // path typo or a rename of `Step::job_id` silently dropping
-        // every step out of the by-job query.
+        // path typo or a rename of `Step::turn_id` silently dropping
+        // every step out of the by-turn query.
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
         let store = SqliteTraceStore::new(pool);
-        let job_a = JobId::new();
-        let job_b = JobId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
 
-        let a1 = make_step(job_a);
-        let a2 = make_step(job_a);
-        let b1 = make_step(job_b);
+        let a1 = make_step(turn_a);
+        let a2 = make_step(turn_a);
+        let b1 = make_step(turn_b);
         for s in [&a1, &a2, &b1] {
             store.save_step(&s.to_row().unwrap()).await.unwrap();
         }
 
-        let got = store.list_steps_by_job(&job_a).await.unwrap();
+        let got = store.list_steps_by_turn(&turn_a).await.unwrap();
         let got_ids: Vec<_> = got.iter().map(|r| r.id).collect();
-        assert_eq!(got.len(), 2, "only the two job_a steps should match");
+        assert_eq!(got.len(), 2, "only the two turn_a steps should match");
         assert!(got_ids.contains(&a1.id) && got_ids.contains(&a2.id));
 
-        assert_eq!(store.list_steps_by_job(&job_b).await.unwrap().len(), 1);
+        assert_eq!(store.list_steps_by_turn(&turn_b).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn list_spans_by_job_joins_through_steps() {
+    async fn list_spans_by_turn_joins_through_steps() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
         let store = SqliteTraceStore::new(pool);
-        let job_a = JobId::new();
-        let job_b = JobId::new();
-        let a1 = make_step(job_a);
-        let a2 = make_step(job_a);
-        let b1 = make_step(job_b);
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let a1 = make_step(turn_a);
+        let a2 = make_step(turn_a);
+        let b1 = make_step(turn_b);
         for s in [&a1, &a2, &b1] {
             store.save_step(&s.to_row().unwrap()).await.unwrap();
         }
@@ -442,13 +442,13 @@ mod tests {
             store.save_span(&sp.to_row().unwrap()).await.unwrap();
         }
 
-        let got = store.list_spans_by_job(&job_a).await.unwrap();
+        let got = store.list_spans_by_turn(&turn_a).await.unwrap();
         let got_ids: Vec<_> = got.iter().map(|r| r.id).collect();
-        assert_eq!(got.len(), 2, "only job_a's spans across both its steps");
+        assert_eq!(got.len(), 2, "only turn_a's spans across both its steps");
         assert!(got_ids.contains(&s1.id) && got_ids.contains(&s2.id));
         assert!(
             store
-                .list_spans_by_job(&JobId::new())
+                .list_spans_by_turn(&TurnId::new())
                 .await
                 .unwrap()
                 .is_empty()
@@ -503,19 +503,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trace_counts_by_job_counts_across_steps_without_loading() {
+    async fn trace_counts_by_turn_counts_across_steps_without_loading() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
         let store = SqliteTraceStore::new(pool);
-        let job_a = JobId::new();
-        let job_b = JobId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
 
-        // job_a: two steps carrying 2 + 1 spans; job_b: one step, one span.
-        let a1 = make_step(job_a);
-        let a2 = make_step(job_a);
-        let b1 = make_step(job_b);
+        // turn_a: two steps carrying 2 + 1 spans; turn_b: one step, one span.
+        let a1 = make_step(turn_a);
+        let a2 = make_step(turn_a);
+        let b1 = make_step(turn_b);
         for s in [&a1, &a2, &b1] {
             store.save_step(&s.to_row().unwrap()).await.unwrap();
         }
@@ -528,10 +528,10 @@ mod tests {
             store.save_span(&span.to_row().unwrap()).await.unwrap();
         }
 
-        assert_eq!(store.trace_counts_by_job(&job_a).await.unwrap(), (2, 3));
-        assert_eq!(store.trace_counts_by_job(&job_b).await.unwrap(), (1, 1));
+        assert_eq!(store.trace_counts_by_turn(&turn_a).await.unwrap(), (2, 3));
+        assert_eq!(store.trace_counts_by_turn(&turn_b).await.unwrap(), (1, 1));
         assert_eq!(
-            store.trace_counts_by_job(&JobId::new()).await.unwrap(),
+            store.trace_counts_by_turn(&TurnId::new()).await.unwrap(),
             (0, 0)
         );
     }
@@ -544,12 +544,12 @@ mod tests {
             .unwrap();
         let store = SqliteTraceStore::new(pool);
 
-        let open_step = make_step(JobId::new());
+        let open_step = make_step(TurnId::new());
         store.save_step(&open_step.to_row().unwrap()).await.unwrap();
 
         let step_with_open_span = Step {
             id: StepId::new(),
-            job_id: JobId::new(),
+            turn_id: TurnId::new(),
             kind: StepKind::compression(
                 CompressionTrigger::Threshold,
                 CompressionApplied::LiveSummary,
@@ -567,7 +567,7 @@ mod tests {
 
         let finished_step = Step {
             id: StepId::new(),
-            job_id: JobId::new(),
+            turn_id: TurnId::new(),
             kind: StepKind::LlmIteration,
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),

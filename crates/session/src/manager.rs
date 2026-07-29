@@ -217,7 +217,7 @@ impl SessionManager {
         if let Some(session) = self.store.get(session_id).await? {
             // Idle sessions are NOT deleted on access. Deleting the
             // session row would cascade to `session_messages` and
-            // strand the still-existing `jobs` / `steps` / `spans`
+            // strand the still-existing `turns` / `steps` / `spans`
             // rows pointing at ordinals that get reused by the new
             // lifetime — trace replay then hydrates LLM spans against
             // a different epoch's transcript and shows misleading
@@ -1412,7 +1412,7 @@ mod tests {
     async fn get_or_create_keeps_idle_session_intact() {
         // Idle past the timeout must NOT delete the persisted session
         // row — cascading the cleanup would also wipe `session_messages`
-        // and strand existing `jobs` / `steps` / `spans` rows that
+        // and strand existing `turns` / `steps` / `spans` rows that
         // reference ordinals from this lifetime. The expiry signal is
         // in-memory only (router/supervisor drop the actor); history
         // stays put.

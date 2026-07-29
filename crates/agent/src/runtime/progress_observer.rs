@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use baybo_llm::{Attribution, BillableLlm, ChatRequest, ModelInfo};
-use baybo_model::{ChannelType, JobId, SessionId};
+use baybo_model::{ChannelType, SessionId, TurnId};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallInputs, LlmCallResult, SpanRecorder, StepKind,
 };
@@ -133,7 +133,7 @@ pub(crate) struct ProgressObserverRunner {
     /// the agent as a user-visible Notice — otherwise the observer would
     /// bypass the `Message`-only egress sanitizer in `actor::router`.
     pub(crate) security_gateway: Arc<SecurityGateway>,
-    pub(crate) job_id: JobId,
+    pub(crate) turn_id: TurnId,
     pub(crate) user_id: String,
     pub(crate) session_id: SessionId,
     pub(crate) model_info: ModelInfo,
@@ -144,7 +144,7 @@ impl ProgressObserverRunner {
     /// Run the observer call over `request` (the live context + a
     /// "summarize progress" instruction, no tools). Brackets it in a
     /// `StepKind::ProgressObserver` step + `LlmCall` span so cost + trace
-    /// attribute to the turn's job, sanitizes the response, and returns
+    /// attribute to the turn's turn, sanitizes the response, and returns
     /// the trimmed summary text (empty string when the model produced
     /// nothing — the caller then emits no Notice).
     pub(crate) async fn run(
@@ -156,14 +156,14 @@ impl ProgressObserverRunner {
             llm_client,
             recorder,
             security_gateway,
-            job_id,
+            turn_id,
             user_id,
             session_id,
             model_info,
             cancel_token,
         } = self;
 
-        let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
+        let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));
         // Owned handle so the call below can `select!` on cancellation: an
         // undrainable last summary aborts instead of billing a discarded result.
         let cancel_for_call = cancel_token.clone();
@@ -182,21 +182,21 @@ impl ProgressObserverRunner {
         let recorder_inner = Arc::clone(&recorder);
         crate::runtime::scope::with_step(
             recorder.as_ref(),
-            job_id,
+            turn_id,
             StepKind::ProgressObserver,
             cancel_ctx,
             |step| async move {
                 let text = crate::runtime::scope::with_llm_span(
                     recorder_inner.as_ref(),
                     &step,
-                    job_id,
+                    turn_id,
                     begin,
                     cancel_ctx,
                     |span| async move {
                         let bound = llm_client.bind(Attribution {
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
-                            job_id,
+                            turn_id,
                             span_id: span.span_id,
                             reason: baybo_llm::CallReason::ProgressObserver,
                         });

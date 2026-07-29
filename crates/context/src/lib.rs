@@ -343,7 +343,7 @@ pub struct ContextManagerConfig {
     /// resolves the child's system prompt from the registry by name (and
     /// re-resolves on compaction). `None` for a workspace session (assemble the
     /// workspace soul). The profile *name* is the parent's spawn-time choice;
-    /// resolving it to a prompt is context's job, so an edited profile is
+    /// resolving it to a prompt is context's turn, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
 }

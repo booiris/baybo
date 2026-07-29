@@ -26,7 +26,7 @@ baybo-llm = { workspace = true }
 baybo-tools = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 baybo-context = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 baybo-memory = { workspace = true }
 baybo-cost = { workspace = true }
 baybo-trace = { workspace = true }

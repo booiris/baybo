@@ -7,7 +7,6 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
-mod job;
 mod search;
 mod secret;
 mod session;
@@ -16,6 +15,7 @@ mod skill_risk;
 mod task;
 mod time;
 mod trace;
+mod turn;
 
 pub use agent_profile::SqliteAgentProfileStore;
 pub use blob::SqliteBlobStore;
@@ -26,7 +26,6 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
-pub use job::SqliteJobStore;
 pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
@@ -34,6 +33,7 @@ pub use session_folder::SqliteSessionFolderStore;
 pub use skill_risk::SqliteSkillRiskStore;
 pub use task::SqliteTaskStore;
 pub use trace::SqliteTraceStore;
+pub use turn::SqliteJobStore;
 
 use baybo_store::{StorageError, StoreIdentity};
 use deadpool_sqlite::{Config, Runtime};
@@ -148,14 +148,7 @@ impl AddColumn {
             column,
             definition,
         } = *self;
-        let present: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                rusqlite::params![table, column],
-                |row| row.get(0),
-            )
-            .map_err(|e| anyhow::anyhow!("failed to inspect {table}.{column}: {e}"))?;
-        if present {
+        if has_column(conn, table, column)? {
             return Ok(());
         }
         conn.execute(
@@ -165,6 +158,122 @@ impl AddColumn {
         .map_err(|e| anyhow::anyhow!("migration `{table}.{column}` failed: {e}"))?;
         Ok(())
     }
+}
+
+fn has_table(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        rusqlite::params![table],
+        |row| row.get(0),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to inspect table {table}: {e}"))
+}
+
+/// `table_xinfo` rather than `table_info`: the latter omits VIRTUAL generated
+/// columns entirely, so `steps.turn_id` — a generated column — would read as
+/// absent and every guard keyed on it would silently take the wrong branch.
+fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo(?1) WHERE name = ?2)",
+        rusqlite::params![table, column],
+        |row| row.get(0),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to inspect {table}.{column}: {e}"))
+}
+
+/// One-time rename of the turn entity's persistence: the `jobs` table, the
+/// `job_id` / `parent_job_id` columns on `cost_records` / `sessions`, and the
+/// same keys inside every `data` blob that carries them.
+///
+/// Runs BEFORE the DDL batch, and that ordering is load-bearing:
+/// `CREATE TABLE IF NOT EXISTS turns` against a pre-rename DB would mint an
+/// empty table, after which `ALTER TABLE jobs RENAME TO turns` can only fail
+/// and every historical row would stay stranded under the old name.
+///
+/// Each step guards on the pre-rename shape, so a second pass is a no-op.
+fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| anyhow::anyhow!("turn-rename migration could not open a transaction: {e}"))?;
+
+    if has_table(&tx, "jobs")? && !has_table(&tx, "turns")? {
+        // The indexes ride the table across the rename but keep their old
+        // names, so the DDL's `idx_turns_*` would build a second copy of each.
+        tx.execute_batch(
+            "ALTER TABLE jobs RENAME TO turns;
+             ALTER TABLE turns RENAME COLUMN parent_job_id TO parent_turn_id;
+             DROP INDEX IF EXISTS idx_jobs_session;
+             DROP INDEX IF EXISTS idx_jobs_status;
+             DROP INDEX IF EXISTS idx_jobs_created;
+             DROP INDEX IF EXISTS idx_jobs_parent;
+             UPDATE turns
+                SET data = json_remove(
+                        json_set(data, '$.parent_turn_id',
+                                 json_extract(data, '$.parent_job_id')),
+                        '$.parent_job_id')
+              WHERE json_type(data, '$.parent_job_id') IS NOT NULL;",
+        )
+        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `jobs`: {e}"))?;
+    }
+
+    if has_column(&tx, "cost_records", "job_id")? {
+        tx.execute_batch(
+            "ALTER TABLE cost_records RENAME COLUMN job_id TO turn_id;
+             DROP INDEX IF EXISTS idx_cost_job;",
+        )
+        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `cost_records`: {e}"))?;
+    }
+
+    // `Lineage.parent_turn_id` is a REQUIRED serde field inside `sessions.data`,
+    // and the list decoder skips any row whose blob fails to deserialize. Miss
+    // this rewrite and every spawned session silently vanishes from the chat
+    // list. The flat column is write-only; the blob is the live read path.
+    if has_table(&tx, "sessions")? {
+        if has_column(&tx, "sessions", "parent_job_id")? {
+            tx.execute_batch("ALTER TABLE sessions RENAME COLUMN parent_job_id TO parent_turn_id;")
+                .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `sessions`: {e}"))?;
+        }
+        tx.execute_batch(
+            "UPDATE sessions
+                SET data = json_remove(
+                        json_set(data, '$.lineage.parent_turn_id',
+                                 json_extract(data, '$.lineage.parent_job_id')),
+                        '$.lineage.parent_job_id')
+              WHERE json_type(data, '$.lineage.parent_job_id') IS NOT NULL;",
+        )
+        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on session lineage: {e}"))?;
+    }
+
+    // `steps.job_id` is a GENERATED column. sqlite can rename one but cannot
+    // rewrite its expression, so the only way to re-point it at `$.turn_id` is
+    // to rebuild the table — and the blob key has to move with it, or the
+    // column reads NULL for every historical row and the trace tree renders
+    // empty with no error anywhere. `DROP TABLE` takes the old indexes with it;
+    // the DDL batch recreates them under their new names.
+    if has_column(&tx, "steps", "job_id")? {
+        tx.execute_batch(
+            "CREATE TABLE steps_turn_rename (
+                 id         TEXT PRIMARY KEY,
+                 data       TEXT NOT NULL,
+                 turn_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.turn_id')) VIRTUAL,
+                 started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
+                 ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
+             );
+             INSERT INTO steps_turn_rename (id, data)
+                 SELECT id,
+                        json_remove(
+                            json_set(data, '$.turn_id', json_extract(data, '$.job_id')),
+                            '$.job_id')
+                   FROM steps;
+             DROP TABLE steps;
+             ALTER TABLE steps_turn_rename RENAME TO steps;",
+        )
+        .map_err(|e| anyhow::anyhow!("turn-rename migration failed on `steps`: {e}"))?;
+    }
+
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("turn-rename migration could not commit: {e}"))?;
+    Ok(())
 }
 
 /// Columns added after their `CREATE TABLE` shipped.
@@ -452,7 +561,7 @@ pub(crate) fn in_placeholders(n: usize) -> String {
 
 /// Create all required tables if they do not already exist.
 ///
-/// Timestamp columns (`created_at`, `started_at` on `jobs`, etc.) are Unix
+/// Timestamp columns (`created_at`, `started_at` on `turns`, etc.) are Unix
 /// microseconds — round-trip via `sqlite::time::{to_us, from_us}`. µs is
 /// finer than the millisecond granularity of typical web tooling so sub-ms
 /// ordering survives (useful for fast local tool spans), and
@@ -470,18 +579,19 @@ pub(crate) fn in_placeholders(n: usize) -> String {
 /// the rest of the schema uses; querying these columns means
 /// string comparison, not integer comparison.
 fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
+    migrate_turn_entity_rename(conn)?;
     conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
                     id                    TEXT PRIMARY KEY,
                     root_session_id       TEXT NOT NULL,
                     trigger_kind          TEXT NOT NULL,
                     parent_session_id     TEXT,
-                    parent_job_id         TEXT,
+                    parent_turn_id        TEXT,
                     -- `ToolCall(spawn_subagent)` span on the parent
                     -- that birthed this session, recorded so trace
                     -- viewers can hop from the parent's span to the
                     -- child's session and so sibling subagents from
-                    -- one parent job stay distinguishable. NULL for
+                    -- one parent turn stay distinguishable. NULL for
                     -- non-subagent (root) sessions and for sessions
                     -- migrated from before this column existed.
                     parent_span_id        TEXT,
@@ -714,7 +824,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     id                              INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id                         TEXT    NOT NULL,
                     session_id                      TEXT    NOT NULL,
-                    job_id                          TEXT    NOT NULL,
+                    turn_id                         TEXT    NOT NULL,
                     span_id                         TEXT    NOT NULL,
                     -- Call purpose (CallReason). Nullable: rows written before
                     -- this column read NULL and map to the default reason.
@@ -734,12 +844,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_cost_user_ts ON cost_records(user_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_timestamp ON cost_records(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_cost_session ON cost_records(session_id);
-                CREATE INDEX IF NOT EXISTS idx_cost_job ON cost_records(job_id);
+                CREATE INDEX IF NOT EXISTS idx_cost_turn ON cost_records(turn_id);
 
-                CREATE TABLE IF NOT EXISTS jobs (
+                CREATE TABLE IF NOT EXISTS turns (
                     id                       TEXT PRIMARY KEY,
                     session_id               TEXT NOT NULL,
-                    parent_job_id            TEXT,
+                    parent_turn_id           TEXT,
                     kind                     TEXT NOT NULL,
                     status_kind              TEXT NOT NULL,
                     created_at               INTEGER NOT NULL,
@@ -747,14 +857,14 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     ended_at                 INTEGER,
                     data                     TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_jobs_session
-                    ON jobs(session_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_jobs_status
-                    ON jobs(status_kind);
-                CREATE INDEX IF NOT EXISTS idx_jobs_created
-                    ON jobs(created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_jobs_parent
-                    ON jobs(parent_job_id);
+                CREATE INDEX IF NOT EXISTS idx_turns_session
+                    ON turns(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_turns_status
+                    ON turns(status_kind);
+                CREATE INDEX IF NOT EXISTS idx_turns_created
+                    ON turns(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_turns_parent
+                    ON turns(parent_turn_id);
 
                 -- Old DBs may carry an orphan `job_transitions` table (+
                 -- idx_job_transitions_job_id): a per-transition audit
@@ -773,12 +883,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE TABLE IF NOT EXISTS steps (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,
-                    job_id     TEXT GENERATED ALWAYS AS (json_extract(data, '$.job_id')) VIRTUAL,
+                    turn_id    TEXT GENERATED ALWAYS AS (json_extract(data, '$.turn_id')) VIRTUAL,
                     started_at TEXT GENERATED ALWAYS AS (json_extract(data, '$.started_at')) VIRTUAL,
                     ended_at   TEXT GENERATED ALWAYS AS (json_extract(data, '$.ended_at')) VIRTUAL
                 );
-                CREATE INDEX IF NOT EXISTS idx_steps_job
-                    ON steps(job_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_steps_turn
+                    ON steps(turn_id, started_at);
                 -- Serves the boot recovery sweep: only genuinely open
                 -- rows are read instead of json_extract-scanning every
                 -- step/span blob.
@@ -819,7 +929,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     next_trigger_at INTEGER NOT NULL DEFAULT 0,
                     -- Recycle bin (Unix µs; NULL = live). Orthogonal to
                     -- `status`. Every listing filters on `deleted_at IS NULL`
-                    -- in SQL, which is what keeps a deleted job out of the
+                    -- in SQL, which is what keeps a deleted turn out of the
                     -- tick loop; the full value also rides in `data`.
                     deleted_at      INTEGER,
                     -- Whether the job's cron GROUP is pinned in the chat list

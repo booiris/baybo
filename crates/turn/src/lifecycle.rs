@@ -1,41 +1,43 @@
-//! `JobLifecycle` — thin orchestration layer over `JobStore` for the
-//! Job state machine. See `docs/modules/job.md` for the design.
+//! `TurnLifecycle` — thin orchestration layer over `TurnStore` for the
+//! Turn state machine. See `docs/modules/turn.md` for the design.
 
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::JobStatus;
-use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{CancelReason, Job, JobError, JobInput, JobInputKind, JobStatusKind, JobTransition};
-use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
-use baybo_store::JobStore;
+use crate::TurnStatus;
+use crate::cancellation_registry::{TurnCancellationGuard, TurnCancellationRegistry};
+use crate::{
+    CancelReason, Turn, TurnError, TurnInput, TurnInputKind, TurnStatusKind, TurnTransition,
+};
+use baybo_model::{SessionId, SpanId, TriggerKind, TurnId};
+use baybo_store::TurnStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-type Result<T> = std::result::Result<T, JobError>;
+type Result<T> = std::result::Result<T, TurnError>;
 
 /// Process-wide capacity for the lifecycle-event broadcast bus.
 ///
-/// Sized to absorb the burst a multi-job subagent fan-out can produce
+/// Sized to absorb the burst a multi-turn subagent fan-out can produce
 /// without lagging the parent's wait loop. Subscribers that lag still
 /// reconcile against the store (`list_by_session` /
 /// `active_turn_started_at`) so dropped events don't cause lost
 /// terminations or stale turn state — capacity is a latency knob, not
 /// correctness.
-const JOB_LIFECYCLE_EVENT_CAPACITY: usize = 256;
+const TURN_LIFECYCLE_EVENT_CAPACITY: usize = 256;
 
-/// Which lifecycle transition a [`JobLifecycleEvent`] marks. The bus
+/// Which lifecycle transition a [`TurnLifecycleEvent`] marks. The bus
 /// publishes the `Pending → InProgress` **start** edge and the three
 /// terminal edges; the intermediate `stuck` / `recover` transitions are
 /// not published (rare maintenance moves; the store stays the source of
 /// truth for them).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobPhase {
+pub enum TurnPhase {
     Started,
     /// `reply_ordinal` is the persisted `session_messages.ordinal` of the
-    /// completing job's reply, carried so the push dispatcher reads exactly that
+    /// completing turn's reply, carried so the push dispatcher reads exactly that
     /// row off the event (no read-after-write poll). `None` when the completed
-    /// job produced no message reply (maintenance / subagent) or ran with no
+    /// turn produced no message reply (maintenance / subagent) or ran with no
     /// durable store — the ordinal only ever rides this edge, so the absence
     /// lives on the variant, not as a field on every other phase.
     Completed {
@@ -45,24 +47,24 @@ pub enum JobPhase {
     Cancelled,
 }
 
-impl JobPhase {
-    /// The terminal job status this phase denotes, or `None` for
-    /// [`JobPhase::Started`] — lets a terminal-only consumer (the
+impl TurnPhase {
+    /// The terminal turn status this phase denotes, or `None` for
+    /// [`TurnPhase::Started`] — lets a terminal-only consumer (the
     /// subagent waiter) filter out the start edge in one match.
-    pub fn terminal_status(&self) -> Option<JobStatusKind> {
+    pub fn terminal_status(&self) -> Option<TurnStatusKind> {
         match self {
-            JobPhase::Started => None,
-            JobPhase::Completed { .. } => Some(JobStatusKind::Completed),
-            JobPhase::Failed => Some(JobStatusKind::Failed),
-            JobPhase::Cancelled => Some(JobStatusKind::Cancelled),
+            TurnPhase::Started => None,
+            TurnPhase::Completed { .. } => Some(TurnStatusKind::Completed),
+            TurnPhase::Failed => Some(TurnStatusKind::Failed),
+            TurnPhase::Cancelled => Some(TurnStatusKind::Cancelled),
         }
     }
 }
 
-/// A job lifecycle transition published by `JobLifecycle` on the
+/// A turn lifecycle transition published by `TurnLifecycle` on the
 /// broadcast bus: the `Pending → InProgress` start edge and the three
 /// terminal edges. Carries the minimum identifiers a subscriber needs to
-/// filter without going back to the store: the `JobId`, its session, and
+/// filter without going back to the store: the `TurnId`, its session, and
 /// the optional parent for hierarchy-scoped waits (subagent path).
 ///
 /// Two consumers today: the subagent runtime waits for a child's terminal
@@ -70,38 +72,38 @@ impl JobPhase {
 /// recomputes a session's turn activity on any edge (it ignores `phase` —
 /// every edge just means "recompute this session now").
 #[derive(Debug, Clone)]
-pub struct JobLifecycleEvent {
-    pub job_id: JobId,
+pub struct TurnLifecycleEvent {
+    pub turn_id: TurnId,
     pub session_id: SessionId,
-    pub parent_job_id: Option<JobId>,
-    pub phase: JobPhase,
-    /// Input class of the job. Lets the push dispatcher filter to real user
-    /// turns (`kind == UserChat`) without re-fetching the Job.
-    pub kind: JobInputKind,
+    pub parent_turn_id: Option<TurnId>,
+    pub phase: TurnPhase,
+    /// Input class of the turn. Lets the push dispatcher filter to real user
+    /// turns (`kind == UserChat`) without re-fetching the Turn.
+    pub kind: TurnInputKind,
 }
 
-/// Owns the job state machine + persistence orchestration. Pure
-/// passthrough to `Job`'s internal transition validation —
-/// `JobLifecycle` itself contains no state machine logic.
-pub struct JobLifecycle {
-    store: Arc<dyn JobStore>,
-    /// Process-wide registry of `JobId → CancellationToken` for
-    /// in-flight jobs. `cancel()` trips the matching token (if any)
+/// Owns the turn state machine + persistence orchestration. Pure
+/// passthrough to `Turn`'s internal transition validation —
+/// `TurnLifecycle` itself contains no state machine logic.
+pub struct TurnLifecycle {
+    store: Arc<dyn TurnStore>,
+    /// Process-wide registry of `TurnId → CancellationToken` for
+    /// in-flight turns. `cancel()` trips the matching token (if any)
     /// in addition to flipping the DB row.
-    cancellation: Arc<JobCancellationRegistry>,
+    cancellation: Arc<TurnCancellationRegistry>,
     /// Fire-and-forget bus for lifecycle transitions (start + terminal).
     /// The subagent runtime subscribes to unblock the parent on a child's
     /// terminal edge; the turn-state projector subscribes to drive the
     /// web chat's per-session turn activity off both edges.
-    lifecycle_events: broadcast::Sender<JobLifecycleEvent>,
+    lifecycle_events: broadcast::Sender<TurnLifecycleEvent>,
 }
 
-impl JobLifecycle {
-    pub fn new(store: Arc<dyn JobStore>) -> Self {
-        let (lifecycle_events, _rx) = broadcast::channel(JOB_LIFECYCLE_EVENT_CAPACITY);
+impl TurnLifecycle {
+    pub fn new(store: Arc<dyn TurnStore>) -> Self {
+        let (lifecycle_events, _rx) = broadcast::channel(TURN_LIFECYCLE_EVENT_CAPACITY);
         Self {
             store,
-            cancellation: Arc::new(JobCancellationRegistry::new()),
+            cancellation: Arc::new(TurnCancellationRegistry::new()),
             lifecycle_events,
         }
     }
@@ -112,75 +114,75 @@ impl JobLifecycle {
     /// re-published (the subagent waiter re-checks via the store; the
     /// turn-state projector recomputes on the next event, with the
     /// Subscribe snapshot covering the gap).
-    pub fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<JobLifecycleEvent> {
+    pub fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<TurnLifecycleEvent> {
         self.lifecycle_events.subscribe()
     }
 
-    /// Register an in-flight job's cancellation token. The returned
+    /// Register an in-flight turn's cancellation token. The returned
     /// guard unregisters on drop, so the agent loop's early-`?` paths
-    /// can't leak entries. `cancel(job_id, ...)` while the guard is
+    /// can't leak entries. `cancel(turn_id, ...)` while the guard is
     /// alive will trip the token (and only afterwards flip the DB
     /// row), so the in-flight execution sees the cancel before
     /// terminal-state observers do.
     pub fn register_running(
         &self,
-        job_id: JobId,
+        turn_id: TurnId,
         token: CancellationToken,
-    ) -> JobCancellationGuard {
-        self.cancellation.register(job_id, token);
-        JobCancellationGuard::new(Arc::clone(&self.cancellation), job_id)
+    ) -> TurnCancellationGuard {
+        self.cancellation.register(turn_id, token);
+        TurnCancellationGuard::new(Arc::clone(&self.cancellation), turn_id)
     }
 
-    /// Create a new job in `Pending`.
+    /// Create a new turn in `Pending`.
     ///
     /// `origin` is the root trigger kind of the owning session — stored
-    /// on the job as-is (see `baybo_job::kind`), independent of `input`.
+    /// on the turn as-is (see `baybo_turn::kind`), independent of `input`.
     ///
     /// **Production code does not call this directly** — it goes
-    /// through `agent::scope::with_job` (which builds a `JobSpec`
+    /// through `agent::scope::with_turn` (which builds a `TurnSpec`
     /// and owns the full create→start→run→complete chain) so the
     /// cancel state machine can't be skipped. The method is left
     /// `pub` only for tests in this crate (and downstream test
-    /// fixtures) that need to construct jobs in arbitrary states.
-    pub async fn start_job(
+    /// fixtures) that need to construct turns in arbitrary states.
+    pub async fn start_turn(
         &self,
         session_id: SessionId,
         origin: TriggerKind,
-        input: JobInput,
-        parent_job_id: Option<JobId>,
-    ) -> Result<Job> {
-        let job = Job::new(session_id, origin, input, parent_job_id);
-        self.store.create(&job.to_row()?).await?;
-        Ok(job)
+        input: TurnInput,
+        parent_turn_id: Option<TurnId>,
+    ) -> Result<Turn> {
+        let turn = Turn::new(session_id, origin, input, parent_turn_id);
+        self.store.create(&turn.to_row()?).await?;
+        Ok(turn)
     }
 
-    /// Move `Pending → InProgress`. Publishes a [`JobPhase::Started`]
+    /// Move `Pending → InProgress`. Publishes a [`TurnPhase::Started`]
     /// event — the start edge the turn-state projector turns into the
     /// web chat's "turn began".
-    pub async fn start(&self, job_id: &JobId) -> Result<()> {
-        let job = self.apply(job_id, |j| j.start()).await?;
-        self.persist_and_publish(job, JobPhase::Started).await
+    pub async fn start(&self, turn_id: &TurnId) -> Result<()> {
+        let turn = self.apply(turn_id, |j| j.start()).await?;
+        self.persist_and_publish(turn, TurnPhase::Started).await
     }
 
     /// Move `InProgress → Completed` with a final output.
-    pub async fn complete(&self, job_id: &JobId, output: crate::JobOutput) -> Result<()> {
+    pub async fn complete(&self, turn_id: &TurnId, output: crate::TurnOutput) -> Result<()> {
         // The reply's persisted ordinal rides the Completed edge so push reads
         // exactly that row. `None` for a non-message output (maintenance /
         // subagent) or an unpersisted reply.
         let reply_ordinal = match &output {
-            crate::JobOutput::Message { ordinal, .. } => *ordinal,
-            crate::JobOutput::Structured { .. } => None,
+            crate::TurnOutput::Message { ordinal, .. } => *ordinal,
+            crate::TurnOutput::Structured { .. } => None,
         };
-        let job = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist_and_publish(job, JobPhase::Completed { reply_ordinal })
+        let turn = self.apply(turn_id, |j| j.complete(output)).await?;
+        self.persist_and_publish(turn, TurnPhase::Completed { reply_ordinal })
             .await
     }
 
     /// Move to `Failed { reason }`.
-    pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+    pub async fn fail(&self, turn_id: &TurnId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let job = self.apply(job_id, |j| j.fail(&reason)).await?;
-        self.persist_and_publish(job, JobPhase::Failed).await
+        let turn = self.apply(turn_id, |j| j.fail(&reason)).await?;
+        self.persist_and_publish(turn, TurnPhase::Failed).await
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
@@ -189,33 +191,33 @@ impl JobLifecycle {
     /// the DB row, so the running execution observes the cancel and
     /// can short-circuit instead of running to completion.
     ///
-    /// Idempotent on terminal jobs: a cancel that races against natural
+    /// Idempotent on terminal turns: a cancel that races against natural
     /// completion returns `Ok(())` without touching the row, so admin
-    /// callers don't see a 500 for a job that finished a moment earlier.
+    /// callers don't see a 500 for a turn that finished a moment earlier.
     pub async fn cancel(
         &self,
-        job_id: &JobId,
+        turn_id: &TurnId,
         reason: CancelReason,
         partial_artifacts: Vec<SpanId>,
     ) -> Result<()> {
-        self.cancellation.cancel(job_id);
-        let job = self.load_job(job_id).await?;
-        if job.is_terminal() {
+        self.cancellation.cancel(turn_id);
+        let turn = self.load_turn(turn_id).await?;
+        if turn.is_terminal() {
             return Ok(());
         }
-        let job = self
-            .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
+        let turn = self
+            .apply(turn_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
-        self.persist_and_publish(job, JobPhase::Cancelled).await
+        self.persist_and_publish(turn, TurnPhase::Cancelled).await
     }
 
-    /// Wait (bounded by `timeout`) until `job_id`'s in-flight run has fully
-    /// unwound — its `with_job` scope exited, so any partial row the cancelled
+    /// Wait (bounded by `timeout`) until `turn_id`'s in-flight run has fully
+    /// unwound — its `with_turn` scope exited, so any partial row the cancelled
     /// turn persists is already durable. `/stop` calls this after `cancel` so
     /// its control events anchor after the cancelled turn's last row instead
     /// of racing it. No-op once the run has deregistered.
-    pub async fn wait_until_idle(&self, job_id: &JobId, timeout: std::time::Duration) {
-        self.cancellation.wait_until_idle(job_id, timeout).await;
+    pub async fn wait_until_idle(&self, turn_id: &TurnId, timeout: std::time::Duration) {
+        self.cancellation.wait_until_idle(turn_id, timeout).await;
     }
 
     /// Boot-time recovery cancel. Same state-machine semantics as
@@ -224,161 +226,165 @@ impl JobLifecycle {
     /// the process may have crashed long before the next start, so using
     /// the wall-clock at recovery time would distort duration metrics.
     ///
-    /// No registered token to trip (the job is by definition no longer
+    /// No registered token to trip (the turn is by definition no longer
     /// running), so this skips the `cancellation.cancel` call.
     pub async fn cancel_at(
         &self,
-        job_id: &JobId,
+        turn_id: &TurnId,
         reason: CancelReason,
         partial_artifacts: Vec<SpanId>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        let job = self.load_job(job_id).await?;
-        if job.is_terminal() {
+        let turn = self.load_turn(turn_id).await?;
+        if turn.is_terminal() {
             return Ok(());
         }
-        let job = self
-            .apply(job_id, |j| {
+        let turn = self
+            .apply(turn_id, |j| {
                 j.cancel_at(reason, partial_artifacts.clone(), at)
             })
             .await?;
-        self.persist_and_publish(job, JobPhase::Cancelled).await
+        self.persist_and_publish(turn, TurnPhase::Cancelled).await
     }
 
     /// Move to `Stuck { reason }` from `InProgress`.
-    pub async fn stuck(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+    pub async fn stuck(&self, turn_id: &TurnId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let job = self.apply(job_id, |j| j.stuck(&reason)).await?;
-        self.persist(job).await
+        let turn = self.apply(turn_id, |j| j.stuck(&reason)).await?;
+        self.persist(turn).await
     }
 
     /// Move `Stuck → InProgress`.
-    pub async fn recover(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
+    pub async fn recover(&self, turn_id: &TurnId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
-        let job = self.apply(job_id, |j| j.recover(&reason)).await?;
-        self.persist(job).await
+        let turn = self.apply(turn_id, |j| j.recover(&reason)).await?;
+        self.persist(turn).await
     }
 
-    pub async fn get(&self, job_id: &JobId) -> Result<Option<Job>> {
-        self.store.get(job_id).await?.map(Job::from_row).transpose()
+    pub async fn get(&self, turn_id: &TurnId) -> Result<Option<Turn>> {
+        self.store
+            .get(turn_id)
+            .await?
+            .map(Turn::from_row)
+            .transpose()
     }
 
-    /// List jobs, optionally filtered by status discriminator. Newest
+    /// List turns, optionally filtered by status discriminator. Newest
     /// `created_at` first.
-    pub async fn list(&self, status: Option<JobStatusKind>) -> Result<Vec<Job>> {
+    pub async fn list(&self, status: Option<TurnStatusKind>) -> Result<Vec<Turn>> {
         let mut rows = match status {
             Some(k) => self.store.list_by_status_kind(k.as_snake_case()).await?,
             None => self.store.list_all().await?,
         };
         rows.sort_by_key(|b| std::cmp::Reverse(b.created_at));
-        rows.into_iter().map(Job::from_row).collect()
+        rows.into_iter().map(Turn::from_row).collect()
     }
 
-    /// List every non-terminal job (`Pending` / `InProgress` / `Stuck`)
+    /// List every non-terminal turn (`Pending` / `InProgress` / `Stuck`)
     /// in one query. One trip to the store instead of three —
-    /// `QueryApi::find_recoverable_jobs` used to call `list(Some(k))`
+    /// `QueryApi::find_recoverable_turns` used to call `list(Some(k))`
     /// for each kind serially.
-    pub async fn list_recoverable(&self) -> Result<Vec<Job>> {
+    pub async fn list_recoverable(&self) -> Result<Vec<Turn>> {
         self.store
             .list_recoverable()
             .await?
             .into_iter()
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .collect()
     }
 
-    /// List jobs scoped to one session. Hits the `idx_jobs_session`
+    /// List turns scoped to one session. Hits the `idx_turns_session`
     /// index instead of scanning the full table. Newest first.
     pub async fn list_by_session(
         &self,
         session_id: &baybo_model::SessionId,
-        status: Option<JobStatusKind>,
-    ) -> Result<Vec<Job>> {
-        let mut jobs = self
+        status: Option<TurnStatusKind>,
+    ) -> Result<Vec<Turn>> {
+        let mut turns = self
             .store
             .list_by_session(session_id)
             .await?
             .into_iter()
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .collect::<Result<Vec<_>>>()?;
         if let Some(k) = status {
-            jobs.retain(|j| j.status.kind() == k);
+            turns.retain(|j| j.status.kind() == k);
         }
-        jobs.sort_by_key(|b| std::cmp::Reverse(b.created_at));
-        Ok(jobs)
+        turns.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        Ok(turns)
     }
 
-    /// Per-session job aggregates (count + latest status kind) in one
+    /// Per-session turn aggregates (count + latest status kind) in one
     /// grouped store query — list surfaces use this instead of a
     /// `list_by_session` fan-out across every session.
-    pub async fn session_job_stats(&self) -> Result<Vec<baybo_store::SessionJobStats>> {
-        Ok(self.store.session_job_stats().await?)
+    pub async fn session_turn_stats(&self) -> Result<Vec<baybo_store::SessionTurnStats>> {
+        Ok(self.store.session_turn_stats().await?)
     }
 
-    /// Number of jobs in the given status — a SQL COUNT, no rows
+    /// Number of turns in the given status — a SQL COUNT, no rows
     /// materialised.
-    pub async fn count_by_status(&self, status: JobStatusKind) -> Result<usize> {
+    pub async fn count_by_status(&self, status: TurnStatusKind) -> Result<usize> {
         Ok(self
             .store
             .count_by_status_kind(status.as_snake_case())
             .await?)
     }
 
-    /// One page of jobs (newest `created_at` first) plus the total
+    /// One page of turns (newest `created_at` first) plus the total
     /// matching count — paging lives in SQL, so a page never
     /// materialises the whole table.
     pub async fn list_page(
         &self,
-        status: Option<JobStatusKind>,
+        status: Option<TurnStatusKind>,
         limit: usize,
         offset: usize,
-    ) -> Result<(Vec<Job>, usize)> {
+    ) -> Result<(Vec<Turn>, usize)> {
         let (rows, total) = self
             .store
             .list_page(status.map(|k| k.as_snake_case()), limit, offset)
             .await?;
-        let jobs = rows
+        let turns = rows
             .into_iter()
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .collect::<Result<Vec<_>>>()?;
-        Ok((jobs, total))
+        Ok((turns, total))
     }
 
-    /// Non-terminal jobs for one session, status-filtered at the store rather
+    /// Non-terminal turns for one session, status-filtered at the store rather
     /// than loaded whole and retained. Used by `/stop` to find the in-flight
     /// turn + background children without a full-history load on a long-lived
     /// session.
     pub async fn list_active_by_session(
         &self,
         session_id: &baybo_model::SessionId,
-    ) -> Result<Vec<Job>> {
+    ) -> Result<Vec<Turn>> {
         self.store
             .list_active_by_session(session_id)
             .await?
             .into_iter()
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .collect()
     }
 
-    /// Non-terminal jobs for one session that represent user-visible
-    /// turn activity. This centralizes the `Job::is_turn` filter so
+    /// Non-terminal turns for one session that represent user-visible
+    /// turn activity. This centralizes the `Turn::is_chat_turn` filter so
     /// callers such as `/stop`, crash recovery, and TurnState projection
     /// do not each re-define "active reply" for themselves. A `/compact`
     /// has its own input kind, so it is correctly excluded here.
-    pub async fn list_active_turns_by_session(
+    pub async fn list_active_chat_turns_by_session(
         &self,
         session_id: &baybo_model::SessionId,
-    ) -> Result<Vec<Job>> {
+    ) -> Result<Vec<Turn>> {
         Ok(self
             .list_active_by_session(session_id)
             .await?
             .into_iter()
-            .filter(|j| j.is_turn())
+            .filter(|j| j.is_chat_turn())
             .collect())
     }
 
-    /// When the session has a turn in flight (a non-terminal turn job — see
-    /// [`Job::is_turn`]), the instant it started. Chat
+    /// When the session has a turn in flight (a non-terminal turn turn — see
+    /// [`Turn::is_chat_turn`]), the instant it started. Chat
     /// surfaces use this to tell a late-joining client "a reply is being
     /// produced since T"; `None` means the session is idle. A still-
     /// `Pending` turn reports its `created_at` (queued counts as in
@@ -387,106 +393,106 @@ impl JobLifecycle {
         &self,
         session_id: &baybo_model::SessionId,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let jobs = self.list_active_turns_by_session(session_id).await?;
-        Ok(jobs
+        let turns = self.list_active_chat_turns_by_session(session_id).await?;
+        Ok(turns
             .into_iter()
             .map(|j| j.started_at.unwrap_or(j.created_at))
             .max())
     }
 
-    /// Direct children of `parent_job_id` (one level). Used by `/stop`'s
+    /// Direct children of `parent_turn_id` (one level). Used by `/stop`'s
     /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
-    /// of) in-flight descendant jobs such as foreground subagents. Foreground
+    /// of) in-flight descendant turns such as foreground subagents. Foreground
     /// children are descendants of the turn's loop cancel token, so cancelling
-    /// the turn job already cascades into them — this walk wins the
+    /// the turn turn already cascades into them — this walk wins the
     /// `UserStopped`-vs-`ParentCancelled` reason race and guards any future
     /// child that re-anchors off the actor token.
-    pub async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<Job>> {
+    pub async fn list_children(&self, parent_turn_id: &TurnId) -> Result<Vec<Turn>> {
         self.store
-            .list_children(parent_job_id)
+            .list_children(parent_turn_id)
             .await?
             .into_iter()
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .collect()
     }
 
-    async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<Job>
+    async fn apply<F>(&self, turn_id: &TurnId, f: F) -> Result<Turn>
     where
-        F: FnOnce(&mut Job) -> Result<JobTransition>,
+        F: FnOnce(&mut Turn) -> Result<TurnTransition>,
     {
-        let mut job = self.load_job(job_id).await?;
+        let mut turn = self.load_turn(turn_id).await?;
         // The state machine returns a legality receipt for the edge; the
-        // edge has already mutated `job`, and the per-transition audit
-        // table (`job_transitions`) was retired in the 2026-07
+        // edge has already mutated `turn`, and the per-transition audit
+        // table (`turn_transitions`) was retired in the 2026-07
         // unused-column audit, so the receipt is dropped here.
-        let _transition = f(&mut job)?;
-        Ok(job)
+        let _transition = f(&mut turn)?;
+        Ok(turn)
     }
 
-    async fn persist(&self, job: Job) -> Result<()> {
-        self.store.save(&job.to_row()?).await?;
+    async fn persist(&self, turn: Turn) -> Result<()> {
+        self.store.save(&turn.to_row()?).await?;
         Ok(())
     }
 
     /// Persist a transition, then fire its lifecycle event on the
     /// broadcast bus. Publish happens **after** the store write succeeds
     /// so a subscriber that races back into the lifecycle (e.g. to look
-    /// the job up by id, or to recompute `active_turn_started_at`) is
+    /// the turn up by id, or to recompute `active_turn_started_at`) is
     /// guaranteed to see the new row. Send errors are dropped on the
     /// floor — broadcast `send` only fails when there are no subscribers,
     /// which is the normal state for a process with no live chat tab and
     /// no in-flight subagent.
-    async fn persist_and_publish(&self, job: Job, phase: JobPhase) -> Result<()> {
-        let event = JobLifecycleEvent {
-            job_id: job.id,
-            session_id: job.session_id.clone(),
-            parent_job_id: job.parent_job_id,
+    async fn persist_and_publish(&self, turn: Turn, phase: TurnPhase) -> Result<()> {
+        let event = TurnLifecycleEvent {
+            turn_id: turn.id,
+            session_id: turn.session_id.clone(),
+            parent_turn_id: turn.parent_turn_id,
             phase,
-            kind: job.input_kind(),
+            kind: turn.input_kind(),
         };
-        self.persist(job).await?;
+        self.persist(turn).await?;
         let _ = self.lifecycle_events.send(event);
         Ok(())
     }
 
-    async fn load_job(&self, job_id: &JobId) -> Result<Job> {
+    async fn load_turn(&self, turn_id: &TurnId) -> Result<Turn> {
         self.store
-            .get(job_id)
+            .get(turn_id)
             .await?
-            .map(Job::from_row)
+            .map(Turn::from_row)
             .transpose()?
-            .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))
+            .ok_or_else(|| TurnError::NotFound(format!("turn {turn_id}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MemoryJobStore;
+    use crate::test_support::MemoryTurnStore;
     use baybo_model::ContentBlock;
 
-    fn user_chat_input() -> JobInput {
-        JobInput::UserChat {
+    fn user_chat_input() -> TurnInput {
+        TurnInput::UserChat {
             content: vec![ContentBlock::Text("hi".into())],
         }
     }
 
-    fn dummy_output() -> crate::JobOutput {
-        crate::JobOutput::Message {
+    fn dummy_output() -> crate::TurnOutput {
+        crate::TurnOutput::Message {
             content: vec![ContentBlock::Text("ok".into())],
             ordinal: None,
         }
     }
 
-    fn make_lifecycle() -> JobLifecycle {
-        JobLifecycle::new(Arc::new(MemoryJobStore::new()))
+    fn make_lifecycle() -> TurnLifecycle {
+        TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))
     }
 
     #[tokio::test]
     async fn full_success_path() {
         let lc = make_lifecycle();
-        let job = lc
-            .start_job(
+        let turn = lc
+            .start_turn(
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
@@ -494,20 +500,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(job.status, JobStatus::Pending));
+        assert!(matches!(turn.status, TurnStatus::Pending));
 
-        lc.start(&job.id).await.unwrap();
-        lc.complete(&job.id, dummy_output()).await.unwrap();
+        lc.start(&turn.id).await.unwrap();
+        lc.complete(&turn.id, dummy_output()).await.unwrap();
 
-        let done = lc.get(&job.id).await.unwrap().expect("job exists");
-        assert!(matches!(done.status, JobStatus::Completed));
+        let done = lc.get(&turn.id).await.unwrap().expect("turn exists");
+        assert!(matches!(done.status, TurnStatus::Completed));
     }
 
     #[tokio::test]
     async fn cancel_trips_registered_token_and_unregisters_via_guard() {
         let lc = make_lifecycle();
-        let job = lc
-            .start_job(
+        let turn = lc
+            .start_turn(
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
@@ -515,27 +521,27 @@ mod tests {
             )
             .await
             .unwrap();
-        lc.start(&job.id).await.unwrap();
+        lc.start(&turn.id).await.unwrap();
 
         let token = CancellationToken::new();
-        let guard = lc.register_running(job.id, token.clone());
+        let guard = lc.register_running(turn.id, token.clone());
         assert!(!token.is_cancelled());
 
         // External cancel observes the token before flipping the row.
-        lc.cancel(&job.id, CancelReason::UserPreempt, vec![])
+        lc.cancel(&turn.id, CancelReason::UserPreempt, vec![])
             .await
             .unwrap();
         assert!(token.is_cancelled(), "registered token must be tripped");
 
-        // Drop the guard; subsequent cancels for the same job_id find
+        // Drop the guard; subsequent cancels for the same turn_id find
         // no live token (the registry is empty).
         drop(guard);
         let unrelated_token = CancellationToken::new();
-        // Cancelling an already-terminal job is rejected by the state
+        // Cancelling an already-terminal turn is rejected by the state
         // machine, but we just want to assert the registry didn't keep
         // the entry alive past the guard's drop.
-        let job2 = lc
-            .start_job(
+        let turn2 = lc
+            .start_turn(
                 SessionId::from("s2"),
                 TriggerKind::User,
                 user_chat_input(),
@@ -543,13 +549,13 @@ mod tests {
             )
             .await
             .unwrap();
-        lc.start(&job2.id).await.unwrap();
-        let _job2_guard = lc.register_running(job2.id, unrelated_token.clone());
-        // Cancelling job (already terminal) should not trip job2's token.
-        let _ = lc.cancel(&job.id, CancelReason::UserPreempt, vec![]).await;
+        lc.start(&turn2.id).await.unwrap();
+        let _turn2_guard = lc.register_running(turn2.id, unrelated_token.clone());
+        // Cancelling turn (already terminal) should not trip turn2's token.
+        let _ = lc.cancel(&turn.id, CancelReason::UserPreempt, vec![]).await;
         assert!(
             !unrelated_token.is_cancelled(),
-            "cancel of unrelated job_id must not trip our token"
+            "cancel of unrelated turn_id must not trip our token"
         );
     }
 
@@ -561,19 +567,19 @@ mod tests {
         // trigger; more broadly, no input/trigger pairing is rejected.
         let lc = make_lifecycle();
         for trigger in [TriggerKind::User, TriggerKind::Cron] {
-            let job = lc
-                .start_job(
+            let turn = lc
+                .start_turn(
                     SessionId::from(format!("child-of-{trigger:?}")),
                     trigger,
-                    JobInput::Spawned {
+                    TurnInput::Spawned {
                         initial_prompt: vec![ContentBlock::Text("task".into())],
                     },
                     None,
                 )
                 .await
                 .expect("any input is allowed under any root trigger");
-            assert_eq!(job.origin, trigger);
-            assert_eq!(job.input_kind(), crate::JobInputKind::Spawned);
+            assert_eq!(turn.origin, trigger);
+            assert_eq!(turn.input_kind(), crate::TurnInputKind::Spawned);
         }
     }
 
@@ -583,27 +589,27 @@ mod tests {
         // a UserChat payload in a Cron-trigger session yields input kind =
         // UserChat, origin = Cron, with no payload/trigger constraint.
         let lc = make_lifecycle();
-        let job = lc
-            .start_job(
+        let turn = lc
+            .start_turn(
                 SessionId::from("cron-session"),
                 TriggerKind::Cron,
-                JobInput::UserChat {
+                TurnInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
                 None,
             )
             .await
             .expect("input no longer constrained by trigger");
-        assert_eq!(job.origin, TriggerKind::Cron);
-        assert_eq!(job.input_kind(), crate::JobInputKind::UserChat);
+        assert_eq!(turn.origin, TriggerKind::Cron);
+        assert_eq!(turn.input_kind(), crate::TurnInputKind::UserChat);
     }
 
     #[tokio::test]
-    async fn active_turns_exclude_compact_jobs() {
+    async fn active_turns_exclude_compact_turns() {
         let lc = make_lifecycle();
         let session_id = SessionId::from("s1");
         let turn = lc
-            .start_job(
+            .start_turn(
                 session_id.clone(),
                 TriggerKind::User,
                 user_chat_input(),
@@ -613,10 +619,10 @@ mod tests {
             .unwrap();
         lc.start(&turn.id).await.unwrap();
         let compact = lc
-            .start_job(
+            .start_turn(
                 session_id.clone(),
                 TriggerKind::User,
-                JobInput::Compact,
+                TurnInput::Compact,
                 None,
             )
             .await
@@ -626,7 +632,10 @@ mod tests {
         let all_active = lc.list_active_by_session(&session_id).await.unwrap();
         assert_eq!(all_active.len(), 2);
 
-        let turns = lc.list_active_turns_by_session(&session_id).await.unwrap();
+        let turns = lc
+            .list_active_chat_turns_by_session(&session_id)
+            .await
+            .unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].id, turn.id);
         assert_eq!(
@@ -636,10 +645,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_on_terminal_job_is_noop() {
+    async fn cancel_on_terminal_turn_is_noop() {
         let lc = make_lifecycle();
-        let job = lc
-            .start_job(
+        let turn = lc
+            .start_turn(
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
@@ -647,22 +656,22 @@ mod tests {
             )
             .await
             .unwrap();
-        lc.start(&job.id).await.unwrap();
-        lc.complete(&job.id, dummy_output()).await.unwrap();
+        lc.start(&turn.id).await.unwrap();
+        lc.complete(&turn.id, dummy_output()).await.unwrap();
         // Race: an admin cancel arriving after natural completion must
         // not return InvalidTransition — it's a benign "already done".
-        lc.cancel(&job.id, CancelReason::OperatorCancel, vec![])
+        lc.cancel(&turn.id, CancelReason::OperatorCancel, vec![])
             .await
-            .expect("cancel of terminal job is no-op");
-        let loaded = lc.get(&job.id).await.unwrap().unwrap();
-        assert!(matches!(loaded.status, JobStatus::Completed));
+            .expect("cancel of terminal turn is no-op");
+        let loaded = lc.get(&turn.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.status, TurnStatus::Completed));
     }
 
     #[tokio::test]
     async fn cancel_with_partial_artifacts() {
         let lc = make_lifecycle();
-        let job = lc
-            .start_job(
+        let turn = lc
+            .start_turn(
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
@@ -670,14 +679,14 @@ mod tests {
             )
             .await
             .unwrap();
-        lc.start(&job.id).await.unwrap();
+        lc.start(&turn.id).await.unwrap();
         let span = SpanId::new();
-        lc.cancel(&job.id, CancelReason::UserPreempt, vec![span])
+        lc.cancel(&turn.id, CancelReason::UserPreempt, vec![span])
             .await
             .unwrap();
-        let loaded = lc.get(&job.id).await.unwrap().unwrap();
+        let loaded = lc.get(&turn.id).await.unwrap().unwrap();
         match loaded.status {
-            JobStatus::Cancelled {
+            TurnStatus::Cancelled {
                 reason,
                 partial_artifacts,
             } => {
