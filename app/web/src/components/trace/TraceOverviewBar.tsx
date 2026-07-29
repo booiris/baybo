@@ -22,11 +22,6 @@ import {
 } from './traceFormat';
 import { scrollToAnchor } from './scrollToAnchor';
 
-// Cap the number of rendered minimap cells so a multi-thousand-span trace can't
-// blow up the DOM. Failures are computed from ALL cells, so the "N fail →" jump
-// still reaches a failure whose cell was truncated.
-const MAX_CELLS = 800;
-
 interface Cell {
   key: string;
   turnId: string;
@@ -182,8 +177,6 @@ export function TraceOverviewBar({
 
   const dur = overallDuration(overview.turns);
   const failCells = cells.filter((c) => c.failed);
-  const renderCells = cells.length > MAX_CELLS ? cells.slice(0, MAX_CELLS) : cells;
-  const hidden = cells.length - renderCells.length;
 
   const jump = (c: Cell) => {
     if (c.spanId != null) onSelectSpan(c.turnId, c.spanId);
@@ -218,7 +211,7 @@ export function TraceOverviewBar({
         <div className="mt-2 flex items-start gap-2">
           <span className="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft shrink-0 pt-1 w-14">sequence</span>
           <div className="flex flex-wrap gap-0.5 max-h-20 overflow-y-auto">
-            {renderCells.map((c) => {
+            {cells.map((c) => {
               const selected =
                 c.spanId != null ? c.spanId === selectedSpanId : c.stepId === selectedStepId;
               return (
@@ -235,7 +228,6 @@ export function TraceOverviewBar({
                 />
               );
             })}
-            {hidden > 0 && <span className="text-[0.6rem] font-mono text-ink-soft self-center pl-1">+{hidden}</span>}
           </div>
           {failCells.length > 0 && (
             <button
