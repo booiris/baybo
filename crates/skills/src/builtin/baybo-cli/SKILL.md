@@ -1,7 +1,7 @@
 ---
 name: baybo-cli
 version: 0.1.0
-description: "Inspect the running Baybo instance — sessions, jobs, traces, cron, costs, config, channels, MCP servers, gateway and sidecar logs — by invoking the `baybo` CLI through the Bash tool. Use whenever the user asks about Baybo's own state (what's running, what failed, what spent money, what was said) instead of answering from memory."
+description: "Inspect the running Baybo instance — sessions, turns, traces, cron, costs, config, channels, MCP servers, gateway and sidecar logs — by invoking the `baybo` CLI through the Bash tool. Use whenever the user asks about Baybo's own state (what's running, what failed, what spent money, what was said) instead of answering from memory."
 user-invocable: false
 disable-model-invocation: false
 allowed-tools:
@@ -45,9 +45,9 @@ absolute path to the running binary, baked in at boot time.
 | "What did the user/agent say?" | `{{BAYBO_BIN}} session history <id>` |
 | "What got dropped by compaction?" | `{{BAYBO_BIN}} session history <id> --include-superseded` (or `--superseded-only`) |
 | "What LLM calls / tool calls happened?" | `{{BAYBO_BIN}} session export <id>` (full JSON tree) |
-| "Which jobs are in-flight / failed?" | `{{BAYBO_BIN}} job list [--status in-progress \| failed \| stuck]` |
-| "What's the state of job X?" | `{{BAYBO_BIN}} job show <id>` |
-| "Cancel job X" | `{{BAYBO_BIN}} job cancel <id> --yes` |
+| "Which turns are in-flight / failed?" | `{{BAYBO_BIN}} turn list [--status in-progress \| failed \| stuck]` |
+| "What's the state of turn X?" | `{{BAYBO_BIN}} turn show <id>` |
+| "Cancel turn X" | `{{BAYBO_BIN}} turn cancel <id> --yes` |
 | "What's scheduled in cron?" | `{{BAYBO_BIN}} cron list` |
 | "What does cron job X actually run?" | `{{BAYBO_BIN}} cron show <id>` (returns the prompt body) |
 | "How much are we spending today?" | `{{BAYBO_BIN}} cost show` |

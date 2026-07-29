@@ -1,17 +1,17 @@
-//! Query API v1 — the read surface over Session / Job / Step / Span,
-//! defined as the union of the read paths in `docs/modules/{session,job,trace}.md`.
+//! Query API v1 — the read surface over Session / Turn / Step / Span,
+//! defined as the union of the read paths in `docs/modules/{session,turn,trace}.md`.
 //!
 //! 9 endpoints:
 //!
 //! 1. `load_session` — resolves lineage
-//! 2. `list_jobs` — job summaries for a session
-//! 3. `load_job` — Job + step list
+//! 2. `list_turns` — turn summaries for a session
+//! 3. `load_turn` — Turn + step list
 //! 4. `load_step` — Step + spans + span events
-//! 5. `find_recoverable_jobs` — recovery scan
+//! 5. `find_recoverable_turns` — recovery scan
 //! 6. `list_active_subagents` — live Subagent-lineage children
 //! 7. `lineage_tree` — ancestry + immediate descendants
-//! 8. `cost_summary` — User / Session / Job / TimeRange
-//! 9. `replay` — chronological Job → Step → Span tree
+//! 8. `cost_summary` — User / Session / Turn / TimeRange
+//! 9. `replay` — chronological Turn → Step → Span tree
 //!
 //! Errors collapse into a single `QueryError` so callers don't need to
 //! match four different store error types.
@@ -20,12 +20,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_cost::{CostError, CostStore, CostSummary, TimeRange};
-use baybo_job::{Job, JobError, JobInputKind, JobLifecycle, JobStatus, JobStatusKind};
 use baybo_model::{
-    CallReason, JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId, TriggerKind,
+    CallReason, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId, TriggerKind, TurnId,
 };
 use baybo_session::{SessionError, SessionStore, StoredMessage};
 use baybo_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
+use baybo_turn::{Turn, TurnError, TurnInputKind, TurnLifecycle, TurnStatus, TurnStatusKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,8 +34,8 @@ use thiserror::Error;
 pub enum QueryError {
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-    #[error("job error: {0}")]
-    Job(#[from] JobError),
+    #[error("turn error: {0}")]
+    Turn(#[from] TurnError),
     #[error("trace error: {0}")]
     Trace(#[from] TraceError),
     #[error("cost error: {0}")]
@@ -50,30 +50,30 @@ pub type Result<T> = std::result::Result<T, QueryError>;
 
 // ── DTOs ────────────────────────────────────────────────────────────
 
-/// Filter for `list_jobs`. All fields are AND-combined; `None` means
+/// Filter for `list_turns`. All fields are AND-combined; `None` means
 /// no constraint.
 #[derive(Debug, Clone, Default)]
-pub struct JobFilter {
-    pub status_kind: Option<JobStatusKind>,
+pub struct TurnFilter {
+    pub status_kind: Option<TurnStatusKind>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Lightweight row returned by `list_jobs`.
+/// Lightweight row returned by `list_turns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSummary {
-    pub id: JobId,
+pub struct TurnSummary {
+    pub id: TurnId,
     pub session_id: SessionId,
-    pub input_kind: JobInputKind,
+    pub input_kind: TurnInputKind,
     pub origin: TriggerKind,
-    pub status: JobStatus,
+    pub status: TurnStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
 }
 
-impl JobSummary {
-    fn from_owned(j: &Job) -> Self {
+impl TurnSummary {
+    fn from_owned(j: &Turn) -> Self {
         Self {
             id: j.id,
             session_id: j.session_id.clone(),
@@ -87,16 +87,16 @@ impl JobSummary {
     }
 }
 
-/// Job + its step list. Step children are *not* eagerly loaded; call
+/// Turn + its step list. Step children are *not* eagerly loaded; call
 /// `load_step` for each step's spans.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobDetail {
-    pub job: Job,
+pub struct TurnDetail {
+    pub turn: Turn,
     pub steps: Vec<Step>,
 }
 
 /// Step + every span under it (plus each span's `events` already
-/// inlined by the `Span` struct). Heavier than `JobDetail::steps`
+/// inlined by the `Span` struct). Heavier than `TurnDetail::steps`
 /// because it eagerly fetches spans.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDetail {
@@ -140,15 +140,15 @@ fn build_lineage_node(
 pub enum CostScope {
     User { user_id: String, range: TimeRange },
     Session(SessionId),
-    Job(JobId),
+    Turn(TurnId),
     TimeRange(TimeRange),
 }
 
-/// Chronological replay of a session's job/step/span tree.
+/// Chronological replay of a session's turn/step/span tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayedConversation {
     pub session_id: SessionId,
-    pub jobs: Vec<ReplayJob>,
+    pub turns: Vec<ReplayJob>,
 }
 
 /// Coarse "what started this session" label derived from
@@ -186,16 +186,16 @@ fn derive_session_kind(session: &Session) -> SessionKind {
 
 /// Filter for [`QueryApi::list_session_summaries`]. All fields are
 /// AND-combined; `None` means no constraint. `status_kind` matches
-/// against the *latest* job's `JobStatusKind` (not any historical job).
+/// against the *latest* turn's `TurnStatusKind` (not any historical turn).
 #[derive(Debug, Clone, Default)]
 pub struct SessionSummaryFilter {
-    pub status_kind: Option<JobStatusKind>,
+    pub status_kind: Option<TurnStatusKind>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub session_id_prefix: Option<String>,
     /// Coarse trigger/lineage label. Filters the `list_all` pool by
     /// [`derive_session_kind`]. `Compression` matches no live row
-    /// (compaction runs as a step inside the turn's job), so that
+    /// (compaction runs as a step inside the turn's turn), so that
     /// variant yields an empty listing.
     pub kind: Option<SessionKind>,
 }
@@ -217,10 +217,10 @@ pub struct SessionSummary {
     pub session_id: SessionId,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
-    /// `None` when the session has no jobs (filtered out by default).
-    pub latest_job_status: Option<JobStatus>,
+    /// `None` when the session has no turns (filtered out by default).
+    pub latest_turn_status: Option<TurnStatus>,
     pub kind: SessionKind,
-    pub job_count: usize,
+    pub turn_count: usize,
     pub span_count: usize,
     pub input_tokens: usize,
     pub output_tokens: usize,
@@ -294,7 +294,7 @@ pub struct AnalyticsReasonBucket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayJob {
-    pub job: Job,
+    pub turn: Turn,
     pub steps: Vec<ReplayStep>,
 }
 
@@ -329,16 +329,16 @@ impl From<StoredMessage> for SessionMessageRow {
     }
 }
 
-/// Per-job entry in [`TraceOverview`]: a [`JobSummary`] augmented with
+/// Per-turn entry in [`TraceOverview`]: a [`TurnSummary`] augmented with
 /// the token aggregates the trace sidebar needs to render the
-/// `↑in ↓out` chips before the user has clicked into the job. Token
+/// `↑in ↓out` chips before the user has clicked into the turn. Token
 /// fields are zeros when the underlying `QueryApi` has no `CostStore`
 /// (CLI-style construction via `QueryApi::without_costs`) or when the
 /// cost lookup errors — we'd rather show 0 than fail the whole page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraceJobSummary {
+pub struct TraceTurnSummary {
     #[serde(flatten)]
-    pub summary: JobSummary,
+    pub summary: TurnSummary,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
@@ -346,19 +346,19 @@ pub struct TraceJobSummary {
 }
 
 /// Cheap session overview for the trace detail UI: the full
-/// `session_messages` log + a list of job summaries, ordered
+/// `session_messages` log + a list of turn summaries, ordered
 /// oldest-first to match the sidebar's `#1 #2 ...` numbering.
 ///
-/// Compared to [`ReplayedConversation`] this drops the per-job
+/// Compared to [`ReplayedConversation`] this drops the per-turn
 /// step/span tree — the client lazily fetches that via
-/// [`QueryApi::load_job_trace`] on demand.
+/// [`QueryApi::load_turn_trace`] on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceOverview {
     pub session_id: SessionId,
     /// Full transcript on an unconditional load; only rows with
     /// `ordinal > since_ordinal` on an incremental one.
     pub session_messages: Vec<SessionMessageRow>,
-    pub jobs: Vec<TraceJobSummary>,
+    pub turns: Vec<TraceTurnSummary>,
     /// Highest `superseded_by` marker in the session. Incremental
     /// pollers compare it to the value they last saw: a change means a
     /// compaction re-marked rows they already hold, so the cached
@@ -366,13 +366,13 @@ pub struct TraceOverview {
     pub supersede_watermark: Option<i64>,
 }
 
-/// Full step/span tree for a single job, served by
-/// [`QueryApi::load_job_trace`]. Spans keep their original
+/// Full step/span tree for a single turn, served by
+/// [`QueryApi::load_turn_trace`]. Spans keep their original
 /// `LlmCallInputs::Persisted` shape — clients slice the message log
 /// from [`TraceOverview::session_messages`] themselves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobTrace {
-    pub job: Job,
+pub struct TurnTrace {
+    pub turn: Turn,
     pub steps: Vec<ReplayStep>,
 }
 
@@ -383,8 +383,8 @@ pub struct JobTrace {
 ///
 /// A `data` blob is append-only history, so a field whose enum variant was
 /// retired after the row was written fails to deserialize even though the
-/// store is perfectly intact. Propagating that took out an entire job's
-/// trace — and `session export`, which replays every job — for one such
+/// store is perfectly intact. Propagating that took out an entire turn's
+/// trace — and `session export`, which replays every turn — for one such
 /// row. A batch therefore degrades; point lookups ([`QueryApi::load_step`]
 /// and replay's truncation target) still error, because there the caller
 /// named the row and hiding it would answer a different question.
@@ -413,17 +413,17 @@ fn decode_batch<R, T, E: std::fmt::Display>(
         .collect()
 }
 
-/// Read-only view onto the session/job/trace/cost stores.
+/// Read-only view onto the session/turn/trace/cost stores.
 ///
-/// `Arc<JobLifecycle>` rather than `Arc<dyn JobStore>` because the
+/// `Arc<TurnLifecycle>` rather than `Arc<dyn TurnStore>` because the
 /// lifecycle facade already wraps the store with the strong-typed
-/// API the query layer wants (`list(Option<JobStatusKind>)` →
-/// pre-sorted, status-filtered job lists).
+/// API the query layer wants (`list(Option<TurnStatusKind>)` →
+/// pre-sorted, status-filtered turn lists).
 pub struct QueryApi {
     sessions: Arc<dyn SessionStore>,
-    jobs: Arc<JobLifecycle>,
+    turns: Arc<TurnLifecycle>,
     trace: Arc<dyn TraceStore>,
-    /// Optional. Callers that only need lineage / replay / job listing
+    /// Optional. Callers that only need lineage / replay / turn listing
     /// (CLI `baybo trace list/show/export`, gateway `/v1/traces/{id}`)
     /// pass `None`; cost_summary then returns `Unsupported`.
     costs: Option<Arc<dyn CostStore>>,
@@ -432,13 +432,13 @@ pub struct QueryApi {
 impl QueryApi {
     pub fn new(
         sessions: Arc<dyn SessionStore>,
-        jobs: Arc<JobLifecycle>,
+        turns: Arc<TurnLifecycle>,
         trace: Arc<dyn TraceStore>,
         costs: Arc<dyn CostStore>,
     ) -> Self {
         Self {
             sessions,
-            jobs,
+            turns,
             trace,
             costs: Some(costs),
         }
@@ -449,12 +449,12 @@ impl QueryApi {
     /// commands which never touch cost data.
     pub fn without_costs(
         sessions: Arc<dyn SessionStore>,
-        jobs: Arc<JobLifecycle>,
+        turns: Arc<TurnLifecycle>,
         trace: Arc<dyn TraceStore>,
     ) -> Self {
         Self {
             sessions,
-            jobs,
+            turns,
             trace,
             costs: None,
         }
@@ -466,42 +466,42 @@ impl QueryApi {
         Ok(self.sessions.get(id).await.map_err(SessionError::from)?)
     }
 
-    // ── 2. list_jobs ───────────────────────────────────────────
+    // ── 2. list_turns ───────────────────────────────────────────
 
-    pub async fn list_jobs(
+    pub async fn list_turns(
         &self,
         session_id: &SessionId,
-        filter: JobFilter,
-    ) -> Result<Vec<JobSummary>> {
-        let summaries: Vec<JobSummary> = self
-            .jobs
+        filter: TurnFilter,
+    ) -> Result<Vec<TurnSummary>> {
+        let summaries: Vec<TurnSummary> = self
+            .turns
             .list_by_session(session_id, filter.status_kind)
             .await?
             .into_iter()
             .filter(|j| filter_matches(j, &filter))
-            .map(|j| JobSummary::from_owned(&j))
+            .map(|j| TurnSummary::from_owned(&j))
             .collect();
         Ok(summaries)
     }
 
-    // ── 3. load_job ────────────────────────────────────────────
+    // ── 3. load_turn ────────────────────────────────────────────
 
-    pub async fn load_job(&self, id: &JobId) -> Result<JobDetail> {
-        let job = self
-            .jobs
+    pub async fn load_turn(&self, id: &TurnId) -> Result<TurnDetail> {
+        let turn = self
+            .turns
             .get(id)
             .await?
-            .ok_or_else(|| QueryError::NotFound(format!("job {id}")))?;
+            .ok_or_else(|| QueryError::NotFound(format!("turn {id}")))?;
         let steps = decode_batch(
             self.trace
-                .list_steps_by_job(id)
+                .list_steps_by_turn(id)
                 .await
                 .map_err(TraceError::from)?,
             "step",
             |r| r.id.to_string(),
             Step::from_row,
         );
-        Ok(JobDetail { job, steps })
+        Ok(TurnDetail { turn, steps })
     }
 
     // ── 4. load_step ───────────────────────────────────────────
@@ -566,14 +566,14 @@ impl QueryApi {
         Ok(())
     }
 
-    /// Assemble one job's ordered `steps → spans (+ events)` tree from
+    /// Assemble one turn's ordered `steps → spans (+ events)` tree from
     /// three batched store queries, regardless of tree size. The
     /// per-step / per-span round-trip fan-out this replaces cost
     /// O(steps + spans) pool checkouts per call.
-    async fn load_step_tree_for_job(&self, job_id: &JobId) -> Result<Vec<ReplayStep>> {
+    async fn load_step_tree_for_turn(&self, turn_id: &TurnId) -> Result<Vec<ReplayStep>> {
         let mut steps = decode_batch(
             self.trace
-                .list_steps_by_job(job_id)
+                .list_steps_by_turn(turn_id)
                 .await
                 .map_err(TraceError::from)?,
             "step",
@@ -584,7 +584,7 @@ impl QueryApi {
 
         let mut spans = decode_batch(
             self.trace
-                .list_spans_by_job(job_id)
+                .list_spans_by_turn(turn_id)
                 .await
                 .map_err(TraceError::from)?,
             "span",
@@ -606,29 +606,29 @@ impl QueryApi {
             .collect())
     }
 
-    /// Per-session trace tally `(jobs, steps, spans)` for status
-    /// surfaces — SQL counts per job, no step/span blob is ever
+    /// Per-session trace tally `(turns, steps, spans)` for status
+    /// surfaces — SQL counts per turn, no step/span blob is ever
     /// materialised.
     pub async fn trace_counts(&self, session_id: &SessionId) -> Result<(usize, usize, usize)> {
-        let jobs = self.jobs.list_by_session(session_id, None).await?;
+        let turns = self.turns.list_by_session(session_id, None).await?;
         let mut steps = 0usize;
         let mut spans = 0usize;
-        for job in &jobs {
+        for turn in &turns {
             let (s, sp) = self
                 .trace
-                .trace_counts_by_job(&job.id)
+                .trace_counts_by_turn(&turn.id)
                 .await
                 .map_err(TraceError::from)?;
             steps += s;
             spans += sp;
         }
-        Ok((jobs.len(), steps, spans))
+        Ok((turns.len(), steps, spans))
     }
 
-    // ── 5. find_recoverable_jobs ───────────────────────────────
+    // ── 5. find_recoverable_turns ───────────────────────────────
 
-    pub async fn find_recoverable_jobs(&self) -> Result<Vec<Job>> {
-        Ok(self.jobs.list_recoverable().await?)
+    pub async fn find_recoverable_turns(&self) -> Result<Vec<Turn>> {
+        Ok(self.turns.list_recoverable().await?)
     }
 
     // ── 6. list_active_subagents ───────────────────────────────
@@ -644,9 +644,9 @@ impl QueryApi {
             if !matches!(kind, LineageKind::Subagent) {
                 continue;
             }
-            // "Active" = at least one non-terminal job in this child.
+            // "Active" = at least one non-terminal turn in this child.
             let active = self
-                .jobs
+                .turns
                 .list_by_session(&child_id, None)
                 .await?
                 .iter()
@@ -708,7 +708,7 @@ impl QueryApi {
             CostScope::Session(sid) => {
                 Ok(costs.query_session(&sid).await.map_err(CostError::from)?)
             }
-            CostScope::Job(jid) => Ok(costs.query_job(&jid).await.map_err(CostError::from)?),
+            CostScope::Turn(jid) => Ok(costs.query_turn(&jid).await.map_err(CostError::from)?),
         }
     }
 
@@ -716,12 +716,12 @@ impl QueryApi {
 
     /// List session summaries for the trace browser. Filters apply
     /// against `last_active` (time range), session id prefix, and the
-    /// **latest** job's status kind. Sessions with zero jobs are
+    /// **latest** turn's status kind. Sessions with zero turns are
     /// dropped (a session with no trace is invisible to the browser).
     ///
     /// Cardinality: everything pre-pagination comes from the session
-    /// scan plus one grouped job-stats query; the aggregates that need
-    /// further store reads (full latest job, span counts, token
+    /// scan plus one grouped turn-stats query; the aggregates that need
+    /// further store reads (full latest turn, span counts, token
     /// totals) are computed for the returned page only. Request cost
     /// scales with page size, not total history.
     pub async fn list_session_summaries(
@@ -748,17 +748,17 @@ impl QueryApi {
             sessions.retain(|s| derive_session_kind(s) == want_kind);
         }
 
-        let job_stats: HashMap<SessionId, baybo_store::SessionJobStats> = self
-            .jobs
-            .session_job_stats()
+        let turn_stats: HashMap<SessionId, baybo_store::SessionTurnStats> = self
+            .turns
+            .session_turn_stats()
             .await?
             .into_iter()
             .map(|s| (s.session_id.clone(), s))
             .collect();
 
-        // Latest-status filter + drop sessions with no jobs, from the
+        // Latest-status filter + drop sessions with no turns, from the
         // grouped stats alone — no per-session reads yet.
-        sessions.retain(|s| match job_stats.get(&s.id) {
+        sessions.retain(|s| match turn_stats.get(&s.id) {
             None => false,
             Some(stats) => filter
                 .status_kind
@@ -782,16 +782,16 @@ impl QueryApi {
             futures::future::try_join_all(sessions[start..end].iter().map(|session| {
                 let session = session.clone();
                 async move {
-                    let jobs = self.jobs.list_by_session(&session.id, None).await?;
+                    let turns = self.turns.list_by_session(&session.id, None).await?;
                     // Same (created_at, id) tiebreak as the grouped stats query, so
-                    // the status shown always belongs to the job the filter judged.
-                    let latest = jobs.iter().max_by_key(|j| (j.created_at, j.id));
+                    // the status shown always belongs to the turn the filter judged.
+                    let latest = turns.iter().max_by_key(|j| (j.created_at, j.id));
 
                     let mut span_count = 0usize;
-                    for job in &jobs {
+                    for turn in &turns {
                         span_count += self
                             .trace
-                            .trace_counts_by_job(&job.id)
+                            .trace_counts_by_turn(&turn.id)
                             .await
                             .map_err(TraceError::from)?
                             .1;
@@ -819,9 +819,9 @@ impl QueryApi {
                         session_id: session.id.clone(),
                         created_at: session.created_at,
                         last_active: session.last_active,
-                        latest_job_status: latest.map(|j| j.status.clone()),
+                        latest_turn_status: latest.map(|j| j.status.clone()),
                         kind: derive_session_kind(&session),
-                        job_count: jobs.len(),
+                        turn_count: turns.len(),
                         span_count,
                         input_tokens,
                         output_tokens,
@@ -990,14 +990,14 @@ impl QueryApi {
         session_id: &SessionId,
         until_step_id: Option<StepId>,
     ) -> Result<ReplayedConversation> {
-        // Full jobs, oldest-first for replay.
-        let mut full_jobs = self.jobs.list_by_session(session_id, None).await?;
-        full_jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Full turns, oldest-first for replay.
+        let mut full_turns = self.turns.list_by_session(session_id, None).await?;
+        full_turns.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-        // The truncation target's owning job comes from the step row
-        // itself — one point lookup instead of scanning every job's
+        // The truncation target's owning turn comes from the step row
+        // itself — one point lookup instead of scanning every turn's
         // step list.
-        let truncate_after_job: Option<JobId> = match until_step_id.as_ref() {
+        let truncate_after_turn: Option<TurnId> = match until_step_id.as_ref() {
             None => None,
             Some(target) => self
                 .trace
@@ -1006,23 +1006,23 @@ impl QueryApi {
                 .map_err(TraceError::from)?
                 .map(Step::from_row)
                 .transpose()?
-                .map(|s| s.job_id),
+                .map(|s| s.turn_id),
         };
 
-        let mut jobs = Vec::with_capacity(full_jobs.len());
-        for job in full_jobs {
-            let job_id = job.id;
-            let mut step_blocks = self.load_step_tree_for_job(&job_id).await?;
+        let mut turns = Vec::with_capacity(full_turns.len());
+        for turn in full_turns {
+            let turn_id = turn.id;
+            let mut step_blocks = self.load_step_tree_for_turn(&turn_id).await?;
             if let Some(target) = until_step_id
                 && let Some(pos) = step_blocks.iter().position(|b| b.step.id == target)
             {
                 step_blocks.truncate(pos + 1);
             }
-            jobs.push(ReplayJob {
-                job,
+            turns.push(ReplayJob {
+                turn,
                 steps: step_blocks,
             });
-            if Some(job_id) == truncate_after_job {
+            if Some(turn_id) == truncate_after_turn {
                 break;
             }
         }
@@ -1030,25 +1030,25 @@ impl QueryApi {
         // Hydrate transcript-backed LLM inputs and tool outputs into their
         // legacy inline API shapes. The session_messages log is read once per
         // session and reused for every reference.
-        self.hydrate_persisted_trace_data(session_id, &mut jobs)
+        self.hydrate_persisted_trace_data(session_id, &mut turns)
             .await?;
 
         Ok(ReplayedConversation {
             session_id: session_id.clone(),
-            jobs,
+            turns,
         })
     }
 
     // ── 12. load_trace_overview ────────────────────────────────
 
     /// Trace detail page's first call: returns the session message
-    /// log + job summaries, **without** any step/span data. Cheap.
-    /// The client lazily fetches each job's tree via
-    /// [`Self::load_job_trace`] when the user selects it.
+    /// log + turn summaries, **without** any step/span data. Cheap.
+    /// The client lazily fetches each turn's tree via
+    /// [`Self::load_turn_trace`] when the user selects it.
     ///
     /// This split exists because the old single-shot `replay`
     /// inlined the whole transcript into every `LlmCall` span — for a
-    /// session with N jobs × S spans the response payload was
+    /// session with N turns × S spans the response payload was
     /// O(N · S · message_count), even though storage is already
     /// O(N · S) thanks to the `LlmCallInputs::Persisted` ordinal
     /// indirection. Returning the message log once and letting the
@@ -1062,9 +1062,9 @@ impl QueryApi {
         session_id: &SessionId,
         since_ordinal: Option<i64>,
     ) -> Result<TraceOverview> {
-        // Re-sort oldest-first to match the trace sidebar's job
+        // Re-sort oldest-first to match the trace sidebar's turn
         // numbering (`#1, #2, ...` from earliest to latest).
-        let mut summaries = self.list_jobs(session_id, JobFilter::default()).await?;
+        let mut summaries = self.list_turns(session_id, TurnFilter::default()).await?;
         summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         let (session_messages, supersede_watermark): (Vec<SessionMessageRow>, Option<i64>) =
@@ -1103,22 +1103,22 @@ impl QueryApi {
                 }
             };
 
-        // Per-job token aggregates power the sidebar's `↑in ↓out`
+        // Per-turn token aggregates power the sidebar's `↑in ↓out`
         // chips: one grouped cost query for the whole session. A cost
         // failure degrades to zeroed chips rather than failing the
         // overview.
-        let costs_by_job: HashMap<String, CostSummary> = match self.costs.as_ref() {
-            Some(c) => match c.query_session_by_job(session_id).await {
+        let costs_by_turn: HashMap<String, CostSummary> = match self.costs.as_ref() {
+            Some(c) => match c.query_session_by_turn(session_id).await {
                 Ok(buckets) => buckets.into_iter().map(|b| (b.key, b.summary)).collect(),
                 Err(_) => HashMap::new(),
             },
             None => HashMap::new(),
         };
-        let jobs = summaries
+        let turns = summaries
             .into_iter()
             .map(|summary| {
-                let c = costs_by_job.get(&summary.id.to_string());
-                TraceJobSummary {
+                let c = costs_by_turn.get(&summary.id.to_string());
+                TraceTurnSummary {
                     input_tokens: c.map_or(0, |c| c.total_input_tokens),
                     output_tokens: c.map_or(0, |c| c.total_output_tokens),
                     cached_input_tokens: c.map_or(0, |c| c.total_cached_input_tokens),
@@ -1132,32 +1132,32 @@ impl QueryApi {
         Ok(TraceOverview {
             session_id: session_id.clone(),
             session_messages,
-            jobs,
+            turns,
             supersede_watermark,
         })
     }
 
-    // ── 13. load_job_trace ─────────────────────────────────────
+    // ── 13. load_turn_trace ─────────────────────────────────────
 
-    /// Per-job follow-up to [`Self::load_trace_overview`]: returns
-    /// one job's full `steps → spans → events` tree. `Persisted`
+    /// Per-turn follow-up to [`Self::load_trace_overview`]: returns
+    /// one turn's full `steps → spans → events` tree. `Persisted`
     /// `input_messages` references stay as ordinal pointers; the
     /// client resolves them against the message log it already
     /// received from the overview call.
-    pub async fn load_job_trace(&self, job_id: &JobId) -> Result<JobTrace> {
-        let job = self
-            .jobs
-            .get(job_id)
+    pub async fn load_turn_trace(&self, turn_id: &TurnId) -> Result<TurnTrace> {
+        let turn = self
+            .turns
+            .get(turn_id)
             .await?
-            .ok_or_else(|| QueryError::NotFound(format!("job {job_id}")))?;
-        let step_blocks = self.load_step_tree_for_job(job_id).await?;
-        Ok(JobTrace {
-            job,
+            .ok_or_else(|| QueryError::NotFound(format!("turn {turn_id}")))?;
+        let step_blocks = self.load_step_tree_for_turn(turn_id).await?;
+        Ok(TurnTrace {
+            turn,
             steps: step_blocks,
         })
     }
 
-    /// Walk every span in `jobs`, hydrating both persisted LLM input slices and
+    /// Walk every span in `turns`, hydrating both persisted LLM input slices and
     /// transcript-backed tool outputs into their legacy inline API shapes.
     /// Skips the work entirely if no span needs hydration; reads the log once
     /// when at least one does.
@@ -1167,11 +1167,11 @@ impl QueryApi {
     async fn hydrate_persisted_trace_data(
         &self,
         log_session_id: &SessionId,
-        jobs: &mut [ReplayJob],
+        turns: &mut [ReplayJob],
     ) -> Result<()> {
         use baybo_trace::{LlmCallInputs, SpanKind, ToolCallOutput};
 
-        let any_persisted = jobs.iter().any(|j| {
+        let any_persisted = turns.iter().any(|j| {
             j.steps.iter().any(|s| {
                 s.spans.iter().any(|sp| {
                     matches!(
@@ -1195,8 +1195,8 @@ impl QueryApi {
             .await
             .map_err(SessionError::from)?;
 
-        for job in jobs.iter_mut() {
-            for step in job.steps.iter_mut() {
+        for turn in turns.iter_mut() {
+            for step in turn.steps.iter_mut() {
                 for span in step.spans.iter_mut() {
                     let span_started_at = span.started_at;
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
@@ -1327,7 +1327,7 @@ fn reconstruction_warning(expected: usize, reconstructed: usize) -> baybo_model:
     ))])
 }
 
-fn filter_matches(j: &Job, f: &JobFilter) -> bool {
+fn filter_matches(j: &Turn, f: &TurnFilter) -> bool {
     if let Some(s) = f.since
         && j.created_at < s
     {
@@ -1345,17 +1345,17 @@ fn filter_matches(j: &Job, f: &JobFilter) -> bool {
 mod tests {
     use super::*;
     use baybo_cost::test_support::MemoryCostStore;
-    use baybo_job::JobInput;
-    use baybo_job::test_support::MemoryJobStore;
     use baybo_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use baybo_session::SessionStore;
-    use baybo_store::JobStore as _;
+    use baybo_store::TurnStore as _;
     use baybo_trace::test_support::MemoryTraceStore;
     use baybo_trace::{CompressionApplied, CompressionTrigger};
+    use baybo_turn::TurnInput;
+    use baybo_turn::test_support::MemoryTurnStore;
     use std::sync::Arc;
 
-    fn user_input() -> JobInput {
-        JobInput::UserChat {
+    fn user_input() -> TurnInput {
+        TurnInput::UserChat {
             content: vec![ContentBlock::Text("hi".into())],
         }
     }
@@ -1980,10 +1980,10 @@ mod tests {
     }
 
     fn make_query_api(sessions: Arc<dyn SessionStore>) -> QueryApi {
-        let job_store = Arc::new(MemoryJobStore::new());
+        let turn_store = Arc::new(MemoryTurnStore::new());
         let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
         let cost_store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
         QueryApi::new(sessions, lifecycle, trace_store, cost_store)
     }
 
@@ -2005,9 +2005,9 @@ mod tests {
         ) -> baybo_store::trace::Result<Option<baybo_store::StepRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
-        async fn list_steps_by_job(
+        async fn list_steps_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::StepRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
@@ -2031,15 +2031,15 @@ mod tests {
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
-        async fn trace_counts_by_job(
+        async fn trace_counts_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<(usize, usize)> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
-        async fn list_spans_by_job(
+        async fn list_spans_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
             Err(baybo_store::StorageError::Storage("boom".into()))
         }
@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     /// Hands back row bytes verbatim, the way `SqliteTraceStore` does — its
-    /// generated `job_id` column is a `json_extract`, so a row whose `kind`
+    /// generated `turn_id` column is a `json_extract`, so a row whose `kind`
     /// no longer decodes is still selected and still returned.
     /// `MemoryTraceStore` decodes inside its own list methods and silently
     /// drops what fails, which would make the test below vacuous.
@@ -2083,9 +2083,9 @@ mod tests {
         ) -> baybo_store::trace::Result<Option<baybo_store::StepRow>> {
             Ok(None)
         }
-        async fn list_steps_by_job(
+        async fn list_steps_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::StepRow>> {
             Ok(self.steps.clone())
         }
@@ -2109,15 +2109,15 @@ mod tests {
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
             Ok(Vec::new())
         }
-        async fn trace_counts_by_job(
+        async fn trace_counts_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<(usize, usize)> {
             Ok((self.steps.len(), 0))
         }
-        async fn list_spans_by_job(
+        async fn list_spans_by_turn(
             &self,
-            _: &JobId,
+            _: &TurnId,
         ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
             Ok(Vec::new())
         }
@@ -2142,22 +2142,22 @@ mod tests {
     }
 
     /// A persisted step whose `kind` carries a value this build's enum no
-    /// longer has must cost that one step, not the job. Retiring a `StepKind`
+    /// longer has must cost that one step, not the turn. Retiring a `StepKind`
     /// variant is a normal thing to do, and every row written before the
     /// retirement stays on disk forever — collecting the batch into a
-    /// `Result` turned each of those into a permanent 500 on the job's trace
-    /// page and an unclosable job in boot recovery.
+    /// `Result` turned each of those into a permanent 500 on the turn's trace
+    /// page and an unclosable turn in boot recovery.
     #[tokio::test]
-    async fn an_undecodable_step_row_costs_one_step_not_the_job() {
-        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
-        let job = lifecycle
-            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
+    async fn an_undecodable_step_row_costs_one_step_not_the_turn() {
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
+        let turn = lifecycle
+            .start_turn(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
 
         let mut step = Step {
             id: StepId::new(),
-            job_id: job.id,
+            turn_id: turn.id,
             kind: baybo_trace::StepKind::LlmIteration,
             started_at: chrono::Utc::now(),
             ended_at: None,
@@ -2194,7 +2194,10 @@ mod tests {
             Arc::new(MemoryCostStore::default()),
         );
 
-        let detail = api.load_job(&job.id).await.expect("job trace still loads");
+        let detail = api
+            .load_turn(&turn.id)
+            .await
+            .expect("turn trace still loads");
         assert_eq!(
             detail.steps.len(),
             1,
@@ -2206,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn trace_store_failure_surfaces_as_trace_error() {
         let sessions: Arc<dyn SessionStore> = Arc::new(MemSessionStore::default());
-        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
         let trace: Arc<dyn TraceStore> = Arc::new(FailingTraceStore);
         let cost: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let api = QueryApi::new(sessions, lifecycle, trace, cost);
@@ -2242,10 +2245,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_recoverable_jobs_filters_to_non_terminal() {
+    async fn find_recoverable_turns_filters_to_non_terminal() {
         let store = Arc::new(MemSessionStore::default());
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store.clone()));
         let api = QueryApi::new(
             store,
             lifecycle.clone(),
@@ -2255,25 +2258,25 @@ mod tests {
 
         // Pending (recoverable)
         lifecycle
-            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
+            .start_turn(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         // InProgress (recoverable)
         let j = lifecycle
-            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
+            .start_turn(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
         // Completed (NOT recoverable)
         let j2 = lifecycle
-            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
+            .start_turn(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j2.id).await.unwrap();
         lifecycle
             .complete(
                 &j2.id,
-                baybo_job::JobOutput::Message {
+                baybo_turn::TurnOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
                     ordinal: None,
                 },
@@ -2281,7 +2284,7 @@ mod tests {
             .await
             .unwrap();
 
-        let recoverable = api.find_recoverable_jobs().await.unwrap();
+        let recoverable = api.find_recoverable_turns().await.unwrap();
         assert_eq!(recoverable.len(), 2);
         for r in &recoverable {
             assert!(!r.status.is_terminal());
@@ -2326,24 +2329,24 @@ mod tests {
             ],
         );
 
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
-        // Active child has an InProgress job
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store.clone()));
+        // Active child has an InProgress turn
         let j_active = lifecycle
-            .start_job(active_child.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(active_child.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j_active.id).await.unwrap();
-        // Done child has a Completed job
+        // Done child has a Completed turn
         let j_done = lifecycle
-            .start_job(done_child.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(done_child.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j_done.id).await.unwrap();
         lifecycle
             .complete(
                 &j_done.id,
-                baybo_job::JobOutput::Message {
+                baybo_turn::TurnOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
                     ordinal: None,
                 },
@@ -2362,19 +2365,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_returns_jobs_in_chronological_order() {
+    async fn replay_returns_turns_in_chronological_order() {
         let store = Arc::new(MemSessionStore::default());
         let s = make_session("cli-1");
         store.save(&s).await.unwrap();
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
 
         let _j1 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         let _j2 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
 
@@ -2385,8 +2388,8 @@ mod tests {
             Arc::new(MemoryCostStore::default()),
         );
         let replay = api.replay(&s.id, None).await.unwrap();
-        assert_eq!(replay.jobs.len(), 2);
-        assert!(replay.jobs[0].job.created_at <= replay.jobs[1].job.created_at);
+        assert_eq!(replay.turns.len(), 2);
+        assert!(replay.turns[0].turn.created_at <= replay.turns[1].turn.created_at);
     }
 
     /// A `Persisted` span with a non-empty `suffix` (compression /
@@ -2428,9 +2431,9 @@ mod tests {
             .await
             .unwrap();
 
-        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
         let j = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -2442,7 +2445,7 @@ mod tests {
             .save_step(
                 &Step {
                     id: step_id,
-                    job_id: j.id,
+                    turn_id: j.id,
                     kind: StepKind::compression(
                         CompressionTrigger::Threshold,
                         CompressionApplied::LiveSummary,
@@ -2497,7 +2500,7 @@ mod tests {
         );
         let replay = api.replay(&s.id, None).await.unwrap();
         let span = replay
-            .jobs
+            .turns
             .iter()
             .flat_map(|j| j.steps.iter())
             .flat_map(|st| st.spans.iter())
@@ -2542,15 +2545,15 @@ mod tests {
             .await
             .unwrap();
 
-        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
-        let job = lifecycle
-            .start_job(session.id.clone(), TriggerKind::User, user_input(), None)
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
+        let turn = lifecycle
+            .start_turn(session.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
         let step = Step {
             id: StepId::new(),
-            job_id: job.id,
+            turn_id: turn.id,
             kind: StepKind::LlmIteration,
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
@@ -2603,9 +2606,9 @@ mod tests {
         );
         let replay = api.replay(&session.id, None).await.unwrap();
         let span = replay
-            .jobs
+            .turns
             .iter()
-            .flat_map(|job| job.steps.iter())
+            .flat_map(|turn| turn.steps.iter())
             .flat_map(|step| step.spans.iter())
             .find(|span| span.id == span_id)
             .unwrap();
@@ -2655,9 +2658,9 @@ mod tests {
             .unwrap()
             .expect("messages appended");
 
-        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
         let j = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -2668,7 +2671,7 @@ mod tests {
             .save_step(
                 &Step {
                     id: step_id,
-                    job_id: j.id,
+                    turn_id: j.id,
                     kind: StepKind::compression(
                         CompressionTrigger::Threshold,
                         CompressionApplied::LiveSummary,
@@ -2723,7 +2726,7 @@ mod tests {
         );
         let replay = api.replay(&s.id, None).await.unwrap();
         let span = replay
-            .jobs
+            .turns
             .iter()
             .flat_map(|j| j.steps.iter())
             .flat_map(|st| st.spans.iter())
@@ -2805,12 +2808,12 @@ mod tests {
             .await
             .unwrap();
 
-        // First job + step + span. The span's `last_ordinal` anchors
+        // First turn + step + span. The span's `last_ordinal` anchors
         // to the transcript at this point in time (ordinals 0..=1).
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
         let j1 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j1.id).await.unwrap();
@@ -2822,7 +2825,7 @@ mod tests {
             .save_step(
                 &Step {
                     id: step1_id,
-                    job_id: j1.id,
+                    turn_id: j1.id,
                     kind: StepKind::LlmIteration,
                     started_at: now,
                     ended_at: None,
@@ -2890,9 +2893,9 @@ mod tests {
             .expect("post-compaction messages exist");
         assert_eq!(post_last, 5);
 
-        // Second job + span anchored to the post-compaction transcript.
+        // Second turn + span anchored to the post-compaction transcript.
         let j2 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j2.id).await.unwrap();
@@ -2902,7 +2905,7 @@ mod tests {
             .save_step(
                 &Step {
                     id: step2_id,
-                    job_id: j2.id,
+                    turn_id: j2.id,
                     kind: StepKind::LlmIteration,
                     started_at: Utc::now(),
                     ended_at: None,
@@ -2963,12 +2966,12 @@ mod tests {
         let replay = api.replay(&s.id, None).await.unwrap();
 
         let all_spans: Vec<&Span> = replay
-            .jobs
+            .turns
             .iter()
             .flat_map(|j| j.steps.iter())
             .flat_map(|s| s.spans.iter())
             .collect();
-        assert_eq!(all_spans.len(), 2, "expected one LlmCall span per job");
+        assert_eq!(all_spans.len(), 2, "expected one LlmCall span per turn");
 
         // Every Persisted reference must have collapsed to Inline:
         // the read surface never leaks the ordinal indirection.
@@ -3019,7 +3022,7 @@ mod tests {
 
     /// `load_trace_overview` returns the full `session_messages`
     /// log (including superseded rows so the client can still slice
-    /// pre-compaction spans) and the job summaries oldest-first.
+    /// pre-compaction spans) and the turn summaries oldest-first.
     /// No step/span data — that's the cheap-on-purpose contract.
     #[tokio::test]
     async fn load_trace_overview_returns_message_log_and_summaries() {
@@ -3046,14 +3049,14 @@ mod tests {
             .await
             .unwrap();
 
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
         let _j1 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         let _j2 = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
 
@@ -3076,8 +3079,8 @@ mod tests {
         assert_eq!(overview.session_messages[2].ordinal, 2);
         assert_eq!(overview.session_messages[2].superseded_by, None);
 
-        assert_eq!(overview.jobs.len(), 2);
-        assert!(overview.jobs[0].summary.created_at <= overview.jobs[1].summary.created_at);
+        assert_eq!(overview.turns.len(), 2);
+        assert!(overview.turns[0].summary.created_at <= overview.turns[1].summary.created_at);
         assert_eq!(overview.supersede_watermark, Some(2));
 
         // Incremental poll: only rows above the client's ordinal, same
@@ -3086,7 +3089,7 @@ mod tests {
         assert_eq!(delta.session_messages.len(), 1);
         assert_eq!(delta.session_messages[0].ordinal, 2);
         assert_eq!(delta.supersede_watermark, Some(2));
-        assert_eq!(delta.jobs.len(), 2, "job summaries always ship in full");
+        assert_eq!(delta.turns.len(), 2, "turn summaries always ship in full");
     }
 
     #[tokio::test]
@@ -3096,32 +3099,32 @@ mod tests {
         };
 
         let session_store = Arc::new(MemSessionStore::default());
-        let job_store = Arc::new(MemoryJobStore::new());
+        let turn_store = Arc::new(MemoryTurnStore::new());
         let trace_store = Arc::new(MemoryTraceStore::new());
         let base = Utc::now();
 
-        // Three sessions with one job each (newest-active first), plus a
-        // zero-job session that must stay invisible even though it is
+        // Three sessions with one turn each (newest-active first), plus a
+        // zero-turn session that must stay invisible even though it is
         // the newest of all.
-        let mut with_jobs = Vec::new();
+        let mut with_turns = Vec::new();
         for (i, name) in ["sum-new", "sum-mid", "sum-old"].iter().enumerate() {
             let mut s = make_session(name);
             s.last_active = base - chrono::Duration::hours(i as i64);
             session_store.save(&s).await.unwrap();
-            let mut j = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+            let mut j = Turn::new(s.id.clone(), TriggerKind::User, user_input(), None);
             j.created_at = base;
-            job_store.create(&j.to_row().unwrap()).await.unwrap();
-            with_jobs.push((s, j));
+            turn_store.create(&j.to_row().unwrap()).await.unwrap();
+            with_turns.push((s, j));
         }
         let mut empty = make_session("sum-empty");
         empty.last_active = base + chrono::Duration::hours(1);
         session_store.save(&empty).await.unwrap();
 
         // "sum-mid" carries one step with two spans.
-        let (mid_session, mid_job) = &with_jobs[1];
+        let (mid_session, mid_turn) = &with_turns[1];
         let step = Step {
             id: StepId::new(),
-            job_id: mid_job.id,
+            turn_id: mid_turn.id,
             kind: StepKind::LlmIteration,
             started_at: base,
             ended_at: None,
@@ -3159,7 +3162,7 @@ mod tests {
 
         let api = QueryApi::new(
             session_store,
-            Arc::new(JobLifecycle::new(job_store)),
+            Arc::new(TurnLifecycle::new(turn_store)),
             trace_store,
             Arc::new(MemoryCostStore::default()),
         );
@@ -3174,41 +3177,41 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(listing.total, 3, "zero-job session must not count");
+        assert_eq!(listing.total, 3, "zero-turn session must not count");
         assert_eq!(listing.items.len(), 1);
         let item = &listing.items[0];
         assert_eq!(item.session_id, mid_session.id);
-        assert_eq!(item.job_count, 1);
+        assert_eq!(item.turn_count, 1);
         assert_eq!(item.span_count, 2);
-        assert!(matches!(item.latest_job_status, Some(JobStatus::Pending)));
+        assert!(matches!(item.latest_turn_status, Some(TurnStatus::Pending)));
     }
 
     #[tokio::test]
-    async fn list_session_summaries_status_filter_matches_latest_job_only() {
+    async fn list_session_summaries_status_filter_matches_latest_turn_only() {
         let session_store = Arc::new(MemSessionStore::default());
-        let job_store = Arc::new(MemoryJobStore::new());
+        let turn_store = Arc::new(MemoryTurnStore::new());
         let s = make_session("sum-status");
         session_store.save(&s).await.unwrap();
         let base = Utc::now();
 
-        let mut done = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+        let mut done = Turn::new(s.id.clone(), TriggerKind::User, user_input(), None);
         done.created_at = base;
         let _ = done.start().unwrap();
         let _ = done
-            .complete(baybo_job::JobOutput::Message {
+            .complete(baybo_turn::TurnOutput::Message {
                 content: vec![ContentBlock::Text("ok".into())],
                 ordinal: None,
             })
             .unwrap();
-        job_store.create(&done.to_row().unwrap()).await.unwrap();
+        turn_store.create(&done.to_row().unwrap()).await.unwrap();
 
-        let mut pending = Job::new(s.id.clone(), TriggerKind::User, user_input(), None);
+        let mut pending = Turn::new(s.id.clone(), TriggerKind::User, user_input(), None);
         pending.created_at = base + chrono::Duration::seconds(1);
-        job_store.create(&pending.to_row().unwrap()).await.unwrap();
+        turn_store.create(&pending.to_row().unwrap()).await.unwrap();
 
         let api = QueryApi::new(
             session_store,
-            Arc::new(JobLifecycle::new(job_store)),
+            Arc::new(TurnLifecycle::new(turn_store)),
             Arc::new(MemoryTraceStore::new()),
             Arc::new(MemoryCostStore::default()),
         );
@@ -3220,7 +3223,7 @@ mod tests {
         let completed = api
             .list_session_summaries(
                 SessionSummaryFilter {
-                    status_kind: Some(JobStatusKind::Completed),
+                    status_kind: Some(TurnStatusKind::Completed),
                     ..Default::default()
                 },
                 page,
@@ -3229,13 +3232,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             completed.total, 0,
-            "an older completed job must not match — the latest job is pending"
+            "an older completed turn must not match — the latest turn is pending"
         );
 
         let pending_hits = api
             .list_session_summaries(
                 SessionSummaryFilter {
-                    status_kind: Some(JobStatusKind::Pending),
+                    status_kind: Some(TurnStatusKind::Pending),
                     ..Default::default()
                 },
                 page,
@@ -3243,19 +3246,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending_hits.total, 1);
-        assert_eq!(pending_hits.items[0].job_count, 2);
+        assert_eq!(pending_hits.items[0].turn_count, 2);
         assert!(matches!(
-            pending_hits.items[0].latest_job_status,
-            Some(JobStatus::Pending)
+            pending_hits.items[0].latest_turn_status,
+            Some(TurnStatus::Pending)
         ));
     }
 
-    /// `load_job_trace` returns the per-job step/span tree with
+    /// `load_turn_trace` returns the per-turn step/span tree with
     /// `LlmCallInputs::Persisted` references **unchanged** — the
     /// client is expected to slice them against the message log
     /// served by `load_trace_overview`.
     #[tokio::test]
-    async fn load_job_trace_preserves_persisted_inputs() {
+    async fn load_turn_trace_preserves_persisted_inputs() {
         use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
         use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
@@ -3266,7 +3269,7 @@ mod tests {
         }
 
         let session_store = Arc::new(MemSessionStore::default());
-        let s = make_session("job-trace-1");
+        let s = make_session("turn-trace-1");
         session_store.save(&s).await.unwrap();
         session_store
             .append_session_message(&s.id, &user_msg("hi"))
@@ -3278,10 +3281,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let job_store = Arc::new(MemoryJobStore::new());
-        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
         let j = lifecycle
-            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -3293,7 +3296,7 @@ mod tests {
             .save_step(
                 &Step {
                     id: step_id,
-                    job_id: j.id,
+                    turn_id: j.id,
                     kind: StepKind::LlmIteration,
                     started_at: now,
                     ended_at: None,
@@ -3342,17 +3345,17 @@ mod tests {
             trace_store,
             Arc::new(MemoryCostStore::default()),
         );
-        let job_trace = api.load_job_trace(&j.id).await.unwrap();
+        let turn_trace = api.load_turn_trace(&j.id).await.unwrap();
 
-        assert_eq!(job_trace.job.id, j.id);
-        assert_eq!(job_trace.steps.len(), 1);
-        assert_eq!(job_trace.steps[0].spans.len(), 1);
-        let SpanKind::LlmCall { begin, .. } = &job_trace.steps[0].spans[0].kind else {
+        assert_eq!(turn_trace.turn.id, j.id);
+        assert_eq!(turn_trace.steps.len(), 1);
+        assert_eq!(turn_trace.steps[0].spans.len(), 1);
+        let SpanKind::LlmCall { begin, .. } = &turn_trace.steps[0].spans[0].kind else {
             panic!("expected LlmCall span");
         };
         assert!(
             matches!(begin.input_messages, LlmCallInputs::Persisted { .. }),
-            "load_job_trace must preserve Persisted refs; got {:?}",
+            "load_turn_trace must preserve Persisted refs; got {:?}",
             begin.input_messages
         );
     }

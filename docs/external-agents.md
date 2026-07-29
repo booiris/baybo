@@ -172,27 +172,27 @@ the child session's transcript looks like a normal agent loop:
 `FinalContent` duplicates the last assistant text, so the consumer
 treats it as a result signal only and does not double-write.
 
-## Job lifecycle + trace visibility
+## Turn lifecycle + trace visibility
 
-`run_external_agent_job` wraps each run in a `Spawned` job
-(`JobLifecycle::start_job` → `start` → terminal transition), the same
-job kind the in-process Baybo backend mints per turn. Without a job the
+`run_external_agent_turn` wraps each run in a `Spawned` turn
+(`TurnLifecycle::start_turn` → `start` → terminal transition), the same
+turn kind the in-process Baybo backend mints per turn. Without a turn the
 child session is invisible to the trace browser:
-`QueryApi::list_session_summaries` drops zero-job sessions and
+`QueryApi::list_session_summaries` drops zero-turn sessions and
 `GET /v1/traces/{id}` 404s on them. The terminal `SubagentExitStatus`
-maps onto the job: `Completed` → `complete(JobOutput::Message)`,
+maps onto the turn: `Completed` → `complete(TurnOutput::Message)`,
 `Failed` → `fail`, `Timeout` → `cancel(SubagentTimeout)`, `Cancelled`
 → `cancel(ParentCancelled)`. The run's cancel token is registered via
-`register_running`, so an operator-issued job cancel trips the
+`register_running`, so an operator-issued turn cancel trips the
 subprocess.
 
 External runs record **no step/span tree** — the agent's internal
 loop is opaque, and faking `LlmCall` spans would pollute cost /
 analytics with calls baybo never made. So the trace detail page
 (`app/web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
-persisted `session_messages` transcript directly when a job has zero
+persisted `session_messages` transcript directly when a turn has zero
 steps. Net frontend behaviour: the external subagent appears in the
-Traces list with a `subagent` badge + job status, and opening it
+Traces list with a `subagent` badge + turn status, and opening it
 shows the full transcript (thinking / tool_use / tool_result) via the
 shared `MessageList` component.
 

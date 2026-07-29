@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use baybo_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
+use baybo_model::{ParallelGroup, SessionId, SpanId, StepId, TurnId};
 use chrono::Utc;
 use tokio::sync::broadcast;
 
@@ -26,25 +26,25 @@ const TRACE_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub enum TraceEvent {
     StepStarted {
         step_id: StepId,
-        job_id: JobId,
+        turn_id: TurnId,
         kind: StepKind,
     },
     StepEnded {
         step_id: StepId,
-        job_id: JobId,
+        turn_id: TurnId,
         outcome: LifecycleOutcome,
     },
     SpanStarted {
         span_id: SpanId,
         step_id: StepId,
-        job_id: JobId,
+        turn_id: TurnId,
         /// String tag of the kind (`"llm_call"`, `"tool_call"`, etc.).
         kind_tag: &'static str,
     },
     SpanEnded {
         span_id: SpanId,
         step_id: StepId,
-        job_id: JobId,
+        turn_id: TurnId,
         outcome: LifecycleOutcome,
     },
     SpanEventEmitted(SpanEvent),
@@ -55,7 +55,7 @@ pub enum TraceEvent {
     /// when an LLM call closes.
     LlmSpanEnded {
         span_id: SpanId,
-        job_id: JobId,
+        turn_id: TurnId,
         session_id: SessionId,
         user_id: String,
         model_id: String,
@@ -109,7 +109,7 @@ impl TraceEventStream {
 /// Owns the per-session Step / Span / SpanEvent write path.
 ///
 /// One `SpanRecorder` per session — held by `AgentActor` alongside its
-/// `JobLifecycle`. Cheap to construct (just three Arc clones + an
+/// `TurnLifecycle`. Cheap to construct (just three Arc clones + an
 /// `mpsc`-style broadcast sender).
 pub struct SpanRecorder {
     session_id: SessionId,
@@ -149,14 +149,14 @@ impl SpanRecorder {
 
     // ── Step lifecycle ────────────────────────────────────────────
 
-    /// Open a new `Step` under `job_id`. Persists immediately to the
+    /// Open a new `Step` under `turn_id`. Persists immediately to the
     /// columnar `steps` table.
-    pub async fn begin_step(&self, job_id: JobId, kind: StepKind) -> Result<StepHandle> {
+    pub async fn begin_step(&self, turn_id: TurnId, kind: StepKind) -> Result<StepHandle> {
         let started_at = Utc::now();
         let step_id = StepId::new();
         let step = Step {
             id: step_id,
-            job_id,
+            turn_id,
             kind: kind.clone(),
             started_at,
             ended_at: None,
@@ -165,10 +165,10 @@ impl SpanRecorder {
         self.trace_store.save_step(&step.to_row()?).await?;
         self.stream.publish(TraceEvent::StepStarted {
             step_id,
-            job_id,
+            turn_id,
             kind: kind.clone(),
         });
-        Ok(StepHandle::new(step_id, job_id, kind, started_at))
+        Ok(StepHandle::new(step_id, turn_id, kind, started_at))
     }
 
     /// Close a step. Constructs the closed `Step` row from the handle
@@ -177,7 +177,7 @@ impl SpanRecorder {
     pub async fn end_step(&self, handle: StepHandle, outcome: LifecycleOutcome) -> Result<()> {
         let step = Step {
             id: handle.step_id,
-            job_id: handle.job_id,
+            turn_id: handle.turn_id,
             kind: handle.kind,
             started_at: handle.started_at,
             ended_at: Some(Utc::now()),
@@ -186,7 +186,7 @@ impl SpanRecorder {
         self.trace_store.save_step(&step.to_row()?).await?;
         self.stream.publish(TraceEvent::StepEnded {
             step_id: handle.step_id,
-            job_id: handle.job_id,
+            turn_id: handle.turn_id,
             outcome,
         });
         Ok(())
@@ -218,7 +218,7 @@ impl SpanRecorder {
         self.stream.publish(TraceEvent::SpanStarted {
             span_id,
             step_id: step.step_id,
-            job_id: step.job_id,
+            turn_id: step.turn_id,
             kind_tag,
         });
         Ok(SpanHandle::new(
@@ -241,7 +241,7 @@ impl SpanRecorder {
     pub async fn end_span(
         &self,
         mut handle: SpanHandle,
-        job_id: JobId,
+        turn_id: TurnId,
         finalize: SpanFinalize,
         outcome: LifecycleOutcome,
     ) -> Result<()> {
@@ -253,7 +253,7 @@ impl SpanRecorder {
         {
             self.stream.publish(TraceEvent::LlmSpanEnded {
                 span_id: handle.span_id,
-                job_id,
+                turn_id,
                 session_id: self.session_id.clone(),
                 user_id: self.user_id.clone(),
                 model_id: begin.model_id.clone(),
@@ -278,7 +278,7 @@ impl SpanRecorder {
         self.stream.publish(TraceEvent::SpanEnded {
             span_id: handle.span_id,
             step_id: handle.step_id,
-            job_id,
+            turn_id,
             outcome,
         });
         Ok(())
@@ -294,10 +294,10 @@ impl SpanRecorder {
     pub async fn cancel_span(
         &self,
         handle: SpanHandle,
-        job_id: JobId,
+        turn_id: TurnId,
         outcome: LifecycleOutcome,
     ) -> Result<()> {
-        self.end_span(handle, job_id, SpanFinalize::Empty, outcome)
+        self.end_span(handle, turn_id, SpanFinalize::Empty, outcome)
             .await
     }
 
@@ -378,8 +378,8 @@ mod tests {
     async fn step_round_trip_emits_events() {
         let rec = make_recorder();
         let mut rx = rec.stream().subscribe();
-        let job = JobId::new();
-        let h = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let turn = TurnId::new();
+        let h = rec.begin_step(turn, StepKind::LlmIteration).await.unwrap();
         rec.end_step(h, LifecycleOutcome::Ok).await.unwrap();
         let started = rx.recv().await.unwrap();
         assert!(matches!(started, TraceEvent::StepStarted { .. }));
@@ -396,12 +396,12 @@ mod tests {
         // does NOT fire (a cancelled LLM call has no token counts).
         let rec = make_recorder();
         let mut rx = rec.stream().subscribe();
-        let job = JobId::new();
-        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let turn = TurnId::new();
+        let step = rec.begin_step(turn, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
         rec.cancel_span(
             span,
-            job,
+            turn,
             LifecycleOutcome::Failed {
                 reason: "sanitize failed".into(),
             },
@@ -423,10 +423,10 @@ mod tests {
     async fn span_lifecycle_emits_started_and_ended() {
         let rec = make_recorder();
         let mut rx = rec.stream().subscribe();
-        let job = JobId::new();
-        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let turn = TurnId::new();
+        let step = rec.begin_step(turn, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, llm_finalize(10, 5), LifecycleOutcome::Ok)
+        rec.end_span(span, turn, llm_finalize(10, 5), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain step started + span started + llm span ended + span ended
@@ -444,10 +444,10 @@ mod tests {
     async fn llm_span_end_emits_token_counts_for_cost_subscriber() {
         let rec = make_recorder();
         let mut rx = rec.stream().subscribe();
-        let job = JobId::new();
-        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let turn = TurnId::new();
+        let step = rec.begin_step(turn, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
-        rec.end_span(span, job, llm_finalize(123, 45), LifecycleOutcome::Ok)
+        rec.end_span(span, turn, llm_finalize(123, 45), LifecycleOutcome::Ok)
             .await
             .unwrap();
         // Drain until LlmSpanEnded
@@ -470,15 +470,15 @@ mod tests {
     #[tokio::test]
     async fn end_span_rejects_variant_mismatch() {
         let rec = make_recorder();
-        let job = JobId::new();
-        let step = rec.begin_step(job, StepKind::LlmIteration).await.unwrap();
+        let turn = TurnId::new();
+        let step = rec.begin_step(turn, StepKind::LlmIteration).await.unwrap();
         let span = rec.begin_span(&step, dummy_llm_kind(), None).await.unwrap();
         // Begin-time kind is LlmCall; result variant is ToolCall —
         // programming error, surfaces as TraceError::Internal.
         let err = rec
             .end_span(
                 span,
-                job,
+                turn,
                 SpanFinalize::ToolCall(crate::ToolCallResult {
                     output: crate::ToolCallOutput::inline(serde_json::Value::Null),
                     success: false,

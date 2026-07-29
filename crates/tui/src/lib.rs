@@ -1041,7 +1041,7 @@ fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result
 /// When the body streamed, its text is already in the scrollback, so we
 /// append only the trailing partial plus any non-text extras the stream
 /// didn't carry (e.g. the CronCreate recurring-trigger hint). When
-/// nothing streamed — a cron turn with `delta_tx = None`, or a direct
+/// nothing streamed — a cron job with `delta_tx = None`, or a direct
 /// synthetic Message such as the background-completion reply — the body never
 /// reached the scrollback, so the full message is rendered from `blocks`. The
 /// `cooked for` footer is committed separately by [`finalize_stream`] (with its

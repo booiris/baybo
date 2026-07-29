@@ -2,7 +2,7 @@
 //!
 //! A tool call that trips the approval gate parks for
 //! [`APPROVAL_TIMEOUT`](crate::channel::boot::APPROVAL_TIMEOUT) and then
-//! **denies itself**. Nothing on the [`JobLifecycle`](baybo_job::JobLifecycle)
+//! **denies itself**. Nothing on the [`TurnLifecycle`](baybo_turn::TurnLifecycle)
 //! bus fires while it waits — that bus only speaks in completed turns — so the
 //! dispatcher's existing subscription cannot see the one moment the user's
 //! attention is load-bearing. This relay is the second source feeding

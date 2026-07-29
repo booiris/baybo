@@ -550,7 +550,7 @@ Dispatch triggers — there are **two**, and only the first is a turn ending:
 
 **A completed turn.**
 
-1. A's `PushDispatcher` subscribes to the `JobLifecycle` broadcast bus.
+1. A's `PushDispatcher` subscribes to the `TurnLifecycle` broadcast bus.
 2. A dispatches only successfully completed chat turns a user is meant to read:
    `phase == Completed` and `kind` in `UserChat` / `Cron` / `CronNotification`.
 3. Compact (`/compact`), Spawned, SubagentNotification, failed turns, and

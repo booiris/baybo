@@ -28,7 +28,7 @@ pub use slash::{
 };
 pub use types::{
     AgentEvent, AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage, RouterInbound,
-    SessionEvent, ToolStatus, TurnStatus,
+    SessionEvent, StatusPhase, ToolStatus,
 };
 // `MessageRole` now lives in `wire`; keep it at the crate root so
 // `baybo_channels::MessageRole` consumers are unchanged.

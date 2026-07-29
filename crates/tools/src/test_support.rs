@@ -102,7 +102,7 @@ pub struct RecordingTool {
     name: String,
     invocations: Arc<Mutex<Vec<Value>>>,
     response: Arc<Mutex<ToolOutput>>,
-    last_job_id: Arc<Mutex<Option<baybo_model::JobId>>>,
+    last_turn_id: Arc<Mutex<Option<baybo_model::TurnId>>>,
 }
 
 impl RecordingTool {
@@ -111,7 +111,7 @@ impl RecordingTool {
             name: name.into(),
             invocations: Arc::new(Mutex::new(Vec::new())),
             response: Arc::new(Mutex::new(ToolOutput::Text(String::new()))),
-            last_job_id: Arc::new(Mutex::new(None)),
+            last_turn_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -126,12 +126,12 @@ impl RecordingTool {
         self.invocations.lock().to_vec()
     }
 
-    /// The `job_id` of the most recent `execute()` call — lets a test
+    /// The `turn_id` of the most recent `execute()` call — lets a test
     /// reconstruct the per-turn cohort key
     /// (`BackgroundNotificationGroup::cohort_key`) that a
     /// grouped `spawn_subagent` running in that turn would have produced.
-    pub fn last_job_id(&self) -> Option<baybo_model::JobId> {
-        *self.last_job_id.lock()
+    pub fn last_turn_id(&self) -> Option<baybo_model::TurnId> {
+        *self.last_turn_id.lock()
     }
 
     pub fn manifest(&self) -> ToolManifest {
@@ -159,7 +159,7 @@ impl Tool for RecordingTool {
     }
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         self.invocations.lock().push(params);
-        *self.last_job_id.lock() = Some(ctx.job_id);
+        *self.last_turn_id.lock() = Some(ctx.turn_id);
         Ok(self.response.lock().clone())
     }
 }

@@ -92,7 +92,7 @@ the child transcript or command output file.
 ### 2. Group barriers
 
 Each grouped spawn is counted under a key namespaced by the dispatching turn's
-`JobId`. At the turn boundary the cohort seals, fixing its membership and
+`TurnId`. At the turn boundary the cohort seals, fixing its membership and
 starting its 30-minute timeout.
 
 - A sealed cohort with every member terminal releases immediately.
@@ -140,7 +140,7 @@ raw results do not need to be re-buffered after an inference failure. A crash
 between the transcript append and the session-state save restores the raw batch
 on hydration, but its deterministic key resolves to the row already written.
 
-The inference job retains the historical persisted/API kind
+The inference turn retains the historical persisted/API kind
 `SubagentNotification` for compatibility, although its payload may describe
 either subagents or commands.
 

@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use baybo_channels::{AgentEvent, AgentOutput};
-use baybo_job::{JobLifecycle, JobLifecycleEvent, JobStatusKind};
 use baybo_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
+use baybo_turn::{TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -19,7 +19,7 @@ use crate::actor::mailbox::MailboxSender;
 /// Wait for a freshly-spawned subagent to terminate. The caller (router)
 /// owns the synchronous prelude (build child session, spawn actor, send
 /// initial message); this routine then watches output_rx for the final
-/// message + the lifecycle bus for the job's terminal event (ignoring
+/// message + the lifecycle bus for the turn's terminal event (ignoring
 /// the child's own start edge), with a store fallback on broadcast lag.
 ///
 /// `actor_token` is the child actor's own
@@ -28,10 +28,10 @@ use crate::actor::mailbox::MailboxSender;
 pub async fn await_subagent_terminal(
     child_session_id: SessionId,
     mut output_rx: mpsc::Receiver<AgentOutput>,
-    mut terminal_rx: broadcast::Receiver<JobLifecycleEvent>,
+    mut terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
     mailbox: MailboxSender<AgentMessage>,
     actor_token: CancellationToken,
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
 ) -> SubagentResult {
     let mut captured: Option<Vec<ContentBlock>> = None;
     let wait_result = async {
@@ -63,9 +63,9 @@ pub async fn await_subagent_terminal(
                             let Some(kind) = ev.phase.terminal_status() else {
                                 continue;
                             };
-                            if matches!(kind, JobStatusKind::Completed) && captured.is_none() {
-                                // `JobLifecycle::complete` publishes the terminal
-                                // event inside `with_job` BEFORE
+                            if matches!(kind, TurnStatusKind::Completed) && captured.is_none() {
+                                // `TurnLifecycle::complete` publishes the terminal
+                                // event inside `with_turn` BEFORE
                                 // `handle_subagent_spawned` dispatches the final
                                 // `AgentEvent::Message`. Drain `output_rx` so the
                                 // queued message isn't lost when the terminal
@@ -82,10 +82,10 @@ pub async fn await_subagent_terminal(
                                 "subagent waiter lagged on lifecycle-event bus, reconciling via store"
                             );
                             if let Some(kind) = check_child_terminal_via_store(
-                                &job_lifecycle,
+                                &turn_lifecycle,
                                 &child_session_id,
                             ).await {
-                                if matches!(kind, JobStatusKind::Completed) && captured.is_none() {
+                                if matches!(kind, TurnStatusKind::Completed) && captured.is_none() {
                                     captured = drain_for_final_message(&mut output_rx).await;
                                 }
                                 return terminal_event_to_status(kind, captured.take());
@@ -94,7 +94,7 @@ pub async fn await_subagent_terminal(
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             return Err(SubagentExitStatus::Failed {
-                                reason: "job lifecycle-event bus closed".into(),
+                                reason: "turn lifecycle-event bus closed".into(),
                             });
                         }
                     }
@@ -121,15 +121,15 @@ pub async fn await_subagent_terminal(
 }
 
 fn terminal_event_to_status(
-    kind: JobStatusKind,
+    kind: TurnStatusKind,
     captured: Option<Vec<ContentBlock>>,
 ) -> Result<Option<Vec<ContentBlock>>, SubagentExitStatus> {
     match kind {
-        JobStatusKind::Completed => Ok(captured),
-        JobStatusKind::Failed => Err(SubagentExitStatus::Failed {
-            reason: "child job failed".into(),
+        TurnStatusKind::Completed => Ok(captured),
+        TurnStatusKind::Failed => Err(SubagentExitStatus::Failed {
+            reason: "child turn failed".into(),
         }),
-        JobStatusKind::Cancelled => Err(SubagentExitStatus::Cancelled),
+        TurnStatusKind::Cancelled => Err(SubagentExitStatus::Cancelled),
         other => Err(SubagentExitStatus::Failed {
             reason: format!("unexpected non-terminal terminal-event kind: {other:?}"),
         }),
@@ -137,13 +137,13 @@ fn terminal_event_to_status(
 }
 
 /// Single-query store reconcile for the broadcast-lag path. Lists every
-/// job on the child session, then picks the first terminal one — saves
+/// turn on the child session, then picks the first terminal one — saves
 /// the 3× round-trip of the per-status query the previous shape did.
 async fn check_child_terminal_via_store(
-    job_lifecycle: &JobLifecycle,
+    turn_lifecycle: &TurnLifecycle,
     child_session_id: &SessionId,
-) -> Option<JobStatusKind> {
-    let jobs = match job_lifecycle.list_by_session(child_session_id, None).await {
+) -> Option<TurnStatusKind> {
+    let turns = match turn_lifecycle.list_by_session(child_session_id, None).await {
         Ok(j) => j,
         Err(e) => {
             warn!(
@@ -154,10 +154,10 @@ async fn check_child_terminal_via_store(
             return None;
         }
     };
-    jobs.into_iter().map(|j| j.status.kind()).find(|kind| {
+    turns.into_iter().map(|j| j.status.kind()).find(|kind| {
         matches!(
             kind,
-            JobStatusKind::Completed | JobStatusKind::Failed | JobStatusKind::Cancelled
+            TurnStatusKind::Completed | TurnStatusKind::Failed | TurnStatusKind::Cancelled
         )
     })
 }
@@ -186,9 +186,9 @@ mod tests {
     use super::*;
     use crate::actor::mailbox::{self, MailboxReceiver};
     use baybo_channels::OutgoingMessage;
-    use baybo_job::test_support::MemoryJobStore;
-    use baybo_job::{JobInput, JobOutput};
     use baybo_model::{ChannelType, MessageMetadata, TriggerKind};
+    use baybo_turn::test_support::MemoryTurnStore;
+    use baybo_turn::{TurnInput, TurnOutput};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
@@ -196,8 +196,8 @@ mod tests {
     const CHILD_SESSION: &str = "child";
 
     struct Harness {
-        job_lifecycle: Arc<JobLifecycle>,
-        terminal_rx: tokio::sync::broadcast::Receiver<JobLifecycleEvent>,
+        turn_lifecycle: Arc<TurnLifecycle>,
+        terminal_rx: tokio::sync::broadcast::Receiver<TurnLifecycleEvent>,
         output_tx: mpsc::Sender<AgentOutput>,
         output_rx: mpsc::Receiver<AgentOutput>,
         mailbox_tx: MailboxSender<AgentMessage>,
@@ -207,12 +207,12 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let job_lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
-            let terminal_rx = job_lifecycle.subscribe_lifecycle_events();
+            let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
+            let terminal_rx = turn_lifecycle.subscribe_lifecycle_events();
             let (output_tx, output_rx) = mpsc::channel(1);
             let (mailbox_tx, _mailbox_rx) = mailbox::channel(1);
             Self {
-                job_lifecycle,
+                turn_lifecycle,
                 terminal_rx,
                 output_tx,
                 output_rx,
@@ -239,7 +239,7 @@ mod tests {
                     self.terminal_rx,
                     self.mailbox_tx,
                     self.actor_token,
-                    self.job_lifecycle,
+                    self.turn_lifecycle,
                 )),
                 output_tx: self.output_tx,
                 _mailbox_rx: self._mailbox_rx,
@@ -247,24 +247,24 @@ mod tests {
         }
     }
 
-    /// Create + start an in-progress `Spawned` job on the child session.
-    /// Mirrors what `with_job` does for a real subagent so tests can
-    /// drive `JobLifecycle::complete` / observe `JobLifecycle::cancel`
+    /// Create + start an in-progress `Spawned` turn on the child session.
+    /// Mirrors what `with_turn` does for a real subagent so tests can
+    /// drive `TurnLifecycle::complete` / observe `TurnLifecycle::cancel`
     /// against a real row.
-    async fn start_in_progress_child_job(lc: &JobLifecycle) -> baybo_model::JobId {
-        let job = lc
-            .start_job(
+    async fn start_in_progress_child_turn(lc: &TurnLifecycle) -> baybo_model::TurnId {
+        let turn = lc
+            .start_turn(
                 SessionId::from(CHILD_SESSION),
                 TriggerKind::User,
-                JobInput::Spawned {
+                TurnInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },
                 None,
             )
             .await
             .unwrap();
-        lc.start(&job.id).await.unwrap();
-        job.id
+        lc.start(&turn.id).await.unwrap();
+        turn.id
     }
 
     fn outgoing(text: &str) -> AgentOutput {
@@ -283,7 +283,7 @@ mod tests {
     /// Spawned waiter plus the peer endpoints that must outlive it —
     /// dropping `output_tx` here would close `output_rx` mid-test and
     /// surface `Failed` regardless of intent. Tests that need the
-    /// `JobLifecycle` after spawn clone it from the `Harness` before
+    /// `TurnLifecycle` after spawn clone it from the `Harness` before
     /// calling `spawn_waiter`.
     struct Waiter {
         actor_token: CancellationToken,
@@ -314,8 +314,8 @@ mod tests {
         assert!(matches!(result.status, SubagentExitStatus::Failed { .. }));
     }
 
-    /// `JobLifecycle::complete` publishes the terminal event inside
-    /// `with_job` BEFORE `handle_subagent_spawned` dispatches the final
+    /// `TurnLifecycle::complete` publishes the terminal event inside
+    /// `with_turn` BEFORE `handle_subagent_spawned` dispatches the final
     /// `AgentEvent::Message`. The waiter must keep draining `output_rx`
     /// after observing `Completed` with `captured == None`, otherwise
     /// the queued final Message is lost and the parent sees an empty
@@ -323,16 +323,16 @@ mod tests {
     #[tokio::test]
     async fn completed_event_drains_late_final_message() {
         let h = Harness::new();
-        let lc = Arc::clone(&h.job_lifecycle);
-        let job_id = start_in_progress_child_job(&lc).await;
+        let lc = Arc::clone(&h.turn_lifecycle);
+        let turn_id = start_in_progress_child_turn(&lc).await;
 
         let w = h.spawn_waiter();
 
         // Publish terminal Completed BEFORE the final Message lands on
         // output_rx — the precise race the production path produces.
         lc.complete(
-            &job_id,
-            JobOutput::Message {
+            &turn_id,
+            TurnOutput::Message {
                 content: vec![ContentBlock::Text("done".into())],
                 ordinal: None,
             },

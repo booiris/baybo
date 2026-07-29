@@ -594,7 +594,11 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
             None
         }
     };
-    let turn = match state.job_lifecycle.active_turn_started_at(session_id).await {
+    let turn = match state
+        .turn_lifecycle
+        .active_turn_started_at(session_id)
+        .await
+    {
         Ok(started_at) => TurnSnapshot {
             active: started_at.is_some(),
             started_at,

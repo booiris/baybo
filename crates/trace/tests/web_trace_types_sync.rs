@@ -232,3 +232,41 @@ fn web_trace_types_cover_the_compression_unions() {
         }
     }
 }
+
+/// The turn-entity field names the trace REST bodies emit.
+///
+/// `crates/gateway/src/api/admin/traces.rs` builds those bodies from
+/// hand-written `json!` literals against an untyped `serde_json::Value`
+/// response, and the frontend mirror is hand-maintained too — so nothing
+/// between the two is type-checked. A key renamed on one side and missed on
+/// the other compiles, passes every other test, and renders an empty trace
+/// tree. This pins both directions: the turn names must be present, and the
+/// pre-rename names must be gone.
+#[test]
+fn web_trace_types_use_turn_field_names() {
+    let ts = web_trace_types();
+
+    for field in ["turn_id", "turn_status_kind", "turns:"] {
+        assert!(
+            ts.contains(field),
+            "app/web/src/types/trace.ts is missing `{field}`. The trace endpoints in \
+             crates/gateway/src/api/admin/traces.rs emit that key; the mirror has to \
+             declare it or the trace viewer silently renders nothing."
+        );
+    }
+
+    for stale in [
+        "job_id",
+        "job_status_kind",
+        "jobs:",
+        "JobTrace",
+        "TraceJobSummary",
+    ] {
+        assert!(
+            !ts.contains(stale),
+            "app/web/src/types/trace.ts still carries `{stale}`. The turn entity is \
+             named Turn everywhere else, so this mirror is describing a shape the \
+             gateway no longer emits."
+        );
+    }
+}

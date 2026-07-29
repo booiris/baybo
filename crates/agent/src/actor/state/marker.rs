@@ -156,14 +156,14 @@ mod tests {
         use crate::actor::supervisor::AgentSupervisor;
         use crate::runtime::agent_loop::AgentLoop;
         use baybo_channels::AgentOutput;
-        use baybo_job::JobLifecycle;
         use baybo_session::SessionManager;
         use baybo_store::CronStore;
         use baybo_trace::SpanRecorder;
+        use baybo_turn::TurnLifecycle;
 
         assert_volatile::<AgentLoop>();
         assert_volatile::<mpsc::Sender<AgentOutput>>();
-        assert_volatile::<Arc<JobLifecycle>>();
+        assert_volatile::<Arc<TurnLifecycle>>();
         assert_volatile::<Arc<SpanRecorder>>();
         assert_volatile::<CancellationToken>();
         assert_volatile::<Option<AgentSupervisor>>();

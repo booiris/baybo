@@ -112,7 +112,7 @@ The split exists so the user's git workflow stays clean: `config/`, `profile/`, 
 ## Constraints
 
 - No baybo-* dependencies. The crate is leaf-level: `paths` is pure data, `walk` is std-only, `io` only adds optional `tokio` + `anyhow`, and `test-support` only adds optional `libc` for the symlink back-dating fixture.
-- Does not record message-level Trace or Job data
+- Does not record message-level Trace or Turn data
 - Missing identity files should degrade gracefully, not block startup
 - Identity file changes should carry a version stamp or content hash for Trace provenance
 

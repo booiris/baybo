@@ -22,8 +22,8 @@ pub enum GatewayError {
     #[error("session error: {0}")]
     Session(String),
 
-    #[error("job error: {0}")]
-    Job(String),
+    #[error("turn error: {0}")]
+    Turn(String),
 
     #[error("cron error: {0}")]
     Cron(String),

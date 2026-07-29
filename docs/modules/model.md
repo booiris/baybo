@@ -22,7 +22,7 @@ Contents:
 - **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`, `SubagentBackendTag`, the `BAYBO_BACKEND_TAG` const
 - **LLM routing types**: `LlmEntryName`, `ModelTier`, `LlmPricingOverride`
 - **Fingerprints**: `FileFingerprint` (mtime + size, used by the read-before-write tracker)
-- **ID newtypes**: `SessionId`, `JobId`, `SpanId`, `StepId`, `CostRecordId`, `TaskId`, `ParallelGroup`
+- **ID newtypes**: `SessionId`, `TurnId`, `SpanId`, `StepId`, `CostRecordId`, `TaskId`, `ParallelGroup`
 
 ## Design Decisions
 
@@ -40,7 +40,7 @@ injection-marker rule names arrive as plain strings rather than as a
 
 ### Minimal scope
 
-`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `baybo-session` re-uses them via `baybo_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `BAYBO_CONFIG_PATH`) live in `baybo-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
+`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `baybo-session` re-uses them via `baybo_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `turn`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `BAYBO_CONFIG_PATH`) live in `baybo-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
 
 ### Media by reference, not inline
 
@@ -59,7 +59,7 @@ All `model` types are `Send + Sync + Clone`; persisted and wire-visible types ar
 - `model` depends on no other workspace crate
 - `model` does not define business interfaces or error types
 - All upper layers use `model` only as a data exchange layer
-- Any field that may enter logs, Trace, or Job should be sanitizable and serializable by default
+- Any field that may enter logs, Trace, or Turn should be sanitizable and serializable by default
 
 ## Collaboration
 

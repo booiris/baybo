@@ -13,18 +13,18 @@ import {
 import { IconButton } from '../components/IconButton';
 import { Button } from '../components/Button';
 import { useAdminClient, useAuth } from '../api/auth';
-import { getMockJobTrace, getMockTraceOverview, useMockMode } from '../api/mock';
+import { getMockTurnTrace, getMockTraceOverview, useMockMode } from '../api/mock';
 import type {
-  JobStatusKind,
+  TurnStatusKind,
   LlmCallInputs,
-  JobTrace,
+  TurnTrace,
   ReplayStep,
   SecretKind,
   SessionMessageRow,
   Span,
   SpanEvent,
   ToolEventPayload,
-  TraceJobSummary,
+  TraceTurnSummary,
   TraceOverview,
 } from '../types/trace';
 import { resolveInputMessages, resolveToolCallOutput } from '../types/trace';
@@ -33,16 +33,16 @@ import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/Sanit
 import { TraceTree } from '../components/trace/TraceTree';
 import { TraceOverviewBar } from '../components/trace/TraceOverviewBar';
 import type { TraceGroup } from '../components/trace/traceFormat';
-import { JobAnchors } from '../components/trace/JobAnchors';
+import { TurnAnchors } from '../components/trace/TurnAnchors';
 import {
   contentText,
   durationMs,
   formatDuration,
   formatTime,
-  jobDurationMs,
-  jobInputText,
-  jobOutputText,
-  jobQueuedMs,
+  turnDurationMs,
+  turnInputText,
+  turnOutputText,
+  turnQueuedMs,
   OutcomeBadge,
   SPAWN_SUBAGENT_TOOL,
   spanVisual,
@@ -55,9 +55,9 @@ import {
 import {
   findSpan,
   findStep,
-  isExternalAgentJob,
-  isJobLive,
-  neededJobIds,
+  isExternalAgentTurn,
+  isTurnLive,
+  neededTurnIds,
   traceHasPendingSpan,
 } from '../components/trace/traceTreeModel';
 
@@ -537,12 +537,12 @@ function SpanDetailPanel({
 
 function StepDetail({
   rs,
-  jobId,
+  turnId,
   onSelectSpan,
 }: {
   rs: ReplayStep;
-  jobId: string;
-  onSelectSpan: (jobId: string, spanId: string) => void;
+  turnId: string;
+  onSelectSpan: (turnId: string, spanId: string) => void;
 }) {
   const { step, spans } = rs;
   const visual = stepVisual(step.kind.kind);
@@ -600,7 +600,7 @@ function StepDetail({
                   <button
                     key={s.id}
                     type="button"
-                    onClick={() => onSelectSpan(jobId, s.id)}
+                    onClick={() => onSelectSpan(turnId, s.id)}
                     className="w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md bg-white hover:bg-gray-50 hover:shadow-brutal-xs transition-all"
                   >
                     <div className={`w-8 h-8 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${sv.bg}`}>
@@ -622,33 +622,33 @@ function StepDetail({
   );
 }
 
-// ── Job-level summary (default detail) ───────────────────────────────
+// ── Turn-level summary (default detail) ───────────────────────────────
 
-function JobSummaryPanel({
+function TurnSummaryPanel({
   summary,
   trace,
   traceLoading,
   messageLog,
-  jobIndex,
-  totalJobs,
+  turnIndex,
+  totalTurns,
   interjections,
 }: {
-  summary: TraceJobSummary | undefined;
-  trace: JobTrace | undefined;
+  summary: TraceTurnSummary | undefined;
+  trace: TurnTrace | undefined;
   traceLoading: boolean;
   messageLog: SessionMessageRow[];
-  jobIndex: number;
-  totalJobs: number;
+  turnIndex: number;
+  totalTurns: number;
   interjections: SessionMessageRow[];
 }) {
   const interjectionCount = interjections.length;
   if (!summary) {
-    return <div className="flex-1 min-h-0 p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>;
+    return <div className="flex-1 min-h-0 p-5 text-ink-soft italic text-[0.85rem]">No turn available.</div>;
   }
   const { input, output, cached, cacheCreate, inputTotal } = trace ? traceTokens(trace) : summaryTokens(summary);
   const total = inputTotal + output;
-  const inputText = trace ? jobInputText(trace, messageLog) : null;
-  const outputText = trace ? jobOutputText(trace) : null;
+  const inputText = trace ? turnInputText(trace, messageLog) : null;
+  const outputText = trace ? turnOutputText(trace) : null;
   let llmCount = 0;
   let toolCount = 0;
   if (trace) {
@@ -660,8 +660,8 @@ function JobSummaryPanel({
     }
   }
   const stepCount = trace?.steps.length ?? 0;
-  const durMs = jobDurationMs(summary, trace);
-  const queuedMs = jobQueuedMs(summary);
+  const durMs = turnDurationMs(summary, trace);
+  const queuedMs = turnQueuedMs(summary);
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
@@ -672,10 +672,10 @@ function JobSummaryPanel({
           </div>
           <div className="min-w-0">
             <h3 className="font-bold uppercase tracking-wider leading-tight text-[1rem] truncate">
-              {totalJobs > 1 ? `Job #${jobIndex + 1}` : 'Job Overview'}
+              {totalTurns > 1 ? `Turn #${turnIndex + 1}` : 'Turn Overview'}
             </h3>
             <div className="text-ink-soft text-[0.8rem] font-mono truncate">
-              {summary.job_status_kind}
+              {summary.turn_status_kind}
               {trace
                 ? ` • ${stepCount} ${stepCount === 1 ? 'step' : 'steps'} • ${formatDuration(durMs)}`
                 : traceLoading
@@ -684,7 +684,7 @@ function JobSummaryPanel({
             </div>
             {interjectionCount > 0 && (
               <div
-                title="This job folded in mid-turn user message(s) (steering)"
+                title="This turn folded in mid-turn user message(s) (steering)"
                 className="mt-1 inline-flex items-center gap-1 border-2 border-black rounded bg-warn/15 px-1.5 py-0.5 text-[0.65rem] font-bold uppercase tracking-wider text-warn"
               >
                 <RiCornerDownLeftLine className="text-[0.8rem]" />
@@ -704,7 +704,7 @@ function JobSummaryPanel({
             </pre>
           ) : traceLoading ? (
             <div className="text-ink-soft text-[0.8rem] italic flex items-center gap-2">
-              <RiLoader4Line className="animate-spin" /> Loading job…
+              <RiLoader4Line className="animate-spin" /> Loading turn…
             </div>
           ) : (
             <div className="text-ink-soft text-[0.8rem] italic">No user input recorded.</div>
@@ -740,11 +740,11 @@ function JobSummaryPanel({
             </pre>
           ) : traceLoading ? (
             <div className="text-ink-soft text-[0.8rem] italic flex items-center gap-2">
-              <RiLoader4Line className="animate-spin" /> Loading job…
+              <RiLoader4Line className="animate-spin" /> Loading turn…
             </div>
           ) : (
             <div className="text-ink-soft text-[0.8rem] italic">
-              {summary.job_status_kind === 'completed' ? 'No output text.' : 'Awaiting final output…'}
+              {summary.turn_status_kind === 'completed' ? 'No output text.' : 'Awaiting final output…'}
             </div>
           )}
         </section>
@@ -752,12 +752,12 @@ function JobSummaryPanel({
         <section>
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">Activity</h4>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
-            <dt className="font-bold text-ink-soft">Job ID</dt>
+            <dt className="font-bold text-ink-soft">Turn ID</dt>
             <dd className="break-all">
-              <code>{summary.job_id}</code>
+              <code>{summary.turn_id}</code>
             </dd>
             <dt className="font-bold text-ink-soft">Status</dt>
-            <dd>{summary.job_status_kind}</dd>
+            <dd>{summary.turn_status_kind}</dd>
             <dt className="font-bold text-ink-soft">Duration</dt>
             <dd>{formatDuration(durMs)}</dd>
             {queuedMs !== null && queuedMs > 0 && (
@@ -923,8 +923,8 @@ export function TraceSessionPage() {
   const { logout } = useAuth();
 
   const [overview, setOverview] = useState<TraceOverview | null>(null);
-  const [jobTraces, setJobTraces] = useState<Map<string, JobTrace>>(() => new Map());
-  const [loadingJobs, setLoadingJobs] = useState<Set<string>>(() => new Set());
+  const [turnTraces, setTurnTraces] = useState<Map<string, TurnTrace>>(() => new Map());
+  const [loadingTurns, setLoadingTurns] = useState<Set<string>>(() => new Set());
   const [userToggles, setUserToggles] = useState<Map<string, boolean>>(() => new Map());
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -942,10 +942,10 @@ export function TraceSessionPage() {
   overviewRef.current = overview;
 
   const inFlight = useRef<Set<string>>(new Set());
-  // The job_status_kind each cached trace was fetched at, so a status change
+  // The turn_status_kind each cached trace was fetched at, so a status change
   // (live → terminal) triggers a refetch of the finalized tree — a pending-span
-  // heuristic alone misses a job cached at a no-pending moment that then ends.
-  const fetchedStatus = useRef<Map<string, JobStatusKind>>(new Map());
+  // heuristic alone misses a turn cached at a no-pending moment that then ends.
+  const fetchedStatus = useRef<Map<string, TurnStatusKind>>(new Map());
 
   // Debounce the tree filter text (matches TracesPage/LogsPage cadence).
   useEffect(() => {
@@ -955,15 +955,15 @@ export function TraceSessionPage() {
   const filtering = failuresOnly || filter.trim() !== '';
 
   const sessionId = id ?? '';
-  const jobIdParam = searchParams.get('job');
+  const turnIdParam = searchParams.get('turn');
   const stepIdParam = searchParams.get('step');
   const spanIdParam = searchParams.get('span');
   const tabParam = (searchParams.get('tab') as DetailTab | null) ?? 'io';
 
-  // Fetch the overview (session messages + job summaries). A same-session poll
+  // Fetch the overview (session messages + turn summaries). A same-session poll
   // pulls only the transcript delta above the cursor it already holds
   // (`since_ordinal`); a fresh session or cold start pulls the full page.
-  // `jobs` is always the full (tiny) array — replaced, never merged.
+  // `turns` is always the full (tiny) array — replaced, never merged.
   useEffect(() => {
     let cancelled = false;
 
@@ -1034,7 +1034,7 @@ export function TraceSessionPage() {
         }
         if (sinceOrdinal != null && held != null) {
           // Delta rows are strictly newer than everything held — append them
-          // (no dedup) and take the fresh full `jobs` array + watermark.
+          // (no dedup) and take the fresh full `turns` array + watermark.
           setOverview({
             ...first.overview,
             session_messages: [...held.session_messages, ...first.overview.session_messages],
@@ -1057,49 +1057,49 @@ export function TraceSessionPage() {
 
   // Reset per-session caches when the session id changes.
   useEffect(() => {
-    setJobTraces(new Map());
+    setTurnTraces(new Map());
     setUserToggles(new Map());
     inFlight.current = new Set();
     fetchedStatus.current = new Map();
   }, [sessionId]);
 
-  // Derive the active job id from URL ∩ overview. Default to the oldest job.
-  const activeJobId =
-    jobIdParam && overview?.jobs.some((j) => j.job_id === jobIdParam)
-      ? jobIdParam
-      : (overview?.jobs[0]?.job_id ?? '');
-  const activeJobSummary = overview?.jobs.find((j) => j.job_id === activeJobId);
-  const activeJobTrace = activeJobId ? jobTraces.get(activeJobId) : undefined;
+  // Derive the active turn id from URL ∩ overview. Default to the oldest turn.
+  const activeTurnId =
+    turnIdParam && overview?.turns.some((t) => t.turn_id === turnIdParam)
+      ? turnIdParam
+      : (overview?.turns[0]?.turn_id ?? '');
+  const activeTurnSummary = overview?.turns.find((t) => t.turn_id === activeTurnId);
+  const activeTurnTrace = activeTurnId ? turnTraces.get(activeTurnId) : undefined;
   const messageLog = useMemo(() => overview?.session_messages ?? [], [overview]);
   const interjectionIndex = useMemo(() => buildInterjectionIndex(messageLog), [messageLog]);
 
-  const fetchJobTrace = useCallback(
-    async (jobId: string, status?: JobStatusKind) => {
-      if (!jobId) return;
+  const fetchTurnTrace = useCallback(
+    async (turnId: string, status?: TurnStatusKind) => {
+      if (!turnId) return;
       // `inFlight` dedupes concurrent fetches (double-invoke, overlapping
       // polls); the cache-hit skip lives in the caller, which holds current
-      // `jobTraces` — so this callback stays a stable identity.
-      if (inFlight.current.has(jobId)) return;
-      inFlight.current.add(jobId);
-      setLoadingJobs((prev) => {
+      // `turnTraces` — so this callback stays a stable identity.
+      if (inFlight.current.has(turnId)) return;
+      inFlight.current.add(turnId);
+      setLoadingTurns((prev) => {
         const next = new Set(prev);
-        next.add(jobId);
+        next.add(turnId);
         return next;
       });
       const record = () => {
-        if (status) fetchedStatus.current.set(jobId, status);
+        if (status) fetchedStatus.current.set(turnId, status);
       };
       try {
         if (isMock) {
-          const mock = getMockJobTrace(sessionId, jobId);
+          const mock = getMockTurnTrace(sessionId, turnId);
           if (mock) {
-            setJobTraces((prev) => new Map(prev).set(jobId, mock));
+            setTurnTraces((prev) => new Map(prev).set(turnId, mock));
             record();
           }
           return;
         }
-        const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}/jobs/{job_id}', {
-          params: { path: { session_id: sessionId, job_id: jobId } },
+        const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}/turns/{turn_id}', {
+          params: { path: { session_id: sessionId, turn_id: turnId } },
         });
         if (response.status === 401) {
           logout();
@@ -1109,15 +1109,15 @@ export function TraceSessionPage() {
           // Non-fatal — keep the overview visible; the next poll retries.
           return;
         }
-        setJobTraces((prev) => new Map(prev).set(jobId, data as unknown as JobTrace));
+        setTurnTraces((prev) => new Map(prev).set(turnId, data as unknown as TurnTrace));
         record();
       } catch {
-        // Network errors on the per-job fetch are non-fatal.
+        // Network errors on the per-turn fetch are non-fatal.
       } finally {
-        inFlight.current.delete(jobId);
-        setLoadingJobs((prev) => {
+        inFlight.current.delete(turnId);
+        setLoadingTurns((prev) => {
           const next = new Set(prev);
-          next.delete(jobId);
+          next.delete(turnId);
           return next;
         });
       }
@@ -1125,83 +1125,83 @@ export function TraceSessionPage() {
     [client, isMock, logout, sessionId],
   );
 
-  // The jobs whose step tree we need loaded: the failure path + expanded +
-  // selection. While a filter is active every job must load — a content filter
-  // that searched only the already-loaded jobs would silently hide matches.
+  // The turns whose step tree we need loaded: the failure path + expanded +
+  // selection. While a filter is active every turn must load — a content filter
+  // that searched only the already-loaded turns would silently hide matches.
   const neededIds = useMemo(() => {
     if (!overview) return [];
-    if (filtering) return overview.jobs.map((j) => j.job_id);
-    return neededJobIds(overview.jobs, userToggles, activeJobId);
-  }, [overview, userToggles, activeJobId, filtering]);
+    if (filtering) return overview.turns.map((t) => t.turn_id);
+    return neededTurnIds(overview.turns, userToggles, activeTurnId);
+  }, [overview, userToggles, activeTurnId, filtering]);
 
-  // Load missing needed jobs and keep live ones fresh. A poll bumps
+  // Load missing needed turns and keep live ones fresh. A poll bumps
   // `refreshKey` → overview refetches → `neededIds` gets a new identity → this
-  // effect re-runs, refreshing live jobs at the fast cadence. `jobTraces` is
-  // read as a snapshot, NOT a dep — a job becomes needed solely via
-  // `neededIds`/`overview`, and depending on `jobTraces` would make a live
-  // job's completed fetch re-trigger and refetch forever.
+  // effect re-runs, refreshing live turns at the fast cadence. `turnTraces` is
+  // read as a snapshot, NOT a dep — a turn becomes needed solely via
+  // `neededIds`/`overview`, and depending on `turnTraces` would make a live
+  // turn's completed fetch re-trigger and refetch forever.
   useEffect(() => {
     if (!overview) return;
-    for (const jid of neededIds) {
-      const summary = overview.jobs.find((j) => j.job_id === jid);
-      const live = summary ? isJobLive(summary.job_status_kind) : false;
-      const missing = !jobTraces.has(jid);
-      if (missing || live) void fetchJobTrace(jid, summary?.job_status_kind);
+    for (const tid of neededIds) {
+      const summary = overview.turns.find((t) => t.turn_id === tid);
+      const live = summary ? isTurnLive(summary.turn_status_kind) : false;
+      const missing = !turnTraces.has(tid);
+      if (missing || live) void fetchTurnTrace(tid, summary?.turn_status_kind);
     }
-    // `jobTraces` is a deliberate snapshot read: adding it as a dep would make a
-    // completed fetch re-fire this effect and refetch a live job forever.
+    // `turnTraces` is a deliberate snapshot read: adding it as a dep would make a
+    // completed fetch re-fire this effect and refetch a live turn forever.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [neededIds, overview, fetchJobTrace]);
+  }, [neededIds, overview, fetchTurnTrace]);
 
-  // Completion catcher: a job whose cached trace was fetched at a now-stale
+  // Completion catcher: a turn whose cached trace was fetched at a now-stale
   // status (its last fetch happened while live, before it went terminal) is
-  // refetched once so the finalized tree/output loads. Keyed on `jobTraces` so
+  // refetched once so the finalized tree/output loads. Keyed on `turnTraces` so
   // it fires even after polling stops (the fast-path load effect above can miss
-  // this when a per-job fetch outlives the poll interval). Excludes live jobs,
+  // this when a per-turn fetch outlives the poll interval). Excludes live turns,
   // so `status` settling makes it converge instead of looping.
   useEffect(() => {
     if (!overview) return;
-    for (const summary of overview.jobs) {
-      if (!jobTraces.has(summary.job_id)) continue;
-      if (isJobLive(summary.job_status_kind)) continue;
-      if (fetchedStatus.current.get(summary.job_id) !== summary.job_status_kind) {
-        void fetchJobTrace(summary.job_id, summary.job_status_kind);
+    for (const summary of overview.turns) {
+      if (!turnTraces.has(summary.turn_id)) continue;
+      if (isTurnLive(summary.turn_status_kind)) continue;
+      if (fetchedStatus.current.get(summary.turn_id) !== summary.turn_status_kind) {
+        void fetchTurnTrace(summary.turn_id, summary.turn_status_kind);
       }
     }
-  }, [jobTraces, overview, fetchJobTrace]);
+  }, [turnTraces, overview, fetchTurnTrace]);
 
-  // Interjections folded into each job (the [started, ended) window contains
-  // the interjection row's created_at). Jobs run sequentially → unambiguous.
-  const interjectionsByJob = useMemo(() => {
-    const byJob = new Map<string, SessionMessageRow[]>();
+  // Interjections folded into each turn (the [started, ended) window contains
+  // the interjection row's created_at). Turns run sequentially → unambiguous.
+  const interjectionsByTurn = useMemo(() => {
+    const byTurn = new Map<string, SessionMessageRow[]>();
     const interjections = (overview?.session_messages ?? []).filter((r) => r.message.source === 'user_interjection');
-    if (interjections.length === 0) return byJob;
-    for (const job of overview?.jobs ?? []) {
-      const startIso = job.started_at ?? job.created_at;
+    if (interjections.length === 0) return byTurn;
+    for (const turn of overview?.turns ?? []) {
+      const startIso = turn.started_at ?? turn.created_at;
       if (!startIso) continue;
       const start = new Date(startIso).getTime();
-      const end = job.ended_at ? new Date(job.ended_at).getTime() : Number.POSITIVE_INFINITY;
+      const end = turn.ended_at ? new Date(turn.ended_at).getTime() : Number.POSITIVE_INFINITY;
       const rows = interjections.filter((r) => {
         const t = new Date(r.created_at).getTime();
         return t >= start && t < end;
       });
-      if (rows.length > 0) byJob.set(job.job_id, rows);
+      if (rows.length > 0) byTurn.set(turn.turn_id, rows);
     }
-    return byJob;
+    return byTurn;
   }, [overview]);
 
-  const interjectionCountByJob = useMemo(() => {
+  const interjectionCountByTurn = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const [jid, rows] of interjectionsByJob) counts.set(jid, rows.length);
+    for (const [tid, rows] of interjectionsByTurn) counts.set(tid, rows.length);
     return counts;
-  }, [interjectionsByJob]);
+  }, [interjectionsByTurn]);
 
   // LLM-call spans whose input first folds in a mid-turn interjection — marked
-  // across EVERY loaded job (the tree renders spans for any expanded job, not
-  // just the active one). The monotonic count resets per job.
+  // across EVERY loaded turn (the tree renders spans for any expanded turn, not
+  // just the active one). The monotonic count resets per turn.
   const interjectionSpanIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const trace of jobTraces.values()) {
+    for (const trace of turnTraces.values()) {
       const llmSpans: Span[] = [];
       for (const rs of trace.steps) {
         for (const span of rs.spans) {
@@ -1216,10 +1216,10 @@ export function TraceSessionPage() {
         // Counted off the precomputed index, NOT by rebuilding the message list
         // per span — that was O(spans × transcript) on every poll tick.
         const count = interjectionInputCount(span.kind.begin.input_messages, span.started_at, interjectionIndex);
-        // Seed the baseline from the job's FIRST LLM input: interjections
-        // already carried in from earlier jobs (persisted transcripts replay the
-        // whole history) are not new to this job, so only a count that RISES
-        // above the baseline marks the iteration this job's steering entered.
+        // Seed the baseline from the turn's FIRST LLM input: interjections
+        // already carried in from earlier turns (persisted transcripts replay the
+        // whole history) are not new to this turn, so only a count that RISES
+        // above the baseline marks the iteration this turn's steering entered.
         if (first) {
           seen = count;
           first = false;
@@ -1230,14 +1230,14 @@ export function TraceSessionPage() {
       }
     }
     return ids;
-  }, [jobTraces, interjectionIndex]);
+  }, [turnTraces, interjectionIndex]);
 
   // Polling — visibility-aware, two-tier. A single `refreshKey` bump refetches
-  // the overview; that cascades (via `neededIds`) into refetching live jobs.
+  // the overview; that cascades (via `neededIds`) into refetching live turns.
   const activeIsLive =
-    !!activeJobSummary && (isJobLive(activeJobSummary.job_status_kind) || traceHasPendingSpan(activeJobTrace));
-  const anyJobLive = overview?.jobs.some((j) => isJobLive(j.job_status_kind)) ?? false;
-  const polling = activeIsLive || anyJobLive;
+    !!activeTurnSummary && (isTurnLive(activeTurnSummary.turn_status_kind) || traceHasPendingSpan(activeTurnTrace));
+  const anyTurnLive = overview?.turns.some((t) => isTurnLive(t.turn_status_kind)) ?? false;
+  const polling = activeIsLive || anyTurnLive;
 
   useEffect(() => {
     if (isMock || !polling) return;
@@ -1253,15 +1253,15 @@ export function TraceSessionPage() {
   // When the selection changes via URL — deep link, breadcrumb, jump-to-llm,
   // back/forward — drop any stale collapse override on its ancestors so the
   // selected node is revealed (the design's "URL-selected node auto-expands its
-  // ancestors"). Keyed on the URL params only, NOT on jobTraces, so a poll
+  // ancestors"). Keyed on the URL params only, NOT on turnTraces, so a poll
   // refetch never re-expands a node the user deliberately collapsed.
   useEffect(() => {
     setUserToggles((prev) => {
       const ancestors: string[] = [];
-      if (jobIdParam) ancestors.push(jobIdParam);
+      if (turnIdParam) ancestors.push(turnIdParam);
       if (stepIdParam) ancestors.push(stepIdParam);
       if (spanIdParam) {
-        const owning = findSpan(jobTraces.get(activeJobId), spanIdParam)?.stepId;
+        const owning = findSpan(turnTraces.get(activeTurnId), spanIdParam)?.stepId;
         if (owning) ancestors.push(owning);
       }
       if (!ancestors.some((a) => prev.has(a))) return prev;
@@ -1269,13 +1269,13 @@ export function TraceSessionPage() {
       for (const a of ancestors) next.delete(a);
       return next;
     });
-    // `jobTraces` is read as a snapshot, deliberately NOT a dep: re-running on
+    // `turnTraces` is read as a snapshot, deliberately NOT a dep: re-running on
     // every poll refetch would re-expand a node the user just collapsed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobIdParam, stepIdParam, spanIdParam, activeJobId]);
+  }, [turnIdParam, stepIdParam, spanIdParam, activeTurnId]);
 
   const updateUrl = useCallback(
-    (next: Partial<{ job: string | null; step: string | null; span: string | null; tab: string | null }>) => {
+    (next: Partial<{ turn: string | null; step: string | null; span: string | null; tab: string | null }>) => {
       const sp = new URLSearchParams(searchParams);
       for (const [k, v] of Object.entries(next)) {
         if (v == null || v === '') sp.delete(k);
@@ -1293,43 +1293,43 @@ export function TraceSessionPage() {
     setUserToggles((prev) => new Map(prev).set(nodeId, !currentlyOpen));
   }, []);
 
-  const handleSelectJob = useCallback(
-    (jobId: string) => updateUrl({ job: jobId, step: null, span: null }),
+  const handleSelectTurn = useCallback(
+    (turnId: string) => updateUrl({ turn: turnId, step: null, span: null }),
     [updateUrl],
   );
-  // A job anchor is a "take me to this job" action, so it must clear an active
-  // filter — otherwise the filter can hide the very job it just selected and the
+  // A turn anchor is a "take me to this turn" action, so it must clear an active
+  // filter — otherwise the filter can hide the very turn it just selected and the
   // tree shows nothing while the detail panel switches.
-  const handleJumpToJob = useCallback(
-    (jobId: string) => {
+  const handleJumpToTurn = useCallback(
+    (turnId: string) => {
       setFailuresOnly(false);
       setFilterRaw('');
       setFilter('');
-      handleSelectJob(jobId);
+      handleSelectTurn(turnId);
     },
-    [handleSelectJob],
+    [handleSelectTurn],
   );
 
   const handleSelectStep = useCallback(
-    (jobId: string, stepId: string) => updateUrl({ job: jobId, step: stepId, span: null }),
+    (turnId: string, stepId: string) => updateUrl({ turn: turnId, step: stepId, span: null }),
     [updateUrl],
   );
   const handleSelectSpan = useCallback(
-    (jobId: string, spanId: string) => updateUrl({ job: jobId, span: spanId, step: null, tab: tabParam }),
+    (turnId: string, spanId: string) => updateUrl({ turn: turnId, span: spanId, step: null, tab: tabParam }),
     [tabParam, updateUrl],
   );
 
   const handleJumpToLlm = useCallback(
     (llmSpanId: string) => {
       updateUrl({ span: llmSpanId, step: null });
-      const found = findSpan(activeJobTrace, llmSpanId);
+      const found = findSpan(activeTurnTrace, llmSpanId);
       if (found) {
         setTimeout(() => {
           document.querySelector(`[data-step-id="${found.stepId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }, 16);
       }
     },
-    [activeJobTrace, updateUrl],
+    [activeTurnTrace, updateUrl],
   );
 
   const handleDrillIntoChild = useCallback(
@@ -1359,19 +1359,19 @@ export function TraceSessionPage() {
     return <div className="p-5 text-ink-soft">No trace.</div>;
   }
 
-  const selectedSpan = spanIdParam ? (findSpan(activeJobTrace, spanIdParam)?.span ?? null) : null;
-  const selectedStepRs = !selectedSpan && stepIdParam ? findStep(activeJobTrace, stepIdParam) : null;
-  const activeJobIndex = activeJobSummary ? overview.jobs.indexOf(activeJobSummary) : 0;
+  const selectedSpan = spanIdParam ? (findSpan(activeTurnTrace, spanIdParam)?.span ?? null) : null;
+  const selectedStepRs = !selectedSpan && stepIdParam ? findStep(activeTurnTrace, stepIdParam) : null;
+  const activeTurnIndex = activeTurnSummary ? overview.turns.indexOf(activeTurnSummary) : 0;
   const externalAgent =
     !selectedSpan &&
     !selectedStepRs &&
-    !!activeJobSummary &&
-    isExternalAgentJob(activeJobTrace, activeJobSummary.job_status_kind);
+    !!activeTurnSummary &&
+    isExternalAgentTurn(activeTurnTrace, activeTurnSummary.turn_status_kind);
 
-  const activeTokens = activeJobTrace
-    ? traceTokens(activeJobTrace)
-    : activeJobSummary
-      ? summaryTokens(activeJobSummary)
+  const activeTokens = activeTurnTrace
+    ? traceTokens(activeTurnTrace)
+    : activeTurnSummary
+      ? summaryTokens(activeTurnSummary)
       : null;
 
   return (
@@ -1393,16 +1393,16 @@ export function TraceSessionPage() {
             <span className="truncate">{overview.session_id}</span>
           </span>
           <span className="shrink-0">
-            {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
+            {overview.turns.length} {overview.turns.length === 1 ? 'turn' : 'turns'}
           </span>
-          {activeJobSummary && activeTokens && (
+          {activeTurnSummary && activeTokens && (
             <span className="shrink-0 inline-flex items-center gap-2">
               <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
-                {overview.jobs.length === 1 ? 'Tokens' : `Job #${activeJobIndex + 1}`}
+                {overview.turns.length === 1 ? 'Tokens' : `Turn #${activeTurnIndex + 1}`}
               </span>
               <span className="text-ink">↑ {activeTokens.inputTotal.toLocaleString()}</span>
               <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
-              <span className="text-ink-soft">• {formatDuration(jobDurationMs(activeJobSummary, activeJobTrace))}</span>
+              <span className="text-ink-soft">• {formatDuration(turnDurationMs(activeTurnSummary, activeTurnTrace))}</span>
             </span>
           )}
           {polling && !isMock && (
@@ -1422,8 +1422,8 @@ export function TraceSessionPage() {
 
       <TraceOverviewBar
         overview={overview}
-        jobTraces={jobTraces}
-        loadingJobs={loadingJobs}
+        turnTraces={turnTraces}
+        loadingTurns={loadingTurns}
         highlight={highlight}
         onHighlight={setHighlight}
         selectedSpanId={selectedSpan?.id ?? null}
@@ -1433,26 +1433,26 @@ export function TraceSessionPage() {
       />
 
       <div className="flex-1 flex overflow-hidden min-h-0">
-        <JobAnchors
+        <TurnAnchors
           overview={overview}
-          jobTraces={jobTraces}
+          turnTraces={turnTraces}
           messageLog={messageLog}
-          activeJobId={activeJobId}
-          onSelectJob={handleJumpToJob}
+          activeTurnId={activeTurnId}
+          onSelectTurn={handleJumpToTurn}
         />
         <TraceTree
           overview={overview}
-          jobTraces={jobTraces}
-          loadingJobs={loadingJobs}
+          turnTraces={turnTraces}
+          loadingTurns={loadingTurns}
           userToggles={userToggles}
           onToggle={handleToggle}
-          selectedJobId={activeJobId}
+          selectedTurnId={activeTurnId}
           selectedStepId={selectedStepRs?.step.id ?? null}
           selectedSpanId={selectedSpan?.id ?? null}
-          onSelectJob={handleSelectJob}
+          onSelectTurn={handleSelectTurn}
           onSelectStep={handleSelectStep}
           onSelectSpan={handleSelectSpan}
-          interjectionCountByJob={interjectionCountByJob}
+          interjectionCountByTurn={interjectionCountByTurn}
           interjectionSpanIds={interjectionSpanIds}
           messageLog={messageLog}
           highlight={highlight}
@@ -1474,18 +1474,18 @@ export function TraceSessionPage() {
               onDrillIn={handleDrillIntoChild}
             />
           ) : selectedStepRs ? (
-            <StepDetail rs={selectedStepRs} jobId={activeJobId} onSelectSpan={handleSelectSpan} />
+            <StepDetail rs={selectedStepRs} turnId={activeTurnId} onSelectSpan={handleSelectSpan} />
           ) : externalAgent ? (
             <TranscriptPanel messageLog={messageLog} />
           ) : (
-            <JobSummaryPanel
-              summary={activeJobSummary}
-              trace={activeJobTrace}
-              traceLoading={loadingJobs.has(activeJobId)}
+            <TurnSummaryPanel
+              summary={activeTurnSummary}
+              trace={activeTurnTrace}
+              traceLoading={loadingTurns.has(activeTurnId)}
               messageLog={messageLog}
-              jobIndex={activeJobIndex}
-              totalJobs={overview.jobs.length}
-              interjections={interjectionsByJob.get(activeJobId) ?? []}
+              turnIndex={activeTurnIndex}
+              totalTurns={overview.turns.length}
+              interjections={interjectionsByTurn.get(activeTurnId) ?? []}
             />
           )}
         </aside>

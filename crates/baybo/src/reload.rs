@@ -57,16 +57,16 @@ pub(crate) async fn build_pool_clients(
 ) -> anyhow::Result<BuiltPoolClients> {
     let proxy = boot::proxy_settings(config);
 
-    // One build job per (entry, model) across the entry's normalized
+    // One build turn per (entry, model) across the entry's normalized
     // `models()`. `is_default` marks the entry's primary model (goes into
     // `clients`); the rest go to `overrides`. A model listed twice builds
     // once.
-    struct Job<'a> {
+    struct Turn<'a> {
         entry: &'a baybo_config::LlmEntry,
         spec: baybo_config::LlmModelSpec,
         is_default: bool,
     }
-    let jobs: Vec<Job<'_>> = config
+    let turns: Vec<Turn<'_>> = config
         .llm
         .iter()
         .flat_map(|entry| {
@@ -75,7 +75,7 @@ pub(crate) async fn build_pool_clients(
                 .models()
                 .into_iter()
                 .filter(move |spec| seen.insert(spec.model.clone()))
-                .map(move |spec| Job {
+                .map(move |spec| Turn {
                     entry,
                     is_default: spec.model == entry.model,
                     spec,
@@ -83,15 +83,15 @@ pub(crate) async fn build_pool_clients(
         })
         .collect();
 
-    let results = futures::future::join_all(jobs.into_iter().map(|job| {
+    let results = futures::future::join_all(turns.into_iter().map(|turn| {
         let blob = blob.clone();
         let vault = Arc::clone(&vault);
         let billing = cost_hooks(cost_manager);
         let proxy = proxy.clone();
         async move {
             let r = boot::build_llm_client_for_entry_model(
-                job.entry,
-                &job.spec,
+                turn.entry,
+                &turn.spec,
                 registry,
                 Some(blob),
                 Some(vault),
@@ -99,7 +99,7 @@ pub(crate) async fn build_pool_clients(
                 proxy,
             )
             .await;
-            (job.entry.name.clone(), job.spec.model, job.is_default, r)
+            (turn.entry.name.clone(), turn.spec.model, turn.is_default, r)
         }
     }))
     .await;

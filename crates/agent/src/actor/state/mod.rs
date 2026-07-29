@@ -34,10 +34,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
-use baybo_job::JobLifecycle;
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
 use baybo_trace::SpanRecorder;
+use baybo_turn::TurnLifecycle;
 
 pub mod marker;
 
@@ -82,7 +82,7 @@ impl DurableActorState {
 pub struct VolatileResources {
     pub agent_loop: AgentLoop,
     pub response_tx: mpsc::Sender<AgentOutput>,
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub span_recorder: Arc<SpanRecorder>,
     /// Lifetime token for this actor. Derived as a child of the
     /// `parent_token` passed at construction. For top-level user/cron
@@ -122,7 +122,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     fn assert_volatile<T: Volatile>() {}
     assert_volatile::<AgentLoop>();
     assert_volatile::<mpsc::Sender<AgentOutput>>();
-    assert_volatile::<Arc<JobLifecycle>>();
+    assert_volatile::<Arc<TurnLifecycle>>();
     assert_volatile::<Arc<SpanRecorder>>();
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();

@@ -4,10 +4,10 @@
 
 The `baybo-cli` crate is the **operator-facing command layer** for Baybo. It does two things and only two things:
 
-1. **Argv mode** — `baybo <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `baybo config show`, `baybo job list`, `baybo session export <id>`.
+1. **Argv mode** — `baybo <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `baybo config show`, `baybo turn list`, `baybo session export <id>`.
 2. **Slash mode** — while a user is chatting over any channel, lines starting with `/` (e.g. `/config show`, `/cron list`) are intercepted by the channel adapter, dispatched through the same parser and handlers as Argv mode, and their output returned to the user as a normal response. Slash commands **do not** enter the agent's conversation context.
 
-`baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
+`baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `TurnLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
 The command taxonomy is organized by subsystem: one family per manager exposed in `crates/baybo/src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. browser control, node fabric, `mcp serve`) get no command family at all.
 
@@ -29,7 +29,7 @@ Every command receives a `CommandContext` carrying `Arc` clones of the managers 
 
 ### Explicit mutation confirmation in slash mode
 
-Confirmation is per-subcommand: every mutating subcommand carries a `--yes` (or `-y`) flag in the clap tree, and its handler checks the invocation — over slash, without `--yes` (or a pre-confirmed `ctx.confirmed`), it returns `CliError::ConfirmationRequired` and the response explains what would have happened. Argv mode allows interactive prompts; slash mode does not (there is no TTY guarantee on non-CLI channels). This keeps mis-typed `/job cancel foo` from firing silently while a user is chatting.
+Confirmation is per-subcommand: every mutating subcommand carries a `--yes` (or `-y`) flag in the clap tree, and its handler checks the invocation — over slash, without `--yes` (or a pre-confirmed `ctx.confirmed`), it returns `CliError::ConfirmationRequired` and the response explains what would have happened. Argv mode allows interactive prompts; slash mode does not (there is no TTY guarantee on non-CLI channels). This keeps mis-typed `/turn cancel foo` from firing silently while a user is chatting.
 
 ### Output format is structured, not just printed
 
@@ -39,7 +39,7 @@ Commands return `CommandOutput`, not `String`. The caller decides how to render:
 - `OutputFormat::Json` → `serde_json::to_string_pretty` for scripts
 - `OutputFormat::Plain` → uncolored single-block text, what slash renders when sending back over a channel
 
-`--json` and `--plain` are global flags and work identically in both modes — `/job list --json` returns a JSON-formatted text block.
+`--json` and `--plain` are global flags and work identically in both modes — `/turn list --json` returns a JSON-formatted text block.
 
 ### Shell completion is built-in
 
@@ -82,14 +82,14 @@ custom help printer to keep in sync.
 
 Hidden by default — only listed when `BAYBO_HELP_AGENT` is set:
 
-- Subcommands: `config`, `session`, `job`, `cron`, `log`, `cost`
+- Subcommands: `config`, `session`, `turn`, `cron`, `log`, `cost`
 
 `session` is the unified "everything about a session" surface: metadata
 (`show`), chat transcript (`history`), and full execution-trace JSON
 (`export`). The earlier separate `trace` family was folded back into
 `session` — operators kept hitting the "which command shows me what
 happened in session X" branch and the split bought nothing. The
-execution-trace summary (jobs / steps / spans counts) is now appended
+execution-trace summary (turns / steps / spans counts) is now appended
 to `session show` directly when the trace graph is wired.
 
 `log` is a distinct family because it reads the **rolling tracing
@@ -137,14 +137,14 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `baybo.json` and per-entry vault keys                                                       | shipped                                           |
 | `memory`     | `status` · `setup` · `test` · `disable`                                                                   | `baybo-memory` backends + `UserSecretManager` (`user_env.<NAME>` shared with `baybo secret`) | `status` / `test` are read-only (test runs the backend's startup health probe); `setup` is interactive (single-select provider picker + endpoint for openviking) and persists to `baybo.json`; the actual API-key value goes through `baybo secret add <NAME>` (defaults: `MEM0_API_KEY` / `OPENVIKING_API_KEY`); `disable` flips `provider = noop` and clears `extra`. Memory config is **not** hot-reload, so each mutating command prints a restart hint. | shipped                                           |
 | `external-agent` | `status` · `setup` · `disable` · `default`                                                            | `baybo-agent::external_agent` CLI backends (Claude Code / Codex / Gemini)     | `status` re-probes each kind offline (read-only); `setup` is an interactive wizard that probes a binary path and writes the resolved **absolute** `external_agents.<kind>.binary_path` to `baybo.json` (empty input = PATH lookup, still recorded as a concrete path); `disable` is a multi-select that flips `external_agents.<kind>.enabled = false` for the checked kinds and re-resolves the default (no-op success when nothing is enabled); `default` sets `external_agents.default_external_agent` to an enabled kind (operator-facing designation — nothing reads it at runtime yet, so no restart) | shipped                                           |
-| `session`    | `list` · `show <id>` · `history <id> [--include-superseded \| --superseded-only]` · `export <id> [--out <path>]` | `SessionManager` + `QueryApi::replay`                                        | read-only. `show` returns metadata + message count + (when `QueryApi` is wired) jobs/steps/spans counts from the trace store. `history` defaults to the *active* (non-superseded) transcript; `--include-superseded` walks the full log and tags each row `[active]` or `[→ #N]`, `--superseded-only` keeps just the dropped rows. `export` writes the full call tree as pretty JSON (stdout, or `--out <path>` with `--yes` required in slash mode). | shipped                                           |
-| `job`        | `list [--status]` · `show <id>` · `cancel <id>`                                                           | `JobLifecycle`                                                               | `cancel` mutates                                                                                   | shipped                                           |
+| `session`    | `list` · `show <id>` · `history <id> [--include-superseded \| --superseded-only]` · `export <id> [--out <path>]` | `SessionManager` + `QueryApi::replay`                                        | read-only. `show` returns metadata + message count + (when `QueryApi` is wired) turns/steps/spans counts from the trace store. `history` defaults to the *active* (non-superseded) transcript; `--include-superseded` walks the full log and tags each row `[active]` or `[→ #N]`, `--superseded-only` keeps just the dropped rows. `export` writes the full call tree as pretty JSON (stdout, or `--out <path>` with `--yes` required in slash mode). | shipped                                           |
+| `turn`       | `list [--status]` · `show <id>` · `cancel <id>`                                                           | `TurnLifecycle`                                                              | `cancel` mutates                                                                                   | shipped                                           |
 | `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. Cron mutations are driven through the LLM tools (`CronCreate`, `CronUpdate`, `CronDelete`, `CronPause`, `CronResume`, `CronList`) registered by `baybo-cron::tools::agent_tools`, and through the admin `/v1/cron` API + web cron page, which additionally own the recycle bin (list deleted / restore). | shipped                                           |
 | `log`        | `main [--date <YYYY-MM-DD>] [-n <limit>] [-f/--follow]` · `channel <channel> [--date] [-n] [-f]` | Workspace `logs/` files (`logs/baybo.log.<date>`, `logs/channel/<ch>.log.<date>`) written by the tracing appender | read-only. Tails the last `--limit` lines (default 200) by seeking backwards from EOF; `--follow` polls for appended bytes until Ctrl-C (incompatible with `--json`). | shipped                                           |
 | `secret`     | `add [NAME] [--force]` · `list` · `delete [NAME] [--yes]`                                                 | `baybo_security::UserSecretManager` over `SecretVault` (`user_env.<NAME>`)    | `add`/`delete` mutate the vault. `add` reads the value via masked TTY input (never an argument that would hit shell history) and is terminal-only (rejected in slash); `list` shows a masked first/last-char preview; `delete` with no NAME is an interactive single-select picker and needs `--yes` in slash mode. Agent-side counterparts are the `SecretAdd`/`SecretList`/`SecretCheck` tools — there is no agent delete. | shipped |
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` would return rule count by action + vault master-key flag (never secret material); `leaks check` would report blocked/hits via the shared detector | deferred — no `Security` variant in the clap tree yet |
-| `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
-| `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
+| `cost`       | `show [--user <u> \| --session <id> \| --turn <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`       | `QueryApi::cost_summary` (`CostScope::{User, Session, Turn, TimeRange}`)     | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--turn` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
+| `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `TurnLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight turn count, failed-turns-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
 | `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `baybo-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `crates/baybo/src/main.rs` before dispatch, runs in `crates/baybo/src/gateway_cmd.rs`) |
 | `vault`      | `rotate [--yes]`                                                                                          | `baybo_security::key_file` over `SecretVault`                                 | Re-encrypts every vault entry under a fresh master key and replaces the key file. Terminal-only (rejected in slash). Gated three ways: the workspace singleton lock is *held* for the whole run so a gateway can neither be running nor start midway; the operator must type the outgoing key (masked) rather than answer a `[y/N]`; and the outgoing key plus the current `secrets` rows are written to a backup directory first. | shipped |
 | `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `baybo_store::ChannelPairingStore`                                            | `approve`/`revoke` mutate                                                                          | shipped                                           |
@@ -253,7 +253,7 @@ Persistent TUI input history is owned by the gateway, not `baybo-cli`. The TUI l
 
 ### Dashboard shortcut
 
-Bare dashboard commands — `/skills`, `/jobs`, `/sessions` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
+Bare dashboard commands — `/skills`, `/turns`, `/sessions` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
 
 ### Skill shortcut
 
@@ -265,7 +265,7 @@ Bare dashboard commands — `/skills`, `/jobs`, `/sessions` with no further toke
 
 ### Mutation feedback
 
-When a mutating command runs in slash mode, its response includes the affected id (job id, server name, config path, …), so the user sees an auditable handle. This aligns with the observability constraint in CLAUDE.md.
+When a mutating command runs in slash mode, its response includes the affected id (turn id, server name, config path, …), so the user sees an auditable handle. This aligns with the observability constraint in CLAUDE.md.
 
 ## Constraints
 
@@ -284,7 +284,7 @@ When a mutating command runs in slash mode, its response includes the affected i
 | `config`                                                                                                            | `config` family directly reads/writes `BayboConfig`; `doctor` reads the loaded config (path + `security.encryption_key_file`).                                    |
 | `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
-| `job` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
+| `turn` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
 
 ## Verification
 

@@ -46,7 +46,7 @@ One `AgentActor` per session. All messages targeting the same session (user inpu
 
 ### Subagent parent deletion drains the subtree first — design intent, not yet wired
 
-`CancelReason::ParentDeleted` exists in `baybo-job` for this, but today `SessionManager::delete` performs no subagent cancellation and has no production caller: the chat `DELETE /v1/chat/sessions/:id` endpoint hides the session via `set_hidden` instead of deleting it. If row-level deletion ever gets a production path, it must trip the subagent's cancellation token (`Cancelled { ParentDeleted }`) **before** the parent row is removed, so a parent never disappears while a child is still running tools or holding LLM state.
+`CancelReason::ParentDeleted` exists in `baybo-turn` for this, but today `SessionManager::delete` performs no subagent cancellation and has no production caller: the chat `DELETE /v1/chat/sessions/:id` endpoint hides the session via `set_hidden` instead of deleting it. If row-level deletion ever gets a production path, it must trip the subagent's cancellation token (`Cancelled { ParentDeleted }`) **before** the parent row is removed, so a parent never disappears while a child is still running tools or holding LLM state.
 
 ### Session ID conventions
 

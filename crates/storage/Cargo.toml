@@ -38,7 +38,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 baybo-trace = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

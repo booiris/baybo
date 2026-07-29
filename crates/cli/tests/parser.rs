@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use baybo_cli::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, LogCmd,
-    SessionCmd, ShellKind, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, LlmCmd, LogCmd, SessionCmd, ShellKind,
+    SkillsCmd, TurnCmd, TurnStatusArg,
 };
 use clap::Parser;
 
@@ -62,14 +62,14 @@ fn cost_show_scopes_are_mutually_exclusive() {
                 CostCmd::Show {
                     user,
                     session,
-                    job,
+                    turn,
                     since,
                     until,
                 },
         }) => {
             assert!(user.is_none());
             assert!(session.is_none());
-            assert!(job.is_none());
+            assert!(turn.is_none());
             assert!(since.is_none());
             assert!(until.is_none());
         }
@@ -84,12 +84,12 @@ fn cost_show_scopes_are_mutually_exclusive() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    // --user and --session / --job are mutually exclusive
+    // --user and --session / --turn are mutually exclusive
     assert!(
         Cli::try_parse_from(["baybo", "cost", "show", "--user", "u", "--session", "s"]).is_err()
     );
     assert!(
-        Cli::try_parse_from(["baybo", "cost", "show", "--session", "s", "--job", "j"]).is_err()
+        Cli::try_parse_from(["baybo", "cost", "show", "--session", "s", "--turn", "j"]).is_err()
     );
 }
 
@@ -521,39 +521,39 @@ fn session_kill_is_no_longer_a_subcommand() {
 }
 
 #[test]
-fn job_list_parses_without_filter() {
-    let cli = parse(&["job", "list"]);
+fn turn_list_parses_without_filter() {
+    let cli = parse(&["turn", "list"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::List { status },
+        Some(Commands::Turn {
+            cmd: TurnCmd::List { status },
         }) => assert!(status.is_none()),
         other => panic!("unexpected: {other:?}"),
     }
 }
 
 #[test]
-fn job_list_accepts_status_filter() {
-    let cli = parse(&["job", "list", "--status", "in-progress"]);
+fn turn_list_accepts_status_filter() {
+    let cli = parse(&["turn", "list", "--status", "in-progress"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::List { status },
-        }) => assert!(matches!(status, Some(JobStatusArg::InProgress))),
+        Some(Commands::Turn {
+            cmd: TurnCmd::List { status },
+        }) => assert!(matches!(status, Some(TurnStatusArg::InProgress))),
         other => panic!("unexpected: {other:?}"),
     }
 }
 
 #[test]
-fn job_list_rejects_unknown_status() {
-    assert!(Cli::try_parse_from(["baybo", "job", "list", "--status", "bogus"]).is_err());
+fn turn_list_rejects_unknown_status() {
+    assert!(Cli::try_parse_from(["baybo", "turn", "list", "--status", "bogus"]).is_err());
 }
 
 #[test]
-fn job_show_requires_id() {
-    assert!(Cli::try_parse_from(["baybo", "job", "show"]).is_err());
-    let cli = parse(&["job", "show", "jid-1"]);
+fn turn_show_requires_id() {
+    assert!(Cli::try_parse_from(["baybo", "turn", "show"]).is_err());
+    let cli = parse(&["turn", "show", "jid-1"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::Show { id },
+        Some(Commands::Turn {
+            cmd: TurnCmd::Show { id },
         }) => assert_eq!(id, "jid-1"),
         other => panic!("unexpected: {other:?}"),
     }
@@ -627,11 +627,11 @@ fn memory_is_no_longer_a_subcommand() {
 }
 
 #[test]
-fn job_cancel_accepts_yes_flag() {
-    let cli = parse(&["job", "cancel", "jid"]);
+fn turn_cancel_accepts_yes_flag() {
+    let cli = parse(&["turn", "cancel", "jid"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::Cancel { id, yes },
+        Some(Commands::Turn {
+            cmd: TurnCmd::Cancel { id, yes },
         }) => {
             assert_eq!(id, "jid");
             assert!(!yes);
@@ -639,18 +639,18 @@ fn job_cancel_accepts_yes_flag() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    let cli = parse(&["job", "cancel", "jid", "--yes"]);
+    let cli = parse(&["turn", "cancel", "jid", "--yes"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::Cancel { yes, .. },
+        Some(Commands::Turn {
+            cmd: TurnCmd::Cancel { yes, .. },
         }) => assert!(yes),
         other => panic!("unexpected: {other:?}"),
     }
 
-    let cli = parse(&["job", "cancel", "jid", "-y"]);
+    let cli = parse(&["turn", "cancel", "jid", "-y"]);
     match cli.command {
-        Some(Commands::Job {
-            cmd: JobCmd::Cancel { yes, .. },
+        Some(Commands::Turn {
+            cmd: TurnCmd::Cancel { yes, .. },
         }) => assert!(yes),
         other => panic!("unexpected: {other:?}"),
     }

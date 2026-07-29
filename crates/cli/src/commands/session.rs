@@ -109,12 +109,12 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "messages": messages.len(),
         "called_skills": baybo_context::scan_skill_calls(&messages),
     });
-    if let Some((jobs, steps, spans)) = trace_counts
+    if let Some((turns, steps, spans)) = trace_counts
         && let Value::Object(ref mut map) = value
     {
         map.insert(
             "trace".into(),
-            json!({ "jobs": jobs, "steps": steps, "spans": spans }),
+            json!({ "turns": turns, "steps": steps, "spans": spans }),
         );
     }
 
@@ -125,7 +125,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         called_skills.join(", ")
     };
     let trace_human = match trace_counts {
-        Some((j, s, p)) => format!("\ntrace:          {j} jobs · {s} steps · {p} spans"),
+        Some((j, s, p)) => format!("\ntrace:          {j} turns · {s} steps · {p} spans"),
         None => String::new(),
     };
 
@@ -296,14 +296,14 @@ async fn export(
         .replay(&session_id, None)
         .await
         .map_err(|e| CliError::Manager(format!("replay session: {e}")))?;
-    if replay.jobs.is_empty() {
+    if replay.turns.is_empty() {
         return Err(CliError::Manager(format!(
             "no trace recorded for session {id}"
         )));
     }
 
     let tree: Vec<Value> = replay
-        .jobs
+        .turns
         .iter()
         .map(|rj| {
             let steps: Vec<Value> = rj
@@ -311,10 +311,10 @@ async fn export(
                 .iter()
                 .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
                 .collect();
-            json!({ "job": rj.job, "steps": steps })
+            json!({ "turn": rj.turn, "steps": steps })
         })
         .collect();
-    let exported = json!({ "session": id, "jobs": tree });
+    let exported = json!({ "session": id, "turns": tree });
     let json_text = serde_json::to_string_pretty(&exported)
         .map_err(|e| CliError::Manager(format!("serialize trace: {e}")))?;
 

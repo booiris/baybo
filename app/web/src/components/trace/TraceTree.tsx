@@ -1,6 +1,6 @@
 /**
- * The unified trace navigator: a collapsible `Job → Step → Span` tree that
- * replaces the old flat job sidebar + step-card stream. Jobs collapse to a
+ * The unified trace navigator: a collapsible `Turn → Step → Span` tree that
+ * replaces the old flat turn sidebar + step-card stream. Turns collapse to a
  * single row; the failure path (failed / stuck / pending nodes) auto-expands
  * and collapsed parents carry a red roll-up badge, so a complex trace is
  * navigable at a glance. See docs/todo/trace-tree-redesign.md.
@@ -12,20 +12,20 @@
  * tree reads like a table and rarely needs the detail panel.
  *
  * Filter state is owned by the page (controlled) so it can eager-load every
- * job's step tree while a filter is active — a filter that searched only the
- * already-loaded jobs would silently hide matches.
+ * turn's step tree while a filter is active — a filter that searched only the
+ * already-loaded turns would silently hide matches.
  */
 import { useMemo, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { RiArrowDownSLine, RiArrowRightSLine, RiCornerDownLeftLine, RiLoader4Line } from 'react-icons/ri';
 import type {
-  JobTrace,
   LifecycleState,
   ReplayStep,
   SessionMessageRow,
   Span,
-  TraceJobSummary,
   TraceOverview,
+  TraceTurnSummary,
+  TurnTrace,
 } from '../../types/trace';
 import { resolveToolCallOutput } from '../../types/trace';
 import { Button } from '../Button';
@@ -34,7 +34,6 @@ import {
   durationMs,
   formatDuration,
   formatTok,
-  jobDurationMs,
   OutcomeBadge,
   stepSummaryText,
   stepVisual,
@@ -42,31 +41,32 @@ import {
   sumLlmTokens,
   summaryTokens,
   traceTokens,
+  turnDurationMs,
 } from './traceFormat';
 import type { TraceGroup } from './traceFormat';
 import { nodeGroup, spanToolName, spanVisualOf } from './traceFormat';
-import type { JobRollup } from './traceTreeModel';
-import { attention, isExternalAgentJob, isJobLive, jobRollup, resolveExpanded } from './traceTreeModel';
+import type { TurnRollup } from './traceTreeModel';
+import { attention, isExternalAgentTurn, isTurnLive, resolveExpanded, turnRollup } from './traceTreeModel';
 
-const INDENT_JOB = 8;
+const INDENT_TURN = 8;
 const INDENT_STEP = 26;
 const INDENT_SPAN = 46;
 
 export interface TraceTreeProps {
   overview: TraceOverview;
-  jobTraces: Map<string, JobTrace>;
-  loadingJobs: Set<string>;
+  turnTraces: Map<string, TurnTrace>;
+  loadingTurns: Set<string>;
   userToggles: Map<string, boolean>;
   /** Toggle a node's expansion. `currentlyOpen` is its displayed state, so the
    *  handler can flip it regardless of whether it was open by default. */
   onToggle: (id: string, currentlyOpen: boolean) => void;
-  selectedJobId: string | null;
+  selectedTurnId: string | null;
   selectedStepId: string | null;
   selectedSpanId: string | null;
-  onSelectJob: (jobId: string) => void;
-  onSelectStep: (jobId: string, stepId: string) => void;
-  onSelectSpan: (jobId: string, spanId: string) => void;
-  interjectionCountByJob: Map<string, number>;
+  onSelectTurn: (turnId: string) => void;
+  onSelectStep: (turnId: string, stepId: string) => void;
+  onSelectSpan: (turnId: string, spanId: string) => void;
+  interjectionCountByTurn: Map<string, number>;
   interjectionSpanIds: Set<string>;
   /** Session transcript — needed to resolve transcript-backed tool outputs for
    *  the inline I/O preview. */
@@ -93,8 +93,8 @@ function stepText(rs: ReplayStep): string {
   return `${stepVisual(rs.step.kind.kind).label} ${rs.step.kind.kind} ${stepSummaryText(rs.step, rs.spans)}`;
 }
 
-function jobText(job: TraceJobSummary, index: number): string {
-  return `#${index + 1} ${job.job_status_kind} ${job.job_id}`;
+function turnText(turn: TraceTurnSummary, index: number): string {
+  return `#${index + 1} ${turn.turn_status_kind} ${turn.turn_id}`;
 }
 
 // A one-line preview of what a span did: llm output or its emitted tool calls,
@@ -346,10 +346,10 @@ function StepRow({
   );
 }
 
-// ── Job row ──────────────────────────────────────────────────────────
+// ── Turn row ─────────────────────────────────────────────────────────
 
-function JobRow({
-  job,
+function TurnRow({
+  turn,
   index,
   trace,
   loading,
@@ -360,29 +360,29 @@ function JobRow({
   onToggle,
   onSelect,
 }: {
-  job: TraceJobSummary;
+  turn: TraceTurnSummary;
   index: number;
-  trace: JobTrace | undefined;
+  trace: TurnTrace | undefined;
   loading: boolean;
   selected: boolean;
   open: boolean;
-  rollup: JobRollup;
+  rollup: TurnRollup;
   interjections: number;
   onToggle: () => void;
   onSelect: () => void;
 }) {
-  const tokens = trace ? traceTokens(trace) : summaryTokens(job);
-  const dur = jobDurationMs(job, trace);
-  const live = isJobLive(job.job_status_kind);
+  const tokens = trace ? traceTokens(trace) : summaryTokens(turn);
+  const dur = turnDurationMs(turn, trace);
+  const live = isTurnLive(turn.turn_status_kind);
 
   return (
-    <div {...rowInteractive(onSelect)} className={rowShell(selected, 'border-l-brand', '')} style={{ paddingLeft: INDENT_JOB }}>
+    <div {...rowInteractive(onSelect)} className={rowShell(selected, 'border-l-brand', '')} style={{ paddingLeft: INDENT_TURN }}>
       <Chevron open={open} onClick={onToggle} />
       <Glyph ch="◆" accent="text-brand" />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="font-bold text-[0.85rem]">Job #{index + 1}</span>
-          <span className="text-[0.72rem] text-ink-soft font-mono truncate">{job.job_status_kind}</span>
+          <span className="font-bold text-[0.85rem]">Turn #{index + 1}</span>
+          <span className="text-[0.72rem] text-ink-soft font-mono truncate">{turn.turn_status_kind}</span>
           {live && <RiLoader4Line className="shrink-0 text-info animate-spin text-xs" />}
         </div>
         <div className="text-[0.7rem] text-ink-soft font-mono">
@@ -392,7 +392,7 @@ function JobRow({
       <div className="shrink-0 flex items-center gap-2">
         {interjections > 0 && (
           <span
-            title="This job folded in mid-turn user message(s) (steering)"
+            title="This turn folded in mid-turn user message(s) (steering)"
             className="inline-flex items-center gap-0.5 border-2 border-black rounded bg-warn/15 px-1 py-px text-[0.6rem] font-bold text-warn"
           >
             <RiCornerDownLeftLine className="text-[0.7rem]" />
@@ -426,17 +426,17 @@ function Toggle({ on, onClick, children, title }: { on: boolean; onClick: () => 
 export function TraceTree(props: TraceTreeProps) {
   const {
     overview,
-    jobTraces,
-    loadingJobs,
+    turnTraces,
+    loadingTurns,
     userToggles,
     onToggle,
-    selectedJobId,
+    selectedTurnId,
     selectedStepId,
     selectedSpanId,
-    onSelectJob,
+    onSelectTurn,
     onSelectStep,
     onSelectSpan,
-    interjectionCountByJob,
+    interjectionCountByTurn,
     interjectionSpanIds,
     messageLog,
     highlight,
@@ -484,66 +484,66 @@ export function TraceTree(props: TraceTreeProps) {
           </Toggle>
         </div>
         <div className="text-[0.62rem] font-bold uppercase tracking-wider text-ink-soft">
-          {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
+          {overview.turns.length} {overview.turns.length === 1 ? 'turn' : 'turns'}
           {filtering && ' · filtered'}
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {overview.jobs.map((job, i) => {
-          const trace = jobTraces.get(job.job_id);
-          const loading = loadingJobs.has(job.job_id);
-          const rollup = jobRollup(job, trace);
+        {overview.turns.map((turn, i) => {
+          const trace = turnTraces.get(turn.turn_id);
+          const loading = loadingTurns.has(turn.turn_id);
+          const rollup = turnRollup(turn, trace);
           const maxStepMs = trace ? Math.max(1, ...trace.steps.map((rs) => durationMs(rs.step) ?? 0)) : 1;
 
           let showAllChildren = false;
           if (filtering) {
-            const jobShallow =
-              (!failuresOnly || rollup.hasFailure) && (!q || jobText(job, i).toLowerCase().includes(q));
-            const jobDeep = trace ? trace.steps.some(matchers.stepVisible) : false;
-            const statusOnly = failuresOnly && !q && rollup.hasFailure && !!trace && !jobDeep;
-            const jobVisible = jobShallow || jobDeep || statusOnly || loading;
-            if (!jobVisible) return null;
+            const turnShallow =
+              (!failuresOnly || rollup.hasFailure) && (!q || turnText(turn, i).toLowerCase().includes(q));
+            const turnDeep = trace ? trace.steps.some(matchers.stepVisible) : false;
+            const statusOnly = failuresOnly && !q && rollup.hasFailure && !!trace && !turnDeep;
+            const turnVisible = turnShallow || turnDeep || statusOnly || loading;
+            if (!turnVisible) return null;
             showAllChildren = statusOnly;
           }
 
           // Everything is expanded by default (nothing hidden — the bench-web
           // "show the whole flow" model); a chevron records an explicit collapse
           // that `resolveExpanded` honours.
-          const jobOpen = resolveExpanded(job.job_id, userToggles, true);
-          const jobSelected =
-            selectedJobId === job.job_id && selectedStepId == null && selectedSpanId == null;
+          const turnOpen = resolveExpanded(turn.turn_id, userToggles, true);
+          const turnSelected =
+            selectedTurnId === turn.turn_id && selectedStepId == null && selectedSpanId == null;
           const emptyTrace = !!trace && trace.steps.length === 0;
 
           return (
-            <div key={job.job_id} data-job-id={job.job_id}>
-              <JobRow
-                job={job}
+            <div key={turn.turn_id} data-turn-id={turn.turn_id}>
+              <TurnRow
+                turn={turn}
                 index={i}
                 trace={trace}
                 loading={loading}
-                selected={jobSelected}
-                open={jobOpen}
+                selected={turnSelected}
+                open={turnOpen}
                 rollup={rollup}
-                interjections={interjectionCountByJob.get(job.job_id) ?? 0}
-                onToggle={() => onToggle(job.job_id, jobOpen)}
-                onSelect={() => onSelectJob(job.job_id)}
+                interjections={interjectionCountByTurn.get(turn.turn_id) ?? 0}
+                onToggle={() => onToggle(turn.turn_id, turnOpen)}
+                onSelect={() => onSelectTurn(turn.turn_id)}
               />
-              {jobOpen && (
+              {turnOpen && (
                 <>
                   {loading && !trace && (
                     <div
                       className="flex items-center gap-2 py-1.5 text-ink-soft text-[0.75rem] italic"
                       style={{ paddingLeft: INDENT_STEP }}
                     >
-                      <RiLoader4Line className="animate-spin" /> Loading job…
+                      <RiLoader4Line className="animate-spin" /> Loading turn…
                     </div>
                   )}
                   {emptyTrace && (
                     <div className="py-1.5 text-ink-soft text-[0.72rem] italic" style={{ paddingLeft: INDENT_STEP }}>
-                      {isExternalAgentJob(trace, job.job_status_kind)
-                        ? 'external agent · no step tree — select the job for its transcript'
-                        : isJobLive(job.job_status_kind)
+                      {isExternalAgentTurn(trace, turn.turn_status_kind)
+                        ? 'external agent · no step tree — select the turn for its transcript'
+                        : isTurnLive(turn.turn_status_kind)
                           ? 'no steps recorded yet…'
                           : 'no steps recorded'}
                     </div>
@@ -558,8 +558,8 @@ export function TraceTree(props: TraceTreeProps) {
                         (!stepOpen && selectedSpanId != null && rs.spans.some((s) => s.id === selectedSpanId));
                       const onStepClick = () =>
                         rs.spans.length === 1
-                          ? onSelectSpan(job.job_id, rs.spans[0].id)
-                          : onSelectStep(job.job_id, rs.step.id);
+                          ? onSelectSpan(turn.turn_id, rs.spans[0].id)
+                          : onSelectStep(turn.turn_id, rs.step.id);
                       const maxSpanMs = Math.max(1, ...rs.spans.map((s) => durationMs(s) ?? 0));
                       return (
                         <div key={rs.step.id} data-step-id={rs.step.id}>
@@ -592,7 +592,7 @@ export function TraceTree(props: TraceTreeProps) {
                                       highlight != null &&
                                       nodeGroup(spanVisualOf(span), span.outcome, spanToolName(span)) !== highlight
                                     }
-                                    onSelect={() => onSelectSpan(job.job_id, span.id)}
+                                    onSelect={() => onSelectSpan(turn.turn_id, span.id)}
                                   />
                                   {pv != null && pv !== '' && (
                                     <div

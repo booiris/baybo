@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval::ApprovedResource;
-use crate::ids::{JobId, SessionId};
+use crate::ids::{SessionId, TurnId};
 use crate::llm_entry_name::LlmEntryName;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,10 +122,10 @@ pub enum TriggerSource {
         /// chat-list row (see `docs/cron-groups.md`) and the gateway labels
         /// that group with the job's *live* title, so a rename propagates
         /// with no rewrite here. This snapshot answers only the one question
-        /// the live lookup cannot — "the job is gone; what was this history
+        /// the live lookup cannot — "the turn is gone; what was this history
         /// called?" — which is why it is written once at mint and never
         /// updated, and why it cannot go stale. `None` for fires persisted
-        /// before it existed; those group only while their job is alive.
+        /// before it existed; those group only while their turn is alive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
     },
@@ -178,10 +178,10 @@ impl TriggerSource {
     }
 }
 
-/// Discriminator for `TriggerSource`, also recorded on each `Job` as its
+/// Discriminator for `TriggerSource`, also recorded on each `Turn` as its
 /// `origin` (the owning session's root trigger). `Spawned` has no
 /// `TriggerSource` counterpart — a spawned session inherits its parent's
-/// trigger — but it is a valid job origin, since a subagent session's
+/// trigger — but it is a valid turn origin, since a subagent session's
 /// root is itself `Spawned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -192,16 +192,16 @@ pub enum TriggerKind {
 }
 /// Direct parent relationship for sessions spawned from another session.
 ///
-/// `parent_session_id` + `parent_job_id` together pin the **exact moment**
+/// `parent_session_id` + `parent_turn_id` together pin the **exact moment**
 /// in the parent's lifeline that the spawn happened. `kind` distinguishes
 /// the two semantically distinct spawn paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lineage {
     pub parent_session_id: SessionId,
-    pub parent_job_id: JobId,
+    pub parent_turn_id: TurnId,
     /// The parent's `SpanId` that birthed this session. For
     /// `Subagent`, this is the parent's `ToolCall(spawn_subagent)`
-    /// span — disambiguates sibling subagents from the same job.
+    /// span — disambiguates sibling subagents from the same turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<crate::ids::SpanId>,
     pub kind: LineageKind,
@@ -219,7 +219,7 @@ pub enum LineageKind {
 }
 
 /// A persisted conversation session — the root container of one trace
-/// tree (Job → Step → Span). Trigger and lineage are **orthogonal**:
+/// tree (Turn → Step → Span). Trigger and lineage are **orthogonal**:
 /// trigger names the business source of work, lineage names the parent
 /// session relationship.
 ///
@@ -324,7 +324,7 @@ pub struct SessionState {
     pub approved_resources: Vec<ApprovedResource>,
 
     /// Durable state for the complete background-notification pipeline:
-    /// collecting terminal job results, waiting on grouped barriers, and
+    /// collecting terminal turn results, waiting on grouped barriers, and
     /// actively delivering one transcript-backed notification turn.
     ///
     /// Flattening deliberately preserves the existing session JSON keys so
@@ -389,11 +389,11 @@ pub struct SessionState {
 ///
 /// `buffered_results` and `active_delivery` are different pipeline stages,
 /// not alternatives: while one batch is waiting for a proactive delivery
-/// retry, newly finished jobs continue accumulating in the buffer for the
+/// retry, newly finished turns continue accumulating in the buffer for the
 /// next batch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackgroundNotificationState {
-    /// Terminal background-job results not yet committed to the transcript as
+    /// Terminal background-turn results not yet committed to the transcript as
     /// a notification prompt. The actor merges this buffer into one turn once
     /// higher-priority mailbox work has drained.
     ///
@@ -456,9 +456,9 @@ impl BackgroundNotificationState {
     /// Count one successfully dispatched member in a turn-namespaced barrier
     /// cohort. The completion path uses the same key constructor when routing
     /// the member back into this aggregate.
-    pub fn register_group_member(&mut self, job_id: JobId, group: &str) {
+    pub fn register_group_member(&mut self, turn_id: TurnId, group: &str) {
         self.groups
-            .entry(BackgroundNotificationGroup::cohort_key(job_id, group))
+            .entry(BackgroundNotificationGroup::cohort_key(turn_id, group))
             .or_default()
             .expected += 1;
     }
@@ -525,11 +525,11 @@ impl BackgroundNotificationGroup {
         self.results.len() < self.expected
     }
 
-    /// The dispatching turn's `job_id` namespaces the LLM-chosen group name so
+    /// The dispatching turn's `turn_id` namespaces the LLM-chosen group name so
     /// reuse in a later turn starts a fresh cohort instead of extending the
     /// earlier one. Both the dispatch and completion paths derive the key here.
-    pub fn cohort_key(job_id: JobId, group: &str) -> String {
-        format!("{job_id}::{group}")
+    pub fn cohort_key(turn_id: TurnId, group: &str) -> String {
+        format!("{turn_id}::{group}")
     }
 }
 
@@ -574,15 +574,15 @@ mod tests {
     }
 
     #[test]
-    fn cohort_key_namespaces_group_by_job() {
-        let j1 = JobId::new();
-        let j2 = JobId::new();
-        // Deterministic per (job, name): same inputs → same key.
+    fn cohort_key_namespaces_group_by_turn() {
+        let j1 = TurnId::new();
+        let j2 = TurnId::new();
+        // Deterministic per (turn, name): same inputs → same key.
         assert_eq!(
             BackgroundNotificationGroup::cohort_key(j1, "g"),
             BackgroundNotificationGroup::cohort_key(j1, "g")
         );
-        // Reusing a name in a different turn (job) yields a distinct cohort —
+        // Reusing a name in a different turn (turn) yields a distinct cohort —
         // the property that stops a later turn from extending a prior cohort.
         assert_ne!(
             BackgroundNotificationGroup::cohort_key(j1, "g"),
@@ -597,20 +597,20 @@ mod tests {
 
     #[test]
     fn group_registration_counts_members_per_turn() {
-        let first_job = JobId::new();
-        let second_job = JobId::new();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
         let mut notifications = BackgroundNotificationState::default();
 
-        notifications.register_group_member(first_job, "research");
-        notifications.register_group_member(first_job, "research");
-        notifications.register_group_member(second_job, "research");
+        notifications.register_group_member(first_turn, "research");
+        notifications.register_group_member(first_turn, "research");
+        notifications.register_group_member(second_turn, "research");
 
         assert_eq!(notifications.groups.len(), 2);
         assert_eq!(
             notifications
                 .groups
                 .get(&BackgroundNotificationGroup::cohort_key(
-                    first_job, "research"
+                    first_turn, "research"
                 ))
                 .map(|group| group.expected),
             Some(2)
@@ -815,7 +815,7 @@ mod tests {
     ///
     /// The same default carries the cron-group tombstone: a fire minted before
     /// `job_title` existed has no snapshot, so it can only be grouped while its
-    /// job is alive to supply the label (see `docs/cron-groups.md`).
+    /// turn is alive to supply the label (see `docs/cron-groups.md`).
     #[test]
     fn legacy_cron_trigger_defaults_to_invisible() {
         let back: TriggerSource =
@@ -826,7 +826,7 @@ mod tests {
     }
 
     /// The snapshot is a tombstone, not a source of truth — it must survive a
-    /// round-trip through the `sessions.data` blob so a group whose job has
+    /// round-trip through the `sessions.data` blob so a group whose turn has
     /// been deleted keeps its name.
     #[test]
     fn cron_job_title_snapshot_survives_a_blob_round_trip() {
@@ -845,7 +845,7 @@ mod tests {
     fn lineage_subagent_round_trip() {
         let l = Lineage {
             parent_session_id: SessionId::from("cli-parent"),
-            parent_job_id: JobId::new(),
+            parent_turn_id: TurnId::new(),
             parent_span_id: Some(crate::ids::SpanId::new()),
             kind: LineageKind::Subagent,
         };
@@ -862,7 +862,7 @@ mod tests {
         // shape to any pre-`parent_span_id` row.
         let l = Lineage {
             parent_session_id: SessionId::from("p"),
-            parent_job_id: JobId::new(),
+            parent_turn_id: TurnId::new(),
             parent_span_id: None,
             kind: LineageKind::Subagent,
         };

@@ -46,7 +46,7 @@ pub struct GlobalArgs {
 
 /// Environment variable that, when set to any non-empty value, makes
 /// every CLI invocation surface the extended help (hidden subcommands
-/// like `config`, `log`, `session`, `job`, `cron`, `cost` and the
+/// like `config`, `log`, `session`, `turn`, `cron`, `cost` and the
 /// `-v`/`--verbose` flag become visible in `baybo --help`).
 ///
 /// The agent-side `BashTool` exports this automatically for any
@@ -162,13 +162,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Inspect tracked async jobs: `list [--status]`, `show <id>`,
-    /// `cancel <id>` (requires `--yes` in slash mode). Jobs are the
-    /// per-turn unit of work — one job per agent loop invocation.
+    /// Inspect tracked async turns: `list [--status]`, `show <id>`,
+    /// `cancel <id>` (requires `--yes` in slash mode). Turns are the
+    /// per-turn unit of work — one turn per agent loop invocation.
     #[command(hide = true)]
-    Job {
+    Turn {
         #[command(subcommand)]
-        cmd: JobCmd,
+        cmd: TurnCmd,
     },
     /// Inspect cron-scheduled jobs: `list` all schedules, `show <id>`
     /// for the full row including prompt body. Cron mutations
@@ -194,7 +194,7 @@ pub enum Commands {
     },
     /// Inspect LLM spend (USD + token counts) recorded by the cost
     /// manager. `show` aggregates over a scope — `--user <id>`,
-    /// `--session <id>`, `--job <id>`, or the default current-UTC-day
+    /// `--session <id>`, `--turn <id>`, or the default current-UTC-day
     /// range bounded by `--since` / `--until`. Scopes are mutually
     /// exclusive.
     #[command(hide = true)]
@@ -263,12 +263,12 @@ pub enum Commands {
     /// Default view is the *static* inventory: registered skills /
     /// tools / channels / current LLM model / config path — answers
     /// "how is this process configured". Pass `--live` to also query
-    /// the live runtime: in-flight job count, failed jobs in the last
+    /// the live runtime: in-flight turn count, failed turns in the last
     /// 24h, and today's LLM spend (parallelized via `tokio::try_join!`).
     /// Use `--live` first when diagnosing "is anything happening right
     /// now / did anything just fail".
     Status {
-        /// Include live runtime snapshot: in-flight jobs, recent
+        /// Include live runtime snapshot: in-flight turns, recent
         /// failures (last 24h), cost-spent today.
         #[arg(long)]
         live: bool,
@@ -724,7 +724,7 @@ pub enum SessionCmd {
     /// List known sessions, newest-active first.
     List,
     /// Show session metadata plus, when the trace graph is wired, an
-    /// execution-trace summary (jobs / steps / spans recorded under
+    /// execution-trace summary (turns / steps / spans recorded under
     /// this session).
     Show {
         /// Session id.
@@ -751,7 +751,7 @@ pub enum SessionCmd {
         #[arg(long)]
         superseded_only: bool,
     },
-    /// Export the full execution trace (job → step → span tree) as
+    /// Export the full execution trace (turn → step → span tree) as
     /// pretty JSON. Prints to stdout unless `--out <path>` is given,
     /// which writes the file in argv mode. Requires `--yes` under
     /// slash mode when `--out` is set, because the write path is
@@ -771,22 +771,22 @@ pub enum SessionCmd {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum JobCmd {
-    /// List tracked jobs, optionally filtered by status.
+pub enum TurnCmd {
+    /// List tracked turns, optionally filtered by status.
     List {
         /// Filter by status: pending, in-progress, stuck, cancelled,
         /// failed, completed.
         #[arg(long)]
-        status: Option<JobStatusArg>,
+        status: Option<TurnStatusArg>,
     },
-    /// Show a job's metadata.
+    /// Show a turn's metadata.
     Show {
-        /// Job id.
+        /// Turn id.
         id: String,
     },
-    /// Cancel a running or pending job. Requires `--yes` in slash mode.
+    /// Cancel a running or pending turn. Requires `--yes` in slash mode.
     Cancel {
-        /// Job id.
+        /// Turn id.
         id: String,
         /// Confirm the destructive action (required in slash mode).
         #[arg(long, short = 'y')]
@@ -794,12 +794,12 @@ pub enum JobCmd {
     },
 }
 
-/// Status filter accepted by `baybo job list --status`. Mirrors
-/// `baybo_job::JobStatusKind` 1:1 — adding a new kind here without
-/// the matching `From` arm in `commands/job.rs` is a compile error.
+/// Status filter accepted by `baybo turn list --status`. Mirrors
+/// `baybo_turn::TurnStatusKind` 1:1 — adding a new kind here without
+/// the matching `From` arm in `commands/turn.rs` is a compile error.
 #[derive(Debug, Copy, Clone, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-pub enum JobStatusArg {
+pub enum TurnStatusArg {
     Pending,
     InProgress,
     Stuck,
@@ -865,20 +865,20 @@ pub enum LogCmd {
 #[derive(Debug, Subcommand)]
 pub enum CostCmd {
     /// Show aggregated spend. Default scope is the current UTC day
-    /// across every user. Pass `--user`, `--session`, or `--job` to
+    /// across every user. Pass `--user`, `--session`, or `--turn` to
     /// narrow; the scopes are mutually exclusive.
     Show {
         /// Aggregate over a single user.
-        #[arg(long, short = 'u', conflicts_with_all = ["session", "job"])]
+        #[arg(long, short = 'u', conflicts_with_all = ["session", "turn"])]
         user: Option<String>,
         /// Aggregate over a single session.
-        #[arg(long, short = 's', conflicts_with_all = ["user", "job"])]
+        #[arg(long, short = 's', conflicts_with_all = ["user", "turn"])]
         session: Option<String>,
-        /// Aggregate over a single job.
-        #[arg(long, short = 'j', conflicts_with_all = ["user", "session"])]
-        job: Option<String>,
+        /// Aggregate over a single turn.
+        #[arg(long, short = 't', conflicts_with_all = ["user", "session"])]
+        turn: Option<String>,
         /// Lower bound (inclusive) for the time range, `YYYY-MM-DD` UTC.
-        /// Defaults to start-of-today. Ignored when `--session`/`--job`
+        /// Defaults to start-of-today. Ignored when `--session`/`--turn`
         /// are set (those scopes are bounded by the row itself).
         #[arg(long)]
         since: Option<String>,

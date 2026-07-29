@@ -1,8 +1,8 @@
 //! Trace + raw-file endpoints. Trace files are treated as opaque JSON
 //! (the same "untyped on the Rust side by design" stance the gateway
 //! takes): we only reshape the envelope so the frontend's ported viewer
-//! types line up — `{session, jobs}` + `{messages}` → `{session_id,
-//! session_messages, jobs}`.
+//! types line up — `{session, turns}` + `{messages}` → `{session_id,
+//! session_messages, turns}`.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -42,14 +42,14 @@ pub(crate) fn tool_sidecar_rel(trace_rel: &str) -> String {
 }
 
 /// Count `tool_call` spans by `tool_name` in a parsed `trace.json`,
-/// highest first (ties broken by name). Walks the `jobs[].steps[].spans[]`
+/// highest first (ties broken by name). Walks the `turns[].steps[].spans[]`
 /// shape `baybo session export` emits. The precompute bin runs this once
 /// per trace and writes the result as the sidecar [`tool_counts`] reads.
 pub(crate) fn count_tools_in_trace(val: &Value) -> Vec<ToolCount> {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
-    let jobs = val.get("jobs").and_then(Value::as_array);
-    for job in jobs.into_iter().flatten() {
-        let steps = job.get("steps").and_then(Value::as_array);
+    let turns = val.get("turns").and_then(Value::as_array);
+    for turn in turns.into_iter().flatten() {
+        let steps = turn.get("steps").and_then(Value::as_array);
         for step in steps.into_iter().flatten() {
             let spans = step.get("spans").and_then(Value::as_array);
             for span in spans.into_iter().flatten() {
@@ -76,7 +76,7 @@ pub(crate) fn count_tools_in_trace(val: &Value) -> Vec<ToolCount> {
 }
 
 /// Reshape an item's `trace.json` (+ optional `messages.json`) into the
-/// `{ session_id, session_messages, jobs }` shape the frontend viewer
+/// `{ session_id, session_messages, turns }` shape the frontend viewer
 /// consumes.
 pub(crate) fn trace_response(
     bench_dir: &Path,
@@ -86,8 +86,8 @@ pub(crate) fn trace_response(
     let trace_path = safe_join(bench_dir, trace_rel)?;
     let trace_val = read_json(&trace_path)?;
     let session = trace_val.get("session").cloned().unwrap_or(Value::Null);
-    let jobs = trace_val
-        .get("jobs")
+    let turns = trace_val
+        .get("turns")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
 
@@ -105,7 +105,7 @@ pub(crate) fn trace_response(
     let body = json!({
         "session_id": session,
         "session_messages": session_messages,
-        "jobs": jobs,
+        "turns": turns,
     });
     Ok(Json(body).into_response())
 }

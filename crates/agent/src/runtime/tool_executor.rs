@@ -5,7 +5,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
-use baybo_model::{ContentBlock, JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
+use baybo_model::{ContentBlock, ParallelGroup, SessionId, SpanId, TrustLevel, TurnId, User};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
@@ -436,7 +436,7 @@ impl ToolExecutor {
     /// Tool calls live as `Span`s under their parent agent-loop `Step`
     /// (see `docs/modules/trace.md`). `triggering_llm_span` is the LLM
     /// span that emitted the `tool_use` block; `parallel_group` ties
-    /// concurrent siblings together; `job_id` is the parent job (for
+    /// concurrent siblings together; `turn_id` is the parent turn (for
     /// the WAL log).
     ///
     /// `approved_resources` is a shared, mutable set of session-scoped
@@ -450,7 +450,7 @@ impl ToolExecutor {
         params: Value,
         session_id: &SessionId,
         // What started this session. Reaches the tool as
-        // [`ToolContext::session_trigger`]; `CronCreate` reads it so a job
+        // [`ToolContext::session_trigger`]; `CronCreate` reads it so a turn
         // created inside a cron fire inherits the fire's origin conversation.
         session_trigger: &baybo_model::TriggerSource,
         user: &User,
@@ -460,7 +460,7 @@ impl ToolExecutor {
         triggering_llm_span: Option<SpanId>,
         tool_use_id: String,
         parallel_group: Option<ParallelGroup>,
-        _parent_job_for_log: Option<JobId>,
+        _parent_turn_for_log: Option<TurnId>,
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
@@ -500,7 +500,7 @@ impl ToolExecutor {
             }
         }
 
-        let job_id = step.job_id;
+        let turn_id = step.turn_id;
         let tool_name_owned = tool_name.to_string();
         // Reborrow the cancel token so the closure can move its
         // ownership into `ctx` while `with_span` keeps a borrow for
@@ -524,7 +524,7 @@ impl ToolExecutor {
         let output = crate::runtime::scope::with_span(
             recorder.as_ref(),
             step,
-            job_id,
+            turn_id,
             SpanKind::ToolCall {
                 begin: ToolCallBegin {
                     tool_name: tool_name_owned.clone(),
@@ -539,7 +539,7 @@ impl ToolExecutor {
                 result: None,
             },
             parallel_group,
-            Some((&cancel_for_close, baybo_job::CancelReason::ParentCancelled)),
+            Some((&cancel_for_close, baybo_turn::CancelReason::ParentCancelled)),
             |span_handle| async move {
                 let mut event_seq: u32 = 0;
 
@@ -698,8 +698,8 @@ impl ToolExecutor {
                 let event_sink = Arc::new(SpanEventRecorder::new());
 
                 // Build tool context. The token comes from the agent
-                // loop's per-job cancel tree — tripping it (via
-                // JobLifecycle::cancel or a parent subagent's cascade)
+                // loop's per-turn cancel tree — tripping it (via
+                // TurnLifecycle::cancel or a parent subagent's cascade)
                 // signals the running tool. The billed-LLM handle (if
                 // any) is bound to this exact tool span so a tool that
                 // makes a side-LLM call (e.g. `WebFetch`'s extraction)
@@ -711,7 +711,7 @@ impl ToolExecutor {
                     let bound = guarded.bind(Attribution {
                         user_id: user.id.clone(),
                         session_id: session_id.clone(),
-                        job_id,
+                        turn_id,
                         span_id: span_handle.span_id,
                         reason: baybo_llm::CallReason::Tool(tool_name_owned.clone()),
                     });
@@ -723,7 +723,7 @@ impl ToolExecutor {
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
                     session_trigger: session_trigger.clone(),
-                    job_id,
+                    turn_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),
                     timeout: effective_timeout,
@@ -746,7 +746,7 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
-                    // Gate: the background-job sink reaches a tool only for
+                    // Gate: the background-turn sink reaches a tool only for
                     // user-facing sessions, so a command can convert to
                     // background on timeout only there.
                     background_jobs: if background_eligible {

@@ -33,16 +33,16 @@ reason to forbid the whole shape.
 // crates/memory/src/lib.rs
 pub struct RecalledMemory { pub content: String }
 
-// Carries the real (user, session, job) + the trace recorder + the enclosing
+// Carries the real (user, session, turn) + the trace recorder + the enclosing
 // memory step. `scoped_llm_call(begin, body)` opens an LlmCall span under that
 // step and hands `body` an Attribution bound to it, for billed sub-calls.
-pub struct MemoryContext { /* user_id, session_id, job_id, recorder, step */ }
+pub struct MemoryContext { /* user_id, session_id, turn_id, recorder, step */ }
 
 #[async_trait]
 pub trait Memory: Send + Sync {
     async fn recall(&self, ctx: &MemoryContext, query: &[ContentBlock])
         -> Result<Vec<RecalledMemory>>;
-    async fn on_job_complete(&self, ctx: &MemoryContext,
+    async fn on_turn_complete(&self, ctx: &MemoryContext,
         user_input: &[ContentBlock], final_output: &[ContentBlock]) -> Result<()>;
     async fn on_session_end(&self, ctx: &MemoryContext,
         transcript: &[ChatMessage]) -> Result<()>;
@@ -50,14 +50,14 @@ pub trait Memory: Send + Sync {
 }
 ```
 
-- **`recall`** — synchronous query, on the critical path (job start + each
+- **`recall`** — synchronous query, on the critical path (turn start + each
   interjection). De-duplication against already-surfaced memories is **internal
   to the impl** (keyed off `ctx`; one impl is a process singleton, so that state
   survives actor reap/rehydration for free). The core injects exactly what is
   returned.
-- **`on_job_complete` / `on_session_end`** — fire-and-forget lifecycle events
+- **`on_turn_complete` / `on_session_end`** — fire-and-forget lifecycle events
   (the read/write asymmetry is intentional; the verb is **not** "sync", which
-  would imply bidirectional reconciliation). `on_job_complete` sees one finished
+  would imply bidirectional reconciliation). `on_turn_complete` sees one finished
   exchange (`user_input` includes mid-turn interjections); `on_session_end` sees
   the full durable transcript at idle-timeout.
 - **`tools`** — the model's "explicit signal" path, coexisting with the
@@ -67,7 +67,7 @@ pub trait Memory: Send + Sync {
 
 The implementation holds the **unbound** `Arc<BillableLlm>`, constructor-injected.
 The core hands each call a `MemoryContext` carrying the real `(user, session,
-job)` + the trace recorder + the enclosing `MemoryRecall` / `MemoryWrite` step;
+turn)` + the trace recorder + the enclosing `MemoryRecall` / `MemoryWrite` step;
 the impl binds its handle per billed sub-call via
 `MemoryContext::scoped_llm_call` (below), so spend bills to the **real**
 user/session under a real span (mirrors `compression.rs`, not
@@ -77,10 +77,10 @@ user/session under a real span (mirrors `compression.rs`, not
 off `attribution.span_id`, so a billed sub-call needs a *real* span or its cost
 row is orphaned. `MemoryContext::scoped_llm_call(begin, body)` provides one: it
 opens an `LlmCall` span **under the memory step**, hands `body` an `Attribution`
-bound to that span (built from the real user/session/job + the span id), and
+bound to that span (built from the real user/session/turn + the span id), and
 closes the span with the call's token usage. The impl binds its `BillableLlm`
 with that attribution and makes the call — so the cost row lands on a recorded
-span, attributed to the real user/session/job. The impl never constructs a bare
+span, attributed to the real user/session/turn. The impl never constructs a bare
 `Attribution`, so it can't bill against an orphaned id.
 
 ## Recall injection (enforces hard constraint #3)
@@ -102,7 +102,7 @@ Recalled memories enter the prompt as a **persisted, framed** block — never
 
 Two gates run independently:
 
-- **`memory_recall_query(&JobInput)`** — per-job gate for the read/write hooks
+- **`memory_recall_query(&TurnInput)`** — per-turn gate for the read/write hooks
   on a turn. Exhaustive match: returns the query for `UserChat` / `Cron`, `None`
   for `System`, `Spawned` (subagent), and `SubagentNotification` (no direct
   user input → would pollute / double-write).
@@ -114,16 +114,16 @@ Two gates run independently:
 The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
 `AgentMessage::ActorStop` handler (`actor/mod.rs`) owns the fourth.
 
-1. **Recall — inline, job start.** After the user message is in context and
+1. **Recall — inline, turn start.** After the user message is in context and
    before the first LLM call, `recall_and_inject` opens a `MemoryRecall` step,
    mints `Attribution`, calls `recall`, and injects each result as a
    `RecalledMemory` row. Recall failure is logged and swallowed — never fails
    the turn.
 2. **Recall — inline, interjection.** Each mid-turn interjection drained at a
-   tool boundary is recalled against too, and folded into the job's input.
-3. **`on_job_complete` — background, job end.** At `IterationOutcome::Final`,
-   `spawn_job_complete_write` detaches a task (so the actor returns the answer
-   without waiting) that opens a `MemoryWrite` step and calls `on_job_complete`.
+   tool boundary is recalled against too, and folded into the turn's input.
+3. **`on_turn_complete` — background, turn end.** At `IterationOutcome::Final`,
+   `spawn_turn_complete_write` detaches a task (so the actor returns the answer
+   without waiting) that opens a `MemoryWrite` step and calls `on_turn_complete`.
    **Only on a clean `Final`** — a max-iterations, cancelled, or errored turn
    writes nothing (those paths return before this point), so memory only ever
    sees completed exchanges.
@@ -134,7 +134,7 @@ The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
    task loads the FULL durable transcript via `SessionManager::full_transcript`
    (`history` filters out rows marked `superseded_by`, so a compacted session
    would lose the turns compression folded into a summary), opens a
-   `MemoryWrite` step, mints a synthetic `JobId` for trace/cost keying, and
+   `MemoryWrite` step, mints a synthetic `TurnId` for trace/cost keying, and
    calls `on_session_end`. The session-level gate skips subagent-lineage actors
    (whose `ActorStop` is not a user-session ending). A missing session row or
    empty transcript skips silently.
@@ -187,12 +187,12 @@ session via Mem0's `run_id` (sourced from `ToolContext::session_id`).
 | Hook | Behaviour |
 | --- | --- |
 | `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
-| `on_job_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
+| `on_turn_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
 | `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
 | `tools()` | Eight `mem0_*` tools — the model's explicit-signal path (see below). |
 
 The tool surface mirrors the Mem0 `openclaw` plugin (each `mem0_`-prefixed),
-mapped onto Mem0 REST endpoints. Unlike `on_job_complete`, `mem0_add` stores
+mapped onto Mem0 REST endpoints. Unlike `on_turn_complete`, `mem0_add` stores
 verbatim (`infer: false`) — the model already decided what is worth keeping.
 
 | Tool | Endpoint | Purpose |
@@ -224,7 +224,7 @@ session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
 | Hook | Behaviour |
 | --- | --- |
 | `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"`. |
-| `on_job_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
+| `on_turn_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
 | `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
 | `tools()` | Four `viking_*` tools (see below). |
 
@@ -264,6 +264,6 @@ hot-reload, so `setup` prints a restart hint.
 | `llm`       | `Attribution`; `BillableLlm`/`BoundBilledLlm` (memory's billed chat handle)     |
 | `tools`     | `Tool` / `ToolManifest` for `Memory::tools()`                                   |
 | `context`   | `<recalled_memory>` framing + `append_recalled_memory` + budget                 |
-| `agent`     | Drives `recall` / `on_job_complete`; `AgentLoopConfig.memory`                   |
+| `agent`     | Drives `recall` / `on_turn_complete`; `AgentLoopConfig.memory`                   |
 | `config`    | `MemoryConfig` (typed knobs + opaque `extra`)                                   |
 | `trace`     | `StepKind::MemoryRecall` / `MemoryWrite`                                         |

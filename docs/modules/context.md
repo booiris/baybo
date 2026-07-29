@@ -81,14 +81,14 @@ here is the byte-budget cap and the content-addressed spill.
 
 `append()` only pushes the message and updates the token budget — it does **not** auto-compress. The agent loop calls `maybe_compress()` at the top of every iteration; that's the single point where compression LLM calls happen and where their cost is recorded against the cost ledger.
 
-This trade-off — losing the "impossible to forget" property of auto-compression — is deliberate: every compression that reaches Stage 2 spawns a billable LLM call, and the cost-recording context (`SpanRecorder`, `JobId`, `CostManager`) only exists at the agent-loop layer. Auto-compressing inside `append()` would silently bypass that recording.
+This trade-off — losing the "impossible to forget" property of auto-compression — is deliberate: every compression that reaches Stage 2 spawns a billable LLM call, and the cost-recording context (`SpanRecorder`, `TurnId`, `CostManager`) only exists at the agent-loop layer. Auto-compressing inside `append()` would silently bypass that recording.
 
 ```rust
 // Append in any number of places without cost-recording overhead.
 self.context_manager.append(&user_msg).await;
 
 // Single explicit compression site at the top of each iteration.
-self.compress_if_needed(session, span_recorder, job_id, &cancel_token, delta_tx.as_ref()).await?;
+self.compress_if_needed(session, span_recorder, turn_id, &cancel_token, delta_tx.as_ref()).await?;
 ```
 
 `maybe_compress` returns `Result<CompressionOutcome>`, a four-variant enum: `Compressed` (the transcript was replaced with a shorter list), `BelowThreshold` (budget under the configured compression threshold; only produced by `maybe_compress`), `StrategyDeclined` (the compressor's pre-flight gate fired — non-system message count already at or below `keep_recent`, so even truncate couldn't shrink), or `NoSavings` (the compressor produced a candidate slice but its post-tokenise total wasn't smaller than the original). The chat closure supplied by the agent loop is what opens the `StepKind::Compression` step + `SpanKind::LlmCall` span and records the call against the cost ledger.

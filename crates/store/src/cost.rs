@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use baybo_model::{CostRecord, CostSummary, JobId, SessionId, TimeRange};
+use baybo_model::{CostRecord, CostSummary, SessionId, TimeRange, TurnId};
 
 use crate::StorageError;
 
@@ -57,11 +57,11 @@ pub trait CostStore: Send + Sync {
     /// Return the aggregated cost summary for a single session.
     async fn query_session(&self, session_id: &SessionId) -> Result<CostSummary>;
 
-    /// Per-job aggregated summaries for one session, one bucket per
-    /// `job_id` (rendered as the bucket key). One grouped query
-    /// replaces a `query_job` fan-out over the session's jobs.
-    async fn query_session_by_job(&self, session_id: &SessionId) -> Result<Vec<CostGroupBucket>>;
+    /// Per-turn aggregated summaries for one session, one bucket per
+    /// `turn_id` (rendered as the bucket key). One grouped query
+    /// replaces a `query_turn` fan-out over the session's turns.
+    async fn query_session_by_turn(&self, session_id: &SessionId) -> Result<Vec<CostGroupBucket>>;
 
-    /// Return the aggregated cost summary for a single job.
-    async fn query_job(&self, job_id: &JobId) -> Result<CostSummary>;
+    /// Return the aggregated cost summary for a single turn.
+    async fn query_turn(&self, turn_id: &TurnId) -> Result<CostSummary>;
 }

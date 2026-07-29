@@ -21,7 +21,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// execution rows and the conversations they opened pointing at a real job.
 #[async_trait]
 pub trait CronStore: Send + Sync {
-    // ── Job CRUD ──
+    // ── Turn CRUD ──
     async fn create(&self, job: &CronJob) -> Result<()>;
     /// Fetch a job by id, deleted or not.
     async fn get(&self, job_id: &str) -> Result<Option<CronJob>>;

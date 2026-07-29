@@ -6,7 +6,6 @@ pub mod cron;
 pub mod device;
 pub mod doctor;
 pub mod external_agent;
-pub mod job;
 pub mod llm;
 pub mod log;
 pub mod mcp;
@@ -19,6 +18,7 @@ pub(crate) mod select;
 pub mod session;
 pub mod skills;
 pub mod status;
+pub mod turn;
 pub mod vault;
 
 /// Parse a `YYYY-MM-DD` CLI argument with a consistent error message

@@ -40,7 +40,7 @@ When a `BlobFetcher` is attached (`LlmClient::with_blob_fetcher`) and the model 
 
 ### Error handling
 
-Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Job monitoring can mark long-running calls as `Stuck`.
+Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.
 
 ## Constraints
 

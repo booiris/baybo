@@ -5,8 +5,10 @@ use baybo_channels::wire::MAX_MESSAGE_BATCH_MESSAGES;
 use baybo_channels::{
     AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
 };
-use baybo_job::{CancelReason, JobStatusKind};
-use baybo_model::{ChannelType, ContentBlock, ControlEventKind, JobId, MessageMetadata, SessionId};
+use baybo_model::{
+    ChannelType, ContentBlock, ControlEventKind, MessageMetadata, SessionId, TurnId,
+};
+use baybo_turn::{CancelReason, TurnStatusKind};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
@@ -369,53 +371,55 @@ impl Router {
             .take_in_flight_background_subagents(session_id);
 
         // Cancel the in-flight turn, then walk its in-flight descendants.
-        // Cancelling the turn job trips the turn's loop cancel token first,
+        // Cancelling the turn turn trips the turn's loop cancel token first,
         // which cascades into any foreground subagents (their tokens descend
         // from it) and aborts the turn's own await immediately — so the
         // descendant walk is a best-effort `UserStopped` audit stamp + backstop,
         // not the load-bearing stop (a foreground child cancelled via cascade
         // ends up `ParentCancelled`, which is the accurate reason for it).
-        // `list_active_turns_by_session` is store-filtered before applying the
-        // turn-kind filter, so a long-lived session's full job history isn't
-        // loaded just to find the live reply job(s).
+        // `list_active_chat_turns_by_session` is store-filtered before applying the
+        // turn-kind filter, so a long-lived session's full turn history isn't
+        // loaded just to find the live reply turn(s).
         let mut cancelled_turn = false;
-        let mut cancelled_turn_jobs: Vec<JobId> = Vec::new();
+        let mut cancelled_turn_turns: Vec<TurnId> = Vec::new();
         match self
-            .job_lifecycle
-            .list_active_turns_by_session(session_id)
+            .turn_lifecycle
+            .list_active_chat_turns_by_session(session_id)
             .await
         {
-            Ok(jobs) => {
-                for job in jobs {
+            Ok(turns) => {
+                for turn in turns {
                     cancelled_turn = true;
-                    cancelled_turn_jobs.push(job.id);
+                    cancelled_turn_turns.push(turn.id);
                     let _ = self
-                        .job_lifecycle
-                        .cancel(&job.id, CancelReason::UserStopped, vec![])
+                        .turn_lifecycle
+                        .cancel(&turn.id, CancelReason::UserStopped, vec![])
                         .await;
-                    self.cancel_in_flight_descendants(&job.id).await;
+                    self.cancel_in_flight_descendants(&turn.id).await;
                 }
             }
-            Err(e) => warn!(session_id = %session_id, error = %e, "stop: list session jobs failed"),
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "stop: list session turns failed")
+            }
         }
 
-        // Stop each drained background subagent. Cancel its running job with
+        // Stop each drained background subagent. Cancel its running turn with
         // `UserStopped` FIRST — that trips the loop token AND makes the reason
         // win the race against the escort's `ParentCancelled` — then trip the
-        // stored token to also cover the pre-job-dispatch window: when no row
+        // stored token to also cover the pre-turn-dispatch window: when no row
         // exists yet the token is the only handle, and the child aborts at
-        // iteration 0 once it spawns its job (`with_job` then flips that row
-        // terminal). `list_active_turns_by_session` keeps the lookup bounded.
+        // iteration 0 once it spawns its turn (`with_turn` then flips that row
+        // terminal). `list_active_chat_turns_by_session` keeps the lookup bounded.
         for (child_session, info) in &background {
-            if let Ok(jobs) = self
-                .job_lifecycle
-                .list_active_turns_by_session(child_session)
+            if let Ok(turns) = self
+                .turn_lifecycle
+                .list_active_chat_turns_by_session(child_session)
                 .await
             {
-                for job in jobs {
+                for turn in turns {
                     let _ = self
-                        .job_lifecycle
-                        .cancel(&job.id, CancelReason::UserStopped, vec![])
+                        .turn_lifecycle
+                        .cancel(&turn.id, CancelReason::UserStopped, vec![])
                         .await;
                 }
             }
@@ -449,9 +453,9 @@ impl Router {
         // tears down, so anchoring after the turn settles keeps the `/stop`
         // echo + notice after that row on reload (instead of racing it, which
         // would sort the cancelled turn's work block *after* the stop notice).
-        for job_id in &cancelled_turn_jobs {
-            self.job_lifecycle
-                .wait_until_idle(job_id, STOP_SETTLE_TIMEOUT)
+        for turn_id in &cancelled_turn_turns {
+            self.turn_lifecycle
+                .wait_until_idle(turn_id, STOP_SETTLE_TIMEOUT)
                 .await;
         }
 
@@ -518,43 +522,43 @@ impl Router {
         }
     }
 
-    /// Cancel every in-flight job in the subtree rooted at `root_job_id`
+    /// Cancel every in-flight turn in the subtree rooted at `root_turn_id`
     /// (foreground subagents, at any depth). Iterative BFS so a deep lineage
     /// doesn't need boxed async recursion.
-    async fn cancel_in_flight_descendants(&self, root_job_id: &JobId) {
+    async fn cancel_in_flight_descendants(&self, root_turn_id: &TurnId) {
         let mut visited = HashSet::new();
-        let mut worklist = vec![*root_job_id];
-        while let Some(job_id) = worklist.pop() {
-            // `parent_job_id` is immutable so the lineage is a tree today, but
+        let mut worklist = vec![*root_turn_id];
+        while let Some(turn_id) = worklist.pop() {
+            // `parent_turn_id` is immutable so the lineage is a tree today, but
             // a visited-set keeps this from spinning forever if a future
             // re-parenting feature ever introduces a cycle.
-            if !visited.insert(job_id) {
+            if !visited.insert(turn_id) {
                 continue;
             }
-            match self.job_lifecycle.list_children(&job_id).await {
+            match self.turn_lifecycle.list_children(&turn_id).await {
                 Ok(children) => {
                     for child in children
                         .into_iter()
                         .filter(|c| is_in_flight(c.status.kind()))
                     {
                         let _ = self
-                            .job_lifecycle
+                            .turn_lifecycle
                             .cancel(&child.id, CancelReason::UserStopped, vec![])
                             .await;
                         worklist.push(child.id);
                     }
                 }
-                Err(e) => warn!(job_id = %job_id, error = %e, "stop: list child jobs failed"),
+                Err(e) => warn!(turn_id = %turn_id, error = %e, "stop: list child turns failed"),
             }
         }
     }
 }
 
-/// True for the non-terminal job states `/stop` should cancel.
-fn is_in_flight(kind: JobStatusKind) -> bool {
+/// True for the non-terminal turn states `/stop` should cancel.
+fn is_in_flight(kind: TurnStatusKind) -> bool {
     matches!(
         kind,
-        JobStatusKind::Pending | JobStatusKind::InProgress | JobStatusKind::Stuck
+        TurnStatusKind::Pending | TurnStatusKind::InProgress | TurnStatusKind::Stuck
     )
 }
 
@@ -673,11 +677,11 @@ mod tests {
 
     #[test]
     fn in_flight_covers_non_terminal_states_only() {
-        assert!(is_in_flight(JobStatusKind::Pending));
-        assert!(is_in_flight(JobStatusKind::InProgress));
-        assert!(is_in_flight(JobStatusKind::Stuck));
-        assert!(!is_in_flight(JobStatusKind::Completed));
-        assert!(!is_in_flight(JobStatusKind::Failed));
-        assert!(!is_in_flight(JobStatusKind::Cancelled));
+        assert!(is_in_flight(TurnStatusKind::Pending));
+        assert!(is_in_flight(TurnStatusKind::InProgress));
+        assert!(is_in_flight(TurnStatusKind::Stuck));
+        assert!(!is_in_flight(TurnStatusKind::Completed));
+        assert!(!is_in_flight(TurnStatusKind::Failed));
+        assert!(!is_in_flight(TurnStatusKind::Cancelled));
     }
 }

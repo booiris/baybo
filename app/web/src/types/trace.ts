@@ -70,7 +70,7 @@ export type StepKindTag = StepKind['kind'];
 
 export interface Step {
   id: string;
-  job_id: string;
+  turn_id: string;
   kind: StepKind;
   started_at: string;
   ended_at?: string | null;
@@ -145,7 +145,7 @@ export interface ToolCallOrigin {
 /**
  * Mirrors `baybo_trace::LlmCallInputs` (`#[serde(untagged)]`). The
  * inline array variant matches the long-standing wire shape; the
- * `{ last_ordinal }` object variant is what the per-job trace endpoint
+ * `{ last_ordinal }` object variant is what the per-turn trace endpoint
  * returns for spans whose transcript prefix lives in `session_messages`.
  * `suffix` (compression / progress-observer spans) carries the framing
  * messages appended after that prefix which are *not* themselves rows in
@@ -301,7 +301,7 @@ export interface SpanEvent {
 
 // ── Replay (per-session export wire shape) ────────────────────────────
 
-export type JobStatusKind =
+export type TurnStatusKind =
   | 'pending'
   | 'in_progress'
   | 'stuck'
@@ -314,7 +314,7 @@ export interface ReplayStep {
   spans: Span[];
 }
 
-// ── Trace overview / per-job split (matches baybo_query) ──────────────
+// ── Trace overview / per-turn split (matches baybo_query) ─────────────
 
 /**
  * Mirrors `baybo_session::StoredMessage` on the wire. Used to hydrate
@@ -329,15 +329,15 @@ export interface SessionMessageRow {
 }
 
 /**
- * Per-job row in `TraceOverview`. Carries everything the sidebar +
- * job-summary panel need before the user drills into a specific job —
+ * Per-turn row in `TraceOverview`. Carries everything the sidebar +
+ * turn-summary panel need before the user drills into a specific turn —
  * notably the `↑in ↓out` token chips, aggregated server-side from the
  * cost store so the client doesn't need the span tree to render them.
  */
-export interface TraceJobSummary {
-  job_id: string;
+export interface TraceTurnSummary {
+  turn_id: string;
   session_id: string;
-  job_status_kind: JobStatusKind;
+  turn_status_kind: TurnStatusKind;
   created_at: string;
   started_at?: string | null;
   ended_at?: string | null;
@@ -351,7 +351,7 @@ export interface TraceJobSummary {
 export interface TraceOverview {
   session_id: string;
   session_messages: SessionMessageRow[];
-  jobs: TraceJobSummary[];
+  turns: TraceTurnSummary[];
   // Highest `superseded_by` marker in the session. Advances only when a
   // compaction re-marks rows the client may already hold; an incremental
   // (`since_ordinal`) poll compares it against the cached value to decide
@@ -359,11 +359,11 @@ export interface TraceOverview {
   supersede_watermark: number | null;
 }
 
-/** Response shape of `GET /v1/traces/{session_id}/jobs/{job_id}`. */
-export interface JobTrace {
-  job_id: string;
+/** Response shape of `GET /v1/traces/{session_id}/turns/{turn_id}`. */
+export interface TurnTrace {
+  turn_id: string;
   session_id: string;
-  job_status_kind: JobStatusKind;
+  turn_status_kind: TurnStatusKind;
   created_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;

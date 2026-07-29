@@ -1,5 +1,5 @@
 [package]
-name = "baybo-job"
+name = "baybo-turn"
 version.workspace = true
 edition.workspace = true
 

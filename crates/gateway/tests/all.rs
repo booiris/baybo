@@ -14,11 +14,11 @@ mod chat_api;
 mod cron_api;
 #[path = "device_channel_ws.rs"]
 mod device_channel_ws;
-#[path = "jobs_pagination.rs"]
-mod jobs_pagination;
 #[path = "llm_endpoint.rs"]
 mod llm_endpoint;
 #[path = "logs_endpoint.rs"]
 mod logs_endpoint;
 #[path = "openapi_spec_sync.rs"]
 mod openapi_spec_sync;
+#[path = "turns_pagination.rs"]
+mod turns_pagination;

@@ -6,7 +6,7 @@
 //! `baybo-storage` can still spin up a fake store for unit tests.
 
 use async_trait::async_trait;
-use baybo_model::{JobId, SessionId};
+use baybo_model::{SessionId, TurnId};
 use parking_lot::Mutex;
 
 use crate::error::CostError;
@@ -116,16 +116,16 @@ impl CostStore for MemoryCostStore {
             .collect())
     }
 
-    async fn query_session_by_job(
+    async fn query_session_by_turn(
         &self,
         session_id: &SessionId,
     ) -> CostResult<Vec<CostGroupBucket>> {
         let records = self.records.lock();
-        let mut by_job: std::collections::BTreeMap<String, Vec<&CostRecord>> = Default::default();
+        let mut by_turn: std::collections::BTreeMap<String, Vec<&CostRecord>> = Default::default();
         for r in records.iter().filter(|r| &r.session_id == session_id) {
-            by_job.entry(r.job_id.to_string()).or_default().push(r);
+            by_turn.entry(r.turn_id.to_string()).or_default().push(r);
         }
-        Ok(by_job
+        Ok(by_turn
             .into_iter()
             .map(|(key, rs)| CostGroupBucket {
                 key,
@@ -155,9 +155,9 @@ impl CostStore for MemoryCostStore {
         ))
     }
 
-    async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
+    async fn query_turn(&self, turn_id: &TurnId) -> CostResult<CostSummary> {
         Ok(fold(
-            self.records.lock().iter().filter(|r| &r.job_id == job_id),
+            self.records.lock().iter().filter(|r| &r.turn_id == turn_id),
         ))
     }
 }

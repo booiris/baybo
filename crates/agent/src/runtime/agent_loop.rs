@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
+use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, StatusPhase, ToolStatus};
 use baybo_context::ContextManager;
-use baybo_job::{JobInput, JobLifecycle, JobOutput};
 use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
 use baybo_memory::{Memory, MemoryContext};
 use baybo_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, SessionId, ThinkingContent,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, SessionId, ThinkingContent, TurnId,
 };
+use baybo_turn::{TurnInput, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -28,7 +28,7 @@ use crate::runtime::progress_observer::{
     ObserverState, ProgressObserverRunner, build_observer_prompt, channel_wants_progress,
     should_fire_observer,
 };
-use crate::runtime::scope::JobSpec;
+use crate::runtime::scope::TurnSpec;
 
 use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
 use crate::security::SecurityGateway;
@@ -361,11 +361,11 @@ enum IterationOutcome {
     Continue { task_mutated: bool },
 }
 
-/// Captured inputs for the deferred `Memory::on_job_complete` write. Built
-/// inside `with_job`'s body at the Final-iteration boundary and returned up
-/// so `run()` can fire `spawn_job_complete_write` **after** `with_job`
-/// commits the job — otherwise a cancel-race in `with_job`'s post-body
-/// window could let a memorized turn outlive a `Cancelled` job row.
+/// Captured inputs for the deferred `Memory::on_turn_complete` write. Built
+/// inside `with_turn`'s body at the Final-iteration boundary and returned up
+/// so `run()` can fire `spawn_turn_complete_write` **after** `with_turn`
+/// commits the turn — otherwise a cancel-race in `with_turn`'s post-body
+/// window could let a memorized turn outlive a `Cancelled` turn row.
 struct PendingMemoryWrite {
     user_input: Vec<ContentBlock>,
     final_output: Vec<ContentBlock>,
@@ -398,27 +398,27 @@ pub trait InterjectionSource: Send {
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
-/// The recall query for a job, or `None` for job kinds that don't recall.
-/// Memory recall/write run only for `UserChat` and `Cron` jobs — `Compact`,
+/// The recall query for a turn, or `None` for turn kinds that don't recall.
+/// Memory recall/write run only for `UserChat` and `Cron` turns — `Compact`,
 /// `Spawned` (subagent), `SubagentNotification`, and `CronNotification` have no
 /// direct user input and would pollute or double-write (a `CronNotification`
 /// also runs no LLM call at all, so there is nothing to recall *for*). The
-/// exhaustive match forces a classification when a new `JobInput` variant is
+/// exhaustive match forces a classification when a new `TurnInput` variant is
 /// added.
-fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
+fn memory_recall_query(input: &TurnInput) -> Option<Vec<ContentBlock>> {
     match input {
-        JobInput::UserChat { content } => Some(content.clone()),
-        JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
-        JobInput::Compact
-        | JobInput::Spawned { .. }
-        | JobInput::SubagentNotification { .. }
-        | JobInput::CronNotification { .. } => None,
+        TurnInput::UserChat { content } => Some(content.clone()),
+        TurnInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
+        TurnInput::Compact
+        | TurnInput::Spawned { .. }
+        | TurnInput::SubagentNotification { .. }
+        | TurnInput::CronNotification { .. } => None,
     }
 }
 
 /// Best-effort extraction of a cron fire's prompt text for the recall query.
 /// The cron router writes `action_payload` as `{cron_job_id, prompt}` (an
-/// opaque trace blob — see `baybo_job::JobInput::Cron`); a missing or non-string
+/// opaque trace blob — see `baybo_turn::TurnInput::Cron`); a missing or non-string
 /// `prompt` yields an empty query, so recall degrades to a no-op rather than
 /// coupling hard to that shape.
 fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
@@ -498,7 +498,7 @@ pub struct AgentLoop {
     /// per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory. `None` disables every memory hook (recall,
-    /// `on_job_complete`) — the runtime wires `None` until a real
+    /// `on_turn_complete`) — the runtime wires `None` until a real
     /// implementation is registered.
     memory: Option<Arc<dyn Memory>>,
     /// Durable per-session planning checklist (`Task*`). The loop
@@ -555,7 +555,7 @@ pub struct AgentLoopConfig {
     /// progress observer's durable shadow, and title generation.
     pub sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory handle — one registered implementation, or
-    /// `None` to disable the memory hooks (recall / `on_job_complete`).
+    /// `None` to disable the memory hooks (recall / `on_turn_complete`).
     pub memory: Option<Arc<dyn Memory>>,
     /// Durable per-session planning-checklist store backing the `Task*` tools
     /// and the per-turn reminder.
@@ -701,8 +701,8 @@ impl AgentLoop {
     /// `OutgoingMessage` returned here should still be dispatched by the
     /// caller as `AgentEvent::Message` so non-streaming adapters receive
     /// the canonical response.
-    // `job_input` records why this job exists (provenance: which trigger
-    // kicked it off — User / Cron / Spawned), used for the JobSpec.
+    // `turn_input` records why this turn exists (provenance: which trigger
+    // kicked it off — User / Cron / Spawned), used for the TurnSpec.
     // The turn's triggering message is appended to the transcript by the
     // actor *before* this runs (via `append_user_message` / `append_cron_fire`
     // / `append_background_notification_prompt_once`), so the loop iterates
@@ -767,10 +767,10 @@ impl AgentLoop {
     pub async fn run(
         &mut self,
         session: &mut Session,
-        job_input: JobInput,
-        job_lifecycle: &Arc<JobLifecycle>,
+        turn_input: TurnInput,
+        turn_lifecycle: &Arc<TurnLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
-        parent_job_id: Option<JobId>,
+        parent_turn_id: Option<TurnId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         interjections: Option<&mut dyn InterjectionSource>,
@@ -780,40 +780,40 @@ impl AgentLoop {
         notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
-        // Memory recall query (and write eligibility) for this job — `None`
+        // Memory recall query (and write eligibility) for this turn — `None`
         // for kinds that don't participate (Spawned / notification).
-        let memory_query = memory_recall_query(&job_input);
-        let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
-        let spec = JobSpec {
+        let memory_query = memory_recall_query(&turn_input);
+        let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
+        let spec = TurnSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
-            input: job_input,
-            parent_job_id,
+            input: turn_input,
+            parent_turn_id,
         };
-        // Capture what the post-`with_job` memory spawn needs from `self`
+        // Capture what the post-`with_turn` memory spawn needs from `self`
         // and `session` before the closure takes `&mut self` + `&mut session`
-        // by move — once `with_job`'s body runs we can no longer touch either
+        // by move — once `with_turn`'s body runs we can no longer touch either
         // directly out here.
         let memory_handle = self.memory.clone();
         let memory_user_id = session.user.id.clone();
         let memory_session_id = session.id.clone();
-        // The `on_job_complete` spawn is intentionally OUTSIDE `with_job`'s
-        // body: `with_job`'s post-body window can still mark the job
+        // The `on_turn_complete` spawn is intentionally OUTSIDE `with_turn`'s
+        // body: `with_turn`'s post-body window can still mark the turn
         // `Cancelled` (cancel-race case 3 in `scope.rs`), in which case the
-        // body's Ok is suppressed and `with_job` returns Err — so a spawn
+        // body's Ok is suppressed and `with_turn` returns Err — so a spawn
         // launched inside the body would persist memory for a turn the
         // runtime later treats as cancelled. Carry `PendingMemoryWrite` up
-        // through `with_job`'s `T` and fire only once it has returned Ok.
-        let (outgoing, pending_write) = crate::runtime::scope::with_job(
-            job_lifecycle,
+        // through `with_turn`'s `T` and fire only once it has returned Ok.
+        let (outgoing, pending_write) = crate::runtime::scope::with_turn(
+            turn_lifecycle,
             cancel_token.clone(),
             spec,
-            |job_id| async move {
+            |turn_id| async move {
                 let (outgoing, pending) = self
                     .run_inner(
                         session,
                         span_recorder,
-                        job_id,
+                        turn_id,
                         delta_tx,
                         cancel_token,
                         interjections,
@@ -829,11 +829,11 @@ impl AgentLoop {
                     // (`gateway::push` returns early on `reply_ordinal: None`).
                     // The dispatch is suppressed and the fire session hidden by
                     // `dispatch_cron_prompt`; nothing is deleted.
-                    JobOutput::Structured {
+                    TurnOutput::Structured {
                         value: serde_json::json!({ "notify": "suppressed" }),
                     }
                 } else {
-                    JobOutput::Message {
+                    TurnOutput::Message {
                         content: outgoing.content.clone(),
                         // The reply's persisted ordinal (captured from the store
                         // append) rides the Completed event so push reads exactly
@@ -841,19 +841,19 @@ impl AgentLoop {
                         ordinal: outgoing.ordinal,
                     }
                 };
-                let pending_with_id = pending.map(|p| (job_id, p));
+                let pending_with_id = pending.map(|p| (turn_id, p));
                 Ok((output, (outgoing, pending_with_id)))
             },
         )
         .await?;
-        // Past the cancel-race window — `with_job` returned Ok, so the job
+        // Past the cancel-race window — `with_turn` returned Ok, so the turn
         // row is `Complete`. Safe to bill the memory write against it.
-        if let Some((job_id, write)) = pending_write {
-            Self::spawn_job_complete_write(
+        if let Some((turn_id, write)) = pending_write {
+            Self::spawn_turn_complete_write(
                 memory_handle,
                 memory_user_id,
                 memory_session_id,
-                job_id,
+                turn_id,
                 span_recorder,
                 write.user_input,
                 write.final_output,
@@ -867,7 +867,7 @@ impl AgentLoop {
         &mut self,
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
@@ -879,10 +879,10 @@ impl AgentLoop {
 
         // Fire-and-forget at turn start so the title derives concurrently with
         // the answer (it needs only the question, already in context).
-        self.maybe_generate_title(session, span_recorder, job_id, is_user_turn, &cancel_token)
+        self.maybe_generate_title(session, span_recorder, turn_id, is_user_turn, &cancel_token)
             .await;
 
-        // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
+        // Tool-authored notices (`AgentEvent::Notice`) ride the turn-wide
         // delta_tx directly, not the per-iteration `iter_delta_tx`: they
         // are a distinct output variant from the LLM's streamed `AnswerDelta`
         // and must reach the channel on every iteration, independent of
@@ -903,14 +903,14 @@ impl AgentLoop {
 
         // Recall relevant long-term memories for the triggering input and
         // inject them (framed) before the first LLM call. No-op without a
-        // memory impl or for ineligible job kinds (`memory_query` is `None`).
+        // memory impl or for ineligible turn kinds (`memory_query` is `None`).
         if let Some(query) = memory_query.as_deref() {
-            self.recall_and_inject(query, session, span_recorder, job_id, &cancel_token)
+            self.recall_and_inject(query, session, span_recorder, turn_id, &cancel_token)
                 .await;
         }
-        // Accumulates this job's user-authored input (initial prompt + any
-        // mid-turn interjections) for the `on_job_complete` write at turn end.
-        let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
+        // Accumulates this turn's user-authored input (initial prompt + any
+        // mid-turn interjections) for the `on_turn_complete` write at turn end.
+        let mut turn_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
         // Media the turn's tools produced (`ToolOutput::WithAttachments`),
         // folded into the final assistant row so it persists. Dropped on any
         // non-`Final` exit: attachments are durable only when the turn is.
@@ -943,14 +943,14 @@ impl AgentLoop {
         );
         loop {
             // Cooperative cancel checkpoint between iterations. Without
-            // this, a `cancel(job_id, ...)` admin call (which trips the
+            // this, a `cancel(turn_id, ...)` admin call (which trips the
             // registered token before flipping the row) lets the loop
             // finish whatever it's doing and run another LLM call /
             // compress / tool-call before observing the cancel. Tools
             // and the LLM still get the token via their own paths;
             // this catches the orchestration-layer wait windows.
             if cancel_token.is_cancelled() {
-                warn!(job_id = %job_id, iterations, "cancel observed at iteration boundary; aborting loop");
+                warn!(turn_id = %turn_id, iterations, "cancel observed at iteration boundary; aborting loop");
                 return Err(anyhow::anyhow!("agent loop cancelled"));
             }
             if iterations >= self.max_iterations {
@@ -971,18 +971,18 @@ impl AgentLoop {
                 let drained = self.drain_user_interjections(&mut interjections).await;
                 // Recall against each freshly-drained interjection so the next
                 // LLM call also sees memory relevant to the steering message,
-                // and fold it into this job's input for the end-of-turn write.
+                // and fold it into this turn's input for the end-of-turn write.
                 if memory_query.is_some() {
                     for content in &drained {
                         self.recall_and_inject(
                             content,
                             session,
                             span_recorder,
-                            job_id,
+                            turn_id,
                             &cancel_token,
                         )
                         .await;
-                        job_user_input.extend(content.iter().cloned());
+                        turn_user_input.extend(content.iter().cloned());
                     }
                 }
             }
@@ -1001,7 +1001,7 @@ impl AgentLoop {
             self.compress_if_needed(
                 session,
                 span_recorder,
-                job_id,
+                turn_id,
                 &cancel_token,
                 delta_tx.as_ref(),
             )
@@ -1019,15 +1019,15 @@ impl AgentLoop {
 
             let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
-                job_id,
+                turn_id,
                 StepKind::LlmIteration,
-                Some((&cancel_token, baybo_job::CancelReason::ParentCancelled)),
+                Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled)),
                 |step| {
                     let fut = self.run_iteration(
                         session,
                         span_recorder,
                         step,
-                        job_id,
+                        turn_id,
                         iterations,
                         iter_delta_tx,
                         notifier.clone(),
@@ -1043,12 +1043,12 @@ impl AgentLoop {
             match outcome {
                 IterationOutcome::Final { outgoing } => {
                     // Capture the memory write inputs and return them up to
-                    // `run()` — the actual `spawn_job_complete_write` fires
-                    // **after** `with_job` accepts the job, so a cancel-race
-                    // in `with_job`'s post-body window can't memorize a
+                    // `run()` — the actual `spawn_turn_complete_write` fires
+                    // **after** `with_turn` accepts the turn, so a cancel-race
+                    // in `with_turn`'s post-body window can't memorize a
                     // cancelled turn.
                     let pending = memory_query.is_some().then(|| PendingMemoryWrite {
-                        user_input: std::mem::take(&mut job_user_input),
+                        user_input: std::mem::take(&mut turn_user_input),
                         final_output: outgoing.content.clone(),
                     });
                     return Ok((outgoing, pending));
@@ -1072,7 +1072,7 @@ impl AgentLoop {
                     self.maybe_run_progress_observer(
                         session,
                         span_recorder,
-                        job_id,
+                        turn_id,
                         &cancel_token,
                         &observer_cancel,
                         delta_tx.as_ref(),
@@ -1095,7 +1095,7 @@ impl AgentLoop {
         // Max-iterations fallback. No assistant row was persisted at
         // the loop end — the early-return path inside `run_iteration`
         // is the only one that calls `append_context_message`, so
-        // there's no ordinal to stamp here. `on_job_complete` is also
+        // there's no ordinal to stamp here. `on_turn_complete` is also
         // deliberately NOT fired on this path (`PendingMemoryWrite` is
         // `None`): memory writes only on a clean `IterationOutcome::Final`,
         // so a budget-exhausted (or cancelled / errored, which `?`-return
@@ -1132,7 +1132,7 @@ impl AgentLoop {
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         step: StepHandle,
-        job_id: JobId,
+        turn_id: TurnId,
         iterations: usize,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
@@ -1340,7 +1340,7 @@ impl AgentLoop {
                         triggering_llm_span,
                         tool_use_id,
                         None,
-                        Some(job_id),
+                        Some(turn_id),
                         cancel,
                         notifier,
                         Some(&bind_source),
@@ -1390,7 +1390,7 @@ impl AgentLoop {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
             {
-                // Namespace the cohort by this turn's `job_id` so reusing a
+                // Namespace the cohort by this turn's `turn_id` so reusing a
                 // group name in a later turn opens a fresh cohort rather than
                 // extending the prior (still-sealed, still-draining) one. The
                 // spawner stamps the escorted member's `group` through the
@@ -1398,7 +1398,7 @@ impl AgentLoop {
                 session
                     .state
                     .background_notifications
-                    .register_group_member(job_id, group);
+                    .register_group_member(turn_id, group);
             }
 
             let raw_result_text = match &executed.output {
@@ -1631,7 +1631,7 @@ impl AgentLoop {
         crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
-            step.job_id,
+            step.turn_id,
             LlmCallBegin {
                 model_id: model_info.id.clone(),
                 provider: model_info.provider.clone(),
@@ -1639,7 +1639,7 @@ impl AgentLoop {
                 input_messages,
                 temperature: None,
             },
-            Some((cancel_token, baybo_job::CancelReason::ParentCancelled)),
+            Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
             |span| async move {
                 // Bind this call to its `LlmCall` span so the spend lands
                 // on the right span. `BoundBilledLlm` does gate → call →
@@ -1647,7 +1647,7 @@ impl AgentLoop {
                 let bound = self.llm_client.bind(Attribution {
                     user_id: session.user.id.clone(),
                     session_id: session.id.clone(),
-                    job_id: step.job_id,
+                    turn_id: step.turn_id,
                     span_id: span.span_id,
                     reason: baybo_llm::CallReason::Chat,
                 });
@@ -1839,7 +1839,7 @@ impl AgentLoop {
         query: &[ContentBlock],
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         cancel_token: &CancellationToken,
     ) {
         // A prompt-less trigger (e.g. a tool-only cron fire whose payload has no
@@ -1862,11 +1862,11 @@ impl AgentLoop {
         let recorder = Arc::clone(span_recorder);
         let recalled = crate::runtime::scope::with_step(
             span_recorder.as_ref(),
-            job_id,
+            turn_id,
             StepKind::MemoryRecall,
-            Some((cancel_token, baybo_job::CancelReason::ParentCancelled)),
+            Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
             move |step| async move {
-                let ctx = MemoryContext::new(user_id, session_id, job_id, recorder, step);
+                let ctx = MemoryContext::new(user_id, session_id, turn_id, recorder, step);
                 match memory.recall(&ctx, &query).await {
                     Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
                     Err(e) => Err(anyhow::Error::new(e)),
@@ -1889,7 +1889,7 @@ impl AgentLoop {
             return;
         }
         // Belt-and-braces dedup: the `Memory` trait says per-session
-        // de-duplication is the impl's job, but mem0 / openviking don't do
+        // de-duplication is the impl's turn, but mem0 / openviking don't do
         // it today (a recall on the same query a few turns later returns
         // the same `memory` strings). Filter against the live transcript's
         // existing `RecalledMemory` rows so we don't accumulate identical
@@ -1973,19 +1973,19 @@ impl AgentLoop {
             if transcript.is_empty() {
                 return;
             }
-            // Synthetic JobId — `on_session_end` isn't tied to a user job; this
+            // Synthetic TurnId — `on_session_end` isn't tied to a user turn; this
             // id only exists so the trace step + any billed sub-call records
             // share one key. Mirrors how compression mints its own ids for
             // maintenance work.
-            let job_id = JobId::new();
+            let turn_id = TurnId::new();
             let ctx_recorder = Arc::clone(&recorder);
             let result = crate::runtime::scope::with_step(
                 recorder.as_ref(),
-                job_id,
+                turn_id,
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(user_id, session_id, turn_id, ctx_recorder, step);
                     match memory.on_session_end(&ctx, &transcript).await {
                         Ok(()) => Ok((LifecycleOutcome::Ok, ())),
                         Err(e) => Err(anyhow::Error::new(e)),
@@ -1999,23 +1999,23 @@ impl AgentLoop {
         });
     }
 
-    /// Fire-and-forget the [`Memory::on_job_complete`] write for a finished
+    /// Fire-and-forget the [`Memory::on_turn_complete`] write for a finished
     /// exchange. Detached so the actor returns the answer without waiting on
     /// the memory write; the impl bills its work against the minted
     /// [`Attribution`] under a `MemoryWrite` trace step. No-op when no memory
     /// is wired (`memory == None`).
     ///
     /// Free-standing (no `&self`) and takes owned `user_id` / `session_id`
-    /// so `run()` can call it AFTER `with_job` returns — the closure that
+    /// so `run()` can call it AFTER `with_turn` returns — the closure that
     /// drives the iteration loop moves `&mut self` + `&mut session` into
-    /// `with_job`'s body, so the borrow checker won't let us touch either
+    /// `with_turn`'s body, so the borrow checker won't let us touch either
     /// from `run()` afterwards. Pre-extract `self.memory.clone()` and the
     /// two ids before the closure, then call this with the owned values.
-    fn spawn_job_complete_write(
+    fn spawn_turn_complete_write(
         memory: Option<Arc<dyn Memory>>,
         user_id: String,
         session_id: SessionId,
-        job_id: JobId,
+        turn_id: TurnId,
         span_recorder: &Arc<SpanRecorder>,
         user_input: Vec<ContentBlock>,
         final_output: Vec<ContentBlock>,
@@ -2028,13 +2028,13 @@ impl AgentLoop {
             let ctx_recorder = Arc::clone(&recorder);
             let result = crate::runtime::scope::with_step(
                 recorder.as_ref(),
-                job_id,
+                turn_id,
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(user_id, session_id, turn_id, ctx_recorder, step);
                     match memory
-                        .on_job_complete(&ctx, &user_input, &final_output)
+                        .on_turn_complete(&ctx, &user_input, &final_output)
                         .await
                     {
                         Ok(()) => Ok((LifecycleOutcome::Ok, ())),
@@ -2044,7 +2044,7 @@ impl AgentLoop {
             )
             .await;
             if let Err(e) = result {
-                warn!(error = %e, "memory on_job_complete write failed");
+                warn!(error = %e, "memory on_turn_complete write failed");
             }
         });
     }
@@ -2081,9 +2081,9 @@ impl AgentLoop {
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
-    pub async fn append_cron_fire(&mut self, job_id: &str, prompt: &str) -> anyhow::Result<()> {
+    pub async fn append_cron_fire(&mut self, turn_id: &str, prompt: &str) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
-        let framed = baybo_context::prompts::cron::frame_cron_prompt(job_id, prompt);
+        let framed = baybo_context::prompts::cron::frame_cron_prompt(turn_id, prompt);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
         self.context_manager.append(&msg).await;
         Ok(())
@@ -2103,7 +2103,7 @@ impl AgentLoop {
     /// notification can be the first thing an otherwise-cold session appends.
     ///
     /// `None` when the session runs with no durable store (tests); the caller
-    /// then has no ordinal to push or to record on the job.
+    /// then has no ordinal to push or to record on the turn.
     pub async fn append_cron_notification(
         &mut self,
         content: Vec<ContentBlock>,
@@ -2483,7 +2483,7 @@ impl AgentLoop {
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         session: &Session,
-        status: TurnStatus,
+        status: StatusPhase,
     ) {
         let Some(tx) = delta_tx else { return };
         let _ = tx
@@ -2509,14 +2509,14 @@ impl AgentLoop {
         &mut self,
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         cancel_token: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(
             session,
             span_recorder,
-            job_id,
+            turn_id,
             cancel_token,
             CompressionTrigger::Threshold,
         );
@@ -2525,7 +2525,7 @@ impl AgentLoop {
         // report the phase when a pass will actually run.
         let compacting = self.context_manager.needs_compression(&model_id);
         if compacting {
-            self.emit_status(delta_tx, session, TurnStatus::Compacting)
+            self.emit_status(delta_tx, session, StatusPhase::Compacting)
                 .await;
         }
         let result = self
@@ -2538,13 +2538,13 @@ impl AgentLoop {
         // status line never dangles — except on a cancel, where the compaction
         // was abandoned and the turn is unwinding behind it.
         if compacting && !cancel_token.is_cancelled() {
-            self.emit_status(delta_tx, session, TurnStatus::Compacted)
+            self.emit_status(delta_tx, session, StatusPhase::Compacted)
                 .await;
         }
         if let Ok(baybo_context::CompressionOutcome::Compressed { stage }) = &result {
             Self::record_spanless_compaction(
                 span_recorder,
-                job_id,
+                turn_id,
                 CompressionTrigger::Threshold,
                 *stage,
             )
@@ -2564,7 +2564,7 @@ impl AgentLoop {
     /// model round-trip to span.
     async fn record_spanless_compaction(
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         trigger: CompressionTrigger,
         stage: baybo_context::CompressionStage,
     ) {
@@ -2578,7 +2578,7 @@ impl AgentLoop {
             trigger: Some(trigger),
             applied: Some(applied),
         };
-        match span_recorder.begin_step(job_id, kind).await {
+        match span_recorder.begin_step(turn_id, kind).await {
             Ok(step) => {
                 if let Err(e) = span_recorder
                     .end_step(step, baybo_trace::LifecycleOutcome::Ok)
@@ -2595,7 +2595,7 @@ impl AgentLoop {
         &self,
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         cancel_token: &CancellationToken,
         trigger: CompressionTrigger,
     ) -> CompressionRunner {
@@ -2604,7 +2604,7 @@ impl AgentLoop {
             llm_client: self.llm_client.clone(),
             recorder: Arc::clone(span_recorder),
             security_gateway: Arc::clone(&self.security_gateway),
-            job_id,
+            turn_id,
             user_id: session.user.id.clone(),
             session_id: session.id.clone(),
             model_info,
@@ -2627,7 +2627,7 @@ impl AgentLoop {
         &self,
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         cancel_token: &CancellationToken,
         // Bound to the spawned call (not the gate/drain checks) so it aborts on
         // turn end even when the turn itself succeeded.
@@ -2719,7 +2719,7 @@ impl AgentLoop {
         // step) — the runner `select!`s on `observer_cancel` instead, closing
         // as Cancelled when the loop trips it on turn end.
         let runner =
-            self.build_progress_observer_runner(session, span_recorder, job_id, observer_cancel);
+            self.build_progress_observer_runner(session, span_recorder, turn_id, observer_cancel);
         observer_state.in_flight = Some(tokio::spawn(async move {
             runner.run(request, input_marker).await
         }));
@@ -2729,14 +2729,14 @@ impl AgentLoop {
         &self,
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
+        turn_id: TurnId,
         cancel_token: &CancellationToken,
     ) -> ProgressObserverRunner {
         ProgressObserverRunner {
             llm_client: self.llm_client.clone(),
             recorder: Arc::clone(span_recorder),
             security_gateway: Arc::clone(&self.security_gateway),
-            job_id,
+            turn_id,
             user_id: session.user.id.clone(),
             session_id: session.id.clone(),
             model_info: self.llm_client.model_info().clone(),
@@ -2803,36 +2803,36 @@ impl AgentLoop {
     /// messages so the caller (typically a `/compact` notice) can
     /// distinguish "strategy declined", "no savings", and a real
     /// compress — instead of one generic "nothing to compress" line.
-    /// A fresh job is minted so the compression step + LLM span land
+    /// A fresh turn is minted so the compression step + LLM span land
     /// on a real lifecycle.
     pub async fn compact_now(
         &mut self,
         session: &mut Session,
-        job_lifecycle: &Arc<JobLifecycle>,
+        turn_lifecycle: &Arc<TurnLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
-        parent_job_id: Option<JobId>,
+        parent_turn_id: Option<TurnId>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<String> {
         // `/compact` is a user-typed command, but it is not a chat turn: it
         // runs `force_compress` directly and emits a notice, not an assistant
         // reply.
-        let job_input = JobInput::Compact;
-        let spec = JobSpec {
+        let turn_input = TurnInput::Compact;
+        let spec = TurnSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
-            input: job_input,
-            parent_job_id,
+            input: turn_input,
+            parent_turn_id,
         };
 
-        crate::runtime::scope::with_job(
-            job_lifecycle,
+        crate::runtime::scope::with_turn(
+            turn_lifecycle,
             cancel_token.clone(),
             spec,
-            |job_id| async move {
+            |turn_id| async move {
                 let runner = self.build_compression_runner(
                     session,
                     span_recorder,
-                    job_id,
+                    turn_id,
                     &cancel_token,
                     CompressionTrigger::Forced,
                 );
@@ -2846,7 +2846,7 @@ impl AgentLoop {
                 if let baybo_context::CompressionOutcome::Compressed { stage } = &outcome {
                     Self::record_spanless_compaction(
                         span_recorder,
-                        job_id,
+                        turn_id,
                         CompressionTrigger::Forced,
                         *stage,
                     )
@@ -2869,7 +2869,7 @@ impl AgentLoop {
                         "Compaction cancelled; the conversation is unchanged.".to_string()
                     }
                 };
-                let output = JobOutput::Message {
+                let output = TurnOutput::Message {
                     content: vec![ContentBlock::Text(text.clone())],
                     // `/compact` is not a user-chat turn — never pushed.
                     ordinal: None,
@@ -2887,9 +2887,9 @@ impl AgentLoop {
     /// first question, which is already in context, not on the reply. It
     /// `tokio::spawn`s a DETACHED pass that records a
     /// [`StepKind::TitleGeneration`] step + its `LlmCall` span **under this
-    /// turn's own job** (`current_job_id`) — so cost + trace attribute to the
+    /// turn's own turn** (`current_turn_id`) — so cost + trace attribute to the
     /// triggering turn, exactly like [`Self::maybe_run_progress_observer`],
-    /// rather than spinning up a separate maintenance job. It titles the
+    /// rather than spinning up a separate maintenance turn. It titles the
     /// session, persists it via `SessionManager::set_title`, and notifies the
     /// [`Self::title_sink`] to broadcast it. Fire-and-forget: the turn never
     /// blocks on it.
@@ -2914,7 +2914,7 @@ impl AgentLoop {
         &mut self,
         session: &Session,
         span_recorder: &Arc<SpanRecorder>,
-        current_job_id: JobId,
+        current_turn_id: TurnId,
         is_user_turn: bool,
         cancel_token: &CancellationToken,
     ) {
@@ -2950,7 +2950,7 @@ impl AgentLoop {
                 llm_client,
                 recorder,
                 security_gateway,
-                job_id: current_job_id,
+                turn_id: current_turn_id,
                 user_id,
                 session_id: session_id.clone(),
                 model_info,
@@ -3462,7 +3462,7 @@ mod session_end_gate_tests {
     //! predicate that gates the background-summary pass (subagents skip it).
     use super::{is_subagent, should_fire_session_end};
     use baybo_model::{
-        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,
+        ChannelType, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource, TurnId,
         User,
     };
     use chrono::Utc;
@@ -3518,7 +3518,7 @@ mod session_end_gate_tests {
     fn skips_subagent_session() {
         let lineage = Lineage {
             parent_session_id: SessionId::from("parent"),
-            parent_job_id: JobId::new(),
+            parent_turn_id: TurnId::new(),
             parent_span_id: None,
             kind: LineageKind::Subagent,
         };
@@ -3535,7 +3535,7 @@ mod session_end_gate_tests {
         assert!(!is_subagent(&session_with(TriggerSource::User, None)));
         let lineage = Lineage {
             parent_session_id: SessionId::from("parent"),
-            parent_job_id: JobId::new(),
+            parent_turn_id: TurnId::new(),
             parent_span_id: None,
             kind: LineageKind::Subagent,
         };

@@ -25,7 +25,7 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{
     AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
-    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus, TurnStatus,
+    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, StatusPhase, ToolStatus,
 };
 use baybo_model::{ChannelType, ContentBlock};
 use baybo_store::BlobStore;
@@ -445,8 +445,8 @@ async fn agent_output_to_frame(
         }
         AgentEvent::Status(status) => {
             let phase = match status {
-                TurnStatus::Compacting => "compacting",
-                TurnStatus::Compacted => "compacted",
+                StatusPhase::Compacting => "compacting",
+                StatusPhase::Compacted => "compacted",
             };
             Frame::Status {
                 session_id,

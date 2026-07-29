@@ -16,7 +16,7 @@ import type {
   Span,
 } from '../../types/trace';
 import { resolveInputMessages } from '../../types/trace';
-import type { BenchJob, BenchTrace } from '../../api/types';
+import type { BenchTurn, BenchTrace } from '../../api/types';
 import { fmtMs, fmtTokens } from '../../lib/format';
 import { MessageList } from './MessageList';
 
@@ -267,23 +267,23 @@ function StepBlock({
   );
 }
 
-function JobBlock({
-  job,
+function TurnBlock({
+  turn,
   sessionMessages,
 }: {
-  job: BenchJob;
+  turn: BenchTurn;
   sessionMessages: SessionMessageRow[];
 }) {
-  const dur = durMs(job.job.started_at, job.job.ended_at);
+  const dur = durMs(turn.turn.started_at, turn.turn.ended_at);
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 text-[0.75rem]">
-        <span className="font-bold uppercase tracking-wider text-ink-soft">job</span>
-        <span className="font-mono text-ink-soft truncate">{job.job.id}</span>
+        <span className="font-bold uppercase tracking-wider text-ink-soft">turn</span>
+        <span className="font-mono text-ink-soft truncate">{turn.turn.id}</span>
         <span className="ml-auto font-mono text-ink-soft">{fmtMs(dur)}</span>
       </div>
       <div className="space-y-3">
-        {job.steps.map((rs) => (
+        {turn.steps.map((rs) => (
           <StepBlock
             key={rs.step.id}
             step={rs.step}
@@ -297,13 +297,13 @@ function JobBlock({
 }
 
 export function Timeline({ trace }: { trace: BenchTrace }) {
-  if (trace.jobs.length === 0) {
+  if (trace.turns.length === 0) {
     return <div className="text-ink-soft text-[0.85rem] italic">No execution spans recorded.</div>;
   }
   return (
     <div className="space-y-5">
-      {trace.jobs.map((j, i) => (
-        <JobBlock key={j.job.id || i} job={j} sessionMessages={trace.session_messages} />
+      {trace.turns.map((t, i) => (
+        <TurnBlock key={t.turn.id || i} turn={t} sessionMessages={trace.session_messages} />
       ))}
     </div>
   );

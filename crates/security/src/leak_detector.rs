@@ -37,7 +37,7 @@ pub struct LeakScanResult {
     pub block_reason: Option<String>,
 }
 
-/// A single detected secret fragment. Substitution is the caller's job.
+/// A single detected secret fragment. Substitution is the caller's turn.
 #[derive(Debug, Clone)]
 pub struct LeakMatch {
     pub original: String,

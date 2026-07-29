@@ -18,7 +18,7 @@ baybo-workspace = { workspace = true, features = ["io"] }
 baybo-context = { workspace = true }
 baybo-session = { workspace = true }
 baybo-trace = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 baybo-memory = { workspace = true }
 baybo-cost = { workspace = true }
 baybo-security = { workspace = true }
@@ -50,7 +50,7 @@ libc = { workspace = true }
 baybo-cost = { workspace = true, features = ["test-support"] }
 # `InMemoryCronStore` — the router tests drive cron delivery without sqlite.
 baybo-cron = { workspace = true, features = ["test-support"] }
-baybo-job = { workspace = true, features = ["test-support"] }
+baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }
 baybo-memory = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }

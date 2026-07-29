@@ -183,7 +183,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
     }
 
     async fn load_pending_jobs(&self) -> Result<Vec<AssessmentJob>> {
-        type JobRow = (
+        type TurnRow = (
             String,
             String,
             String,
@@ -193,7 +193,7 @@ impl SkillRiskStore for SqliteSkillRiskStore {
             i64,
             i64,
         );
-        let rows: Vec<JobRow> = self
+        let rows: Vec<TurnRow> = self
             .pool
             .interact("skill_risk.load_pending_jobs", move |conn| {
                 let mut stmt = conn.prepare(

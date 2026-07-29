@@ -124,6 +124,11 @@ them only when the client already holds a turn-end signal for the *same*
 turn, matched by `started_at` — never by comparing the cursor to the
 snapshot's `as_of_ordinal` (the cursor advances mid-turn).
 _Avoid_: ordinal-arithmetic staleness (`cursor > as_of_ordinal`)
+_See also_: **Turn** is now also the server-side row and state machine —
+one row per agent-loop invocation ([`modules/turn.md`](modules/turn.md)).
+Every kind of work is one of those rows (user chat, cron fire,
+`/compact`, spawned subagent); the sync-protocol sense used here — a
+reply in flight to a chat client — is the **chat turn** subset.
 
 **Ephemeral plane**:
 Droppable live streams (answer deltas, reasoning, tool lifecycle, activity

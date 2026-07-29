@@ -17,12 +17,12 @@ use baybo_agent::service::ShutdownSignal;
 use baybo_agent::{CronScheduler, SessionManager};
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_config::BayboConfig;
-use baybo_job::JobLifecycle;
 use baybo_llm::{LlmProviderConfig, LlmProviderRegistry};
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_skills::SkillRegistry;
 use baybo_storage::Store;
 use baybo_tools::ToolRegistry;
+use baybo_turn::TurnLifecycle;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -147,7 +147,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores.session.clone(),
         stores.session_folder.clone(),
     ));
-    let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
+    let turn_lifecycle = Arc::new(TurnLifecycle::new(stores.turn.clone()));
 
     let secret_vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
@@ -239,7 +239,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         config_path: None,
         runtime_config,
         session_manager,
-        job_lifecycle,
+        turn_lifecycle,
         cron_scheduler,
         skill_registry,
         tool_registry,

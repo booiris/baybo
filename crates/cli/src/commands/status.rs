@@ -1,6 +1,6 @@
 use baybo_cost::TimeRange;
-use baybo_job::JobStatusKind;
 use baybo_query::CostScope;
+use baybo_turn::TurnStatusKind;
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -54,14 +54,14 @@ pub async fn handle(ctx: &CommandContext, live: bool) -> Result<CommandOutput> {
     })
 }
 
-/// Three independent runtime counters: in-flight jobs, recently-failed
-/// jobs (24h), today's spend. Each section degrades gracefully when
+/// Three independent runtime counters: in-flight turns, recently-failed
+/// turns (24h), today's spend. Each section degrades gracefully when
 /// its manager is absent (argv-light commands don't wire the full
 /// graph) by carrying `None`.
 #[derive(Debug, Serialize)]
 struct LiveSnapshot {
-    in_flight_jobs: Option<usize>,
-    failed_jobs_24h: Option<usize>,
+    in_flight_turns: Option<usize>,
+    failed_turns_24h: Option<usize>,
     cost_today: Option<LiveCostSummary>,
 }
 
@@ -80,12 +80,12 @@ impl LiveSnapshot {
     fn append_human(&self, out: &mut String) {
         out.push_str("\n\nlive:");
         out.push_str(&format!(
-            "\n  in-flight jobs:   {}",
-            fmt_opt_num(self.in_flight_jobs)
+            "\n  in-flight turns:   {}",
+            fmt_opt_num(self.in_flight_turns)
         ));
         out.push_str(&format!(
-            "\n  failed jobs/24h:  {}",
-            fmt_opt_num(self.failed_jobs_24h)
+            "\n  failed turns/24h:  {}",
+            fmt_opt_num(self.failed_turns_24h)
         ));
         let cost_str = match &self.cost_today {
             Some(c) => format!(
@@ -104,38 +104,38 @@ fn fmt_opt_num(n: Option<usize>) -> String {
 }
 
 async fn live_snapshot(ctx: &CommandContext) -> Result<LiveSnapshot> {
-    let (in_flight_jobs, failed_jobs_24h, cost_today) = tokio::try_join!(
+    let (in_flight_turns, failed_turns_24h, cost_today) = tokio::try_join!(
         fetch_in_flight(ctx),
         fetch_recent_failures(ctx),
         fetch_cost_today(ctx),
     )?;
     Ok(LiveSnapshot {
-        in_flight_jobs,
-        failed_jobs_24h,
+        in_flight_turns,
+        failed_turns_24h,
         cost_today,
     })
 }
 
 async fn fetch_in_flight(ctx: &CommandContext) -> Result<Option<usize>> {
-    let Some(jl) = ctx.job.as_deref() else {
+    let Some(jl) = ctx.turn.as_deref() else {
         return Ok(None);
     };
-    let jobs = jl
-        .list(Some(JobStatusKind::InProgress))
+    let turns = jl
+        .list(Some(TurnStatusKind::InProgress))
         .await
-        .map_err(|e| CliError::Manager(format!("list in-flight jobs: {e}")))?;
-    Ok(Some(jobs.len()))
+        .map_err(|e| CliError::Manager(format!("list in-flight turns: {e}")))?;
+    Ok(Some(turns.len()))
 }
 
 async fn fetch_recent_failures(ctx: &CommandContext) -> Result<Option<usize>> {
-    let Some(jl) = ctx.job.as_deref() else {
+    let Some(jl) = ctx.turn.as_deref() else {
         return Ok(None);
     };
     let cutoff = Utc::now() - RECENT_FAILURE_WINDOW;
     let failed = jl
-        .list(Some(JobStatusKind::Failed))
+        .list(Some(TurnStatusKind::Failed))
         .await
-        .map_err(|e| CliError::Manager(format!("list failed jobs: {e}")))?;
+        .map_err(|e| CliError::Manager(format!("list failed turns: {e}")))?;
     Ok(Some(
         failed
             .iter()

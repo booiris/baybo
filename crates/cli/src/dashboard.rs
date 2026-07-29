@@ -31,7 +31,7 @@ impl DashboardProvider for CliDashboardProvider {
     async fn snapshot(&self, kind: ViewKind) -> DashboardSnapshot {
         match kind {
             ViewKind::Skills => skills_snapshot(&self.ctx),
-            ViewKind::Jobs => jobs_snapshot(&self.ctx).await,
+            ViewKind::Turns => turns_snapshot(&self.ctx).await,
             ViewKind::Sessions => sessions_snapshot(&self.ctx).await,
         }
     }
@@ -64,10 +64,10 @@ fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
     }
 }
 
-async fn jobs_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
-    let rows = match ctx.job.as_deref() {
+async fn turns_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
+    let rows = match ctx.turn.as_deref() {
         Some(mgr) => match mgr.list(None).await {
-            Ok(jobs) => jobs
+            Ok(turns) => turns
                 .iter()
                 .map(|j| {
                     vec![
@@ -83,7 +83,7 @@ async fn jobs_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
         None => Vec::new(),
     };
     DashboardSnapshot {
-        title: "Jobs".into(),
+        title: "Turns".into(),
         columns: vec![
             "ID".into(),
             "SESSION".into(),

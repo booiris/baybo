@@ -47,7 +47,7 @@ const RETRY_CUE: &str = "[the user has received only the completion acknowledgem
 
 /// Build the persisted, user-facing acknowledgement that precedes the streamed
 /// analysis turn. It is a bland "work finished, reviewing now" notice with **no
-/// result content**: a finished job's raw output stays LLM-only (it rides
+/// result content**: a finished turn's raw output stays LLM-only (it rides
 /// [`build_notification_content`] as a hidden `agent_context` row), so the user
 /// learns the actual outcome solely from the parent's analysed report, never
 /// from the unprocessed result body.
@@ -75,7 +75,7 @@ pub fn build_retry_cue() -> Vec<ContentBlock> {
     vec![ContentBlock::Text(RETRY_CUE.to_string())]
 }
 
-/// Render pending background-job results into nested-XML content for one
+/// Render pending background-turn results into nested-XML content for one
 /// notification turn. Pure — the actor freezes the rendered content on the
 /// notification ledger, so a retry re-runs against exactly this prompt. The
 /// framing rides in this per-turn content (never the system prompt) so the
@@ -134,16 +134,16 @@ fn pending_status_label(status: &SubagentExitStatus) -> &'static str {
     }
 }
 
-/// Cap a result's free text so one chatty job can't blow the notification
+/// Cap a result's free text so one chatty turn can't blow the notification
 /// turn's budget; the full text stays in the child session transcript (for a
-/// subagent) or the job's output file (for a command).
+/// subagent) or the turn's output file (for a command).
 fn truncate_for_notice(text: &str) -> String {
     const MAX: usize = 1024;
     if text.chars().count() <= MAX {
         return text.to_string();
     }
     let truncated: String = text.chars().take(MAX).collect();
-    format!("{truncated}… [truncated; full text in the job's transcript / output file]")
+    format!("{truncated}… [truncated; full text in the turn's transcript / output file]")
 }
 
 fn xml_escape(s: &str) -> String {
@@ -283,7 +283,7 @@ mod tests {
         ] {
             assert!(
                 !reply.contains(leaked),
-                "acknowledgement leaked job content: {leaked:?} in {reply:?}"
+                "acknowledgement leaked turn content: {leaked:?} in {reply:?}"
             );
         }
     }

@@ -28,8 +28,8 @@ arrived while it was working.
 ## How Claude Code / Codex do it (reference)
 
 Both inject into the running turn at a tool boundary; **neither spawns a separate
-job for an "unrelated" message** — they keep one linear thread and put the timing
-choice on the human (we evaluated and rejected the new-job route; see the
+turn for an "unrelated" message** — they keep one linear thread and put the timing
+choice on the human (we evaluated and rejected the new-turn route; see the
 `feedback`/`project` memory and the rejected-alternative note in git).
 
 - **Codex** (verified from `openai/codex` source): Enter = inject into the
@@ -60,7 +60,7 @@ turn ends once the user stops sending and the model returns a no-tool `Final`.
 | **Batching** | Drain the whole leading non-slash run; each stays its own faithful row; wrapped together under one wire envelope. |
 | **Turn scope** | `UserChat` turns only, gated structurally by which handlers pass the source. Only `handle_merged_user_turn` drains — every non-slash user message routes there (a single message is a batch of one); `handle_user_input` (slash `/skill` turns) and cron/spawned/notification pass `None`. A message during a `SubagentNotification` turn stays queued (avoids that turn's in-memory rollback desyncing already-persisted rows). |
 | **Budget** | `max_iterations` is **not** extended by an injection. The `UserInterjection` row is charged its **framed** wire size via `ContextManager::message_budget_tokens` — used by the live append **and** the `restore_messages` / compaction rebuild paths — so the compression gate never under-counts the envelope the request actually carries. |
-| **Provenance / observability** | No new/mutated job and **no `SpanEventKind` variant** (that enum is hand-mirrored in `app/web/src/types/trace.ts` + rendered in the web trace UI — disproportionate for a greppability marker). Durable record = the persisted rows + their capture in the next `LlmCall` span input; the drain also logs `tracing::info!(interjections = N, …)`. |
+| **Provenance / observability** | No new/mutated turn and **no `SpanEventKind` variant** (that enum is hand-mirrored in `app/web/src/types/trace.ts` + rendered in the web trace UI — disproportionate for a greppability marker). Durable record = the persisted rows + their capture in the next `LlmCall` span input; the drain also logs `tracing::info!(interjections = N, …)`. |
 | **Rollout / ack** | Always on, no config knob (safe fallback: unhit messages defer to the next turn). Silent ack — the eventual reply acknowledges it per the framing; the user already sees their sent message echoed in the channel. |
 
 ## Key correctness properties
@@ -74,11 +74,11 @@ turn ends once the user stops sending and the model returns a no-tool `Final`.
 Interjections are surfaced in the web dashboard via the persisted
 `source: "user_interjection"` (already on the `/v1/traces` wire — no ts-rs
 change): an "Interjected" badge on the message card (`MessageList`, shown in both
-the session transcript and each LLM call's inputs), a per-job count chip in the
-job sidebar, and a header badge + an `Interjections` Activity row in the job
-summary (`TraceSessionPage`). A job is credited an interjection when a
+the session transcript and each LLM call's inputs), a per-turn count chip in the
+turn sidebar, and a header badge + an `Interjections` Activity row in the turn
+summary (`TraceSessionPage`). A turn is credited an interjection when a
 `user_interjection` row's `created_at` falls inside its `[started_at, ended_at)`
-window — jobs run sequentially and the row is only persisted mid-drain, so the
+window — turns run sequentially and the row is only persisted mid-drain, so the
 mapping is exact.
 
 ## Known limitation

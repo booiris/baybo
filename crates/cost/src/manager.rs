@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use baybo_llm::ModelPricing;
-use baybo_model::{JobId, MicroUsd, SessionId, SpanId};
+use baybo_model::{MicroUsd, SessionId, SpanId, TurnId};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -376,7 +376,7 @@ impl CostManager {
         self: &Arc<Self>,
         user_id: &str,
         session_id: SessionId,
-        job_id: JobId,
+        turn_id: TurnId,
         span_id: SpanId,
         reason: CallReason,
         model_id: &str,
@@ -405,7 +405,7 @@ impl CostManager {
         let record = CostRecord {
             user_id: user_id.to_string(),
             session_id,
-            job_id,
+            turn_id,
             span_id,
             reason,
             model: model_id.to_string(),
@@ -431,7 +431,7 @@ impl CostManager {
         self: &Arc<Self>,
         user_id: &str,
         session_id: SessionId,
-        job_id: JobId,
+        turn_id: TurnId,
         span_id: SpanId,
         reason: CallReason,
         model_id: &str,
@@ -443,7 +443,7 @@ impl CostManager {
         let record = CostRecord {
             user_id: user_id.to_string(),
             session_id,
-            job_id,
+            turn_id,
             span_id,
             reason,
             model: model_id.to_string(),
@@ -541,7 +541,7 @@ fn cost_record_closure(manager: &Arc<CostManager>) -> baybo_llm::LlmCostRecorder
             cm.record_call(
                 &attr.user_id,
                 attr.session_id.clone(),
-                attr.job_id,
+                attr.turn_id,
                 attr.span_id,
                 attr.reason.clone(),
                 model_id,
@@ -718,12 +718,12 @@ mod tests {
     /// is `Utc::now()` so the calendar-day / calendar-month windows in
     /// `check_quota` always include it.
     async fn record_spend(store: &Arc<dyn CostStore>, user_id: &str, cost: MicroUsd) {
-        use baybo_model::{JobId, SessionId, SpanId};
+        use baybo_model::{SessionId, SpanId, TurnId};
         store
             .record(&CostRecord {
                 user_id: user_id.into(),
                 session_id: SessionId::from("s1"),
-                job_id: JobId::new(),
+                turn_id: TurnId::new(),
                 span_id: SpanId::new(),
                 reason: CallReason::Chat,
                 model: "m1".into(),
@@ -760,7 +760,7 @@ mod tests {
         cm.record_call(
             user_id,
             SessionId::from("s1"),
-            JobId::new(),
+            TurnId::new(),
             SpanId::new(),
             CallReason::Chat,
             "m1",
@@ -803,7 +803,7 @@ mod tests {
         cm.record_call(
             "u1",
             SessionId::from("s1"),
-            JobId::new(),
+            TurnId::new(),
             SpanId::new(),
             CallReason::Chat,
             "m1",
@@ -827,7 +827,7 @@ mod tests {
         cm.record_call(
             "u1",
             SessionId::from("s1"),
-            JobId::new(),
+            TurnId::new(),
             SpanId::new(),
             CallReason::Chat,
             "m1",
@@ -848,7 +848,7 @@ mod tests {
         cm.record_call(
             "u1",
             SessionId::from("s1"),
-            JobId::new(),
+            TurnId::new(),
             SpanId::new(),
             CallReason::Chat,
             "m1",
@@ -871,7 +871,7 @@ mod tests {
         cm.record_call(
             "u1",
             SessionId::from("s1"),
-            JobId::new(),
+            TurnId::new(),
             SpanId::new(),
             CallReason::Chat,
             "m1",

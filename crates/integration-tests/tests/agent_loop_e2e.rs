@@ -78,7 +78,7 @@ async fn clean_conversation_streams_text_then_final_message() {
         "no minting should happen on clean text"
     );
 
-    // The turn's close edge is always projected from the job store: the
+    // The turn's close edge is always projected from the turn store: the
     // final TurnState a watcher sees is `active: false`. (The open edge is
     // also projected, but this stub turn finishes sub-millisecond — faster
     // than the projector can recompute its `Started` event — so the live
@@ -158,21 +158,21 @@ async fn next_turn_state(rx: &mut tokio::sync::mpsc::Receiver<AgentOutput>) -> (
 }
 
 /// The turn-state projector brackets a turn held open across the `Started`
-/// recompute: driving `JobLifecycle` directly (no actor) keeps the job
+/// recompute: driving `TurnLifecycle` directly (no actor) keeps the turn
 /// `InProgress` until we complete it, so both edges are observed
 /// deterministically — unlike the instant stub turn in
 /// `clean_conversation_streams_text_then_final_message`, which finishes
 /// before the projector can recompute its start edge.
 #[tokio::test]
 async fn turn_state_projector_brackets_a_slow_turn() {
-    use baybo_job::JobInput;
-    use baybo_job::test_support::MemoryJobStore;
-    use baybo_job::{JobLifecycle, JobOutput};
     use baybo_model::{ContentBlock, TriggerKind};
+    use baybo_turn::TurnInput;
+    use baybo_turn::test_support::MemoryTurnStore;
+    use baybo_turn::{TurnLifecycle, TurnOutput};
 
     let session = SessionBuilder::new().build();
-    let job_lifecycle = Arc::new(JobLifecycle::new(
-        Arc::new(MemoryJobStore::new()) as Arc<dyn baybo_store::JobStore>
+    let turn_lifecycle = Arc::new(TurnLifecycle::new(
+        Arc::new(MemoryTurnStore::new()) as Arc<dyn baybo_store::TurnStore>
     ));
     let session_store = {
         let store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
@@ -189,38 +189,38 @@ async fn turn_state_projector_brackets_a_slow_turn() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentOutput>(16);
     let token = tokio_util::sync::CancellationToken::new();
     baybo_agent::supervisor::spawn_turn_state_projector(
-        Arc::clone(&job_lifecycle),
+        Arc::clone(&turn_lifecycle),
         sessions,
         tx,
         token.clone(),
     );
 
-    // Open a turn-kind job and move it InProgress — but NOT terminal — so
+    // Open a turn-kind turn and move it InProgress — but NOT terminal — so
     // the projector's `Started` recompute sees a live turn.
-    let job = job_lifecycle
-        .start_job(
+    let turn = turn_lifecycle
+        .start_turn(
             session.id.clone(),
             TriggerKind::User,
-            JobInput::UserChat { content: vec![] },
+            TurnInput::UserChat { content: vec![] },
             None,
         )
         .await
-        .expect("start_job");
-    job_lifecycle
-        .start(&job.id)
+        .expect("start_turn");
+    turn_lifecycle
+        .start(&turn.id)
         .await
         .expect("start → InProgress");
     assert_eq!(
         next_turn_state(&mut rx).await,
         (true, true),
-        "start edge: active with the job's start instant"
+        "start edge: active with the turn's start instant"
     );
 
     // Complete it → terminal → projected close edge.
-    job_lifecycle
+    turn_lifecycle
         .complete(
-            &job.id,
-            JobOutput::Message {
+            &turn.id,
+            TurnOutput::Message {
                 content: vec![ContentBlock::Text("done".into())],
                 ordinal: None,
             },
@@ -344,7 +344,7 @@ async fn tool_call_round_trip_invokes_recording_tool() {
 
 #[tokio::test]
 async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
-    use baybo_store::{JobStore, SessionStore, TraceStore};
+    use baybo_store::{SessionStore, TraceStore, TurnStore};
     use baybo_trace::{SpanKind, ToolCallOutput};
 
     let payload = format!("persist-this-tool-result:{}", "x".repeat(8 * 1024));
@@ -369,12 +369,12 @@ async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
     harness.send_text("run it").await.unwrap();
     harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    let jobs = harness.job_store.list_all().await.unwrap();
+    let turns = harness.turn_store.list_all().await.unwrap();
     let mut persisted = None;
-    for job in jobs {
+    for turn in turns {
         for step in harness
             .trace_store
-            .list_steps_by_job(&job.id)
+            .list_steps_by_turn(&turn.id)
             .await
             .unwrap()
         {
@@ -1397,12 +1397,12 @@ async fn background_notification_keeps_later_spans_persisted() {
     harness.drain_outputs(Duration::from_millis(500)).await;
 
     let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
-    let jobs = baybo_store::JobStore::list_all(harness.job_store.as_ref())
+    let turns = baybo_store::TurnStore::list_all(harness.turn_store.as_ref())
         .await
-        .expect("list jobs");
+        .expect("list turns");
     let mut llm_inputs = Vec::new();
-    for job in &jobs {
-        for step in trace_store.list_steps_by_job(&job.id).await.unwrap() {
+    for turn in &turns {
+        for step in trace_store.list_steps_by_turn(&turn.id).await.unwrap() {
             let step = baybo_trace::Step::from_row(step).unwrap();
             for row in trace_store.list_spans_by_step(&step.id).await.unwrap() {
                 let span = baybo_trace::Span::from_row(row).unwrap();
@@ -2384,7 +2384,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
 }
 
 /// Regression for the cron bad-case: a fire must reach the model as a
-/// *task to perform now*, not as a live user message. A job created to
+/// *task to perform now*, not as a live user message. A turn created to
 /// "say 你好 in a minute" stored the bare prompt `你好`; before framing,
 /// the model read `你好` as the user greeting it and greeted back. Drives
 /// the real actor path (`AgentMessage::CronTrigger` →
@@ -2393,7 +2393,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
 #[tokio::test]
 async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     // A fire runs in a Cron-rooted session; the dispatch uses
-    // `JobInput::Cron`, which `JobLifecycle` only admits under a
+    // `TurnInput::Cron`, which `TurnLifecycle` only admits under a
     // Cron-triggered session.
     let mut session = SessionBuilder::new().build();
     session.trigger = TriggerSource::Cron {
@@ -2440,7 +2440,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     );
 
     // The framed user turn the LLM actually saw (the only one carrying
-    // the job id).
+    // the turn id).
     let requests = harness.stub_llm.captured_requests();
     let framed = requests
         .iter()
@@ -2477,7 +2477,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 
 /// A recurring fire that calls `report_nothing` notifies no one: no channel
 /// `Message` is dispatched (no live pulse), the fire's own conversation is
-/// hidden (no chat-list row), and its `Cron` job completes with a reply-less
+/// hidden (no chat-list row), and its `Cron` turn completes with a reply-less
 /// `Structured` output so the push dispatcher skips it (`gateway::push` returns
 /// early when the `Completed` edge carries no reply ordinal). The reply row and
 /// transcript survive — suppression hides, it never deletes. Drives the real
@@ -2485,8 +2485,8 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 /// model scripted to call the tool.
 #[tokio::test]
 async fn recurring_fire_that_reports_nothing_notifies_no_one() {
-    use baybo_job::{Job, JobInputKind, JobOutput};
-    use baybo_store::JobStore;
+    use baybo_store::TurnStore;
+    use baybo_turn::{Turn, TurnInputKind, TurnOutput};
 
     // Stand-in for `report_nothing`: flips the fire's silence handle exactly as
     // the real tool does (its own flip is unit-tested in `baybo-cron`).
@@ -2600,17 +2600,17 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
     // Its Cron job completed with a reply-less `Structured` output (not a
     // `Message`), so the push dispatcher skips it (`gateway::push` returns early
     // on a `Completed` edge with no reply ordinal).
-    let rows = JobStore::list_all(harness.job_store.as_ref())
+    let rows = TurnStore::list_all(harness.turn_store.as_ref())
         .await
         .unwrap();
     let cron_job = rows
         .iter()
-        .map(|r| serde_json::from_str::<Job>(&r.data).expect("job row deserializes"))
-        .find(|j| j.input_kind() == JobInputKind::Cron)
-        .expect("a cron fire job");
+        .map(|r| serde_json::from_str::<Turn>(&r.data).expect("turn row deserializes"))
+        .find(|j| j.input_kind() == TurnInputKind::Cron)
+        .expect("a cron fire turn");
     assert!(
-        matches!(cron_job.final_result, Some(JobOutput::Structured { .. })),
-        "a silenced fire's job must complete Structured, got {:?}",
+        matches!(cron_job.final_result, Some(TurnOutput::Structured { .. })),
+        "a silenced fire's turn must complete Structured, got {:?}",
         cron_job.final_result
     );
 
@@ -2635,7 +2635,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
     let origin_id = harness.session.id.clone();
 
     // The fire's own session, with the reply it produced. In production the
-    // fire actor wrote this; the ordinal is what its job's `Completed` edge
+    // fire actor wrote this; the ordinal is what its turn's `Completed` edge
     // carried.
     let fire_session = harness
         .session_manager
@@ -2661,7 +2661,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         .expect("append fire reply");
 
     // The execution ledger, as the waiter leaves it just before delivering.
-    let job = baybo_model::CronJob {
+    let turn = baybo_model::CronJob {
         id: "cj-dinner".into(),
         user_id: harness.session.user.id.clone(),
         channel: harness.session.channel.clone(),
@@ -2678,7 +2678,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         deleted_at: None,
         pinned: false,
     };
-    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
         .cron_store
         .record_execution(&execution)
@@ -2741,7 +2741,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
     let delivered = messages[0];
     assert!(
         delivered.contains(r#"Scheduled task "晚饭提醒" ran:"#),
-        "the notification names the job: {delivered}"
+        "the notification names the turn: {delivered}"
     );
     assert!(
         delivered.contains("该吃晚饭了"),
@@ -2816,7 +2816,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         .await
         .expect("append fire reply");
 
-    let job = baybo_model::CronJob {
+    let turn = baybo_model::CronJob {
         id: "cj-1".into(),
         user_id: harness.session.user.id.clone(),
         channel: harness.session.channel.clone(),
@@ -2833,7 +2833,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         deleted_at: None,
         pinned: false,
     };
-    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
         .cron_store
         .record_execution(&execution)
@@ -2938,7 +2938,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
 ///
 /// The difference is not cosmetic: a row survives a reload, is read back by the
 /// model on a follow-up turn, raises the conversation's unread badge, and rides
-/// a `CronNotification` job's `Completed { reply_ordinal }` edge to the user's
+/// a `CronNotification` turn's `Completed { reply_ordinal }` edge to the user's
 /// phone. A notice does none of those, so a failed scheduled task would show up
 /// as an unbadged, unpushed conversation the user has to notice by themselves.
 #[tokio::test]
@@ -3030,7 +3030,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
     let mut harness = AgentTestHarness::builder().build();
     let origin_id = harness.session.id.clone();
 
-    let job = baybo_model::CronJob {
+    let turn = baybo_model::CronJob {
         id: "cj-1".into(),
         user_id: harness.session.user.id.clone(),
         channel: harness.session.channel.clone(),
@@ -3047,7 +3047,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         deleted_at: None,
         pinned: false,
     };
-    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
         .cron_store
         .record_execution(&execution)
@@ -3476,11 +3476,11 @@ async fn drained_interjection_survives_a_failed_turn() {
     harness.shutdown().await;
 }
 
-/// Wait up to ~500ms for the detached `on_job_complete` write (a fire-and-forget
+/// Wait up to ~500ms for the detached `on_turn_complete` write (a fire-and-forget
 /// task spawned at turn end) to land, so the assertion isn't racy.
-async fn await_job_complete(memory: &RecordingMemory, expected: usize) {
+async fn await_turn_complete(memory: &RecordingMemory, expected: usize) {
     for _ in 0..50 {
-        if memory.job_complete_count() >= expected {
+        if memory.turn_complete_count() >= expected {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3500,9 +3500,9 @@ async fn await_session_end(memory: &RecordingMemory, expected: usize) {
 
 #[tokio::test]
 async fn memory_hooks_fire_on_user_chat_turn() {
-    // The loop drives `recall` inline at job start (with the user input) and
-    // `on_job_complete` (detached) at turn end (with input + final output) for a
-    // UserChat job. Exercises the wiring the `RecordingMemory` fixture exists for.
+    // The loop drives `recall` inline at turn start (with the user input) and
+    // `on_turn_complete` (detached) at turn end (with input + final output) for a
+    // UserChat turn. Exercises the wiring the `RecordingMemory` fixture exists for.
     let memory = Arc::new(RecordingMemory::new());
     let mut harness = AgentTestHarness::builder()
         .with_memory(memory.clone() as Arc<dyn Memory>)
@@ -3515,7 +3515,7 @@ async fn memory_hooks_fire_on_user_chat_turn() {
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     // recall is inline, so it's deterministic right after the drain.
-    assert_eq!(memory.recall_count(), 1, "recall runs once at job start");
+    assert_eq!(memory.recall_count(), 1, "recall runs once at turn start");
     let queries = memory.recall_queries();
     assert!(
         queries[0]
@@ -3524,26 +3524,26 @@ async fn memory_hooks_fire_on_user_chat_turn() {
         "recall query carries the user input: {queries:?}"
     );
 
-    // on_job_complete is detached — wait for it to land.
-    await_job_complete(&memory, 1).await;
+    // on_turn_complete is detached — wait for it to land.
+    await_turn_complete(&memory, 1).await;
     assert_eq!(
-        memory.job_complete_count(),
+        memory.turn_complete_count(),
         1,
-        "on_job_complete runs once at turn end"
+        "on_turn_complete runs once at turn end"
     );
-    let completions = memory.job_completions();
+    let completions = memory.turn_completions();
     let (user_input, final_output) = &completions[0];
     assert!(
         user_input
             .iter()
             .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("remember I like Rust"))),
-        "on_job_complete sees the user input: {user_input:?}"
+        "on_turn_complete sees the user input: {user_input:?}"
     );
     assert!(
         final_output
             .iter()
             .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("noted"))),
-        "on_job_complete sees the final output: {final_output:?}"
+        "on_turn_complete sees the final output: {final_output:?}"
     );
 
     harness.shutdown().await;
@@ -3618,7 +3618,7 @@ async fn recall_dedup_skips_memory_already_in_transcript() {
     harness.send_text("remind me again").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
-    // Both turns ran recall (the harness uses UserChat = eligible job
+    // Both turns ran recall (the harness uses UserChat = eligible turn
     // kind), so the backend was called twice and returned the same memory
     // each time.
     assert_eq!(memory.recall_count(), 2);
@@ -3649,9 +3649,9 @@ async fn recall_dedup_skips_memory_already_in_transcript() {
 
 #[tokio::test]
 async fn memory_hooks_skip_subagent_notification_turn() {
-    // `SubagentNotification` is an ineligible job kind — the gate
+    // `SubagentNotification` is an ineligible turn kind — the gate
     // (`memory_recall_query` → `None`) means neither `recall` nor
-    // `on_job_complete` fires, even though the turn itself runs.
+    // `on_turn_complete` fires, even though the turn itself runs.
     let memory = Arc::new(RecordingMemory::new());
     let mut harness = AgentTestHarness::builder()
         .with_memory(memory.clone() as Arc<dyn Memory>)
@@ -3677,7 +3677,7 @@ async fn memory_hooks_skip_subagent_notification_turn() {
 
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
     // Give any (wrongly-spawned) detached write a chance to land before asserting 0.
-    await_job_complete(&memory, 1).await;
+    await_turn_complete(&memory, 1).await;
 
     assert!(
         !harness.stub_llm.captured_requests().is_empty(),
@@ -3689,9 +3689,9 @@ async fn memory_hooks_skip_subagent_notification_turn() {
         "recall must not fire for a SubagentNotification turn"
     );
     assert_eq!(
-        memory.job_complete_count(),
+        memory.turn_complete_count(),
         0,
-        "on_job_complete must not fire for a SubagentNotification turn"
+        "on_turn_complete must not fire for a SubagentNotification turn"
     );
 
     harness.shutdown().await;
@@ -3904,14 +3904,14 @@ async fn grouped_subagents_deliver_one_merged_notification() {
     harness.send_text("spawn a group of two").await.unwrap();
     let turn_outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(spawn.invocations().len(), 2, "both grouped spawns ran");
-    // The cohort is keyed by the dispatching turn's `job_id`
+    // The cohort is keyed by the dispatching turn's `turn_id`
     // (`BackgroundNotificationGroup::cohort_key`), so a delivered member must
-    // carry the same job-scoped group to route into it — exactly as the real
+    // carry the same turn-scoped group to route into it — exactly as the real
     // spawner stamps it.
     let cohort_group = baybo_model::BackgroundNotificationGroup::cohort_key(
         spawn
-            .last_job_id()
-            .expect("the spawn tool ran, so it captured the turn's job_id"),
+            .last_turn_id()
+            .expect("the spawn tool ran, so it captured the turn's turn_id"),
         "g",
     );
     let dispatch_answers = turn_outs
@@ -3995,7 +3995,7 @@ async fn grouped_subagents_deliver_one_merged_notification() {
 /// Regression for cross-turn group-name reuse: two turns that both name their
 /// group `"g"` — while the first cohort is still draining — must NOT merge into
 /// one barrier. The cohort key is namespaced by the dispatching turn's
-/// `job_id`, so each turn forms its own cohort and fires its own notification.
+/// `turn_id`, so each turn forms its own cohort and fires its own notification.
 /// (Before the fix, the second turn's `expected += 1` landed on the first,
 /// still-sealed cohort, holding the first member hostage and merging the two.)
 #[tokio::test]
@@ -4030,7 +4030,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .push_stream(vec![StreamEvent::Text("dispatched A".into())]);
     harness.send_text("first batch").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
-    let job_a = spawn.last_job_id().expect("turn 1 captured a job_id");
+    let turn_a = spawn.last_turn_id().expect("turn 1 captured a turn_id");
 
     // Turn 2: another grouped spawn with the SAME name "g" (cohort B), while
     // cohort A's member is still in flight.
@@ -4040,8 +4040,8 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .push_stream(vec![StreamEvent::Text("dispatched B".into())]);
     harness.send_text("second batch").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
-    let job_b = spawn.last_job_id().expect("turn 2 captured a job_id");
-    assert_ne!(job_a, job_b, "the two turns ran under distinct jobs");
+    let turn_b = spawn.last_turn_id().expect("turn 2 captured a turn_id");
+    assert_ne!(turn_a, turn_b, "the two turns ran under distinct turns");
 
     // Each notification turn streams its analysed report after a separate
     // deterministic completion reply. A merge bug would consume only one
@@ -4084,7 +4084,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .mailbox
         .send(finish(
             "bg-a",
-            baybo_model::BackgroundNotificationGroup::cohort_key(job_a, "g"),
+            baybo_model::BackgroundNotificationGroup::cohort_key(turn_a, "g"),
         ))
         .await
         .expect("mailbox open");
@@ -4100,7 +4100,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .mailbox
         .send(finish(
             "bg-b",
-            baybo_model::BackgroundNotificationGroup::cohort_key(job_b, "g"),
+            baybo_model::BackgroundNotificationGroup::cohort_key(turn_b, "g"),
         ))
         .await
         .expect("mailbox open");
@@ -4171,18 +4171,18 @@ mod blocking_llm {
 /// `/stop` must abort an LLM call that is already in flight — not just be
 /// observed at the next iteration boundary. The provider call here parks
 /// forever, so the agent loop can only ever leave it if cancelling the turn
-/// job (what the Router's `/stop` does) trips the token threaded into the
+/// turn (what the Router's `/stop` does) trips the token threaded into the
 /// live `chat_stream` and drops the pending await.
 ///
-/// The discriminating assertion is the *timed shutdown*: `JobLifecycle::cancel`
-/// flips the job row terminal by itself, so the turn-state projector emits the
+/// The discriminating assertion is the *timed shutdown*: `TurnLifecycle::cancel`
+/// flips the turn row terminal by itself, so the turn-state projector emits the
 /// `active:false` close edge whether or not the loop actually unblocked.
 /// What only the fix delivers is the actor returning to its mailbox — without
 /// it the actor stays parked in the dead call and never processes `ActorStop`,
 /// so `shutdown` would hang forever.
 #[tokio::test]
 async fn stop_aborts_an_in_flight_llm_call() {
-    use baybo_job::CancelReason;
+    use baybo_turn::CancelReason;
     use blocking_llm::BlockingLlm;
 
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -4201,22 +4201,22 @@ async fn stop_aborts_an_in_flight_llm_call() {
         .expect("the in-flight LLM call should have started");
 
     // Exactly what `handle_stop` does: cancel the session's in-flight turn
-    // job with `UserStopped`, tripping the registered loop token.
+    // turn with `UserStopped`, tripping the registered loop token.
     let turns = harness
-        .job_lifecycle
-        .list_active_turns_by_session(&harness.session.id)
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&harness.session.id)
         .await
         .expect("list active turns");
     assert!(!turns.is_empty(), "a turn must be in flight to cancel");
-    for job in &turns {
+    for turn in &turns {
         harness
-            .job_lifecycle
-            .cancel(&job.id, CancelReason::UserStopped, vec![])
+            .turn_lifecycle
+            .cancel(&turn.id, CancelReason::UserStopped, vec![])
             .await
             .expect("cancel the in-flight turn");
     }
 
-    // The turn job is now terminal, so the projector publishes the close edge.
+    // The turn turn is now terminal, so the projector publishes the close edge.
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     let last_turn_state = outs.iter().rev().find_map(|o| match &o.event {
         AgentEvent::TurnState { active, .. } => Some(*active),
@@ -4323,8 +4323,8 @@ mod partial_stream_llm {
 /// Regression for the in-flight-cancel path dropping the stream wholesale.
 #[tokio::test]
 async fn stop_persists_partial_work_so_it_survives_reload() {
-    use baybo_job::CancelReason;
     use baybo_model::Role;
+    use baybo_turn::CancelReason;
     use partial_stream_llm::PartialStreamLlm;
 
     let drained = Arc::new(tokio::sync::Notify::new());
@@ -4349,15 +4349,15 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
 
     // `/stop`: cancel the in-flight turn.
     let turns = harness
-        .job_lifecycle
-        .list_active_turns_by_session(&harness.session.id)
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&harness.session.id)
         .await
         .expect("list active turns");
     assert!(!turns.is_empty(), "a turn must be in flight to cancel");
-    for job in &turns {
+    for turn in &turns {
         harness
-            .job_lifecycle
-            .cancel(&job.id, CancelReason::UserStopped, vec![])
+            .turn_lifecycle
+            .cancel(&turn.id, CancelReason::UserStopped, vec![])
             .await
             .expect("cancel the in-flight turn");
     }
@@ -4368,7 +4368,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     let session_manager = Arc::clone(&harness.session_manager);
     let trace_store = Arc::clone(&harness.trace_store);
     let sid = harness.session.id.clone();
-    let job_id = turns[0].id;
+    let turn_id = turns[0].id;
 
     // The actor must unwind promptly (in-flight call aborted)...
     tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
@@ -4411,7 +4411,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     // transcript kept it.
     use baybo_trace::{Span, SpanKind, Step, TraceStore};
     let steps: Vec<Step> = trace_store
-        .list_steps_by_job(&job_id)
+        .list_steps_by_turn(&turn_id)
         .await
         .expect("list steps")
         .into_iter()

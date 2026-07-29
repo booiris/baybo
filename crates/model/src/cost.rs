@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{JobId, MicroUsd, SessionId, SpanId};
+use crate::{MicroUsd, SessionId, SpanId, TurnId};
 
 /// Token prefix for a [`CallReason::Tool`] so its tool name rides inside
 /// the single flat `reason` token (`tool:WebFetch`) — one column, and a
@@ -102,14 +102,14 @@ impl<'de> Deserialize<'de> for CallReason {
 
 /// The smallest auditable billing unit.
 ///
-/// Every record is associated with both a `job_id` and a `span_id` (the
+/// Every record is associated with both a `turn_id` and a `span_id` (the
 /// LLM span that drove the spend), so the system never knows a cost
 /// without knowing which call caused it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     pub user_id: String,
     pub session_id: SessionId,
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     pub span_id: SpanId,
     /// Why this call was made. See [`CallReason`].
     pub reason: CallReason,

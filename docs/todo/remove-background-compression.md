@@ -30,7 +30,7 @@ the next LLM call. `/compact` (`force_compress`) runs the same flow without the 
 | D8 | The summarizer still receives the **full** transcript; `SUMMARIZE_INSTRUCTION` gains a static paragraph saying recent messages may be preserved verbatim below the summary. No message count substituted in. | `LlmCallInputs::Persisted{last_ordinal, prefix_len, suffix}` can only express "the whole active set + a suffix". Sending a strict prefix forces `Inline`, re-embedding the transcript into every compaction span — the O(n²) trace-disk regression PR #179 fixed. |
 | D9 | Stage 2 picks between two candidate assemblies with the tokenizer, reusing the summary it already has: `[system+summary+slice]`, else `[system+summary]`, else let `NoSavings` fire. No extra LLM call. | Without this, `/compact` on a mid-sized conversation burns a full-transcript call and then refuses to apply, because the slice makes the candidate larger than the original. |
 | D10 | One PR: Rust + `app/web` + `app/ios` + docs. | Owner's call. Deploy ordering still separates the artifacts — see §7. |
-| D11 | Two hardening items ship in the same PR: (a) the trace-read `collect::<Result<_,_>>()?` sites degrade one row instead of a whole job; (b) `web_trace_types_sync.rs` also pins the two compression unions. | (a) is the only protection if a deployment's DB misses the scrub. (b) guards exactly the enums this PR edits. |
+| D11 | Two hardening items ship in the same PR: (a) the trace-read `collect::<Result<_,_>>()?` sites degrade one row instead of a whole turn; (b) `web_trace_types_sync.rs` also pins the two compression unions. | (a) is the only protection if a deployment's DB misses the scrub. (b) guards exactly the enums this PR edits. |
 | D12 | Test scope: the three coverage gaps left by the deletions, plus one guard per new behaviour (D2, D5, D6, D7, D9, A9). | See §5. |
 | D13 | Add an in-memory `compaction_declined_at_len` latch. | D2 disarms the pre-flight `non_system.len() <= keep_recent → NoOp` gate that stops re-compaction today, and `compress_if_needed` runs once per loop iteration with no backoff on `NoSavings`. |
 | D14 | Fix the `message_fts` duplicate-hit bug in this PR. | `apply_session_compaction` indexes its re-inserted rows and `search_messages` has no `compaction_inserted` predicate, so a kept message returns two hits. Pre-existing (stage 1 already re-inserted its slice) and not amplified by this change, but it is one predicate away. |
@@ -134,8 +134,8 @@ and both call sites drop `.map(|run| run.response)`.
 (`compressor.rs:85-93`, matched at `agent_loop.rs:2596-2602`). `record_spanless_compaction`'s match
 collapses to `LiveSummary => return, Truncate => CompressionApplied::Truncate`.
 
-**A13 — an unscrubbed row wedges boot recovery, not just the trace page.** `close_job_subtree`
-collects with `?` (`recovery.rs:339-344`), so one undecodable row leaves that job non-terminal and
+**A13 — an unscrubbed row wedges boot recovery, not just the trace page.** `close_turn_subtree`
+collects with `?` (`recovery.rs:339-344`), so one undecodable row leaves that turn non-terminal and
 re-fails on every boot. The scrub is therefore a **mandatory pre-deploy step**, and D11a's treatment
 extends to `recovery.rs:343`.
 
@@ -144,8 +144,8 @@ extends to `recovery.rs:343`.
 `kind: 'compression';`, so the scrape currently sees **2 of 7** `StepKind` tags. Fix the terminator to
 `";\n\n"` **before** adding coverage. The two compression unions are flat string unions with no
 `kind: '` needle — they need a second scraper, not a parameter. Also apply D11a to the span collect
-(`query/src/lib.rs:552`) and the span-event collect (`:519`); `:466` is in `load_job`, which has zero
-callers — the 500 that matters comes from `:542` (`load_step_tree_for_job`).
+(`query/src/lib.rs:552`) and the span-event collect (`:519`); `:466` is in `load_turn`, which has zero
+callers — the 500 that matters comes from `:542` (`load_step_tree_for_turn`).
 
 ---
 
@@ -173,7 +173,7 @@ module doc, and apply A1/A2/A3/A11 to `CompressionRunner::run`. `baybo/src/runti
 `workspace_paths_arc` binding, `ContextManagerConfig.workspace` still needs it.
 **Survives despite appearances:** `AgentLoop::sessions` (3 readers), `record_spanless_compaction`
 (the truncate arm is the only trace a truncate compaction gets), `recover_detached_trace_rows`
-(title generation and the progress observer also outlive their job).
+(title generation and the progress observer also outlive their turn).
 
 **C4 — context crate, one commit** (splitting orphans `walk_backward_atomic` into a `dead_code`
 failure). Delete `background_summary.rs`, the `SUMMARY_TRIGGER_*` / `SUMMARY_DIFF_*` consts and
@@ -345,7 +345,7 @@ SQL
 rm -rf ~/.baybo/state/sessions
 ```
 
-`steps.job_id` is a VIRTUAL generated column over `json_extract`, so rewriting `data` recomputes it.
+`steps.turn_id` is a VIRTUAL generated column over `json_extract`, so rewriting `data` recomputes it.
 Repeat for the dylan container's own DB; remote-host is relay-only and has no `steps` table.
 
 Deploy order: **install the iOS build first** (it is forward-compatible — the old server never sends a

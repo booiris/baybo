@@ -5,7 +5,7 @@
 //! [`LlmError::GuardRejected`] if the closure says no. The closure
 //! captures whatever caller-side state it needs (cost budgets, rate
 //! limits, kill switches) so this crate never grows knowledge of
-//! sessions, jobs, or spans.
+//! sessions, turns, or spans.
 //!
 //! Wrap the raw client once at startup and hand the resulting
 //! `Arc<BillableLlm>` to every consumer (the agent loop *and* any

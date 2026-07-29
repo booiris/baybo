@@ -308,7 +308,6 @@ dependencies = [
  "baybo-deck",
  "baybo-gateway",
  "baybo-janitor",
- "baybo-job",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -325,6 +324,7 @@ dependencies = [
  "baybo-tools",
  "baybo-trace",
  "baybo-tui",
+ "baybo-turn",
  "baybo-workspace",
  "chrono",
  "clap",
@@ -353,7 +353,6 @@ dependencies = [
  "baybo-context",
  "baybo-cost",
  "baybo-cron",
- "baybo-job",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -367,6 +366,7 @@ dependencies = [
  "baybo-subagent",
  "baybo-tools",
  "baybo-trace",
+ "baybo-turn",
  "baybo-workspace",
  "chrono",
  "chrono-tz",
@@ -477,7 +477,6 @@ dependencies = [
  "baybo-cost",
  "baybo-cron",
  "baybo-gateway",
- "baybo-job",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -493,6 +492,7 @@ dependencies = [
  "baybo-tools",
  "baybo-trace",
  "baybo-tui",
+ "baybo-turn",
  "baybo-workspace",
  "chrono",
  "clap",
@@ -644,7 +644,6 @@ dependencies = [
  "baybo-cron",
  "baybo-deck",
  "baybo-gateway",
- "baybo-job",
  "baybo-llm",
  "baybo-model",
  "baybo-pairing",
@@ -656,6 +655,7 @@ dependencies = [
  "baybo-store",
  "baybo-tools",
  "baybo-trace",
+ "baybo-turn",
  "baybo-workspace",
  "bytes",
  "chrono",
@@ -708,7 +708,6 @@ dependencies = [
  "baybo-cost",
  "baybo-cron",
  "baybo-gateway",
- "baybo-job",
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
@@ -722,6 +721,7 @@ dependencies = [
  "baybo-task",
  "baybo-tools",
  "baybo-trace",
+ "baybo-turn",
  "baybo-workspace",
  "chrono",
  "futures",
@@ -749,23 +749,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "baybo-job"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "baybo-model",
- "baybo-store",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -867,12 +850,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "baybo-cost",
- "baybo-job",
  "baybo-model",
  "baybo-session",
  "baybo-storage",
  "baybo-store",
  "baybo-trace",
+ "baybo-turn",
  "chrono",
  "futures",
  "parking_lot",
@@ -1019,10 +1002,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "baybo-job",
  "baybo-model",
  "baybo-store",
  "baybo-trace",
+ "baybo-turn",
  "bytes",
  "chrono",
  "deadpool-sqlite",
@@ -1162,9 +1145,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "baybo-job",
  "baybo-model",
  "baybo-store",
+ "baybo-turn",
  "chrono",
  "parking_lot",
  "serde",
@@ -1198,6 +1181,23 @@ dependencies = [
  "tracing",
  "unicode-width",
  "uuid",
+]
+
+[[package]]
+name = "baybo-turn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -151,11 +151,11 @@ async fn recall_swallows_5xx_and_returns_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// on_job_complete
+// on_turn_complete
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
+async fn on_turn_complete_posts_messages_with_user_and_agent_ids() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
@@ -174,7 +174,7 @@ async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
     let ctx = memory_context("u-2", "s-2", StepKind::MemoryWrite).await;
     let user_in = vec![ContentBlock::Text("hi".into())];
     let assistant_out = vec![ContentBlock::Text("hello".into())];
-    m.on_job_complete(&ctx, &user_in, &assistant_out)
+    m.on_turn_complete(&ctx, &user_in, &assistant_out)
         .await
         .unwrap();
 
@@ -190,7 +190,7 @@ async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
 }
 
 #[tokio::test]
-async fn on_job_complete_skips_when_both_sides_empty() {
+async fn on_turn_complete_skips_when_both_sides_empty() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
@@ -207,7 +207,7 @@ async fn on_job_complete_skips_when_both_sides_empty() {
     let m = build(&base_url(&server));
 
     let ctx = memory_context("u-2", "s-2", StepKind::MemoryWrite).await;
-    m.on_job_complete(&ctx, &[], &[]).await.unwrap();
+    m.on_turn_complete(&ctx, &[], &[]).await.unwrap();
     assert!(captured.bodies.lock().is_empty(), "no call should fire");
 }
 

@@ -1,17 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import type { JobTrace, LifecycleState, ReplayStep, Span, Step, TraceJobSummary } from '../../types/trace';
+import type { LifecycleState, ReplayStep, Span, Step, TraceTurnSummary, TurnTrace } from '../../types/trace';
 import {
   attention,
   failureCount,
   findSpan,
   findStep,
-  isExternalAgentJob,
-  isJobLive,
-  jobFailed,
-  jobRollup,
-  neededJobIds,
+  isExternalAgentTurn,
+  isTurnLive,
+  neededTurnIds,
   resolveExpanded,
   traceHasPendingSpan,
+  turnFailed,
+  turnRollup,
 } from './traceTreeModel';
 
 const T0 = '2026-01-01T00:00:00.000Z';
@@ -36,7 +36,7 @@ function mkSpan(id: string, stepId: string, outcome: LifecycleState): Span {
 function mkStep(id: string, outcome: LifecycleState, spans: Span[]): ReplayStep {
   const step: Step = {
     id,
-    job_id: 'job',
+    turn_id: 'turn',
     kind: { kind: 'llm_iteration' },
     started_at: T0,
     ended_at: outcome.outcome === 'pending' ? null : T1,
@@ -45,15 +45,15 @@ function mkStep(id: string, outcome: LifecycleState, spans: Span[]): ReplayStep 
   return { step, spans };
 }
 
-function mkTrace(jobId: string, steps: ReplayStep[]): JobTrace {
-  return { job_id: jobId, session_id: 's', job_status_kind: 'completed', steps };
+function mkTrace(turnId: string, steps: ReplayStep[]): TurnTrace {
+  return { turn_id: turnId, session_id: 's', turn_status_kind: 'completed', steps };
 }
 
-function mkJob(jobId: string, status: TraceJobSummary['job_status_kind']): TraceJobSummary {
+function mkTurn(turnId: string, status: TraceTurnSummary['turn_status_kind']): TraceTurnSummary {
   return {
-    job_id: jobId,
+    turn_id: turnId,
     session_id: 's',
-    job_status_kind: status,
+    turn_status_kind: status,
     created_at: T0,
     started_at: T0,
     ended_at: T1,
@@ -69,7 +69,7 @@ const failed: LifecycleState = { outcome: 'failed', reason: 'boom' };
 const pending: LifecycleState = { outcome: 'pending' };
 const cancelled: LifecycleState = { outcome: 'cancelled', reason: 'user_stopped' };
 
-describe('attention / jobFailed / isJobLive', () => {
+describe('attention / turnFailed / isTurnLive', () => {
   it('attention is true for anything but ok', () => {
     expect(attention(ok)).toBe(false);
     expect(attention(failed)).toBe(true);
@@ -77,19 +77,19 @@ describe('attention / jobFailed / isJobLive', () => {
     expect(attention(cancelled)).toBe(true);
   });
 
-  it('jobFailed covers failed and stuck', () => {
-    expect(jobFailed('failed')).toBe(true);
-    expect(jobFailed('stuck')).toBe(true);
-    expect(jobFailed('completed')).toBe(false);
-    expect(jobFailed('in_progress')).toBe(false);
+  it('turnFailed covers failed and stuck', () => {
+    expect(turnFailed('failed')).toBe(true);
+    expect(turnFailed('stuck')).toBe(true);
+    expect(turnFailed('completed')).toBe(false);
+    expect(turnFailed('in_progress')).toBe(false);
   });
 
-  it('isJobLive covers pending, in_progress, stuck', () => {
-    expect(isJobLive('pending')).toBe(true);
-    expect(isJobLive('in_progress')).toBe(true);
-    expect(isJobLive('stuck')).toBe(true);
-    expect(isJobLive('completed')).toBe(false);
-    expect(isJobLive('failed')).toBe(false);
+  it('isTurnLive covers pending, in_progress, stuck', () => {
+    expect(isTurnLive('pending')).toBe(true);
+    expect(isTurnLive('in_progress')).toBe(true);
+    expect(isTurnLive('stuck')).toBe(true);
+    expect(isTurnLive('completed')).toBe(false);
+    expect(isTurnLive('failed')).toBe(false);
   });
 });
 
@@ -118,28 +118,28 @@ describe('failureCount', () => {
   });
 });
 
-describe('jobRollup', () => {
+describe('turnRollup', () => {
   it('uses the loaded trace for a precise count', () => {
     const trace = mkTrace('j', [mkStep('s1', ok, [mkSpan('a', 's1', failed)])]);
-    expect(jobRollup(mkJob('j', 'completed'), trace)).toEqual({ hasFailure: true, count: 1 });
+    expect(turnRollup(mkTurn('j', 'completed'), trace)).toEqual({ hasFailure: true, count: 1 });
   });
 
-  it('flags a failed span inside a completed job once loaded', () => {
+  it('flags a failed span inside a completed turn once loaded', () => {
     // The cheap status approximation would say completed=clean; the loaded
     // trace is authoritative.
     const trace = mkTrace('j', [mkStep('s1', ok, [mkSpan('a', 's1', failed)])]);
-    expect(jobRollup(mkJob('j', 'completed'), trace).hasFailure).toBe(true);
+    expect(turnRollup(mkTurn('j', 'completed'), trace).hasFailure).toBe(true);
   });
 
   it('falls back to status when the trace is not loaded', () => {
-    expect(jobRollup(mkJob('j', 'failed'), undefined)).toEqual({ hasFailure: true, count: null });
-    expect(jobRollup(mkJob('j', 'completed'), undefined)).toEqual({ hasFailure: false, count: null });
+    expect(turnRollup(mkTurn('j', 'failed'), undefined)).toEqual({ hasFailure: true, count: null });
+    expect(turnRollup(mkTurn('j', 'completed'), undefined)).toEqual({ hasFailure: false, count: null });
   });
 
-  it('keeps the badge for a stuck/failed job whose spans are all ok (job-level failure)', () => {
+  it('keeps the badge for a stuck/failed turn whose spans are all ok (turn-level failure)', () => {
     const clean = mkTrace('j', [mkStep('s1', ok, [mkSpan('a', 's1', ok)])]);
-    expect(jobRollup(mkJob('j', 'stuck'), clean)).toEqual({ hasFailure: true, count: null });
-    expect(jobRollup(mkJob('j', 'failed'), clean)).toEqual({ hasFailure: true, count: null });
+    expect(turnRollup(mkTurn('j', 'stuck'), clean)).toEqual({ hasFailure: true, count: null });
+    expect(turnRollup(mkTurn('j', 'failed'), clean)).toEqual({ hasFailure: true, count: null });
   });
 });
 
@@ -152,21 +152,21 @@ describe('resolveExpanded', () => {
   });
 });
 
-describe('neededJobIds', () => {
-  const jobs = [mkJob('a', 'completed'), mkJob('b', 'failed'), mkJob('c', 'completed')];
+describe('neededTurnIds', () => {
+  const turns = [mkTurn('a', 'completed'), mkTurn('b', 'failed'), mkTurn('c', 'completed')];
 
-  it('includes every job by default (all expanded)', () => {
-    expect(neededJobIds(jobs, new Map(), null).sort()).toEqual(['a', 'b', 'c']);
+  it('includes every turn by default (all expanded)', () => {
+    expect(neededTurnIds(turns, new Map(), null).sort()).toEqual(['a', 'b', 'c']);
   });
 
-  it('excludes a job the user explicitly collapsed', () => {
+  it('excludes a turn the user explicitly collapsed', () => {
     const toggles = new Map<string, boolean>([['b', false]]);
-    expect(neededJobIds(jobs, toggles, null).sort()).toEqual(['a', 'c']);
+    expect(neededTurnIds(turns, toggles, null).sort()).toEqual(['a', 'c']);
   });
 
-  it('always includes the selected job, even if collapsed', () => {
+  it('always includes the selected turn, even if collapsed', () => {
     const toggles = new Map<string, boolean>([['a', false]]);
-    expect(neededJobIds(jobs, toggles, 'a').sort()).toEqual(['a', 'b', 'c']);
+    expect(neededTurnIds(turns, toggles, 'a').sort()).toEqual(['a', 'b', 'c']);
   });
 });
 
@@ -189,19 +189,19 @@ describe('findSpan / findStep', () => {
   });
 });
 
-describe('isExternalAgentJob / traceHasPendingSpan', () => {
+describe('isExternalAgentTurn / traceHasPendingSpan', () => {
   it('flags a terminal loaded-but-empty trace as an external agent', () => {
-    expect(isExternalAgentJob(mkTrace('j', []), 'completed')).toBe(true);
-    expect(isExternalAgentJob(mkTrace('j', []), 'failed')).toBe(true);
-    expect(isExternalAgentJob(mkTrace('j', [mkStep('s1', ok, [])]), 'completed')).toBe(false);
-    // A not-yet-loaded job must not be mistaken for an external agent.
-    expect(isExternalAgentJob(undefined, 'completed')).toBe(false);
+    expect(isExternalAgentTurn(mkTrace('j', []), 'completed')).toBe(true);
+    expect(isExternalAgentTurn(mkTrace('j', []), 'failed')).toBe(true);
+    expect(isExternalAgentTurn(mkTrace('j', [mkStep('s1', ok, [])]), 'completed')).toBe(false);
+    // A not-yet-loaded turn must not be mistaken for an external agent.
+    expect(isExternalAgentTurn(undefined, 'completed')).toBe(false);
   });
 
-  it('does NOT flag a live empty job as external (steps may not have flushed yet)', () => {
-    expect(isExternalAgentJob(mkTrace('j', []), 'in_progress')).toBe(false);
-    expect(isExternalAgentJob(mkTrace('j', []), 'pending')).toBe(false);
-    expect(isExternalAgentJob(mkTrace('j', []), 'stuck')).toBe(false);
+  it('does NOT flag a live empty turn as external (steps may not have flushed yet)', () => {
+    expect(isExternalAgentTurn(mkTrace('j', []), 'in_progress')).toBe(false);
+    expect(isExternalAgentTurn(mkTrace('j', []), 'pending')).toBe(false);
+    expect(isExternalAgentTurn(mkTrace('j', []), 'stuck')).toBe(false);
   });
 
   it('detects a pending span or step', () => {

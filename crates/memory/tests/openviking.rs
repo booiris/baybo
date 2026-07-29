@@ -189,11 +189,11 @@ async fn recall_returns_empty_on_critical_path_timeout() {
 }
 
 // ---------------------------------------------------------------------------
-// on_job_complete
+// on_turn_complete
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn on_job_complete_posts_two_messages_keyed_on_session() {
+async fn on_turn_complete_posts_two_messages_keyed_on_session() {
     let captured = Captured::default();
     let app =
         Router::new()
@@ -214,7 +214,7 @@ async fn on_job_complete_posts_two_messages_keyed_on_session() {
     let m = build(&base_url(&server));
 
     let ctx = memory_context("alice", "session-42", StepKind::MemoryWrite).await;
-    m.on_job_complete(
+    m.on_turn_complete(
         &ctx,
         &[ContentBlock::Text("hi".into())],
         &[ContentBlock::Text("hello".into())],

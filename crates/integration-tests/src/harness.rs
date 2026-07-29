@@ -21,8 +21,6 @@ use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
 use baybo_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
 use baybo_cost::test_support::MemoryCostStore;
 use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
-use baybo_job::JobLifecycle;
-use baybo_job::test_support::MemoryJobStore;
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
 use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
@@ -32,6 +30,8 @@ use baybo_skills::SkillRegistry;
 use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
+use baybo_turn::TurnLifecycle;
+use baybo_turn::test_support::MemoryTurnStore;
 use chrono::Utc;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -56,12 +56,12 @@ pub struct AgentTestHarness {
     pub gateway: Arc<SecurityGateway>,
     pub vault: Arc<SecretVault>,
     pub secret_store: Arc<MemorySecretStore>,
-    pub job_store: Arc<MemoryJobStore>,
-    /// The same `JobLifecycle` instance the actor drives. Exposed so a test
+    pub turn_store: Arc<MemoryTurnStore>,
+    /// The same `TurnLifecycle` instance the actor drives. Exposed so a test
     /// can cancel the session's in-flight turn the way the Router's `/stop`
-    /// does (`list_active_turns_by_session` → `cancel`), which trips the very
+    /// does (`list_active_chat_turns_by_session` → `cancel`), which trips the very
     /// token the agent loop threads into the live LLM call.
-    pub job_lifecycle: Arc<JobLifecycle>,
+    pub turn_lifecycle: Arc<TurnLifecycle>,
     pub cost_store: Arc<MemoryCostStore>,
     pub trace_store: Arc<MemoryTraceStore>,
     pub tool_registry: Arc<ToolRegistry>,
@@ -307,7 +307,7 @@ impl AgentTestHarnessBuilder {
     }
 
     /// Wire a [`baybo_memory::Memory`] impl into the loop so a test can assert
-    /// the recall / `on_job_complete` hooks fire. Defaults to `None` (inert).
+    /// the recall / `on_turn_complete` hooks fire. Defaults to `None` (inert).
     pub fn with_memory(mut self, memory: Arc<dyn baybo_memory::Memory>) -> Self {
         self.memory = Some(memory);
         self
@@ -354,11 +354,11 @@ impl AgentTestHarnessBuilder {
         let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()));
 
         // Observability stores.
-        let job_store = Arc::new(MemoryJobStore::new());
+        let turn_store = Arc::new(MemoryTurnStore::new());
         let cost_store = Arc::new(MemoryCostStore::new());
         let trace_store = Arc::new(MemoryTraceStore::new());
 
-        let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
+        let turn_lifecycle = Arc::new(TurnLifecycle::new(share_turn_store(&turn_store)));
         // One shared bus per harness — the recorder publishes into it
         // and the cost subscriber drains the same bus. Constructing it
         // upfront keeps both sides explicit about which stream they
@@ -537,24 +537,24 @@ impl AgentTestHarnessBuilder {
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
         // Mirror production's turn-state projector so the turn-*ended*
-        // `TurnState { active: false }` is derived from the job store
+        // `TurnState { active: false }` is derived from the turn store
         // (the actor only emits the leading `true`). Without it the e2e
         // outputs would never carry the close edge.
         baybo_agent::supervisor::spawn_turn_state_projector(
-            Arc::clone(&job_lifecycle),
+            Arc::clone(&turn_lifecycle),
             Arc::clone(&session_manager),
             output_tx.clone(),
             actor_parent_token.child_token(),
         );
 
         let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
-        let job_lifecycle_for_harness = Arc::clone(&job_lifecycle);
+        let turn_lifecycle_for_harness = Arc::clone(&turn_lifecycle);
         let actor = AgentActor::from_parts(
             baybo_agent::state::DurableActorState::new(session.clone()),
             baybo_agent::state::VolatileResources {
                 agent_loop,
                 response_tx: output_tx,
-                job_lifecycle,
+                turn_lifecycle,
                 span_recorder,
                 actor_token,
                 supervisor: None,
@@ -570,8 +570,8 @@ impl AgentTestHarnessBuilder {
             gateway,
             vault,
             secret_store,
-            job_store,
-            job_lifecycle: job_lifecycle_for_harness,
+            turn_store,
+            turn_lifecycle: turn_lifecycle_for_harness,
             cost_store,
             trace_store,
             tool_registry,
@@ -592,11 +592,11 @@ impl AgentTestHarnessBuilder {
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
 // Each in-memory store is constructed once as an `Arc` and shared
-// directly with the managers — `JobLifecycle` and `CostManager` accept
+// directly with the managers — `TurnLifecycle` and `CostManager` accept
 // `Arc<dyn Trait>`, so the test handle and the manager-owned handle
 // point at the same instance and post-run assertions see real state.
 
-fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn baybo_job::JobStore> {
+fn share_turn_store(arc: &Arc<MemoryTurnStore>) -> Arc<dyn baybo_turn::TurnStore> {
     arc.clone()
 }
 

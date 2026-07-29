@@ -522,7 +522,7 @@ pub(crate) fn tool_completed_block(
     lines
 }
 
-/// Footer committed when a turn (job) finishes: a "cooked for <duration>"
+/// Footer committed when a turn (turn) finishes: a "cooked for <duration>"
 /// stamp of the wall-clock the turn took.
 pub(crate) fn render_cooked_for_line(elapsed: Duration) -> Vec<Line<'static>> {
     vec![Line::from(Span::styled(
@@ -898,7 +898,7 @@ pub(crate) fn wrapped_height(lines: &[Line<'_>], width: u16) -> u16 {
 const TUI_CRON_RECURRING_HINT: &str = "⚠ This cron is tied to the TUI channel. \
     It only fires while `baybo gateway` is running, and a new TUI session \
     will not replay triggers missed while the gateway was down. For \
-    long-lived recurring jobs, prefer a persistent channel \
+    long-lived recurring turns, prefer a persistent channel \
     (telegram/discord/http).";
 
 fn render_block(block: &ContentBlock) -> Option<String> {

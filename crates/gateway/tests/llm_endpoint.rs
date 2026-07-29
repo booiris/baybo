@@ -20,7 +20,7 @@ use axum::http::{Request, StatusCode, header};
 use baybo_config::{BayboConfig, LlmEntry};
 use baybo_cost::CostRecord;
 use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use baybo_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
+use baybo_model::{CallReason, MicroUsd, SessionId, SpanId, TurnId};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -63,14 +63,14 @@ async fn router_with_reloader(
         config: Arc::new(seed),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
-        job_lifecycle: Arc::clone(&tg.deps.job_lifecycle),
+        turn_lifecycle: Arc::clone(&tg.deps.turn_lifecycle),
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         message_search: tg.deps.stores.message_search.clone(),
         query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
-            Arc::clone(&tg.deps.job_lifecycle),
+            Arc::clone(&tg.deps.turn_lifecycle),
             tg.deps.stores.trace.clone(),
             tg.deps.stores.cost.clone(),
         )),
@@ -349,7 +349,7 @@ fn cost_record(model: &str, input: usize, output: usize, cost: MicroUsd) -> Cost
     CostRecord {
         user_id: "u-test".into(),
         session_id: SessionId::from("sess-1"),
-        job_id: JobId::new(),
+        turn_id: TurnId::new(),
         span_id: SpanId::new(),
         reason: CallReason::Chat,
         model: model.into(),
@@ -415,14 +415,14 @@ async fn get_usage_aggregates_by_model() {
         config: Arc::new(seed_two_entries()),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
-        job_lifecycle: Arc::clone(&tg.deps.job_lifecycle),
+        turn_lifecycle: Arc::clone(&tg.deps.turn_lifecycle),
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         message_search: tg.deps.stores.message_search.clone(),
         query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
-            Arc::clone(&tg.deps.job_lifecycle),
+            Arc::clone(&tg.deps.turn_lifecycle),
             tg.deps.stores.trace.clone(),
             tg.deps.stores.cost.clone(),
         )),

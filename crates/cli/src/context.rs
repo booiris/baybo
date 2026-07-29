@@ -5,7 +5,6 @@ use baybo_agent::{CronScheduler, SecurityGateway, SessionManager};
 use baybo_channels::ChannelRegistry;
 use baybo_config::BayboConfig;
 use baybo_cost::CostStore;
-use baybo_job::JobLifecycle;
 use baybo_llm::BillableLlm;
 use baybo_pairing::DevicePairingService;
 use baybo_query::QueryApi;
@@ -15,6 +14,7 @@ use baybo_skills_assessor::SkillAssessor;
 use baybo_store::{ChannelBotStore, ChannelPairingStore};
 use baybo_tools::ToolRegistry;
 use baybo_trace::TraceStore;
+use baybo_turn::TurnLifecycle;
 use baybo_workspace::WorkspaceManager;
 
 use crate::format::OutputFormat;
@@ -41,12 +41,12 @@ pub struct CommandContext {
     pub llm: Option<Arc<BillableLlm>>,
     pub workspace: Arc<WorkspaceManager>,
     pub session: Option<Arc<SessionManager>>,
-    pub job: Option<Arc<JobLifecycle>>,
+    pub turn: Option<Arc<TurnLifecycle>>,
     pub cron: Option<Arc<CronScheduler>>,
     pub trace: Option<Arc<dyn TraceStore>>,
-    /// Pre-built `QueryApi` so trace / job / session commands don't
+    /// Pre-built `QueryApi` so trace / turn / session commands don't
     /// allocate one per invocation. `None` when the context lacks any
-    /// of session / job / trace (e.g. argv commands that don't touch
+    /// of session / turn / trace (e.g. argv commands that don't touch
     /// the trace surface — `baybo skills info`).
     pub query_api: Option<Arc<QueryApi>>,
     pub security: Option<Arc<SecurityGateway>>,
@@ -115,7 +115,7 @@ pub struct ContextBuilder {
     llm: Option<Arc<BillableLlm>>,
     workspace: Option<Arc<WorkspaceManager>>,
     session: Option<Arc<SessionManager>>,
-    job: Option<Arc<JobLifecycle>>,
+    turn: Option<Arc<TurnLifecycle>>,
     cron: Option<Arc<CronScheduler>>,
     trace: Option<Arc<dyn TraceStore>>,
     cost_store: Option<Arc<dyn CostStore>>,
@@ -139,7 +139,7 @@ impl ContextBuilder {
             llm: None,
             workspace: None,
             session: None,
-            job: None,
+            turn: None,
             cron: None,
             trace: None,
             cost_store: None,
@@ -188,8 +188,8 @@ impl ContextBuilder {
         self
     }
 
-    pub fn job(mut self, job: Arc<JobLifecycle>) -> Self {
-        self.job = Some(job);
+    pub fn turn(mut self, turn: Arc<TurnLifecycle>) -> Self {
+        self.turn = Some(turn);
         self
     }
 
@@ -203,7 +203,7 @@ impl ContextBuilder {
         self
     }
 
-    /// Optional. When set alongside `session`/`job`/`trace`, the
+    /// Optional. When set alongside `session`/`turn`/`trace`, the
     /// auto-derived `QueryApi` is built via `QueryApi::new` (cost
     /// queries supported); otherwise `QueryApi::without_costs` is used
     /// and `cost_summary` returns `Unsupported`.
@@ -248,7 +248,7 @@ impl ContextBuilder {
     }
 
     pub fn build(self) -> CommandContext {
-        let query_api = match (&self.session, &self.job, &self.trace) {
+        let query_api = match (&self.session, &self.turn, &self.trace) {
             (Some(s), Some(j), Some(t)) => Some(Arc::new(match &self.cost_store {
                 Some(c) => QueryApi::new(s.store(), Arc::clone(j), Arc::clone(t), Arc::clone(c)),
                 None => QueryApi::without_costs(s.store(), Arc::clone(j), Arc::clone(t)),
@@ -270,7 +270,7 @@ impl ContextBuilder {
                 .workspace
                 .unwrap_or_else(|| Arc::new(WorkspaceManager::new(PathBuf::from(".")))),
             session: self.session,
-            job: self.job,
+            turn: self.turn,
             cron: self.cron,
             trace: self.trace,
             query_api,

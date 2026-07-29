@@ -220,7 +220,7 @@ async fn token_rotate(config: &BayboConfig) -> anyhow::Result<()> {
 
 async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     // Per-workspace singleton. The gateway owns the same sqlite store as
-    // the TUI, runs job recovery, and drives cron ticks — two instances
+    // the TUI, runs turn recovery, and drives cron ticks — two instances
     // against the same workspace would race.
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
@@ -488,13 +488,13 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         let push_shutdown = shutdown.clone();
         task_tracker.track(baybo_gateway::push::spawn(
             dispatcher,
-            Arc::clone(&graph.job_lifecycle),
+            Arc::clone(&graph.turn_lifecycle),
             approval_stream,
             async move { push_shutdown.wait().await },
         ));
         tracing::info!(
             approval_pushes = approval_wired,
-            "push: dispatcher started (job lifecycle bus + approval gate)"
+            "push: dispatcher started (turn lifecycle bus + approval gate)"
         );
     }
 
@@ -517,7 +517,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         config_path: reload_config_path,
         runtime_config: runtime_cfg.clone(),
         session_manager: Arc::clone(&graph.session_manager),
-        job_lifecycle: Arc::clone(&graph.job_lifecycle),
+        turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),
         skill_registry: Arc::clone(&graph.skill_registry),
         tool_registry: Arc::clone(&graph.tool_registry),

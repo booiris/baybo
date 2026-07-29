@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use baybo_context::prompts::title::{build_title_prompt, sanitize_title};
 use baybo_llm::{Attribution, BillableLlm, ChatRequest, ModelInfo};
-use baybo_model::{ChatMessage, ContentBlock, JobId, SessionId};
+use baybo_model::{ChatMessage, ContentBlock, SessionId, TurnId};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallInputs, LlmCallResult, SpanRecorder, StepKind,
 };
@@ -22,7 +22,7 @@ pub(crate) struct TitleRunner {
     pub(crate) llm_client: Arc<BillableLlm>,
     pub(crate) recorder: Arc<SpanRecorder>,
     pub(crate) security_gateway: Arc<SecurityGateway>,
-    pub(crate) job_id: JobId,
+    pub(crate) turn_id: TurnId,
     pub(crate) user_id: String,
     pub(crate) session_id: SessionId,
     pub(crate) model_info: ModelInfo,
@@ -35,7 +35,7 @@ impl TitleRunner {
             llm_client,
             recorder,
             security_gateway,
-            job_id,
+            turn_id,
             user_id,
             session_id,
             model_info,
@@ -55,7 +55,7 @@ impl TitleRunner {
             reasoning_effort: None,
         };
 
-        let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
+        let cancel_ctx = Some((&cancel_token, baybo_turn::CancelReason::ParentCancelled));
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
@@ -67,21 +67,21 @@ impl TitleRunner {
         let recorder_inner = Arc::clone(&recorder);
         crate::runtime::scope::with_step(
             recorder.as_ref(),
-            job_id,
+            turn_id,
             StepKind::TitleGeneration,
             cancel_ctx,
             |step| async move {
                 let title = crate::runtime::scope::with_llm_span(
                     recorder_inner.as_ref(),
                     &step,
-                    job_id,
+                    turn_id,
                     begin,
                     cancel_ctx,
                     |span| async move {
                         let bound = llm_client.bind(Attribution {
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
-                            job_id,
+                            turn_id,
                             span_id: span.span_id,
                             reason: baybo_llm::CallReason::Title,
                         });

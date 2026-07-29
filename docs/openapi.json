@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Baybo Admin API",
-    "description": "TCP + bearer-token surface: config, jobs, cron, traces, skills, tools, channels, LLM.",
+    "description": "TCP + bearer-token surface: config, turns, cron, traces, skills, tools, channels, LLM.",
     "license": {
       "name": ""
     },
@@ -2068,7 +2068,7 @@
                           },
                           "title": {
                             "type": "string",
-                            "description": "Short human name for the job. Empty for rows created before the field\nexisted — clients fall back to the prompt."
+                            "description": "Short human name for the turn. Empty for rows created before the field\nexisted — clients fall back to the prompt."
                           },
                           "updated_at": {
                             "type": "string",
@@ -3052,322 +3052,6 @@
         }
       }
     },
-    "/v1/jobs": {
-      "get": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "list_jobs",
-        "parameters": [
-          {
-            "name": "session",
-            "in": "query",
-            "description": "Restrict to a single session. Hits the per-session index in\nthe store instead of scanning the full jobs table.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "name": "status",
-            "in": "query",
-            "description": "Restrict to one terminal/in-flight status discriminator.\nSnake-case, matching `JobStatusKind` (`pending`, `in_progress`,\n`stuck`, `cancelled`, `failed`, `completed`).",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Maximum items to return. Defaults to 50; capped at 500.",
-            "required": false,
-            "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "minimum": 0
-            }
-          },
-          {
-            "name": "cursor",
-            "in": "query",
-            "description": "Opaque cursor from a previous response's `next_cursor`.",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Paginated jobs",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
-                  "required": [
-                    "items"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "description": "Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
-                        "required": [
-                          "id",
-                          "session_id",
-                          "input_kind",
-                          "origin",
-                          "status",
-                          "emitted_span_ids",
-                          "created_at"
-                        ],
-                        "properties": {
-                          "created_at": {
-                            "type": "string",
-                            "format": "date-time"
-                          },
-                          "emitted_span_ids": {
-                            "type": "array",
-                            "items": {
-                              "type": "string"
-                            }
-                          },
-                          "ended_at": {
-                            "type": [
-                              "string",
-                              "null"
-                            ],
-                            "format": "date-time"
-                          },
-                          "final_result": {
-                            "type": [
-                              "object",
-                              "null"
-                            ]
-                          },
-                          "id": {
-                            "type": "string"
-                          },
-                          "input_kind": {
-                            "$ref": "#/components/schemas/JobInputKind",
-                            "description": "What payload fed the job (display-only projection of the input)."
-                          },
-                          "origin": {
-                            "$ref": "#/components/schemas/JobOrigin",
-                            "description": "The owning session's root trigger."
-                          },
-                          "parent_job_id": {
-                            "type": [
-                              "string",
-                              "null"
-                            ]
-                          },
-                          "session_id": {
-                            "type": "string"
-                          },
-                          "started_at": {
-                            "type": [
-                              "string",
-                              "null"
-                            ],
-                            "format": "date-time"
-                          },
-                          "status": {
-                            "$ref": "#/components/schemas/JobStatus"
-                          }
-                        }
-                      }
-                    },
-                    "next_cursor": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid query parameters",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Job store error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/jobs/{id}": {
-      "get": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "get_job",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Job id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Job record",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Job"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid job id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/jobs/{id}/cancel": {
-      "post": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "cancel_job",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Job id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Cancelled job record",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Job"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid job id",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Cancel failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/llm": {
       "get": {
         "tags": [
@@ -4133,10 +3817,10 @@
           {
             "name": "status",
             "in": "query",
-            "description": "Filter on the latest job's status (snake_case enum).",
+            "description": "Filter on the latest turn's status (snake_case enum).",
             "required": false,
             "schema": {
-              "$ref": "#/components/schemas/JobStatusKind"
+              "$ref": "#/components/schemas/TurnStatusKind"
             }
           },
           {
@@ -4249,7 +3933,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-session trace overview: session_messages log + job summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            "description": "Per-session trace overview: session_messages log + turn summaries (no step/span data). With `since_ordinal`, `session_messages` carries only rows above that ordinal; `supersede_watermark` tells the client when its cached prefix went stale (compaction) and a full reload is needed. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -4279,26 +3963,26 @@
         }
       }
     },
-    "/v1/traces/{session_id}/jobs/{job_id}": {
+    "/v1/traces/{session_id}/turns/{turn_id}": {
       "get": {
         "tags": [
           "traces"
         ],
-        "operationId": "get_job_trace",
+        "operationId": "get_turn_trace",
         "parameters": [
           {
             "name": "session_id",
             "in": "path",
-            "description": "Session id this job belongs to (or inherits from); used for route scoping only",
+            "description": "Session id this turn belongs to (or inherits from); used for route scoping only",
             "required": true,
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "job_id",
+            "name": "turn_id",
             "in": "path",
-            "description": "Job id whose step/span tree to fetch",
+            "description": "Turn id whose step/span tree to fetch",
             "required": true,
             "schema": {
               "type": "string"
@@ -4307,7 +3991,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
+            "description": "Per-turn step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -4315,7 +3999,7 @@
             }
           },
           "400": {
-            "description": "Invalid job id",
+            "description": "Invalid turn id",
             "content": {
               "application/json": {
                 "schema": {
@@ -4335,7 +4019,323 @@
             }
           },
           "404": {
-            "description": "No such job",
+            "description": "No such turn",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/turns": {
+      "get": {
+        "tags": [
+          "turns"
+        ],
+        "operationId": "list_turns",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "query",
+            "description": "Restrict to a single session. Hits the per-session index in\nthe store instead of scanning the full turns table.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Restrict to one terminal/in-flight status discriminator.\nSnake-case, matching `TurnStatusKind` (`pending`, `in_progress`,\n`stuck`, `cancelled`, `failed`, `completed`).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum items to return. Defaults to 50; capped at 500.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous response's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated turns",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "Wire mirror of [`baybo_turn::Turn`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+                        "required": [
+                          "id",
+                          "session_id",
+                          "input_kind",
+                          "origin",
+                          "status",
+                          "emitted_span_ids",
+                          "created_at"
+                        ],
+                        "properties": {
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "emitted_span_ids": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "ended_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
+                          },
+                          "final_result": {
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "input_kind": {
+                            "$ref": "#/components/schemas/TurnInputKind",
+                            "description": "What payload fed the turn (display-only projection of the input)."
+                          },
+                          "origin": {
+                            "$ref": "#/components/schemas/TurnOrigin",
+                            "description": "The owning session's root trigger."
+                          },
+                          "parent_turn_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "session_id": {
+                            "type": "string"
+                          },
+                          "started_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/TurnStatus"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Turn store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/turns/{id}": {
+      "get": {
+        "tags": [
+          "turns"
+        ],
+        "operationId": "get_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Turn id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Turn record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Turn"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid turn id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/turns/{id}/cancel": {
+      "post": {
+        "tags": [
+          "turns"
+        ],
+        "operationId": "cancel_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Turn id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled turn record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Turn"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid turn id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancel failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -4941,21 +4941,21 @@
           },
           "cron_group_pinned": {
             "type": "boolean",
-            "description": "Whether this row's **cron group** is pinned to the top of the chat list.\nRead off the live job (`cron_jobs.pinned`), so every fire of the job\ncarries the same value and the client folds it into the one group row —\nexactly as it already does for `cron_job_title`. The group is a view, so\nthe bit necessarily dies with the job: a tombstone group (job deleted,\nhistory kept) is always unpinned. `false` for a non-cron row."
+            "description": "Whether this row's **cron group** is pinned to the top of the chat list.\nRead off the live turn (`cron_jobs.pinned`), so every fire of the turn\ncarries the same value and the client folds it into the one group row —\nexactly as it already does for `cron_job_title`. The group is a view, so\nthe bit necessarily dies with the turn: a tombstone group (turn deleted,\nhistory kept) is always unpinned. `false` for a non-cron row."
           },
           "cron_job_id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The cron job whose fire this conversation is, for the clients that\ncollapse a job's fires into one chat-list row (a **cron group** — a\nderived view, never a `session_folders` row; see `docs/cron-groups.md`).\n`None` for a user session, and for the one-shot fire workspaces the list\nnever returns anyway."
+            "description": "The cron job whose fire this conversation is, for the clients that\ncollapse a turn's fires into one chat-list row (a **cron group** — a\nderived view, never a `session_folders` row; see `docs/cron-groups.md`).\n`None` for a user session, and for the one-shot fire workspaces the list\nnever returns anyway."
           },
           "cron_job_title": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The label for that group: the job's **live** title while the job exists\n(so a rename propagates with no rewrite of any session), falling back to\nthe title snapshotted onto the fire at mint once the job is deleted.\n`None` only when both are unavailable — a pre-snapshot fire whose job is\ngone; clients leave those rows flat."
+            "description": "The label for that group: the turn's **live** title while the turn exists\n(so a rename propagates with no rewrite of any session), falling back to\nthe title snapshotted onto the fire at mint once the turn is deleted.\n`None` only when both are unavailable — a pre-snapshot fire whose turn is\ngone; clients leave those rows flat."
           },
           "folder_id": {
             "type": [
@@ -5431,7 +5431,7 @@
           },
           "title": {
             "type": "string",
-            "description": "Short human name for the job. Empty for rows created before the field\nexisted — clients fall back to the prompt."
+            "description": "Short human name for the turn. Empty for rows created before the field\nexisted — clients fall back to the prompt."
           },
           "updated_at": {
             "type": "string",
@@ -5731,136 +5731,6 @@
             "description": "The sessions to hide. Like the per-session `DELETE`, this preserves every\nrow — see the module docstring. Sessions the caller cannot see are\nrejected."
           }
         }
-      },
-      "Job": {
-        "type": "object",
-        "description": "Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
-        "required": [
-          "id",
-          "session_id",
-          "input_kind",
-          "origin",
-          "status",
-          "emitted_span_ids",
-          "created_at"
-        ],
-        "properties": {
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "emitted_span_ids": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "ended_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "final_result": {
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "id": {
-            "type": "string"
-          },
-          "input_kind": {
-            "$ref": "#/components/schemas/JobInputKind",
-            "description": "What payload fed the job (display-only projection of the input)."
-          },
-          "origin": {
-            "$ref": "#/components/schemas/JobOrigin",
-            "description": "The owning session's root trigger."
-          },
-          "parent_job_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "session_id": {
-            "type": "string"
-          },
-          "started_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "status": {
-            "$ref": "#/components/schemas/JobStatus"
-          }
-        }
-      },
-      "JobInputKind": {
-        "type": "string",
-        "description": "Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.",
-        "enum": [
-          "user_chat",
-          "cron",
-          "cron_notification",
-          "compact",
-          "spawned",
-          "subagent_notification"
-        ]
-      },
-      "JobOrigin": {
-        "type": "string",
-        "description": "Wire mirror of a job's origin (the owning session's root trigger,\n[`baybo_model::TriggerKind`]).",
-        "enum": [
-          "user",
-          "cron",
-          "spawned"
-        ]
-      },
-      "JobStatus": {
-        "type": "object",
-        "description": "Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
-        "required": [
-          "kind"
-        ],
-        "properties": {
-          "cancel_reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "kind": {
-            "$ref": "#/components/schemas/JobStatusKind"
-          },
-          "partial_artifacts": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "JobStatusKind": {
-        "type": "string",
-        "enum": [
-          "pending",
-          "in_progress",
-          "stuck",
-          "cancelled",
-          "failed",
-          "completed"
-        ]
       },
       "ListResponse_SlashCommandEntry": {
         "type": "object",
@@ -6711,17 +6581,17 @@
           "version",
           "bind_address",
           "sessions",
-          "jobs_in_flight"
+          "turns_in_flight"
         ],
         "properties": {
           "bind_address": {
             "type": "string"
           },
-          "jobs_in_flight": {
+          "sessions": {
             "type": "integer",
             "minimum": 0
           },
-          "sessions": {
+          "turns_in_flight": {
             "type": "integer",
             "minimum": 0
           },
@@ -6738,7 +6608,7 @@
           "created_at",
           "last_active",
           "kind",
-          "job_count",
+          "turn_count",
           "span_count",
           "input_tokens",
           "output_tokens",
@@ -6762,10 +6632,6 @@
             "type": "integer",
             "minimum": 0
           },
-          "job_count": {
-            "type": "integer",
-            "minimum": 0
-          },
           "kind": {
             "$ref": "#/components/schemas/SessionKind"
           },
@@ -6773,14 +6639,14 @@
             "type": "string",
             "format": "date-time"
           },
-          "latest_job_status": {
+          "latest_turn_status": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/JobStatus",
-                "description": "`None` when the session has no jobs (those rows are filtered\nout, but the type stays Option to keep the wire shape stable\nif the policy ever flips)."
+                "$ref": "#/components/schemas/TurnStatus",
+                "description": "`None` when the session has no turns (those rows are filtered\nout, but the type stays Option to keep the wire shape stable\nif the policy ever flips)."
               }
             ]
           },
@@ -6792,6 +6658,10 @@
             "type": "string"
           },
           "span_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "turn_count": {
             "type": "integer",
             "minimum": 0
           }
@@ -6824,6 +6694,136 @@
           "message",
           "work",
           "notice"
+        ]
+      },
+      "Turn": {
+        "type": "object",
+        "description": "Wire mirror of [`baybo_turn::Turn`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+        "required": [
+          "id",
+          "session_id",
+          "input_kind",
+          "origin",
+          "status",
+          "emitted_span_ids",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "emitted_span_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "final_result": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_kind": {
+            "$ref": "#/components/schemas/TurnInputKind",
+            "description": "What payload fed the turn (display-only projection of the input)."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/TurnOrigin",
+            "description": "The owning session's root trigger."
+          },
+          "parent_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TurnStatus"
+          }
+        }
+      },
+      "TurnInputKind": {
+        "type": "string",
+        "description": "Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.",
+        "enum": [
+          "user_chat",
+          "cron",
+          "cron_notification",
+          "compact",
+          "spawned",
+          "subagent_notification"
+        ]
+      },
+      "TurnOrigin": {
+        "type": "string",
+        "description": "Wire mirror of a turn's origin (the owning session's root trigger,\n[`baybo_model::TriggerKind`]).",
+        "enum": [
+          "user",
+          "cron",
+          "spawned"
+        ]
+      },
+      "TurnStatus": {
+        "type": "object",
+        "description": "Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "cancel_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TurnStatusKind"
+          },
+          "partial_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TurnStatusKind": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "in_progress",
+          "stuck",
+          "cancelled",
+          "failed",
+          "completed"
         ]
       },
       "UnsetConfigRequest": {
@@ -7032,8 +7032,12 @@
       "description": "Read and mutate on-disk BayboConfig"
     },
     {
+      "name": "turns",
+      "description": "Agent turn tracking"
+    },
+    {
       "name": "jobs",
-      "description": "Async operation tracking"
+      "description": "In-flight background jobs"
     },
     {
       "name": "cron",

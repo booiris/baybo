@@ -8,7 +8,7 @@ doctest = false
 
 [dependencies]
 baybo-cost = { workspace = true }
-baybo-job = { workspace = true }
+baybo-turn = { workspace = true }
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
 baybo-session = { workspace = true }
@@ -24,7 +24,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 baybo-cost = { workspace = true, features = ["test-support"] }
-baybo-job = { workspace = true, features = ["test-support"] }
+baybo-turn = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
 baybo-trace = { workspace = true, features = ["test-support"] }

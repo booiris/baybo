@@ -37,7 +37,7 @@ use crate::{SubagentDispatchLimiter, SubagentRegistry, SubagentSpawner};
 /// Late-set handle to the actor-backed spawner. The tool is built while
 /// the tool registry is assembled (before the supervisor + actor spawner
 /// exist), so the runtime injects an empty slot here and fills it once the
-/// spawner is constructed. Mirrors how the background-job manager receives
+/// spawner is constructed. Mirrors how the background-turn manager receives
 /// its supervisor.
 pub type SubagentSpawnerSlot = Arc<OnceLock<Arc<dyn SubagentSpawner>>>;
 
@@ -99,7 +99,7 @@ this conversation and doesn't know what you've tried.
   "based on your findings, decide what to do"); that nullifies the
   point of dispatching one in the first place.
 - If you need short output, say so ("under 200 words").
-- Include the relevant span ids or job ids when the subagent should
+- Include the relevant span ids or turn ids when the subagent should
   hop across traces.
 
 # Cost and parallelism
@@ -583,7 +583,7 @@ impl Tool for SpawnSubagentTool {
 
         let parent = SubagentParentContext {
             session_id: ctx.session_id.clone(),
-            job_id: ctx.job_id,
+            turn_id: ctx.turn_id,
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
         };
@@ -720,7 +720,7 @@ mod tests {
             trigger: parent.trigger.clone(),
             lineage: Some(Lineage {
                 parent_session_id: parent.id.clone(),
-                parent_job_id: baybo_model::JobId::default(),
+                parent_turn_id: baybo_model::TurnId::default(),
                 parent_span_id: None,
                 kind: LineageKind::Subagent,
             }),

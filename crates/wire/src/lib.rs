@@ -710,8 +710,8 @@ pub enum Frame {
     },
     /// Server → client: whether a turn (the session's in-flight reply)
     /// is currently being produced. An idempotent snapshot, recomputed
-    /// from the job store and broadcast by the turn-state projector on
-    /// every job lifecycle transition — the `Pending → InProgress` start
+    /// from the turn store and broadcast by the turn-state projector on
+    /// every turn lifecycle transition — the `Pending → InProgress` start
     /// edge (`active: true` + start instant) and the terminal edges
     /// (`active: false`, so the close can't be skipped by an error or
     /// crash). A late joiner (new tab, reconnect) learns the in-flight

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{JobId, SessionId, SpanId, TriggerSource, User};
+use baybo_model::{SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -207,16 +207,16 @@ pub struct ToolContext {
     /// What started the session this call runs in. A tool that records the
     /// calling conversation for later use needs it: `CronCreate` running
     /// inside a cron fire (fire sessions get the full tool registry) must
-    /// record the fire's *own* origin as the new job's origin, not the
+    /// record the fire's *own* origin as the new turn's origin, not the
     /// transient fire session — otherwise a one-shot's result would be
     /// delivered into a session nobody can see.
     pub session_trigger: TriggerSource,
-    /// Job this tool call belongs to. Tools that emit downstream work
+    /// Turn this tool call belongs to. Tools that emit downstream work
     /// (e.g. spawn a subagent) carry it so the spawned work can be
-    /// lineaged back to the originating job. Production wiring sources
-    /// it from the per-job context the executor opens around each tool
+    /// lineaged back to the originating turn. Production wiring sources
+    /// it from the per-turn context the executor opens around each tool
     /// call.
-    pub job_id: JobId,
+    pub turn_id: TurnId,
     /// This tool's own `ToolCall` span id. Tools that emit downstream
     /// work record it as `parent_span_id` so the resulting lineage
     /// pins back to the exact span that spawned them.
@@ -266,7 +266,7 @@ pub struct ToolContext {
     pub events: Arc<dyn ToolEventSink>,
     /// Per-call billed-LLM handle for tools that need in-flow LLM access
     /// — WebFetch's prompt-driven extraction, the Bash risk judges. The
-    /// agent layer binds it to the current `(user, session, job, span)`
+    /// agent layer binds it to the current `(user, session, turn, span)`
     /// so `chat()` records cost against the running tool's span. `None`
     /// when no LLM is wired (argv-mode boots, tests that don't exercise
     /// the side LLM); tools must fail-closed by ignoring their
@@ -332,7 +332,7 @@ impl ToolContext {
         Self {
             session_id: "test".into(),
             session_trigger: TriggerSource::User,
-            job_id: JobId::default(),
+            turn_id: TurnId::default(),
             span_id: SpanId::default(),
             user: User {
                 id: "u".into(),
@@ -727,7 +727,7 @@ pub struct DetachedCommand {
 }
 
 /// Runtime hook that takes ownership of a [`DetachedCommand`], streams it
-/// to completion off the tool call, and routes a background-job completion
+/// to completion off the tool call, and routes a background-turn completion
 /// notification to the parent session. Implemented by the agent layer
 /// (`baybo-agent`) and injected via [`ToolContext::background_jobs`], which
 /// the runtime populates **only for user-facing sessions** — so the
@@ -738,7 +738,7 @@ pub trait BackgroundJobSink: Send + Sync {
     /// Take the detached command; return the handle id the tool surfaces
     /// to the LLM. Returns promptly (registers + spawns an escort task) —
     /// it does NOT await the command.
-    async fn detach_command(&self, job: DetachedCommand) -> String;
+    async fn detach_command(&self, turn: DetachedCommand) -> String;
 }
 
 /// One in-flight background job, as surfaced by the `JobList` tool.
@@ -759,7 +759,7 @@ pub struct BackgroundJobInfo {
 pub trait BackgroundJobControl: Send + Sync {
     /// In-flight background jobs dispatched from `session_id`.
     async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo>;
-    /// Kill one in-flight job by handle. `true` if it was running.
+    /// Kill one in-flight turn by handle. `true` if it was running.
     async fn stop(&self, session_id: &SessionId, handle: &str) -> bool;
 }
 

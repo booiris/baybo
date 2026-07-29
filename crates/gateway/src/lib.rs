@@ -3,7 +3,7 @@
 //! Exposes two listeners:
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Config / status /
-//!   jobs / cron / memory / traces / skills / tools / llm and a
+//!   turns / cron / memory / traces / skills / tools / llm and a
 //!   read-only channel list. Also co-hosts admin-token web chat routes
 //!   (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can reach
 //!   them over the public bind.

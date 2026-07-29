@@ -7,7 +7,7 @@ Each document covers: module responsibilities, design decisions, key constraints
 Bottom-up along the dependency graph:
 
 1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
-2. [job.md](job.md) → [cron.md](cron.md) → [skills.md](skills.md)
+2. [turn.md](turn.md) → [cron.md](cron.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md)
 4. [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [task.md](task.md) → [context.md](context.md)
 5. [trace.md](trace.md)
@@ -18,7 +18,7 @@ Bottom-up along the dependency graph:
 ### Foundational Types Layer
 
 - **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata, MessageSource), governance types (TrustLevel, ArtifactSource, ExtensionManifest), and pure-data persistence types (`CronJob` family, `CostRecord`/`CostSummary`/`TimeRange`). No business traits.
-- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and every `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`, `DeckCardStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the sqlite adapter that implements the traits. `JobStore` / `TraceStore` trade in row DTOs (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Job` / `Step` / `Span` types and their state-machine / recorder logic stay in `job` / `trace`, which own the `to_row` / `from_row` conversions.
+- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and every `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `TurnStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`, `DeckCardStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the sqlite adapter that implements the traits. `TurnStore` / `TraceStore` trade in row DTOs (`TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Turn` / `Step` / `Span` types and their state-machine / recorder logic stay in `turn` / `trace`, which own the `to_row` / `from_row` conversions.
 - **config** — Root `BayboConfig` with JSON loading and `validate()`. Sections (llm, agent, session, channels, security, tools, trace, cost, workspace). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
@@ -44,17 +44,17 @@ Bottom-up along the dependency graph:
 ### Runtime and Observability Layer
 
 - **trace** — Trace types + row conversions + lifecycle recorder: `Step` / `Span` / `SpanEvent` domain types and the `SpanRecorder` lifecycle facade with its `TraceEvent` / `TraceEventStream` broadcast bus. The `TraceStore` trait lives in `store` and trades in `StepRow` / `SpanRow` / `SpanEventRow`; this crate owns the `to_row` / `from_row` conversions and converts at the recorder boundary. Half-open-span recovery utility included. Closed strong-typed enums; OTel-aligned naming.
-- **job** — Job types + row conversions + state machine + lifecycle orchestrator: `Job` (with `origin`), `JobStatus`, `JobInputKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, and the `JobLifecycle` persistence orchestrator (with `JobCancellationRegistry` and lifecycle-event bus). The `JobStore` trait lives in `store` and trades in `JobRow` / `JobTransitionRow`; this crate owns the state machine and the `to_row` / `from_row` conversions. `Cancelled` and `Failed` are independent terminal states.
-- **memory** — Pluggable long-term memory: a single `Memory` trait (one registered `Arc<dyn Memory>`, storage-opaque) with `recall` (sync) + `on_job_complete`/`on_session_end` (background) hooks + `tools()`. Core ships the trait + a `NoopMemory` default; real backends ship in `crates/memory/src/backends/` (OpenViking, Mem0), selected by `MemoryProvider` in `baybo_memory::boot::build_memory_backend`; the runtime wires `None` (inert no-op) only when memory is disabled or `provider = noop`. The agent loop drives recall/write for `UserChat`+`Cron` jobs; recalled memories inject as framed `MessageSource::RecalledMemory` rows, never `Role::System`. See `docs/modules/memory.md`.
+- **[turn](turn.md)** — Turn types + row conversions + state machine + lifecycle orchestrator: `Turn` (with `origin`), `TurnStatus`, `TurnInputKind`, `TurnInput`, `TurnOutput`, `CancelReason`, `TurnTransition`, and the `TurnLifecycle` persistence orchestrator (with `TurnCancellationRegistry` and lifecycle-event bus). The `TurnStore` trait lives in `store` and trades in `TurnRow`; this crate owns the state machine and the `to_row` / `from_row` conversions. `Cancelled` and `Failed` are independent terminal states. A **Turn** is every externally-triggered unit of work (`/compact` and cron-result delivery included); `Turn::is_chat_turn()` is the only predicate for the user-visible **chat turn** subset.
+- **memory** — Pluggable long-term memory: a single `Memory` trait (one registered `Arc<dyn Memory>`, storage-opaque) with `recall` (sync) + `on_turn_complete`/`on_session_end` (background) hooks + `tools()`. Core ships the trait + a `NoopMemory` default; real backends ship in `crates/memory/src/backends/` (OpenViking, Mem0), selected by `MemoryProvider` in `baybo_memory::boot::build_memory_backend`; the runtime wires `None` (inert no-op) only when memory is disabled or `provider = noop`. The agent loop drives recall/write for `UserChat`+`Cron` turns; recalled memories inject as framed `MessageSource::RecalledMemory` rows, never `Role::System`. See `docs/modules/memory.md`.
 - **cost** — LLM-call spend tracking: the `CostManager` (synchronous in-memory accumulator + async persist + `LlmCallGuard` bridge via `cost_call_guard`) and `CostError`. The `CostStore` trait lives in `store`; data types (`CostRecord`, `CostSummary`, `TimeRange`) live in `model`. Integer `MicroUsd` arithmetic — never floats.
-- **query** — Read-only analytics surface (`QueryApi`) over Session / Job / Step / Span / Cost. One `QueryError` collapses four upstream store error types; CLI and gateway admin handlers use it without re-deriving error shape.
+- **query** — Read-only analytics surface (`QueryApi`) over Session / Turn / Step / Span / Cost. One `QueryError` collapses four upstream store error types; CLI and gateway admin handlers use it without re-deriving error shape.
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — The sqlite **adapter**: implements every `*Store` trait from `store` over a single sqlite backend and bundles the impls in `Store` for DI. All trait contracts + their row types (incl. `RiskVerdict` / `RiskLevel`, `ChannelPairingRow` / `PairingStatus`, `JobRow`, `StepRow` / `SpanRow` / `SpanEventRow`) now live in `store`; consumers import them from `baybo_store` directly (`baybo-storage` does **not** re-export them — it exposes only the `Store` DI bundle, the `sqlite` module, and the `retry` helper). Normal deps are just `store` + `model` — no longer on any domain crate (`session` / `job` / `trace` / `cost` / `cron` / `memory` / `security`). `job` / `trace` remain only as `dev-dependencies`, so the round-trip tests can build the rich types.
+- **storage** — The sqlite **adapter**: implements every `*Store` trait from `store` over a single sqlite backend and bundles the impls in `Store` for DI. All trait contracts + their row types (incl. `RiskVerdict` / `RiskLevel`, `ChannelPairingRow` / `PairingStatus`, `TurnRow`, `StepRow` / `SpanRow` / `SpanEventRow`) now live in `store`; consumers import them from `baybo_store` directly (`baybo-storage` does **not** re-export them — it exposes only the `Store` DI bundle, the `sqlite` module, and the `retry` helper). Normal deps are just `store` + `model` — no longer on any domain crate (`session` / `turn` / `trace` / `cost` / `cron` / `memory` / `security`). `turn` / `trace` remain only as `dev-dependencies`, so the round-trip tests can build the rich types.
 - **[janitor](janitor.md)** — `baybo-janitor`. Best-effort, cadence-driven maintenance outside the agent loop: filesystem TTL sweeps (rotated log files at 30d, stale sidecar-cache dirs at 7d) plus the hourly `channel_pairings` retention purge (pending-expired + approved older than 7d). No storage compaction. Spawned by the gateway boot path.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `baybo pair approve <code>` flips the row to `approved`. The `ChannelPairingStore` trait + its row type live in `store` (imported directly from `baybo_store`); `baybo-pairing` is the service + code generator.
-- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, cost management (`CostManager` as a `TraceEventStream` subscriber, with `CostGuardError` for limit breaches), and `SecurityGateway` (cross-cutting interception facade tied to the execution path). Observability facades live in their domain crates now: `JobLifecycle` in `baybo-job`, `SpanRecorder` in `baybo-trace`, the `Memory` trait in `baybo-memory`, `SessionManager` in `baybo-session`. Agent assembles them via dependency injection. Bridges cron domain types and storage row types.
+- **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, cost management (`CostManager` as a `TraceEventStream` subscriber, with `CostGuardError` for limit breaches), and `SecurityGateway` (cross-cutting interception facade tied to the execution path). Observability facades live in their domain crates now: `TurnLifecycle` in `baybo-turn`, `SpanRecorder` in `baybo-trace`, the `Memory` trait in `baybo-memory`, `SessionManager` in `baybo-session`. Agent assembles them via dependency injection. Bridges cron domain types and storage row types.
 - **[setup](setup.md)** — Interactive first-run wizard (`baybo-setup`, exposed as `baybo setup`). Bootstraps the workspace skeleton, mints the master encryption key under `<root>/.key/encryption.key`, writes a default `baybo.json`, opens sqlite + the secret vault, then runs Quick / Full step sequences (LLM / channel / browser). Same flow primitives back `baybo llm add` / `baybo channel add` (`flow::configure_*_step`), so the wizard's per-step UX is structurally identical to the argv path. β2 commit semantics — `baybo.json` is the only deferred write.
 - **bootstrap** — Binary entry point (`crates/baybo/src/main.rs`) and `boot` submodule. Loads `BayboConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`baybo-cli`). One `clap` tree drives both argv-mode commands (`baybo config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
@@ -83,12 +83,12 @@ model (owns Session/User/ChannelType/SessionState + message types; no internal d
   ├── channels ──► model, wire, tools
   ├── llm ──► model, security
   ├── security ──► model, store
-  ├── trace ──► model, store, job
+  ├── trace ──► model, store, turn
   ├── tools ──► model, llm, security, session, store, storage, trace, workspace
   ├── cron ──► model, store, tools
   ├── skills ──► model, workspace, tools
   ├── skills-assessor ──► skills, store, llm, model
-  ├── job ──► model, store
+  ├── turn ──► model, store
   ├── config ──► model, workspace
   └── workspace (no internal deps)
 
@@ -102,8 +102,8 @@ sandbox   ──► (no internal deps; OS sandbox runner consumed by agent — B
 subagent  ──► model, session, tools (typed subagents + spawn_subagent tool; owns its Tool like skills/cron; profiles from <workspace>/agents/)
 task      ──► model, store, tools (planning-checklist Task* tools over the TaskStore trait; owns its Tool like cron/skills/subagent)
 deck      ──► model, store, security, tools (card bundles + dry-run install gate + supervised host bun service runtime, unsandboxed; owns the DeckCardCreate/DeckCardUpdate tools; gateway consumes DeckManager)
-agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, security, sandbox, store, storage, channels
-gateway   ──► agent, channels, config, context, cron, cost, deck, job, llm, model, pairing, query, security, session, skills, storage, store, tools, trace, workspace
+agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, turn, memory, cost, cron, security, sandbox, store, storage, channels
+gateway   ──► agent, channels, config, context, cron, cost, deck, llm, model, pairing, query, security, session, skills, storage, store, tools, trace, turn, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over WS+MessagePack)
 setup     ──► agent, channels, config, gateway, llm, model, security, storage, store, workspace (interactive first-run wizard; baybo-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)
@@ -113,9 +113,9 @@ bootstrap ──► config + all domain crates it assembles (entry point only)
 
 - Each module defines its own error type; no shared error enum
 - Store trait contracts live in `store`; `storage` is the sqlite adapter; domain types live in their own crates; business logic stays out of the storage layer
-- Logs, Trace, and Job must not record sensitive plaintext — only placeholders or sanitized summaries
+- Logs, Trace, and Turn must not record sensitive plaintext — only placeholders or sanitized summaries
 - Tool/skill extensions must carry source, version, hash, trust level, and capability declarations
-- The Job state machine is fixed: `Pending → InProgress → Completed` (with `Stuck`, `Failed`, and `Cancelled` branches). `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context
+- The Turn state machine is fixed: `Pending → InProgress → Completed` (with `Stuck`, `Failed`, and `Cancelled` branches). `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context
 - Multimedia passed by reference — no raw binary in sessions or Trace
 - Hot reload, tool updates, identity changes, and config changes must leave provenance records in Trace
-- Cron and background execution must all enter Job and Trace
+- Cron and background execution must all enter Turn and Trace

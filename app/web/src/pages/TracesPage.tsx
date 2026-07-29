@@ -9,7 +9,7 @@ import type { components } from '../api/schema';
 import { useMockMode, MOCK_TRACE_SUMMARIES } from '../api/mock';
 
 type TraceSessionSummary = components['schemas']['TraceSessionSummary'];
-type JobStatusKind = components['schemas']['JobStatusKind'];
+type TurnStatusKind = components['schemas']['TurnStatusKind'];
 type SessionKind = components['schemas']['SessionKind'];
 
 const PAGE_SIZE_OPTIONS = [20, 50, 100];
@@ -19,7 +19,7 @@ const DEFAULT_PAGE_SIZE = 20;
 // in-flight session. Static pages (everything terminal) just sit.
 const ACTIVE_POLL_MS = 5_000;
 
-const STATUS_OPTIONS: { value: 'all' | JobStatusKind; label: string }[] = [
+const STATUS_OPTIONS: { value: 'all' | TurnStatusKind; label: string }[] = [
   { value: 'all', label: 'All Statuses' },
   { value: 'in_progress', label: 'In Progress' },
   { value: 'pending', label: 'Pending' },
@@ -36,7 +36,7 @@ const KIND_OPTIONS: { value: 'all' | SessionKind; label: string }[] = [
   { value: 'cron', label: 'Cron' },
 ];
 
-const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
+const STATUS_BADGE_CLASS: Record<TurnStatusKind, string> = {
   pending: 'bg-gray-200 text-ink border-ink',
   in_progress: 'bg-info text-white',
   stuck: 'bg-warn text-white',
@@ -60,7 +60,7 @@ const KIND_BADGE_LABEL: Record<SessionKind, string> = {
 // Only genuinely in-flight kinds keep the list poll alive. `stuck` is
 // excluded on purpose: a stuck row never advances on its own, so polling
 // for it would run forever with nothing to observe.
-const ACTIVE_KINDS: JobStatusKind[] = ['pending', 'in_progress'];
+const ACTIVE_KINDS: TurnStatusKind[] = ['pending', 'in_progress'];
 
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
@@ -87,7 +87,7 @@ function formatNumber(n: number): string {
 
 function applyMockFilters(
   rows: TraceSessionSummary[],
-  status: 'all' | JobStatusKind,
+  status: 'all' | TurnStatusKind,
   kind: 'all' | SessionKind,
   query: string,
   since?: string,
@@ -95,7 +95,7 @@ function applyMockFilters(
 ): TraceSessionSummary[] {
   let out = rows;
   if (status !== 'all') {
-    out = out.filter((r) => r.latest_job_status?.kind === status);
+    out = out.filter((r) => r.latest_turn_status?.kind === status);
   }
   if (kind !== 'all') {
     out = out.filter((r) => r.kind === kind);
@@ -125,11 +125,11 @@ function KindBadge({ kind }: { kind: SessionKind }) {
   );
 }
 
-function StatusBadge({ status }: { status?: components['schemas']['JobStatus'] | null }) {
+function StatusBadge({ status }: { status?: components['schemas']['TurnStatus'] | null }) {
   if (!status) {
     return (
       <span className="inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs bg-gray-100 text-ink-soft">
-        no jobs
+        no turns
       </span>
     );
   }
@@ -153,7 +153,7 @@ export function TracesPage() {
 
   const [filter, setFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
-  const [status, setStatus] = useState<'all' | JobStatusKind>('all');
+  const [status, setStatus] = useState<'all' | TurnStatusKind>('all');
   const [kind, setKind] = useState<'all' | SessionKind>('all');
   const [since, setSince] = useState<string>('');
   const [until, setUntil] = useState<string>('');
@@ -262,8 +262,8 @@ export function TracesPage() {
     () =>
       items.some(
         (it) =>
-          it.latest_job_status &&
-          ACTIVE_KINDS.includes(it.latest_job_status.kind),
+          it.latest_turn_status &&
+          ACTIVE_KINDS.includes(it.latest_turn_status.kind),
       ),
     [items],
   );
@@ -338,7 +338,7 @@ export function TracesPage() {
         />
         <SelectBox
           value={status}
-          onChange={(e) => setStatus(e.target.value as 'all' | JobStatusKind)}
+          onChange={(e) => setStatus(e.target.value as 'all' | TurnStatusKind)}
           className="h-10 px-3"
         >
           {STATUS_OPTIONS.map((opt) => (
@@ -450,11 +450,11 @@ export function TracesPage() {
                         <KindBadge kind={row.kind} />
                       </div>
                       <div className="text-ink-soft text-[0.75rem] mt-1">
-                        {row.job_count} {row.job_count === 1 ? 'job' : 'jobs'}
+                        {row.turn_count} {row.turn_count === 1 ? 'turn' : 'turns'}
                       </div>
                     </td>
                     <td className={cell}>
-                      <StatusBadge status={row.latest_job_status} />
+                      <StatusBadge status={row.latest_turn_status} />
                     </td>
                     <td className={cell}>
                       <span className="text-[0.9rem] font-mono">{row.span_count}</span>

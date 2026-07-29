@@ -513,9 +513,9 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
 }
 
 /// A late joiner (new tab, reconnect) learns whether a turn is in flight
-/// from the `SubscribeState` bundle's `turn` half, derived from the job
+/// from the `SubscribeState` bundle's `turn` half, derived from the turn
 /// store on every `Subscribe` — `active: false` on an idle session,
-/// `active: true` with the start instant while a turn-kind job is
+/// `active: true` with the start instant while a turn-kind turn is
 /// non-terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_hydrates_turn_state_snapshot() {
@@ -572,24 +572,24 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .expect("SubscribeState after Subscribe");
     expect_bundle_turn(frame, false);
 
-    // Turn in flight (a non-terminal UserChat job): a fresh tab's
+    // Turn in flight (a non-terminal UserChat turn): a fresh tab's
     // bundle reports it active, with the start instant.
-    let job = tg
+    let turn = tg
         .deps
-        .job_lifecycle
-        .start_job(
+        .turn_lifecycle
+        .start_turn(
             session.id.clone(),
             baybo_model::TriggerKind::User,
-            baybo_job::JobInput::UserChat { content: vec![] },
+            baybo_turn::TurnInput::UserChat { content: vec![] },
             None,
         )
         .await
-        .expect("start turn job");
+        .expect("start turn turn");
     tg.deps
-        .job_lifecycle
-        .start(&job.id)
+        .turn_lifecycle
+        .start(&turn.id)
         .await
-        .expect("job → InProgress");
+        .expect("turn → InProgress");
 
     let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await

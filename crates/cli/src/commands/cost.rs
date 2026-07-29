@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use baybo_cost::{CostSummary, TimeRange};
-use baybo_model::{JobId, SessionId};
+use baybo_model::{SessionId, TurnId};
 use baybo_query::{CostScope, QueryApi};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -19,10 +19,10 @@ pub async fn handle(ctx: &CommandContext, cmd: CostCmd) -> Result<CommandOutput>
         CostCmd::Show {
             user,
             session,
-            job,
+            turn,
             since,
             until,
-        } => show(ctx, user, session, job, since.as_deref(), until.as_deref()).await,
+        } => show(ctx, user, session, turn, since.as_deref(), until.as_deref()).await,
     }
 }
 
@@ -36,13 +36,13 @@ async fn show(
     ctx: &CommandContext,
     user: Option<String>,
     session: Option<String>,
-    job: Option<String>,
+    turn: Option<String>,
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<CommandOutput> {
     let api = query_api(ctx)?;
     let range = resolve_range(since, until)?;
-    let (scope_label, scope_value, summary) = match (user, session, job) {
+    let (scope_label, scope_value, summary) = match (user, session, turn) {
         (Some(uid), _, _) => {
             let label = format!("user={uid}");
             let value = json!({ "user": uid.clone(), "from": range.from.to_rfc3339(), "to": range.to.to_rfc3339() });
@@ -65,15 +65,15 @@ async fn show(
             (label, value, summary)
         }
         (None, None, Some(jid)) => {
-            let label = format!("job={jid}");
-            let value = json!({ "job": jid.clone() });
-            let parsed = JobId::from_str(&jid).map_err(|e| {
-                CliError::Parse(format!("invalid --job {jid:?}: expected ULID ({e})"))
+            let label = format!("turn={jid}");
+            let value = json!({ "turn": jid.clone() });
+            let parsed = TurnId::from_str(&jid).map_err(|e| {
+                CliError::Parse(format!("invalid --turn {jid:?}: expected ULID ({e})"))
             })?;
             let summary = api
-                .cost_summary(CostScope::Job(parsed))
+                .cost_summary(CostScope::Turn(parsed))
                 .await
-                .map_err(|e| CliError::Manager(format!("cost summary (job): {e}")))?;
+                .map_err(|e| CliError::Manager(format!("cost summary (turn): {e}")))?;
             (label, value, summary)
         }
         (None, None, None) => {

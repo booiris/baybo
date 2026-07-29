@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
-use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobStatusKind};
 use baybo_model::{
     CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId, TriggerSource, User,
 };
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
+use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnPhase, TurnStatusKind};
 use chrono::Utc;
 use chrono_tz::Tz;
 use tokio::sync::broadcast;
@@ -117,8 +117,8 @@ impl Router {
         CronResultWaiter {
             event: event.clone(),
             fire_session_id,
-            lifecycle: Arc::clone(&self.job_lifecycle),
-            terminal_rx: self.job_lifecycle.subscribe_lifecycle_events(),
+            lifecycle: Arc::clone(&self.turn_lifecycle),
+            terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             cron_store: Arc::clone(&self.cron_store),
             delivery: self.cron_result_delivery(),
         }
@@ -294,8 +294,8 @@ impl Router {
 struct CronResultWaiter {
     event: CronTriggerEvent,
     fire_session_id: SessionId,
-    lifecycle: Arc<JobLifecycle>,
-    terminal_rx: broadcast::Receiver<JobLifecycleEvent>,
+    lifecycle: Arc<TurnLifecycle>,
+    terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
     cron_store: Arc<dyn CronStore>,
     delivery: CronResultDelivery,
 }
@@ -394,8 +394,8 @@ impl CronResultWaiter {
         }
     }
 
-    fn is_our_fire(&self, ev: &JobLifecycleEvent) -> bool {
-        ev.session_id == self.fire_session_id && ev.kind == JobInputKind::Cron
+    fn is_our_fire(&self, ev: &TurnLifecycleEvent) -> bool {
+        ev.session_id == self.fire_session_id && ev.kind == TurnInputKind::Cron
     }
 
     /// The fire's outcome from the store, or `None` if it has no terminal job
@@ -418,9 +418,9 @@ impl CronResultWaiter {
         };
         let job = jobs
             .into_iter()
-            .find(|j| j.input_kind() == JobInputKind::Cron && j.is_terminal())?;
+            .find(|j| j.input_kind() == TurnInputKind::Cron && j.is_terminal())?;
         let ordinal = match &job.final_result {
-            Some(baybo_job::JobOutput::Message { ordinal, .. }) => *ordinal,
+            Some(baybo_turn::TurnOutput::Message { ordinal, .. }) => *ordinal,
             _ => None,
         };
         Some(self.outcome_for(job.status.kind(), ordinal).await)
@@ -428,9 +428,9 @@ impl CronResultWaiter {
 
     /// Classify a terminal job state, reading the failure reason off the job
     /// row so the notification can say *why* the scheduled task failed.
-    async fn outcome_for(&self, kind: JobStatusKind, reply_ordinal: Option<i64>) -> FireOutcome {
+    async fn outcome_for(&self, kind: TurnStatusKind, reply_ordinal: Option<i64>) -> FireOutcome {
         match kind {
-            JobStatusKind::Completed => match reply_ordinal {
+            TurnStatusKind::Completed => match reply_ordinal {
                 // A completed fire with no persisted reply produced nothing to
                 // report — still delivered, as an explicit "no output".
                 None => FireOutcome {
@@ -461,10 +461,10 @@ impl CronResultWaiter {
             .await
             .unwrap_or_default();
         jobs.into_iter()
-            .filter(|j| j.input_kind() == JobInputKind::Cron)
+            .filter(|j| j.input_kind() == TurnInputKind::Cron)
             .find_map(|j| match j.status {
-                baybo_job::JobStatus::Failed { reason } => Some(reason),
-                baybo_job::JobStatus::Cancelled { reason, .. } => {
+                baybo_turn::TurnStatus::Failed { reason } => Some(reason),
+                baybo_turn::TurnStatus::Cancelled { reason, .. } => {
                     Some(format!("cancelled ({reason:?})"))
                 }
                 _ => None,
@@ -491,9 +491,9 @@ impl FireOutcome {
 }
 
 /// The reply ordinal a terminal phase carries (`Completed` only).
-fn reply_ordinal(phase: &JobPhase) -> Option<i64> {
+fn reply_ordinal(phase: &TurnPhase) -> Option<i64> {
     match phase {
-        JobPhase::Completed { reply_ordinal } => *reply_ordinal,
+        TurnPhase::Completed { reply_ordinal } => *reply_ordinal,
         _ => None,
     }
 }
@@ -674,11 +674,11 @@ mod tests {
     use baybo_cost::test_support::MemoryCostStore;
     use baybo_cost::{CostManager, SpendingLimits};
     use baybo_cron::test_support::InMemoryCronStore;
-    use baybo_job::test_support::MemoryJobStore;
     use baybo_model::{ChannelType, CronJob, CronSchedule, CronStatus, User};
     use baybo_security::test_support::MemorySecretStore;
     use baybo_security::{EncryptionKey, LeakDetector, SecretVault};
     use baybo_session::test_support::{MemorySessionFolderStore, MemorySessionStore};
+    use baybo_turn::test_support::MemoryTurnStore;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -751,7 +751,7 @@ mod tests {
                     SpendingLimits::default(),
                 ),
                 actor_spawner,
-                job_lifecycle: Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new()))),
+                turn_lifecycle: Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
                 cron_trigger_rx,
                 actor_parent_token: CancellationToken::new(),

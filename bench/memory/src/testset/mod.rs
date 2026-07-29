@@ -95,7 +95,7 @@ pub struct BenchSession {
 
 impl BenchSession {
     /// Split the session's turns into `(user_input, assistant)` pairs for
-    /// `on_job_complete`. The user side of each pair is prefixed with the session
+    /// `on_turn_complete`. The user side of each pair is prefixed with the session
     /// date so temporal questions stay answerable; a trailing odd turn pairs with
     /// an empty assistant string.
     pub fn turn_pairs(&self) -> Vec<(String, String)> {

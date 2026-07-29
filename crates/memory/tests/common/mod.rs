@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use baybo_memory::MemoryContext;
-use baybo_model::{ChannelType, JobId, SessionId, User};
+use baybo_model::{ChannelType, SessionId, TurnId, User};
 use baybo_tools::ToolContext;
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, StepKind, TraceEventStream};
@@ -43,12 +43,12 @@ pub async fn memory_context(user_id: &str, session_id: &str, step_kind: StepKind
         Arc::new(MemoryTraceStore::new()),
         TraceEventStream::new(),
     ));
-    let job_id = JobId::new();
-    let step = recorder.begin_step(job_id, step_kind).await.unwrap();
+    let turn_id = TurnId::new();
+    let step = recorder.begin_step(turn_id, step_kind).await.unwrap();
     MemoryContext::new(
         user_id.to_string(),
         SessionId::from(session_id),
-        job_id,
+        turn_id,
         recorder,
         step,
     )
@@ -58,7 +58,7 @@ pub fn tool_context(user_id: &str) -> ToolContext {
     let tmp = std::env::temp_dir();
     ToolContext {
         session_id: SessionId::from("test-session"),
-        job_id: JobId::new(),
+        turn_id: TurnId::new(),
         user: User {
             id: user_id.into(),
             name: Some("tester".into()),

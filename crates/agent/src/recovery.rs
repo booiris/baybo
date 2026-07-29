@@ -1,32 +1,32 @@
-//! Recovery helpers for orphaned trace rows and non-terminal jobs.
+//! Recovery helpers for orphaned trace rows and non-terminal turns.
 //!
 //! When execution is dropped mid-flight (SIGTERM, SIGKILL, actor panic,
-//! tokio task abort), the in-flight `with_step` / `with_job` futures may
+//! tokio task abort), the in-flight `with_step` / `with_turn` futures may
 //! disappear before their `end_step` / `lifecycle.cancel` calls run. The
 //! tool span typically already wrote its row (it ran one await earlier),
-//! but the surrounding step row, the LLM span row, and the job row can be
+//! but the surrounding step row, the LLM span row, and the turn row can be
 //! stuck in `Pending` / `InProgress` forever unless a recovery path closes
 //! them.
 //!
-//! [`recover_orphaned_traces_and_jobs`] sweeps those orphans at next
+//! [`recover_orphaned_traces_and_turns`] sweeps those orphans at next
 //! boot, cascading bottom-up:
 //!
-//! 1. For each non-terminal job (`Pending` / `InProgress` / `Stuck`):
+//! 1. For each non-terminal turn (`Pending` / `InProgress` / `Stuck`):
 //!    1. For each step under it, walk its spans:
 //!       - Pending span → close as `Cancelled { SystemCrash }` with
 //!         `ended_at = max(span.events.last().at, span.started_at)`.
 //!       - Terminal span → contribute its `ended_at` to the floor.
 //!    2. If the step is pending, close it with
 //!       `ended_at = max(child_spans.ended_at, step.started_at)`.
-//!    3. Contribute the step's `ended_at` to the job-level floor.
-//! 2. Cancel the job with
-//!    `ended_at = max(child_steps.ended_at, job.started_at_or_created_at)`
+//!    3. Contribute the step's `ended_at` to the turn-level floor.
+//! 2. Cancel the turn with
+//!    `ended_at = max(child_steps.ended_at, turn.started_at_or_created_at)`
 //!    and `reason = SystemCrash`.
-//! 3. Sweep unfinished trace rows under terminal jobs. Detached work
+//! 3. Sweep unfinished trace rows under terminal turns. Detached work
 //!    (title generation, progress observers) can
-//!    outlive the turn job that owns its step; if the process exits mid-pass,
-//!    the job is already terminal, so recovery closes only the trace subtree
-//!    and leaves the job status untouched.
+//!    outlive the turn turn that owns its step; if the process exits mid-pass,
+//!    the turn is already terminal, so recovery closes only the trace subtree
+//!    and leaves the turn status untouched.
 //!
 //! All timestamps come from observed activity — never `Utc::now()`.
 //! The process may have crashed hours before the next boot; stamping
@@ -34,20 +34,20 @@
 //!
 //! [`recover_panicked_actor_session`] handles the same shape while the
 //! process is still alive. In that case the actor task's `JoinError`
-//! gives us a real crash instant, so pending spans, steps, and jobs are
+//! gives us a real crash instant, so pending spans, steps, and turns are
 //! closed at that crash time instead of pretending the last trace event
 //! was the end of execution.
 //!
-//! The sweep is best-effort: per-job errors are logged at `warn` and
+//! The sweep is best-effort: per-turn errors are logged at `warn` and
 //! the loop continues. A `RecoverySummary` is returned so the caller
 //! can log totals.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use baybo_job::{CancelReason, JobLifecycle};
-use baybo_model::{JobId, SessionId};
+use baybo_model::{SessionId, TurnId};
 use baybo_trace::{LifecycleOutcome, LifecycleState, Span, Step, TraceError, TraceStore};
+use baybo_turn::{CancelReason, TurnLifecycle};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
@@ -72,46 +72,46 @@ impl RecoveryClock {
     }
 }
 
-/// Counters returned by [`recover_orphaned_traces_and_jobs`].
+/// Counters returned by [`recover_orphaned_traces_and_turns`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RecoverySummary {
-    pub jobs_inspected: usize,
-    pub jobs_cancelled: usize,
+    pub turns_inspected: usize,
+    pub turns_cancelled: usize,
     pub steps_closed: usize,
     pub spans_closed: usize,
 }
 
-/// Sweep orphan trace rows and non-terminal jobs left behind by an
-/// unclean shutdown. Best-effort: per-job errors are warn-logged; the
-/// sweep continues with the next job.
+/// Sweep orphan trace rows and non-terminal turns left behind by an
+/// unclean shutdown. Best-effort: per-turn errors are warn-logged; the
+/// sweep continues with the next turn.
 ///
 /// Idempotent: a second call is a no-op once the first has reached every
-/// non-terminal job and every unfinished detached trace row (steps and spans
-/// are already terminal; the recoverable-job and unfinished-step listings come
+/// non-terminal turn and every unfinished detached trace row (steps and spans
+/// are already terminal; the recoverable-turn and unfinished-step listings come
 /// back empty).
-pub async fn recover_orphaned_traces_and_jobs(
+pub async fn recover_orphaned_traces_and_turns(
     trace_store: Arc<dyn TraceStore>,
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
 ) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
 
-    let jobs = match job_lifecycle.list_recoverable().await {
+    let turns = match turn_lifecycle.list_recoverable().await {
         Ok(js) => js,
         Err(e) => {
-            warn!(error = %e, "recovery sweep: failed to list recoverable jobs");
+            warn!(error = %e, "recovery sweep: failed to list recoverable turns");
             return summary;
         }
     };
 
-    let mut recoverable_job_ids = HashSet::new();
-    for job in jobs {
-        recoverable_job_ids.insert(job.id);
-        summary.jobs_inspected += 1;
-        let job_started = job.started_at.unwrap_or(job.created_at);
-        match close_job_subtree(
+    let mut recoverable_turn_ids = HashSet::new();
+    for turn in turns {
+        recoverable_turn_ids.insert(turn.id);
+        summary.turns_inspected += 1;
+        let turn_started = turn.started_at.unwrap_or(turn.created_at);
+        match close_turn_subtree(
             &trace_store,
-            &job.id,
-            job_started,
+            &turn.id,
+            turn_started,
             RecoveryClock::ObservedActivity,
         )
         .await
@@ -119,70 +119,73 @@ pub async fn recover_orphaned_traces_and_jobs(
             Ok((closed_steps, closed_spans, end_floor)) => {
                 summary.steps_closed += closed_steps;
                 summary.spans_closed += closed_spans;
-                if !job.is_terminal() {
-                    if let Err(e) = job_lifecycle
-                        .cancel_at(&job.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
+                if !turn.is_terminal() {
+                    if let Err(e) = turn_lifecycle
+                        .cancel_at(&turn.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
                         .await
                     {
                         warn!(
-                            job_id = %job.id,
+                            turn_id = %turn.id,
                             error = %e,
-                            "recovery sweep: cancel_at failed; job left non-terminal"
+                            "recovery sweep: cancel_at failed; turn left non-terminal"
                         );
                     } else {
-                        summary.jobs_cancelled += 1;
+                        summary.turns_cancelled += 1;
                     }
                 }
             }
             Err(e) => {
                 warn!(
-                    job_id = %job.id,
+                    turn_id = %turn.id,
                     error = %e,
-                    "recovery sweep: failed to close trace subtree; job left non-terminal"
+                    "recovery sweep: failed to close trace subtree; turn left non-terminal"
                 );
             }
         }
     }
 
     let detached_summary =
-        recover_detached_trace_rows(&trace_store, &job_lifecycle, &recoverable_job_ids).await;
-    summary.jobs_inspected += detached_summary.jobs_inspected;
+        recover_detached_trace_rows(&trace_store, &turn_lifecycle, &recoverable_turn_ids).await;
+    summary.turns_inspected += detached_summary.turns_inspected;
     summary.steps_closed += detached_summary.steps_closed;
     summary.spans_closed += detached_summary.spans_closed;
 
-    if summary.jobs_inspected > 0 {
+    if summary.turns_inspected > 0 {
         info!(
-            jobs_inspected = summary.jobs_inspected,
-            jobs_cancelled = summary.jobs_cancelled,
+            turns_inspected = summary.turns_inspected,
+            turns_cancelled = summary.turns_cancelled,
             steps_closed = summary.steps_closed,
             spans_closed = summary.spans_closed,
             "recovery sweep: closed orphan trace rows from prior process"
         );
     } else {
-        debug!("recovery sweep: no orphan jobs or detached trace rows found");
+        debug!("recovery sweep: no orphan turns or detached trace rows found");
     }
 
     summary
 }
 
-/// Recover active turn jobs for one actor that panicked while the
+/// Recover active turn turns for one actor that panicked while the
 /// process stayed alive. This is the in-process counterpart to
-/// [`recover_orphaned_traces_and_jobs`]: it only scans the panicked
-/// session's active turn-kind jobs, closes their half-open trace rows at
-/// `crash_at`, then cancels the jobs with `SystemCrash`.
+/// [`recover_orphaned_traces_and_turns`]: it only scans the panicked
+/// session's active turn-kind turns, closes their half-open trace rows at
+/// `crash_at`, then cancels the turns with `SystemCrash`.
 ///
-/// `JobLifecycle::cancel_at` publishes the terminal lifecycle event, so
+/// `TurnLifecycle::cancel_at` publishes the terminal lifecycle event, so
 /// the TurnState projector remains the only producer of the web chat's
 /// inactive edge.
 pub async fn recover_panicked_actor_session(
     trace_store: Arc<dyn TraceStore>,
-    job_lifecycle: Arc<JobLifecycle>,
+    turn_lifecycle: Arc<TurnLifecycle>,
     session_id: &SessionId,
     crash_at: DateTime<Utc>,
 ) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
 
-    let jobs = match job_lifecycle.list_active_turns_by_session(session_id).await {
+    let turns = match turn_lifecycle
+        .list_active_chat_turns_by_session(session_id)
+        .await
+    {
         Ok(js) => js,
         Err(e) => {
             warn!(%session_id, error = %e, "actor crash recovery: failed to list active turns");
@@ -190,18 +193,18 @@ pub async fn recover_panicked_actor_session(
         }
     };
 
-    if jobs.is_empty() {
-        debug!(%session_id, "actor crash recovery: no active turn jobs found");
+    if turns.is_empty() {
+        debug!(%session_id, "actor crash recovery: no active turn turns found");
         return summary;
     }
 
-    for job in jobs {
-        summary.jobs_inspected += 1;
-        let job_started = job.started_at.unwrap_or(job.created_at);
-        match close_job_subtree(
+    for turn in turns {
+        summary.turns_inspected += 1;
+        let turn_started = turn.started_at.unwrap_or(turn.created_at);
+        match close_turn_subtree(
             &trace_store,
-            &job.id,
-            job_started,
+            &turn.id,
+            turn_started,
             RecoveryClock::CrashAt(crash_at),
         )
         .await
@@ -209,36 +212,36 @@ pub async fn recover_panicked_actor_session(
             Ok((closed_steps, closed_spans, end_floor)) => {
                 summary.steps_closed += closed_steps;
                 summary.spans_closed += closed_spans;
-                if let Err(e) = job_lifecycle
-                    .cancel_at(&job.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
+                if let Err(e) = turn_lifecycle
+                    .cancel_at(&turn.id, RECOVERY_CANCEL_REASON, Vec::new(), end_floor)
                     .await
                 {
                     warn!(
                         %session_id,
-                        job_id = %job.id,
+                        turn_id = %turn.id,
                         error = %e,
-                        "actor crash recovery: cancel_at failed; job left non-terminal"
+                        "actor crash recovery: cancel_at failed; turn left non-terminal"
                     );
                 } else {
-                    summary.jobs_cancelled += 1;
+                    summary.turns_cancelled += 1;
                 }
             }
             Err(e) => {
                 warn!(
                     %session_id,
-                    job_id = %job.id,
+                    turn_id = %turn.id,
                     error = %e,
-                    "actor crash recovery: failed to close trace subtree; job left non-terminal"
+                    "actor crash recovery: failed to close trace subtree; turn left non-terminal"
                 );
             }
         }
     }
 
-    if summary.jobs_inspected > 0 {
+    if summary.turns_inspected > 0 {
         info!(
             %session_id,
-            jobs_inspected = summary.jobs_inspected,
-            jobs_cancelled = summary.jobs_cancelled,
+            turns_inspected = summary.turns_inspected,
+            turns_cancelled = summary.turns_cancelled,
             steps_closed = summary.steps_closed,
             spans_closed = summary.spans_closed,
             "actor crash recovery: closed orphan trace rows"
@@ -250,8 +253,8 @@ pub async fn recover_panicked_actor_session(
 
 async fn recover_detached_trace_rows(
     trace_store: &Arc<dyn TraceStore>,
-    job_lifecycle: &Arc<JobLifecycle>,
-    recoverable_job_ids: &HashSet<JobId>,
+    turn_lifecycle: &Arc<TurnLifecycle>,
+    recoverable_turn_ids: &HashSet<TurnId>,
 ) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
     let rows = match trace_store.list_unfinished_steps().await {
@@ -262,59 +265,59 @@ async fn recover_detached_trace_rows(
         }
     };
 
-    let mut job_ids = HashSet::new();
+    let mut turn_ids = HashSet::new();
     for row in rows {
         match Step::from_row(row) {
-            Ok(step) if !recoverable_job_ids.contains(&step.job_id) => {
-                job_ids.insert(step.job_id);
+            Ok(step) if !recoverable_turn_ids.contains(&step.turn_id) => {
+                turn_ids.insert(step.turn_id);
             }
             Ok(_) => {}
             Err(e) => warn!(error = %e, "recovery sweep: failed to decode unfinished step row"),
         }
     }
 
-    for job_id in job_ids {
-        let job = match job_lifecycle.get(&job_id).await {
-            Ok(Some(job)) => job,
+    for turn_id in turn_ids {
+        let turn = match turn_lifecycle.get(&turn_id).await {
+            Ok(Some(turn)) => turn,
             Ok(None) => {
-                warn!(%job_id, "recovery sweep: unfinished trace row references missing job");
+                warn!(%turn_id, "recovery sweep: unfinished trace row references missing turn");
                 continue;
             }
             Err(e) => {
-                warn!(%job_id, error = %e, "recovery sweep: failed to load job for unfinished trace row");
+                warn!(%turn_id, error = %e, "recovery sweep: failed to load turn for unfinished trace row");
                 continue;
             }
         };
 
-        if !job.is_terminal() {
+        if !turn.is_terminal() {
             warn!(
-                %job_id,
-                status = %job.status.kind(),
-                "recovery sweep: unfinished trace row belongs to non-terminal job missed by recoverable listing"
+                %turn_id,
+                status = %turn.status.kind(),
+                "recovery sweep: unfinished trace row belongs to non-terminal turn missed by recoverable listing"
             );
             continue;
         }
 
-        let job_started = job.started_at.unwrap_or(job.created_at);
-        match close_job_subtree(
+        let turn_started = turn.started_at.unwrap_or(turn.created_at);
+        match close_turn_subtree(
             trace_store,
-            &job.id,
-            job_started,
+            &turn.id,
+            turn_started,
             RecoveryClock::ObservedActivity,
         )
         .await
         {
             Ok((closed_steps, closed_spans, _)) => {
                 if closed_steps > 0 || closed_spans > 0 {
-                    summary.jobs_inspected += 1;
+                    summary.turns_inspected += 1;
                     summary.steps_closed += closed_steps;
                     summary.spans_closed += closed_spans;
                 }
             }
             Err(e) => warn!(
-                job_id = %job.id,
+                turn_id = %turn.id,
                 error = %e,
-                "recovery sweep: failed to close detached trace rows under terminal job"
+                "recovery sweep: failed to close detached trace rows under terminal turn"
             ),
         }
     }
@@ -322,32 +325,32 @@ async fn recover_detached_trace_rows(
     summary
 }
 
-/// Close every pending step / span under `job_id`, returning
+/// Close every pending step / span under `turn_id`, returning
 /// `(steps_closed, spans_closed, end_floor)`. `end_floor` is
-/// `max(child_steps.ended_at, job_started)` — the timestamp to stamp on
-/// the job's eventual `Cancelled` transition.
-async fn close_job_subtree(
+/// `max(child_steps.ended_at, turn_started)` — the timestamp to stamp on
+/// the turn's eventual `Cancelled` transition.
+async fn close_turn_subtree(
     trace_store: &Arc<dyn TraceStore>,
-    job_id: &JobId,
-    job_started: DateTime<Utc>,
+    turn_id: &TurnId,
+    turn_started: DateTime<Utc>,
     clock: RecoveryClock,
 ) -> Result<(usize, usize, DateTime<Utc>), TraceError> {
     let mut steps_closed = 0usize;
     let mut spans_closed = 0usize;
-    let mut job_end_floor = clock.close_time(job_started);
+    let mut turn_end_floor = clock.close_time(turn_started);
 
     // Skip rather than propagate: an undecodable row can't be closed anyway,
-    // and failing here leaves the whole job non-terminal — so the next boot
+    // and failing here leaves the whole turn non-terminal — so the next boot
     // finds the same open subtree, fails on the same row, and never converges.
     let steps: Vec<Step> = trace_store
-        .list_steps_by_job(job_id)
+        .list_steps_by_turn(turn_id)
         .await?
         .into_iter()
         .filter_map(|row| {
             let step_id = row.id;
             Step::from_row(row)
                 .map_err(|e| {
-                    warn!(%job_id, %step_id, error = %e, "recovery: skipping undecodable step row");
+                    warn!(%turn_id, %step_id, error = %e, "recovery: skipping undecodable step row");
                 })
                 .ok()
         })
@@ -384,12 +387,12 @@ async fn close_job_subtree(
             }
         };
 
-        if step_ended_at > job_end_floor {
-            job_end_floor = step_ended_at;
+        if step_ended_at > turn_end_floor {
+            turn_end_floor = step_ended_at;
         }
     }
 
-    Ok((steps_closed, spans_closed, job_end_floor))
+    Ok((steps_closed, spans_closed, turn_end_floor))
 }
 
 /// Close every pending span under `step`, returning
@@ -469,8 +472,6 @@ async fn pick_span_close_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_job::test_support::MemoryJobStore;
-    use baybo_job::{Job, JobInput, JobStatus, JobStore};
     use baybo_model::{
         ApprovalDecision, ContentBlock, ParallelGroup, ResourceAccess, SessionId, SpanId, StepId,
         TriggerKind,
@@ -480,12 +481,14 @@ mod tests {
     use baybo_trace::{
         LlmCallBegin, LlmCallInputs, SpanEvent, SpanEventKind, SpanKind, StepKind, ToolCallBegin,
     };
+    use baybo_turn::test_support::MemoryTurnStore;
+    use baybo_turn::{Turn, TurnInput, TurnStatus, TurnStore};
     use chrono::Duration;
 
-    fn pending_step(job_id: JobId, started_at: DateTime<Utc>) -> Step {
+    fn pending_step(turn_id: TurnId, started_at: DateTime<Utc>) -> Step {
         Step {
             id: StepId::new(),
-            job_id,
+            turn_id,
             kind: StepKind::LlmIteration,
             started_at,
             ended_at: None,
@@ -537,32 +540,32 @@ mod tests {
         }
     }
 
-    async fn build_lifecycle_with_in_progress_job(
+    async fn build_lifecycle_with_in_progress_turn(
         started: DateTime<Utc>,
-    ) -> (Arc<JobLifecycle>, Job) {
-        let store = Arc::new(MemoryJobStore::new());
-        let mut job = Job::new(
+    ) -> (Arc<TurnLifecycle>, Turn) {
+        let store = Arc::new(MemoryTurnStore::new());
+        let mut turn = Turn::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobInput::UserChat {
+            TurnInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
             None,
         );
-        job.status = JobStatus::InProgress;
-        job.started_at = Some(started);
-        store.create(&job.to_row().unwrap()).await.unwrap();
-        let lifecycle = Arc::new(JobLifecycle::new(store));
-        (lifecycle, job)
+        turn.status = TurnStatus::InProgress;
+        turn.started_at = Some(started);
+        store.create(&turn.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(TurnLifecycle::new(store));
+        (lifecycle, turn)
     }
 
     #[tokio::test]
     async fn step_closed_uses_max_of_child_span_ended_at() {
         let t0 = Utc::now() - Duration::seconds(60);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let step = pending_step(job.id, t0 + Duration::seconds(1));
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let llm_end = t0 + Duration::seconds(20);
@@ -586,11 +589,11 @@ mod tests {
         trace.save_span(&llm.to_row().unwrap()).await.unwrap();
         trace.save_span(&tool.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
+        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
 
         assert_eq!(summary.steps_closed, 1);
         assert_eq!(summary.spans_closed, 0);
-        assert_eq!(summary.jobs_cancelled, 1);
+        assert_eq!(summary.turns_cancelled, 1);
 
         let reloaded = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(reloaded.ended_at, Some(tool_end));
@@ -599,38 +602,38 @@ mod tests {
             LifecycleState::Done(LifecycleOutcome::Cancelled { .. })
         ));
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert_eq!(job_after.ended_at, Some(tool_end));
-        assert!(matches!(job_after.status, JobStatus::Cancelled { .. }));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert_eq!(turn_after.ended_at, Some(tool_end));
+        assert!(matches!(turn_after.status, TurnStatus::Cancelled { .. }));
     }
 
     #[tokio::test]
     async fn zero_span_step_falls_back_to_started_at() {
         let t0 = Utc::now() - Duration::seconds(30);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step_started = t0 + Duration::seconds(5);
-        let step = pending_step(job.id, step_started);
+        let step = pending_step(turn.id, step_started);
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
+        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
         assert_eq!(summary.steps_closed, 1);
 
         let reloaded = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(reloaded.ended_at, Some(step_started));
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert_eq!(job_after.ended_at, Some(step_started));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert_eq!(turn_after.ended_at, Some(step_started));
     }
 
     #[tokio::test]
     async fn pending_span_uses_max_event_at_then_started_at() {
         let t0 = Utc::now() - Duration::seconds(60);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let step = pending_step(job.id, t0 + Duration::seconds(1));
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let span_started = t0 + Duration::seconds(2);
@@ -663,7 +666,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
+        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
         assert_eq!(summary.spans_closed, 1);
 
         let reloaded =
@@ -677,10 +680,10 @@ mod tests {
     async fn panicked_actor_recovery_closes_pending_rows_at_crash_time() {
         let t0 = Utc::now() - Duration::seconds(60);
         let crash_at = t0 + Duration::seconds(30);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let step = pending_step(job.id, t0 + Duration::seconds(1));
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
         let span = make_span(
             step.id,
@@ -694,13 +697,13 @@ mod tests {
         let summary = recover_panicked_actor_session(
             trace.clone(),
             lifecycle.clone(),
-            &job.session_id,
+            &turn.session_id,
             crash_at,
         )
         .await;
 
-        assert_eq!(summary.jobs_inspected, 1);
-        assert_eq!(summary.jobs_cancelled, 1);
+        assert_eq!(summary.turns_inspected, 1);
+        assert_eq!(summary.turns_cancelled, 1);
         assert_eq!(summary.steps_closed, 1);
         assert_eq!(summary.spans_closed, 1);
 
@@ -716,11 +719,11 @@ mod tests {
         let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(step_after.ended_at, Some(crash_at));
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert_eq!(job_after.ended_at, Some(crash_at));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert_eq!(turn_after.ended_at, Some(crash_at));
         assert!(matches!(
-            job_after.status,
-            JobStatus::Cancelled {
+            turn_after.status,
+            TurnStatus::Cancelled {
                 reason: CancelReason::SystemCrash,
                 ..
             }
@@ -730,10 +733,10 @@ mod tests {
     #[tokio::test]
     async fn parallel_spans_take_max_not_last() {
         let t0 = Utc::now() - Duration::seconds(120);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let step = pending_step(job.id, t0 + Duration::seconds(1));
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let pg = ParallelGroup::new();
@@ -759,7 +762,7 @@ mod tests {
         trace.save_span(&a.to_row().unwrap()).await.unwrap();
         trace.save_span(&b.to_row().unwrap()).await.unwrap();
 
-        let _ = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
+        let _ = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
 
         let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(step_after.ended_at, Some(late_end));
@@ -768,99 +771,99 @@ mod tests {
     #[tokio::test]
     async fn rerun_is_idempotent_on_already_terminal_rows() {
         let t0 = Utc::now() - Duration::seconds(60);
-        let (lifecycle, job) = build_lifecycle_with_in_progress_job(t0).await;
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_turn(t0).await;
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let step = pending_step(job.id, t0 + Duration::seconds(1));
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
         trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
-        let first = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
-        assert_eq!(first.jobs_cancelled, 1);
+        let first = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        assert_eq!(first.turns_cancelled, 1);
         assert_eq!(first.steps_closed, 1);
 
-        let second = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
-        assert_eq!(second.jobs_inspected, 0);
-        assert_eq!(second.jobs_cancelled, 0);
+        let second = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        assert_eq!(second.turns_inspected, 0);
+        assert_eq!(second.turns_cancelled, 0);
         assert_eq!(second.steps_closed, 0);
         assert_eq!(second.spans_closed, 0);
     }
 
     #[tokio::test]
-    async fn pending_job_with_no_steps_is_cancelled_at_created_at() {
+    async fn pending_turn_with_no_steps_is_cancelled_at_created_at() {
         let t0 = Utc::now() - Duration::seconds(45);
-        let store = Arc::new(MemoryJobStore::new());
-        let mut job = Job::new(
+        let store = Arc::new(MemoryTurnStore::new());
+        let mut turn = Turn::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobInput::UserChat {
+            TurnInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
             None,
         );
-        job.created_at = t0;
-        store.create(&job.to_row().unwrap()).await.unwrap();
-        let lifecycle = Arc::new(JobLifecycle::new(store));
+        turn.created_at = t0;
+        store.create(&turn.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(TurnLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let summary = recover_orphaned_traces_and_jobs(trace, lifecycle.clone()).await;
-        assert_eq!(summary.jobs_cancelled, 1);
+        let summary = recover_orphaned_traces_and_turns(trace, lifecycle.clone()).await;
+        assert_eq!(summary.turns_cancelled, 1);
         assert_eq!(summary.steps_closed, 0);
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert_eq!(job_after.ended_at, Some(t0));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert_eq!(turn_after.ended_at, Some(t0));
     }
 
     #[tokio::test]
-    async fn does_not_touch_terminal_jobs() {
+    async fn does_not_touch_terminal_turns() {
         let t0 = Utc::now() - Duration::seconds(30);
-        let store = Arc::new(MemoryJobStore::new());
-        let mut job = Job::new(
+        let store = Arc::new(MemoryTurnStore::new());
+        let mut turn = Turn::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobInput::UserChat {
+            TurnInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
             None,
         );
-        job.status = JobStatus::Completed;
-        job.started_at = Some(t0);
-        job.ended_at = Some(t0 + Duration::seconds(10));
-        store.create(&job.to_row().unwrap()).await.unwrap();
-        let lifecycle = Arc::new(JobLifecycle::new(store));
+        turn.status = TurnStatus::Completed;
+        turn.started_at = Some(t0);
+        turn.ended_at = Some(t0 + Duration::seconds(10));
+        store.create(&turn.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(TurnLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
-        let summary = recover_orphaned_traces_and_jobs(trace, lifecycle.clone()).await;
-        assert_eq!(summary.jobs_inspected, 0);
-        assert_eq!(summary.jobs_cancelled, 0);
+        let summary = recover_orphaned_traces_and_turns(trace, lifecycle.clone()).await;
+        assert_eq!(summary.turns_inspected, 0);
+        assert_eq!(summary.turns_cancelled, 0);
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert!(matches!(job_after.status, JobStatus::Completed));
-        assert_eq!(job_after.ended_at, Some(t0 + Duration::seconds(10)));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert!(matches!(turn_after.status, TurnStatus::Completed));
+        assert_eq!(turn_after.ended_at, Some(t0 + Duration::seconds(10)));
     }
 
     #[tokio::test]
-    async fn closes_detached_trace_rows_under_terminal_job_without_reopening_job() {
+    async fn closes_detached_trace_rows_under_terminal_turn_without_reopening_turn() {
         let t0 = Utc::now() - Duration::seconds(90);
-        let store = Arc::new(MemoryJobStore::new());
-        let mut job = Job::new(
+        let store = Arc::new(MemoryTurnStore::new());
+        let mut turn = Turn::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobInput::UserChat {
+            TurnInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
             None,
         );
-        job.status = JobStatus::Completed;
-        job.started_at = Some(t0);
-        let job_ended = t0 + Duration::seconds(10);
-        job.ended_at = Some(job_ended);
-        store.create(&job.to_row().unwrap()).await.unwrap();
-        let lifecycle = Arc::new(JobLifecycle::new(store));
+        turn.status = TurnStatus::Completed;
+        turn.started_at = Some(t0);
+        let turn_ended = t0 + Duration::seconds(10);
+        turn.ended_at = Some(turn_ended);
+        store.create(&turn.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(TurnLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step = Step {
             id: StepId::new(),
-            job_id: job.id,
+            turn_id: turn.id,
             kind: StepKind::compression(
                 CompressionTrigger::Threshold,
                 CompressionApplied::LiveSummary,
@@ -879,9 +882,9 @@ mod tests {
         );
         trace.save_span(&span.to_row().unwrap()).await.unwrap();
 
-        let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
-        assert_eq!(summary.jobs_inspected, 1);
-        assert_eq!(summary.jobs_cancelled, 0);
+        let summary = recover_orphaned_traces_and_turns(trace.clone(), lifecycle.clone()).await;
+        assert_eq!(summary.turns_inspected, 1);
+        assert_eq!(summary.turns_cancelled, 0);
         assert_eq!(summary.steps_closed, 1);
         assert_eq!(summary.spans_closed, 1);
 
@@ -896,8 +899,8 @@ mod tests {
         let span_after = Span::from_row(trace.load_span(&span.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(span_after.ended_at, Some(span.started_at));
 
-        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
-        assert!(matches!(job_after.status, JobStatus::Completed));
-        assert_eq!(job_after.ended_at, Some(job_ended));
+        let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
+        assert!(matches!(turn_after.status, TurnStatus::Completed));
+        assert_eq!(turn_after.ended_at, Some(turn_ended));
     }
 }

@@ -1,13 +1,13 @@
 /**
  * Shape of the `/api/benches/:bench/trace` response. The backend reshapes
- * the on-disk `trace.json` (`{session, jobs:[{job, steps}]}`) + the
+ * the on-disk `trace.json` (`{session, turns:[{turn, steps}]}`) + the
  * `messages.json` (`{messages}`) into this — the `steps` are exactly the
  * viewer's `ReplayStep`, so they render unchanged.
  */
 import type { ReplayStep, SessionMessageRow } from '../types/trace';
 
-/** Loosely-typed job header from `trace.json`'s `jobs[i].job`. */
-export interface BenchJobMeta {
+/** Loosely-typed turn header from `trace.json`'s `turns[i].turn`. */
+export interface BenchTurnMeta {
   id: string;
   session_id?: string;
   status?: unknown;
@@ -18,13 +18,13 @@ export interface BenchJobMeta {
   final_result?: unknown;
 }
 
-export interface BenchJob {
-  job: BenchJobMeta;
+export interface BenchTurn {
+  turn: BenchTurnMeta;
   steps: ReplayStep[];
 }
 
 export interface BenchTrace {
   session_id: string | null;
   session_messages: SessionMessageRow[];
-  jobs: BenchJob[];
+  turns: BenchTurn[];
 }
