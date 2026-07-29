@@ -151,8 +151,7 @@ function buildFlowSteps(trace: BenchTrace): FlowStep[] {
           }
         }
       } else {
-        const label =
-          step.kind.kind === 'subagent' ? `subagent → ${step.kind.child_session_id}` : step.kind.kind;
+        const label = step.kind.kind;
         raw.push({
           t: step.started_at,
           role: 'aux',

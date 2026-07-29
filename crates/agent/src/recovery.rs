@@ -24,7 +24,7 @@
 //!    and `reason = SystemCrash`.
 //! 3. Sweep unfinished trace rows under terminal turns. Detached work
 //!    (title generation, progress observers) can
-//!    outlive the turn turn that owns its step; if the process exits mid-pass,
+//!    outlive the turn that owns its step; if the process exits mid-pass,
 //!    the turn is already terminal, so recovery closes only the trace subtree
 //!    and leaves the turn status untouched.
 //!
@@ -165,11 +165,23 @@ pub async fn recover_orphaned_traces_and_turns(
     summary
 }
 
-/// Recover active turn turns for one actor that panicked while the
-/// process stayed alive. This is the in-process counterpart to
-/// [`recover_orphaned_traces_and_turns`]: it only scans the panicked
-/// session's active turn-kind turns, closes their half-open trace rows at
-/// `crash_at`, then cancels the turns with `SystemCrash`.
+/// Recover active turns for one actor that panicked while the process stayed
+/// alive. This is the in-process counterpart to
+/// [`recover_orphaned_traces_and_turns`]: it scans the panicked session's
+/// non-terminal turns, closes their half-open trace rows at `crash_at`, then
+/// cancels the turns with `SystemCrash`.
+///
+/// Scans **every** non-terminal turn, not just the chat turns. The actor is
+/// gone, so a `/compact` or cron-delivery turn it owned is just as orphaned as
+/// a user turn — `is_chat_turn` answers "is a reply in flight for the user",
+/// which is a display question, not a cleanup one. Filtering here left those
+/// turns `InProgress` with a half-open trace subtree until the next process
+/// boot, where [`recover_orphaned_traces_and_turns`] finally swept them.
+///
+/// Cancelling a non-chat turn publishes a terminal lifecycle event like any
+/// other, and that is harmless: the TurnState projector recomputes from the
+/// chat-turn set (finding the session idle, which it is), and the push
+/// dispatcher only fires for `UserChat`.
 ///
 /// `TurnLifecycle::cancel_at` publishes the terminal lifecycle event, so
 /// the TurnState projector remains the only producer of the web chat's
@@ -182,10 +194,7 @@ pub async fn recover_panicked_actor_session(
 ) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
 
-    let turns = match turn_lifecycle
-        .list_active_chat_turns_by_session(session_id)
-        .await
-    {
+    let turns = match turn_lifecycle.list_active_by_session(session_id).await {
         Ok(js) => js,
         Err(e) => {
             warn!(%session_id, error = %e, "actor crash recovery: failed to list active turns");
@@ -194,7 +203,7 @@ pub async fn recover_panicked_actor_session(
     };
 
     if turns.is_empty() {
-        debug!(%session_id, "actor crash recovery: no active turn turns found");
+        debug!(%session_id, "actor crash recovery: no active turns found");
         return summary;
     }
 
@@ -538,6 +547,23 @@ mod tests {
             outcome,
             events: Vec::new(),
         }
+    }
+
+    async fn build_lifecycle_with_in_progress_compact(
+        started: DateTime<Utc>,
+    ) -> (Arc<TurnLifecycle>, Turn) {
+        let store = Arc::new(MemoryTurnStore::new());
+        let mut turn = Turn::new(
+            SessionId::from("s1"),
+            TriggerKind::User,
+            TurnInput::Compact,
+            None,
+        );
+        turn.status = TurnStatus::InProgress;
+        turn.started_at = Some(started);
+        store.create(&turn.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(TurnLifecycle::new(store));
+        (lifecycle, turn)
     }
 
     async fn build_lifecycle_with_in_progress_turn(
@@ -902,5 +928,39 @@ mod tests {
         let turn_after = lifecycle.get(&turn.id).await.unwrap().unwrap();
         assert!(matches!(turn_after.status, TurnStatus::Completed));
         assert_eq!(turn_after.ended_at, Some(turn_ended));
+    }
+
+    /// A panicking actor orphans every turn it owned, not just the chat ones.
+    ///
+    /// `/compact` opens a real turn with real compression spans, and
+    /// `is_chat_turn()` excludes it — so a sweep filtered to chat turns left it
+    /// `InProgress` with a half-open trace subtree until the next process boot.
+    #[tokio::test]
+    async fn panicked_actor_recovery_also_closes_a_compact_turn() {
+        let t0 = Utc::now() - Duration::seconds(60);
+        let crash_at = t0 + Duration::seconds(30);
+        let (lifecycle, turn) = build_lifecycle_with_in_progress_compact(t0).await;
+        assert!(!turn.is_chat_turn(), "the fixture must be a non-chat turn");
+        let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+
+        let step = pending_step(turn.id, t0 + Duration::seconds(1));
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
+
+        let summary = recover_panicked_actor_session(
+            trace.clone(),
+            lifecycle.clone(),
+            &turn.session_id,
+            crash_at,
+        )
+        .await;
+
+        assert_eq!(
+            summary.turns_cancelled, 1,
+            "the compact turn must be cancelled"
+        );
+        assert_eq!(summary.steps_closed, 1, "its half-open step must be closed");
+
+        let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(step_after.ended_at, Some(crash_at));
     }
 }

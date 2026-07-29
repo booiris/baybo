@@ -371,7 +371,7 @@ impl Router {
             .take_in_flight_background_subagents(session_id);
 
         // Cancel the in-flight turn, then walk its in-flight descendants.
-        // Cancelling the turn turn trips the turn's loop cancel token first,
+        // Cancelling the turn trips the turn's loop cancel token first,
         // which cascades into any foreground subagents (their tokens descend
         // from it) and aborts the turn's own await immediately — so the
         // descendant walk is a best-effort `UserStopped` audit stamp + backstop,

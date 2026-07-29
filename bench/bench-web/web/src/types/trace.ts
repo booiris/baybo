@@ -39,12 +39,22 @@ export function isTerminal(state: LifecycleState): boolean {
 
 export type StepKind =
   | { kind: 'llm_iteration' }
-  | { kind: 'compression' }
+  | {
+      kind: 'compression';
+      trigger?: CompressionTrigger | null;
+      applied?: CompressionApplied | null;
+    }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }
   | { kind: 'skill_selection' }
   | { kind: 'progress_observer' }
-  | { kind: 'subagent'; child_session_id: string };
+  | { kind: 'title_generation' };
+
+/** Why a compaction ran (`baybo_trace::CompressionTrigger`). */
+export type CompressionTrigger = 'threshold' | 'forced';
+
+/** How a compaction shrank the context (`baybo_trace::CompressionApplied`). */
+export type CompressionApplied = 'live_summary' | 'truncate';
 
 export type StepKindTag = StepKind['kind'];
 
@@ -154,8 +164,8 @@ export interface ToolCallResult {
 
 export type SpanKind =
   | { kind: 'llm_call'; begin: LlmCallBegin; result?: LlmCallResult | null }
-  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null }
-  | { kind: 'subagent_stub'; child_session_id: string };
+  | { kind: 'tool_call'; begin: ToolCallBegin; result?: ToolCallResult | null };
+
 
 export type SpanKindTag = SpanKind['kind'];
 

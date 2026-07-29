@@ -401,7 +401,7 @@ impl ActorSubagentSpawner {
         // Foreground dispatch under the shared wait/convert/kill policy. The
         // terminal future is the Baybo actor's terminal observer; the policy
         // (block for nested, or wait-then-convert/kill for a user parent) is
-        // backend-agnostic and lives in `run_foreground_turn`.
+        // backend-agnostic and lives in `run_foreground_job`.
         let fut = await_subagent_terminal(
             child_session_id.clone(),
             output_rx,
@@ -410,7 +410,7 @@ impl ActorSubagentSpawner {
             actor_token.clone(),
             Arc::clone(&self.turn_lifecycle),
         );
-        tokio::spawn(run_foreground_turn(
+        tokio::spawn(run_foreground_job(
             ForegroundJob {
                 user_facing,
                 on_timeout,
@@ -508,7 +508,7 @@ impl ActorSubagentSpawner {
         };
         let child_session_id = child_session.id.clone();
         let session_manager = Arc::clone(&self.session_manager);
-        let turn_ctx = ExternalJobCtx {
+        let turn_ctx = ExternalTurnCtx {
             lifecycle: Arc::clone(&self.turn_lifecycle),
             cost_manager: Arc::clone(&self.cost_manager),
             user_id: child_session.user.id.clone(),
@@ -582,7 +582,7 @@ impl ActorSubagentSpawner {
             Arc::clone(&session_manager),
             turn_ctx,
         );
-        tokio::spawn(run_foreground_turn(
+        tokio::spawn(run_foreground_job(
             ForegroundJob {
                 user_facing,
                 on_timeout: request.on_timeout,
@@ -782,7 +782,7 @@ async fn escort_background_terminal(
     release_reserved_slot(limiter.as_ref(), fan_out_root);
 }
 
-/// Everything [`run_foreground_turn`] needs that isn't the terminal future.
+/// Everything [`run_foreground_job`] needs that isn't the terminal future.
 struct ForegroundJob {
     /// Whether the parent can host the background-conversion notification
     /// turn ([`Session::supports_background_jobs`]). A non-user parent blocks
@@ -799,7 +799,7 @@ struct ForegroundJob {
     /// The parent turn's cancel scope. A convertible child is anchored to the
     /// process-wide token (so it survives the dispatching turn once it
     /// converts), so the parent's `/stop` does NOT cascade to it during the
-    /// foreground window. `run_foreground_turn` watches this to cancel a
+    /// foreground window. `run_foreground_job` watches this to cancel a
     /// still-foreground child when the parent turn is stopped, so a stopped
     /// turn can't leave a subagent running on to convert and notify.
     parent_cancel: CancellationToken,
@@ -818,7 +818,7 @@ struct ForegroundJob {
 /// terminal as a notification turn) or force-cancels it, per `on_timeout`. The
 /// future is pinned and resumed across the `select!` boundary so it is never
 /// polled to completion twice.
-async fn run_foreground_turn(
+async fn run_foreground_job(
     turn: ForegroundJob,
     fut: impl std::future::Future<Output = SubagentResult>,
     supervisor: AgentSupervisor,
@@ -1045,7 +1045,7 @@ fn validate_resume_session(
 /// session needs its own `Spawned` turn for the trace browser to
 /// surface it — `list_session_summaries` drops zero-turn sessions and
 /// `get_trace` 404s on them.
-struct ExternalJobCtx {
+struct ExternalTurnCtx {
     lifecycle: Arc<TurnLifecycle>,
     cost_manager: Arc<CostManager>,
     user_id: String,
@@ -1072,7 +1072,7 @@ async fn run_external_agent_turn(
     request: ExternalAgentRequest,
     child_session_id: SessionId,
     session_manager: Arc<baybo_session::SessionManager>,
-    turn_ctx: ExternalJobCtx,
+    turn_ctx: ExternalTurnCtx,
 ) -> SubagentResult {
     let cancel = request.cancel.clone();
     let initial_prompt = vec![ContentBlock::Text(request.task.clone())];
@@ -1706,7 +1706,7 @@ mod resume_validation_tests {
 
 #[cfg(test)]
 mod foreground_turn_tests {
-    //! Backend-agnostic foreground-wait policy ([`run_foreground_turn`]), shared
+    //! Backend-agnostic foreground-wait policy ([`run_foreground_job`]), shared
     //! by the Baybo and External backends. The terminal future is faked here;
     //! the convert/escort plumbing it calls is exercised end-to-end by the
     //! integration suite.
@@ -1757,7 +1757,7 @@ mod foreground_turn_tests {
         j: ForegroundJob,
         fut: impl std::future::Future<Output = SubagentResult> + Send + 'static,
     ) {
-        tokio::spawn(run_foreground_turn(
+        tokio::spawn(run_foreground_job(
             j,
             fut,
             test_supervisor(),

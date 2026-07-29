@@ -11,6 +11,12 @@
 #   sidecars/tool/browser/src/generated/   ← `baybo-tools::mcp` (MCP `_meta.baybo.*`)
 #   bench/bench-web/web/src/generated/ ← `baybo-bench-web` (bench spine model)
 #
+# NOT covered here: app/web/src/api/schema.d.ts, which openapi-typescript
+# generates from docs/openapi.json rather than from ts-rs. It needs pnpm, which
+# this job does not install, so its drift check lives in the `frontend` CI job
+# right after the build that regenerates it. Locally:
+#   pnpm --filter baybo-web gen:api && git diff --exit-code -- app/web/src/api/schema.d.ts
+#
 # Usage: scripts/check-ts-bindings.sh
 set -euo pipefail
 

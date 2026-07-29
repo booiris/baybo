@@ -148,7 +148,7 @@ pub enum CostScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayedConversation {
     pub session_id: SessionId,
-    pub turns: Vec<ReplayJob>,
+    pub turns: Vec<ReplayTurn>,
 }
 
 /// Coarse "what started this session" label derived from
@@ -293,7 +293,7 @@ pub struct AnalyticsReasonBucket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplayJob {
+pub struct ReplayTurn {
     pub turn: Turn,
     pub steps: Vec<ReplayStep>,
 }
@@ -1018,7 +1018,7 @@ impl QueryApi {
             {
                 step_blocks.truncate(pos + 1);
             }
-            turns.push(ReplayJob {
+            turns.push(ReplayTurn {
                 turn,
                 steps: step_blocks,
             });
@@ -1167,7 +1167,7 @@ impl QueryApi {
     async fn hydrate_persisted_trace_data(
         &self,
         log_session_id: &SessionId,
-        turns: &mut [ReplayJob],
+        turns: &mut [ReplayTurn],
     ) -> Result<()> {
         use baybo_trace::{LlmCallInputs, SpanKind, ToolCallOutput};
 

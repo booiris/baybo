@@ -584,7 +584,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
             None,
         )
         .await
-        .expect("start turn turn");
+        .expect("start turn");
     tg.deps
         .turn_lifecycle
         .start(&turn.id)

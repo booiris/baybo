@@ -6,7 +6,7 @@
  */
 import type { SessionMessageRow, TraceOverview, TurnTrace } from '../../types/trace';
 import { formatDuration, formatTok, summaryTokens, turnDurationMs, turnInputText } from './traceFormat';
-import { turnRollup } from './traceTreeModel';
+import { turnLabels, turnRollup } from './traceTreeModel';
 import { scrollToAnchor } from './scrollToAnchor';
 
 export function TurnAnchors({
@@ -26,6 +26,8 @@ export function TurnAnchors({
     onSelectTurn(turnId);
     scrollToAnchor(`[data-turn-id="${turnId}"]`);
   };
+
+  const labels = turnLabels(overview.turns);
 
   if (overview.turns.length <= 1) return null;
 
@@ -47,7 +49,7 @@ export function TurnAnchors({
             key={j.turn_id}
             type="button"
             onClick={() => jump(j.turn_id)}
-            title={input ?? `Turn #${i + 1} · ${j.turn_status_kind}`}
+            title={input ?? `${labels[i].long} · ${j.turn_status_kind}`}
             className={`px-2 py-2 text-left border-b border-black/10 cursor-pointer transition-colors border-l-[3px] ${
               active
                 ? 'bg-selected text-ink border-l-black'
@@ -55,7 +57,7 @@ export function TurnAnchors({
             }`}
           >
             <div className="flex items-center gap-1.5 min-w-0">
-              <span className="font-mono text-[0.75rem] font-bold shrink-0">#{i + 1}</span>
+              <span className="font-mono text-[0.75rem] font-bold shrink-0">{labels[i].short}</span>
               <span className="font-mono text-[0.62rem] text-ink-soft truncate">{j.turn_status_kind}</span>
               {rollup.hasFailure && <span className="ml-auto shrink-0 w-1.5 h-1.5 rounded-full bg-err" />}
             </div>

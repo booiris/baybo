@@ -5,6 +5,7 @@
  * so it stays unit-testable and the `TraceTree` component reads as layout.
  */
 import type { LifecycleState, ReplayStep, Span, TraceTurnSummary, TurnStatusKind, TurnTrace } from '../../types/trace';
+import { isChatTurn } from '../../types/trace';
 
 /**
  * A node "needs attention" when its outcome is anything other than `ok` —
@@ -13,6 +14,41 @@ import type { LifecycleState, ReplayStep, Span, TraceTurnSummary, TurnStatusKind
  */
 export function attention(state: LifecycleState): boolean {
   return state.outcome !== 'ok';
+}
+
+/** How one turn row is labelled: `short` for the sidebar chip, `long` for the tree header. */
+export interface TurnLabel {
+  short: string;
+  long: string;
+}
+
+/** Labels for the two kinds the chat never showed as turns. */
+const NON_CHAT_TURN_LABEL: Record<string, TurnLabel> = {
+  compact: { short: 'cmp', long: 'Compaction' },
+  cron_notification: { short: 'dlv', long: 'Cron delivery' },
+};
+
+/**
+ * Label every turn row, in the overview's own oldest-first order.
+ *
+ * Only chat turns are numbered, and they are numbered among themselves — a
+ * `/compact` or a cron-result delivery opens a real turn row but was never a
+ * turn the transcript showed, so counting them made the sidebar say "#3" for a
+ * session the chat rendered as two turns. Non-chat rows get their kind as the
+ * label instead of a number.
+ *
+ * Returned as a whole array rather than a per-index lookup so the numbering is
+ * one pass, not one per rendered row.
+ */
+export function turnLabels(turns: TraceTurnSummary[]): TurnLabel[] {
+  let n = 0;
+  return turns.map((turn) => {
+    if (!isChatTurn(turn.turn_input_kind)) {
+      return NON_CHAT_TURN_LABEL[turn.turn_input_kind] ?? { short: '·', long: turn.turn_input_kind };
+    }
+    n++;
+    return { short: `#${n}`, long: `Turn #${n}` };
+  });
 }
 
 export function turnFailed(status: TurnStatusKind): boolean {

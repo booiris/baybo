@@ -57,7 +57,7 @@ pub fn spawn_actor(
         warn!(
             session_id = %ctx.session_id,
             error = %join_err,
-            "agent actor panicked; recovering in-flight turn turns"
+            "agent actor panicked; recovering in-flight turns"
         );
         let summary = recover_panicked_actor_session(
             Arc::clone(&ctx.trace_store),

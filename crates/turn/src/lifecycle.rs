@@ -383,7 +383,7 @@ impl TurnLifecycle {
             .collect())
     }
 
-    /// When the session has a turn in flight (a non-terminal turn turn — see
+    /// When the session has a turn in flight (a non-terminal chat turn — see
     /// [`Turn::is_chat_turn`]), the instant it started. Chat
     /// surfaces use this to tell a late-joining client "a reply is being
     /// produced since T"; `None` means the session is idle. A still-
@@ -404,7 +404,7 @@ impl TurnLifecycle {
     /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
     /// of) in-flight descendant turns such as foreground subagents. Foreground
     /// children are descendants of the turn's loop cancel token, so cancelling
-    /// the turn turn already cascades into them — this walk wins the
+    /// the turn already cascades into them — this walk wins the
     /// `UserStopped`-vs-`ParentCancelled` reason race and guards any future
     /// child that re-anchors off the actor token.
     pub async fn list_children(&self, parent_turn_id: &TurnId) -> Result<Vec<Turn>> {

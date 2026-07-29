@@ -4220,7 +4220,7 @@ async fn stop_aborts_an_in_flight_llm_call() {
             .expect("cancel the in-flight turn");
     }
 
-    // The turn turn is now terminal, so the projector publishes the close edge.
+    // The turn is now terminal, so the projector publishes the close edge.
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     let last_turn_state = outs.iter().rev().find_map(|o| match &o.event {
         AgentEvent::TurnState { active, .. } => Some(*active),

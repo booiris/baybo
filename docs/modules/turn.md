@@ -52,6 +52,16 @@ the only kind in none of the three. Reading one column off another — or
 open-coding an `input_kind` match where the chat-turn subset was meant — is the
 bug this section exists to prevent.
 
+`TurnInputKind::is_chat_turn` carries the rule and `Turn::is_chat_turn`
+delegates to it, so a display surface holding only the projected kind asks the
+same question as `/stop`. That matters because the trace viewer **numbers only
+chat turns**: a session with two messages and one compaction has three `turns`
+rows but rendered "Turn #3", disagreeing with the transcript the user had just
+read. The mirror of the rule lives in `app/web/src/types/trace.ts` (`isChatTurn`)
+and `crates/trace/tests/web_trace_types_sync.rs` pins the two together — it
+fails if the TS union gains a kind Rust lacks, or if the non-chat set stops
+matching.
+
 ### State machine
 
 ```

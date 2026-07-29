@@ -27,6 +27,16 @@ pub enum TurnInputKind {
     SubagentNotification,
 }
 
+impl TurnInputKind {
+    /// Whether a turn of this kind is a **chat turn** — see
+    /// [`crate::Turn::is_chat_turn`], which delegates here so the two can't
+    /// drift. Kind-level because display surfaces (the trace viewer) receive
+    /// the projected kind, not the `TurnInput` payload.
+    pub fn is_chat_turn(self) -> bool {
+        !matches!(self, Self::Compact | Self::CronNotification)
+    }
+}
+
 /// What initially fed this turn.
 ///
 /// `Cron::action_payload` is an opaque trace blob written by the cron

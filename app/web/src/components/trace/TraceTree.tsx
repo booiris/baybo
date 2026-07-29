@@ -46,7 +46,7 @@ import {
 import type { TraceGroup } from './traceFormat';
 import { nodeGroup, spanToolName, spanVisualOf } from './traceFormat';
 import type { TurnRollup } from './traceTreeModel';
-import { attention, isExternalAgentTurn, isTurnLive, resolveExpanded, turnRollup } from './traceTreeModel';
+import { attention, isExternalAgentTurn, isTurnLive, resolveExpanded, turnLabels, turnRollup } from './traceTreeModel';
 
 const INDENT_TURN = 8;
 const INDENT_STEP = 26;
@@ -93,8 +93,8 @@ function stepText(rs: ReplayStep): string {
   return `${stepVisual(rs.step.kind.kind).label} ${rs.step.kind.kind} ${stepSummaryText(rs.step, rs.spans)}`;
 }
 
-function turnText(turn: TraceTurnSummary, index: number): string {
-  return `#${index + 1} ${turn.turn_status_kind} ${turn.turn_id}`;
+function turnText(label: string, turn: TraceTurnSummary): string {
+  return `${label} ${turn.turn_status_kind} ${turn.turn_id}`;
 }
 
 // A one-line preview of what a span did: llm output or its emitted tool calls,
@@ -350,7 +350,7 @@ function StepRow({
 
 function TurnRow({
   turn,
-  index,
+  label,
   trace,
   loading,
   selected,
@@ -361,7 +361,7 @@ function TurnRow({
   onSelect,
 }: {
   turn: TraceTurnSummary;
-  index: number;
+  label: string;
   trace: TurnTrace | undefined;
   loading: boolean;
   selected: boolean;
@@ -381,7 +381,7 @@ function TurnRow({
       <Glyph ch="◆" accent="text-brand" />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="font-bold text-[0.85rem]">Turn #{index + 1}</span>
+          <span className="font-bold text-[0.85rem]">{label}</span>
           <span className="text-[0.72rem] text-ink-soft font-mono truncate">{turn.turn_status_kind}</span>
           {live && <RiLoader4Line className="shrink-0 text-info animate-spin text-xs" />}
         </div>
@@ -452,6 +452,7 @@ export function TraceTree(props: TraceTreeProps) {
   const [preview, setPreview] = useState(false);
 
   const q = filter.trim().toLowerCase();
+  const labels = useMemo(() => turnLabels(overview.turns), [overview.turns]);
   const filtering = q.length > 0 || failuresOnly;
 
   const matchers = useMemo(() => {
@@ -499,7 +500,7 @@ export function TraceTree(props: TraceTreeProps) {
           let showAllChildren = false;
           if (filtering) {
             const turnShallow =
-              (!failuresOnly || rollup.hasFailure) && (!q || turnText(turn, i).toLowerCase().includes(q));
+              (!failuresOnly || rollup.hasFailure) && (!q || turnText(labels[i].long, turn).toLowerCase().includes(q));
             const turnDeep = trace ? trace.steps.some(matchers.stepVisible) : false;
             const statusOnly = failuresOnly && !q && rollup.hasFailure && !!trace && !turnDeep;
             const turnVisible = turnShallow || turnDeep || statusOnly || loading;
@@ -519,7 +520,7 @@ export function TraceTree(props: TraceTreeProps) {
             <div key={turn.turn_id} data-turn-id={turn.turn_id}>
               <TurnRow
                 turn={turn}
-                index={i}
+                label={labels[i].long}
                 trace={trace}
                 loading={loading}
                 selected={turnSelected}

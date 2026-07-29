@@ -7,11 +7,11 @@ use baybo_model::{SessionId, TurnId};
 use baybo_store::turn::Result;
 use baybo_store::{SessionTurnStats, StorageError, TurnRow, TurnStore};
 
-pub struct SqliteJobStore {
+pub struct SqliteTurnStore {
     pool: SqlitePool,
 }
 
-impl SqliteJobStore {
+impl SqliteTurnStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
@@ -23,7 +23,7 @@ const SELECT_COLS: &str = "id, session_id, parent_turn_id, kind, status_kind, \
 /// The `turns` columns exactly as sqlite hands them over, before any fallible
 /// decoding (turn-id parse, µs → `DateTime`). The row closure of `query_map`
 /// can only surface `rusqlite` errors, so decoding happens after the collect.
-type RawJobRow = (
+type RawTurnRow = (
     String,
     String,
     Option<String>,
@@ -35,7 +35,7 @@ type RawJobRow = (
     String,
 );
 
-fn raw_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawJobRow> {
+fn raw_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -54,7 +54,7 @@ fn parse_turn_id(s: String) -> anyhow::Result<TurnId> {
         .map_err(|e| anyhow::anyhow!("parse turn id: {e}"))
 }
 
-fn turn_row_from(raw: RawJobRow) -> anyhow::Result<TurnRow> {
+fn turn_row_from(raw: RawTurnRow) -> anyhow::Result<TurnRow> {
     let (id, session_id, parent_turn_id, kind, status_kind, created_at, started_at, ended_at, data) =
         raw;
     Ok(TurnRow {
@@ -72,7 +72,7 @@ fn turn_row_from(raw: RawJobRow) -> anyhow::Result<TurnRow> {
 }
 
 #[async_trait]
-impl TurnStore for SqliteJobStore {
+impl TurnStore for SqliteTurnStore {
     async fn create(&self, turn: &TurnRow) -> Result<()> {
         let id = turn.id.to_string();
         let session_id = turn.session_id.as_str().to_string();
@@ -304,7 +304,7 @@ impl TurnStore for SqliteJobStore {
     }
 }
 
-impl SqliteJobStore {
+impl SqliteTurnStore {
     async fn collect(
         &self,
         op: &'static str,
@@ -341,11 +341,11 @@ mod tests {
         )
     }
 
-    async fn create(store: &SqliteJobStore, turn: &Turn) {
+    async fn create(store: &SqliteTurnStore, turn: &Turn) {
         store.create(&turn.to_row().unwrap()).await.unwrap();
     }
 
-    async fn load(store: &SqliteJobStore, id: &TurnId) -> Option<Turn> {
+    async fn load(store: &SqliteTurnStore, id: &TurnId) -> Option<Turn> {
         store
             .get(id)
             .await
@@ -359,7 +359,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         let j = test_turn();
         create(&store, &j).await;
         assert_eq!(load(&store, &j.id).await.unwrap().id, j.id);
@@ -371,7 +371,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         let mut j = test_turn();
         create(&store, &j).await;
         j.start().unwrap();
@@ -387,7 +387,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         let j = test_turn();
         let err = store.save(&j.to_row().unwrap()).await.unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)));
@@ -399,7 +399,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         create(&store, &test_turn()).await;
         create(&store, &test_turn()).await;
         let turns = store
@@ -415,7 +415,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         create(&store, &test_turn()).await;
 
         let mut in_progress = test_turn();
@@ -450,7 +450,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         let sess_a = SessionId::from("sess-a");
         let sess_b = SessionId::from("sess-b");
         let mk = |s: &SessionId| {
@@ -499,7 +499,7 @@ mod tests {
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
             .unwrap();
-        let store = SqliteJobStore::new(pool);
+        let store = SqliteTurnStore::new(pool);
         let sess_a = SessionId::from("sess-a");
         let sess_b = SessionId::from("sess-b");
         let base = chrono::Utc::now();

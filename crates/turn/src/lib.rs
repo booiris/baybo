@@ -225,11 +225,12 @@ impl Turn {
     /// compression trace/cost) but produces no reply; a cron-result delivery
     /// appends a reply the fire *already* produced, with no inference of its
     /// own, so there is nothing in flight to wait on or stop.
+    ///
+    /// Delegates to [`TurnInputKind::is_chat_turn`] rather than re-matching on
+    /// `input`: display surfaces only ever see the projected kind, and one
+    /// definition means the viewer's numbering can't disagree with `/stop`.
     pub fn is_chat_turn(&self) -> bool {
-        !matches!(
-            self.input,
-            TurnInput::Compact | TurnInput::CronNotification { .. }
-        )
+        self.input_kind().is_chat_turn()
     }
 
     /// What payload fed this turn — projected from `input`. Display only.

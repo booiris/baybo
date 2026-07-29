@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { LifecycleState, ReplayStep, Span, Step, TraceTurnSummary, TurnTrace } from '../../types/trace';
+import type { LifecycleState, ReplayStep, Span, Step, TraceTurnSummary, TurnInputKind, TurnTrace } from '../../types/trace';
 import {
   attention,
   failureCount,
@@ -10,6 +10,7 @@ import {
   neededTurnIds,
   resolveExpanded,
   traceHasPendingSpan,
+  turnLabels,
   turnFailed,
   turnRollup,
 } from './traceTreeModel';
@@ -46,7 +47,11 @@ function mkStep(id: string, outcome: LifecycleState, spans: Span[]): ReplayStep 
 }
 
 function mkTrace(turnId: string, steps: ReplayStep[]): TurnTrace {
-  return { turn_id: turnId, session_id: 's', turn_status_kind: 'completed', steps };
+  return { turn_id: turnId, session_id: 's', turn_status_kind: 'completed', turn_input_kind: 'user_chat', steps };
+}
+
+function mkKindTurn(turnId: string, kind: TurnInputKind): TraceTurnSummary {
+  return { ...mkTurn(turnId, 'completed'), turn_input_kind: kind };
 }
 
 function mkTurn(turnId: string, status: TraceTurnSummary['turn_status_kind']): TraceTurnSummary {
@@ -54,6 +59,7 @@ function mkTurn(turnId: string, status: TraceTurnSummary['turn_status_kind']): T
     turn_id: turnId,
     session_id: 's',
     turn_status_kind: status,
+    turn_input_kind: 'user_chat',
     created_at: T0,
     started_at: T0,
     ended_at: T1,
@@ -209,5 +215,40 @@ describe('isExternalAgentTurn / traceHasPendingSpan', () => {
     expect(traceHasPendingSpan(mkTrace('j', [mkStep('s1', pending, [])]))).toBe(true);
     expect(traceHasPendingSpan(mkTrace('j', [mkStep('s1', ok, [mkSpan('a', 's1', ok)])]))).toBe(false);
     expect(traceHasPendingSpan(undefined)).toBe(false);
+  });
+});
+
+describe('turnLabels', () => {
+  it('numbers only the turns the chat transcript showed', () => {
+    // Two user messages with a compaction between them: the chat rendered two
+    // turns, so the viewer must too — numbering the compaction as #2 is the
+    // disagreement this labelling exists to prevent.
+    const turns = [
+      mkKindTurn('a', 'user_chat'),
+      mkKindTurn('b', 'compact'),
+      mkKindTurn('c', 'user_chat'),
+    ];
+    expect(turnLabels(turns).map((l) => l.long)).toEqual(['Turn #1', 'Compaction', 'Turn #2']);
+    expect(turnLabels(turns).map((l) => l.short)).toEqual(['#1', 'cmp', '#2']);
+  });
+
+  it('treats a cron-result delivery as non-chat, and a cron fire as a turn', () => {
+    const turns = [
+      mkKindTurn('a', 'cron'),
+      mkKindTurn('b', 'cron_notification'),
+      mkKindTurn('c', 'spawned'),
+      mkKindTurn('d', 'subagent_notification'),
+    ];
+    expect(turnLabels(turns).map((l) => l.long)).toEqual([
+      'Turn #1',
+      'Cron delivery',
+      'Turn #2',
+      'Turn #3',
+    ]);
+  });
+
+  it('is empty-safe and numbers a pure-maintenance session with no turns at all', () => {
+    expect(turnLabels([])).toEqual([]);
+    expect(turnLabels([mkKindTurn('a', 'compact')]).map((l) => l.long)).toEqual(['Compaction']);
   });
 });

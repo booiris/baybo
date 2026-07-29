@@ -78,7 +78,7 @@ impl Store {
             trace: std::sync::Arc::new(sqlite::SqliteTraceStore::new(pool.clone())),
             secret: std::sync::Arc::new(sqlite::SqliteSecretStore::new(pool.clone())),
             cost: std::sync::Arc::new(sqlite::SqliteCostStore::new(pool.clone())),
-            turn: std::sync::Arc::new(sqlite::SqliteJobStore::new(pool.clone())),
+            turn: std::sync::Arc::new(sqlite::SqliteTurnStore::new(pool.clone())),
             cron: std::sync::Arc::new(sqlite::SqliteCronStore::new(pool.clone())),
             risk: std::sync::Arc::new(sqlite::SqliteSkillRiskStore::new(pool.clone())),
             channel_session: std::sync::Arc::new(sqlite::SqliteChannelSessionStore::new(

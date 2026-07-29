@@ -29,7 +29,7 @@ const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize, IntoParams)]
-struct ListJobsParams {
+struct ListTurnsParams {
     /// Restrict to a single session. Hits the per-session index in
     /// the store instead of scanning the full turns table.
     session: Option<String>,
@@ -62,7 +62,7 @@ fn parse_status(s: &str) -> Result<baybo_turn::TurnStatusKind> {
     get,
     path = "/turns",
     tag = "turns",
-    params(ListJobsParams),
+    params(ListTurnsParams),
     responses(
         (status = 200, description = "Paginated turns", body = inline(ListResponse<Turn>)),
         (status = 400, description = "Invalid query parameters", body = ErrorBody),
@@ -72,7 +72,7 @@ fn parse_status(s: &str) -> Result<baybo_turn::TurnStatusKind> {
 )]
 async fn list_turns(
     State(state): State<AdminState>,
-    Query(params): Query<ListJobsParams>,
+    Query(params): Query<ListTurnsParams>,
 ) -> Result<Json<ListResponse<Turn>>> {
     let status = params.status.as_deref().map(parse_status).transpose()?;
     let limit = params

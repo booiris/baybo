@@ -33,7 +33,7 @@ pub use session_folder::SqliteSessionFolderStore;
 pub use skill_risk::SqliteSkillRiskStore;
 pub use task::SqliteTaskStore;
 pub use trace::SqliteTraceStore;
-pub use turn::SqliteJobStore;
+pub use turn::SqliteTurnStore;
 
 use baybo_store::{StorageError, StoreIdentity};
 use deadpool_sqlite::{Config, Runtime};

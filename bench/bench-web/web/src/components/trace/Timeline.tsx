@@ -5,7 +5,6 @@ import {
   RiBrainLine,
   RiRobot2Line,
   RiToolsLine,
-  RiGitBranchLine,
 } from 'react-icons/ri';
 import type {
   LifecycleState,
@@ -131,12 +130,9 @@ function SpanRow({
         outTok={span.kind.result?.output_tokens}
       />
     );
-  } else if (span.kind.kind === 'tool_call') {
+  } else {
     icon = <RiToolsLine className="text-warn" />;
     title = span.kind.begin.tool_name;
-  } else {
-    icon = <RiGitBranchLine className="text-brand" />;
-    title = `subagent ${span.kind.child_session_id}`;
   }
 
   return (

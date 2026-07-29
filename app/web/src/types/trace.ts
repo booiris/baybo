@@ -309,6 +309,29 @@ export type TurnStatusKind =
   | 'failed'
   | 'completed';
 
+/**
+ * What payload fed a turn (`baybo_turn::TurnInputKind`). Display only —
+ * behaviour branches on the server side, never on this.
+ */
+export type TurnInputKind =
+  | 'user_chat'
+  | 'cron'
+  | 'cron_notification'
+  | 'compact'
+  | 'spawned'
+  | 'subagent_notification';
+
+/**
+ * Whether a turn of this kind is a **chat turn** — one the user saw in the
+ * conversation. Mirrors `TurnInputKind::is_chat_turn` and must stay in step
+ * with it: `/compact` and cron-result delivery open real turn rows but were
+ * never turns the chat UI showed, so numbering them would make the trace
+ * viewer disagree with the transcript.
+ */
+export function isChatTurn(kind: TurnInputKind): boolean {
+  return kind !== 'compact' && kind !== 'cron_notification';
+}
+
 export interface ReplayStep {
   step: Step;
   spans: Span[];
@@ -338,6 +361,7 @@ export interface TraceTurnSummary {
   turn_id: string;
   session_id: string;
   turn_status_kind: TurnStatusKind;
+  turn_input_kind: TurnInputKind;
   created_at: string;
   started_at?: string | null;
   ended_at?: string | null;
@@ -364,6 +388,7 @@ export interface TurnTrace {
   turn_id: string;
   session_id: string;
   turn_status_kind: TurnStatusKind;
+  turn_input_kind: TurnInputKind;
   created_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;

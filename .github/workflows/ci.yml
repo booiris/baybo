@@ -176,6 +176,20 @@ jobs:
       # test. pnpm builds in dependency order; this also builds the web
       # dashboard (gen:api + tsc -b + vite build).
       - run: pnpm -r --if-present run build
+      # The build's `gen:api` step regenerates app/web/src/api/schema.d.ts from
+      # docs/openapi.json IN PLACE, so a stale committed client is silently
+      # overwritten here and would never be noticed. `openapi_json_is_in_sync`
+      # (cargo test) gates the spec against the Rust routes; this gates the
+      # generated client against the spec. Without it the two ends are checked
+      # and the middle is not.
+      - name: schema.d.ts matches docs/openapi.json
+        run: |
+          if ! git diff --exit-code -- app/web/src/api/schema.d.ts; then
+            echo
+            echo "[!] app/web/src/api/schema.d.ts is stale against docs/openapi.json."
+            echo "[!] Fix: pnpm --filter baybo-web gen:api && commit the result."
+            exit 1
+          fi
       # eslint gates app/web on the wiring-bug class tsc + the vitest reducers
       # can't see (strict-boolean-expressions, no-unnecessary-condition,
       # react-hooks); the existing backlog is tracked in

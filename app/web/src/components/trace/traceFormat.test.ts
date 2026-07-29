@@ -138,7 +138,7 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
   }
 
   function trace(steps: ReplayStep[]): TurnTrace {
-    return { turn_id: 'turn-1', session_id: 'sess-1', turn_status_kind: 'completed', steps };
+    return { turn_id: 'turn-1', session_id: 'sess-1', turn_status_kind: 'completed', turn_input_kind: 'user_chat', steps };
   }
 
   // The title pass is spawned before the turn's first iteration, so its step

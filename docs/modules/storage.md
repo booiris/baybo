@@ -250,6 +250,37 @@ Table schemas are created centrally in `SqlitePool::init_db()`, but each Store s
 
 Fields difficult to fully structure (`SessionState.extra`, `Turn.input` / `Turn.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`turn_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
+### Renaming a persisted name
+
+`init_db` runs on every open and is the only migration runner: additive
+`AddColumn` entries plus a handful of one-time, self-disarming data passes. A
+rename that touches persisted state has three traps, all of which fail silently
+rather than loudly.
+
+**Order.** A one-time rename must run *before* the DDL batch. `CREATE TABLE IF
+NOT EXISTS <new>` against a pre-rename database mints an empty table, after
+which `ALTER TABLE <old> RENAME TO <new>` can only fail — and the app boots
+clean reporting zero rows.
+
+**`pragma_table_xinfo`, never `pragma_table_info`.** `table_info` omits VIRTUAL
+generated columns entirely, so a guard written against it reports `steps` as
+having only `(id, data)`. Every generated-column migration keyed on it takes the
+wrong branch, and only against a real database — a fresh one has nothing to
+migrate, so the whole test suite stays green.
+
+**Serde field names inside a `data` blob are schema.** Renaming one orphans
+every existing row. Where the field is required (`Lineage.parent_turn_id` inside
+`sessions.data`) the *whole* row stops deserializing, and
+`decode_session_list_rows` drops undecodable rows with only a `warn!` — a live
+conversation silently leaves the user's list. Where it is `Option`, it quietly
+reads `None` and the next write persists that loss. The same applies to enum tag
+keys: `BackgroundJobKind` is `#[serde(tag = "job")]` and pinned by a test,
+because it rides inside `Session`.
+
+Indexes survive `ALTER TABLE … RENAME` under their **old** names, so a migration
+that renames a table must drop them explicitly or the DDL builds a second copy
+of each.
+
 ### Transaction boundaries
 
 Use transactions wherever a multi-statement write must be atomic — most importantly `SessionStore::delete`, which cascades the session's `session_messages` rows and removes the parent row in one `BEGIN IMMEDIATE` transaction (a non-transactional implementation could strand a transcript under a concurrent write).

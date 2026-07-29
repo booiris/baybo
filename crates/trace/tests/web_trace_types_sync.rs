@@ -11,10 +11,42 @@
 use std::path::PathBuf;
 
 use baybo_trace::{CompressionApplied, CompressionTrigger, SpanKind, StepKind};
+use baybo_turn::TurnInputKind;
 
-/// The hand-maintained frontend mirror of this crate's trace types.
+/// Every hand-maintained frontend mirror of this crate's trace types.
+///
+/// Two viewers render these kinds from two independently maintained copies:
+/// the dashboard's, and `bench/bench-web`'s standalone read-only viewer. Both
+/// are checked, because a kind added to Rust and missed by *either* is a row
+/// that degrades to a generic fallback in that viewer.
+const MIRRORS: &[&str] = &[
+    "../../app/web/src/types/trace.ts",
+    "../../bench/bench-web/web/src/types/trace.ts",
+];
+
+fn mirrors() -> Vec<(&'static str, String)> {
+    MIRRORS
+        .iter()
+        .map(|rel| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                let p = path.display();
+                panic!(
+                    "cannot read the trace types at {p} ({e}); this contract test \
+                     cross-checks Rust trace kinds against that file — if the viewer \
+                     moved, update MIRRORS"
+                )
+            });
+            (*rel, body)
+        })
+        .collect()
+}
+
+/// The dashboard mirror alone — for checks that are about the REST body shape
+/// (`turn_id`, `turn_input_kind`), which `bench-web` reads from an on-disk
+/// export envelope rather than from the gateway.
 fn web_trace_types() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/web/src/types/trace.ts");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MIRRORS[0]);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         let p = path.display();
         panic!(
@@ -25,10 +57,10 @@ fn web_trace_types() -> String {
     })
 }
 
-fn assert_kind_listed(ts: &str, ty: &str, tag: &str) {
+fn assert_kind_listed(ts: &str, ty: &str, tag: &str, mirror: &str) {
     assert!(
         ts.contains(&format!("kind: '{tag}'")),
-        "{ty} `{tag}` is not listed in app/web/src/types/trace.ts. The trace detail \
+        "{ty} `{tag}` is not listed in {mirror}. The trace detail \
          page would fall back to a generic row for it (and before that fallback \
          existed, an unknown {ty} white-screened the page — see PR #61's \
          `progress_observer`). Fix: add `| {{ kind: '{tag}' }}` to the `{ty}` \
@@ -39,7 +71,6 @@ fn assert_kind_listed(ts: &str, ty: &str, tag: &str) {
 
 #[test]
 fn web_trace_types_cover_every_step_kind() {
-    let ts = web_trace_types();
     let kinds = [
         StepKind::LlmIteration,
         StepKind::compression(
@@ -66,18 +97,21 @@ fn web_trace_types_cover_every_step_kind() {
             | StepKind::ProgressObserver
             | StepKind::TitleGeneration => {}
         }
-        assert_kind_listed(&ts, "StepKind", k.tag());
+        for (mirror, ts) in mirrors() {
+            assert_kind_listed(&ts, "StepKind", k.tag(), mirror);
+        }
     }
 }
 
 #[test]
 fn web_trace_types_cover_every_span_kind() {
-    let ts = web_trace_types();
     // `SpanKind` variants carry data, so we pin their tags here rather than
     // build sample instances. The exhaustiveness tripwire below keeps this list
     // (and the frontend union) honest when a variant is added.
     for tag in ["llm_call", "tool_call"] {
-        assert_kind_listed(&ts, "SpanKind", tag);
+        for (mirror, ts) in mirrors() {
+            assert_kind_listed(&ts, "SpanKind", tag, mirror);
+        }
     }
 }
 
@@ -100,8 +134,6 @@ fn span_kind_exhaustiveness(k: &SpanKind) {
 /// branches, an icon and a legend entry for kinds that could never arrive.
 #[test]
 fn web_trace_types_declare_no_kinds_rust_lacks() {
-    let ts = web_trace_types();
-
     let step_tags = [
         StepKind::LlmIteration,
         StepKind::compression(
@@ -117,18 +149,20 @@ fn web_trace_types_declare_no_kinds_rust_lacks() {
     .map(|k| k.tag());
     let span_tags = ["llm_call", "tool_call"];
 
-    for (ty, known) in [
-        ("StepKind", step_tags.as_slice()),
-        ("SpanKind", span_tags.as_slice()),
-    ] {
-        for tag in declared_tags(&ts, ty) {
-            assert!(
-                known.contains(&tag.as_str()),
-                "app/web/src/types/trace.ts declares `{ty}` variant `{tag}`, which no \
-                 Rust variant produces. Either it was removed here and the mirror \
-                 kept it, or it was never real — delete it from the union (and the \
-                 viewer branches keyed on it), or add the Rust variant."
-            );
+    for (mirror, ts) in mirrors() {
+        for (ty, known) in [
+            ("StepKind", step_tags.as_slice()),
+            ("SpanKind", span_tags.as_slice()),
+        ] {
+            for tag in declared_tags(&ts, ty) {
+                assert!(
+                    known.contains(&tag.as_str()),
+                    "{mirror} declares `{ty}` variant `{tag}`, which no \
+                     Rust variant produces. Either it was removed here and the mirror \
+                     kept it, or it was never real — delete it from the union (and the \
+                     viewer branches keyed on it), or add the Rust variant."
+                );
+            }
         }
     }
 }
@@ -267,6 +301,91 @@ fn web_trace_types_use_turn_field_names() {
             "app/web/src/types/trace.ts still carries `{stale}`. The turn entity is \
              named Turn everywhere else, so this mirror is describing a shape the \
              gateway no longer emits."
+        );
+    }
+}
+
+/// `TurnInputKind`, both directions — plus the chat-turn rule the viewer's
+/// numbering depends on.
+///
+/// The viewer numbers only chat turns, so if the TS union or its `isChatTurn`
+/// drifts from `TurnInputKind::is_chat_turn`, the trace sidebar silently starts
+/// numbering rows the chat transcript never showed — the exact disagreement the
+/// field was added to fix.
+#[test]
+fn web_trace_types_cover_the_turn_input_kinds() {
+    let ts = web_trace_types();
+
+    let kinds = [
+        TurnInputKind::UserChat,
+        TurnInputKind::Cron,
+        TurnInputKind::CronNotification,
+        TurnInputKind::Compact,
+        TurnInputKind::Spawned,
+        TurnInputKind::SubagentNotification,
+    ];
+    for k in kinds {
+        // Exhaustiveness tripwire: a new variant fails to compile here.
+        match k {
+            TurnInputKind::UserChat
+            | TurnInputKind::Cron
+            | TurnInputKind::CronNotification
+            | TurnInputKind::Compact
+            | TurnInputKind::Spawned
+            | TurnInputKind::SubagentNotification => {}
+        }
+    }
+
+    let wire: Vec<String> = kinds
+        .iter()
+        .map(|k| {
+            serde_json::to_value(k)
+                .expect("TurnInputKind serializes")
+                .as_str()
+                .expect("as a string")
+                .to_string()
+        })
+        .collect();
+
+    let declared = declared_literals(&ts, "TurnInputKind");
+    assert!(
+        !declared.is_empty(),
+        "scraped no literals out of `TurnInputKind` in app/web/src/types/trace.ts — \
+         the scraper is broken, not the mirror"
+    );
+    for w in &wire {
+        assert!(
+            declared.contains(w),
+            "`TurnInputKind` variant `{w}` is missing from app/web/src/types/trace.ts"
+        );
+    }
+    for d in &declared {
+        assert!(
+            wire.contains(d),
+            "app/web/src/types/trace.ts declares `TurnInputKind` value `{d}`, which no \
+             Rust variant produces — delete it, or add the Rust variant"
+        );
+    }
+
+    // The non-chat set is what the viewer must not number. Pin it by value, so
+    // adding a non-chat kind on either side fails here rather than silently
+    // renumbering the sidebar.
+    let non_chat: Vec<&String> = wire
+        .iter()
+        .zip(kinds.iter())
+        .filter(|(_, k)| !k.is_chat_turn())
+        .map(|(w, _)| w)
+        .collect();
+    assert_eq!(
+        non_chat.len(),
+        2,
+        "expected exactly compact + cron_notification to be non-chat, got {non_chat:?}"
+    );
+    for w in non_chat {
+        assert!(
+            ts.contains(&format!("kind !== '{w}'")),
+            "app/web/src/types/trace.ts `isChatTurn` does not exclude `{w}`, so the trace \
+             viewer would number a turn the chat transcript never showed"
         );
     }
 }
