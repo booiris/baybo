@@ -458,7 +458,7 @@ describe('multi-tab turn sync via routeInboundFrame', () => {
       notice_level: 'info',
       created_at: '2026-06-14T12:00:05Z',
     } as components['schemas']['ChatTranscriptItem']);
-    expect(applySyncMerge(rows, [synced])).toBe(rows); // unchanged — deduped
+    expect(applySyncMerge(rows, [synced], [])).toBe(rows); // unchanged — deduped
   });
 
   it('skips the durable-keyed mint when the row is already on screen (sync raced ahead)', () => {

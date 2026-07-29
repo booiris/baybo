@@ -87,8 +87,9 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
 
 /// Map a REST `ChatWorkStep` (the `work` transcript row's step — snake_case
 /// `tool_label` / `tool_status` / `tool_summary`) onto a rendered WorkStep. A
-/// reconstructed step's tool call is already closed, so `status` falls back to
-/// "ok" when the persisted result didn't carry one.
+/// step whose persisted result carried no status stays STATUSLESS ("" — neutral,
+/// as app/web renders it): a call that never reported a result is not evidence
+/// of success, and the old "ok" default painted every one of them green.
 export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
   if (s.kind === "tool") {
     return {
@@ -97,7 +98,7 @@ export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number
       // `workStepKey` falls back to content-keying for those.
       callId: s.call_id ?? "",
       label: s.tool_label || s.tool || "",
-      status: s.tool_status ?? "ok",
+      status: s.tool_status ?? "",
       summary: s.tool_summary || undefined,
       approval: s.approval || undefined,
     };
@@ -118,6 +119,8 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
       role: "work",
       steps,
       active: false,
+      cancelled: item.cancelled,
+      turnComplete: item.turn_complete,
       // Server-anchored turn start — so a reopened/reconciled block's live ticker
       // is `now − true start`, not `now − localOpen` (the latter inflates across
       // app-close / re-entry into an absurd "Worked 7h").
@@ -134,7 +137,7 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
     if (isStopAckNotice(item.text ?? "")) {
       return { id: item.id, role: "notice", content: "", stopped: true };
     }
-    return { id: item.id, role: "notice", content: item.text ?? "" };
+    return { id: item.id, role: "notice", content: item.text ?? "", level: item.notice_level };
   }
   const role = item.role === "user" ? "user" : "assistant";
   // The gateway persists `/stop` as a `Command` control event, which
@@ -148,6 +151,7 @@ export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
   return {
     id,
     role,
+    ordinal: item.ordinal ?? undefined,
     content: item.text ?? "",
     attachments: item.attachments,
     createdAt: item.created_at,
@@ -275,6 +279,52 @@ export function rowOrdinal(id: string): number | null {
   if (!match) return null;
   const n = Number(match[1]);
   return Number.isSafeInteger(n) ? n : null;
+}
+
+/// The durable ordinal a rendered row counts as sync coverage: the one in its
+/// `m`/`w` id, or — for a user row, which is keyed by its `platform_msg_id` so
+/// an optimistic bubble reconciles — the server ordinal carried beside the id.
+/// Without that second half EVERY user message, from this device or another,
+/// reads as ordinal-less. `null` for a row that truly has none: an optimistic
+/// send, a live work block, an `n<seq>` notice.
+function rowCoverageOrdinal(r: Row): number | null {
+  if (r.role !== "work" && r.ordinal !== undefined) return r.ordinal;
+  return rowOrdinal(r.id);
+}
+
+/// Whether the thread already carries the optimistic bubble for `msgId`. Native
+/// re-seeds the outbox's unconfirmed sends on EVERY mount edge — it cannot know
+/// whether the tree it is seeding came up empty (a resync, a mirror older than
+/// the send) or already holds them — so the replay has to be idempotent, and a
+/// user row is keyed by its `platform_msg_id` precisely so this can be asked.
+export function holdsUserSend(rows: Row[], msgId: string): boolean {
+  return rows.some((r) => r.role === "user" && r.id === msgId);
+}
+
+/// The `since_ordinal` the next sync may present: the cursor, unless the thread
+/// is not a PREFIX of it. A difference answers rows strictly `> since` and the
+/// merge appends what it doesn't already hold, so a page that OVERLAPS rendered
+/// rows welds them below the thread instead of at their ordinal (and folds a
+/// leading work block into the tail's card). Rows do outrun the cursor — it is a
+/// coverage watermark, while scroll-up paging and a rebase-dirty freeze render
+/// rows that never advance it — so hand those opens the baseline REPLACE, the
+/// path a fresh install proves correct. Rows carrying no durable ordinal at all
+/// (an optimistic send, a live work block) are not coverage and never trip it.
+///
+/// This PREVENTS the scramble; it does not repair one. The welding sync itself
+/// ends by advancing the cursor to `next_cursor`, and a difference is only
+/// returned when its scan did not overrun — so that watermark is the session's
+/// newest ordinal, above every rendered row. A mirror scarred by this is
+/// therefore persisted already covering itself: the gate stays quiet, the
+/// server answers an empty difference, and the order stands. The exit is the
+/// per-session resync hatch.
+export function syncSince(cursor: number | null, rows: Row[]): number | null {
+  if (cursor === null) return null;
+  for (const r of rows) {
+    const ordinal = rowCoverageOrdinal(r);
+    if (ordinal !== null && ordinal > cursor) return null;
+  }
+  return cursor;
 }
 
 /// Ids of the rows that get a `CompactionDivider` rendered *before* them: the
@@ -596,16 +646,20 @@ export function severTerminalNoticeIn(rows: Row[], text: string, durableId: stri
 /// union the steps, anchor `startedAt` to the server's true turn start, and take
 /// the server's duration for the frozen label (while still active the live
 /// ticker rules, so `elapsedMs` stays unset). Keeps `base`'s id/active so a live
-/// block isn't remounted mid-stream.
+/// block isn't remounted mid-stream. Cancellation is a property of the whole
+/// turn, so either side carrying it cancels the card — that is how a `/stop`ped
+/// live block gets its label: only the reconstruction knows.
 export function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
   return {
     ...base,
     steps: mergeWorkSteps(base.steps, recon.steps),
+    cancelled: (base.cancelled ?? false) || (recon.cancelled ?? false),
     startedAt: recon.startedAt ?? base.startedAt,
     // Carry the server's authoritative duration even while active (the live
     // ticker ignores it until the block closes) so the frozen "Worked Xs" is the
     // server's number regardless of who closes the block first.
     elapsedMs: recon.elapsedMs ?? base.elapsedMs,
+    turnComplete: recon.turnComplete ?? base.turnComplete,
   };
 }
 
@@ -622,6 +676,12 @@ export function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
 /// `startedAt` (stripped), so fall back to a half's own duration — an
 /// undercount, but the mirror only holds a split written before this joined at
 /// the seam.
+///
+/// Completeness follows the NEWER half: the pair is whole once the half
+/// carrying the turn's end is in, and stays cut off — joinable again — until
+/// then, which is what lets a turn spanning three pages fold down in one pass.
+/// Cancellation ORs, which amounts to the same rule: the server flags the half
+/// the `/stop` closed, and a cut-off head is never flagged.
 export function joinWorkHalves(first: WorkRow, second: WorkRow): WorkRow {
   const secondEnd =
     second.startedAt !== undefined && second.elapsedMs !== undefined
@@ -637,17 +697,19 @@ export function joinWorkHalves(first: WorkRow, second: WorkRow): WorkRow {
     // A half still live keeps the card live; anchored to the turn's true start,
     // so the ticker reads the whole turn rather than restarting at the seam.
     active: first.active || second.active,
+    cancelled: (first.cancelled ?? false) || (second.cancelled ?? false),
     startedAt: first.startedAt,
     elapsedMs: spanned ?? first.elapsedMs ?? second.elapsedMs,
+    turnComplete: second.turnComplete ?? first.turnComplete,
   };
 }
 
-/// Fold two ADJACENT work rows — always one turn, since a healthy turn has a
-/// message row between its block and the next. Which fold depends on what the
-/// two rows ARE: two server reconstructions with DIFFERENT `w<ordinal>` ids are
-/// sequential halves of one turn (a page boundary cut it), so span them;
-/// anything else — a live block beside its own reconstruction, or the same row
-/// re-delivered — is two representations of ONE span, so reconcile them.
+/// Fold two ADJACENT work rows that `sameContinuingTurn` has already cleared as
+/// one turn. Which fold depends on what the two rows ARE: two server
+/// reconstructions with DIFFERENT `w<ordinal>` ids are sequential halves of one
+/// turn (a page boundary cut it), so span them; anything else — a live block
+/// beside its own reconstruction, or the same row re-delivered — is two
+/// representations of ONE span, so reconcile them.
 export function foldWork(prev: WorkRow, next: WorkRow): WorkRow {
   const prevOrd = rowOrdinal(prev.id);
   const nextOrd = rowOrdinal(next.id);
@@ -656,12 +718,38 @@ export function foldWork(prev: WorkRow, next: WorkRow): WorkRow {
     : reconcileWork(prev, next);
 }
 
+/// Whether the block AFTER `prev` may be folded into it — the one question
+/// every seam asks before calling `foldWork`. Adjacency alone used to answer it
+/// ("a healthy turn has a message row between its block and the next"), which a
+/// sync bug that scrambled row order turned into three turns welded under one
+/// "Worked 2h 47m" card. The server answers it instead: a reconstructed head
+/// qualifies ONLY when it says the page window's edge cut it off
+/// (`turnComplete === false`) — a whole block is its own turn and never fuses
+/// with the neighbour (a completed turn whose empty final reply left no bubble,
+/// abutting the next fire). A live block is keyed by `uid()`, carries no flag,
+/// and still fuses: that is the reconcile path, one span in two forms. An
+/// `undefined` flag — a mirror written before this existed — DECLINES: an extra
+/// card is a cosmetic split, a wrong join swallows a whole turn into another
+/// turn's card.
+function sameContinuingTurn(prev: WorkRow): boolean {
+  if (rowOrdinal(prev.id) === null) return true;
+  return prev.turnComplete === false;
+}
+
 /// Whether a compaction boundary sits between two work blocks' ordinals — the
 /// server already breaks a work block at a watermark, so the two halves are
 /// DIFFERENT turns (compaction is a turn boundary) and must not be re-fused: a
 /// fused card would swallow the seam the `CompactionDivider` keys off. Both
 /// halves must carry a durable `w<ordinal>` id; a live block (no ordinal) never
 /// straddles a boundary.
+///
+/// Kept alongside `sameContinuingTurn`, which subsumes it only for a watermark
+/// the server SAW: a split inside one reconstruction window flushes the
+/// pre-compaction half `turn_complete: true`, and the turn-complete guard
+/// refuses that on its own. A watermark falling in the gap BETWEEN two pages is
+/// straddled by no single window, so neither reconstruction splits and the head
+/// is an ordinary cut-off (`false`) block — this is the only guard that refuses
+/// there.
 function crossesCompaction(prev: WorkRow, next: WorkRow, points: CompactionPoint[]): boolean {
   const a = rowOrdinal(prev.id);
   const b = rowOrdinal(next.id);
@@ -669,10 +757,11 @@ function crossesCompaction(prev: WorkRow, next: WorkRow, points: CompactionPoint
   return points.some((p) => a < p.ordinal && p.ordinal <= b);
 }
 
-/// Collapse every adjacent work pair in an assembled row list. Idempotent — a
-/// healthy list has no adjacency — so it is safe to run at each seam where rows
-/// are joined (a prepended history page, a rebuilt sync page). Two work blocks
-/// straddling a `compactionPoints` boundary are NEVER fused — a mid-turn
+/// Collapse every adjacent SAME-TURN work pair in an assembled row list.
+/// Idempotent — a healthy list has no such adjacency — so it is safe to run at
+/// each seam where rows are joined (a prepended history page, a rebuilt sync
+/// page). Two blocks the server calls two turns stay two cards, and two
+/// straddling a `compactionPoints` boundary are never fused either — a mid-turn
 /// compaction's pre-/post halves are distinct turns with the divider between.
 export function foldAdjacentWork(rows: Row[], compactionPoints: CompactionPoint[] = []): Row[] {
   const out: Row[] = [];
@@ -682,6 +771,7 @@ export function foldAdjacentWork(rows: Row[], compactionPoints: CompactionPoint[
       r.role === "work" &&
       prev &&
       prev.role === "work" &&
+      sameContinuingTurn(prev) &&
       !crossesCompaction(prev, r, compactionPoints)
     ) {
       out[out.length - 1] = foldWork(prev, r);
@@ -710,6 +800,114 @@ export function sameTurnWorkIndex(rows: Row[], ord: number): number {
     j--;
   }
   return sawTurnAnswer && j >= 0 && rows[j].role === "work" ? j : -1;
+}
+
+/// Merge a DIFFERENCE sync page into the rendered thread: a row already held is
+/// reconciled where it stands, one we don't hold is appended. Plain append is
+/// only correct because the page extends the thread — every row is above the
+/// cursor, and `syncSince` refuses a difference the thread is not a prefix of.
+/// Rows arrive ascending; each carries its stable id.
+export function mergeSyncPage(
+  prev: Row[],
+  pageRows: Row[],
+  compactionPoints: CompactionPoint[],
+): Row[] {
+  const next = [...prev];
+  const byId = new Map(next.map((r, i) => [r.id, i] as const));
+  const closeTrailingWork = () => {
+    const last = next[next.length - 1];
+    if (!last || last.role !== "work" || !last.active) return;
+    if (last.steps.length === 0) {
+      next.pop();
+      return;
+    }
+    next[next.length - 1] = {
+      ...last,
+      active: false,
+      elapsedMs: last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined),
+    };
+  };
+  for (const row of pageRows) {
+    const existingIdx = byId.get(row.id);
+    if (existingIdx !== undefined) {
+      const existing = next[existingIdx];
+      // A redelivery of a row already on screen: fold a same-id work
+      // block's newer server steps + timing into what's rendered, or
+      // reconcile a message row — drop an optimistic send's chrome, and
+      // adopt the server's clock over the arrival stamp a live frame /
+      // optimistic send left behind, so the time under the bubble is the
+      // one a cold open will show. Otherwise a no-op.
+      if (existing.role === "work" || row.role === "work") {
+        if (existing.role === "work" && row.role === "work") {
+          next[existingIdx] = reconcileWork(existing, row);
+        }
+      } else {
+        const createdAt = row.createdAt ?? existing.createdAt;
+        // A send of ours is keyed by its `platform_msg_id`, so its ordinal only
+        // ever arrives on the durable twin — take it, or the confirmed row stays
+        // invisible to `syncSince` forever. A live notice minted under its
+        // `durable_id` likewise learns its severity only here.
+        const ordinal = row.ordinal ?? existing.ordinal;
+        const level = row.level ?? existing.level;
+        if (
+          existing.sendState !== undefined ||
+          createdAt !== existing.createdAt ||
+          ordinal !== existing.ordinal ||
+          level !== existing.level
+        ) {
+          next[existingIdx] = { ...existing, sendState: undefined, createdAt, ordinal, level };
+        }
+      }
+      continue;
+    }
+    // The in-flight turn's reconstructed `w<ordinal>` work block is the
+    // SAME turn as the live/restored block at the tail — RECONCILE into
+    // it (union steps + adopt server timing) rather than rendering a
+    // second card. A turn we don't have yet ends on a non-work tail, so
+    // its own work block is still appended. Guarded exactly as
+    // `foldAdjacentWork` guards its own seams: only a tail the server calls
+    // the same continuing turn, and never across a compaction boundary —
+    // the server already broke the block there, so the two halves are
+    // different turns and a fused card would swallow the divider's seam.
+    const tail = next[next.length - 1];
+    if (
+      row.role === "work" &&
+      tail &&
+      tail.role === "work" &&
+      sameContinuingTurn(tail) &&
+      !crossesCompaction(tail, row, compactionPoints)
+    ) {
+      next[next.length - 1] = foldWork(tail, row);
+      continue;
+    }
+    // A re-delivered `work` row whose turn ALREADY ended on screen: its
+    // block sits ABOVE the turn's answer bubble (+ any trailing
+    // notices), so the tail isn't work and id-dedup misses — a live
+    // block is keyed by a client `uid()` while the reconstruction keys
+    // it `w<ordinal>`, and even two reconstructions disagree
+    // (`w<first-tool>` for a full tail vs `w<progress-anchor>` for a
+    // difference window). Fold it back into that block instead of
+    // pushing a SECOND card below the answer — the observer's `status`
+    // narration, made durable, is re-delivered by the inclusive
+    // (`after_ordinal >= since`) control-event scan and would otherwise
+    // land as a stray "Worked" block under the reply. Bound the
+    // back-scan to the SAME turn: reconcile only when the trailing run
+    // holds an answer ordinal-above this block, so a genuinely later
+    // turn's block (its answer not yet on screen) still appends.
+    if (row.role === "work") {
+      const ord = rowOrdinal(row.id);
+      const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
+      const target = at >= 0 ? next[at] : undefined;
+      if (target && target.role === "work") {
+        next[at] = reconcileWork(target, row);
+        continue;
+      }
+    }
+    if (row.role === "assistant") closeTrailingWork();
+    next.push(row);
+    byId.set(row.id, next.length - 1);
+  }
+  return next;
 }
 
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
@@ -774,11 +972,14 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
       // permanent "waiting for approval" on a step nothing can ever clear.
       r = { ...r, steps: r.steps.map(clearAwaitingApproval) };
       // Heal a mirror split by the (now-fixed) re-entry bug: two work blocks
-      // directly adjacent (NO message row between) are ONE turn torn apart — a
-      // healthy turn always has a message between its block and the next, so
-      // adjacency alone marks the tear, whether or not either half already
-      // closed. Fold the whole run into one card, staying "working" if any piece
-      // was still live (a turn with no final reply must not read as "worked").
+      // directly adjacent (NO message row between) are ONE turn torn apart,
+      // whether or not either half already closed. Fold the whole run into one
+      // card, staying "working" if any piece was still live (a turn with no
+      // final reply must not read as "worked"). NOT onto a head the server
+      // called COMPLETE, though: that adjacency is one `sameContinuingTurn`
+      // deliberately left standing (two turns, two cards), and welding it here
+      // would undo the fold guard on every cold open. A head with no flag at
+      // all is a pre-guard mirror — the only kind this heal was written for.
       // Since the `openWorkIn` fold-into-frozen-tail invariant now prevents
       // minting a fresh adjacency split, this only ever folds a LEGACY on-disk
       // mirror written by a pre-fix build (it re-persists as one row, so it
@@ -796,7 +997,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
       // other restore path — a restored anchor would have a live ticker count
       // all the app-closed hours.
       const prev = out[out.length - 1];
-      if (prev && prev.role === "work") {
+      if (prev && prev.role === "work" && prev.turnComplete !== true) {
         out[out.length - 1] = {
           ...prev,
           steps: mergeWorkSteps(prev.steps, r.steps),
@@ -1828,7 +2029,8 @@ const MessageRow = memo(function MessageRow({
         </div>
       );
     }
-    return <div className="bubble notice">{m.content}</div>;
+    const level = m.level ?? "";
+    return <div className={level === "" ? "bubble notice" : `bubble notice notice-${level}`}>{m.content}</div>;
   }
 
   const attachments = m.attachments ?? [];
@@ -1939,6 +2141,14 @@ export function Transcript({
 }) {
   const { t } = useTranslation();
   const [messages, setMessages] = useState<Row[]>(() => sanitizeRestoredRows(restored?.messages));
+  // The rendered thread, readable from `runSync` — which must NOT re-create on
+  // every row change: its identity gates the mount and safety-tick sync effects,
+  // so a `messages` dependency would fire a pull on every bubble. Seeded from
+  // the restored mirror, since the mount sync runs before the effect below.
+  const messagesRef = useRef<Row[]>(messages);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
   // Latest turn-active value readable synchronously from the sync-apply
@@ -2278,10 +2488,18 @@ export function Transcript({
   }, []);
 
   // The server acknowledged our own send (its echo arrived by platform_msg_id) —
-  // clear the send-state chrome (spinner / retry dot) on that optimistic bubble.
-  const markSent = useCallback((msgId: string) => {
+  // clear the send-state chrome (spinner / retry dot) on that optimistic bubble
+  // and stamp the ordinal the echo brought. The row stays keyed by its
+  // `platform_msg_id`, so this stamp is the only thing that ever makes a send of
+  // ours count as sync coverage (`rowCoverageOrdinal`).
+  const markSent = useCallback((msgId: string, ordinal: number | null) => {
     setMessages((rows) =>
-      rows.map((r) => (r.role === "user" && r.id === msgId && r.sendState ? { ...r, sendState: undefined } : r)),
+      rows.map((r) => {
+        if (r.role !== "user" || r.id !== msgId) return r;
+        const next = ordinal ?? r.ordinal;
+        if (r.sendState === undefined && next === r.ordinal) return r;
+        return { ...r, sendState: undefined, ordinal: next };
+      }),
     );
   }, []);
 
@@ -2597,18 +2815,19 @@ export function Transcript({
 
   // The one forward-recovery pull (docs/sync-protocol.md "The one client
   // algorithm"): session open, reconnect, gap nudge and the safety tick all
-  // land here. Posts the current cursor to native, which fetches
-  // `GET …/sync?since_ordinal=<cursor>&limit=…` over the active leg and pushes
-  // the result back as a local `sync_page` frame. `null` cursor → baseline
-  // REPLACE; a rebased response also REPLACEs. `syncInFlight` coalesces a
-  // burst of triggers to one pull (cleared by the reply).
+  // land here. Posts `syncSince` to native, which fetches
+  // `GET …/sync?since_ordinal=<since>&limit=…` over the active leg and pushes
+  // the result back as a local `sync_page` frame. `null` → baseline REPLACE (no
+  // cursor, or a thread the cursor doesn't cover); a rebased response also
+  // REPLACEs. `syncInFlight` coalesces a burst of triggers to one pull (cleared
+  // by the reply).
   const runSync = useCallback(() => {
     if (syncInFlight.current) return;
-    const cursor = cursorRef.current.cursor;
-    const limit = cursor === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
+    const since = syncSince(cursorRef.current.cursor, messagesRef.current);
+    const limit = since === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
     setSyncInFlight(true);
     try {
-      postSyncRequest(cursor, limit);
+      postSyncRequest(since, limit);
     } catch (e) {
       setSyncInFlight(false);
       log("warn", `sync request failed: ${String(e)}`);
@@ -2676,15 +2895,19 @@ export function Transcript({
             (r) => r.role === "user" && r.sendState !== undefined && !pageIds.has(r.id),
           );
           // The page's reconstructed trailing `w<ordinal>` block and the live
-          // in-flight block are the SAME turn. Fuse them into ONE block — keep it
+          // in-flight block are the SAME turn — while the server says so
+          // (`sameContinuingTurn`: an in-flight turn's trailing block is always
+          // cut off by the window's edge). Fuse them into ONE block — keep it
           // active, adopt the server id + server-anchored timing, union the steps
           // — instead of rendering both (duplicate/overlapping cards) or dropping
-          // either (losing steps or the correct duration).
+          // either (losing steps or the correct duration). A COMPLETE tail block
+          // is a finished turn that merely left no answer bubble; the live block
+          // belongs to the next one and keeps its own card.
           let rows = folded;
           let carried = openWork;
           if (openWork.length > 0) {
             const tail = rows[rows.length - 1];
-            if (tail && tail.role === "work") {
+            if (tail && tail.role === "work" && sameContinuingTurn(tail)) {
               rows = [
                 ...rows.slice(0, -1),
                 {
@@ -2706,83 +2929,7 @@ export function Transcript({
         followRef.current = true;
         if (!turnActiveRef.current) clearStreaming();
       } else {
-        setMessages((prev) => {
-          const next = [...prev];
-          const byId = new Map(next.map((r, i) => [r.id, i] as const));
-          const closeTrailingWork = () => {
-            const last = next[next.length - 1];
-            if (!last || last.role !== "work" || !last.active) return;
-            if (last.steps.length === 0) {
-              next.pop();
-              return;
-            }
-            next[next.length - 1] = {
-              ...last,
-              active: false,
-              elapsedMs: last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined),
-            };
-          };
-          for (const row of pageRows) {
-            const existingIdx = byId.get(row.id);
-            if (existingIdx !== undefined) {
-              const existing = next[existingIdx];
-              // A redelivery of a row already on screen: fold a same-id work
-              // block's newer server steps + timing into what's rendered, or
-              // reconcile a message row — drop an optimistic send's chrome, and
-              // adopt the server's clock over the arrival stamp a live frame /
-              // optimistic send left behind, so the time under the bubble is the
-              // one a cold open will show. Otherwise a no-op.
-              if (existing.role === "work" || row.role === "work") {
-                if (existing.role === "work" && row.role === "work") {
-                  next[existingIdx] = reconcileWork(existing, row);
-                }
-              } else {
-                const createdAt = row.createdAt ?? existing.createdAt;
-                if (existing.sendState !== undefined || createdAt !== existing.createdAt) {
-                  next[existingIdx] = { ...existing, sendState: undefined, createdAt };
-                }
-              }
-              continue;
-            }
-            // The in-flight turn's reconstructed `w<ordinal>` work block is the
-            // SAME turn as the live/restored block at the tail — RECONCILE into
-            // it (union steps + adopt server timing) rather than rendering a
-            // second card. A turn we don't have yet ends on a non-work tail, so
-            // its own work block is still appended.
-            const tail = next[next.length - 1];
-            if (row.role === "work" && tail && tail.role === "work") {
-              next[next.length - 1] = foldWork(tail, row);
-              continue;
-            }
-            // A re-delivered `work` row whose turn ALREADY ended on screen: its
-            // block sits ABOVE the turn's answer bubble (+ any trailing
-            // notices), so the tail isn't work and id-dedup misses — a live
-            // block is keyed by a client `uid()` while the reconstruction keys
-            // it `w<ordinal>`, and even two reconstructions disagree
-            // (`w<first-tool>` for a full tail vs `w<progress-anchor>` for a
-            // difference window). Fold it back into that block instead of
-            // pushing a SECOND card below the answer — the observer's `status`
-            // narration, made durable, is re-delivered by the inclusive
-            // (`after_ordinal >= since`) control-event scan and would otherwise
-            // land as a stray "Worked" block under the reply. Bound the
-            // back-scan to the SAME turn: reconcile only when the trailing run
-            // holds an answer ordinal-above this block, so a genuinely later
-            // turn's block (its answer not yet on screen) still appends.
-            if (row.role === "work") {
-              const ord = rowOrdinal(row.id);
-              const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
-              const target = at >= 0 ? next[at] : undefined;
-              if (target && target.role === "work") {
-                next[at] = reconcileWork(target, row);
-                continue;
-              }
-            }
-            if (row.role === "assistant") closeTrailingWork();
-            next.push(row);
-            byId.set(row.id, next.length - 1);
-          }
-          return next;
-        });
+        setMessages((prev) => mergeSyncPage(prev, pageRows, frame.compaction_points ?? []));
         if (pageRows.some((r) => r.role === "assistant")) clearStreaming();
       }
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
@@ -2813,7 +2960,7 @@ export function Transcript({
         const role = frame.role === "user" ? "user" : "assistant";
         if (role === "user" && frame.platform_msg_id && sentIds.current.has(frame.platform_msg_id)) {
           if (ordinal !== null) renderedOrdinals.current.add(ordinal);
-          markSent(frame.platform_msg_id); // server confirmed the send — stop the spinner
+          markSent(frame.platform_msg_id, ordinal); // server confirmed the send — stop the spinner
           return; // our own message / already rendered
         }
         // The native stop BUTTON issues `/stop` as an ordinary chat send; the
@@ -2849,6 +2996,7 @@ export function Transcript({
           {
             id: frame.platform_msg_id || (ordinal !== null ? `m${ordinal}` : uid()),
             role,
+            ordinal: ordinal ?? undefined,
             content: frame.content,
             attachments: frame.attachments,
             // The wire `Message` frame carries no time field, so arrival is the
@@ -3062,7 +3210,14 @@ export function Transcript({
 
   // Native sent a user message: append the optimistic bubble, seed echo-dedup,
   // snap follow to the newest edge (an own send always returns there).
+  //
+  // Also the outbox's re-seed path, which runs on every mount edge — so a
+  // bubble this thread already holds returns before ANY of that. Not just the
+  // append: `awaitingReply` below would raise the composer's stop button on a
+  // send that failed days ago and is merely awaiting its red dot. A live send
+  // mints a fresh uuid and can never take this exit.
   const handleUserSent = (payload: UserSentPayload) => {
+    if (holdsUserSend(messagesRef.current, payload.msgId)) return;
     sentIds.current.add(payload.msgId);
     followRef.current = true;
     // Optimistically enter the "awaiting reply" window so the composer's stop

@@ -13,7 +13,7 @@ import type { Frame } from '../api/chatWs';
 // batch-vs-individual choice (`canBatchDeferred`) extracted from
 // `drainQueueOnFrame`. The reducer carries all the rules; the callback in
 // ChatPage only performs the side effects the action names. See
-// docs/todo/web-unit-tests.md.
+// docs/web-unit-tests.md.
 
 const SID = 'sess-1';
 

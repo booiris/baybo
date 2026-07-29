@@ -102,6 +102,12 @@ export type TranscriptRowItem = {
   work_started_at?: string;
   work_ended_at?: string;
   cancelled?: boolean;
+  /// For a `work` row: `true` when a real turn boundary (the final answer, the
+  /// next user turn, a `/stop`, a compaction watermark) closed the block INSIDE
+  /// this reconstruction window; `false` when the window's trailing edge cut it
+  /// off and the turn continues into the adjacent (older) page. Absent on
+  /// `message` / `notice` rows, which never fold.
+  turn_complete?: boolean;
   notice_level?: string;
 };
 
@@ -247,6 +253,17 @@ export type ChatMsg = {
   id: string;
   role: "user" | "assistant" | "notice";
   content: string;
+  // The row's persisted ordinal, carried BESIDE the id rather than inside it: a
+  // user row is keyed by its `platform_msg_id` (the echo-dedup key), so
+  // `rowOrdinal` can never recover an ordinal from such an id. `syncSince` reads
+  // it — without it the guard is blind to exactly the rows a rebase-dirty freeze
+  // renders above the cursor. Absent on an optimistic send, on a notice (not
+  // ordinal-addressed), and in a mirror written before this existed.
+  ordinal?: number;
+  // Severity of a reconstructed notice row (`"info"` / `"warn"` / `"error"`), so
+  // a reloaded warning still reads as one instead of neutral grey. Absent on a
+  // live-minted notice and on message rows.
+  level?: string;
   attachments?: WireAttachment[];
   // When the row was said, as an ISO timestamp — the clock under the bubble.
   // Reconstructed rows carry the server's `created_at`; a live `Frame::Message`
@@ -307,6 +324,15 @@ export type WorkRow = {
   startedAt?: number;
   /// Total run, set when the block closes ("Worked Xs").
   elapsedMs?: number;
+  /// The turn this block belongs to ended in a `/stop` — the closed card reads
+  /// "Cancelled" instead of a plain completion. Server-declared; a live block
+  /// learns it when its reconstruction reconciles in.
+  cancelled?: boolean;
+  /// The server's `turn_complete` for a reconstructed block. `false` marks a
+  /// head the page window's edge cut off — the ONLY thing another block may be
+  /// JOINED onto (`sameContinuingTurn`). Absent on a live block (it has no
+  /// server row yet) and on a mirror written before this existed.
+  turnComplete?: boolean;
 };
 
 export type Row = ChatMsg | WorkRow;

@@ -351,8 +351,8 @@ Repeat for the dylan container's own DB; remote-host is relay-only and has no `s
 Deploy order: **install the iOS build first** (it is forward-compatible — the old server never sends a
 `status` frame), then scrub, then deploy the gateway.
 
-Local verification before opening the PR — `app/ios` has **no** CI coverage (`ios-checks` and `ios-sim`
-are both `if: false`), so say so in the PR body:
+Local verification before opening the PR — `app/ios` has no CI coverage at all right now
+(`ios-web`, `ios-core` and `ios-sim` are all `if: false`), so say so in the PR body:
 
 ```bash
 cd /data/aura            && cargo clippy --all --benches --tests --examples --all-features && cargo nextest run --workspace

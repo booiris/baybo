@@ -38,11 +38,10 @@ function LiveElapsed({ startedAt }: { startedAt?: number }) {
   return <span className="work-elapsed">{formatDuration(t, ms)}</span>;
 }
 
-export function workedLabel(t: TFunction, elapsedMs?: number): string {
-  if (elapsedMs !== undefined && elapsedMs >= 1000) {
-    return t("chat.workedFor", { dur: formatDuration(t, elapsedMs) });
-  }
-  return t("chat.worked");
+export function workedLabel(t: TFunction, elapsedMs?: number, cancelled = false): string {
+  const dur = elapsedMs !== undefined && elapsedMs >= 1000 ? formatDuration(t, elapsedMs) : null;
+  if (cancelled) return dur === null ? t("chat.cancelled") : t("chat.cancelledFor", { dur });
+  return dur === null ? t("chat.worked") : t("chat.workedFor", { dur });
 }
 
 /// The step's approval label: "waiting for approval" while the gate holds the
@@ -205,7 +204,7 @@ export const WorkBlockView = memo(function WorkBlockView({
           onToggle?.(next);
         }}
       >
-        <span>{workedLabel(t, row.elapsedMs)}</span>
+        <span>{workedLabel(t, row.elapsedMs, row.cancelled)}</span>
         <span className={`work-chevron${expanded ? " open" : ""}`}>›</span>
       </button>
       {expanded && (

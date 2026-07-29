@@ -1,7 +1,9 @@
 // The per-session sync cursor (protocol v2), lifted out of `Transcript.tsx` so
 // the one rule that guards against silent, permanent data loss is testable on
-// its own. Mirrors `app/web/src/pages/chat/syncCursor.ts` — same protocol, same
-// rule, two clients.
+// its own. `app/web/src/pages/chat/syncCursor.ts` is a byte copy of everything
+// past this header — same protocol, same rule, two clients, two pnpm workspace
+// roots that cannot share a package. `mathDelimiters.port.test.ts` on the web
+// side enforces the copy; port a change to both or that check fires.
 //
 // One cursor per session, advanced max-wins from a sync response's coverage
 // watermark (`next_cursor`) and from ordinal-stamped live final replies —
@@ -20,6 +22,13 @@ export type CursorState = {
   /// Live ordinals still render; they just don't move the cursor.
   rebaseDirty: boolean;
 };
+
+/// The no-baseline-yet state, frozen because it is the shared default handed
+/// out for every session that has not synced yet.
+export const INITIAL_CURSOR: CursorState = Object.freeze({
+  cursor: null,
+  rebaseDirty: false,
+});
 
 /// Advance from a completed sync. `next_cursor` always feeds the max — even on
 /// a rebased page, since it is the sync's own watermark — and the dirty flag

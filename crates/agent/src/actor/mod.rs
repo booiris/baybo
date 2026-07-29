@@ -110,7 +110,8 @@ pub enum AgentMessage {
     /// survives eviction. Processed at a turn boundary (the mailbox is
     /// drained sequentially), so it never swaps the model mid-turn —
     /// it takes effect on the next turn. Routed by the gateway's
-    /// `PUT /v1/chat/sessions/{id}/model` via [`AgentSupervisor::route`].
+    /// `PUT /v1/chat/sessions/{id}/model` via
+    /// [`supervisor::AgentSupervisor::route`].
     SetModel {
         llm: Option<LlmEntryName>,
         /// The model within `llm`'s entry (a `model_list` id), or

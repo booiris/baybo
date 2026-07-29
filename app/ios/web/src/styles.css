@@ -295,6 +295,10 @@ button {
 .send-failed:active { opacity: 0.6; }
 .bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+/* The same severity ramp a folded notice step uses, for a standalone durable
+   notice reloaded with its `notice_level`. */
+.bubble.notice.notice-warn { color: var(--color-ink); }
+.bubble.notice.notice-error { color: var(--color-err); }
 /* Pre-compaction seam: a centered uppercase label flanked by hairlines. Marks
    where a compaction rewrote the model's context — the messages above still
    render, the model just no longer sees them. */

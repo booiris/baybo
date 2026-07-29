@@ -1,12 +1,13 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **20 files, 293 tests** — and the conventions that
+The dashboard's vitest suite — **24 files, 371 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
 Scope: `app/web` only. `app/ios/web` is a **separate** pnpm workspace with its own
-vitest suite over the iOS transcript reducers, gated by the (currently disabled)
-`ios-checks` CI job — it follows the same pure-logic style but is not covered here.
+vitest suite over the iOS transcript reducers, nominally gated by the `ios-web` CI job
+(currently `if: false`) — it
+follows the same pure-logic style but is not covered here.
 
 For **raising** coverage further — the remaining components, drag, real reload —
 see the roadmap at the end.
@@ -160,7 +161,7 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/chat/syncCursor.test.ts` (5) | `syncCursor.ts` — `advanceFromSync`, `advanceFromLive`, `INITIAL_CURSOR` | Cursor is max-wins (never regresses) with a rebase-dirty flag. |
 | `pages/chat/sessionBuckets.test.ts` (20) | `sessionBuckets.ts` — `bucketSessions`, `withoutArchived`, `resolveCollapsed`, `cronCollapseKey`, `cronGroupUnread`, `collapsedByDefault` | Sidebar folder/cron grouping, collapse defaults + override, per-group unread rollup, and archived rows dropped ahead of every other rule (fed raw, so the bucketer itself is the guard). |
 | `pages/chat/mathDelimiters.test.ts` (14) | `mathDelimiters.ts` — `normalizeMath` | Assistant LaTeX normalized for `remark-math`: prose money stays literal, AMS `\(…\)`/`\[…\]` rewritten, own-line `$$` promoted (never inside a list/table), code masked, no super-linear time. Ported verbatim from `app/ios/web`. |
-| `pages/chat/mathDelimiters.port.test.ts` (2) | the two `mathDelimiters` copies | The web copy stays byte-identical to its `app/ios/web` original past the header — the only gate on a module duplicated across two pnpm projects. |
+| `pages/chat/mathDelimiters.port.test.ts` (3) | the `mathDelimiters` pair + `syncCursor.ts` ⇄ `transcript/cursor.ts` | Each web copy stays byte-identical to its `app/ios/web` original past the header — the only gate on a module duplicated across two pnpm projects. The cursor is here because web and device run the ONE sync loop: a rebase-dirty rule that holds on only one client loses rows. |
 | `pages/sessionPatch.test.ts` (6) | `ChatPage.tsx` — `applySessionPatch` | Archive merges in place (the row stays in state so a sparse unarchive patch has something to land on) while `hidden` still removes the row; cron grouping + group pin survive an unrelated patch. |
 | `pages/composerSend.test.ts` (6) | `ChatPage.tsx` — `decideComposerAction` | send / park / stop / noop rule; a non-empty queue never stalls an idle submit (the regression). |
 | `pages/slashCompletion.test.ts` (8) | `ChatPage.tsx` — `applySlashCompletion`, `caretOnSlashToken` | Slash Tab-completion replaces the command token, lands the caret past the trailing space, preserves args. |

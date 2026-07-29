@@ -20,7 +20,7 @@ both legs (same web bundle, same `GatewayJsonClient` API surface):
 
 ```
 on open / reconnect / gap / buffer-overflow re-attach / safety tick:
-  page = sync(since = cursor)          # cursor null → newest-page baseline
+  page = sync(since = syncSince(cursor, rows))   # null → newest-page baseline
   if page.rebased or cursor == null:
       REPLACE thread with page.rows    # keep the open work block + optimistic sends
   else:
@@ -44,6 +44,75 @@ Clock edges — there are five:
 - the 3-minute safety tick.
 
 `syncInFlight` coalesces a burst to one pull.
+
+### A difference must EXTEND the thread, never overlap it
+
+`syncSince` (`Transcript.tsx`) is the gate, and it exists because of a shipped
+bug. The cursor is a **coverage watermark**, not a high-water mark of what is
+rendered: scroll-up paging (`prependOlder`) and the rebase-dirty freeze both put
+rows on screen without advancing it. Ask for `since = cursor` from such a thread
+and the server answers correctly — a *difference*, so no `rebased` REPLACE ever
+fires — while the merge, which appends any row it doesn't already hold, welds
+that whole span onto the BOTTOM of the thread and fuses the page's leading work
+block into the tail's card. One device rendered three hours of conversation 75
+rows too high, under a single "Worked 2h 47m" block; nothing was lost, and
+nothing could self-heal (a re-sync returns nothing, and `sanitizeRestoredRows`
+does not sort).
+
+So: if any rendered row carries a durable ordinal **above** the cursor, present
+`null` and take the baseline REPLACE — the path a fresh install proves correct.
+"Durable ordinal" is `rowCoverageOrdinal`, not the id alone: a user row is KEYED
+by its `platform_msg_id` (so an optimistic bubble reconciles), so it carries the
+server `ordinal` as a field beside the id. Reading only the id made the gate
+blind to every user message ever sent — from this device or another — which is
+precisely the rebase-dirty case it exists for. `app/web` never had the hole: it
+keys every row `row-<sid>-m<ordinal>` and keeps `clientMsgId` separately.
+**This prevents the scramble; it does not repair one.** The welding sync ends by
+advancing the cursor to `next_cursor`, and a difference is only returned when its
+scan did not overrun, so that watermark is the session's newest ordinal — above
+every rendered row. A mirror already scarred is persisted covering itself, so the
+gate stays quiet and the order stands; the exit is the per-session resync. It is quiet
+on a healthy thread (a sync's `next_cursor` covers every row it delivered, a
+live final reply advances the cursor with itself, and paged rows are older than
+everything) and it is self-terminating (a REPLACE leaves the thread a prefix of
+its own watermark). Ordinal-less rows — an optimistic send, a live work block —
+are not durable coverage and never trip it; a send gains its ordinal when the
+echo (`markSent`) or its durable twin (`mergeSyncPage`) confirms it.
+
+### Only the server says two work blocks are one turn
+
+Two adjacent `work` rows used to be folded into one card on ADJACENCY alone
+("a healthy turn has a message row between its block and the next"). The
+scramble above disproved the premise — three turns' blocks ended up side by side
+and welded into a single "Worked 2h 47m" card — and it is not even bug-specific:
+a turn whose empty final reply leaves no bubble abuts the next fire the same
+way.
+
+So the fold asks the server instead. Every reconstructed `work` row carries
+`turn_complete` (`ChatTranscriptItem`, already on the wire — the FFI passes sync
+/ history rows through verbatim): `false` = the page window's trailing edge cut
+this block off and its turn continues into the adjacent page, `true` = a real
+boundary (the final answer, the next user turn, a `/stop`, a compaction
+watermark) closed it in-window. `sameContinuingTurn` (`Transcript.tsx`, mirroring
+`app/web`'s) lets a block be JOINED onto the previous one only when that previous
+one is a cut-off (`false`) head — every seam asks it: `foldAdjacentWork` (the
+prepend and REPLACE folds), `mergeSyncPage`'s tail fold, and the REPLACE
+overlay's live-block fuse. A live block is keyed by `uid()`, carries no flag, and
+still fuses with its own reconstruction — that is RECONCILE (one span, two
+representations), not a join. An ABSENT flag declines: an extra card is
+cosmetic, a wrong join swallows a whole turn into another's card.
+
+The mirror's restore heal (`sanitizeRestoredRows`, which folds a legacy
+[work][work] tear) skips a head the server called complete — otherwise the next
+cold open would weld back exactly what the guard kept apart.
+
+`crossesCompaction` STAYS alongside it. It is subsumed only for a watermark the
+server saw: a split inside one reconstruction window flushes the pre-compaction
+half `turn_complete: true`, which `sameContinuingTurn` refuses on its own. A
+watermark falling in the GAP between two pages is straddled by no single window,
+so neither page splits its own half and the head is an ordinary cut-off block —
+there the compaction guard is the only refusal. `mergeSyncPage` carries both
+guards for the same reason `foldAdjacentWork` does.
 
 ### The server replays NOTHING on Subscribe
 
@@ -118,6 +187,13 @@ exactly three such paths — all of them a user's deletion, none of them a sweep
   directory sweep).
 - `removeAll` — logout/rebind: the rows belong to the gateway we just left.
 
+The one delete that is **not** a conversation going away is
+`dropTranscriptMirror` — the per-session resync escape hatch
+([transcript.md](transcript.md#per-session-resync-the-escape-hatch)). The row,
+the outbox and the pending approvals all stay; only the local rendering is
+discarded, so the cold-open path can rebuild it from the gateway. It is still
+user-triggered and still per-session: nothing here sweeps.
+
 ### Never mint the orphan in the first place
 
 **An empty thread with no cursor never writes a mirror at all** (the persist
@@ -182,6 +258,38 @@ Entries are keyed by `platform_msg_id` with a two-stage confirmation:
 
 No echo within 10 s → one blind resend, capped at 3 transmissions, then `failed` +
 the manual red-dot retry (`resetForManualRetry`).
+
+### The re-seed runs on every mount
+
+An entry's optimistic BUBBLE lives in the webview's thread, and the gateway has
+no row to bring a queued send back from — so whenever the thread a page mounts
+with is older than the outbox, the user's message silently vanishes and a
+`failed` one loses the red dot that is its only retry affordance (the retry
+payload lives in the web row). `ChatStore.replayUnconfirmedSends` re-seeds the
+surviving entries, oldest first, `sendFailed` for the failed ones.
+
+It runs on **every** mount edge — the `ready` of any page load, and every
+`retarget` attach — never behind a "a resync just happened" latch. The
+[per-session resync](transcript.md#per-session-resync-the-escape-hatch) is only
+the loudest way to lose the bubbles; a jetsam between a send and the mirror's
+debounced write, a session whose mirror was never written, and a rebased page
+that dropped the row all do it too, and a latch reachable only from the hatch
+left every one of those permanent. (The resync itself does not touch the outbox
+file, and seeds nothing of its own: reached from the list, the session it
+rebuilds usually has no page yet.)
+
+Running it always is safe because the re-seed is **idempotent, and the WEBVIEW is
+what makes it so**. A user row is keyed by its `platform_msg_id`, so
+`handleUserSent` asks `holdsUserSend` and returns before appending — before
+`awaitingReply` too, which would otherwise raise the composer's stop button on a
+send that failed days ago. A live send mints a fresh uuid and can never take that
+exit. Native cannot make the call itself: it does not know whether the tree it is
+seeding came up from a mirror that already carries the bubbles.
+
+The one native-side rule the idempotency needs: `retarget` skips the re-seed
+while the page is not `ready`. Those calls would only queue in the bridge's
+`pending`, and the `ready` that flushes them re-seeds again — the same work
+twice, arriving before React has committed the first pass and can recognise it.
 
 On the reconnect edge the sync runs first (the reconciliation gate), then
 unconfirmed entries resend. A **rebased** sync hides the floor, so each

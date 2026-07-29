@@ -5,6 +5,7 @@ import {
   applySyncReplace,
   compactionDividerKeys,
   shouldAutoLoadOlder,
+  syncSince,
   transcriptItemToRow,
   type TranscriptRow,
 } from './ChatPage';
@@ -24,6 +25,20 @@ function msg(ordinal: number, role: 'user' | 'assistant', text: string, pmid?: s
     platform_msg_id: pmid ?? '',
     created_at: new Date(0).toISOString(),
   } as ApiItem;
+}
+
+function work(key: string, complete: boolean): TranscriptRow {
+  return {
+    key,
+    role: 'system',
+    text: '',
+    kind: 'work',
+    workActive: false,
+    workComplete: complete,
+    workStartedAt: 1,
+    workEndedAt: 2,
+    steps: [{ key: `${key}-0`, kind: 'tool', tool: 'bash', toolStatus: 'ok' }],
+  };
 }
 
 describe('transcriptItemToRow', () => {
@@ -83,7 +98,7 @@ describe('applySyncMerge (difference append + dedup)', () => {
       transcriptItemToRow(SID, msg(2, 'user', 'q', 'x')), // redelivery of our send
       transcriptItemToRow(SID, msg(3, 'assistant', 'a')), // new assistant reply
     ];
-    const out = applySyncMerge(prev, page);
+    const out = applySyncMerge(prev, page, []);
     // The optimistic row is reconciled in place (pending cleared), the reply
     // appended — no duplicate user bubble.
     const users = out.filter((r) => r.role === 'user');
@@ -95,7 +110,7 @@ describe('applySyncMerge (difference append + dedup)', () => {
   it('a redelivered row already on screen is a no-op', () => {
     const prev: TranscriptRow[] = [{ key: `row-${SID}-m3`, role: 'assistant', text: 'a' }];
     const page = [transcriptItemToRow(SID, msg(3, 'assistant', 'a'))];
-    expect(applySyncMerge(prev, page)).toHaveLength(1);
+    expect(applySyncMerge(prev, page, [])).toHaveLength(1);
   });
 
   it('reconciles a live /stop-ack notice with its durable twin by content (no double)', () => {
@@ -115,11 +130,11 @@ describe('applySyncMerge (difference append + dedup)', () => {
       notice_level: 'info',
       created_at: new Date(0).toISOString(),
     } as ApiItem);
-    const out = applySyncMerge(prev, [synced]);
+    const out = applySyncMerge(prev, [synced], []);
     expect(out).toHaveLength(1); // reconciled, not doubled
     expect(out[0].key).toBe(`row-${SID}-n4`); // adopted the durable key
     // A second sync now dedups by key.
-    expect(applySyncMerge(out, [synced])).toBe(out);
+    expect(applySyncMerge(out, [synced], [])).toBe(out);
   });
 
   it('reconciles a durable /compact command echo with the optimistic bubble by platform_msg_id', () => {
@@ -138,10 +153,77 @@ describe('applySyncMerge (difference append + dedup)', () => {
       platform_msg_id: 'c',
       created_at: new Date(0).toISOString(),
     } as ApiItem);
-    const out = applySyncMerge(prev, [synced]);
+    const out = applySyncMerge(prev, [synced], []);
     const commands = out.filter((r) => r.text === '/compact');
     expect(commands).toHaveLength(1); // reconciled, not doubled
     expect(commands[0].pending).toBeFalsy();
+  });
+
+  it('never fuses across a compaction boundary at the merge seam', () => {
+    // The cursor fell mid-turn, so the thread's trailing cut-off block meets
+    // this page's leading one — but a compaction watermark landed in the GAP
+    // between the two windows, which neither reconstruction split. They are two
+    // turns; fusing them takes the older key and eats the divider's anchor row.
+    const points = [{ ordinal: 30, at: 't' }];
+    const prev: TranscriptRow[] = [
+      { key: `row-${SID}-m10`, role: 'assistant', text: 'a' },
+      work(`row-${SID}-w20`, false),
+    ];
+    const page = [work(`row-${SID}-w40`, true)];
+    const out = applySyncMerge(prev, page, points);
+    expect(out.map((r) => r.key)).toEqual([
+      `row-${SID}-m10`,
+      `row-${SID}-w20`,
+      `row-${SID}-w40`,
+    ]);
+    // …and the seam the divider keys off is still on screen.
+    expect([...compactionDividerKeys(out, points).keys()]).toEqual([`row-${SID}-w40`]);
+    // No boundary between them ⇒ one turn the page edge cut, still one card.
+    expect(applySyncMerge(prev, page, [])).toHaveLength(2);
+  });
+});
+
+describe('syncSince — a difference page must EXTEND the thread, never overlap it', () => {
+  // The iOS scar, which this client shares: the cursor is a COVERAGE watermark,
+  // and `loadOlder` renders rows without advancing it. Ask for `since = cursor`
+  // from such a thread and the server answers a correct DIFFERENCE (no rebase,
+  // so nothing self-heals) that `applySyncMerge` welds onto the bottom.
+  const rendered = (): TranscriptRow[] => [
+    { key: `row-${SID}-m10`, role: 'assistant', text: 'older' },
+    { key: `row-${SID}-m20`, role: 'assistant', text: 'newer' },
+  ];
+
+  it('takes the baseline when a rendered row sits above the cursor', () => {
+    expect(syncSince(5, rendered())).toBeNull();
+  });
+
+  it('keeps differencing when the cursor covers the thread', () => {
+    expect(syncSince(20, rendered())).toBe(20);
+    expect(syncSince(99, rendered())).toBe(99);
+  });
+
+  it('is quiet on rows carrying no ordinal — an optimistic send is not durable coverage', () => {
+    const rows: TranscriptRow[] = [
+      ...rendered(),
+      { key: 'pending-x', role: 'user', text: 'just sent', pending: true, clientMsgId: 'x' },
+      { key: `notice-${SID}-0-1700`, role: 'system', text: '', notice: { level: 'info', text: 'n' } },
+    ];
+    expect(syncSince(20, rows)).toBe(20);
+  });
+
+  it('stays null with no cursor at all (the fresh-tab baseline)', () => {
+    expect(syncSince(null, rendered())).toBeNull();
+  });
+
+  it('is what stands between the overlap and the merge', () => {
+    // What the merge does with the page the guard now refuses: rows 11..19 land
+    // BELOW m20 instead of between m10 and it.
+    const page = [transcriptItemToRow(SID, msg(18, 'assistant', 'missing'))];
+    expect(applySyncMerge(rendered(), page, []).map((r) => r.key)).toEqual([
+      `row-${SID}-m10`,
+      `row-${SID}-m20`,
+      `row-${SID}-m18`,
+    ]);
   });
 });
 

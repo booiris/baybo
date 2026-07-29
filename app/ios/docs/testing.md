@@ -16,7 +16,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 # Transcript bundle (own pnpm workspace — the root `frontend` job never sees it)
 (cd web && pnpm lint)     # eslint: wiring-bug gate (suppression baseline)
 (cd web && pnpm test)     # vitest: reducers, sync cursor, bridge isolation, WorkBlock render
-(cd web && pnpm build)    # tsc --noEmit -> enforces web/src/wireSentinel.ts
+(cd web && pnpm build)    # tsc --noEmit -> enforces both drift sentinels
 
 # Swift. Build once, then run either bundle against the built products.
 xcodegen generate
@@ -106,19 +106,29 @@ Demo flags are only hermetic with it.
 
 ## CI
 
-CI (`.github/workflows/ci.yml`) — **both jobs are currently `if: false`, so
-nothing under `app/ios` is covered.** Run the four tiers above by hand and say
-so in the PR body; a green check means only that the rest of the workspace
-passed.
+CI (`.github/workflows/ci.yml`) defines three iOS jobs and **runs none of them**
+— all three are `if: false` while the Actions quota is out. Every tier below is
+run by hand; say so in the PR body, because no check anywhere will.
 
-- `ios-checks` (ubuntu) would run the Rust and web tiers;
-- `ios-sim` (macos-26, build + unit tests, non-gating UI smokes) would run the
-  Swift half.
+- `ios-web` (ubuntu, 1×) — **off, and the cheapest to restore.** `pnpm lint &&
+  pnpm test && pnpm build` in `app/ios/web`. `pnpm build` is
+  `tsc --noEmit && vite build`, and that typecheck is the only place the two
+  compile-time drift sentinels are ever evaluated: `src/wireSentinel.ts` (frame
+  mirrors ⇄ the ts-rs contract in `crates/wire`) and `src/restSentinel.ts`
+  (`TranscriptRowItem` ⇄ the gateway's `ChatTranscriptItem`). Until it is back
+  on, both sentinels only fire on a laptop.
+- `ios-core` (ubuntu, 1×) — **`if: false`.** Would run `cargo fmt` / `clippy` /
+  `nextest` over the ffi workspace. Off because it shares no cache with the root
+  workspace and pays a cold ~286-crate build.
+- `ios-sim` (macos-26, 10×) — **`if: false`.** Would run the build + unit tests
+  and the non-gating UI smokes.
 
-Both are path-filtered — and the filter deliberately includes
-`crates/{wire,device-proto,model}` and `remote-host/`, because the ffi workspace
-path-depends on them and a root-crate change can break the iOS build without
-touching `app/ios` at all.
+All three are path-filtered — and the filter deliberately includes
+`crates/{wire,device-proto,model}`, `remote-host/` and `docs/openapi.json`,
+because the ffi workspace path-depends on the first two and the transcript
+bundle's REST sentinel is generated from the third, so a change to any of them
+can break the iOS build (or silently drift the transcript's row contract)
+without touching `app/ios` at all.
 
 ## Headless UI verification
 
