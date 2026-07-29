@@ -558,15 +558,19 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
 /// Combine streamed reasoning deltas + any complete `Thinking` blocks
 /// into one `Reasoning` block for `AssistantContent`. Returns `None`
 /// when there's nothing to surface.
+///
+/// `reasoning_summary_text.delta` streams the *same* prose that the
+/// finalised `output_item.done` reasoning item then repeats under
+/// `summary[]`, so keeping both yields the summary twice — once from
+/// each source. The finalised item wins (it is complete even when the
+/// deltas were cut short); the delta buffer only fills in when no item
+/// carried a summary at all.
 fn build_reasoning_block(
     reasoning_buf: String,
     thinking_blocks: Vec<baybo_model::ContentBlock>,
 ) -> Option<Reasoning> {
     let mut content: Vec<ReasoningContent> = Vec::new();
-    if !reasoning_buf.is_empty() {
-        // Codex reasoning deltas are summary-style (no signature payload).
-        content.push(ReasoningContent::Summary(reasoning_buf));
-    }
+    let mut saw_item_summary = false;
     for block in thinking_blocks {
         if let baybo_model::ContentBlock::Thinking { content: tc, .. } = block {
             for piece in tc {
@@ -575,6 +579,7 @@ fn build_reasoning_block(
                         ReasoningContent::Text { text, signature }
                     }
                     baybo_model::ThinkingContent::Summary { text } => {
+                        saw_item_summary = true;
                         ReasoningContent::Summary(text)
                     }
                     baybo_model::ThinkingContent::Redacted { data } => {
@@ -583,6 +588,10 @@ fn build_reasoning_block(
                 });
             }
         }
+    }
+    if !reasoning_buf.is_empty() && !saw_item_summary {
+        // Codex reasoning deltas are summary-style (no signature payload).
+        content.insert(0, ReasoningContent::Summary(reasoning_buf));
     }
     if content.is_empty() {
         return None;
@@ -1255,9 +1264,9 @@ mod tests {
             ReasoningContent::Summary(s) if s == "step 1\nstep 2"
         ));
 
-        // Reasoning deltas + structured thinking block -> Summary + the
-        // block's pieces appended in order. Verifies neither path drops
-        // content (the bug this regression test guards against).
+        // Reasoning deltas + a thinking block that carries NO summary ->
+        // Summary + the block's pieces appended in order. Verifies neither
+        // path drops content (the bug this regression test guards against).
         let block = baybo_model::ContentBlock::Thinking {
             id: Some("t1".into()),
             content: vec![
@@ -1279,6 +1288,32 @@ mod tests {
                 if text == "signed thought" && sig == "sig"
         ));
         assert!(matches!(&r.content[2], ReasoningContent::Redacted { data } if data == "secret"));
+    }
+
+    #[test]
+    fn build_reasoning_block_drops_deltas_the_finalised_item_repeats() {
+        // Codex streams `reasoning_summary_text.delta` and then repeats the
+        // same prose in `output_item.done`'s `summary[]`. Keeping both
+        // surfaced the summary twice ("**Title**\n**Title**") in the trace
+        // and echoed it twice back to the provider.
+        let summary = "**Planning live GitHub trending fetch**";
+        let block = baybo_model::ContentBlock::Thinking {
+            id: Some("rs_1".into()),
+            content: vec![
+                baybo_model::ThinkingContent::Summary {
+                    text: summary.into(),
+                },
+                baybo_model::ThinkingContent::Redacted {
+                    data: "encrypted".into(),
+                },
+            ],
+        };
+        let r = build_reasoning_block(summary.into(), vec![block]).unwrap();
+        assert_eq!(r.content.len(), 2);
+        assert!(matches!(&r.content[0], ReasoningContent::Summary(s) if s == summary));
+        assert!(
+            matches!(&r.content[1], ReasoningContent::Redacted { data } if data == "encrypted")
+        );
     }
 
     #[test]
