@@ -29,6 +29,8 @@ export const en = {
       approvalApprovedAlways: "always approved",
       approvalDenied: "denied",
       workedFor: "Worked {{dur}}",
+      cancelled: "Cancelled",
+      cancelledFor: "Cancelled · Worked {{dur}}",
       durS: "{{s}}s",
       durM: "{{m}}m",
       durMS: "{{m}}m {{s}}s",

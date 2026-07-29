@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
@@ -8,19 +9,24 @@ import {
   severTerminalNoticeIn,
   freezeActiveWork,
   hasUntimedWork,
+  holdsUserSend,
   isStopAckNotice,
   isStopCommand,
+  mergeSyncPage,
   mergeWorkSteps,
   openWorkIn,
   outlineEntries,
   reconcileWork,
   restStepToWork,
   restoreImageDims,
+  rowOrdinal,
   sameTurnWorkIndex,
   sanitizeRestoredRows,
+  syncSince,
   transcriptItemToRow,
   wireStepToWork,
 } from "../Transcript";
+import { workedLabel } from "../WorkBlock";
 import type { ChatMsg, Row, TranscriptRowItem, WorkRow, WorkStep } from "../types";
 
 const NOW = 1_700_000_000_000;
@@ -89,6 +95,17 @@ describe("sanitizeRestoredRows — the four restore heals", () => {
     ]);
   });
 
+  it("does NOT weld an adjacency the fold guard deliberately left standing", () => {
+    // Two complete turns, persisted as two cards because `sameContinuingTurn`
+    // refused them at the sync seam. The legacy heal must not undo that on the
+    // next cold open — or the guard would hold for exactly one session.
+    const rows: Row[] = [
+      work({ id: "w1", steps: [{ kind: "reasoning", text: "a" }], turnComplete: true }),
+      work({ id: "w2", steps: [{ kind: "reasoning", text: "b" }], turnComplete: true }),
+    ];
+    expect(sanitizeRestoredRows(rows)).toHaveLength(2);
+  });
+
   it("falls back to the stranded half's duration when the anchoring block has none", () => {
     const rows: Row[] = [
       work({ id: "w1", steps: [{ kind: "reasoning", text: "a" }] }),
@@ -152,13 +169,20 @@ describe("sanitizeRestoredRows — the four restore heals", () => {
 describe("transcriptItemToRow — three wire shapes, one Row", () => {
   it("keys a user row by its platform_msg_id so the optimistic bubble reconciles", () => {
     const item: TranscriptRowItem = { id: "m4", ordinal: 4, kind: "message", role: "user", text: "hi", platform_msg_id: "pm-1" };
-    expect(transcriptItemToRow(item)).toEqual({ id: "pm-1", role: "user", content: "hi", attachments: undefined });
+    expect(transcriptItemToRow(item)).toEqual({ id: "pm-1", role: "user", ordinal: 4, content: "hi", attachments: undefined });
+  });
+
+  // The id it is KEYED by carries no ordinal, so the row must carry one itself —
+  // `syncSince` is blind to every user message otherwise.
+  it("carries the server ordinal beside the platform_msg_id key", () => {
+    const item: TranscriptRowItem = { id: "m4", ordinal: 4, kind: "message", role: "user", text: "hi", platform_msg_id: "pm-1" };
+    expect(transcriptItemToRow(item)).toMatchObject({ ordinal: 4 });
   });
 
   it("keys an assistant row by the stable m<ordinal> id and carries its attachments", () => {
     const attachments = [{ kind: "image" as const, blob_id: "sha256:ab.tok", mime_type: "image/png", size: 12 }];
     const item: TranscriptRowItem = { id: "m5", ordinal: 5, kind: "message", role: "assistant", text: "there", attachments };
-    expect(transcriptItemToRow(item)).toEqual({ id: "m5", role: "assistant", content: "there", attachments });
+    expect(transcriptItemToRow(item)).toEqual({ id: "m5", role: "assistant", ordinal: 5, content: "there", attachments });
   });
 
   it("carries the server's created_at — the clock under a reconstructed bubble", () => {
@@ -188,6 +212,11 @@ describe("transcriptItemToRow — three wire shapes, one Row", () => {
     expect(transcriptItemToRow(item)).toEqual({ id: "n4", role: "notice", content: "degraded mode" });
   });
 
+  it("reloads a notice at the severity the live frame carried, not neutral", () => {
+    const item: TranscriptRowItem = { id: "n5", kind: "notice", text: "skill failed", notice_level: "error" };
+    expect(transcriptItemToRow(item)).toMatchObject({ level: "error" });
+  });
+
   it("anchors a work row to the SERVER's turn start and duration", () => {
     const item: TranscriptRowItem = {
       id: "w7",
@@ -196,20 +225,28 @@ describe("transcriptItemToRow — three wire shapes, one Row", () => {
       steps: [{ kind: "reasoning", text: "hmm" }],
       work_started_at: "2026-07-12T10:00:00.000Z",
       work_ended_at: "2026-07-12T10:00:12.000Z",
+      turn_complete: true,
     };
     expect(transcriptItemToRow(item)).toEqual({
       id: "w7",
       role: "work",
       steps: [{ kind: "reasoning", text: "hmm" }],
       active: false,
+      turnComplete: true,
       startedAt: Date.parse("2026-07-12T10:00:00.000Z"),
       elapsedMs: 12_000,
     });
   });
 
+  it("marks a /stop'd turn's block cancelled so its card says so instead of reading as a normal turn", () => {
+    const item: TranscriptRowItem = { id: "w9", ordinal: 9, kind: "work", steps: [{ kind: "prose", text: "x" }], cancelled: true };
+    expect(transcriptItemToRow(item)).toMatchObject({ cancelled: true });
+  });
+
   it("leaves an unfinished work row untimed rather than inventing a duration", () => {
-    const item: TranscriptRowItem = { id: "w8", kind: "work", steps: [{ kind: "prose", text: "x" }], work_started_at: "2026-07-12T10:00:00.000Z" };
-    expect(transcriptItemToRow(item)).toMatchObject({ elapsedMs: undefined });
+    const item: TranscriptRowItem = { id: "w8", kind: "work", steps: [{ kind: "prose", text: "x" }], work_started_at: "2026-07-12T10:00:00.000Z", turn_complete: false };
+    // The cut-off flag rides along — it is what lets the next page's half join.
+    expect(transcriptItemToRow(item)).toMatchObject({ elapsedMs: undefined, turnComplete: false });
   });
 });
 
@@ -261,8 +298,10 @@ describe("restStepToWork — the REST shape (tool_* names)", () => {
     expect(restStepToWork({ kind: "tool", tool: "Bash" })).toMatchObject({ callId: "" });
   });
 
-  it("defaults a reconstructed call to 'ok' — its call is closed by definition", () => {
-    expect(restStepToWork({ kind: "tool", tool: "Read" })).toMatchObject({ label: "Read", status: "ok" });
+  // A persisted result that carried no status is not evidence of success; the
+  // old "ok" default painted such a step green while app/web left it neutral.
+  it("leaves a statusless step NEUTRAL rather than calling it ok", () => {
+    expect(restStepToWork({ kind: "tool", tool: "Read" })).toMatchObject({ label: "Read", status: "" });
   });
 
   it("keeps the persisted approval verdict so a reload re-labels the same step", () => {
@@ -516,10 +555,13 @@ describe("foldAdjacentWork — a turn cut by a page boundary is still one turn",
   const FIRST_END = 1784173863833; // row 41 — the older page's last row
   const SECOND_START = 1784173872143; // row 43
   const TURN_END = 1784174854449; // row 91 — the answer
+  // `turnComplete` is the server's `turn_complete`: the older page's half was
+  // cut off by that window's trailing edge (`false` — its turn continues into
+  // the next page), the newer page's half was closed by the answer (`true`).
   const first = (): WorkRow =>
-    work({ id: "w3", steps: [tool({ callId: "", label: "Fetch(a)" })], startedAt: TURN_START, elapsedMs: FIRST_END - TURN_START });
+    work({ id: "w3", steps: [tool({ callId: "", label: "Fetch(a)" })], startedAt: TURN_START, elapsedMs: FIRST_END - TURN_START, turnComplete: false });
   const second = (): WorkRow =>
-    work({ id: "w43", steps: [tool({ callId: "", label: "Fetch(b)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START });
+    work({ id: "w43", steps: [tool({ callId: "", label: "Fetch(b)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START, turnComplete: true });
 
   it("spans the whole turn — neither half's own duration is the turn's", () => {
     const [row] = foldAdjacentWork([first(), second()]) as [WorkRow];
@@ -551,10 +593,14 @@ describe("foldAdjacentWork — a turn cut by a page boundary is still one turn",
   });
 
   it("collapses a run of three halves (a turn spanning three pages)", () => {
-    const third = work({ id: "w80", steps: [tool({ callId: "", label: "Fetch(c)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START });
-    const out = foldAdjacentWork([first(), second(), third]) as WorkRow[];
+    // Two cut-off halves, then the one the answer closed: the fused pair stays
+    // cut off (it takes the NEWER half's completeness), so the chain continues.
+    const middle = work({ id: "w43", steps: [tool({ callId: "", label: "Fetch(b)" })], startedAt: SECOND_START, elapsedMs: 1_000, turnComplete: false });
+    const third = work({ id: "w80", steps: [tool({ callId: "", label: "Fetch(c)" })], startedAt: SECOND_START, elapsedMs: TURN_END - SECOND_START, turnComplete: true });
+    const out = foldAdjacentWork([first(), middle, third]) as WorkRow[];
     expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ id: "w3", startedAt: TURN_START, elapsedMs: TURN_END - TURN_START });
+    expect(out[0]).toMatchObject({ id: "w3", startedAt: TURN_START, elapsedMs: TURN_END - TURN_START, turnComplete: true });
+    expect(out[0].steps).toHaveLength(3);
   });
 
   // The other fold: a live block beside its OWN reconstruction is one span in
@@ -577,11 +623,43 @@ describe("foldAdjacentWork — a turn cut by a page boundary is still one turn",
     // A mid-turn compaction split w3 | w43 at watermark 20 (server-side). Without
     // the guard iOS's fold would re-join them into one card and swallow the
     // divider; with the boundary between their ordinals they stay two cards.
+    //
+    // This is also the case `turn_complete` does NOT subsume, which is why both
+    // guards stay: the head here is an ordinary cut-off (`false`) block — a
+    // watermark landing in the GAP between two pages is straddled by no single
+    // reconstruction window, so neither page splits its own half and only the
+    // compaction guard knows the seam is there.
     const out = foldAdjacentWork([first(), second()], [{ ordinal: 20, at: "t" }]);
     expect(out).toHaveLength(2);
     expect((out as WorkRow[]).map((r) => r.id)).toEqual(["w3", "w43"]);
     // A boundary OUTSIDE the pair (below both) still lets them fuse.
     expect(foldAdjacentWork([first(), second()], [{ ordinal: 2, at: "t" }])).toHaveLength(1);
+  });
+
+  it("does NOT fuse a COMPLETE block with the block after it (two turns, two cards)", () => {
+    // The scar: a sync bug put blocks from three different turns side by side
+    // and adjacency alone welded them into one "Worked 2h 47m" card carrying
+    // every turn's steps. The same shape arises without any bug — a turn whose
+    // empty final reply left no bubble, abutting the next fire — so the server's
+    // word is the only thing that tells the two apart.
+    const out = foldAdjacentWork([{ ...first(), turnComplete: true }, second()]) as WorkRow[];
+    expect(out).toHaveLength(2);
+    expect(out.map((r) => r.id)).toEqual(["w3", "w43"]);
+    expect(out.map((r) => r.steps.length)).toEqual([1, 1]); // no card wears another turn's steps
+  });
+
+  it("DECLINES when completeness is unknown — a mirror written before the flag existed", () => {
+    // Refusing costs one extra card; joining wrongly swallows a whole turn.
+    const out = foldAdjacentWork([{ ...first(), turnComplete: undefined }, second()]);
+    expect(out).toHaveLength(2);
+  });
+
+  // The server flags the half its `/stop` closed and resets per flush, so only
+  // the NEWER half of a page-torn turn ever carries it — the joined card must
+  // still read "Cancelled".
+  it("keeps the newer half's cancelled flag on the joined card", () => {
+    const [row] = foldAdjacentWork([first(), { ...second(), cancelled: true }]) as [WorkRow];
+    expect(row).toMatchObject({ id: "w3", cancelled: true });
   });
 });
 
@@ -593,6 +671,9 @@ describe("reconcileWork", () => {
       id: "live-uid",
       role: "work",
       active: true,
+      // Neither side claims a cancel, and a reconciled card always STATES that:
+      // the flag is only ever known server-side, so "no news" is settled news.
+      cancelled: false,
       startedAt: 100,
       elapsedMs: 8_000,
       steps: [tool({ callId: "c1" }), { kind: "reasoning", text: "r" }],
@@ -602,6 +683,49 @@ describe("reconcileWork", () => {
   it("falls back to the live anchors when the server carries none", () => {
     const base = work({ id: "live", steps: [], active: true, startedAt: 999, elapsedMs: 5 });
     expect(reconcileWork(base, work({ id: "w1" }))).toMatchObject({ startedAt: 999, elapsedMs: 5 });
+  });
+
+  // The ONLY way a `/stop`ped block gets its label: the live card knows nothing
+  // about the cancel — the reconstruction carries the flag.
+  it("takes the server's cancelled flag onto the live block", () => {
+    const base = work({ id: "live", steps: [tool({ callId: "c1" })], active: true });
+    expect(reconcileWork(base, work({ id: "w7", cancelled: true }))).toMatchObject({ cancelled: true });
+  });
+
+  it("never un-cancels a card the base already carried", () => {
+    const base = work({ id: "live", steps: [], cancelled: true });
+    expect(reconcileWork(base, work({ id: "w7", cancelled: false }))).toMatchObject({ cancelled: true });
+  });
+});
+
+describe("a cancelled turn's card says so", () => {
+  /// The label helpers own the KEY plus its interpolation, not the English copy
+  /// (`formatters.test.ts` uses the same stand-in).
+  const t = ((key: string, values?: unknown) =>
+    values === undefined ? key : `${key}:${JSON.stringify(values)}`) as unknown as TFunction;
+
+  it("carries `cancelled` from the wire row all the way to the closed card's label", () => {
+    const item: TranscriptRowItem = {
+      id: "w9",
+      ordinal: 9,
+      kind: "work",
+      steps: [{ kind: "prose", text: "half an answer" }],
+      work_started_at: "2026-07-12T10:00:00.000Z",
+      work_ended_at: "2026-07-12T10:00:07.000Z",
+      cancelled: true,
+    };
+    const row = transcriptItemToRow(item) as WorkRow;
+    expect(workedLabel(t, row.elapsedMs, row.cancelled)).toContain("chat.cancelledFor");
+  });
+
+  it("says just 'Cancelled' when the turn was too short to time", () => {
+    expect(workedLabel(t, 400, true)).toBe("chat.cancelled");
+    expect(workedLabel(t, undefined, true)).toBe("chat.cancelled");
+  });
+
+  it("leaves an ordinary completed turn's label alone", () => {
+    expect(workedLabel(t, 400, false)).toBe("chat.worked");
+    expect(workedLabel(t, 7_000)).toContain("chat.workedFor");
   });
 });
 
@@ -637,6 +761,211 @@ describe("sameTurnWorkIndex", () => {
       { id: "pm-1", role: "user", content: "next" },
     ];
     expect(sameTurnWorkIndex(rows, 10)).toBe(-1);
+  });
+});
+
+describe("holdsUserSend — the outbox re-seed runs on every mount, so it must be idempotent", () => {
+  const queued = (id: string): Row => ({ id, role: "user", content: "hi", sendState: "sending" });
+
+  it("recognises a bubble the restored mirror already carries", () => {
+    expect(holdsUserSend([queued("pm-1")], "pm-1")).toBe(true);
+  });
+
+  // The resync case: the mirror is gone, so the rebuilt page has nothing and
+  // every unconfirmed send has to come back.
+  it("says no on an empty thread", () => {
+    expect(holdsUserSend([], "pm-1")).toBe(false);
+  });
+
+  // The mirror predating the send (a jetsam before the debounced write) is the
+  // pre-existing hole this closes — the thread is there, the bubble is not.
+  it("says no when the thread predates the send", () => {
+    expect(holdsUserSend([{ id: "m10", role: "assistant", content: "older" }], "pm-1")).toBe(false);
+  });
+
+  // A send is keyed by its `platform_msg_id` and an assistant row by `m<ordinal>`,
+  // so the roles cannot collide — but the check must not rely on that.
+  it("ignores a non-user row that happens to share the id", () => {
+    expect(holdsUserSend([{ id: "pm-1", role: "assistant", content: "hi" }], "pm-1")).toBe(false);
+  });
+
+  // The bubble stays keyed by its `platform_msg_id` once the echo confirms it,
+  // and its outbox entry lives on until DURABILITY does — so a re-seed in that
+  // window must still recognise it.
+  it("recognises a bubble whose echo already cleared the spinner", () => {
+    expect(holdsUserSend([{ id: "pm-1", role: "user", content: "hi", ordinal: 7 }], "pm-1")).toBe(true);
+  });
+});
+
+describe("syncSince / mergeSyncPage — a difference page must EXTEND the thread, never overlap it", () => {
+  // The scar: a device mirror rendering rows far above its persisted cursor (a
+  // COVERAGE watermark, which scroll-up paging and a rebase-dirty freeze never
+  // advance) asked for the difference anyway. The server answered correctly —
+  // as a difference, not a rebase, so nothing self-healed — and the merge welded
+  // three hours of conversation 75 rows up the thread and fused three turns into
+  // one "Worked 2h 47m" card.
+  const rendered = (): Row[] => [
+    { id: "m10", role: "assistant", content: "older" },
+    { id: "m20", role: "assistant", content: "newer" },
+    work({ id: "w30", steps: [tool({ callId: "c30" })], startedAt: 30_000, elapsedMs: 1_000 }),
+  ];
+  // What the gateway answers: rows strictly above `since`, or the newest page
+  // (a REPLACE) when the client presents no cursor at all.
+  const answer = (since: number | null): { rows: Row[]; replace: boolean } => {
+    const all: Row[] = [
+      { id: "m10", role: "assistant", content: "older" },
+      work({ id: "w15", steps: [tool({ callId: "c15" })], startedAt: 15_000, elapsedMs: 1_000 }),
+      { id: "m18", role: "assistant", content: "missing" },
+      { id: "m20", role: "assistant", content: "newer" },
+      work({ id: "w30", steps: [tool({ callId: "c30" })], startedAt: 30_000, elapsedMs: 1_000 }),
+    ];
+    return since === null
+      ? { rows: all, replace: true }
+      : { rows: all.filter((r) => (rowOrdinal(r.id) ?? -1) > since), replace: false };
+  };
+  // The one client loop (docs/sync-protocol.md), exactly as `runSync` +
+  // `applySyncPage` run it: ask with `syncSince`, REPLACE a baseline, merge a
+  // difference.
+  const syncOnce = (rows: Row[], cursor: number | null): Row[] => {
+    const page = answer(syncSince(cursor, rows));
+    return page.replace ? page.rows : mergeSyncPage(rows, page.rows, []);
+  };
+
+  it("rebuilds a thread the cursor does not cover, in ordinal order", () => {
+    // Unguarded this asks since=5, and the merge appends m18 BELOW w30 while
+    // folding w15 into w30's card: ["m10", "m20", "w30", "m18"].
+    expect(syncOnce(rendered(), 5).map((r) => r.id)).toEqual(["m10", "w15", "m18", "m20", "w30"]);
+  });
+
+  it("leaves every work card its own turn — no card carries two turns' steps", () => {
+    const blocks = syncOnce(rendered(), 5).filter((r): r is WorkRow => r.role === "work");
+    expect(blocks.map((r) => r.steps.length)).toEqual([1, 1]);
+  });
+
+  it("still differences an ordinary page — the cursor covers the thread, so nothing changes", () => {
+    const rows: Row[] = [
+      { id: "m10", role: "assistant", content: "a" },
+      { id: "m20", role: "assistant", content: "b" },
+    ];
+    expect(syncSince(20, rows)).toBe(20);
+    const page: Row[] = [
+      { id: "m21", role: "user", content: "next" },
+      work({ id: "w25", steps: [tool({ callId: "c25" })] }),
+      { id: "m30", role: "assistant", content: "reply" },
+    ];
+    expect(mergeSyncPage(rows, page, []).map((r) => r.id)).toEqual(["m10", "m20", "m21", "w25", "m30"]);
+  });
+
+  // The hole the byte-mirror had: iOS keys a user row by its `platform_msg_id`,
+  // so `rowOrdinal` answers `null` for EVERY user message — while app/web keeps
+  // `row-<sid>-m<ordinal>` and counts them. A rebase-dirty freeze renders another
+  // device's sends above the cursor and nothing else, and the guard would present
+  // the cursor anyway — the exact welding merge it exists to prevent.
+  it("presents the baseline for another device's user row above the cursor", () => {
+    const rows: Row[] = [
+      { id: "m10", role: "assistant", content: "a" },
+      { id: "pm-laptop-1", role: "user", ordinal: 21, content: "sent from my laptop" },
+    ];
+    expect(syncSince(10, rows)).toBeNull();
+  });
+
+  it("counts a send of ours once its durable row confirms it — the id never gains an ordinal", () => {
+    const optimistic: Row[] = [{ id: "pm-1", role: "user", content: "hi", sendState: "sending" }];
+    expect(syncSince(10, optimistic)).toBe(10); // unconfirmed: not durable coverage
+    const confirmed = mergeSyncPage(optimistic, [{ id: "pm-1", role: "user", ordinal: 11, content: "hi" }], []);
+    expect(confirmed[0]).toMatchObject({ ordinal: 11, sendState: undefined });
+    expect(syncSince(10, confirmed)).toBeNull(); // a cursor left behind it
+    expect(syncSince(11, confirmed)).toBe(11); // and quiet again once covered
+  });
+
+  // A terminal notice is minted live under its `durable_id`, so the redelivered
+  // durable twin dedups by id — and is the only thing that ever knows its level.
+  it("upgrades a live-minted notice to the severity its durable twin carries", () => {
+    const prev: Row[] = [{ id: "n7", role: "notice", content: "skill failed" }];
+    const merged = mergeSyncPage(prev, [{ id: "n7", role: "notice", content: "skill failed", level: "error" }], []);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ id: "n7", level: "error" });
+  });
+
+  it("is quiet on rows carrying no ordinal — an optimistic send is not durable coverage", () => {
+    const rows: Row[] = [
+      { id: "m10", role: "assistant", content: "a" },
+      { id: "pm-uuid", role: "user", content: "just sent", sendState: "sending" },
+      work({ id: "u7-abc", steps: [tool()], active: true }),
+      { id: "n4", role: "notice", content: "note" },
+    ];
+    expect(syncSince(10, rows)).toBe(10);
+  });
+
+  it("is quiet when the cursor sits exactly ON the newest rendered row", () => {
+    expect(syncSince(30, rendered())).toBe(30);
+  });
+
+  it("stays null with no cursor at all (the fresh-install baseline)", () => {
+    expect(syncSince(null, rendered())).toBeNull();
+  });
+
+  it("never fuses across a compaction boundary at the merge seam", () => {
+    const prev: Row[] = [
+      { id: "m10", role: "assistant", content: "a" },
+      work({ id: "w20", steps: [tool({ callId: "c20" })], turnComplete: false }),
+    ];
+    const page: Row[] = [work({ id: "w40", steps: [tool({ callId: "c40" })], turnComplete: true })];
+    expect(mergeSyncPage(prev, page, [{ ordinal: 30, at: "t" }]).map((r) => r.id)).toEqual([
+      "m10",
+      "w20",
+      "w40",
+    ]);
+    // No boundary between them ⇒ still one turn cut by the page edge, still one card.
+    expect(mergeSyncPage(prev, page, [])).toHaveLength(2);
+  });
+
+  it("never fuses a COMPLETE tail with the next turn's block at the merge seam", () => {
+    const prev: Row[] = [
+      { id: "m10", role: "assistant", content: "a" },
+      work({ id: "w20", steps: [tool({ callId: "c20" })], turnComplete: true }),
+    ];
+    const page: Row[] = [work({ id: "w40", steps: [tool({ callId: "c40" })], turnComplete: true })];
+    const out = mergeSyncPage(prev, page, []) as [ChatMsg, WorkRow, WorkRow];
+    expect(out.map((r) => r.id)).toEqual(["m10", "w20", "w40"]);
+    expect(out[1].steps).toHaveLength(1);
+  });
+
+  it("still reconciles a LIVE tail with its own reconstruction (it carries no flag)", () => {
+    const prev: Row[] = [work({ id: "u7-abc", steps: [tool({ callId: "c1" })], active: true, startedAt: 999 })];
+    const page: Row[] = [work({ id: "w40", steps: [tool({ callId: "c2" })], startedAt: 40_000, turnComplete: false })];
+    const out = mergeSyncPage(prev, page, []) as WorkRow[];
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: "u7-abc", active: true, startedAt: 40_000 });
+    expect(out[0].steps).toHaveLength(2);
+  });
+
+  // What the unguarded merge left on disk: the welded span below the tail, and
+  // w15's step fused into w30's card.
+  const scrambled = (): Row[] => [
+    { id: "m10", role: "assistant", content: "older" },
+    { id: "m20", role: "assistant", content: "newer" },
+    work({
+      id: "w30",
+      steps: [tool({ callId: "c30" }), tool({ callId: "c15" })],
+      startedAt: 30_000,
+      elapsedMs: 1_000,
+    }),
+    { id: "m18", role: "assistant", content: "missing" },
+  ];
+
+  it("re-orders an already-scrambled mirror while its cursor is still behind the tail", () => {
+    expect(syncOnce(scrambled(), 5).map((r) => r.id)).toEqual(["m10", "w15", "m18", "m20", "w30"]);
+  });
+
+  // The guard PREVENTS the scramble; it does not heal every mirror already
+  // holding one. A difference that returns at all scanned to the end of the log
+  // (`sync_difference` rebases instead once the scan overruns), so the very
+  // response that welded the span carries a `next_cursor` at the session's
+  // NEWEST ordinal — above every rendered row, leaving the guard quiet on the
+  // next open. That mirror needs the resync hatch, not another sync.
+  it("cannot re-order one whose cursor that same sync already advanced past the tail", () => {
+    expect(syncOnce(scrambled(), 30).map((r) => r.id)).toEqual(["m10", "m20", "w30", "m18"]);
   });
 });
 

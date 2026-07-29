@@ -28,6 +28,8 @@ export const zh: typeof en = {
       approvalApprovedAlways: "始终批准",
       approvalDenied: "已拒绝",
       workedFor: "思考了 {{dur}}",
+      cancelled: "已取消",
+      cancelledFor: "已取消 · 思考了 {{dur}}",
       durS: "{{s}} 秒",
       durM: "{{m}} 分钟",
       durMS: "{{m}} 分 {{s}} 秒",

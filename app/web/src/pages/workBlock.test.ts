@@ -607,6 +607,37 @@ describe('foldAdjacentWork — a turn cut by a page boundary is still one turn',
     const unknownHead: TranscriptRow = { ...first(), workComplete: undefined };
     expect(foldAdjacentWork([unknownHead, second()])).toHaveLength(2);
   });
+
+  it('does NOT fuse across a compaction boundary — the divider needs its anchor row', () => {
+    // The watermark fell in the GAP between the two page windows, so neither
+    // reconstruction split its own half: the head is an ordinary cut-off
+    // (`false`) block and `turn_complete` alone clears it to fuse. Compaction is
+    // a turn boundary, so the fused card would take the older key and the
+    // divider's anchor row would vanish.
+    const out = foldAdjacentWork([first(), second()], [{ ordinal: 20, at: 't' }]);
+    expect(out).toHaveLength(2);
+    expect(out.map((r) => r.key)).toEqual([wkey(3), wkey(43)]);
+  });
+
+  it('still fuses when the boundary sits outside the pair', () => {
+    // At the head's own ordinal (the block starts AT the watermark) and beyond
+    // the tail — neither sits between them.
+    expect(foldAdjacentWork([first(), second()], [{ ordinal: 3, at: 't' }])).toHaveLength(1);
+    expect(foldAdjacentWork([first(), second()], [{ ordinal: 99, at: 't' }])).toHaveLength(1);
+  });
+
+  it('still reconciles a live block with its reconstruction (no ordinal ⇒ straddles nothing)', () => {
+    const live: TranscriptRow = {
+      key: 'work-999-0',
+      role: 'system',
+      text: '',
+      kind: 'work',
+      workActive: true,
+      workStartedAt: 999,
+      steps: [{ key: 'l0', kind: 'tool', toolCallId: 'c1', tool: 'bash', toolStatus: 'running' }],
+    };
+    expect(foldAdjacentWork([live, second()], [{ ordinal: 20, at: 't' }])).toHaveLength(1);
+  });
 });
 
 describe('stopRowKind — /stop echo hidden, ack rendered as a compact indicator (iOS parity)', () => {
