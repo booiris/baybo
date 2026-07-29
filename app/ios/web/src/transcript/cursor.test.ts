@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { advanceFromLive, advanceFromSync, type CursorState } from "./cursor";
-
-const CLEAN: CursorState = { cursor: null, rebaseDirty: false };
+import { INITIAL_CURSOR, advanceFromLive, advanceFromSync, type CursorState } from "./cursor";
 
 describe("advanceFromSync", () => {
   it("takes the watermark as the baseline when there is no cursor yet", () => {
-    expect(advanceFromSync(CLEAN, 7, false)).toEqual({ cursor: 7, rebaseDirty: false });
+    expect(advanceFromSync(INITIAL_CURSOR, 7, false)).toEqual({ cursor: 7, rebaseDirty: false });
   });
 
   it("is max-wins — a lower watermark never rewinds the cursor", () => {
@@ -19,7 +17,7 @@ describe("advanceFromSync", () => {
   });
 
   it("advances from a REBASED page's watermark (it is still a sync watermark) and marks it dirty", () => {
-    expect(advanceFromSync(CLEAN, 100, true)).toEqual({ cursor: 100, rebaseDirty: true });
+    expect(advanceFromSync(INITIAL_CURSOR, 100, true)).toEqual({ cursor: 100, rebaseDirty: true });
   });
 
   it("clears the dirty flag once a non-rebased sync completes", () => {
@@ -35,7 +33,7 @@ describe("advanceFromSync", () => {
 
 describe("advanceFromLive", () => {
   it("takes a live ordinal as the baseline when there is no cursor yet", () => {
-    expect(advanceFromLive(CLEAN, 5)).toEqual({ cursor: 5, rebaseDirty: false });
+    expect(advanceFromLive(INITIAL_CURSOR, 5)).toEqual({ cursor: 5, rebaseDirty: false });
   });
 
   it("is max-wins — an older or equal ordinal never moves the cursor", () => {
@@ -62,7 +60,7 @@ describe("the rebase window", () => {
   // and rows 101..104 — persisted after the rebased page was built — would be
   // skipped by every future sync. Silent, permanent loss.
   it("never lets a live final reply leapfrog rows persisted inside it", () => {
-    let state = advanceFromSync(CLEAN, 100, true);
+    let state = advanceFromSync(INITIAL_CURSOR, 100, true);
     state = advanceFromLive(state, 105);
 
     expect(state.cursor).toBe(100);
