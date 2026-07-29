@@ -183,7 +183,11 @@ fn drift_ratio(a: baybo_model::MicroUsd, b: baybo_model::MicroUsd) -> f64 {
     let a = a.into_micros() as f64;
     let b = b.into_micros() as f64;
     if a <= 0.0 {
-        return 1.0;
+        // Both zero is agreement, not infinite drift: flat-subscription
+        // providers (`openai-subscription`) price every model at $0, so
+        // re-merging their own overlay on each config reload would
+        // otherwise warn about a snapshot that hasn't moved.
+        return if b <= 0.0 { 0.0 } else { 1.0 };
     }
     (a - b).abs() / a
 }
@@ -712,6 +716,10 @@ mod tests {
         // surface fires loudly on the first real rate after a misconfigured
         // snapshot rather than silently treating it as no-drift.
         assert_eq!(drift_ratio(MicroUsd::ZERO, MicroUsd::from_micros(1)), 1.0);
+        // …but zero-to-zero is agreement. A flat-subscription provider
+        // prices every model at $0, and re-merging its own overlay on each
+        // config reload must stay silent.
+        assert_eq!(drift_ratio(MicroUsd::ZERO, MicroUsd::ZERO), 0.0);
     }
 
     /// Push a synthetic spend row for `user_id` with `cost`. Timestamp
