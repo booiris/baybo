@@ -114,6 +114,10 @@ pub struct CostRecord {
     /// Why this call was made. See [`CallReason`].
     pub reason: CallReason,
     pub model: String,
+    /// Reasoning effort carried by the call request. `None` when the request
+    /// omitted it and for records written before the dimension existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub input_tokens: usize,
     pub output_tokens: usize,
     /// Anthropic prompt-cache: input tokens served from the cache.

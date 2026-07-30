@@ -4546,6 +4546,51 @@
           }
         }
       },
+      "AnalyticsReasoningEffortBucket": {
+        "type": "object",
+        "description": "Per-reasoning-effort breakdown row for the analytics dashboard.\n`None` covers requests without this setting and legacy records.",
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cache_creation_input_tokens",
+          "cost_micro_usd",
+          "call_count"
+        ],
+        "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "call_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cost_micro_usd": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Spend for the effort bucket, in **micro-USD** (1 USD = 1_000_000)."
+          },
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "AnalyticsResponse": {
         "type": "object",
         "description": "`GET /v1/analytics` response body.",
@@ -4560,7 +4605,8 @@
           "total_record_count",
           "daily",
           "by_model",
-          "by_reason"
+          "by_reason",
+          "by_reasoning_effort"
         ],
         "properties": {
           "by_model": {
@@ -4573,6 +4619,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AnalyticsReasonBucket"
+            }
+          },
+          "by_reasoning_effort": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsReasoningEffortBucket"
             }
           },
           "daily": {

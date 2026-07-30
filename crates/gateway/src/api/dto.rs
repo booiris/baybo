@@ -1114,6 +1114,35 @@ impl From<baybo_query::AnalyticsReasonBucket> for AnalyticsReasonBucket {
     }
 }
 
+/// Per-reasoning-effort breakdown row for the analytics dashboard.
+/// `None` covers requests without this setting and legacy records.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsReasoningEffortBucket {
+    pub reasoning_effort: Option<String>,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    /// Spend for the effort bucket, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: baybo_model::MicroUsd,
+    pub call_count: usize,
+}
+
+impl From<baybo_query::AnalyticsReasoningEffortBucket> for AnalyticsReasoningEffortBucket {
+    fn from(v: baybo_query::AnalyticsReasoningEffortBucket) -> Self {
+        Self {
+            reasoning_effort: v.reasoning_effort,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
+            cost_micro_usd: v.cost_usd,
+            call_count: v.call_count,
+        }
+    }
+}
+
 /// `GET /v1/analytics` response body.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AnalyticsResponse {
@@ -1132,6 +1161,7 @@ pub struct AnalyticsResponse {
     pub daily: Vec<AnalyticsDayBucket>,
     pub by_model: Vec<AnalyticsModelBucket>,
     pub by_reason: Vec<AnalyticsReasonBucket>,
+    pub by_reasoning_effort: Vec<AnalyticsReasoningEffortBucket>,
 }
 
 // ── ToolDefinition ───────────────────────────────────────────────────

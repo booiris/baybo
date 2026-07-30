@@ -299,6 +299,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "TEXT",
     },
     AddColumn {
+        table: "cost_records",
+        column: "reasoning_effort",
+        definition: "TEXT",
+    },
+    AddColumn {
         table: "sessions",
         column: "folder_id",
         definition: "TEXT",
@@ -830,6 +835,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- this column read NULL and map to the default reason.
                     reason                          TEXT,
                     model                           TEXT    NOT NULL,
+                    -- Reasoning effort carried by the call request. Nullable
+                    -- for requests without the setting and legacy rows.
+                    reasoning_effort                TEXT,
                     input_tokens                    INTEGER NOT NULL,
                     output_tokens                   INTEGER NOT NULL,
                     cached_input_tokens             INTEGER NOT NULL DEFAULT 0,

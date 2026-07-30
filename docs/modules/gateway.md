@@ -631,7 +631,7 @@ GET    /v1/deck/cards/:card_id/bundle   the card's frontend (card.html) for the 
 GET    /v1/deck/services/:card_id/openapi.json   the card's own op contract
 POST   /v1/deck/services/:card_id/:op   invoke a card op (admitted against that contract first)
 
-GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
+GET    /v1/analytics                    aggregated tokens / cost / sessions, with model / reason / reasoning-effort breakdowns
 GET    /v1/logs                         paged snapshot from LogBuffer
 GET    /v1/logs/stream                  SSE tail of the same buffer
 

@@ -1100,10 +1100,28 @@ export interface components {
             output_tokens: number;
             reason: string;
         };
+        /**
+         * @description Per-reasoning-effort breakdown row for the analytics dashboard.
+         *     `None` covers requests without this setting and legacy records.
+         */
+        AnalyticsReasoningEffortBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            call_count: number;
+            /**
+             * Format: int64
+             * @description Spend for the effort bucket, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
+            input_tokens: number;
+            output_tokens: number;
+            reasoning_effort?: string | null;
+        };
         /** @description `GET /v1/analytics` response body. */
         AnalyticsResponse: {
             by_model: components["schemas"]["AnalyticsModelBucket"][];
             by_reason: components["schemas"]["AnalyticsReasonBucket"][];
+            by_reasoning_effort: components["schemas"]["AnalyticsReasoningEffortBucket"][];
             daily: components["schemas"]["AnalyticsDayBucket"][];
             /**
              * Format: date-time

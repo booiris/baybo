@@ -60,10 +60,12 @@ impl Attribution {
 }
 
 /// Post-call cost recorder: invoked after a provider response with the
-/// call's attribution, model id, and token usage; returns the billed
-/// amount. Opaque so `baybo-llm` needn't depend on `baybo-cost` — the cost
-/// layer injects a closure capturing its `CostManager`.
-pub type LlmCostRecorder = Arc<dyn Fn(&Attribution, &str, &TokenUsage) -> MicroUsd + Send + Sync>;
+/// call's attribution, model id, request reasoning effort, and token usage;
+/// returns the billed amount. Opaque so `baybo-llm` needn't depend on
+/// `baybo-cost` — the cost layer injects a closure capturing its
+/// `CostManager`.
+pub type LlmCostRecorder =
+    Arc<dyn Fn(&Attribution, &str, Option<&str>, &TokenUsage) -> MicroUsd + Send + Sync>;
 
 /// The two cost hooks every [`BillableLlm`] runs: an admission `guard`
 /// before the provider call and a `record` after it. Bundled because both
@@ -83,7 +85,7 @@ impl CostHooks {
     pub fn passthrough() -> Self {
         Self {
             guard: Arc::new(|| Ok(())),
-            record: Arc::new(|_, _, _| MicroUsd::ZERO),
+            record: Arc::new(|_, _, _, _| MicroUsd::ZERO),
         }
     }
 
@@ -153,6 +155,7 @@ impl BoundBilledLlm {
         let cost_micros = self.llm.record(
             &self.attribution,
             &self.llm.model_info().id,
+            request.reasoning_effort.as_deref(),
             &response.usage,
         );
         Ok(BilledChatResponse {
@@ -176,6 +179,7 @@ impl BoundBilledLlm {
             inner,
             llm: Arc::clone(&self.llm),
             attribution: self.attribution.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
             last_usage: TokenUsage::default(),
             recorded: false,
         }))
@@ -189,6 +193,7 @@ struct RecordingStream {
     inner: LlmStream,
     llm: Arc<BillableLlm>,
     attribution: Attribution,
+    reasoning_effort: Option<String>,
     last_usage: TokenUsage,
     recorded: bool,
 }
@@ -200,8 +205,12 @@ impl RecordingStream {
         }
         self.recorded = true;
         let model_id = self.llm.model_info().id.clone();
-        self.llm
-            .record(&self.attribution, &model_id, &self.last_usage);
+        self.llm.record(
+            &self.attribution,
+            &model_id,
+            self.reasoning_effort.as_deref(),
+            &self.last_usage,
+        );
     }
 }
 
@@ -239,20 +248,28 @@ mod tests {
 
     /// Records every recorder invocation so a test can assert the bound
     /// attribution + usage that landed in the ledger.
+    struct RecordedCall {
+        session_id: String,
+        model_id: String,
+        reasoning_effort: Option<String>,
+        usage: TokenUsage,
+    }
+
     #[derive(Default)]
     struct RecorderProbe {
-        calls: Mutex<Vec<(String, String, TokenUsage)>>,
+        calls: Mutex<Vec<RecordedCall>>,
     }
 
     fn billing_with_probe(probe: Arc<RecorderProbe>) -> CostHooks {
         CostHooks {
             guard: Arc::new(|| Ok(())),
-            record: Arc::new(move |attr, model_id, usage| {
-                probe.calls.lock().push((
-                    attr.session_id.as_str().to_string(),
-                    model_id.to_string(),
-                    *usage,
-                ));
+            record: Arc::new(move |attr, model_id, reasoning_effort, usage| {
+                probe.calls.lock().push(RecordedCall {
+                    session_id: attr.session_id.as_str().to_string(),
+                    model_id: model_id.to_string(),
+                    reasoning_effort: reasoning_effort.map(str::to_string),
+                    usage: *usage,
+                });
                 MicroUsd::ZERO
             }),
         }
@@ -267,12 +284,12 @@ mod tests {
         }
     }
 
-    fn empty_request() -> ChatRequest {
+    fn request_with_effort(reasoning_effort: Option<&str>) -> ChatRequest {
         ChatRequest {
             messages: vec![],
             temperature: None,
             tools: vec![],
-            reasoning_effort: None,
+            reasoning_effort: reasoning_effort.map(str::to_string),
         }
     }
 
@@ -300,13 +317,18 @@ mod tests {
         );
         let bound = guarded.bind(Attribution::system("unit-test"));
 
-        bound.chat(&empty_request()).await.expect("chat ok");
+        bound
+            .chat(&request_with_effort(Some("high")))
+            .await
+            .expect("chat ok");
 
         let calls = probe.calls.lock();
         assert_eq!(calls.len(), 1, "exactly one record per chat");
-        assert_eq!(calls[0].0, "system:unit-test");
-        assert_eq!(calls[0].2.input_tokens, 12);
-        assert_eq!(calls[0].2.output_tokens, 34);
+        assert_eq!(calls[0].session_id, "system:unit-test");
+        assert_eq!(calls[0].model_id, "stub-model");
+        assert_eq!(calls[0].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(calls[0].usage.input_tokens, 12);
+        assert_eq!(calls[0].usage.output_tokens, 34);
     }
 
     #[tokio::test]
@@ -324,7 +346,7 @@ mod tests {
         let bound = guarded.bind(Attribution::system("stream-test"));
 
         let mut stream = bound
-            .chat_stream(&empty_request())
+            .chat_stream(&request_with_effort(Some("xhigh")))
             .await
             .expect("stream ok");
         while stream.next().await.is_some() {}
@@ -332,8 +354,9 @@ mod tests {
 
         let calls = probe.calls.lock();
         assert_eq!(calls.len(), 1, "drained stream records exactly once");
-        assert_eq!(calls[0].2.input_tokens, 7);
-        assert_eq!(calls[0].2.output_tokens, 9);
+        assert_eq!(calls[0].reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(calls[0].usage.input_tokens, 7);
+        assert_eq!(calls[0].usage.output_tokens, 9);
     }
 
     #[tokio::test]
@@ -355,7 +378,7 @@ mod tests {
         let bound = guarded.bind(Attribution::system("stream-err"));
 
         let mut stream = bound
-            .chat_stream(&empty_request())
+            .chat_stream(&request_with_effort(None))
             .await
             .expect("stream ok");
         let mut saw_err = false;
@@ -370,7 +393,8 @@ mod tests {
 
         let calls = probe.calls.lock();
         assert_eq!(calls.len(), 1, "error + early drop records exactly once");
-        assert_eq!(calls[0].2.input_tokens, 7);
-        assert_eq!(calls[0].2.output_tokens, 9);
+        assert_eq!(calls[0].reasoning_effort, None);
+        assert_eq!(calls[0].usage.input_tokens, 7);
+        assert_eq!(calls[0].usage.output_tokens, 9);
     }
 }

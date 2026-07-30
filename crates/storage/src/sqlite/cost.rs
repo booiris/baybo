@@ -27,6 +27,7 @@ impl CostStore for SqliteCostStore {
         let span_id = record.span_id.to_string();
         let reason = record.reason.to_token().into_owned();
         let model = record.model.clone();
+        let reasoning_effort = record.reasoning_effort.clone();
         let input_tokens = record.input_tokens as i64;
         let output_tokens = record.output_tokens as i64;
         let cached_input_tokens = record.cached_input_tokens as i64;
@@ -37,9 +38,10 @@ impl CostStore for SqliteCostStore {
             .interact("cost.record", move |conn| {
                 conn.execute(
                     "INSERT INTO cost_records \
-                     (user_id, session_id, turn_id, span_id, reason, model, input_tokens, output_tokens, \
-                      cached_input_tokens, cache_creation_input_tokens, cost_usd, timestamp) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     (user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
+                      input_tokens, output_tokens, cached_input_tokens, \
+                      cache_creation_input_tokens, cost_usd, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         user_id,
                         session_id,
@@ -47,6 +49,7 @@ impl CostStore for SqliteCostStore {
                         span_id,
                         reason,
                         model,
+                        reasoning_effort,
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
@@ -68,9 +71,9 @@ impl CostStore for SqliteCostStore {
             .pool
             .interact("cost.query_user", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, turn_id, span_id, reason, model, input_tokens, \
-                            output_tokens, cached_input_tokens, cache_creation_input_tokens, \
-                            cost_usd, timestamp \
+                    "SELECT user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
+                            input_tokens, output_tokens, cached_input_tokens, \
+                            cache_creation_input_tokens, cost_usd, timestamp \
                      FROM cost_records \
                      WHERE user_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
                 )?;
@@ -120,6 +123,7 @@ impl CostStore for SqliteCostStore {
             CostGroupKey::Day => "strftime('%Y-%m-%d', timestamp / 1000000, 'unixepoch')",
             CostGroupKey::Model => "model",
             CostGroupKey::Reason => "COALESCE(reason, '')",
+            CostGroupKey::ReasoningEffort => "COALESCE(reasoning_effort, '')",
         };
         self.pool
             .interact("cost.query_range_grouped", move |conn| {
@@ -216,9 +220,9 @@ impl CostStore for SqliteCostStore {
             .pool
             .interact("cost.query_records_in_range", move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT user_id, session_id, turn_id, span_id, reason, model, input_tokens, \
-                            output_tokens, cached_input_tokens, cache_creation_input_tokens, \
-                            cost_usd, timestamp \
+                    "SELECT user_id, session_id, turn_id, span_id, reason, model, reasoning_effort, \
+                            input_tokens, output_tokens, cached_input_tokens, \
+                            cache_creation_input_tokens, cost_usd, timestamp \
                      FROM cost_records \
                      WHERE timestamp >= ?1 AND timestamp < ?2 \
                      ORDER BY timestamp",
@@ -287,6 +291,7 @@ struct RawCostRow {
     span_id: String,
     reason: Option<String>,
     model: String,
+    reasoning_effort: Option<String>,
     input_tokens: i64,
     output_tokens: i64,
     cached_input_tokens: i64,
@@ -303,12 +308,13 @@ fn raw_cost_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawCostRow> {
         span_id: row.get(3)?,
         reason: row.get(4)?,
         model: row.get(5)?,
-        input_tokens: row.get(6)?,
-        output_tokens: row.get(7)?,
-        cached_input_tokens: row.get(8)?,
-        cache_creation_input_tokens: row.get(9)?,
-        cost_usd: row.get(10)?,
-        timestamp_us: row.get(11)?,
+        reasoning_effort: row.get(6)?,
+        input_tokens: row.get(7)?,
+        output_tokens: row.get(8)?,
+        cached_input_tokens: row.get(9)?,
+        cache_creation_input_tokens: row.get(10)?,
+        cost_usd: row.get(11)?,
+        timestamp_us: row.get(12)?,
     })
 }
 
@@ -342,6 +348,7 @@ fn raw_to_cost_record(raw: RawCostRow) -> CostResult<CostRecord> {
             .map_err(|e| StorageError::Storage(format!("decode span_id: {e}")))?,
         reason,
         model: raw.model,
+        reasoning_effort: raw.reasoning_effort,
         input_tokens: raw.input_tokens as usize,
         output_tokens: raw.output_tokens as usize,
         cached_input_tokens: raw.cached_input_tokens as usize,
@@ -364,6 +371,7 @@ mod tests {
             span_id: SpanId::new(),
             reason: CallReason::Chat,
             model: "gpt-4".to_string(),
+            reasoning_effort: None,
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 0,
@@ -391,10 +399,70 @@ mod tests {
             .await
             .unwrap();
         let store = SqliteCostStore::new(pool);
-        store.record(&test_record("u1", usd(0.05))).await.unwrap();
+        let mut record = test_record("u1", usd(0.05));
+        record.reasoning_effort = Some("high".into());
+        store.record(&record).await.unwrap();
         let records = store.query_user("u1", wide_range()).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].cost_usd, usd(0.05));
+        assert_eq!(records[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_survive_reasoning_effort_migration() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("legacy.db");
+        let record = test_record("u1", usd(0.05));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE cost_records (
+                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id                     TEXT    NOT NULL,
+                    session_id                  TEXT    NOT NULL,
+                    turn_id                     TEXT    NOT NULL,
+                    span_id                     TEXT    NOT NULL,
+                    reason                      TEXT,
+                    model                       TEXT    NOT NULL,
+                    input_tokens                INTEGER NOT NULL,
+                    output_tokens               INTEGER NOT NULL,
+                    cached_input_tokens         INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd                    INTEGER NOT NULL,
+                    timestamp                   INTEGER NOT NULL
+                );"#,
+            )
+            .unwrap();
+            conn.execute(
+                r#"INSERT INTO cost_records
+                 (user_id, session_id, turn_id, span_id, reason, model, input_tokens,
+                  output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                  cost_usd, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                rusqlite::params![
+                    record.user_id,
+                    record.session_id.as_str(),
+                    record.turn_id.to_string(),
+                    record.span_id.to_string(),
+                    record.reason.to_token().into_owned(),
+                    record.model,
+                    record.input_tokens as i64,
+                    record.output_tokens as i64,
+                    record.cached_input_tokens as i64,
+                    record.cache_creation_input_tokens as i64,
+                    record.cost_usd.into_micros(),
+                    time::to_us(record.timestamp),
+                ],
+            )
+            .unwrap();
+        }
+
+        let pool = SqlitePool::open(path).await.unwrap();
+        let store = SqliteCostStore::new(pool);
+        let records = store.query_user("u1", wide_range()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_usd, usd(0.05));
+        assert_eq!(records[0].reasoning_effort, None);
     }
 
     #[tokio::test]
@@ -428,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_range_grouped_by_day_model_and_reason() {
+    async fn query_range_grouped_by_day_model_reason_and_effort() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
@@ -437,6 +505,7 @@ mod tests {
         let mut a = test_record("u1", usd(0.10));
         a.model = "m-a".into();
         a.reason = CallReason::Chat;
+        a.reasoning_effort = Some("high".into());
         let mut b = test_record("u1", usd(0.20));
         b.model = "m-b".into();
         b.reason = CallReason::Tool("WebFetch".into());
@@ -467,6 +536,13 @@ mod tests {
             .unwrap();
         let keys: Vec<_> = reasons.iter().map(|b| b.key.as_str()).collect();
         assert!(keys.contains(&"chat") && keys.contains(&"tool:WebFetch"));
+
+        let efforts = store
+            .query_range_grouped(wide_range(), CostGroupKey::ReasoningEffort)
+            .await
+            .unwrap();
+        let keys: Vec<_> = efforts.iter().map(|b| b.key.as_str()).collect();
+        assert!(keys.contains(&"high") && keys.contains(&""));
     }
 
     #[tokio::test]

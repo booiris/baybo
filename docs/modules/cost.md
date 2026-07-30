@@ -21,13 +21,15 @@ Every monetary field — `CostRecord.cost_usd`, `CostSummary.total_cost_usd`, `S
 
 `record_external_tokens` is the one other recording entry point: the subagent spawner logs subscription-billed external-agent runs (claude code Max / codex) at `cost_usd = MicroUsd::ZERO` — tokens are persisted for the analytics breakdowns but never touch the daily/monthly accumulators.
 
+Each in-process call also records `ChatRequest::reasoning_effort` directly. Requests that omit the setting, external-agent rows, and records written before the column existed store `NULL`. `QueryApi::compute_analytics` groups those rows into a nullable effort bucket alongside its model and reason breakdowns.
+
 `Router` also calls `check` at message ingress so over-cap users never spin up an actor.
 
 ### `cost_call_guard` bridges to `LlmCallGuard`
 
 `BillableLlm` admits every provider call through a closure-shaped `LlmCallGuard` (from `baybo-llm`); it reaches `LlmProviderRegistry::create_client` as the `guard` field of the `CostHooks` parameter. `cost_call_guard(&Arc<CostManager>)` produces that closure: it calls `CostManager::check` and maps `CostGuardError` → `LlmError::GuardRejected`. Lives as a free function rather than a `CostManager` method so the manager doesn't have to know about `LlmError`.
 
-The production wiring is `cost_hooks(&Arc<CostManager>)`, which bundles `cost_call_guard` (the admission guard) with the `record_call` recorder closure into the `baybo_llm::CostHooks` every `BillableLlm` is built with; argv one-shots and tests use `CostHooks::passthrough` instead.
+The production wiring is `cost_hooks(&Arc<CostManager>)`, which bundles `cost_call_guard` (the admission guard) with the `record_call` recorder closure into the `baybo_llm::CostHooks` every `BillableLlm` is built with; argv one-shots and tests use `CostHooks::passthrough` instead. The recorder receives the request effort from `BoundBilledLlm`.
 
 ### Pricing snapshot reload
 

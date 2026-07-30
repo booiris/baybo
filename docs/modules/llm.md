@@ -76,6 +76,8 @@ Because that gate is per-provider, the ESTIMATE caps at the ceiling rather than 
 
 `LlmResponse` carries provider reasoning/thinking, tool calls, and full output content. The trace layer records all of these: `output_content`, `thinking`, `tool_calls`, and token usage.
 
+`BoundBilledLlm` hands `ChatRequest::reasoning_effort` directly to the cost recorder on both completion and streaming paths. This dimension records the request value as issued; it does not infer provider defaults or rewrite it from model-specific clamping.
+
 ### Error handling
 
 Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` through `ErrorHandler`. Timeout is configurable at the HTTP client level; upper-layer Turn monitoring can mark long-running calls as `Stuck`.

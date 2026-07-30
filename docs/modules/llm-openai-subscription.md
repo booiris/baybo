@@ -230,5 +230,4 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 
 1. Multi-profile (e.g. one personal + one workspace account) — vault key would shard to `llm.openai-subscription.profiles.<id>`. `CredentialKey.vault_key` exists for exactly this: populate it from the real key or two profiles collide on one coordinator.
 2. Wiring the same `OAuthTokenBundle` into image-generation tool calls
-3. Cost tracking — Codex Responses doesn't bill per-token to the user; treat as $0 in `cost` records and document
-4. C track: native Codex app-server harness (sidecar)
+3. C track: native Codex app-server harness (sidecar)
