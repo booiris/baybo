@@ -82,6 +82,30 @@ A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invoc
 
 The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `ContextManager::expand_slash_command` matches the leading `/<cmd>` against the invocable skill set and injects the skill body. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#slash-completion) for the full wiring.
 
+### Per-agent overlays
+
+Beyond the shared set (builtins + `<workspace>/skills/`), each agent profile
+may own a private overlay at `<workspace>/personas/<agent_id>/skills/`, same
+one-directory-per-skill shape. `SkillRegistry` holds it in a second map keyed
+by profile id, and every session-scoped read goes through the scoped pair:
+
+- `get_scoped(agent, name)` — the agent's overlay first, then the shared set.
+- `summaries_for(agent)` — shared ∪ overlay, **overlay wins a name
+  collision**, for that agent only; sorted by name so ordering is stable
+  across turns. `ContextManager` routes the per-turn listing, the
+  post-compaction trailer, and slash candidates through it.
+- `load_agent_dir(agent, dir)` / `agent_dir_loaded(agent)` — the actor-build
+  path loads one agent's folder on a cold start; `reload()` replays overlays
+  after builtins and the shared dirs.
+
+A name that exists only in *another* agent's overlay simply misses, so the
+`Skill` tool answers "unknown skill" rather than a refusal that would leak
+another agent's inventory. Governance is unchanged: persona folders are
+workspace content, so their skills are `Trusted` and the risk assessor judges
+them by content hash like any other. `SkillInstall` / `SkillUninstall` keep
+targeting the shared folder — overlays are hand-authored. The built-in
+profile has no overlay: its skills *are* the shared set.
+
 ### Three-tier trust model
 
 - **Trusted**: workspace or admin-placed skills. May hot-reload and request full tool set.

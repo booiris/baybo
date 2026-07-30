@@ -33,10 +33,12 @@ reason to forbid the whole shape.
 // crates/memory/src/lib.rs
 pub struct RecalledMemory { pub content: String }
 
-// Carries the real (user, session, turn) + the trace recorder + the enclosing
-// memory step. `scoped_llm_call(begin, body)` opens an LlmCall span under that
-// step and hands `body` an Attribution bound to it, for billed sub-calls.
-pub struct MemoryContext { /* user_id, session_id, turn_id, recorder, step */ }
+// Carries a `MemoryScope` (the real user/session/turn + the agent partition)
+// plus the trace recorder and the enclosing memory step.
+// `scoped_llm_call(begin, body)` opens an LlmCall span under that step and
+// hands `body` an Attribution bound to it, for billed sub-calls.
+pub struct MemoryContext { /* scope, recorder, step */ }
+pub struct MemoryScope { user_id, session_id, turn_id, agent_id }
 
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -82,6 +84,29 @@ closes the span with the call's token usage. The impl binds its `BillableLlm`
 with that attribution and makes the call — so the cost row lands on a recorded
 span, attributed to the real user/session/turn. The impl never constructs a bare
 `Attribution`, so it can't bill against an orphaned id.
+
+## Partitioning: memory is scoped by `(user, agent)`
+
+One human, many personas: every recall and write carries
+`MemoryContext::agent_id()` — the calling session's agent — so agent A never
+recalls agent B's memories. `BUILTIN_AGENT_PROFILE_ID` is `"baybo"`, which is
+what both backends already sent, so an unbound session sees exactly the
+memories it always did; custom agents partition under their ULID
+(rename-proof, and it survives the profile row being deleted).
+
+- **mem0** — `agent_id` on writes, and an `agent_id` condition in `recall`'s
+  filter set beside `user_id`.
+- **openviking** — `x-openviking-agent` is a *per-request* header built from
+  the call's `VikingScope`, not a client-construction constant.
+
+**The model cannot address its way out of the partition.** The mem0 tools'
+`agentId` parameter is gone: it was prompt-injectable, and against a
+partition it would have been cross-partition read *plus* bulk delete
+(`mem0_delete { all: true }`). Tool calls take the partition from
+`ToolContext::agent_id`, which the executor stamps from the session. A
+sibling of the user-scope rule already documented below — same reason, same
+enforcement point. This invariant is why cross-agent memory sharing is
+[deferred](#deferred) rather than a profile flag.
 
 ## Recall injection (enforces hard constraint #3)
 
@@ -255,6 +280,9 @@ hot-reload, so `setup` prints a restart hint.
 
 - Operator/GDPR wipe of memory rows: re-add behind a user-triggered command if a
   future backend needs it (no background sweeper — see CLAUDE.md).
+- Cross-agent memory (a shared pool two personas both read): needs a
+  per-write policy and a recall union, and it reopens exactly the
+  cross-partition access removing the `agentId` override closed.
 
 ## Collaboration
 

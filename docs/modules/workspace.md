@@ -22,6 +22,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   profile/         # standalone git repo: SOUL.md / USER.md / IDENTITY.md identity files
   skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
+  personas/        # standalone git repo: one dir per agent profile — SOUL.md + skills/
   .key/            # not version-controlled: encryption.key (mode 0600)
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
@@ -42,6 +43,8 @@ checkout rather than polluting the real user home.
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
 | identity files   | `<workspace.path>/profile/{SOUL,USER,IDENTITY}.md` |
 | skills           | `<workspace.path>/skills/`                 |
+| agent soul       | `<workspace.path>/personas/<agent_id>/SOUL.md` |
+| agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
 | singleton lock   | `<workspace.path>/state/baybo.lock`         |
@@ -61,8 +64,13 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
-- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, and `agents/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `profile/`, `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
+- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check).
+
+Per-agent subdirectories under `personas/` are created on demand by
+`ensure_persona_layout` (at profile creation, and defensively when a bound
+session's actor is built), not by `ensure_layout` — the set of agents is
+DB-state, not layout.
 
 `config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
@@ -80,6 +88,16 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - **SOUL.md**: personality, tone, and preferences
 - **USER.md**: long-term user profile
 - **IDENTITY.md**: system or instance identity description
+
+**Only SOUL.md is per-agent.** A chat session bound to a custom agent reads
+`personas/<agent_id>/SOUL.md` for its `<soul>` section and the workspace
+`profile/` files for the other two: `IDENTITY.md` describes the deployment
+and `USER.md` describes the human, and neither belongs to an agent. The
+built-in profile has no `personas/` directory at all — its soul *is*
+`profile/SOUL.md`, so an unbound session and a built-in-bound one assemble
+byte-identical prompts. `load_identity_files` therefore takes the soul path
+(and the text to seed it with) as parameters; `load_soul` reads one on its
+own. See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md).
 
 Identity file changes usually affect the system prompt; memory changes usually affect recall.
 

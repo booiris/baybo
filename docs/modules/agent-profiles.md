@@ -155,6 +155,14 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 
 ## Deferred
 
+The first three items below are designed as one feature in
+[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) — session binding,
+a per-agent persona directory (`personas/<agent_id>/` carrying `SOUL.md` and a
+`skills/` overlay), a memory partition per agent, and external-framework chat.
+That spec is authoritative where it differs from the sketches here: the binding
+is INSERT-seeded and immutable rather than a targeted setter, and an agent's
+prompt is its own `SOUL.md` rather than the `system_prompt` column.
+
 - **Session binding** — the consumer this schema was shaped for: a flat anti-clobber `sessions.agent_id` column with a targeted setter, `PUT /v1/chat/sessions/{session_id}/agent` persisting then live-re-pinning via an `AgentMessage` (the exact `last_llm` split), and `ContextManager` resolving the bound profile's prompt with `NULL` → Soul.
 - **Per-agent skills** — the envisioned model is each agent owning a workspace folder with its own skills (like Claude Code's `.claude/skills/`), discovered live. The read-only skills readout would then read that agent's folder instead of the global registry. This is why skills are deliberately *not* a stored profile allow-list.
 - **External-framework top-level sessions** — `claude`/`codex`/`gemini` currently run only as subagent backends; a profile with an external framework needs the external-agent leg generalized to top-level chat. (`gemini` exists as a runtime backend but isn't offered as an agent-profile framework.)
