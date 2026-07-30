@@ -124,6 +124,10 @@ pub struct GatewayDeps {
     /// Deck card manager (`/v1/deck/*`). Built by the runtime alongside
     /// the other managers; its boot/shutdown are driven by the caller.
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Workspace addresses, so admin handlers resolve workspace-relative
+    /// files (an agent's `SOUL.md`, its skills folder) through the same
+    /// source of truth as the runtime.
+    pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 /// State shared with admin TCP handlers. Cheap to clone.
@@ -163,6 +167,9 @@ pub struct AdminState {
     pub secret_vault: Arc<SecretVault>,
     /// Deck card manager (`/v1/deck/*` — docs/modules/deck.md).
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Workspace addresses. The agents surface resolves an agent's `SOUL.md`
+    /// and its private skills folder through these.
+    pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -212,6 +219,7 @@ impl AdminState {
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
             deck_manager: Arc::clone(&deps.deck_manager),
+            workspace_paths: Arc::clone(&deps.workspace_paths),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }

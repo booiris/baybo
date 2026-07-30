@@ -27,6 +27,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_agent))
         .routes(routes!(update_agent))
         .routes(routes!(set_agent_avatar))
+        .routes(routes!(get_agent_soul))
+        .routes(routes!(set_agent_soul))
         .routes(routes!(delete_agent))
 }
 
@@ -63,9 +65,12 @@ impl From<AgentFrameworkDto> for AgentFramework {
     }
 }
 
-/// One agent profile. Absent `system_prompt` = workspace Soul; absent
-/// `llm` = follow `default-llm`. Skills are not part of the profile — they
-/// are read live from the skill registry (`GET /v1/skills`).
+/// One agent profile. Absent `llm` = follow `default-llm`.
+///
+/// Neither the soul nor the skills are fields here. An agent's soul is its
+/// own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
+/// read live from the registry (`GET /v1/skills?agent_id=`) — both are
+/// files, so they stay editable by hand, by git, and by the agent itself.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AgentProfileDto {
     pub id: String,
@@ -73,8 +78,6 @@ pub struct AgentProfileDto {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_blob_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
     pub framework: AgentFrameworkDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
@@ -92,7 +95,6 @@ impl From<AgentProfileRow> for AgentProfileDto {
             name: r.name,
             description: r.description,
             avatar_blob_id: r.avatar_blob_id,
-            system_prompt: r.system_prompt,
             framework: r.framework.into(),
             llm: r.llm.map(|l| l.to_string()),
             builtin: r.builtin,
@@ -111,8 +113,12 @@ pub struct CreateAgentProfileRequest {
     pub description: String,
     #[serde(default)]
     pub framework: AgentFrameworkDto,
+    /// Initial soul body. Written once into `personas/<id>/SOUL.md`;
+    /// absent seeds the shipped template. Later edits go through
+    /// `PUT /v1/agents/{agent_id}/soul` — this field is a convenience for
+    /// creating an agent in one call, not a second source of truth.
     #[serde(default)]
-    pub system_prompt: Option<String>,
+    pub soul: Option<String>,
     /// `baybo.json` LLM entry name; must match a configured entry — see
     /// `GET /v1/llm/models`.
     #[serde(default)]
@@ -132,8 +138,6 @@ pub struct UpdateAgentProfileRequest {
     pub name: String,
     pub description: String,
     pub framework: AgentFrameworkDto,
-    #[serde(default)]
-    pub system_prompt: Option<String>,
     #[serde(default)]
     pub llm: Option<String>,
 }
@@ -199,13 +203,23 @@ fn store_err(ctx: &str, e: StorageError) -> GatewayError {
 }
 
 async fn load_agent(state: &AdminState, agent_id: &str) -> Result<AgentProfileRow> {
-    let id = AgentProfileId::from(agent_id);
+    // A path param that fails the id grammar can never name a row — and the
+    // id joins onto the persona directory — so reject it here rather than
+    // letting it reach the store as a miss.
+    let id = parse_agent_id(agent_id)?;
     state
         .agent_profile_store
         .get(&id)
         .await
         .map_err(|e| GatewayError::Internal(format!("load agent profile: {e}")))?
         .ok_or_else(|| GatewayError::NotFound(format!("agent profile {agent_id}")))
+}
+
+/// Parse an untrusted agent id (path param, request body) into the
+/// validated newtype, surfacing a failure as a 400 rather than a 404: the
+/// value is malformed, not merely absent.
+pub(crate) fn parse_agent_id(agent_id: &str) -> Result<AgentProfileId> {
+    AgentProfileId::parse(agent_id).map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 
 const BUILTIN_READ_ONLY: &str = "the built-in agent profile is read-only (avatar excepted)";
@@ -265,7 +279,9 @@ async fn create_agent(
         name,
         description: req.description,
         avatar_blob_id: req.avatar_blob_id,
-        system_prompt: req.system_prompt,
+        // Never written again: the column exists only to seed a persona
+        // that predates the soul file (see `persona_soul_seed`).
+        system_prompt: None,
         framework: req.framework.into(),
         llm,
         builtin: false,
@@ -277,6 +293,16 @@ async fn create_agent(
         .create(&row)
         .await
         .map_err(|e| store_err("create agent profile", e))?;
+    // Materialise the persona directory now, so the agent has a soul and a
+    // skills folder before its first session — and so the operator can see
+    // where to edit them.
+    let seed = req
+        .soul
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| baybo_store::agent_profile::persona_soul_seed(&row));
+    baybo_workspace::ensure_persona_layout(&state.workspace_paths, row.id.as_str(), &seed)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
     Ok(Json(AgentProfileDto::from(row)))
 }
 
@@ -324,7 +350,7 @@ async fn update_agent(
     let update = AgentProfileUpdate {
         name: validate_name(&req.name)?,
         description: req.description,
-        system_prompt: req.system_prompt,
+        system_prompt: None,
         framework: req.framework.into(),
         llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
     };
@@ -339,6 +365,97 @@ async fn update_agent(
         return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Response body for `GET /v1/agents/{agent_id}/soul`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentSoulDto {
+    /// The soul markdown as it stands on disk.
+    pub content: String,
+    /// Absolute path of the file this content came from — the agent's own
+    /// `personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the
+    /// built-in. Surfaced so an operator knows what to edit and what to
+    /// commit; the file is inside a git repo.
+    pub path: String,
+}
+
+/// Request body for `PUT /v1/agents/{agent_id}/soul`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetAgentSoulRequest {
+    pub content: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/agents/{agent_id}/soul",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    responses(
+        (status = 200, description = "The agent's soul", body = AgentSoulDto),
+        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn get_agent_soul(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentSoulDto>> {
+    let row = load_agent(&state, &agent_id).await?;
+    let path = row.id.soul_file(&state.workspace_paths);
+    // Seeds on first read, exactly like the runtime's own assembly, so the
+    // editor never opens on a phantom empty file.
+    let content =
+        baybo_workspace::load_soul(&path, &baybo_store::agent_profile::persona_soul_seed(&row))
+            .await
+            .map_err(|e| GatewayError::Internal(format!("read agent soul: {e}")))?;
+    Ok(Json(AgentSoulDto {
+        content,
+        path: baybo_workspace::absolutise(&path).display().to_string(),
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/agents/{agent_id}/soul",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    request_body = SetAgentSoulRequest,
+    responses(
+        (status = 204, description = "Soul replaced"),
+        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn set_agent_soul(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<SetAgentSoulRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Deliberately NOT behind the builtin lock: the built-in row is
+    // read-only, but its soul is a file, not a row field — and editing the
+    // workspace `profile/SOUL.md` is exactly what an operator expects the
+    // built-in's entry to offer. Racing writes are last-write-wins; the file
+    // is git-versioned, so a clobber is recoverable.
+    let row = load_agent(&state, &agent_id).await?;
+    let path = row.id.soul_file(&state.workspace_paths);
+    write_file_atomic(&path, &req.content)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("write agent soul: {e}")))?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Stage through a sibling `.tmp` and rename, so a concurrent reader (the
+/// runtime assembling a system prompt) sees either the old file or the whole
+/// new one — never a partial write.
+async fn write_file_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("md.tmp");
+    tokio::fs::write(&tmp, content).await?;
+    tokio::fs::rename(&tmp, path).await
 }
 
 #[utoipa::path(

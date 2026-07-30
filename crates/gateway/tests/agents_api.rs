@@ -29,7 +29,7 @@ async fn agents_api_round_trip() {
     assert_eq!(builtin["builtin"].as_bool(), Some(true));
     assert_eq!(builtin["framework"].as_str(), Some("baybo"));
     // NULL = inherit-default fields are absent on the wire.
-    for inherit in ["system_prompt", "llm", "avatar_blob_id"] {
+    for inherit in ["llm", "avatar_blob_id"] {
         assert!(
             builtin.get(inherit).is_none(),
             "builtin {inherit} must be absent (inherit), got {builtin:?}",
@@ -119,7 +119,7 @@ async fn agents_api_round_trip() {
             "name": "  Helper  ",
             "description": "test persona",
             "framework": "claude",
-            "system_prompt": "Be terse.",
+            "soul": "Be terse.",
             "llm": llm_entry,
             "avatar_blob_id": png_blob.blob_id,
         }),
@@ -197,6 +197,65 @@ async fn agents_api_round_trip() {
     )
     .await;
 
+    // ── 4b. The soul is a file, edited on its own endpoint ──────────
+    // Created with the body's `soul`, so a one-call create still gives the
+    // agent a persona.
+    let soul = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(soul["content"].as_str(), Some("Be terse."));
+    assert!(
+        soul["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&format!("personas/{agent_id}/SOUL.md")),
+        "soul must live in the agent's own persona dir, got {soul:?}",
+    );
+
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        json!({ "content": "# Helper\n\nRewritten." }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let soul = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(soul["content"].as_str(), Some("# Helper\n\nRewritten."));
+
+    // The built-in's soul is the workspace identity file — editable, even
+    // though its row is locked, because the soul is not a row field.
+    let builtin_soul = get(&router, "/v1/agents/baybo/soul", StatusCode::OK).await;
+    assert!(
+        builtin_soul["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("profile/SOUL.md"),
+        "the builtin's soul is the workspace one, got {builtin_soul:?}",
+    );
+    put_expect(
+        &router,
+        "/v1/agents/baybo/soul",
+        json!({ "content": "workspace soul, edited" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    // A malformed id can never reach the filesystem.
+    get(
+        &router,
+        "/v1/agents/..%2F..%2Fetc/soul",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
     // ── 5. PUT is a full replace: absent nullables reset to inherit ──
     put_expect(
         &router,
@@ -208,12 +267,10 @@ async fn agents_api_round_trip() {
     let replaced = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
     assert_eq!(replaced["name"].as_str(), Some("Helper 2"));
     assert_eq!(replaced["framework"].as_str(), Some("baybo"));
-    for reset in ["system_prompt", "llm"] {
-        assert!(
-            replaced.get(reset).is_none(),
-            "full replace must reset {reset} to inherit, got {replaced:?}",
-        );
-    }
+    assert!(
+        replaced.get("llm").is_none(),
+        "full replace must reset llm to inherit, got {replaced:?}",
+    );
     assert_eq!(
         replaced["avatar_blob_id"].as_str(),
         Some(png_blob.blob_id.as_str()),
@@ -291,6 +348,9 @@ fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
     baybo_gateway::server::AdminState {
+        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
+            std::env::temp_dir().join("baybo-test-workspace"),
+        )),
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),

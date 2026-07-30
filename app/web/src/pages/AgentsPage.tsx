@@ -464,7 +464,13 @@ function AgentEditorPanel({
   const [name, setName] = useState(agent?.name ?? '');
   const [description, setDescription] = useState(agent?.description ?? '');
   const [framework, setFramework] = useState<AgentFramework>(agent?.framework ?? 'baybo');
-  const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? '');
+  // The soul is a file (`personas/<id>/SOUL.md`), not a profile field, so it
+  // loads and saves on its own endpoint. `soulPath` is shown to the operator
+  // because that file is inside a git repo they may want to commit.
+  const [soul, setSoul] = useState('');
+  const [soulPath, setSoulPath] = useState<string | null>(null);
+  const [soulLoaded, setSoulLoaded] = useState(false);
+  const [soulDirty, setSoulDirty] = useState(false);
   const [llm, setLlm] = useState(agent?.llm ?? '');
   const [avatarBlobId, setAvatarBlobId] = useState<string | null>(agent?.avatar_blob_id ?? null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -486,6 +492,41 @@ function AgentEditorPanel({
       if (avatarPreview) URL.revokeObjectURL(avatarPreview);
     };
   }, [avatarPreview]);
+
+  // Load the selected agent's soul from its own file. The panel is keyed by
+  // selection, so this runs once per agent; a create form starts empty and
+  // lets the server seed the template.
+  useEffect(() => {
+    if (agent === null) {
+      setSoulLoaded(true);
+      return;
+    }
+    if (isMock) {
+      setSoul(`# ${agent.name}\n\n${agent.description}`);
+      setSoulPath(`personas/${agent.id}/SOUL.md`);
+      setSoulLoaded(true);
+      return;
+    }
+    let canceled = false;
+    void (async () => {
+      const { data, error: apiError, response } = await client.GET('/v1/agents/{agent_id}/soul', {
+        params: { path: { agent_id: agent.id } },
+      });
+      if (canceled) return;
+      if (response.status === 401) return logout();
+      if (apiError || !data) {
+        setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+        return;
+      }
+      setSoul(data.content);
+      setSoulPath(data.path);
+      setSoulDirty(false);
+      setSoulLoaded(true);
+    })();
+    return () => {
+      canceled = true;
+    };
+  }, [agent, client, isMock, logout]);
 
   const uploadAvatar = useCallback(
     async (file: File) => {
@@ -530,12 +571,15 @@ function AgentEditorPanel({
         name,
         description,
         framework,
-        system_prompt: systemPrompt.trim() === '' ? null : systemPrompt,
         llm: llm === '' ? null : llm,
       };
       if (agent === null) {
         const { data, error: apiError, response } = await client.POST('/v1/agents', {
-          body: { ...content, avatar_blob_id: avatarBlobId },
+          body: {
+            ...content,
+            avatar_blob_id: avatarBlobId,
+            soul: soul.trim() === '' ? null : soul,
+          },
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
@@ -555,6 +599,18 @@ function AgentEditorPanel({
           setSaveError(apiError?.error || `HTTP Error ${response.status}`);
           return;
         }
+      }
+      if (soulDirty) {
+        const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}/soul', {
+          params: { path: { agent_id: agent.id } },
+          body: { content: soul },
+        });
+        if (response.status === 401) return logout();
+        if (apiError || !response.ok) {
+          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          return;
+        }
+        setSoulDirty(false);
       }
       if (avatarChanged) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}/avatar', {
@@ -588,7 +644,8 @@ function AgentEditorPanel({
     logout,
     name,
     onSaved,
-    systemPrompt,
+    soul,
+    soulDirty,
   ]);
 
   return (
@@ -731,20 +788,33 @@ function AgentEditorPanel({
             </div>
           </div>
 
-          {/* ── system prompt ── */}
+          {/* ── soul ── */}
           <div>
             <label className={fieldLabel}>
-              System prompt{' '}
-              <span className="normal-case">(empty = workspace Soul default)</span>
+              Soul{' '}
+              <span className="normal-case">
+                {soulPath
+                  ? `(${soulPath})`
+                  : agent === null
+                    ? '(seeded from a template if left empty)'
+                    : '(loading…)'}
+              </span>
             </label>
             <textarea
               className={`${textInput} resize-y`}
-              rows={10}
-              value={systemPrompt}
-              disabled={contentLocked}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder="Markdown system prompt replacing the workspace Soul…"
+              rows={14}
+              value={soul}
+              disabled={agent !== null && !soulLoaded}
+              onChange={(e) => {
+                setSoul(e.target.value);
+                setSoulDirty(true);
+              }}
+              placeholder="Markdown persona: who this agent is, how it should come across, what it refuses to do…"
             />
+            <p className="mt-1 text-xs text-muted">
+              This agent&apos;s own identity file. The agent can rewrite it during a conversation;
+              the workspace IDENTITY.md and USER.md still apply on top.
+            </p>
           </div>
 
           {/* ── skills (read-only, live from the registry, full width) ── */}

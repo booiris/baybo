@@ -52,6 +52,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/agents/{agent_id}/soul": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent_soul"];
+        put: operations["set_agent_soul"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/analytics": {
         parameters: {
             query?: never;
@@ -1027,9 +1043,12 @@ export interface components {
          */
         AgentFrameworkDto: "baybo" | "claude" | "codex";
         /**
-         * @description One agent profile. Absent `system_prompt` = workspace Soul; absent
-         *     `llm` = follow `default-llm`. Skills are not part of the profile — they
-         *     are read live from the skill registry (`GET /v1/skills`).
+         * @description One agent profile. Absent `llm` = follow `default-llm`.
+         *
+         *     Neither the soul nor the skills are fields here. An agent's soul is its
+         *     own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
+         *     read live from the registry (`GET /v1/skills?agent_id=`) — both are
+         *     files, so they stay editable by hand, by git, and by the agent itself.
          */
         AgentProfileDto: {
             avatar_blob_id?: string | null;
@@ -1045,9 +1064,20 @@ export interface components {
             id: string;
             llm?: string | null;
             name: string;
-            system_prompt?: string | null;
             /** Format: date-time */
             updated_at: string;
+        };
+        /** @description Response body for `GET /v1/agents/{agent_id}/soul`. */
+        AgentSoulDto: {
+            /** @description The soul markdown as it stands on disk. */
+            content: string;
+            /**
+             * @description Absolute path of the file this content came from — the agent's own
+             *     `personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the
+             *     built-in. Surfaced so an operator knows what to edit and what to
+             *     commit; the file is inside a git repo.
+             */
+            path: string;
         };
         /**
          * @description One bucket per UTC day for the analytics chart.
@@ -1660,7 +1690,13 @@ export interface components {
              */
             llm?: string | null;
             name: string;
-            system_prompt?: string | null;
+            /**
+             * @description Initial soul body. Written once into `personas/<id>/SOUL.md`;
+             *     absent seeds the shipped template. Later edits go through
+             *     `PUT /v1/agents/{agent_id}/soul` — this field is a convenience for
+             *     creating an agent in one call, not a second source of truth.
+             */
+            soul?: string | null;
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
@@ -1693,6 +1729,17 @@ export interface components {
         };
         /** @description Request body for `POST /v1/chat/sessions`. */
         CreateSessionRequest: {
+            /**
+             * @description The agent this conversation runs as: its soul, its private skills,
+             *     its memory partition. Omitted or `null` ⇒ the built-in profile, which
+             *     is what every channel and TUI session gets.
+             *
+             *     Fixed for the session's life — there is no endpoint that changes it,
+             *     because a mid-thread swap would split the memory partition and leave
+             *     two personas' output in one transcript. To talk to another agent,
+             *     start another conversation.
+             */
+            agent_id?: string | null;
             /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
             session_id?: string | null;
         };
@@ -2176,6 +2223,10 @@ export interface components {
              */
             blob_id?: string | null;
         };
+        /** @description Request body for `PUT /v1/agents/{agent_id}/soul`. */
+        SetAgentSoulRequest: {
+            content: string;
+        };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -2374,7 +2425,6 @@ export interface components {
             framework: components["schemas"]["AgentFrameworkDto"];
             llm?: string | null;
             name: string;
-            system_prompt?: string | null;
         };
         /**
          * @description `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
@@ -2489,7 +2539,6 @@ export interface operations {
                             id: string;
                             llm?: string | null;
                             name: string;
-                            system_prompt?: string | null;
                             /** Format: date-time */
                             updated_at: string;
                         }[];
@@ -2715,6 +2764,108 @@ export interface operations {
                 content?: never;
             };
             /** @description Unknown blob id or non-image mime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_agent_soul: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent's soul */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentSoulDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_soul: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentSoulRequest"];
+            };
+        };
+        responses: {
+            /** @description Soul replaced */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id */
             400: {
                 headers: {
                     [name: string]: unknown;

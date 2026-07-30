@@ -60,6 +60,9 @@ async fn router_with_reloader(
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let config_reloader = reloader_override.unwrap_or_else(|| tg.deps.config_reloader.clone());
     let state = baybo_gateway::server::AdminState {
+        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
+            std::env::temp_dir().join("baybo-test-workspace"),
+        )),
         config: Arc::new(seed),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
@@ -412,6 +415,9 @@ async fn get_usage_aggregates_by_model() {
     use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let state = baybo_gateway::server::AdminState {
+        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
+            std::env::temp_dir().join("baybo-test-workspace"),
+        )),
         config: Arc::new(seed_two_entries()),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),

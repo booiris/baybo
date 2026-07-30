@@ -37,6 +37,9 @@ async fn admin_router() -> axum::Router {
     use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let state = baybo_gateway::server::AdminState {
+        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
+            std::env::temp_dir().join("baybo-test-workspace"),
+        )),
         config: std::sync::Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: std::sync::Arc::clone(&tg.deps.session_manager),

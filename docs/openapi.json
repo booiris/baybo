@@ -31,7 +31,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+                        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
                         "required": [
                           "id",
                           "name",
@@ -73,12 +73,6 @@
                           },
                           "name": {
                             "type": "string"
-                          },
-                          "system_prompt": {
-                            "type": [
-                              "string",
-                              "null"
-                            ]
                           },
                           "updated_at": {
                             "type": "string",
@@ -357,6 +351,129 @@
           },
           "400": {
             "description": "Unknown blob id or non-image mime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/soul": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent_soul",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent's soul",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentSoulDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_soul",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentSoulRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Soul replaced"
+          },
+          "400": {
+            "description": "Malformed agent id",
             "content": {
               "application/json": {
                 "schema": {
@@ -4361,7 +4478,7 @@
       },
       "AgentProfileDto": {
         "type": "object",
-        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
         "required": [
           "id",
           "name",
@@ -4404,15 +4521,27 @@
           "name": {
             "type": "string"
           },
-          "system_prompt": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AgentSoulDto": {
+        "type": "object",
+        "description": "Response body for `GET /v1/agents/{agent_id}/soul`.",
+        "required": [
+          "content",
+          "path"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The soul markdown as it stands on disk."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path of the file this content came from — the agent's own\n`personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the\nbuilt-in. Surfaced so an operator knows what to edit and what to\ncommit; the file is inside a git repo."
           }
         }
       },
@@ -5274,11 +5403,12 @@
           "name": {
             "type": "string"
           },
-          "system_prompt": {
+          "soul": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Initial soul body. Written once into `personas/<id>/SOUL.md`;\nabsent seeds the shipped template. Later edits go through\n`PUT /v1/agents/{agent_id}/soul` — this field is a convenience for\ncreating an agent in one call, not a second source of truth."
           }
         }
       },
@@ -5350,6 +5480,13 @@
         "type": "object",
         "description": "Request body for `POST /v1/chat/sessions`.",
         "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent this conversation runs as: its soul, its private skills,\nits memory partition. Omitted or `null` ⇒ the built-in profile, which\nis what every channel and TUI session gets.\n\nFixed for the session's life — there is no endpoint that changes it,\nbecause a mid-thread swap would split the memory partition and leave\ntwo personas' output in one transcript. To talk to another agent,\nstart another conversation."
+          },
           "session_id": {
             "type": [
               "string",
@@ -6417,6 +6554,18 @@
           }
         }
       },
+      "SetAgentSoulRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/soul`.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -6861,12 +7010,6 @@
           },
           "name": {
             "type": "string"
-          },
-          "system_prompt": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },

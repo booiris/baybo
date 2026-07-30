@@ -511,6 +511,9 @@ fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
     baybo_gateway::server::AdminState {
+        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
+            std::env::temp_dir().join("baybo-test-workspace"),
+        )),
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),

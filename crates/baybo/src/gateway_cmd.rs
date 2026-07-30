@@ -534,6 +534,9 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
         deck_manager: Arc::clone(&graph.deck_manager),
+        workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
+            graph.workspace.root.clone(),
+        )),
     };
 
     // Channel loopback-TCP listener — publishes its ephemeral port to
