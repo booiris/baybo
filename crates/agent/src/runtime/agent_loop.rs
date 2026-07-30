@@ -6,9 +6,9 @@ use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
-use baybo_memory::{Memory, MemoryContext};
+use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
-    ChatMessage, ContentBlock, LlmEntryName, MessageSource, SessionId, ThinkingContent, TurnId,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
@@ -797,6 +797,7 @@ impl AgentLoop {
         let memory_handle = self.memory.clone();
         let memory_user_id = session.user.id.clone();
         let memory_session_id = session.id.clone();
+        let memory_agent_id = session.state.agent_id_or_builtin();
         // The `on_turn_complete` spawn is intentionally OUTSIDE `with_turn`'s
         // body: `with_turn`'s post-body window can still mark the turn
         // `Cancelled` (cancel-race case 3 in `scope.rs`), in which case the
@@ -851,9 +852,12 @@ impl AgentLoop {
         if let Some((turn_id, write)) = pending_write {
             Self::spawn_turn_complete_write(
                 memory_handle,
-                memory_user_id,
-                memory_session_id,
-                turn_id,
+                MemoryScope {
+                    user_id: memory_user_id,
+                    session_id: memory_session_id,
+                    turn_id,
+                    agent_id: memory_agent_id,
+                },
                 span_recorder,
                 write.user_input,
                 write.final_output,
@@ -1267,6 +1271,10 @@ impl AgentLoop {
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
         let session_trigger_for_calls = session.trigger.clone();
+        // The agent this session runs as, so a tool's memory writes and its
+        // `Skill` lookups land in the right partition and scope. Unbound
+        // sessions resolve to the built-in.
+        let agent_for_calls = session.state.agent_id_or_builtin();
         let user_for_calls = session.user.clone();
         // Gate (Copy, captured per closure): only a user-facing session may
         // background a slow command — keeps cron / nested-subagent bash on
@@ -1294,6 +1302,7 @@ impl AgentLoop {
             let notify_silence = notify_silence_for_calls.clone();
             let session_id = session_id_for_calls.clone();
             let session_trigger = session_trigger_for_calls.clone();
+            let agent_id = agent_for_calls.clone();
             let user = user_for_calls.clone();
             let approved = Arc::clone(&approved);
             let recorder = Arc::clone(&recorder_for_calls);
@@ -1333,6 +1342,7 @@ impl AgentLoop {
                         arguments,
                         &session_id,
                         &session_trigger,
+                        &agent_id,
                         &user,
                         &approved,
                         &recorder,
@@ -1858,6 +1868,7 @@ impl AgentLoop {
         };
         let user_id = session.user.id.clone();
         let session_id = session.id.clone();
+        let agent_id = session.state.agent_id_or_builtin();
         let query = query.to_vec();
         let recorder = Arc::clone(span_recorder);
         let recalled = crate::runtime::scope::with_step(
@@ -1866,7 +1877,16 @@ impl AgentLoop {
             StepKind::MemoryRecall,
             Some((cancel_token, baybo_turn::CancelReason::ParentCancelled)),
             move |step| async move {
-                let ctx = MemoryContext::new(user_id, session_id, turn_id, recorder, step);
+                let ctx = MemoryContext::new(
+                    MemoryScope {
+                        user_id,
+                        session_id,
+                        turn_id,
+                        agent_id,
+                    },
+                    recorder,
+                    step,
+                );
                 match memory.recall(&ctx, &query).await {
                     Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
                     Err(e) => Err(anyhow::Error::new(e)),
@@ -1952,6 +1972,7 @@ impl AgentLoop {
         }
         let user_id = session.user.id.clone();
         let session_id = session.id.clone();
+        let agent_id = session.state.agent_id_or_builtin();
         let recorder = Arc::clone(span_recorder);
         tokio::spawn(async move {
             // `full_transcript` (not `history`) so the impl sees the raw
@@ -1985,7 +2006,16 @@ impl AgentLoop {
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, turn_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(
+                        MemoryScope {
+                            user_id,
+                            session_id,
+                            turn_id,
+                            agent_id,
+                        },
+                        ctx_recorder,
+                        step,
+                    );
                     match memory.on_session_end(&ctx, &transcript).await {
                         Ok(()) => Ok((LifecycleOutcome::Ok, ())),
                         Err(e) => Err(anyhow::Error::new(e)),
@@ -2013,9 +2043,7 @@ impl AgentLoop {
     /// two ids before the closure, then call this with the owned values.
     fn spawn_turn_complete_write(
         memory: Option<Arc<dyn Memory>>,
-        user_id: String,
-        session_id: SessionId,
-        turn_id: TurnId,
+        scope: MemoryScope,
         span_recorder: &Arc<SpanRecorder>,
         user_input: Vec<ContentBlock>,
         final_output: Vec<ContentBlock>,
@@ -2026,13 +2054,14 @@ impl AgentLoop {
         let recorder = Arc::clone(span_recorder);
         tokio::spawn(async move {
             let ctx_recorder = Arc::clone(&recorder);
+            let turn_id = scope.turn_id;
             let result = crate::runtime::scope::with_step(
                 recorder.as_ref(),
                 turn_id,
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, turn_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(scope, ctx_recorder, step);
                     match memory
                         .on_turn_complete(&ctx, &user_input, &final_output)
                         .await

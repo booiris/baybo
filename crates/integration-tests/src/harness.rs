@@ -485,6 +485,7 @@ impl AgentTestHarnessBuilder {
             source_path: None,
         });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer,
             workspace,
             keep_recent,
