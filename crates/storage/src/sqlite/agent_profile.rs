@@ -132,7 +132,10 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         ))
     })?;
     Ok(AgentProfileRow {
-        id: AgentProfileId::from(id),
+        // A stored id that fails the grammar is a hard error, not a warn:
+        // this id names the profile's persona directory, and every consumer
+        // of the row joins it back onto the filesystem.
+        id: AgentProfileId::parse(id).map_err(|e| StorageError::Storage(e.to_string()))?,
         name,
         description,
         avatar_blob_id,
@@ -435,7 +438,10 @@ mod tests {
         // Missing rows are indistinguishable at the store layer.
         assert!(
             !store
-                .update(&AgentProfileId::from("missing"), &content_update("x"))
+                .update(
+                    &AgentProfileId::parse("missing").expect("valid id"),
+                    &content_update("x")
+                )
                 .await
                 .unwrap()
         );
@@ -498,7 +504,7 @@ mod tests {
 
         assert!(
             !store
-                .set_avatar(&AgentProfileId::from("missing"), None)
+                .set_avatar(&AgentProfileId::parse("missing").expect("valid id"), None)
                 .await
                 .unwrap()
         );

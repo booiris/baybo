@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
-    LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState, TriggerSource, User,
+    AgentBinding, ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    FolderSummary, LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState,
+    TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -108,6 +109,51 @@ impl SessionManager {
             .await
     }
 
+    /// Mint a session bound to an agent. The binding is seeded by this
+    /// INSERT and never written again — there is no setter, so a session's
+    /// agent is fixed for its life (see `docs/todo/multi-agent-chat.md`).
+    /// `None` mints an unbound session, which reads as the built-in.
+    pub async fn create_session_with_agent(
+        &self,
+        user: User,
+        channel: ChannelType,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
+        self.create_bound_session(
+            SessionId::new(),
+            user,
+            channel,
+            TriggerSource::User,
+            binding,
+        )
+        .await
+    }
+
+    /// [`Self::get_or_create`] for a client-supplied id, carrying an agent
+    /// binding for the create half. An existing row is returned as-is: its
+    /// binding was decided at its own creation and cannot be changed, so a
+    /// mismatched request is not an error — it is simply the session the
+    /// caller asked for.
+    pub async fn get_or_create_with_agent(
+        &self,
+        session_id: &SessionId,
+        user: User,
+        channel: ChannelType,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
+        if let Some(session) = self.store.get(session_id).await? {
+            return Ok(session);
+        }
+        self.create_bound_session(
+            session_id.clone(),
+            user,
+            channel,
+            TriggerSource::User,
+            binding,
+        )
+        .await
+    }
+
     /// Mint a brand-new session with an explicit `TriggerSource`. Used
     /// by the cron router so each fire gets an isolated session
     /// (`TriggerSource::Cron { cron_job_id }` stamped at creation,
@@ -186,14 +232,35 @@ impl SessionManager {
         channel: ChannelType,
         trigger: TriggerSource,
     ) -> Result<Session> {
+        self.create_bound_session(id, user, channel, trigger, None)
+            .await
+    }
+
+    /// The one creation path. `binding` is applied to `SessionState` before
+    /// the first `save`, which is what makes the flat `agent_id` /
+    /// `agent_framework` columns write-once: `save`'s `DO UPDATE` omits them,
+    /// so nothing can set them afterwards.
+    async fn create_bound_session(
+        &self,
+        id: SessionId,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
         let now = Utc::now();
+        let mut state = SessionState::default();
+        if let Some(binding) = binding {
+            state.agent_id = Some(binding.agent_id);
+            state.agent_framework = Some(binding.framework);
+        }
         let session = Session {
             id: id.clone(),
             user,
             channel,
             created_at: now,
             last_active: now,
-            state: SessionState::default(),
+            state,
             root_session_id: id,
             trigger,
             lineage: None,

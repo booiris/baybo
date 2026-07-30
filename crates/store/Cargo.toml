@@ -8,14 +8,21 @@ doctest = false
 
 [dependencies]
 baybo-model = { workspace = true }
+# Pure path/template data: the persona soul seed template.
+baybo-workspace = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 anyhow = { workspace = true }
+parking_lot = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+
+[features]
+# In-memory store fakes (`test_support`) for downstream crates' tests.
+test-support = []

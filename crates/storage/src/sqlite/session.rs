@@ -4,8 +4,8 @@ use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_model::{
-    ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
-    SessionId,
+    AgentFramework, AgentProfileId, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    LineageKind, LlmEntryName, Session, SessionId,
 };
 use baybo_store::StorageError;
 use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
@@ -38,7 +38,8 @@ type RawMessageRow = (String, String, String, String);
 type RawMessageRowWithMeta = (i64, String, String, String, i64, String);
 
 /// Raw `sessions` columns projected by the list/get reads:
-/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort)`.
+/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model,
+/// last_effort, agent_id, agent_framework)`.
 type RawSessionListRow = (
     String,
     i64,
@@ -50,7 +51,15 @@ type RawSessionListRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
+
+/// Column list shared by every `sessions` read that decodes a
+/// [`RawSessionListRow`] — the projection order *is* the tuple order, so the
+/// two must never drift.
+pub(super) const SESSION_LIST_COLUMNS: &str = "data, hidden, last_llm, pinned, id, folder_id, \
+     archived, title, last_model, last_effort, agent_id, agent_framework";
 
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
@@ -115,6 +124,8 @@ fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
         title_col,
         last_model_col,
         last_effort_col,
+        agent_id_col,
+        agent_framework_col,
     ) = row;
     let mut session: Session = serde_json::from_str(data)?;
     session.hidden = *hidden_col != 0;
@@ -125,6 +136,8 @@ fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
     session.folder_id = folder_id_col.clone().map(FolderId::from);
     session.archived = *archived_col != 0;
     session.title = title_col.clone();
+    session.state.agent_id = decode_agent_id(agent_id_col, &session.id);
+    session.state.agent_framework = decode_agent_framework(agent_framework_col, &session.id);
     Ok(session)
 }
 
@@ -140,7 +153,41 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
+}
+
+/// Decode the flat `agent_id` column. A value that fails the id grammar is
+/// dropped to `None` (built-in behaviour) with a `warn!` rather than failing
+/// the read: the column is a soft reference, and a session row is user data
+/// that must stay openable.
+fn decode_agent_id(raw: &Option<String>, session_id: &SessionId) -> Option<AgentProfileId> {
+    let raw = raw.as_ref()?;
+    match AgentProfileId::parse(raw.as_str()) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, "ignoring unusable sessions.agent_id: {e}");
+            None
+        }
+    }
+}
+
+/// Decode the flat `agent_framework` snapshot, degrading an unknown tag to
+/// `None` (baybo) with a `warn!` for the same reason as [`decode_agent_id`].
+fn decode_agent_framework(raw: &Option<String>, session_id: &SessionId) -> Option<AgentFramework> {
+    let raw = raw.as_ref()?;
+    match AgentFramework::parse(raw) {
+        Some(framework) => Some(framework),
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                framework = %raw,
+                "ignoring unknown sessions.agent_framework"
+            );
+            None
+        }
+    }
 }
 
 /// Decode a batch of session-list rows into `Session`s, skipping (with a
@@ -169,58 +216,25 @@ fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> 
 impl SessionStore for SqliteSessionStore {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
         let sid = session_id.as_str().to_string();
+        // Same projection and decode as the list reads (`decode_session_row`
+        // patches the flat columns over the JSON blob), so the two can never
+        // disagree about which columns are authoritative.
+        let sql = format!("SELECT {SESSION_LIST_COLUMNS} FROM sessions WHERE id = ?1");
         let row = self
             .pool
             .interact("sessions.get", move |conn| {
                 Ok(conn
-                    .query_row(
-                        "SELECT data, hidden, last_llm, pinned, folder_id, archived, title, last_model, last_effort FROM sessions WHERE id = ?1",
-                        rusqlite::params![sid],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                                row.get::<_, i64>(5)?,
-                                row.get::<_, Option<String>>(6)?,
-                                row.get::<_, Option<String>>(7)?,
-                                row.get::<_, Option<String>>(8)?,
-                            ))
-                        },
-                    )
+                    .query_row(&sql, rusqlite::params![sid], read_session_list_row)
                     .optional()?)
             })
             .await?;
 
-        let Some((
-            data,
-            hidden_col,
-            last_llm_col,
-            pinned_col,
-            folder_id_col,
-            archived_col,
-            title_col,
-            last_model_col,
-            last_effort_col,
-        )) = row
-        else {
+        let Some(row) = row else {
             return Ok(None);
         };
-        let mut session: Session = serde_json::from_str(&data)
-            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-        // Flat columns are authoritative; targeted setters leave the
-        // JSON blob untouched to avoid load/save races.
-        session.hidden = hidden_col != 0;
-        session.state.last_llm = last_llm_col.map(LlmEntryName::from);
-        session.state.last_model = last_model_col;
-        session.state.last_effort = last_effort_col;
-        session.pinned = pinned_col != 0;
-        session.folder_id = folder_id_col.map(FolderId::from);
-        session.archived = archived_col != 0;
-        session.title = title_col;
-        Ok(Some(session))
+        decode_session_row(&row)
+            .map(Some)
+            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
@@ -253,6 +267,15 @@ impl SessionStore for SqliteSessionStore {
         let channel = session.channel.as_str().to_string();
         let created_us = super::time::to_us(session.created_at);
         let last_active_us = super::time::to_us(session.last_active);
+        let agent_id = session
+            .state
+            .agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        let agent_framework = session
+            .state
+            .agent_framework
+            .map(|f| f.as_str().to_string());
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
         // the row). The DO UPDATE clause omits the flat columns owned by
         // targeted setters (`hidden`, `last_llm`, `pinned`, `folder_id`,
@@ -261,14 +284,20 @@ impl SessionStore for SqliteSessionStore {
         // archived the conversation) cannot clobber them. `hidden` / `pinned` /
         // `archived` are seeded only on a brand-new row (`?10`–`?12`); `get`
         // reads all flat columns as authoritative over the JSON blob.
+        //
+        // `agent_id` / `agent_framework` (`?15`/`?16`) follow the same
+        // INSERT-seeding rule for a stronger reason: there is no setter for
+        // them anywhere, so omitting them from DO UPDATE is what makes the
+        // binding structurally write-once rather than write-once by
+        // convention.
         self.pool
             .interact("sessions.save", move |conn| {
                 conn.execute(
                     "INSERT INTO sessions \
                      (id, root_session_id, trigger_kind, parent_session_id, parent_turn_id, \
                       parent_span_id, lineage_kind, created_at, last_active, \
-                      hidden, pinned, archived, channel, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13) \
+                      hidden, pinned, archived, channel, data, agent_id, agent_framework) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13, ?15, ?16) \
                      ON CONFLICT(id) DO UPDATE SET \
                        root_session_id = excluded.root_session_id, \
                        trigger_kind = excluded.trigger_kind, \
@@ -294,6 +323,8 @@ impl SessionStore for SqliteSessionStore {
                         archived_flag,
                         data,
                         channel,
+                        agent_id,
+                        agent_framework,
                     ],
                 )?;
                 Ok(())
@@ -537,10 +568,9 @@ impl SessionStore for SqliteSessionStore {
         let rows = self
             .pool
             .interact("sessions.list_all", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
-                     ORDER BY last_active DESC",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions ORDER BY last_active DESC"
+                ))?;
                 let rows = stmt
                     .query_map([], read_session_list_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -560,11 +590,11 @@ impl SessionStore for SqliteSessionStore {
         let rows = self
             .pool
             .interact("sessions.list_by_channel", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
                      WHERE channel = ?1 \
-                     ORDER BY last_active DESC",
-                )?;
+                     ORDER BY last_active DESC"
+                ))?;
                 let rows = stmt
                     .query_map(rusqlite::params![channel], read_session_list_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2045,6 +2075,98 @@ mod tests {
         assert!(store.set_last_llm(&s.id, None).await.unwrap());
         let cleared = store.get(&s.id).await.unwrap().expect("row present");
         assert_eq!(cleared.state.last_llm, None);
+    }
+
+    #[tokio::test]
+    async fn the_agent_binding_is_seeded_once_and_then_unwritable() {
+        // The binding decides soul, skills and memory partition, so it must
+        // be fixed for the session's life. There is no setter; the guarantee
+        // is that `save`'s DO UPDATE omits both columns, so even a save that
+        // carries a DIFFERENT binding cannot move it.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        let bound = AgentProfileId::parse("01JAGENT").unwrap();
+        let mut s = make_root_session("bound-session");
+        s.state.agent_id = Some(bound.clone());
+        s.state.agent_framework = Some(AgentFramework::Baybo);
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, Some(bound.clone()));
+        assert_eq!(loaded.state.agent_framework, Some(AgentFramework::Baybo));
+
+        // A later save carrying a different (or absent) binding must not
+        // move the columns.
+        let mut rebind = s.clone();
+        rebind.state.agent_id = Some(AgentProfileId::parse("01JOTHER").unwrap());
+        rebind.state.agent_framework = Some(AgentFramework::Claude);
+        store.save(&rebind).await.unwrap();
+        let mut unbind = s.clone();
+        unbind.state.agent_id = None;
+        unbind.state.agent_framework = None;
+        store.save(&unbind).await.unwrap();
+
+        let after = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(
+            after.state.agent_id,
+            Some(bound),
+            "the binding must survive every later save"
+        );
+        assert_eq!(after.state.agent_framework, Some(AgentFramework::Baybo));
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_reads_as_the_builtin() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        // Every pre-binding row, and every channel/TUI session.
+        let s = make_root_session("unbound");
+        store.save(&s).await.unwrap();
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, None);
+        assert_eq!(
+            loaded.state.agent_id_or_builtin(),
+            AgentProfileId::builtin(),
+            "NULL is the built-in, which is the partition old memories live in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_agent_column_degrades_instead_of_failing_the_read() {
+        // Session rows are user data that must stay openable. A value that
+        // fails the id grammar (or an unknown framework tag) drops to the
+        // built-in with a warn rather than erroring the whole listing.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+
+        let s = make_root_session("corrupt-binding");
+        store.save(&s).await.unwrap();
+        let sid = s.id.as_str().to_string();
+        pool.interact("test.corrupt", move |conn| {
+            conn.execute(
+                "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 WHERE id = ?1",
+                rusqlite::params![sid, "../escape", "borked"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, None);
+        assert_eq!(loaded.state.agent_framework, None);
+        assert_eq!(store.list_all().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
