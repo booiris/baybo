@@ -91,7 +91,6 @@ pub fn agent_profile_row(id: &AgentProfileId, name: &str) -> AgentProfileRow {
         name: name.to_owned(),
         description: String::new(),
         avatar_blob_id: None,
-        system_prompt: None,
         framework: baybo_model::AgentFramework::Baybo,
         llm: None,
         builtin: false,

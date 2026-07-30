@@ -1059,14 +1059,17 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- impl and create never binds `builtin`, so the open()-time
                 -- seed is the only writer of 1. avatar_blob_id is a soft
                 -- reference into blobs (FKs are off — see set_wal_mode).
-                -- Skills are not stored here — they are read live from the
-                -- skill registry (see docs/modules/agent-profiles.md).
+                -- Neither skills nor a prompt are stored here: skills are
+                -- read live from the registry, and an agent's prompt is its
+                -- own `personas/<id>/SOUL.md` (see
+                -- docs/modules/agent-profiles.md). A DB created before that
+                -- keeps an inert `system_prompt` column — `init_db` never
+                -- drops — which nothing reads or writes.
                 CREATE TABLE IF NOT EXISTS agent_profiles (
                     id              TEXT PRIMARY KEY,
                     name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     description     TEXT NOT NULL,
                     avatar_blob_id  TEXT,
-                    system_prompt   TEXT,
                     framework       TEXT NOT NULL,
                     llm             TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,

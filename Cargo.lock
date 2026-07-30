@@ -1051,7 +1051,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "baybo-model",
- "baybo-workspace",
  "bytes",
  "chrono",
  "futures",

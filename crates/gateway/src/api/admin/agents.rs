@@ -282,9 +282,6 @@ async fn create_agent(
         name,
         description: req.description,
         avatar_blob_id: req.avatar_blob_id,
-        // Never written again: the column exists only to seed a persona
-        // that predates the soul file (see `persona_soul_seed`).
-        system_prompt: None,
         framework: req.framework.into(),
         llm,
         builtin: false,
@@ -302,7 +299,7 @@ async fn create_agent(
     let seed = req
         .soul
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| baybo_store::agent_profile::persona_soul_seed(&row));
+        .unwrap_or_else(|| baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_owned());
     baybo_workspace::ensure_persona_layout(&state.workspace_paths, row.id.as_str(), &seed)
         .await
         .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
@@ -353,7 +350,6 @@ async fn update_agent(
     let update = AgentProfileUpdate {
         name: validate_name(&req.name)?,
         description: req.description,
-        system_prompt: None,
         framework: req.framework.into(),
         llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
     };
@@ -422,13 +418,12 @@ async fn read_agent_identity_file(
     let row = load_agent(state, agent_id).await?;
     let path = row.id.identity_file(&state.workspace_paths, kind);
     let seed = match kind {
-        IdentityKind::Soul => baybo_store::agent_profile::persona_soul_seed(&row),
-        other => other.default_content().to_owned(),
+        IdentityKind::Soul => baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE,
+        other => other.default_content(),
     };
-    let content =
-        baybo_workspace::load_identity(baybo_workspace::IdentitySource::new(&path, &seed))
-            .await
-            .map_err(|e| GatewayError::Internal(format!("read agent {kind:?} file: {e}")))?;
+    let content = baybo_workspace::load_identity(baybo_workspace::IdentitySource::new(&path, seed))
+        .await
+        .map_err(|e| GatewayError::Internal(format!("read agent {kind:?} file: {e}")))?;
     Ok(Json(AgentIdentityFileDto {
         version: content_version(&content),
         content,

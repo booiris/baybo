@@ -14,7 +14,7 @@ use baybo_store::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfil
 const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
     "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.";
 
-const SELECT_COLS: &str = "id, name, description, avatar_blob_id, system_prompt, framework, \
+const SELECT_COLS: &str = "id, name, description, avatar_blob_id, framework, \
                            llm, builtin, created_at, updated_at";
 
 pub struct SqliteAgentProfileStore {
@@ -80,7 +80,6 @@ type RawProfileRow = (
     String,
     String,
     Option<String>,
-    Option<String>,
     String,
     Option<String>,
     i64,
@@ -99,7 +98,6 @@ fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
-        row.get(9)?,
     ))
 }
 
@@ -109,7 +107,6 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         name,
         description,
         avatar_blob_id,
-        system_prompt,
         framework_raw,
         llm,
         builtin_col,
@@ -139,7 +136,6 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         name,
         description,
         avatar_blob_id,
-        system_prompt,
         framework,
         llm: llm.map(LlmEntryName::from),
         builtin: builtin_col != 0,
@@ -189,7 +185,6 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let id = row.id.as_str().to_string();
         let description = row.description.clone();
         let avatar_blob_id = row.avatar_blob_id.clone();
-        let system_prompt = row.system_prompt.clone();
         let framework = row.framework.as_str();
         let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
         let created_at = super::time::to_us(row.created_at);
@@ -204,15 +199,14 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                 // DEFAULT 0 fills it, so the seed stays the only writer of 1.
                 match conn.execute(
                     "INSERT INTO agent_profiles \
-                     (id, name, description, avatar_blob_id, system_prompt, framework, \
+                     (id, name, description, avatar_blob_id, framework, \
                       llm, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         id,
                         insert_name,
                         description,
                         avatar_blob_id,
-                        system_prompt,
                         framework,
                         llm,
                         created_at,
@@ -235,7 +229,6 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let name = update.name.clone();
         let update_name = name.clone();
         let description = update.description.clone();
-        let system_prompt = update.system_prompt.clone();
         let framework = update.framework.as_str();
         let llm = update.llm.as_ref().map(|l| l.as_str().to_string());
         let now = super::time::now_us();
@@ -244,18 +237,10 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .interact("agent_profiles.update", move |conn| {
                 match conn.execute(
                     "UPDATE agent_profiles SET \
-                     name = ?2, description = ?3, system_prompt = ?4, framework = ?5, \
-                     llm = ?6, updated_at = ?7 \
+                     name = ?2, description = ?3, framework = ?4, \
+                     llm = ?5, updated_at = ?6 \
                      WHERE id = ?1 AND builtin = 0",
-                    rusqlite::params![
-                        id,
-                        update_name,
-                        description,
-                        system_prompt,
-                        framework,
-                        llm,
-                        now,
-                    ],
+                    rusqlite::params![id, update_name, description, framework, llm, now,],
                 ) {
                     Ok(affected) => Ok(Ok(affected)),
                     Err(e) => Ok(Err(e.to_string())),
@@ -323,7 +308,6 @@ mod tests {
             name: name.to_owned(),
             description: "a test persona".to_owned(),
             avatar_blob_id: None,
-            system_prompt: Some("You are terse.".to_owned()),
             framework: AgentFramework::Claude,
             llm: Some(LlmEntryName::from("primary")),
             builtin: false,
@@ -336,7 +320,6 @@ mod tests {
         AgentProfileUpdate {
             name: name.to_owned(),
             description: String::new(),
-            system_prompt: None,
             framework: AgentFramework::Baybo,
             llm: None,
         }
@@ -353,7 +336,6 @@ mod tests {
         assert_eq!(b.description, BUILTIN_AGENT_PROFILE_DESCRIPTION);
         assert!(b.builtin);
         assert_eq!(b.framework, AgentFramework::Baybo);
-        assert!(b.system_prompt.is_none());
         assert!(b.llm.is_none());
         assert!(b.avatar_blob_id.is_none());
     }
@@ -390,7 +372,6 @@ mod tests {
         assert_eq!(back.name, "Reviewer");
         assert_eq!(back.framework, AgentFramework::Claude);
         assert_eq!(back.llm, Some(LlmEntryName::from("primary")));
-        assert_eq!(back.system_prompt.as_deref(), Some("You are terse."));
         assert_eq!(back.created_at, row.created_at);
     }
 
@@ -422,7 +403,6 @@ mod tests {
         let back = store.get(&row.id).await.unwrap().unwrap();
         assert_eq!(back.name, "Helper 2");
         assert_eq!(back.description, "");
-        assert!(back.system_prompt.is_none());
         assert_eq!(back.framework, AgentFramework::Baybo);
         assert!(back.llm.is_none());
         assert!(back.updated_at >= back.created_at);

@@ -2575,7 +2575,7 @@ async fn resolve_agent_binding(
         baybo_workspace::ensure_persona_layout(
             &state.workspace_paths,
             agent_id.as_str(),
-            &baybo_store::agent_profile::persona_soul_seed(&row),
+            baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE,
         )
         .await
         .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;

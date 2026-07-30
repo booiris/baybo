@@ -574,9 +574,12 @@ impl ContextManager {
         // on workspace-persona behaviour, and its memories stay partitioned
         // under the stored id.
         match store.get(agent_id).await {
-            Ok(Some(row)) => PersonaSources {
+            // The row's content no longer feeds the prompt at all; the
+            // lookup survives to tell "bound to a live profile" from "bound
+            // to one that has been deleted", which fall back differently.
+            Ok(Some(_)) => PersonaSources {
                 soul_path: agent_id.identity_file(&self.workspace, IdentityKind::Soul),
-                soul_seed: baybo_store::agent_profile::persona_soul_seed(&row),
+                soul_seed: baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_string(),
                 self_image_path: agent_id.identity_file(&self.workspace, IdentityKind::Identity),
                 self_image_seed: IdentityKind::Identity.default_content().to_string(),
             },

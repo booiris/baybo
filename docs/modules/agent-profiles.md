@@ -2,9 +2,9 @@
 
 ## Overview
 
-Agent profiles are user-managed personas: a named, avatar-carrying bundle of system prompt, an execution framework (`baybo` / `claude` / `codex`), and an optional LLM pin. The operator creates and edits them from the web dashboard; a later feature will let a chat session bind to one so the profile drives that session's behavior. Skills are **not** a profile field — the editor displays them read-only, live from the skill registry (managed by the skill system, not configured per agent here).
+Agent profiles are user-managed personas: a named, avatar-carrying row bundling an execution framework (`baybo` / `claude` / `codex`) and an optional LLM pin. The operator creates and edits them from the web dashboard, and a chat session binds to one at creation.
 
-**v1 is management-only.** The feature ships the entity, its persistence, full CRUD over `/v1/agents`, and the web **Agents** page — and deliberately **no runtime consumer**: nothing in `baybo-agent`, `baybo-context`, or the spawn path reads `agent_profiles` yet. Binding, allow-list enforcement, and external-framework top-level sessions are all in [Deferred](#deferred).
+**The row is half of an agent.** The other half is its persona directory, `<workspace>/personas/<agent_id>/`, holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` overlay only it sees. The split is by kind of content: the row carries what the system queries (a unique name to sort and pick by, a binary avatar, a framework), the directory carries the prose the agent itself rewrites. Neither a prompt nor a skill list is a column. See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding, the resolution rules, and what is still unbuilt.
 
 This is a cross-crate feature subsystem, not a crate. The pieces live where their kind of code already lives:
 
@@ -14,7 +14,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 - `crates/gateway/src/api/admin/agents.rs` — the `/v1/agents` handlers and DTOs.
 - `app/web/src/pages/AgentsPage.tsx` — the management page.
 
-**What this is NOT.** It is not `SubagentProfile` ([`subagent.md`](subagent.md)): that is the filesystem-authoritative registry (`<workspace>/agents/<name>.md`, `DashMap`, disk wins on `reload`) that types *spawned subagents*. Agent profiles are DB-authoritative, web-managed, and aimed at *top-level* sessions. The two registries do not read each other, share no types beyond `baybo-model`, and a name appearing in both means nothing. It is also not the Soul: the workspace `profile/` identity files remain the default persona, and an agent profile only ever *overrides* them (a `NULL` prompt means "use the Soul").
+**What this is NOT.** It is not `SubagentProfile` ([`subagent.md`](subagent.md)): that is the filesystem-authoritative registry (`<workspace>/agents/<name>.md`, `DashMap`, disk wins on `reload`) that types *spawned subagents*. Agent profiles are DB-authoritative, web-managed, and aimed at *top-level* sessions. The two registries do not read each other, share no types beyond `baybo-model`, and a name appearing in both means nothing. It is also not the Soul itself: a soul is a file, and the row only names which agent's file to read. The built-in profile's persona *is* the workspace `profile/`, so an unbound session and a built-in-bound one assemble byte-identical prompts.
 
 ## Data model
 
@@ -25,7 +25,6 @@ pub struct AgentProfileRow {
     pub name: String,                  // display name; unique, ASCII case-insensitive
     pub description: String,
     pub avatar_blob_id: Option<String>,// full blob id incl. read token, from POST /v1/blobs
-    pub system_prompt: Option<String>, // None = workspace Soul (default behavior)
     pub framework: AgentFramework,     // baybo | claude | codex
     pub llm: Option<LlmEntryName>,     // None = follow default-llm; meaningful for baybo only
     pub builtin: bool,                 // the seeded `baybo` row; locked except avatar
@@ -36,12 +35,18 @@ pub struct AgentProfileRow {
 
 `AgentFramework` is a flat unit enum in `baybo-model` (`#[serde(rename_all = "snake_case")]` + the house `as_str()` / `parse()` / `const ALL` mirror): `Baybo | Claude | Codex`, `Baybo` the `Default`. Its string forms are a subset of the spawn protocol's backend tags — `BAYBO_BACKEND_TAG` and `ExternalAgentKind::as_str()` (the runtime also has `Gemini`, deliberately not offered as an agent-profile framework) — and it carries `to_backend_kind(self) -> SubagentBackendKind` so future runtime wiring is a lossless mapping, not a string translation.
 
-`system_prompt` is markdown text, matching the Soul files it overrides. `NULL` consistently means **inherit the default**:
+`NULL` consistently means **inherit the default**:
 
 | Field | `NULL` / `None` | `Some(...)` |
 |---|---|---|
-| `system_prompt` | workspace Soul (`assemble_from_workspace`), same as every session today | replaces the Soul for bound sessions |
 | `llm` | follow `default-llm` | pin to this `baybo.json` entry name |
+
+**There is no prompt column.** An agent's prompt is its own
+`personas/<id>/SOUL.md` — a file, so the agent can rewrite it through `Edit`
+and git keeps the history (see
+[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md)). A database
+created before that keeps an inert `system_prompt` column, since `init_db`
+never drops; nothing reads or writes it.
 
 `llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. Nothing is consumed yet (v1 is management-only).
 
@@ -89,7 +94,6 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
     description     TEXT NOT NULL,
     avatar_blob_id  TEXT,
-    system_prompt   TEXT,
     framework       TEXT NOT NULL,          -- AgentFramework::as_str()
     llm             TEXT,
     builtin         INTEGER NOT NULL DEFAULT 0,
@@ -98,7 +102,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
 );
 ```
 
-House encodings throughout: timestamps µs via `super::time`, booleans `INTEGER` 0/1 (an unknown `framework` string on read is an error, never a silent fallback). No `skills` column — skills are read live from the registry, not stored per agent.
+House encodings throughout: timestamps µs via `super::time`, booleans `INTEGER` 0/1 (an unknown `framework` string on read is an error, never a silent fallback). No `skills` column — skills are read live from the registry, not stored per agent — and no prompt column, for the same reason one level up: the soul is a file.
 
 ```rust
 // crates/store/src/agent_profile.rs
@@ -113,7 +117,7 @@ pub trait AgentProfileStore: Send + Sync {
 }
 ```
 
-`AgentProfileUpdate` is the full content state minus `id`/`avatar_blob_id`/`builtin`/timestamps; `update` and `set_avatar` bump `updated_at`. Both name-writing methods map the `UNIQUE` violation to `StorageError::Conflict` (the device-store message-sniff); a case-only self-rename is not a conflict. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
+`AgentProfileUpdate` is the full content state minus `id`/`avatar_blob_id`/`builtin`/timestamps (so: name, description, framework, llm); `update` and `set_avatar` bump `updated_at`. Both name-writing methods map the `UNIQUE` violation to `StorageError::Conflict` (the device-store message-sniff); a case-only self-rename is not a conflict. `Ok(false)` = no row matched (missing id, or the builtin behind the guard) — the gateway `get`s first to disambiguate, and reads `Ok(false)` after a non-builtin `get` as a concurrent delete → 404. The store stays a dumb writer — name/llm/blob validation lives in the gateway handlers — and rides the `Store.agent_profile` bundle field out of `Store::open`.
 
 ## HTTP API
 
