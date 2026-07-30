@@ -1,28 +1,42 @@
 //! `Edit` — targeted string replacement inside an existing file.
 //!
-//! Edits whose `file_path` resolves under `<workspace>/profile/` pick up
-//! three extra guards before the write:
+//! Edits that target an **identity file** pick up three extra guards
+//! before the write. Two locations qualify, because an agent's soul is
+//! wherever that agent's soul lives:
 //!
-//! - **Allowlist**: only the three identity files (`SOUL.md`, `USER.md`,
-//!   `IDENTITY.md`) may be touched. The dir is a declarative
-//!   three-slot store, not a freeform scratch space.
+//! - `<workspace>/profile/{SOUL,USER,IDENTITY}.md` — the shared
+//!   three-slot store, and the built-in agent's own persona.
+//! - `<workspace>/personas/<agent_id>/SOUL.md` — one custom agent's
+//!   soul. Only `SOUL.md`, and only directly under the agent's own
+//!   directory: a persona's `skills/` tree is skill content, not
+//!   identity.
+//!
+//! The guards:
+//!
+//! - **Allowlist**: nothing else in either location may be touched.
+//!   They are declarative stores, not freeform scratch space.
 //! - **Size cap**: identity files are system-prompt-bound (~kB). A
 //!   multi-MiB file is corruption or symlink shenanigans — fail before
 //!   we slurp it.
 //! - **Audit commit**: after a successful write, the change is staged
-//!   and committed into `profile/`'s standalone git repo with a fixed
-//!   `Baybo <baybo@local>` author so the user can later see what the
-//!   agent rewrote and revert with `git`. `--no-verify` is intentional:
-//!   `profile/` is Baybo-managed audit history, not a hand-curated repo
-//!   where pre-commit hooks would be authored. A commit failure
-//!   (detached HEAD, missing git, etc.) leaves the file write in place
-//!   and surfaces a warning in the tool output.
+//!   and committed into the owning standalone git repo (`profile/` or
+//!   `personas/`) with a fixed `Baybo <baybo@local>` author, so the user
+//!   can later see what the agent rewrote and revert with `git`.
+//!   `--no-verify` is intentional: both are Baybo-managed audit history,
+//!   not hand-curated repos where pre-commit hooks would be authored. A
+//!   commit failure (detached HEAD, missing git, etc.) leaves the file
+//!   write in place and surfaces a warning in the tool output.
+//!
+//! This is what keeps the system prompt's own instruction honest: it
+//! names each identity file's absolute path and tells the model to
+//! `Edit` it, so a self-edit must not be a per-turn approval prompt with
+//! no audit trail — for *every* agent, not just the built-in.
 //!
 //! Edits under `<workspace>/work/` and `<workspace>/skills/` also skip
 //! the approval gate (matching the `Write` tool's `work/` bypass), but
 //! without the identity-file allowlist, size cap, or audit commit —
-//! those roots are agent scratch / managed skill content, not the
-//! three-slot identity store.
+//! those roots are agent scratch / managed skill content, not an
+//! identity store.
 
 use std::path::{Path, PathBuf};
 
@@ -37,10 +51,22 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 const GIT_AUTHOR_NAME: &str = "Baybo";
 const GIT_AUTHOR_EMAIL: &str = "baybo@local";
-const MAX_PROFILE_BYTES: u64 = 1 << 20;
+const MAX_IDENTITY_BYTES: u64 = 1 << 20;
+
+/// An identity-file edit, resolved to the git repo that audits it and the
+/// path to stage inside that repo.
+struct IdentityTarget {
+    repo: PathBuf,
+    /// Repo-relative, so `git add --` stages exactly this file:
+    /// `SOUL.md` under `profile/`, `<agent_id>/SOUL.md` under `personas/`.
+    rel_path: String,
+    /// Dir name for the tool's own output line (`profile` / `personas`).
+    repo_label: &'static str,
+}
 
 pub struct EditTool {
     profile_dir: PathBuf,
+    personas_dir: PathBuf,
     work_dir: PathBuf,
     skills_dir: PathBuf,
 }
@@ -54,6 +80,7 @@ impl EditTool {
         // `<soul path="...">` wrapper.
         Self {
             profile_dir: absolutise(&workspace_paths.profile_dir()),
+            personas_dir: absolutise(&workspace_paths.personas_dir()),
             work_dir: absolutise(&workspace_paths.work_dir()),
             skills_dir: absolutise(&workspace_paths.skills_dir()),
         }
@@ -71,6 +98,55 @@ impl EditTool {
             return false;
         };
         IdentityKind::all().iter().any(|k| k.file_name() == name)
+    }
+
+    /// True for exactly `<workspace>/personas/<agent_id>/SOUL.md` — one
+    /// custom agent's soul.
+    ///
+    /// The grandparent check is what keeps a persona's `skills/` tree out:
+    /// `personas/<id>/skills/x/SOUL.md` is skill content that happens to be
+    /// named like a soul, and must not inherit the identity treatment.
+    fn is_persona_soul(&self, file_path: &Path) -> bool {
+        if !file_path.starts_with(&self.personas_dir) {
+            return false;
+        }
+        if file_path.file_name().and_then(|f| f.to_str()) != Some(IdentityKind::Soul.file_name()) {
+            return false;
+        }
+        file_path
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|grandparent| grandparent == self.personas_dir)
+    }
+
+    /// Whether this edit gets the identity treatment (approval bypass, and
+    /// — once resolved by [`Self::identity_target`] — the size cap and audit
+    /// commit).
+    fn is_identity_target(&self, file_path: &Path) -> bool {
+        self.is_profile_target(file_path) || self.is_persona_soul(file_path)
+    }
+
+    /// Resolve an identity edit to the repo that audits it, rejecting a path
+    /// inside one of the two stores that is not an allowed file.
+    /// `None` when the path is in neither store.
+    fn identity_target(&self, file_path: &Path) -> crate::Result<Option<IdentityTarget>> {
+        if file_path.starts_with(&self.profile_dir) {
+            let name = check_profile_target(file_path)?;
+            return Ok(Some(IdentityTarget {
+                repo: self.profile_dir.clone(),
+                rel_path: name.to_owned(),
+                repo_label: baybo_workspace::paths::PROFILE_DIR,
+            }));
+        }
+        if file_path.starts_with(&self.personas_dir) {
+            let rel_path = check_persona_soul_target(file_path, &self.personas_dir)?;
+            return Ok(Some(IdentityTarget {
+                repo: self.personas_dir.clone(),
+                rel_path,
+                repo_label: baybo_workspace::paths::PERSONAS_DIR,
+            }));
+        }
+        Ok(None)
     }
 
     fn is_inside_work_dir(&self, file_path: &Path) -> bool {
@@ -142,7 +218,7 @@ impl Tool for EditTool {
         // is the per-edit git commit, not a user prompt), and any path
         // under `work/` or `skills/` (agent scratch / managed skill
         // content). Anything else still goes through the gate.
-        if self.is_profile_target(&path)
+        if self.is_identity_target(&path)
             || self.is_inside_work_dir(&path)
             || self.is_inside_skills_dir(&path)
         {
@@ -166,11 +242,7 @@ impl Tool for EditTool {
             ));
         }
 
-        let profile_target = if p.file_path.starts_with(&self.profile_dir) {
-            Some(check_profile_target(&p.file_path)?)
-        } else {
-            None
-        };
+        let identity_target = self.identity_target(Path::new(&p.file_path))?;
 
         // Read-before-write contract: the file must have been read in this
         // session and be unchanged since. `stat` it for the current
@@ -221,11 +293,11 @@ impl Tool for EditTool {
             p.file_path.display()
         );
 
-        if let Some(file_name) = profile_target {
-            match commit_profile_change(&self.profile_dir, file_name, ctx.session_id.as_str()).await
-            {
-                Ok(sha) => text.push_str(&format!("\ncommitted to profile/ ({sha})")),
-                Err(reason) => text.push_str(&format!("\nprofile/ commit_warning: {reason}")),
+        if let Some(target) = identity_target {
+            let label = target.repo_label;
+            match commit_identity_change(&target, ctx.session_id.as_str()).await {
+                Ok(sha) => text.push_str(&format!("\ncommitted to {label}/ ({sha})")),
+                Err(reason) => text.push_str(&format!("\n{label}/ commit_warning: {reason}")),
             }
             text.push_str(
                 "\nnote: the in-memory system prompt picks up this change on the next compaction or new session",
@@ -258,35 +330,74 @@ fn check_profile_target(path: &Path) -> crate::Result<&'static str> {
             ))
         })?;
 
+    reject_if_oversized(path)?;
+    Ok(canonical)
+}
+
+/// Resolve a `personas/`-relative edit to `<agent_id>/SOUL.md`, or reject
+/// with `InvalidParams`. A persona directory holds one identity file; its
+/// `skills/` tree is skill content and is not editable through this path.
+fn check_persona_soul_target(path: &Path, personas_dir: &Path) -> crate::Result<String> {
+    let rel = path.strip_prefix(personas_dir).map_err(|_| {
+        ToolError::InvalidParams(format!("{} is not under personas/", path.display()))
+    })?;
+    let components: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // Exactly `<agent_id>/SOUL.md` — a longer path is either the persona's
+    // `skills/` tree or a `..` walk, and neither is an identity file.
+    if components.len() != 2 || components[1] != IdentityKind::Soul.file_name() {
+        return Err(ToolError::InvalidParams(format!(
+            "edits under personas/ are restricted to <agent_id>/{}; got {}",
+            IdentityKind::Soul.file_name(),
+            rel.display()
+        )));
+    }
+    reject_if_oversized(path)?;
+    Ok(format!("{}/{}", components[0], components[1]))
+}
+
+/// Enforce the size cap on an existing identity file so a corrupted
+/// multi-MiB blob can't be slurped into memory just to replace one byte.
+fn reject_if_oversized(path: &Path) -> crate::Result<()> {
     match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > MAX_PROFILE_BYTES => Err(ToolError::Execution(format!(
-            "profile file {} is {} bytes (> {} MiB cap); refusing to edit",
+        Ok(meta) if meta.len() > MAX_IDENTITY_BYTES => Err(ToolError::Execution(format!(
+            "identity file {} is {} bytes (> {} MiB cap); refusing to edit",
             path.display(),
             meta.len(),
-            MAX_PROFILE_BYTES >> 20
+            MAX_IDENTITY_BYTES >> 20
         ))),
-        Ok(_) | Err(_) => Ok(canonical),
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 
-async fn commit_profile_change(
-    profile_dir: &Path,
-    file_name: &str,
+async fn commit_identity_change(
+    target: &IdentityTarget,
     session_id: &str,
 ) -> Result<String, String> {
-    if !is_on_branch(profile_dir).await? {
-        return Err("HEAD is detached; check out a branch in profile/ first".into());
+    let IdentityTarget {
+        repo,
+        rel_path,
+        repo_label,
+    } = target;
+    let repo = repo.as_path();
+    let file_name = rel_path.as_str();
+    if !is_on_branch(repo).await? {
+        return Err(format!(
+            "HEAD is detached; check out a branch in {repo_label}/ first"
+        ));
     }
 
-    run_git(profile_dir, &[], &["add", "--", file_name]).await?;
+    run_git(repo, &[], &["add", "--", file_name]).await?;
 
     let commit_msg = format!(
-        "profile: update {file_name}\n\n\
+        "{repo_label}: update {file_name}\n\n\
          Tool: Edit\n\
          Session: {session_id}\n",
     );
     run_git(
-        profile_dir,
+        repo,
         &[
             "-c",
             &format!("user.name={GIT_AUTHOR_NAME}"),
@@ -305,7 +416,7 @@ async fn commit_profile_change(
     )
     .await?;
 
-    let sha = run_git(profile_dir, &[], &["rev-parse", "--short", "HEAD"]).await?;
+    let sha = run_git(repo, &[], &["rev-parse", "--short", "HEAD"]).await?;
     Ok(sha.trim().to_string())
 }
 
@@ -685,6 +796,132 @@ mod tests {
         assert!(log.contains("Session: sess-test"), "{log}");
     }
 
+    /// A custom agent's soul lives under `personas/<id>/`, not `profile/`.
+    /// The self-edit the system prompt instructs must get the same treatment
+    /// there — no approval prompt, and an audit commit — or the instruction
+    /// is only honest for the built-in agent.
+    async fn make_persona_workspace(agent_id: &str) -> (tempfile::TempDir, WorkspacePaths) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        let personas = paths.personas_dir();
+        tokio::fs::create_dir_all(paths.persona_skills_dir(agent_id))
+            .await
+            .unwrap();
+        tokio::fs::write(paths.persona_soul_file(agent_id), "## seed\nalpha\n")
+            .await
+            .unwrap();
+        run_git_quiet(&personas, &["init", "--quiet", "-b", "main"]).await;
+        for args in [
+            vec!["add", "."],
+            vec!["commit", "--no-verify", "--quiet", "-m", "seed"],
+        ] {
+            let mut full = vec!["-c", "user.name=seed", "-c", "user.email=seed@local"];
+            full.extend(args);
+            run_git_quiet(&personas, &full).await;
+        }
+        (tmp, paths)
+    }
+
+    #[tokio::test]
+    async fn persona_soul_edit_skips_approval_and_commits_to_personas() {
+        let agent = "01JAGENT";
+        let (_tmp, paths) = make_persona_workspace(agent).await;
+        let target = paths.persona_soul_file(agent);
+
+        // Approval gate: an identity edit declares only a read, so the
+        // agent is not prompted every time it updates its own persona.
+        let declared = tool_with(paths.clone()).accessed_resources(&json!({ "file_path": target }));
+        assert_eq!(
+            declared.len(),
+            1,
+            "persona soul must bypass the write gate: {declared:?}"
+        );
+        assert!(matches!(declared[0], ResourceAccess::ReadFile { .. }));
+
+        let ctx = ctx_with_paths(paths.clone());
+        let out = tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": target,
+                    "old_string": "alpha",
+                    "new_string": "bravo",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(text) = out else {
+            panic!("expected text output")
+        };
+        assert!(text.contains("committed to personas/"), "{text}");
+
+        // The commit landed in the personas/ repo and names the agent's own
+        // file, so `git log` can show what the agent rewrote.
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(paths.personas_dir())
+            .args(["log", "-1", "--pretty=%an <%ae>%n%s%n%b", "--name-only"])
+            .output()
+            .await
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("Baybo <baybo@local>"), "{log}");
+        assert!(
+            log.contains(&format!("personas: update {agent}/SOUL.md")),
+            "{log}"
+        );
+        assert!(log.contains(&format!("{agent}/SOUL.md")), "{log}");
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "## seed\nbravo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_personas_path_that_is_not_a_soul_gets_no_identity_treatment() {
+        let agent = "01JAGENT";
+        let (_tmp, paths) = make_persona_workspace(agent).await;
+
+        // A skill inside the persona dir is skill content, not identity:
+        // it keeps the write gate and takes no audit commit. Named SOUL.md
+        // deliberately — the guard is the location, not the filename.
+        let skill_dir = paths.persona_skills_dir(agent).join("deploy");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        let decoy = skill_dir.join("SOUL.md");
+        tokio::fs::write(&decoy, "alpha\n").await.unwrap();
+
+        let declared = tool_with(paths.clone()).accessed_resources(&json!({ "file_path": decoy }));
+        assert!(
+            declared.len() > 1,
+            "a persona skill file must still go through the write gate: {declared:?}"
+        );
+
+        // And an edit under personas/ that is neither is refused outright.
+        let stray = paths.persona_dir(agent).join("notes.md");
+        tokio::fs::write(&stray, "alpha\n").await.unwrap();
+        let ctx = ctx_with_paths(paths.clone());
+        let err = tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": stray,
+                    "old_string": "alpha",
+                    "new_string": "bravo",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL.md")),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&stray).await.unwrap(),
+            "alpha\n",
+            "file must not be modified on guard reject"
+        );
+    }
+
     #[tokio::test]
     async fn profile_edit_rejects_unknown_filename() {
         let (_tmp, paths) = make_profile_workspace().await;
@@ -714,7 +951,7 @@ mod tests {
     async fn profile_edit_rejects_oversized_file() {
         let (_tmp, paths) = make_profile_workspace().await;
         let target = paths.identity_file(IdentityKind::User);
-        let big = "x".repeat((MAX_PROFILE_BYTES + 1) as usize);
+        let big = "x".repeat((MAX_IDENTITY_BYTES + 1) as usize);
         tokio::fs::write(&target, &big).await.unwrap();
         let ctx = ctx_with_paths(paths.clone());
         let err = tool_with(paths.clone())
