@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{SessionId, SpanId, TriggerSource, TurnId, User};
+use baybo_model::{AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -222,6 +222,14 @@ pub struct ToolContext {
     /// pins back to the exact span that spawned them.
     pub span_id: SpanId,
     pub user: User,
+    /// The agent this call's session runs as — its memory partition and its
+    /// private skill overlay. Always populated (an unbound session resolves
+    /// to the built-in via `SessionState::agent_id_or_builtin`), so a tool
+    /// never has to decide what "no agent" means. Sessions whose work
+    /// originates inside a bound one (subagent children, cron fires) carry
+    /// the originating agent, so a worker's `mem0_add` lands in the right
+    /// partition.
+    pub agent_id: AgentProfileId,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
     /// Sandbox FS scope — points at `<workspace>/work/`. Tools whose
@@ -339,6 +347,7 @@ impl ToolContext {
                 name: None,
                 channel: ChannelType::tui(),
             },
+            agent_id: AgentProfileId::builtin(),
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),

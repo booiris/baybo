@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use baybo_model::AgentProfileId;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -67,9 +69,17 @@ impl SkillSummary {
 /// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
     skills: DashMap<String, SkillDefinition>,
+    /// Per-agent private overlays, keyed by profile id. An agent sees
+    /// `shared ∪ its own map`, its own entry winning a name collision — for
+    /// that agent only. The built-in profile has no entry here: its skills
+    /// *are* the shared set.
+    agent_skills: DashMap<AgentProfileId, HashMap<String, SkillDefinition>>,
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
+    /// Agent overlay roots passed to `load_agent_dir`, so `reload` can
+    /// replay those scans alongside `load_dirs`.
+    agent_dirs: RwLock<Vec<(AgentProfileId, PathBuf)>>,
     /// Skills registered via `register_builtins`, kept so `reload` can
     /// replay them. Without this, the first `SkillInstall`-triggered
     /// reload silently dropped every builtin (the map is cleared and
@@ -87,7 +97,9 @@ impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: DashMap::new(),
+            agent_skills: DashMap::new(),
             load_dirs: RwLock::new(Vec::new()),
+            agent_dirs: RwLock::new(Vec::new()),
             builtins: RwLock::new(Vec::new()),
         }
     }
@@ -184,14 +196,121 @@ impl SkillRegistry {
     /// "authoritative disk state wins."
     pub fn reload(&self) -> usize {
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
+        // Snapshot before mutating: iterating a `DashMap` holds shard locks,
+        // and the scans below insert into the same shards.
+        let agent_dirs: Vec<(AgentProfileId, PathBuf)> = self.agent_dirs.read().clone();
         self.skills.clear();
+        self.agent_skills.clear();
         for skill in self.builtins.read().iter() {
             self.register(skill.clone());
         }
         for dir in &dirs {
             self.scan_dir(dir);
         }
+        for (agent, dir) in &agent_dirs {
+            self.scan_agent_dir(agent, dir);
+        }
         self.skills.len()
+    }
+
+    /// Load one agent's private overlay from `dir`
+    /// (`<workspace>/personas/<id>/skills/`), remembering it so `reload` can
+    /// replay the scan. Same on-disk shape and same governance as the shared
+    /// tree — persona folders are workspace content, so their skills are
+    /// `Trusted` and the risk assessor judges them like any other.
+    ///
+    /// A missing directory is not an error: an agent with no private skills
+    /// simply sees the shared set.
+    pub fn load_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+        {
+            let mut dirs = self.agent_dirs.write();
+            if !dirs.iter().any(|(a, d)| a == agent && d == dir) {
+                dirs.push((agent.clone(), dir.to_path_buf()));
+            }
+        }
+        self.scan_agent_dir(agent, dir)
+    }
+
+    /// Whether this agent's overlay has already been scanned in this
+    /// process. The actor-build path uses it to load one agent's folder on a
+    /// cold start without paying for a global `reload`.
+    pub fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
+        self.agent_dirs.read().iter().any(|(a, _)| a == agent)
+    }
+
+    fn scan_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(err) => {
+                debug!(
+                    path = %dir.display(),
+                    agent_id = %agent,
+                    error = %err,
+                    "agent skill directory not available; skipping"
+                );
+                return 0;
+            }
+        };
+
+        let mut loaded = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("SKILL.md").is_file() {
+                continue;
+            }
+            match load_skill_from_dir(&path) {
+                Ok(skill) => {
+                    loaded.insert(skill.name.clone(), skill);
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), agent_id = %agent, error = %e, "failed to load agent skill");
+                }
+            }
+        }
+        let count = loaded.len();
+        self.agent_skills.insert(agent.clone(), loaded);
+        count
+    }
+
+    /// Look up a skill in one agent's scope: its private overlay first, then
+    /// the shared set. `None` for the agent scope (or the built-in, which has
+    /// no overlay) is exactly [`Self::get`].
+    ///
+    /// A name that exists only in *another* agent's overlay simply misses —
+    /// the caller reports "unknown skill", never a refusal that would leak
+    /// another agent's inventory.
+    pub fn get_scoped(
+        &self,
+        agent: Option<&AgentProfileId>,
+        name: &str,
+    ) -> Option<SkillDefinition> {
+        if let Some(agent) = agent
+            && let Some(overlay) = self.agent_skills.get(agent)
+            && let Some(skill) = overlay.get(name)
+        {
+            return Some(skill.clone());
+        }
+        self.get(name)
+    }
+
+    /// [`Self::all_summaries_sorted`] for one agent's scope: shared ∪ the
+    /// agent's overlay, the overlay winning a name collision, sorted by name
+    /// so ordering is stable across turns.
+    pub fn summaries_for(&self, agent: Option<&AgentProfileId>) -> Vec<SkillSummary> {
+        let Some(overlay) = agent.and_then(|a| self.agent_skills.get(a)) else {
+            return self.all_summaries_sorted();
+        };
+        let mut merged: HashMap<String, SkillSummary> = self
+            .skills
+            .iter()
+            .map(|e| (e.key().clone(), SkillSummary::from(e.value())))
+            .collect();
+        for (name, skill) in overlay.iter() {
+            merged.insert(name.clone(), SkillSummary::from(skill));
+        }
+        let mut out: Vec<SkillSummary> = merged.into_values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Remove a skill by name.
@@ -743,5 +862,101 @@ mod tests {
         assert_eq!(reg.get("deck").unwrap().description, "patched");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_overlay_wins_for_its_own_agent_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "baybo-agent-skills-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let shared = dir.join("shared");
+        let overlay = dir.join("persona-a");
+        let _ = std::fs::remove_dir_all(&dir);
+        for (root, desc) in [(&shared, "shared version"), (&overlay, "agent version")] {
+            let sub = root.join("deploy");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(
+                sub.join("SKILL.md"),
+                format!("---\nname: deploy\ndescription: {desc}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        // One skill only this agent can see.
+        let private = overlay.join("secret-recipe");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(
+            private.join("SKILL.md"),
+            "---\nname: secret-recipe\ndescription: private\n---\nbody\n",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::new();
+        reg.load_dir(&shared);
+        let agent_a = AgentProfileId::parse("01JAGENTA").unwrap();
+        let agent_b = AgentProfileId::parse("01JAGENTB").unwrap();
+        assert_eq!(reg.load_agent_dir(&agent_a, &overlay), 2);
+
+        // Same name, different body, per agent.
+        assert_eq!(
+            reg.get_scoped(Some(&agent_a), "deploy")
+                .unwrap()
+                .description,
+            "agent version"
+        );
+        assert_eq!(
+            reg.get_scoped(Some(&agent_b), "deploy")
+                .unwrap()
+                .description,
+            "shared version"
+        );
+        assert_eq!(reg.get("deploy").unwrap().description, "shared version");
+
+        // A private skill is invisible to every other scope, and the miss is
+        // an ordinary "not found" — it must not leak that it exists.
+        assert!(reg.get_scoped(Some(&agent_a), "secret-recipe").is_some());
+        assert!(reg.get_scoped(Some(&agent_b), "secret-recipe").is_none());
+        assert!(reg.get_scoped(None, "secret-recipe").is_none());
+
+        // Listings follow the same rule.
+        let names_a: Vec<String> = reg
+            .summaries_for(Some(&agent_a))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names_a, vec!["deploy", "secret-recipe"]);
+        let names_b: Vec<String> = reg
+            .summaries_for(Some(&agent_b))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names_b, vec!["deploy"]);
+
+        // reload() replays overlays, not just the shared dirs.
+        reg.reload();
+        assert_eq!(
+            reg.get_scoped(Some(&agent_a), "deploy")
+                .unwrap()
+                .description,
+            "agent version"
+        );
+        assert!(reg.agent_dir_loaded(&agent_a));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_agent_overlay_is_empty_not_an_error() {
+        let reg = SkillRegistry::new();
+        let agent = AgentProfileId::parse("01JNOWHERE").unwrap();
+        assert_eq!(
+            reg.load_agent_dir(
+                &agent,
+                std::path::Path::new("/nonexistent/personas/x/skills")
+            ),
+            0
+        );
+        assert!(reg.summaries_for(Some(&agent)).is_empty());
     }
 }
