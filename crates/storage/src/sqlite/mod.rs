@@ -276,6 +276,54 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
     Ok(())
 }
 
+/// One-time rebuild of `agent_profiles` for a database created while the
+/// prompt and the display name were columns.
+///
+/// Both moved into files the agent owns — `personas/<id>/SOUL.md` and
+/// `IDENTITY.md` — so the columns are not merely unread: `name` was
+/// `NOT NULL UNIQUE`, which an INSERT that omits it would trip. SQLite cannot
+/// `DROP COLUMN` one carrying a `UNIQUE` index, so the table is rebuilt.
+///
+/// Self-disarming (guarded on the column's presence) and transactional, and
+/// it copies every surviving column, so the only thing it destroys is two
+/// values nothing reads. It runs *before* the DDL batch: after the rename the
+/// `CREATE TABLE IF NOT EXISTS` below is a no-op, which is what keeps the two
+/// declarations of this table's shape from diverging — `rebuild_matches_fresh_schema`
+/// pins that.
+fn migrate_agent_profiles_to_file_owned_persona(
+    conn: &mut rusqlite::Connection,
+) -> anyhow::Result<()> {
+    if !has_table(conn, "agent_profiles")? || !has_column(conn, "agent_profiles", "name")? {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| anyhow::anyhow!("agent_profiles rebuild could not begin: {e}"))?;
+    tx.execute_batch(
+        "CREATE TABLE agent_profiles_rebuilt (
+             id              TEXT PRIMARY KEY,
+             description     TEXT NOT NULL,
+             avatar_blob_id  TEXT,
+             framework       TEXT NOT NULL,
+             llm             TEXT,
+             builtin         INTEGER NOT NULL DEFAULT 0,
+             created_at      INTEGER NOT NULL,
+             updated_at      INTEGER NOT NULL
+         );
+         INSERT INTO agent_profiles_rebuilt
+             (id, description, avatar_blob_id, framework, llm, builtin, created_at, updated_at)
+             SELECT id, description, avatar_blob_id, framework, llm, builtin, created_at, updated_at
+             FROM agent_profiles;
+         DROP TABLE agent_profiles;
+         ALTER TABLE agent_profiles_rebuilt RENAME TO agent_profiles;",
+    )
+    .map_err(|e| anyhow::anyhow!("agent_profiles rebuild failed: {e}"))?;
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("agent_profiles rebuild could not commit: {e}"))?;
+    tracing::info!("rebuilt agent_profiles: name and system_prompt now live in the agent's files");
+    Ok(())
+}
+
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
     AddColumn {
@@ -590,6 +638,7 @@ pub(crate) fn in_placeholders(n: usize) -> String {
 /// string comparison, not integer comparison.
 fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     migrate_turn_entity_rename(conn)?;
+    migrate_agent_profiles_to_file_owned_persona(conn)?;
     conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
                     id                    TEXT PRIMARY KEY,

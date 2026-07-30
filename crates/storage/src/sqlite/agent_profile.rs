@@ -17,19 +17,8 @@ const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
 const SELECT_COLS: &str = "id, description, avatar_blob_id, framework, \
                            llm, builtin, created_at, updated_at";
 
-/// Legacy column an older schema declared `NOT NULL UNIQUE`. New code never
-/// reads it, but an INSERT that omits it would trip that constraint on a
-/// database created before the name moved into `IDENTITY.md` — so writes
-/// fill it with the row's id, which is unique by construction and carries no
-/// meaning anyone reads.
-const LEGACY_NAME_COL: &str = "name";
-
 pub struct SqliteAgentProfileStore {
     pool: SqlitePool,
-    /// Whether this database predates the name moving out of the table.
-    /// Dropping the column would mean rebuilding the table at boot, which is
-    /// exactly the destructive schema surgery `init_db` refuses to do.
-    legacy_name_column: bool,
 }
 
 impl SqliteAgentProfileStore {
@@ -38,31 +27,15 @@ impl SqliteAgentProfileStore {
     /// (including a user-set avatar). This seed is the only statement in
     /// the process that writes `builtin = 1`.
     pub async fn open(pool: SqlitePool) -> anyhow::Result<Self> {
-        let legacy_name_column = pool
-            .interact("agent_profiles.detect_legacy_name", |conn| {
-                super::has_column(conn, "agent_profiles", LEGACY_NAME_COL)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to inspect agent_profiles: {e}"))?;
-        let store = Self {
-            pool,
-            legacy_name_column,
-        };
+        let store = Self { pool };
         let now = super::time::now_us();
         store
             .pool
             .interact("agent_profiles.seed_builtin", move |conn| {
-                let sql = if legacy_name_column {
-                    "INSERT OR IGNORE INTO agent_profiles \
-                     (id, name, description, framework, builtin, created_at, updated_at) \
-                     VALUES (?1, ?1, ?2, ?3, 1, ?4, ?4)"
-                } else {
+                conn.execute(
                     "INSERT OR IGNORE INTO agent_profiles \
                      (id, description, framework, builtin, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, 1, ?4, ?4)"
-                };
-                conn.execute(
-                    sql,
+                     VALUES (?1, ?2, ?3, 1, ?4, ?4)",
                     rusqlite::params![
                         BUILTIN_AGENT_PROFILE_ID,
                         BUILTIN_AGENT_PROFILE_DESCRIPTION,
@@ -212,7 +185,6 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
-        let legacy_name_column = self.legacy_name_column;
         // The write error has to survive the closure as data: `Conflict` is a
         // non-`Internal` variant and can't be built inside it.
         let outcome = self
@@ -220,19 +192,11 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .interact("agent_profiles.create", move |conn| {
                 // `builtin` is deliberately not in the column list: the schema
                 // DEFAULT 0 fills it, so the seed stays the only writer of 1.
-                let sql = if legacy_name_column {
-                    "INSERT INTO agent_profiles \
-                     (id, name, description, avatar_blob_id, framework, \
-                      llm, created_at, updated_at) \
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                } else {
+                match conn.execute(
                     "INSERT INTO agent_profiles \
                      (id, description, avatar_blob_id, framework, \
                       llm, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                };
-                match conn.execute(
-                    sql,
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         id,
                         description,
@@ -323,6 +287,18 @@ mod tests {
             .await
             .unwrap();
         SqliteAgentProfileStore::open(pool).await.unwrap()
+    }
+
+    async fn agent_profile_columns(pool: &SqlitePool) -> Vec<String> {
+        pool.interact("test.columns", |conn| {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_xinfo('agent_profiles')")?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(cols)
+        })
+        .await
+        .unwrap()
     }
 
     fn now_us_precision() -> DateTime<Utc> {
@@ -496,11 +472,12 @@ mod tests {
         assert_eq!(tail, ids[1..], "the tail must be id-ordered");
     }
 
-    /// A database created before the name moved into `IDENTITY.md` still has
-    /// `name NOT NULL UNIQUE`; writes must satisfy it without a boot-time
-    /// table rebuild.
+    /// A database created before the name and prompt moved into the agent's
+    /// own files is rebuilt at open, and the rebuilt table must be
+    /// indistinguishable from a fresh one — otherwise the two declarations of
+    /// this table's shape have drifted and only one of them is exercised.
     #[tokio::test]
-    async fn writes_survive_a_legacy_not_null_name_column() {
+    async fn a_legacy_schema_is_rebuilt_to_match_a_fresh_one() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("legacy.db"))
             .await
@@ -528,10 +505,46 @@ mod tests {
         .await
         .unwrap();
 
-        let store = SqliteAgentProfileStore::open(pool).await.unwrap();
+        // Seed a row the way the old build would, so the rebuild has
+        // something to carry across.
+        pool.interact("test.legacy_row", |conn| {
+            conn.execute(
+                "INSERT INTO agent_profiles \
+                 (id, name, description, system_prompt, framework, builtin, created_at, updated_at) \
+                 VALUES ('01JLEGACY', 'Old Name', 'kept', 'dead prompt', 'baybo', 0, 1, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // What a boot on the new binary does.
+        pool.interact("test.init_db", super::super::init_db)
+            .await
+            .unwrap();
+        let store = SqliteAgentProfileStore::open(pool.clone()).await.unwrap();
+
+        // The surviving columns came across, and writes no longer trip the
+        // dropped `NOT NULL UNIQUE`.
+        let legacy = store
+            .get(&AgentProfileId::parse("01JLEGACY").unwrap())
+            .await
+            .unwrap()
+            .expect("legacy row survives the rebuild");
+        assert_eq!(legacy.description, "kept");
         let row = custom_row();
         store.create(&row).await.unwrap();
-        assert_eq!(store.list().await.unwrap().len(), 2, "builtin + custom");
         assert!(store.get(&row.id).await.unwrap().is_some());
+
+        // Shape parity with a database that never saw the old schema.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = SqlitePool::open(fresh_dir.path().join("fresh.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent_profile_columns(&pool).await,
+            agent_profile_columns(&fresh).await,
+        );
     }
 }

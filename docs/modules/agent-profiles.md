@@ -54,10 +54,15 @@ display ambiguity, never a correctness problem. `list` therefore orders by
 `builtin DESC, id` and the gateway re-sorts by the name it reads from each
 agent's file.
 
-A database created before this keeps inert `system_prompt` / `name` columns,
-since `init_db` never drops. `name` was `NOT NULL UNIQUE` there, so the store
-detects it at open and fills it with the row's id — a table rebuild at boot
-is exactly the destructive surgery `init_db` refuses to do.
+A database created before this is **rebuilt once at open**
+(`migrate_agent_profiles_to_file_owned_persona`, one of `init_db`'s
+self-disarming one-time passes). `name` was `NOT NULL UNIQUE`, so leaving it
+was not an option — an INSERT that omits it trips the constraint, and SQLite
+cannot `DROP COLUMN` one carrying a `UNIQUE` index. The pass is guarded on the
+column's presence, runs in a transaction, and copies every surviving column,
+so the only thing it destroys is two values nothing reads. It runs before the
+DDL batch, and `a_legacy_schema_is_rebuilt_to_match_a_fresh_one` pins the
+rebuilt shape against a fresh one so the two declarations cannot drift.
 
 `llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. Nothing is consumed yet (v1 is management-only).
 
