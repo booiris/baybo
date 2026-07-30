@@ -469,8 +469,15 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": "Self-image replaced"
+          "200": {
+            "description": "Self-image replaced; carries the new version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed agent id",
@@ -494,6 +501,16 @@
           },
           "404": {
             "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The file changed since it was read",
             "content": {
               "application/json": {
                 "schema": {
@@ -592,8 +609,15 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": "Soul replaced"
+          "200": {
+            "description": "Soul replaced; carries the new version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed agent id",
@@ -617,6 +641,16 @@
           },
           "404": {
             "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The file changed since it was read",
             "content": {
               "application/json": {
                 "schema": {
@@ -4604,6 +4638,7 @@
         "description": "Response body for the per-agent identity-file reads.",
         "required": [
           "content",
+          "version",
           "path"
         ],
         "properties": {
@@ -4614,6 +4649,10 @@
           "path": {
             "type": "string",
             "description": "Absolute path this content came from — the agent's own\n`personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for\nthe built-in. Surfaced so an operator knows what to edit and what to\ncommit; both live inside a git repo."
+          },
+          "version": {
+            "type": "string",
+            "description": "Hash of exactly the bytes in `content`. Pass it back on `PUT` to make\nthe write conditional — see [`SetAgentIdentityFileRequest::version`]."
           }
         }
       },
@@ -6686,6 +6725,13 @@
         "properties": {
           "content": {
             "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `version` from the `GET` this edit started from. When present the\nwrite is compare-and-set: a file that changed underneath returns 409\nand nothing is written.\n\nThis is what makes it safe for a client to render *stale* content —\nwhich the web deliberately does, since it neither polls nor\nsubscribes. Without it, an editor opened before the agent rewrote its\nown file would silently delete that rewrite on the next Save. Absent\nmeans unconditional last-write-wins, for a caller that genuinely\nmeans \"set it to this\" (a script, a restore)."
           }
         }
       },

@@ -468,10 +468,17 @@ function AgentEditorPanel({
   // `personas/<id>/{SOUL,IDENTITY}.md` — not profile fields, so each loads and
   // saves on its own endpoint. The paths are shown to the operator because
   // both live in a git repo they may want to commit.
+  //
+  // The page never polls or subscribes, so what it shows can be stale — the
+  // agent rewrites these files mid-conversation. `version` is what keeps that
+  // safe: it rides back on Save, and the server refuses a write whose base
+  // has moved rather than deleting the agent's own edit.
   const [soul, setSoul] = useState('');
   const [soulPath, setSoulPath] = useState<string | null>(null);
+  const [soulVersion, setSoulVersion] = useState<string | null>(null);
   const [identity, setIdentity] = useState('');
   const [identityPath, setIdentityPath] = useState<string | null>(null);
+  const [identityVersion, setIdentityVersion] = useState<string | null>(null);
   const [filesLoaded, setFilesLoaded] = useState(false);
   const [soulDirty, setSoulDirty] = useState(false);
   const [identityDirty, setIdentityDirty] = useState(false);
@@ -531,8 +538,10 @@ function AgentEditorPanel({
       }
       setSoul(soulRes.data.content);
       setSoulPath(soulRes.data.path);
+      setSoulVersion(soulRes.data.version);
       setIdentity(identityRes.data.content);
       setIdentityPath(identityRes.data.path);
+      setIdentityVersion(identityRes.data.version);
       setSoulDirty(false);
       setIdentityDirty(false);
       setFilesLoaded(true);
@@ -615,19 +624,44 @@ function AgentEditorPanel({
         }
       }
       for (const file of [
-        { dirty: soulDirty, path: '/v1/agents/{agent_id}/soul' as const, content: soul },
-        { dirty: identityDirty, path: '/v1/agents/{agent_id}/identity' as const, content: identity },
+        {
+          label: 'Soul',
+          dirty: soulDirty,
+          path: '/v1/agents/{agent_id}/soul' as const,
+          content: soul,
+          version: soulVersion,
+          setVersion: setSoulVersion,
+        },
+        {
+          label: 'Identity',
+          dirty: identityDirty,
+          path: '/v1/agents/{agent_id}/identity' as const,
+          content: identity,
+          version: identityVersion,
+          setVersion: setIdentityVersion,
+        },
       ]) {
         if (!file.dirty) continue;
-        const { error: apiError, response } = await client.PUT(file.path, {
+        const { data, error: apiError, response } = await client.PUT(file.path, {
           params: { path: { agent_id: agent.id } },
-          body: { content: file.content },
+          body: { content: file.content, version: file.version },
         });
         if (response.status === 401) return logout();
-        if (apiError || !response.ok) {
+        if (response.status === 409) {
+          setSaveError(
+            `${file.label} was rewritten by the agent since this page loaded. ` +
+              'Reopen the agent to see the current version, then reapply your edit — ' +
+              'saving now would delete what it wrote.',
+          );
+          return;
+        }
+        if (apiError || !response.ok || !data) {
           setSaveError(apiError?.error || `HTTP Error ${response.status}`);
           return;
         }
+        // Adopt the version we just created, so a second Save from this same
+        // open editor does not conflict with its own write.
+        file.setVersion(data.version);
       }
       setSoulDirty(false);
       setIdentityDirty(false);
@@ -665,8 +699,10 @@ function AgentEditorPanel({
     onSaved,
     soul,
     soulDirty,
+    soulVersion,
     identity,
     identityDirty,
+    identityVersion,
   ]);
 
   return (

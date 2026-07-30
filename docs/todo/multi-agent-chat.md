@@ -366,15 +366,23 @@ Prompt caching is unaffected — the system row already varies per session.
   race detection, since the columns are INSERT-seeded and cannot be patched
   afterwards.
 - **`GET /v1/agents`** (exists) is the roster; the picker and the chip read it.
-- **`GET /v1/agents/{id}/soul`** → `{ content, path }`, and
-  **`PUT /v1/agents/{id}/soul`** `{ content }` → 204, a full replace written
-  tmp-file + rename. 404 on unknown id. Racing writes are last-write-wins, as
-  everywhere else in the admin surface — and because the file is inside a git
-  repo, a clobbered soul is recoverable. This endpoint resolves through
-  `agent_soul_file`, so it edits `profile/SOUL.md` for the builtin: the Agents
-  page becomes the one place to edit *any* agent's soul, and the builtin's
-  "locked except avatar" rule is untouched (the soul is a file, not a row
-  field).
+- **`GET`/`PUT /v1/agents/{id}/soul`** and **`…/identity`** — the two files an
+  agent owns, `{ content, path, version }` out and `{ content, version? }` in,
+  a full replace written tmp-file + rename, answering with the new state so an
+  open editor holds a fresh base. Both resolve through
+  `AgentProfileId::identity_file`, so for the builtin they edit
+  `profile/{SOUL,IDENTITY}.md`: the Agents page is the one place to edit *any*
+  agent's persona, and the builtin's "locked except avatar" rule is untouched
+  (these are files, not row fields).
+
+  **`version` is a compare-and-set token**, not an optimisation. Clients here
+  are *routinely* stale by design — the page neither polls nor subscribes, and
+  the agent rewrites these files mid-conversation through `Edit`. Without the
+  precondition, a Save from an editor opened before a self-edit would silently
+  delete what the agent wrote; with it, the write is refused (409) and the
+  operator re-reads. An absent `version` stays unconditional, for a caller
+  that genuinely means "set it to this". Stale *display* is fine; stale
+  *writes* are data loss.
 - **`GET /v1/skills?agent_id=`** returns shared ∪ that agent's overlay, with a
   flag marking which entries are private. Feeds the Agents-page readout.
 - **`GET /v1/chat/slash-manifest?agent_id=`** — the manifest is fetched once at

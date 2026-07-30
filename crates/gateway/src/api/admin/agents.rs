@@ -375,6 +375,9 @@ async fn update_agent(
 pub struct AgentIdentityFileDto {
     /// The markdown as it stands on disk.
     pub content: String,
+    /// Hash of exactly the bytes in `content`. Pass it back on `PUT` to make
+    /// the write conditional — see [`SetAgentIdentityFileRequest::version`].
+    pub version: String,
     /// Absolute path this content came from — the agent's own
     /// `personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for
     /// the built-in. Surfaced so an operator knows what to edit and what to
@@ -386,6 +389,26 @@ pub struct AgentIdentityFileDto {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAgentIdentityFileRequest {
     pub content: String,
+    /// The `version` from the `GET` this edit started from. When present the
+    /// write is compare-and-set: a file that changed underneath returns 409
+    /// and nothing is written.
+    ///
+    /// This is what makes it safe for a client to render *stale* content —
+    /// which the web deliberately does, since it neither polls nor
+    /// subscribes. Without it, an editor opened before the agent rewrote its
+    /// own file would silently delete that rewrite on the next Save. Absent
+    /// means unconditional last-write-wins, for a caller that genuinely
+    /// means "set it to this" (a script, a restore).
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Content hash used as the conditional-write token. Not a blob id — this is
+/// a bare digest over the file's bytes, so an identical rewrite is a no-op
+/// rather than a conflict.
+fn content_version(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 /// Read one of an agent's own identity files, seeding it on first read
@@ -407,6 +430,7 @@ async fn read_agent_identity_file(
             .await
             .map_err(|e| GatewayError::Internal(format!("read agent {kind:?} file: {e}")))?;
     Ok(Json(AgentIdentityFileDto {
+        version: content_version(&content),
         content,
         path: baybo_workspace::absolutise(&path).display().to_string(),
     }))
@@ -423,14 +447,34 @@ async fn write_agent_identity_file(
     state: &AdminState,
     agent_id: &str,
     kind: IdentityKind,
-    content: &str,
-) -> Result<axum::http::StatusCode> {
+    req: &SetAgentIdentityFileRequest,
+) -> Result<Json<AgentIdentityFileDto>> {
     let row = load_agent(state, agent_id).await?;
     let path = row.id.identity_file(&state.workspace_paths, kind);
-    write_file_atomic(&path, content)
+    if let Some(expected) = req.version.as_deref() {
+        // Read what is actually on disk now, not what this request thinks was
+        // there. A missing file hashes as empty, so a fresh write after a
+        // delete conflicts rather than silently resurrecting old content.
+        let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let actual = content_version(&current);
+        if actual != expected {
+            return Err(GatewayError::Conflict(format!(
+                "{} changed since it was read (the agent may have rewritten it); \
+                 re-read it and reapply the edit",
+                path.display()
+            )));
+        }
+    }
+    write_file_atomic(&path, &req.content)
         .await
         .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    // Return the new state, so an editor that stays open holds a fresh base
+    // for its next conditional write instead of conflicting with itself.
+    Ok(Json(AgentIdentityFileDto {
+        version: content_version(&req.content),
+        content: req.content.clone(),
+        path: baybo_workspace::absolutise(&path).display().to_string(),
+    }))
 }
 
 #[utoipa::path(
@@ -459,18 +503,19 @@ async fn get_agent_soul(
     params(("agent_id" = String, Path, description = "Agent profile id")),
     request_body = SetAgentIdentityFileRequest,
     responses(
-        (status = 204, description = "Soul replaced"),
+        (status = 200, description = "Soul replaced; carries the new version", body = AgentIdentityFileDto),
         (status = 400, description = "Malformed agent id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
+        (status = 409, description = "The file changed since it was read", body = ErrorBody),
     )
 )]
 async fn set_agent_soul(
     State(state): State<AdminState>,
     Path(agent_id): Path<String>,
     Json(req): Json<SetAgentIdentityFileRequest>,
-) -> Result<axum::http::StatusCode> {
-    write_agent_identity_file(&state, &agent_id, IdentityKind::Soul, &req.content).await
+) -> Result<Json<AgentIdentityFileDto>> {
+    write_agent_identity_file(&state, &agent_id, IdentityKind::Soul, &req).await
 }
 
 #[utoipa::path(
@@ -499,18 +544,19 @@ async fn get_agent_identity(
     params(("agent_id" = String, Path, description = "Agent profile id")),
     request_body = SetAgentIdentityFileRequest,
     responses(
-        (status = 204, description = "Self-image replaced"),
+        (status = 200, description = "Self-image replaced; carries the new version", body = AgentIdentityFileDto),
         (status = 400, description = "Malformed agent id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
+        (status = 409, description = "The file changed since it was read", body = ErrorBody),
     )
 )]
 async fn set_agent_identity(
     State(state): State<AdminState>,
     Path(agent_id): Path<String>,
     Json(req): Json<SetAgentIdentityFileRequest>,
-) -> Result<axum::http::StatusCode> {
-    write_agent_identity_file(&state, &agent_id, IdentityKind::Identity, &req.content).await
+) -> Result<Json<AgentIdentityFileDto>> {
+    write_agent_identity_file(&state, &agent_id, IdentityKind::Identity, &req).await
 }
 
 /// Stage through a sibling `.tmp` and rename, so a concurrent reader (the

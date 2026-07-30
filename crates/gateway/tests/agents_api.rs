@@ -219,7 +219,7 @@ async fn agents_api_round_trip() {
         &router,
         &format!("/v1/agents/{agent_id}/soul"),
         json!({ "content": "# Helper\n\nRewritten." }),
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
     )
     .await;
     let soul = get(
@@ -255,7 +255,7 @@ async fn agents_api_round_trip() {
         &router,
         &format!("/v1/agents/{agent_id}/identity"),
         json!({ "content": "* **Name:** Vega\n" }),
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
     )
     .await;
     let identity = get(
@@ -265,6 +265,64 @@ async fn agents_api_round_trip() {
     )
     .await;
     assert_eq!(identity["content"].as_str(), Some("* **Name:** Vega\n"));
+
+    // ── 4c. A stale editor cannot delete what the agent wrote ───────
+    // The web renders these files without polling or subscribing, so it is
+    // routinely stale. The version token is what makes that safe: a Save
+    // from an editor opened before a self-edit is refused, not applied.
+    let stale = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    let stale_version = stale["version"].as_str().expect("version").to_owned();
+    // …the agent rewrites the file underneath (what `Edit` does mid-turn).
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Chosen by the agent\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "clobber", "version": stale_version }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let survived = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        survived["content"].as_str(),
+        Some("* **Name:** Chosen by the agent\n"),
+        "the agent's self-edit must survive a stale Save",
+    );
+    // Re-reading yields a version that writes cleanly.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({
+            "content": "* **Name:** Vega\n",
+            "version": survived["version"].as_str().expect("version"),
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    // An omitted version is still an unconditional write, for callers that
+    // genuinely mean "set it to this".
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Vega\n" }),
+        StatusCode::OK,
+    )
+    .await;
 
     // The built-in's pair is the workspace's own — editable, even though its
     // row is locked, because these are files, not row fields.
@@ -280,7 +338,7 @@ async fn agents_api_round_trip() {
         &router,
         "/v1/agents/baybo/soul",
         json!({ "content": "workspace soul, edited" }),
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
     )
     .await;
     let builtin_identity = get(&router, "/v1/agents/baybo/identity", StatusCode::OK).await;

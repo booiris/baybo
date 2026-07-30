@@ -1069,6 +1069,11 @@ export interface components {
              *     commit; both live inside a git repo.
              */
             path: string;
+            /**
+             * @description Hash of exactly the bytes in `content`. Pass it back on `PUT` to make
+             *     the write conditional — see [`SetAgentIdentityFileRequest::version`].
+             */
+            version: string;
         };
         /**
          * @description One agent profile. Absent `llm` = follow `default-llm`.
@@ -2242,6 +2247,19 @@ export interface components {
         /** @description Request body for the per-agent identity-file writes. */
         SetAgentIdentityFileRequest: {
             content: string;
+            /**
+             * @description The `version` from the `GET` this edit started from. When present the
+             *     write is compare-and-set: a file that changed underneath returns 409
+             *     and nothing is written.
+             *
+             *     This is what makes it safe for a client to render *stale* content —
+             *     which the web deliberately does, since it neither polls nor
+             *     subscribes. Without it, an editor opened before the agent rewrote its
+             *     own file would silently delete that rewrite on the next Save. Absent
+             *     means unconditional last-write-wins, for a caller that genuinely
+             *     means "set it to this" (a script, a restore).
+             */
+            version?: string | null;
         };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
@@ -2874,12 +2892,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Self-image replaced */
-            204: {
+            /** @description Self-image replaced; carries the new version */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
             };
             /** @description Malformed agent id */
             400: {
@@ -2901,6 +2921,15 @@ export interface operations {
             };
             /** @description No such agent profile */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The file changed since it was read */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2976,12 +3005,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Soul replaced */
-            204: {
+            /** @description Soul replaced; carries the new version */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
             };
             /** @description Malformed agent id */
             400: {
@@ -3003,6 +3034,15 @@ export interface operations {
             };
             /** @description No such agent profile */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The file changed since it was read */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
