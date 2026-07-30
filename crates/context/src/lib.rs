@@ -81,7 +81,7 @@ use baybo_skills::{
 };
 use baybo_store::agent_profile::AgentProfileStore;
 use baybo_trace::LlmCallInputs;
-use baybo_workspace::IdentityKind;
+use baybo_workspace::{IdentityKind, IdentitySource};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -360,6 +360,15 @@ pub struct ContextManagerConfig {
     pub agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
 }
 
+/// The two per-agent identity files a session assembles from, resolved to a
+/// path plus the text to create that file with if it is absent.
+struct PersonaSources {
+    soul_path: PathBuf,
+    soul_seed: String,
+    self_image_path: PathBuf,
+    self_image_seed: String,
+}
+
 impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
         Self {
@@ -514,16 +523,21 @@ impl ContextManager {
             return resolved;
         }
 
-        let (soul_path, soul_seed) = self.resolve_soul_source().await;
-        match crate::prompts::soul::assemble(&self.workspace, &soul_path, &soul_seed).await {
+        let sources = self.resolve_persona_sources().await;
+        match crate::prompts::soul::assemble(
+            &self.workspace,
+            IdentitySource::new(&sources.soul_path, &sources.soul_seed),
+            IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
+        )
+        .await
+        {
             Ok(prompt) => Some(prompt),
             Err(e) => {
-                tracing::warn!(error = %e, soul = %soul_path.display(), "failed to assemble soul");
-                // A custom agent's soul is a file that can go missing or
-                // unreadable in ways the workspace one cannot (it is created
-                // per profile). Falling back to the workspace soul keeps the
-                // turn alive with a coherent persona instead of a bare
-                // one-line fallback.
+                tracing::warn!(error = %e, soul = %sources.soul_path.display(), "failed to assemble persona");
+                // A custom agent's files can go missing or unreadable in ways
+                // the workspace ones cannot (they are created per profile).
+                // Falling back to the workspace persona keeps the turn alive
+                // with a coherent one instead of a bare one-line fallback.
                 if self.agent.is_some() {
                     match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
                         Ok(prompt) => return Some(prompt),
@@ -537,38 +551,42 @@ impl ContextManager {
         }
     }
 
-    /// Which `SOUL.md` this session reads, and what to seed it with when it
-    /// does not exist yet. The profile row is fetched live on every call — at
-    /// the seed and at every post-compaction reseed — so an edit to the
-    /// profile or to the file lands on the next reseed.
-    async fn resolve_soul_source(&self) -> (PathBuf, String) {
-        let workspace_soul = || {
-            (
-                self.workspace.identity_file(IdentityKind::Soul),
-                IdentityKind::Soul.default_content().to_string(),
-            )
+    /// Which `SOUL.md` and `IDENTITY.md` this session reads, and what to seed
+    /// each with when it does not exist yet.
+    ///
+    /// The profile row is fetched live on every call — at the seed and at
+    /// every post-compaction reseed — so an edit to the profile or to either
+    /// file lands on the next reseed.
+    async fn resolve_persona_sources(&self) -> PersonaSources {
+        let workspace = || PersonaSources {
+            soul_path: self.workspace.identity_file(IdentityKind::Soul),
+            soul_seed: IdentityKind::Soul.default_content().to_string(),
+            self_image_path: self.workspace.identity_file(IdentityKind::Identity),
+            self_image_seed: IdentityKind::Identity.default_content().to_string(),
         };
         let Some((store, agent_id)) = &self.agent else {
-            return workspace_soul();
+            return workspace();
         };
         if agent_id.is_builtin() {
-            return workspace_soul();
+            return workspace();
         }
         // A deleted profile is tolerated, not an error: the session survives
-        // on workspace-soul behaviour, and its memories stay partitioned under
-        // the stored id.
+        // on workspace-persona behaviour, and its memories stay partitioned
+        // under the stored id.
         match store.get(agent_id).await {
-            Ok(Some(row)) => (
-                agent_id.soul_file(&self.workspace),
-                baybo_store::agent_profile::persona_soul_seed(&row),
-            ),
+            Ok(Some(row)) => PersonaSources {
+                soul_path: agent_id.identity_file(&self.workspace, IdentityKind::Soul),
+                soul_seed: baybo_store::agent_profile::persona_soul_seed(&row),
+                self_image_path: agent_id.identity_file(&self.workspace, IdentityKind::Identity),
+                self_image_seed: IdentityKind::Identity.default_content().to_string(),
+            },
             Ok(None) => {
-                tracing::warn!(agent_id = %agent_id, "bound agent profile is gone; using workspace soul");
-                workspace_soul()
+                tracing::warn!(agent_id = %agent_id, "bound agent profile is gone; using workspace persona");
+                workspace()
             }
             Err(e) => {
-                tracing::warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using workspace soul");
-                workspace_soul()
+                tracing::warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using workspace persona");
+                workspace()
             }
         }
     }
@@ -2738,21 +2756,38 @@ mod tests {
         store.insert(baybo_store::test_support::agent_profile_row(
             &agent, "Reviewer",
         ));
-        let persona_soul = workspace.persona_soul_file(agent.as_str());
+        let persona_soul = workspace.persona_identity_file(agent.as_str(), IdentityKind::Soul);
         std::fs::create_dir_all(persona_soul.parent().expect("persona parent"))
             .expect("persona dir");
         std::fs::write(&persona_soul, "PERSONA_SOUL_MARKER").expect("write persona soul");
 
-        let ctx = bound_ctx(&workspace, store, agent);
+        let ctx = bound_ctx(&workspace, store, agent.clone());
         let prompt = ctx.resolve_system_prompt().await;
         assert!(prompt.contains("PERSONA_SOUL_MARKER"), "{prompt}");
         assert!(
             !prompt.contains("WORKSPACE_SOUL_SHOULD_NOT_APPEAR"),
             "{prompt}"
         );
-        // The shared sections still apply: one deployment, one human.
-        assert!(prompt.contains("<identity "), "{prompt}");
-        assert!(prompt.contains("<user_profile "), "{prompt}");
+        // The agent's self-image is its own file too; only the user profile
+        // is shared, because there is one human however many agents exist.
+        assert!(
+            prompt.contains(
+                &workspace
+                    .persona_identity_file(agent.as_str(), IdentityKind::Identity)
+                    .display()
+                    .to_string()
+            ),
+            "the identity section must name the agent's own file: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                &workspace
+                    .identity_file(IdentityKind::User)
+                    .display()
+                    .to_string()
+            ),
+            "the user profile stays shared: {prompt}"
+        );
         // And the path in the tag is the agent's own file, so its self-edit
         // rewrites its persona and nobody else's.
         assert!(
@@ -2777,7 +2812,9 @@ mod tests {
         // Seeded from the template, which carries the profile's own name.
         assert!(prompt.contains("Fresh"), "{prompt}");
         assert!(
-            workspace.persona_soul_file(agent.as_str()).exists(),
+            workspace
+                .persona_identity_file(agent.as_str(), IdentityKind::Soul)
+                .exists(),
             "the seed must be written through to disk so the agent can Edit it"
         );
     }

@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use baybo_workspace::{IdentityKind, WorkspacePaths, absolutise};
+use baybo_workspace::{IdentityKind, IdentitySource, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
@@ -41,28 +41,23 @@ const TAIL_HINT: &str = r#"Tool results and user messages may include <system-re
 /// files via the auto-seeding `load_identity_files`, so a deleted file is
 /// recreated rather than left half-formed.
 ///
-/// `soul_path` is a parameter because the soul is the one section an agent
-/// owns: a session bound to a custom agent reads its
-/// `personas/<id>/SOUL.md`, everything else reads the workspace
-/// `profile/SOUL.md`. `soul_seed` is what that file is created with if it
-/// does not exist yet. `identity` and `user_profile` are always the
-/// workspace's — they describe the deployment and the human, which no agent
-/// owns.
+/// `soul` and `self_image` are parameters because both belong to the agent:
+/// a session bound to a custom agent reads `personas/<id>/SOUL.md` and
+/// `personas/<id>/IDENTITY.md`, everything else reads the workspace pair
+/// under `profile/`. Each source also carries what to create that file with
+/// if it does not exist yet. `user_profile` is always the workspace's — it
+/// describes the human, and there is one of those however many agents exist.
 pub async fn assemble(
     paths: &WorkspacePaths,
-    soul_path: &Path,
-    soul_seed: &str,
+    soul: IdentitySource<'_>,
+    self_image: IdentitySource<'_>,
 ) -> anyhow::Result<String> {
     let identity =
-        baybo_workspace::identity::load_identity_files(paths.root(), soul_path, soul_seed).await?;
+        baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image).await?;
     let parts = [
         TOP_HINT.to_string(),
-        wrap_section("soul", soul_path, &identity.soul),
-        wrap_section(
-            "identity",
-            &paths.identity_file(IdentityKind::Identity),
-            &identity.identity,
-        ),
+        wrap_section("soul", soul.path, &identity.soul),
+        wrap_section("identity", self_image.path, &identity.identity),
         wrap_section(
             "user_profile",
             &paths.identity_file(IdentityKind::User),
@@ -74,15 +69,16 @@ pub async fn assemble(
     Ok(parts.join("\n\n"))
 }
 
-/// [`assemble`] for a session with no agent binding: the workspace soul,
-/// seeded from its shipped template. Byte-identical to what a session bound
-/// to the built-in profile produces, because the built-in's soul *is* this
-/// file.
+/// [`assemble`] for a session with no agent binding: the workspace's own
+/// soul and self-image, each seeded from its shipped template.
+/// Byte-identical to what a session bound to the built-in profile produces,
+/// because the built-in's persona *is* the workspace `profile/`.
 pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
+    let (soul, self_image) = baybo_workspace::identity::workspace_identity_paths(paths);
     assemble(
         paths,
-        &paths.identity_file(IdentityKind::Soul),
-        IdentityKind::Soul.default_content(),
+        IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
+        IdentitySource::new(&self_image, IdentityKind::Identity.default_content()),
     )
     .await
 }

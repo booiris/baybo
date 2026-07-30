@@ -6,10 +6,11 @@
 //!
 //! - `<workspace>/profile/{SOUL,USER,IDENTITY}.md` — the shared
 //!   three-slot store, and the built-in agent's own persona.
-//! - `<workspace>/personas/<agent_id>/SOUL.md` — one custom agent's
-//!   soul. Only `SOUL.md`, and only directly under the agent's own
-//!   directory: a persona's `skills/` tree is skill content, not
-//!   identity.
+//! - `<workspace>/personas/<agent_id>/{SOUL,IDENTITY}.md` — one custom
+//!   agent's personality and self-image. Not `USER.md`: the human is
+//!   shared, so that slot only exists under `profile/`. And only directly
+//!   under the agent's own directory — a persona's `skills/` tree is skill
+//!   content, not identity.
 //!
 //! The guards:
 //!
@@ -100,17 +101,20 @@ impl EditTool {
         IdentityKind::all().iter().any(|k| k.file_name() == name)
     }
 
-    /// True for exactly `<workspace>/personas/<agent_id>/SOUL.md` — one
-    /// custom agent's soul.
+    /// True for exactly `<workspace>/personas/<agent_id>/{SOUL,IDENTITY}.md`
+    /// — one custom agent's personality or self-image.
     ///
     /// The grandparent check is what keeps a persona's `skills/` tree out:
     /// `personas/<id>/skills/x/SOUL.md` is skill content that happens to be
     /// named like a soul, and must not inherit the identity treatment.
-    fn is_persona_soul(&self, file_path: &Path) -> bool {
+    fn is_persona_identity(&self, file_path: &Path) -> bool {
         if !file_path.starts_with(&self.personas_dir) {
             return false;
         }
-        if file_path.file_name().and_then(|f| f.to_str()) != Some(IdentityKind::Soul.file_name()) {
+        let Some(name) = file_path.file_name().and_then(|f| f.to_str()) else {
+            return false;
+        };
+        if !PERSONA_IDENTITY_KINDS.iter().any(|k| k.file_name() == name) {
             return false;
         }
         file_path
@@ -123,7 +127,7 @@ impl EditTool {
     /// — once resolved by [`Self::identity_target`] — the size cap and audit
     /// commit).
     fn is_identity_target(&self, file_path: &Path) -> bool {
-        self.is_profile_target(file_path) || self.is_persona_soul(file_path)
+        self.is_profile_target(file_path) || self.is_persona_identity(file_path)
     }
 
     /// Resolve an identity edit to the repo that audits it, rejecting a path
@@ -139,7 +143,7 @@ impl EditTool {
             }));
         }
         if file_path.starts_with(&self.personas_dir) {
-            let rel_path = check_persona_soul_target(file_path, &self.personas_dir)?;
+            let rel_path = check_persona_identity_target(file_path, &self.personas_dir)?;
             return Ok(Some(IdentityTarget {
                 repo: self.personas_dir.clone(),
                 rel_path,
@@ -334,10 +338,16 @@ fn check_profile_target(path: &Path) -> crate::Result<&'static str> {
     Ok(canonical)
 }
 
-/// Resolve a `personas/`-relative edit to `<agent_id>/SOUL.md`, or reject
-/// with `InvalidParams`. A persona directory holds one identity file; its
-/// `skills/` tree is skill content and is not editable through this path.
-fn check_persona_soul_target(path: &Path, personas_dir: &Path) -> crate::Result<String> {
+/// The identity files an agent owns. `USER.md` is absent on purpose: it
+/// describes the human, of whom there is one however many agents exist, so
+/// it lives only in the shared `profile/`.
+const PERSONA_IDENTITY_KINDS: [IdentityKind; 2] = [IdentityKind::Soul, IdentityKind::Identity];
+
+/// Resolve a `personas/`-relative edit to `<agent_id>/{SOUL,IDENTITY}.md`,
+/// or reject with `InvalidParams`. A persona directory holds those two
+/// identity files; its `skills/` tree is skill content and is not editable
+/// through this path.
+fn check_persona_identity_target(path: &Path, personas_dir: &Path) -> crate::Result<String> {
     let rel = path.strip_prefix(personas_dir).map_err(|_| {
         ToolError::InvalidParams(format!("{} is not under personas/", path.display()))
     })?;
@@ -345,12 +355,15 @@ fn check_persona_soul_target(path: &Path, personas_dir: &Path) -> crate::Result<
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    // Exactly `<agent_id>/SOUL.md` — a longer path is either the persona's
+    // Exactly `<agent_id>/<FILE>.md` — a longer path is either the persona's
     // `skills/` tree or a `..` walk, and neither is an identity file.
-    if components.len() != 2 || components[1] != IdentityKind::Soul.file_name() {
+    let allowed = components.len() == 2
+        && PERSONA_IDENTITY_KINDS
+            .iter()
+            .any(|k| k.file_name() == components[1]);
+    if !allowed {
         return Err(ToolError::InvalidParams(format!(
-            "edits under personas/ are restricted to <agent_id>/{}; got {}",
-            IdentityKind::Soul.file_name(),
+            "edits under personas/ are restricted to <agent_id>/{{SOUL,IDENTITY}}.md; got {}",
             rel.display()
         )));
     }
@@ -807,9 +820,14 @@ mod tests {
         tokio::fs::create_dir_all(paths.persona_skills_dir(agent_id))
             .await
             .unwrap();
-        tokio::fs::write(paths.persona_soul_file(agent_id), "## seed\nalpha\n")
+        for kind in [IdentityKind::Soul, IdentityKind::Identity] {
+            tokio::fs::write(
+                paths.persona_identity_file(agent_id, kind),
+                "## seed\nalpha\n",
+            )
             .await
             .unwrap();
+        }
         run_git_quiet(&personas, &["init", "--quiet", "-b", "main"]).await;
         for args in [
             vec!["add", "."],
@@ -826,7 +844,7 @@ mod tests {
     async fn persona_soul_edit_skips_approval_and_commits_to_personas() {
         let agent = "01JAGENT";
         let (_tmp, paths) = make_persona_workspace(agent).await;
-        let target = paths.persona_soul_file(agent);
+        let target = paths.persona_identity_file(agent, IdentityKind::Soul);
 
         // Approval gate: an identity edit declares only a read, so the
         // agent is not prompted every time it updates its own persona.
@@ -877,6 +895,60 @@ mod tests {
         );
     }
 
+    /// An agent's self-image is its own file too, so it gets the same
+    /// treatment as its soul — and `USER.md` is deliberately not part of the
+    /// set, because the human is shared.
+    #[tokio::test]
+    async fn a_personas_identity_file_is_editable_but_a_persona_user_file_is_not() {
+        let agent = "01JAGENT";
+        let (_tmp, paths) = make_persona_workspace(agent).await;
+        let target = paths.persona_identity_file(agent, IdentityKind::Identity);
+
+        let declared = tool_with(paths.clone()).accessed_resources(&json!({ "file_path": target }));
+        assert_eq!(
+            declared.len(),
+            1,
+            "persona IDENTITY.md must bypass the write gate"
+        );
+
+        let ctx = ctx_with_paths(paths.clone());
+        let out = tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": target,
+                    "old_string": "alpha",
+                    "new_string": "Aster",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(text) = out else {
+            panic!("expected text output")
+        };
+        assert!(text.contains("committed to personas/"), "{text}");
+
+        // USER.md describes the human, not the agent: there is no per-agent
+        // copy, so an edit that invents one is refused.
+        let stray = paths.persona_identity_file(agent, IdentityKind::User);
+        tokio::fs::write(&stray, "alpha\n").await.unwrap();
+        let err = tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": stray,
+                    "old_string": "alpha",
+                    "new_string": "bravo",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL,IDENTITY")),
+            "got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_personas_path_that_is_not_a_soul_gets_no_identity_treatment() {
         let agent = "01JAGENT";
@@ -912,7 +984,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL.md")),
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL,IDENTITY")),
             "got: {err:?}"
         );
         assert_eq!(

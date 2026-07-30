@@ -382,6 +382,129 @@
         }
       }
     },
+    "/v1/agents/{agent_id}/identity": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent_identity",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent's self-image (name, creature, vibe, emoji, avatar)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_identity",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentIdentityFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Self-image replaced"
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agents/{agent_id}/soul": {
       "get": {
         "tags": [
@@ -401,11 +524,11 @@
         ],
         "responses": {
           "200": {
-            "description": "The agent's soul",
+            "description": "The agent's soul (personality, tone)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AgentSoulDto"
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
                 }
               }
             }
@@ -462,7 +585,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SetAgentSoulRequest"
+                "$ref": "#/components/schemas/SetAgentIdentityFileRequest"
               }
             }
           },
@@ -4476,6 +4599,24 @@
           "codex"
         ]
       },
+      "AgentIdentityFileDto": {
+        "type": "object",
+        "description": "Response body for the per-agent identity-file reads.",
+        "required": [
+          "content",
+          "path"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The markdown as it stands on disk."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path this content came from — the agent's own\n`personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for\nthe built-in. Surfaced so an operator knows what to edit and what to\ncommit; both live inside a git repo."
+          }
+        }
+      },
       "AgentProfileDto": {
         "type": "object",
         "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
@@ -4524,24 +4665,6 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
-          }
-        }
-      },
-      "AgentSoulDto": {
-        "type": "object",
-        "description": "Response body for `GET /v1/agents/{agent_id}/soul`.",
-        "required": [
-          "content",
-          "path"
-        ],
-        "properties": {
-          "content": {
-            "type": "string",
-            "description": "The soul markdown as it stands on disk."
-          },
-          "path": {
-            "type": "string",
-            "description": "Absolute path of the file this content came from — the agent's own\n`personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the\nbuilt-in. Surfaced so an operator knows what to edit and what to\ncommit; the file is inside a git repo."
           }
         }
       },
@@ -6554,9 +6677,9 @@
           }
         }
       },
-      "SetAgentSoulRequest": {
+      "SetAgentIdentityFileRequest": {
         "type": "object",
-        "description": "Request body for `PUT /v1/agents/{agent_id}/soul`.",
+        "description": "Request body for the per-agent identity-file writes.",
         "required": [
           "content"
         ],

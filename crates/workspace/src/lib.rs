@@ -10,7 +10,8 @@ pub mod test_support;
 pub mod identity;
 #[cfg(feature = "io")]
 pub use identity::{
-    IdentityFiles, ensure_persona_layout, load_identity_files, load_soul, write_identity_file,
+    IdentityFiles, IdentitySource, ensure_persona_layout, load_identity, load_identity_files,
+    write_identity_file,
 };
 
 #[cfg(feature = "io")]

@@ -230,8 +230,44 @@ async fn agents_api_round_trip() {
     .await;
     assert_eq!(soul["content"].as_str(), Some("# Helper\n\nRewritten."));
 
-    // The built-in's soul is the workspace identity file — editable, even
-    // though its row is locked, because the soul is not a row field.
+    // The self-image is a second per-agent file with the same treatment.
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        identity["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&format!("personas/{agent_id}/IDENTITY.md")),
+        "self-image must live in the agent's own persona dir, got {identity:?}",
+    );
+    assert!(
+        identity["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Who Am I"),
+        "seeded from the shipped template, got {identity:?}",
+    );
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Vega\n" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(identity["content"].as_str(), Some("* **Name:** Vega\n"));
+
+    // The built-in's pair is the workspace's own — editable, even though its
+    // row is locked, because these are files, not row fields.
     let builtin_soul = get(&router, "/v1/agents/baybo/soul", StatusCode::OK).await;
     assert!(
         builtin_soul["path"]
@@ -247,6 +283,14 @@ async fn agents_api_round_trip() {
         StatusCode::NO_CONTENT,
     )
     .await;
+    let builtin_identity = get(&router, "/v1/agents/baybo/identity", StatusCode::OK).await;
+    assert!(
+        builtin_identity["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("profile/IDENTITY.md"),
+        "got {builtin_identity:?}",
+    );
 
     // A malformed id can never reach the filesystem.
     get(

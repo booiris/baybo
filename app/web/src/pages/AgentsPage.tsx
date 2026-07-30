@@ -464,13 +464,17 @@ function AgentEditorPanel({
   const [name, setName] = useState(agent?.name ?? '');
   const [description, setDescription] = useState(agent?.description ?? '');
   const [framework, setFramework] = useState<AgentFramework>(agent?.framework ?? 'baybo');
-  // The soul is a file (`personas/<id>/SOUL.md`), not a profile field, so it
-  // loads and saves on its own endpoint. `soulPath` is shown to the operator
-  // because that file is inside a git repo they may want to commit.
+  // Soul (personality) and identity (self-image) are files the agent owns —
+  // `personas/<id>/{SOUL,IDENTITY}.md` — not profile fields, so each loads and
+  // saves on its own endpoint. The paths are shown to the operator because
+  // both live in a git repo they may want to commit.
   const [soul, setSoul] = useState('');
   const [soulPath, setSoulPath] = useState<string | null>(null);
-  const [soulLoaded, setSoulLoaded] = useState(false);
+  const [identity, setIdentity] = useState('');
+  const [identityPath, setIdentityPath] = useState<string | null>(null);
+  const [filesLoaded, setFilesLoaded] = useState(false);
   const [soulDirty, setSoulDirty] = useState(false);
+  const [identityDirty, setIdentityDirty] = useState(false);
   const [llm, setLlm] = useState(agent?.llm ?? '');
   const [avatarBlobId, setAvatarBlobId] = useState<string | null>(agent?.avatar_blob_id ?? null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -498,30 +502,40 @@ function AgentEditorPanel({
   // lets the server seed the template.
   useEffect(() => {
     if (agent === null) {
-      setSoulLoaded(true);
+      setFilesLoaded(true);
       return;
     }
     if (isMock) {
       setSoul(`# ${agent.name}\n\n${agent.description}`);
       setSoulPath(`personas/${agent.id}/SOUL.md`);
-      setSoulLoaded(true);
+      setIdentity('# Who Am I?\n\n* **Name:**\n* **Vibe:**\n');
+      setIdentityPath(`personas/${agent.id}/IDENTITY.md`);
+      setFilesLoaded(true);
       return;
     }
     let canceled = false;
     void (async () => {
-      const { data, error: apiError, response } = await client.GET('/v1/agents/{agent_id}/soul', {
-        params: { path: { agent_id: agent.id } },
-      });
+      const [soulRes, identityRes] = await Promise.all([
+        client.GET('/v1/agents/{agent_id}/soul', { params: { path: { agent_id: agent.id } } }),
+        client.GET('/v1/agents/{agent_id}/identity', { params: { path: { agent_id: agent.id } } }),
+      ]);
       if (canceled) return;
-      if (response.status === 401) return logout();
-      if (apiError || !data) {
-        setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+      if (soulRes.response.status === 401 || identityRes.response.status === 401) return logout();
+      if (soulRes.error || !soulRes.data || identityRes.error || !identityRes.data) {
+        setSaveError(
+          soulRes.error?.error ||
+            identityRes.error?.error ||
+            `HTTP Error ${soulRes.response.status}`,
+        );
         return;
       }
-      setSoul(data.content);
-      setSoulPath(data.path);
+      setSoul(soulRes.data.content);
+      setSoulPath(soulRes.data.path);
+      setIdentity(identityRes.data.content);
+      setIdentityPath(identityRes.data.path);
       setSoulDirty(false);
-      setSoulLoaded(true);
+      setIdentityDirty(false);
+      setFilesLoaded(true);
     })();
     return () => {
       canceled = true;
@@ -600,18 +614,23 @@ function AgentEditorPanel({
           return;
         }
       }
-      if (soulDirty) {
-        const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}/soul', {
+      for (const file of [
+        { dirty: soulDirty, path: '/v1/agents/{agent_id}/soul' as const, content: soul },
+        { dirty: identityDirty, path: '/v1/agents/{agent_id}/identity' as const, content: identity },
+      ]) {
+        if (!file.dirty) continue;
+        const { error: apiError, response } = await client.PUT(file.path, {
           params: { path: { agent_id: agent.id } },
-          body: { content: soul },
+          body: { content: file.content },
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
           setSaveError(apiError?.error || `HTTP Error ${response.status}`);
           return;
         }
-        setSoulDirty(false);
       }
+      setSoulDirty(false);
+      setIdentityDirty(false);
       if (avatarChanged) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}/avatar', {
           params: { path: { agent_id: agent.id } },
@@ -646,6 +665,8 @@ function AgentEditorPanel({
     onSaved,
     soul,
     soulDirty,
+    identity,
+    identityDirty,
   ]);
 
   return (
@@ -804,7 +825,7 @@ function AgentEditorPanel({
               className={`${textInput} resize-y`}
               rows={14}
               value={soul}
-              disabled={agent !== null && !soulLoaded}
+              disabled={agent !== null && !filesLoaded}
               onChange={(e) => {
                 setSoul(e.target.value);
                 setSoulDirty(true);
@@ -812,8 +833,37 @@ function AgentEditorPanel({
               placeholder="Markdown persona: who this agent is, how it should come across, what it refuses to do…"
             />
             <p className="mt-1 text-xs text-muted">
-              This agent&apos;s own identity file. The agent can rewrite it during a conversation;
-              the workspace IDENTITY.md and USER.md still apply on top.
+              This agent&apos;s personality and tone. The agent can rewrite it during a
+              conversation.
+            </p>
+          </div>
+
+          {/* ── identity (self-image) ── */}
+          <div>
+            <label className={fieldLabel}>
+              Identity{' '}
+              <span className="normal-case">
+                {identityPath
+                  ? `(${identityPath})`
+                  : agent === null
+                    ? '(seeded from a template)'
+                    : '(loading…)'}
+              </span>
+            </label>
+            <textarea
+              className={`${textInput} resize-y`}
+              rows={8}
+              value={identity}
+              disabled={agent === null || !filesLoaded}
+              onChange={(e) => {
+                setIdentity(e.target.value);
+                setIdentityDirty(true);
+              }}
+              placeholder="Who am I — name, creature, vibe, emoji, avatar…"
+            />
+            <p className="mt-1 text-xs text-muted">
+              How this agent sees itself. Per-agent, like the soul — only the workspace USER.md
+              (who you are) is shared across every agent.
             </p>
           </div>
 

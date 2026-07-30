@@ -10,6 +10,7 @@ use axum::extract::{Path, State};
 use baybo_model::{AgentFramework, AgentProfileId, MAX_AGENT_PROFILE_NAME_CHARS};
 use baybo_store::StorageError;
 use baybo_store::agent_profile::{AgentProfileRow, AgentProfileUpdate};
+use baybo_workspace::IdentityKind;
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -29,6 +30,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(set_agent_avatar))
         .routes(routes!(get_agent_soul))
         .routes(routes!(set_agent_soul))
+        .routes(routes!(get_agent_identity))
+        .routes(routes!(set_agent_identity))
         .routes(routes!(delete_agent))
 }
 
@@ -367,22 +370,67 @@ async fn update_agent(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Response body for `GET /v1/agents/{agent_id}/soul`.
+/// Response body for the per-agent identity-file reads.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct AgentSoulDto {
-    /// The soul markdown as it stands on disk.
+pub struct AgentIdentityFileDto {
+    /// The markdown as it stands on disk.
     pub content: String,
-    /// Absolute path of the file this content came from — the agent's own
-    /// `personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the
-    /// built-in. Surfaced so an operator knows what to edit and what to
-    /// commit; the file is inside a git repo.
+    /// Absolute path this content came from — the agent's own
+    /// `personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for
+    /// the built-in. Surfaced so an operator knows what to edit and what to
+    /// commit; both live inside a git repo.
     pub path: String,
 }
 
-/// Request body for `PUT /v1/agents/{agent_id}/soul`.
+/// Request body for the per-agent identity-file writes.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct SetAgentSoulRequest {
+pub struct SetAgentIdentityFileRequest {
     pub content: String,
+}
+
+/// Read one of an agent's own identity files, seeding it on first read
+/// exactly like the runtime's assembly does — so the editor never opens on a
+/// phantom empty file.
+async fn read_agent_identity_file(
+    state: &AdminState,
+    agent_id: &str,
+    kind: IdentityKind,
+) -> Result<Json<AgentIdentityFileDto>> {
+    let row = load_agent(state, agent_id).await?;
+    let path = row.id.identity_file(&state.workspace_paths, kind);
+    let seed = match kind {
+        IdentityKind::Soul => baybo_store::agent_profile::persona_soul_seed(&row),
+        other => other.default_content().to_owned(),
+    };
+    let content =
+        baybo_workspace::load_identity(baybo_workspace::IdentitySource::new(&path, &seed))
+            .await
+            .map_err(|e| GatewayError::Internal(format!("read agent {kind:?} file: {e}")))?;
+    Ok(Json(AgentIdentityFileDto {
+        content,
+        path: baybo_workspace::absolutise(&path).display().to_string(),
+    }))
+}
+
+/// Replace one of an agent's own identity files.
+///
+/// Deliberately NOT behind the builtin lock: the built-in row is read-only,
+/// but these are files, not row fields — and editing the workspace
+/// `profile/` pair is exactly what an operator expects the built-in's entry
+/// to offer. Racing writes are last-write-wins; both files are
+/// git-versioned, so a clobber is recoverable.
+async fn write_agent_identity_file(
+    state: &AdminState,
+    agent_id: &str,
+    kind: IdentityKind,
+    content: &str,
+) -> Result<axum::http::StatusCode> {
+    let row = load_agent(state, agent_id).await?;
+    let path = row.id.identity_file(&state.workspace_paths, kind);
+    write_file_atomic(&path, content)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -391,7 +439,7 @@ pub struct SetAgentSoulRequest {
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent profile id")),
     responses(
-        (status = 200, description = "The agent's soul", body = AgentSoulDto),
+        (status = 200, description = "The agent's soul (personality, tone)", body = AgentIdentityFileDto),
         (status = 400, description = "Malformed agent id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such agent profile", body = ErrorBody),
@@ -400,19 +448,8 @@ pub struct SetAgentSoulRequest {
 async fn get_agent_soul(
     State(state): State<AdminState>,
     Path(agent_id): Path<String>,
-) -> Result<Json<AgentSoulDto>> {
-    let row = load_agent(&state, &agent_id).await?;
-    let path = row.id.soul_file(&state.workspace_paths);
-    // Seeds on first read, exactly like the runtime's own assembly, so the
-    // editor never opens on a phantom empty file.
-    let content =
-        baybo_workspace::load_soul(&path, &baybo_store::agent_profile::persona_soul_seed(&row))
-            .await
-            .map_err(|e| GatewayError::Internal(format!("read agent soul: {e}")))?;
-    Ok(Json(AgentSoulDto {
-        content,
-        path: baybo_workspace::absolutise(&path).display().to_string(),
-    }))
+) -> Result<Json<AgentIdentityFileDto>> {
+    read_agent_identity_file(&state, &agent_id, IdentityKind::Soul).await
 }
 
 #[utoipa::path(
@@ -420,7 +457,7 @@ async fn get_agent_soul(
     path = "/agents/{agent_id}/soul",
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent profile id")),
-    request_body = SetAgentSoulRequest,
+    request_body = SetAgentIdentityFileRequest,
     responses(
         (status = 204, description = "Soul replaced"),
         (status = 400, description = "Malformed agent id", body = ErrorBody),
@@ -431,19 +468,49 @@ async fn get_agent_soul(
 async fn set_agent_soul(
     State(state): State<AdminState>,
     Path(agent_id): Path<String>,
-    Json(req): Json<SetAgentSoulRequest>,
+    Json(req): Json<SetAgentIdentityFileRequest>,
 ) -> Result<axum::http::StatusCode> {
-    // Deliberately NOT behind the builtin lock: the built-in row is
-    // read-only, but its soul is a file, not a row field — and editing the
-    // workspace `profile/SOUL.md` is exactly what an operator expects the
-    // built-in's entry to offer. Racing writes are last-write-wins; the file
-    // is git-versioned, so a clobber is recoverable.
-    let row = load_agent(&state, &agent_id).await?;
-    let path = row.id.soul_file(&state.workspace_paths);
-    write_file_atomic(&path, &req.content)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("write agent soul: {e}")))?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    write_agent_identity_file(&state, &agent_id, IdentityKind::Soul, &req.content).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/agents/{agent_id}/identity",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    responses(
+        (status = 200, description = "The agent's self-image (name, creature, vibe, emoji, avatar)", body = AgentIdentityFileDto),
+        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn get_agent_identity(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentIdentityFileDto>> {
+    read_agent_identity_file(&state, &agent_id, IdentityKind::Identity).await
+}
+
+#[utoipa::path(
+    put,
+    path = "/agents/{agent_id}/identity",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    request_body = SetAgentIdentityFileRequest,
+    responses(
+        (status = 204, description = "Self-image replaced"),
+        (status = 400, description = "Malformed agent id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn set_agent_identity(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<SetAgentIdentityFileRequest>,
+) -> Result<axum::http::StatusCode> {
+    write_agent_identity_file(&state, &agent_id, IdentityKind::Identity, &req.content).await
 }
 
 /// Stage through a sibling `.tmp` and rename, so a concurrent reader (the

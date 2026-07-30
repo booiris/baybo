@@ -13,7 +13,8 @@ pub struct IdentityFiles {
     pub soul: String,
     /// USER.md - long-term user profile.
     pub user: String,
-    /// IDENTITY.md - system or instance identity description.
+    /// IDENTITY.md - the agent's self-image: name, creature, vibe, emoji,
+    /// avatar. Per-agent, like the soul.
     pub identity: String,
 }
 
@@ -56,19 +57,45 @@ pub async fn write_identity_file(
     Ok(target)
 }
 
-/// Read one soul file, seeding it with `seed` if it does not exist yet.
+/// Where one identity section is read from, and what to create it with if
+/// it is absent.
 ///
-/// The path is a parameter because the soul is the one identity section
-/// that varies per agent: a session bound to a custom agent reads
-/// `personas/<id>/SOUL.md`, everything else reads `profile/SOUL.md`.
-pub async fn load_soul(path: &Path, seed: &str) -> anyhow::Result<String> {
-    read_or_seed(path, seed).await
+/// A parameter rather than a fixed path because `SOUL.md` and `IDENTITY.md`
+/// belong to the *agent*: a session bound to a custom agent reads them from
+/// `personas/<id>/`, everything else from `profile/`.
+#[derive(Clone, Copy)]
+pub struct IdentitySource<'a> {
+    pub path: &'a Path,
+    pub seed: &'a str,
 }
 
-/// Load the three identity sections. `IDENTITY.md` and `USER.md` always
-/// come from `<root>/profile/` — they describe the deployment and the
-/// human, which no agent owns — while the soul is read from `soul_path`
-/// and seeded with `soul_seed` when absent.
+impl<'a> IdentitySource<'a> {
+    pub fn new(path: &'a Path, seed: &'a str) -> Self {
+        Self { path, seed }
+    }
+}
+
+/// The two per-agent sections as the *workspace* holds them: the built-in
+/// agent's own files under `profile/`, each seeded from its shipped
+/// template. Returned as paths because [`IdentitySource`] borrows them.
+pub fn workspace_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf) {
+    (
+        paths.identity_file(IdentityKind::Soul),
+        paths.identity_file(IdentityKind::Identity),
+    )
+}
+
+/// Read one identity file, seeding it with `source.seed` if it does not
+/// exist yet.
+pub async fn load_identity(source: IdentitySource<'_>) -> anyhow::Result<String> {
+    read_or_seed(source.path, source.seed).await
+}
+
+/// Load the three identity sections. `SOUL.md` (personality) and
+/// `IDENTITY.md` (self-image: name, creature, vibe, emoji, avatar) are read
+/// from the caller-supplied sources, because both belong to the agent.
+/// `USER.md` always comes from `<root>/profile/` — it describes the human,
+/// and there is one of those however many agents exist.
 ///
 /// Auto-seeding here means a deleted identity file is recreated on the
 /// next session boot. That matches what we want for runtime correctness
@@ -77,16 +104,15 @@ pub async fn load_soul(path: &Path, seed: &str) -> anyhow::Result<String> {
 /// edit the file to be empty instead.
 pub async fn load_identity_files(
     root: &Path,
-    soul_path: &Path,
-    soul_seed: &str,
+    soul: IdentitySource<'_>,
+    identity: IdentitySource<'_>,
 ) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
     let user_path = paths.identity_file(IdentityKind::User);
-    let identity_path = paths.identity_file(IdentityKind::Identity);
     let (soul, user, identity) = tokio::try_join!(
-        read_or_seed(soul_path, soul_seed),
+        read_or_seed(soul.path, soul.seed),
         read_or_seed(&user_path, IdentityKind::User.default_content()),
-        read_or_seed(&identity_path, IdentityKind::Identity.default_content()),
+        read_or_seed(identity.path, identity.seed),
     )?;
 
     Ok(IdentityFiles {
@@ -97,11 +123,12 @@ pub async fn load_identity_files(
 }
 
 /// Materialize one agent's persona directory: create
-/// `personas/<agent_id>/skills/` and write `SOUL.md` with `seed_soul` **only
-/// if it is absent**, staged through a sibling `.tmp` file and renamed.
+/// `personas/<agent_id>/skills/`, then write `SOUL.md` and `IDENTITY.md`
+/// **only if absent**, each staged through a sibling `.tmp` file and
+/// renamed.
 ///
-/// Idempotent and never destructive — a soul the agent has since rewritten
-/// survives every later call. Run at profile creation and again defensively
+/// Idempotent and never destructive — files the agent has since rewritten
+/// survive every later call. Run at profile creation and again defensively
 /// when an actor for a bound session is built, which is what covers rows
 /// created before this existed and files an operator deleted.
 pub async fn ensure_persona_layout(
@@ -113,16 +140,41 @@ pub async fn ensure_persona_layout(
     tokio::fs::create_dir_all(&skills)
         .await
         .map_err(|e| anyhow::anyhow!("create persona skills dir {}: {e}", skills.display()))?;
-    let soul = paths.persona_soul_file(agent_id);
-    read_or_seed(&soul, seed_soul)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed persona soul {}: {e}", soul.display()))?;
+    for (kind, seed) in [
+        (IdentityKind::Soul, seed_soul),
+        // The self-image template is seeded verbatim: it invites the agent to
+        // pick its own name and emoji, and pre-filling it from the profile row
+        // would only mint a copy that goes stale on the next rename.
+        (
+            IdentityKind::Identity,
+            IdentityKind::Identity.default_content(),
+        ),
+    ] {
+        let path = paths.persona_identity_file(agent_id, kind);
+        read_or_seed(&path, seed)
+            .await
+            .map_err(|e| anyhow::anyhow!("seed persona {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Load the workspace's own three sections — i.e. what the built-in
+    /// agent reads, both per-agent files coming from `profile/`.
+    async fn load_workspace(dir: &Path) -> IdentityFiles {
+        let paths = WorkspacePaths::new(dir.to_path_buf());
+        let (soul, identity) = workspace_identity_paths(&paths);
+        load_identity_files(
+            dir,
+            IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
+            IdentitySource::new(&identity, IdentityKind::Identity.default_content()),
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn write_identity_file_creates_dir_and_round_trips() {
@@ -137,25 +189,13 @@ mod tests {
             .expect("write soul");
         assert_eq!(path, dir.join("profile").join("SOUL.md"));
 
-        let loaded = load_identity_files(
-            &dir,
-            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
-            IdentityKind::Soul.default_content(),
-        )
-        .await
-        .unwrap();
+        let loaded = load_workspace(&dir).await;
         assert_eq!(loaded.soul, "You are helpful.");
 
         write_identity_file(&dir, IdentityKind::Soul, "You are concise.")
             .await
             .expect("overwrite soul");
-        let loaded = load_identity_files(
-            &dir,
-            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
-            IdentityKind::Soul.default_content(),
-        )
-        .await
-        .unwrap();
+        let loaded = load_workspace(&dir).await;
         assert_eq!(loaded.soul, "You are concise.");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -175,13 +215,7 @@ mod tests {
             .await
             .unwrap();
 
-        let files = load_identity_files(
-            &dir,
-            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
-            IdentityKind::Soul.default_content(),
-        )
-        .await
-        .unwrap();
+        let files = load_workspace(&dir).await;
         assert_eq!(files.soul, "You are helpful.");
         assert_eq!(files.user, IdentityKind::User.default_content());
         assert_eq!(files.identity, IdentityKind::Identity.default_content());
@@ -214,13 +248,7 @@ mod tests {
 
         // No `profile/` dir at all yet — load must create it and seed
         // every file.
-        let files = load_identity_files(
-            &dir,
-            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
-            IdentityKind::Soul.default_content(),
-        )
-        .await
-        .unwrap();
+        let files = load_workspace(&dir).await;
         assert_eq!(files.soul, IdentityKind::Soul.default_content());
         assert_eq!(files.user, IdentityKind::User.default_content());
         assert_eq!(files.identity, IdentityKind::Identity.default_content());

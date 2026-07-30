@@ -11,7 +11,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use baybo_workspace::WorkspacePaths;
+use baybo_workspace::{IdentityKind, WorkspacePaths};
 use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
@@ -48,7 +48,7 @@ pub struct InvalidAgentProfileId {
 /// directory name of the profile's persona folder — so it is **not** an
 /// opaque string: every construction path runs the same grammar,
 /// `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the skill-name grammar), which is
-/// what keeps [`Self::soul_file`] and [`Self::skills_overlay_dir`] inside
+/// what keeps [`Self::identity_file`] and [`Self::skills_overlay_dir`] inside
 /// the workspace. There is deliberately no infallible `From<String>`, and
 /// `Deserialize` is not transparent: a guard only on the constructor would
 /// be bypassed by every request body and stored row that parses an id.
@@ -110,14 +110,20 @@ impl AgentProfileId {
         self.0 == BUILTIN_AGENT_PROFILE_ID
     }
 
-    /// The `SOUL.md` this agent's system prompt reads. The built-in resolves
-    /// to the workspace identity file, so an unbound session and a session
-    /// bound to the built-in take byte-identical paths.
-    pub fn soul_file(&self, paths: &WorkspacePaths) -> PathBuf {
-        if self.is_builtin() {
-            paths.identity_file(baybo_workspace::IdentityKind::Soul)
+    /// Where this agent reads one identity file from.
+    ///
+    /// `SOUL.md` (personality) and `IDENTITY.md` (self-image: name, creature,
+    /// vibe, emoji, avatar) belong to the agent, so a custom agent reads them
+    /// from its own persona directory. `USER.md` describes the human and is
+    /// always the shared one — there is one person however many agents exist.
+    ///
+    /// The built-in resolves everything to `profile/`, so an unbound session
+    /// and a session bound to the built-in take byte-identical paths.
+    pub fn identity_file(&self, paths: &WorkspacePaths, kind: IdentityKind) -> PathBuf {
+        if self.is_builtin() || matches!(kind, IdentityKind::User) {
+            paths.identity_file(kind)
         } else {
-            paths.persona_soul_file(&self.0)
+            paths.persona_identity_file(&self.0, kind)
         }
     }
 
@@ -277,19 +283,34 @@ mod tests {
     }
 
     #[test]
-    fn builtin_soul_is_the_workspace_identity_file_and_has_no_overlay() {
+    fn the_builtin_reads_every_identity_file_from_the_workspace() {
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
         let builtin = AgentProfileId::builtin();
-        assert_eq!(
-            builtin.soul_file(&paths),
-            paths.identity_file(baybo_workspace::IdentityKind::Soul)
-        );
+        for kind in IdentityKind::all() {
+            assert_eq!(
+                builtin.identity_file(&paths, kind),
+                paths.identity_file(kind)
+            );
+        }
         assert!(builtin.skills_overlay_dir(&paths).is_none());
+    }
 
+    #[test]
+    fn a_custom_agent_owns_its_soul_and_self_image_but_shares_the_user() {
+        let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
         let custom = AgentProfileId::parse("01JCUSTOM").unwrap();
+
+        for kind in [IdentityKind::Soul, IdentityKind::Identity] {
+            assert_eq!(
+                custom.identity_file(&paths, kind),
+                paths.persona_identity_file("01JCUSTOM", kind),
+                "{kind:?} belongs to the agent"
+            );
+        }
+        // One human however many agents exist.
         assert_eq!(
-            custom.soul_file(&paths),
-            paths.persona_soul_file("01JCUSTOM")
+            custom.identity_file(&paths, IdentityKind::User),
+            paths.identity_file(IdentityKind::User),
         );
         assert_eq!(
             custom.skills_overlay_dir(&paths),

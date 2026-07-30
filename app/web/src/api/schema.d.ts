@@ -52,6 +52,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/agents/{agent_id}/identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent_identity"];
+        put: operations["set_agent_identity"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/agents/{agent_id}/soul": {
         parameters: {
             query?: never;
@@ -1042,6 +1058,18 @@ export interface components {
          * @enum {string}
          */
         AgentFrameworkDto: "baybo" | "claude" | "codex";
+        /** @description Response body for the per-agent identity-file reads. */
+        AgentIdentityFileDto: {
+            /** @description The markdown as it stands on disk. */
+            content: string;
+            /**
+             * @description Absolute path this content came from — the agent's own
+             *     `personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for
+             *     the built-in. Surfaced so an operator knows what to edit and what to
+             *     commit; both live inside a git repo.
+             */
+            path: string;
+        };
         /**
          * @description One agent profile. Absent `llm` = follow `default-llm`.
          *
@@ -1066,18 +1094,6 @@ export interface components {
             name: string;
             /** Format: date-time */
             updated_at: string;
-        };
-        /** @description Response body for `GET /v1/agents/{agent_id}/soul`. */
-        AgentSoulDto: {
-            /** @description The soul markdown as it stands on disk. */
-            content: string;
-            /**
-             * @description Absolute path of the file this content came from — the agent's own
-             *     `personas/<id>/SOUL.md`, or the workspace `profile/SOUL.md` for the
-             *     built-in. Surfaced so an operator knows what to edit and what to
-             *     commit; the file is inside a git repo.
-             */
-            path: string;
         };
         /**
          * @description One bucket per UTC day for the analytics chart.
@@ -2223,8 +2239,8 @@ export interface components {
              */
             blob_id?: string | null;
         };
-        /** @description Request body for `PUT /v1/agents/{agent_id}/soul`. */
-        SetAgentSoulRequest: {
+        /** @description Request body for the per-agent identity-file writes. */
+        SetAgentIdentityFileRequest: {
             content: string;
         };
         /** @description `PUT /v1/config` body. */
@@ -2792,6 +2808,108 @@ export interface operations {
             };
         };
     };
+    get_agent_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent's self-image (name, creature, vibe, emoji, avatar) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentIdentityFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Self-image replaced */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_agent_soul: {
         parameters: {
             query?: never;
@@ -2804,13 +2922,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The agent's soul */
+            /** @description The agent's soul (personality, tone) */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AgentSoulDto"];
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
                 };
             };
             /** @description Malformed agent id */
@@ -2854,7 +2972,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SetAgentSoulRequest"];
+                "application/json": components["schemas"]["SetAgentIdentityFileRequest"];
             };
         };
         responses: {

@@ -40,9 +40,10 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 - **Selection**: the agent is chosen when the session is created and is
   **immutable** for that session's life. Web chat gets the picker; channels and
   TUI keep creating builtin sessions.
-- **Soul**: each agent's soul is its own `SOUL.md`. `IDENTITY.md` (which baybo
-  instance this is) and `USER.md` (who the human is) stay workspace-shared —
-  they describe the deployment and the user, not the agent.
+- **Soul + self-image**: each agent owns its own `SOUL.md` (personality) and
+  `IDENTITY.md` (name, creature, vibe, emoji, avatar). Only `USER.md` (who the
+  human is) stays workspace-shared — there is one person however many agents
+  exist.
 - **Skills**: shared base (builtins + `<workspace>/skills/`) visible to every
   agent, plus a per-agent overlay; same-name skills in the agent's folder win
   for that agent only.
@@ -141,7 +142,8 @@ for them** and custom agents partition under their ULID — rename-proof.
 <workspace_root>/
   personas/                      # standalone git repo (ensure_layout: mkdir + git init)
     01J.../                      # one dir per non-builtin agent, named by profile id
-      SOUL.md                    # this agent's persona
+      SOUL.md                    # this agent's personality and tone
+      IDENTITY.md                # this agent's self-image: name, vibe, emoji, avatar
       skills/
         deploy/SKILL.md          # private overlay; wins over a same-named shared skill
 ```
@@ -208,12 +210,14 @@ exactly one consumer: `ensure_persona_layout`'s seed for an agent whose
 `SOUL.md` does not exist yet. So a prompt an owner typed into the v1 editor
 becomes that agent's first soul, once, and nothing writes the column again.
 
-## Soul: one section swaps, the rest stays shared
+## Soul + self-image swap; the user profile stays shared
 
 The assembled system prompt keeps its current shape — `TOP_HINT`, `<soul>`,
-`<identity>`, `<user_profile>`, `BACKGROUND_TASKS_HINT`, `TAIL_HINT` — and the
-only thing an agent changes is **which file the `<soul>` section reads**. The
-`path=` attribute carries that file's absolute path, so each agent's self-edit
+`<identity>`, `<user_profile>`, `BACKGROUND_TASKS_HINT`, `TAIL_HINT` — and what
+an agent changes is **which files the `<soul>` and `<identity>` sections
+read**. Both answer "who is this assistant"; `<user_profile>` answers "who is
+the human", so it is the one section that cannot belong to an agent. The
+`path=` attribute carries each file's absolute path, so an agent's self-edit
 loop rewrites its own persona and nobody else's.
 
 ```rust

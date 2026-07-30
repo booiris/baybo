@@ -14,6 +14,7 @@
 //!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
+//!   personas/          # standalone git repo: per-agent SOUL.md + IDENTITY.md + skills/
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), tmp/ (disposable, swept), other scratch
@@ -50,9 +51,9 @@ pub const AGENTS_DIR: &str = "agents";
 
 /// Standalone git repo at `<root>/personas/`: one directory per
 /// user-managed agent profile, named by its id, carrying that agent's
-/// `SOUL.md` and its private `skills/` overlay. The built-in profile has no
-/// directory here — its persona is the workspace's own `profile/` and
-/// `skills/`.
+/// `SOUL.md`, its `IDENTITY.md`, and its private `skills/` overlay. The
+/// built-in profile has no directory here — its persona is the workspace's
+/// own `profile/` and `skills/`.
 pub const PERSONAS_DIR: &str = "personas";
 
 /// Per-agent private skill overlay, at `<root>/personas/<id>/skills/`.
@@ -395,9 +396,16 @@ impl WorkspacePaths {
         self.personas_dir().join(agent_id)
     }
 
-    /// One agent's soul: `<root>/personas/<agent_id>/SOUL.md`.
-    pub fn persona_soul_file(&self, agent_id: &str) -> PathBuf {
-        self.persona_dir(agent_id).join(IDENTITY_SOUL_FILE)
+    /// One agent's own copy of an identity file:
+    /// `<root>/personas/<agent_id>/<FILE>.md`.
+    ///
+    /// Only `SOUL.md` and `IDENTITY.md` are ever addressed this way —
+    /// personality and self-image belong to the agent, while `USER.md`
+    /// describes the human and stays in the shared `profile/`. This method
+    /// takes any kind because it is pure address arithmetic; the routing
+    /// rule lives with the agent id (`AgentProfileId::identity_file`).
+    pub fn persona_identity_file(&self, agent_id: &str, kind: IdentityKind) -> PathBuf {
+        self.persona_dir(agent_id).join(kind.file_name())
     }
 
     /// One agent's private skill overlay:
