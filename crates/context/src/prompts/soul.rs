@@ -35,21 +35,29 @@ When a subagent or command runs in the background — you spawned it with `backg
 /// first message that may carry one.
 const TAIL_HINT: &str = r#"Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear."#;
 
-/// Assemble the system prompt from the workspace identity files: [`TOP_HINT`]
-/// up front (agent role + Edit affordance), the three identity sections
-/// (`soul` / `identity` / `user_profile`), then [`TAIL_HINT`]
-/// (tag-handling guidance). Reads the files via the auto-seeding free
-/// `load_identity_files`, so a deleted file is recreated rather than left
-/// half-formed.
-pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let identity = baybo_workspace::identity::load_identity_files(paths.root()).await?;
+/// Assemble the system prompt: [`TOP_HINT`] up front (agent role + Edit
+/// affordance), the three identity sections (`soul` / `identity` /
+/// `user_profile`), then [`TAIL_HINT`] (tag-handling guidance). Reads the
+/// files via the auto-seeding `load_identity_files`, so a deleted file is
+/// recreated rather than left half-formed.
+///
+/// `soul_path` is a parameter because the soul is the one section an agent
+/// owns: a session bound to a custom agent reads its
+/// `personas/<id>/SOUL.md`, everything else reads the workspace
+/// `profile/SOUL.md`. `soul_seed` is what that file is created with if it
+/// does not exist yet. `identity` and `user_profile` are always the
+/// workspace's — they describe the deployment and the human, which no agent
+/// owns.
+pub async fn assemble(
+    paths: &WorkspacePaths,
+    soul_path: &Path,
+    soul_seed: &str,
+) -> anyhow::Result<String> {
+    let identity =
+        baybo_workspace::identity::load_identity_files(paths.root(), soul_path, soul_seed).await?;
     let parts = [
         TOP_HINT.to_string(),
-        wrap_section(
-            "soul",
-            &paths.identity_file(IdentityKind::Soul),
-            &identity.soul,
-        ),
+        wrap_section("soul", soul_path, &identity.soul),
         wrap_section(
             "identity",
             &paths.identity_file(IdentityKind::Identity),
@@ -64,6 +72,19 @@ pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<S
         TAIL_HINT.to_string(),
     ];
     Ok(parts.join("\n\n"))
+}
+
+/// [`assemble`] for a session with no agent binding: the workspace soul,
+/// seeded from its shipped template. Byte-identical to what a session bound
+/// to the built-in profile produces, because the built-in's soul *is* this
+/// file.
+pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
+    assemble(
+        paths,
+        &paths.identity_file(IdentityKind::Soul),
+        IdentityKind::Soul.default_content(),
+    )
+    .await
 }
 
 /// Wrap an identity-file body in an XML tag carrying the absolute on-disk

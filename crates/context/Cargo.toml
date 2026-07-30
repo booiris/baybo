@@ -11,6 +11,9 @@ baybo-model = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-skills = { workspace = true }
 baybo-session = { workspace = true }
+# `AgentProfileStore`: the bound agent's row is fetched live at every seed
+# and post-compaction reseed, so a profile edit lands without a restart.
+baybo-store = { workspace = true }
 # Subagent profile registry: context resolves a subagent session's system
 # prompt from its profile name (see `ContextManager::subagent_profile`).
 baybo-subagent = { workspace = true }
@@ -40,6 +43,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+baybo-store = { workspace = true, features = ["test-support"] }
 # `render_inlined_document`: the tokenizer's bound has to be checked
 # against the string the LLM layer really delivers, not a reconstruction.
 baybo-llm = { workspace = true, features = ["test-support"] }

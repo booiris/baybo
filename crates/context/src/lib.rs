@@ -67,18 +67,21 @@ pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
 pub type Result<T> = std::result::Result<T, ContextError>;
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse};
-use baybo_model::{ChatMessage, ContentBlock, Role, SessionId};
+use baybo_model::{AgentProfileId, ChatMessage, ContentBlock, Role, SessionId};
 use baybo_session::{SessionManager, SessionMessageAppendOutcome};
 use baybo_skills::render::{render_skill_block, render_skill_reminder};
 use baybo_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
     render_skill_for_slash,
 };
+use baybo_store::agent_profile::AgentProfileStore;
 use baybo_trace::LlmCallInputs;
+use baybo_workspace::IdentityKind;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -278,6 +281,11 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
+    /// For an agent-bound session: `(profile store, agent id)`. Resolves the
+    /// agent's soul file and its skill scope. `None` for an unbound session,
+    /// which reads the workspace soul and the shared skill set — the same
+    /// thing a session bound to the built-in profile reads.
+    agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
     /// Transcript length at which a compaction last came back with no
     /// savings, so the next threshold check can short-circuit instead of
     /// spending another full-transcript LLM call on the same input.
@@ -346,6 +354,10 @@ pub struct ContextManagerConfig {
     /// resolving it to a prompt is context's turn, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
+    /// For an agent-bound session: `(profile store, agent id)`. One field
+    /// feeds both the soul arm and the skill scope, so a session cannot end
+    /// up running one agent's soul with another's skills. `None` ⇒ unbound.
+    pub agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
 }
 
 impl ContextManager {
@@ -370,6 +382,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
+            agent: config.agent,
             compaction_declined_at_len: None,
             task_reminder: None,
             task_reminder_raw: 0,
@@ -486,27 +499,77 @@ impl ContextManager {
             .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string())
     }
 
-    /// Resolve the session's system prompt from its source: a subagent profile
-    /// (looked up by name in the spawn registry) or the workspace soul. `None`
+    /// Resolve the session's system prompt from its source, in priority order:
+    /// a subagent profile (a worker's contract is its profile, not a persona),
+    /// then the bound agent's own `SOUL.md`, then the workspace soul. `None`
     /// on a resolution failure (profile not found, or workspace I/O error) so
     /// the caller decides whether to fall back (seed) or keep the prior row
     /// (reseed).
     async fn try_resolve_system_prompt(&self) -> Option<String> {
-        match &self.subagent_profile {
-            Some((registry, profile_name)) => {
-                let resolved = registry.get(profile_name).map(|p| p.system_prompt);
-                if resolved.is_none() {
-                    tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
-                }
-                resolved
+        if let Some((registry, profile_name)) = &self.subagent_profile {
+            let resolved = registry.get(profile_name).map(|p| p.system_prompt);
+            if resolved.is_none() {
+                tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
             }
-            None => match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
-                Ok(prompt) => Some(prompt),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to assemble workspace soul");
-                    None
+            return resolved;
+        }
+
+        let (soul_path, soul_seed) = self.resolve_soul_source().await;
+        match crate::prompts::soul::assemble(&self.workspace, &soul_path, &soul_seed).await {
+            Ok(prompt) => Some(prompt),
+            Err(e) => {
+                tracing::warn!(error = %e, soul = %soul_path.display(), "failed to assemble soul");
+                // A custom agent's soul is a file that can go missing or
+                // unreadable in ways the workspace one cannot (it is created
+                // per profile). Falling back to the workspace soul keeps the
+                // turn alive with a coherent persona instead of a bare
+                // one-line fallback.
+                if self.agent.is_some() {
+                    match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
+                        Ok(prompt) => return Some(prompt),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to assemble workspace soul")
+                        }
+                    }
                 }
-            },
+                None
+            }
+        }
+    }
+
+    /// Which `SOUL.md` this session reads, and what to seed it with when it
+    /// does not exist yet. The profile row is fetched live on every call — at
+    /// the seed and at every post-compaction reseed — so an edit to the
+    /// profile or to the file lands on the next reseed.
+    async fn resolve_soul_source(&self) -> (PathBuf, String) {
+        let workspace_soul = || {
+            (
+                self.workspace.identity_file(IdentityKind::Soul),
+                IdentityKind::Soul.default_content().to_string(),
+            )
+        };
+        let Some((store, agent_id)) = &self.agent else {
+            return workspace_soul();
+        };
+        if agent_id.is_builtin() {
+            return workspace_soul();
+        }
+        // A deleted profile is tolerated, not an error: the session survives
+        // on workspace-soul behaviour, and its memories stay partitioned under
+        // the stored id.
+        match store.get(agent_id).await {
+            Ok(Some(row)) => (
+                agent_id.soul_file(&self.workspace),
+                baybo_store::agent_profile::persona_soul_seed(&row),
+            ),
+            Ok(None) => {
+                tracing::warn!(agent_id = %agent_id, "bound agent profile is gone; using workspace soul");
+                workspace_soul()
+            }
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using workspace soul");
+                workspace_soul()
+            }
         }
     }
 
@@ -581,7 +644,7 @@ impl ContextManager {
             return Vec::new();
         }
         self.skill_registry
-            .all_summaries_sorted()
+            .summaries_for(self.skill_scope())
             .into_iter()
             .filter(|s| {
                 s.agent_invocable
@@ -589,6 +652,16 @@ impl ContextManager {
                     && s.allows_channel(&self.channel)
             })
             .collect()
+    }
+
+    /// The agent whose private skill overlay this session sees, or `None`
+    /// when it has no overlay of its own (unbound, or bound to the built-in
+    /// whose skills *are* the shared set).
+    pub(crate) fn skill_scope(&self) -> Option<&AgentProfileId> {
+        self.agent
+            .as_ref()
+            .map(|(_, id)| id)
+            .filter(|id| !id.is_builtin())
     }
 
     /// Skills a user `/command` may expand here: anything carrying a
@@ -603,7 +676,7 @@ impl ContextManager {
             return Vec::new();
         }
         self.skill_registry
-            .all_summaries_sorted()
+            .summaries_for(self.skill_scope())
             .into_iter()
             .filter(|s| {
                 s.command.is_some()
@@ -653,7 +726,9 @@ impl ContextManager {
             .map(|m| baybo_llm::multimodal::extract_text(&m.content))?;
         let (skill_name, _args) =
             detect_slash_invocation(&user_text, &self.slash_skill_summaries())?;
-        let skill = self.skill_registry.get(&skill_name)?;
+        let skill = self
+            .skill_registry
+            .get_scoped(self.skill_scope(), &skill_name)?;
         let body = render_skill_for_slash(&skill, self.session_id.as_str());
         Some((
             skill_name,
@@ -2153,6 +2228,7 @@ mod tests {
         threshold: f64,
     ) -> ContextManager {
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
             keep_recent,
@@ -2179,6 +2255,7 @@ mod tests {
         max_tokens: usize,
     ) -> ContextManager {
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
             keep_recent: 5,
@@ -2514,6 +2591,7 @@ mod tests {
         .expect("write soul");
 
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
@@ -2577,6 +2655,7 @@ mod tests {
         });
 
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: Arc::clone(&workspace),
             keep_recent: 2,
@@ -2614,6 +2693,135 @@ mod tests {
             }
             other => panic!("expected system text, got {other:?}"),
         }
+    }
+
+    /// Build a context bound to `agent`, over a workspace whose own soul is
+    /// distinctive enough to prove it did NOT leak in.
+    fn bound_ctx(
+        workspace: &Arc<baybo_workspace::WorkspacePaths>,
+        store: Arc<dyn AgentProfileStore>,
+        agent: AgentProfileId,
+    ) -> ContextManager {
+        ContextManager::from_config(ContextManagerConfig {
+            agent: Some((store, agent)),
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+        })
+    }
+
+    fn workspace_with_soul(
+        dir: &std::path::Path,
+        soul: &str,
+    ) -> Arc<baybo_workspace::WorkspacePaths> {
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(dir.to_path_buf()));
+        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
+        std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
+        std::fs::write(&soul_path, soul).expect("write soul");
+        workspace
+    }
+
+    #[tokio::test]
+    async fn bound_agent_reads_its_own_soul_file_not_the_workspace_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_SHOULD_NOT_APPEAR");
+
+        let agent = AgentProfileId::parse("01JAGENT").expect("valid id");
+        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+        store.insert(baybo_store::test_support::agent_profile_row(
+            &agent, "Reviewer",
+        ));
+        let persona_soul = workspace.persona_soul_file(agent.as_str());
+        std::fs::create_dir_all(persona_soul.parent().expect("persona parent"))
+            .expect("persona dir");
+        std::fs::write(&persona_soul, "PERSONA_SOUL_MARKER").expect("write persona soul");
+
+        let ctx = bound_ctx(&workspace, store, agent);
+        let prompt = ctx.resolve_system_prompt().await;
+        assert!(prompt.contains("PERSONA_SOUL_MARKER"), "{prompt}");
+        assert!(
+            !prompt.contains("WORKSPACE_SOUL_SHOULD_NOT_APPEAR"),
+            "{prompt}"
+        );
+        // The shared sections still apply: one deployment, one human.
+        assert!(prompt.contains("<identity "), "{prompt}");
+        assert!(prompt.contains("<user_profile "), "{prompt}");
+        // And the path in the tag is the agent's own file, so its self-edit
+        // rewrites its persona and nobody else's.
+        assert!(
+            prompt.contains(&persona_soul.display().to_string()),
+            "soul section must name the agent's own file: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_persona_soul_is_seeded_rather_than_failing_the_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL");
+
+        let agent = AgentProfileId::parse("01JFRESH").expect("valid id");
+        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+        let mut row = baybo_store::test_support::agent_profile_row(&agent, "Fresh");
+        row.description = "A brand new agent".into();
+        store.insert(row);
+
+        let ctx = bound_ctx(&workspace, store, agent.clone());
+        let prompt = ctx.resolve_system_prompt().await;
+        // Seeded from the template, which carries the profile's own name.
+        assert!(prompt.contains("Fresh"), "{prompt}");
+        assert!(
+            workspace.persona_soul_file(agent.as_str()).exists(),
+            "the seed must be written through to disk so the agent can Edit it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_profile_falls_back_to_the_workspace_soul() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_FALLBACK");
+
+        // Bound to an agent whose row is gone — the binding survives on the
+        // session, so this is the ordinary read path, not an error path.
+        let agent = AgentProfileId::parse("01JGONE").expect("valid id");
+        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+
+        let ctx = bound_ctx(&workspace, store, agent);
+        let prompt = ctx.resolve_system_prompt().await;
+        assert!(prompt.contains("WORKSPACE_SOUL_FALLBACK"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn the_builtin_binding_is_byte_identical_to_no_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SHARED_SOUL");
+        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+
+        let bound = bound_ctx(&workspace, store, AgentProfileId::builtin())
+            .resolve_system_prompt()
+            .await;
+        let unbound = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+        })
+        .resolve_system_prompt()
+        .await;
+        assert_eq!(bound, unbound);
     }
 
     #[tokio::test]
@@ -3304,6 +3512,7 @@ mod tests {
         threshold: f64,
     ) -> ContextManager {
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
             keep_recent,
