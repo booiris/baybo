@@ -56,23 +56,35 @@ pub async fn write_identity_file(
     Ok(target)
 }
 
-/// Load the three identity files from `<root>/profile/`. Any missing
-/// file is atomically seeded with its
-/// [`IdentityKind::default_content`] before being returned, so the
-/// caller is guaranteed a fully-populated [`IdentityFiles`].
+/// Read one soul file, seeding it with `seed` if it does not exist yet.
+///
+/// The path is a parameter because the soul is the one identity section
+/// that varies per agent: a session bound to a custom agent reads
+/// `personas/<id>/SOUL.md`, everything else reads `profile/SOUL.md`.
+pub async fn load_soul(path: &Path, seed: &str) -> anyhow::Result<String> {
+    read_or_seed(path, seed).await
+}
+
+/// Load the three identity sections. `IDENTITY.md` and `USER.md` always
+/// come from `<root>/profile/` — they describe the deployment and the
+/// human, which no agent owns — while the soul is read from `soul_path`
+/// and seeded with `soul_seed` when absent.
 ///
 /// Auto-seeding here means a deleted identity file is recreated on the
 /// next session boot. That matches what we want for runtime correctness
 /// (the Soul prompt is never half-formed), but it does mean
 /// "delete to disable" is not a way to opt out of identity injection —
 /// edit the file to be empty instead.
-pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
+pub async fn load_identity_files(
+    root: &Path,
+    soul_path: &Path,
+    soul_seed: &str,
+) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
-    let soul_path = paths.identity_file(IdentityKind::Soul);
     let user_path = paths.identity_file(IdentityKind::User);
     let identity_path = paths.identity_file(IdentityKind::Identity);
     let (soul, user, identity) = tokio::try_join!(
-        read_or_seed(&soul_path, IdentityKind::Soul.default_content()),
+        read_or_seed(soul_path, soul_seed),
         read_or_seed(&user_path, IdentityKind::User.default_content()),
         read_or_seed(&identity_path, IdentityKind::Identity.default_content()),
     )?;
@@ -82,6 +94,30 @@ pub async fn load_identity_files(root: &Path) -> anyhow::Result<IdentityFiles> {
         user,
         identity,
     })
+}
+
+/// Materialize one agent's persona directory: create
+/// `personas/<agent_id>/skills/` and write `SOUL.md` with `seed_soul` **only
+/// if it is absent**, staged through a sibling `.tmp` file and renamed.
+///
+/// Idempotent and never destructive — a soul the agent has since rewritten
+/// survives every later call. Run at profile creation and again defensively
+/// when an actor for a bound session is built, which is what covers rows
+/// created before this existed and files an operator deleted.
+pub async fn ensure_persona_layout(
+    paths: &WorkspacePaths,
+    agent_id: &str,
+    seed_soul: &str,
+) -> anyhow::Result<()> {
+    let skills = paths.persona_skills_dir(agent_id);
+    tokio::fs::create_dir_all(&skills)
+        .await
+        .map_err(|e| anyhow::anyhow!("create persona skills dir {}: {e}", skills.display()))?;
+    let soul = paths.persona_soul_file(agent_id);
+    read_or_seed(&soul, seed_soul)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed persona soul {}: {e}", soul.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -101,13 +137,25 @@ mod tests {
             .expect("write soul");
         assert_eq!(path, dir.join("profile").join("SOUL.md"));
 
-        let loaded = load_identity_files(&dir).await.unwrap();
+        let loaded = load_identity_files(
+            &dir,
+            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
+            IdentityKind::Soul.default_content(),
+        )
+        .await
+        .unwrap();
         assert_eq!(loaded.soul, "You are helpful.");
 
         write_identity_file(&dir, IdentityKind::Soul, "You are concise.")
             .await
             .expect("overwrite soul");
-        let loaded = load_identity_files(&dir).await.unwrap();
+        let loaded = load_identity_files(
+            &dir,
+            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
+            IdentityKind::Soul.default_content(),
+        )
+        .await
+        .unwrap();
         assert_eq!(loaded.soul, "You are concise.");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -127,7 +175,13 @@ mod tests {
             .await
             .unwrap();
 
-        let files = load_identity_files(&dir).await.unwrap();
+        let files = load_identity_files(
+            &dir,
+            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
+            IdentityKind::Soul.default_content(),
+        )
+        .await
+        .unwrap();
         assert_eq!(files.soul, "You are helpful.");
         assert_eq!(files.user, IdentityKind::User.default_content());
         assert_eq!(files.identity, IdentityKind::Identity.default_content());
@@ -160,7 +214,13 @@ mod tests {
 
         // No `profile/` dir at all yet — load must create it and seed
         // every file.
-        let files = load_identity_files(&dir).await.unwrap();
+        let files = load_identity_files(
+            &dir,
+            &WorkspacePaths::new(dir.clone()).identity_file(IdentityKind::Soul),
+            IdentityKind::Soul.default_content(),
+        )
+        .await
+        .unwrap();
         assert_eq!(files.soul, IdentityKind::Soul.default_content());
         assert_eq!(files.user, IdentityKind::User.default_content());
         assert_eq!(files.identity, IdentityKind::Identity.default_content());

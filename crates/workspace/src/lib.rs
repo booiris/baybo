@@ -9,7 +9,9 @@ pub mod test_support;
 #[cfg(feature = "io")]
 pub mod identity;
 #[cfg(feature = "io")]
-pub use identity::{IdentityFiles, load_identity_files, write_identity_file};
+pub use identity::{
+    IdentityFiles, ensure_persona_layout, load_identity_files, load_soul, write_identity_file,
+};
 
 #[cfg(feature = "io")]
 pub mod singleton;

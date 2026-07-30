@@ -14,10 +14,10 @@ impl WorkspaceManager {
     }
 
     /// Materialise the workspace skeleton: create `config/`, `profile/`,
-    /// `skills/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/`, and initialise a
-    /// standalone git repo inside each of `config/`, `profile/`, and
-    /// `skills/` if it isn't one already. Idempotent — safe to call on
-    /// every boot.
+    /// `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`,
+    /// `work/tmp/`, `logs/`, and initialise a standalone git repo inside
+    /// each of the declarative dirs if it isn't one already. Idempotent —
+    /// safe to call on every boot.
     pub async fn ensure_layout(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
         for dir in [
@@ -25,6 +25,7 @@ impl WorkspaceManager {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.personas_dir(),
             paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
@@ -41,6 +42,7 @@ impl WorkspaceManager {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.personas_dir(),
         ] {
             ensure_git_repo(&dir).await?;
         }
@@ -82,7 +84,13 @@ impl WorkspaceManager {
     /// [`IdentityFiles`] is always fully populated. The `profile/` dir
     /// itself is created on demand if absent.
     pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
-        identity::load_identity_files(&self.root).await
+        let paths = WorkspacePaths::new(self.root.clone());
+        identity::load_identity_files(
+            &self.root,
+            &paths.identity_file(IdentityKind::Soul),
+            IdentityKind::Soul.default_content(),
+        )
+        .await
     }
 
     /// Atomically write one identity document to the workspace `profile/`
@@ -165,6 +173,7 @@ mod tests {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.personas_dir(),
             paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
@@ -180,6 +189,7 @@ mod tests {
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
         assert!(paths.agents_dir().join(".git").is_dir());
+        assert!(paths.personas_dir().join(".git").is_dir());
         // .key/ is NOT a git repo — encryption key must never be tracked.
         assert!(!paths.key_dir().join(".git").exists());
 

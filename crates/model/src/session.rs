@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_profile::{AgentFramework, AgentProfileId};
 use crate::approval::ApprovedResource;
 use crate::ids::{SessionId, TurnId};
 use crate::llm_entry_name::LlmEntryName;
@@ -380,9 +381,41 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_effort: Option<String>,
 
+    /// The agent profile this session's work belongs to: its soul, its skill
+    /// overlay, and its memory partition. `None` — every pre-binding row, plus
+    /// channel and TUI sessions — reads as the built-in, so
+    /// [`Self::agent_id_or_builtin`] is the only correct way to consume it.
+    ///
+    /// Seeded by the session-creation INSERT and never written again: a
+    /// mid-thread swap would split the memory partition and leave two personas'
+    /// output in one transcript with no marker. Sessions whose work originates
+    /// inside a bound one (subagent children, cron fires) copy the value at
+    /// their own creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentProfileId>,
+
+    /// Snapshot of the bound profile's framework at creation — deliberately
+    /// not re-read from the row, because a transcript written by baybo's agent
+    /// loop cannot be served by an external CLI that has never seen it.
+    /// Editing a profile's framework only affects new sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_framework: Option<AgentFramework>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
+}
+
+impl SessionState {
+    /// The agent this session runs as, resolving the unbound case to the
+    /// built-in profile. Consumers must never read [`Self::agent_id`]
+    /// directly: `None` is not "no agent", it is the built-in, whose id is
+    /// also the memory partition every pre-binding memory was written under.
+    pub fn agent_id_or_builtin(&self) -> AgentProfileId {
+        self.agent_id
+            .clone()
+            .unwrap_or_else(AgentProfileId::builtin)
+    }
 }
 
 /// The complete durable state of background-result notification delivery.

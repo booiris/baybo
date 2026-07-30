@@ -65,6 +65,29 @@ pub(crate) const DEFAULT_USER_CONTENT: &str = r#"# About Your Human
 *(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)*
 "#;
 
+/// Seed body for a newly-created agent's `personas/<id>/SOUL.md`.
+///
+/// Substituted with [`String::replace`] at the call site (the gateway, which
+/// is the layer holding the profile row) rather than assembled with
+/// `format!`, so the markdown below stays literal.
+pub const PERSONA_SOUL_TEMPLATE: &str = r#"# {{name}}
+
+{{description}}
+
+*This file is this agent's soul: its personality, tone, and preferences. It is
+yours to rewrite — edit it directly, or let the agent update it as it learns.
+Sessions bound to any other agent never read it, and the workspace
+`profile/IDENTITY.md` and `profile/USER.md` still apply on top.*
+
+## Core Truths
+
+*(What is this agent for? How should it come across? What does it refuse to do?)*
+
+## Boundaries
+
+*(Anything this agent must never touch, or must always confirm first.)*
+"#;
+
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 
 *Fill this in during your first conversation. Make it yours.*

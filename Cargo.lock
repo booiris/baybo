@@ -404,6 +404,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "baybo-memory",
+ "baybo-model",
  "chrono",
  "clap",
  "futures",
@@ -549,6 +550,7 @@ dependencies = [
  "baybo-session",
  "baybo-skills",
  "baybo-storage",
+ "baybo-store",
  "baybo-subagent",
  "baybo-tools",
  "baybo-trace",
@@ -828,6 +830,7 @@ dependencies = [
 name = "baybo-model"
 version = "0.1.0"
 dependencies = [
+ "baybo-workspace",
  "chrono",
  "chrono-tz",
  "serde",
@@ -1048,10 +1051,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "baybo-model",
+ "baybo-workspace",
  "bytes",
  "chrono",
  "futures",
  "hex",
+ "parking_lot",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",

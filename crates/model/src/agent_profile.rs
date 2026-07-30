@@ -9,8 +9,10 @@
 //! subagents. See `docs/modules/agent-profiles.md`.
 
 use std::fmt;
+use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use baybo_workspace::WorkspacePaths;
+use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
 use crate::{BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackendKind};
@@ -27,12 +29,30 @@ pub const BUILTIN_AGENT_PROFILE_ID: &str = "baybo";
 /// Single source of truth for every validation site.
 pub const MAX_AGENT_PROFILE_NAME_CHARS: usize = 64;
 
+/// Upper bound on an agent profile *id*, which — unlike the display name —
+/// becomes a directory name under the workspace `personas/` tree.
+pub const MAX_AGENT_PROFILE_ID_CHARS: usize = 64;
+
+/// An id that failed the [`AgentProfileId`] grammar. Carries the rejected
+/// value so operator-facing errors can name it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid agent profile id {value:?}: {reason}")]
+pub struct InvalidAgentProfileId {
+    pub value: String,
+    pub reason: &'static str,
+}
+
 /// Server-generated identifier for an agent profile.
 ///
-/// Opaque string (a ULID at genesis, the fixed sentinel for the built-in
-/// row); the store and gateway treat it as a key and never inspect internal
-/// structure. Mirrors [`crate::FolderId`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// A ULID at genesis (the fixed sentinel for the built-in row), and the
+/// directory name of the profile's persona folder — so it is **not** an
+/// opaque string: every construction path runs the same grammar,
+/// `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the skill-name grammar), which is
+/// what keeps [`Self::soul_file`] and [`Self::skills_overlay_dir`] inside
+/// the workspace. There is deliberately no infallible `From<String>`, and
+/// `Deserialize` is not transparent: a guard only on the constructor would
+/// be bypassed by every request body and stored row that parses an id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct AgentProfileId(String);
 
@@ -47,12 +67,65 @@ impl AgentProfileId {
         Self(BUILTIN_AGENT_PROFILE_ID.to_owned())
     }
 
+    /// Validate `value` against the id grammar. The only fallible entry
+    /// point; `TryFrom` and `Deserialize` both delegate here.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidAgentProfileId> {
+        let value = value.into();
+        let reject = |reason| InvalidAgentProfileId {
+            value: value.clone(),
+            reason,
+        };
+        let mut chars = value.chars();
+        let Some(first) = chars.next() else {
+            return Err(reject("empty"));
+        };
+        if !first.is_ascii_alphanumeric() {
+            return Err(reject("must start with an ASCII letter or digit"));
+        }
+        if !chars
+            .clone()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(reject(
+                "may contain only ASCII letters, digits, '.', '_' and '-'",
+            ));
+        }
+        if value.chars().count() > MAX_AGENT_PROFILE_ID_CHARS {
+            return Err(reject("longer than 64 characters"));
+        }
+        Ok(Self(value))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     pub fn into_inner(self) -> String {
         self.0
+    }
+
+    /// Whether this is the seeded built-in profile — the one whose persona
+    /// *is* the workspace's own declarative content.
+    pub fn is_builtin(&self) -> bool {
+        self.0 == BUILTIN_AGENT_PROFILE_ID
+    }
+
+    /// The `SOUL.md` this agent's system prompt reads. The built-in resolves
+    /// to the workspace identity file, so an unbound session and a session
+    /// bound to the built-in take byte-identical paths.
+    pub fn soul_file(&self, paths: &WorkspacePaths) -> PathBuf {
+        if self.is_builtin() {
+            paths.identity_file(baybo_workspace::IdentityKind::Soul)
+        } else {
+            paths.persona_soul_file(&self.0)
+        }
+    }
+
+    /// This agent's private skill overlay, or `None` for the built-in — whose
+    /// skills are exactly the shared set, so an overlay pointing at
+    /// `<workspace>/skills/` would register the same directory twice.
+    pub fn skills_overlay_dir(&self, paths: &WorkspacePaths) -> Option<PathBuf> {
+        (!self.is_builtin()).then(|| paths.persona_skills_dir(&self.0))
     }
 }
 
@@ -62,15 +135,19 @@ impl fmt::Display for AgentProfileId {
     }
 }
 
-impl From<&str> for AgentProfileId {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
+impl TryFrom<String> for AgentProfileId {
+    type Error = InvalidAgentProfileId;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
     }
 }
 
-impl From<String> for AgentProfileId {
-    fn from(value: String) -> Self {
-        Self(value)
+impl TryFrom<&str> for AgentProfileId {
+    type Error = InvalidAgentProfileId;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
     }
 }
 
@@ -78,6 +155,26 @@ impl From<AgentProfileId> for String {
     fn from(value: AgentProfileId) -> Self {
         value.0
     }
+}
+
+impl<'de> Deserialize<'de> for AgentProfileId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// What a new session is bound to at creation: which agent, and which
+/// framework that agent ran on *at that moment*.
+///
+/// The two travel together because they are seeded by the same INSERT and
+/// neither is ever written again — the id decides soul, skills and memory
+/// partition; the framework is a snapshot, because a transcript written by
+/// one framework cannot later be served by another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBinding {
+    pub agent_id: AgentProfileId,
+    pub framework: AgentFramework,
 }
 
 /// Execution framework an agent profile runs on: baybo's own agent loop or
@@ -130,11 +227,74 @@ mod tests {
 
     #[test]
     fn profile_id_round_trips_as_string() {
-        let id = AgentProfileId::from("agent-abc");
+        let id = AgentProfileId::parse("agent-abc").unwrap();
         let s = serde_json::to_string(&id).unwrap();
         assert_eq!(s, "\"agent-abc\"");
         let back: AgentProfileId = serde_json::from_str(&s).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn generated_and_builtin_ids_pass_their_own_grammar() {
+        for id in [AgentProfileId::generate(), AgentProfileId::builtin()] {
+            AgentProfileId::parse(id.as_str())
+                .unwrap_or_else(|e| panic!("minted id must be parseable: {e}"));
+        }
+    }
+
+    #[test]
+    fn profile_id_grammar_rejects_traversal_and_junk() {
+        for bad in [
+            "",
+            "..",
+            "../etc",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "-lead",
+            "has space",
+            "naïve",
+            &"a".repeat(MAX_AGENT_PROFILE_ID_CHARS + 1),
+        ] {
+            assert!(
+                AgentProfileId::parse(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["baybo", "01JABCDEF", "a", "a.b_c-d", &"a".repeat(64)] {
+            assert!(
+                AgentProfileId::parse(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_enforces_the_grammar() {
+        let err = serde_json::from_str::<AgentProfileId>("\"../escape\"")
+            .expect_err("traversal must not deserialize");
+        assert!(err.to_string().contains("invalid agent profile id"));
+    }
+
+    #[test]
+    fn builtin_soul_is_the_workspace_identity_file_and_has_no_overlay() {
+        let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
+        let builtin = AgentProfileId::builtin();
+        assert_eq!(
+            builtin.soul_file(&paths),
+            paths.identity_file(baybo_workspace::IdentityKind::Soul)
+        );
+        assert!(builtin.skills_overlay_dir(&paths).is_none());
+
+        let custom = AgentProfileId::parse("01JCUSTOM").unwrap();
+        assert_eq!(
+            custom.soul_file(&paths),
+            paths.persona_soul_file("01JCUSTOM")
+        );
+        assert_eq!(
+            custom.skills_overlay_dir(&paths),
+            Some(paths.persona_skills_dir("01JCUSTOM"))
+        );
     }
 
     #[test]

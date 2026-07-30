@@ -48,6 +48,17 @@ pub const SKILLS_DIR: &str = "skills";
 /// concern, only a frontmatter + system-prompt body).
 pub const AGENTS_DIR: &str = "agents";
 
+/// Standalone git repo at `<root>/personas/`: one directory per
+/// user-managed agent profile, named by its id, carrying that agent's
+/// `SOUL.md` and its private `skills/` overlay. The built-in profile has no
+/// directory here — its persona is the workspace's own `profile/` and
+/// `skills/`.
+pub const PERSONAS_DIR: &str = "personas";
+
+/// Per-agent private skill overlay, at `<root>/personas/<id>/skills/`.
+/// Same one-directory-per-skill shape as the shared `skills/` tree.
+pub const PERSONA_SKILLS_DIR: &str = "skills";
+
 /// Deck card bundles at `<root>/deck/<uuid>/` — agent-authored plain
 /// files (docs/modules/deck.md). Installed atomically via a `.staging/`
 /// sibling inside this dir so the rename stays same-filesystem.
@@ -368,6 +379,31 @@ impl WorkspacePaths {
 
     pub fn deck_dir(&self) -> PathBuf {
         self.root.join(DECK_DIR)
+    }
+
+    /// Root of the per-agent persona tree: `<root>/personas/`.
+    pub fn personas_dir(&self) -> PathBuf {
+        self.root.join(PERSONAS_DIR)
+    }
+
+    /// One agent's persona directory: `<root>/personas/<agent_id>/`.
+    ///
+    /// Callers hold an `AgentProfileId`, whose grammar is what keeps the
+    /// joined component inside `personas/`; this crate is leaf-level and
+    /// takes the id as a `&str`.
+    pub fn persona_dir(&self, agent_id: &str) -> PathBuf {
+        self.personas_dir().join(agent_id)
+    }
+
+    /// One agent's soul: `<root>/personas/<agent_id>/SOUL.md`.
+    pub fn persona_soul_file(&self, agent_id: &str) -> PathBuf {
+        self.persona_dir(agent_id).join(IDENTITY_SOUL_FILE)
+    }
+
+    /// One agent's private skill overlay:
+    /// `<root>/personas/<agent_id>/skills/`.
+    pub fn persona_skills_dir(&self, agent_id: &str) -> PathBuf {
+        self.persona_dir(agent_id).join(PERSONA_SKILLS_DIR)
     }
 
     pub fn key_dir(&self) -> PathBuf {
