@@ -184,3 +184,62 @@ struct BadgeCenterTests {
         #expect(BadgeCenter.total(rows) == 3)
     }
 }
+
+@Suite(.serialized) @MainActor
+struct BadgeCenterDeliveryTests {
+    @Test func foregroundReconciliationRewritesAValueTheNSEMayHaveChanged() async {
+        BadgeCenter.resetForTesting()
+        var writes: [Int] = []
+        BadgeCenter.setWriterForTesting { count, completion in
+            writes.append(count)
+            completion(nil)
+        }
+
+        BadgeCenter.apply(0)
+        await Task.yield()
+        BadgeCenter.apply(0)
+        #expect(writes == [0])
+
+        BadgeCenter.apply(0, force: true)
+        #expect(writes == [0, 0])
+        BadgeCenter.resetForTesting()
+    }
+
+    @Test func aFailedSystemWriteDoesNotPoisonTheCoalescingMemo() async {
+        BadgeCenter.resetForTesting()
+        var writes: [Int] = []
+        BadgeCenter.setWriterForTesting { count, completion in
+            writes.append(count)
+            let error =
+                writes.count == 1
+                ? NSError(domain: "BadgeCenterTests", code: 1)
+                : nil
+            completion(error)
+        }
+
+        BadgeCenter.apply(4)
+        await Task.yield()
+        BadgeCenter.apply(4)
+        #expect(writes == [4, 4])
+        BadgeCenter.resetForTesting()
+    }
+
+    @Test func theLatestCountSupersedesAnOppositeWriteStillInFlight() async {
+        BadgeCenter.resetForTesting()
+        var writes: [Int] = []
+        BadgeCenter.setWriterForTesting { count, completion in
+            writes.append(count)
+            if writes.count == 1 {
+                completion(nil)
+            }
+        }
+
+        BadgeCenter.apply(0)
+        await Task.yield()
+        BadgeCenter.apply(3)
+        BadgeCenter.apply(0)
+
+        #expect(writes == [0, 3, 0])
+        BadgeCenter.resetForTesting()
+    }
+}

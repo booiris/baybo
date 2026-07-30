@@ -440,6 +440,7 @@ final class AppStore: ObservableObject {
     /// and re-subscribe cached chat stores so catch-up does not wait for a
     /// screen to reappear.
     func didBecomeActive() {
+        SessionIndex.shared.reconcileAppBadge()
         if !AppDelegate.hasToken {
             AppDelegate.registerForPush()
         }
