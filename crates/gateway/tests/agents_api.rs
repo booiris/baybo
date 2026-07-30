@@ -136,25 +136,22 @@ async fn agents_api_round_trip() {
     assert_eq!(fetched["name"].as_str(), Some("Helper"));
     assert_eq!(fetched["created_at"], created["created_at"]);
 
-    // Duplicate names are rejected case-insensitively (builtin's too).
-    let err = post_expect(
+    // Names are not unique any more, and cannot be: they live in a file the
+    // agent rewrites at will, so no constraint could hold. The id is the
+    // identity — every binding, partition and lookup keys off it — and a
+    // duplicate name is only a display ambiguity.
+    let twin = post_expect(
         &router,
         "/v1/agents",
         json!({ "name": "hELPer" }),
-        StatusCode::BAD_REQUEST,
+        StatusCode::OK,
     )
     .await;
-    assert!(
-        err["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("already exists")
-    );
-    post_expect(
+    assert_ne!(twin["id"].as_str(), created["id"].as_str());
+    delete_expect(
         &router,
-        "/v1/agents",
-        json!({ "name": "Baybo" }),
-        StatusCode::BAD_REQUEST,
+        &format!("/v1/agents/{}", twin["id"].as_str().expect("id")),
+        StatusCode::NO_CONTENT,
     )
     .await;
 
@@ -324,6 +321,59 @@ async fn agents_api_round_trip() {
     )
     .await;
 
+    // ── 4d. The name is IDENTITY.md, from both directions ───────────
+    // Renaming through the API rewrites the `Name:` line and leaves every
+    // other line the agent wrote alone.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\n* **Name:** Vega\n* **Vibe:** dry\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}"),
+        json!({ "name": "Renamed", "description": "", "framework": "baybo" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    let body = identity["content"].as_str().unwrap_or_default();
+    assert!(body.contains("* **Name:** Renamed"), "{body}");
+    assert!(
+        body.contains("* **Vibe:** dry"),
+        "the rest survives: {body}"
+    );
+
+    // And the other direction — what the agent writes into the file is what
+    // the roster shows, with no column to keep in step.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\n* **Name:** Chosen by the agent\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(fetched["name"].as_str(), Some("Chosen by the agent"));
+
+    // An unnamed agent falls back to its id rather than rendering blank.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\nno name line at all\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(fetched["name"].as_str(), Some(agent_id.as_str()));
+
     // The built-in's pair is the workspace's own — editable, even though its
     // row is locked, because these are files, not row fields.
     let builtin_soul = get(&router, "/v1/agents/baybo/soul", StatusCode::OK).await;
@@ -396,19 +446,14 @@ async fn agents_api_round_trip() {
     )
     .await;
     let beta_id = beta["id"].as_str().expect("id").to_owned();
-    let err = put_expect(
+    // A rename onto another agent's name is allowed — see above.
+    put_expect(
         &router,
         &format!("/v1/agents/{beta_id}"),
         json!({ "name": "helper 2", "description": "", "framework": "baybo" }),
-        StatusCode::BAD_REQUEST,
+        StatusCode::NO_CONTENT,
     )
     .await;
-    assert!(
-        err["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("already exists")
-    );
     delete_expect(
         &router,
         &format!("/v1/agents/{beta_id}"),

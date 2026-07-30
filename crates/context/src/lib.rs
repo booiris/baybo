@@ -2756,9 +2756,7 @@ mod tests {
 
         let agent = AgentProfileId::parse("01JAGENT").expect("valid id");
         let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
-        store.insert(baybo_store::test_support::agent_profile_row(
-            &agent, "Reviewer",
-        ));
+        store.insert(baybo_store::test_support::agent_profile_row(&agent));
         let persona_soul = workspace.persona_identity_file(agent.as_str(), IdentityKind::Soul);
         std::fs::create_dir_all(persona_soul.parent().expect("persona parent"))
             .expect("persona dir");
@@ -2806,20 +2804,12 @@ mod tests {
 
         let agent = AgentProfileId::parse("01JFRESH").expect("valid id");
         let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
-        let mut row = baybo_store::test_support::agent_profile_row(&agent, "Fresh");
-        row.description = "A brand new agent".into();
-        store.insert(row);
+        store.insert(baybo_store::test_support::agent_profile_row(&agent));
 
         let ctx = bound_ctx(&workspace, store, agent.clone());
         let prompt = ctx.resolve_system_prompt().await;
         // Seeded from the shipped template, verbatim.
         assert!(prompt.contains("## Core Truths"), "{prompt}");
-        // The row's name and description are the operator's label for the
-        // roster, not the agent's self-concept: one name, one source, and
-        // that source is IDENTITY.md. Baking them here would go stale on the
-        // next rename.
-        assert!(!prompt.contains("Fresh"), "{prompt}");
-        assert!(!prompt.contains("A brand new agent"), "{prompt}");
         // Both per-agent files are written through to disk, so the agent can
         // Edit either one.
         for kind in [IdentityKind::Soul, IdentityKind::Identity] {

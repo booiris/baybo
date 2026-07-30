@@ -375,6 +375,17 @@ Prompt caching is unaffected — the system row already varies per session.
   agent's persona, and the builtin's "locked except avatar" rule is untouched
   (these are files, not row fields).
 
+- **The display name is not a column.** `POST` / `PUT /v1/agents` accept a
+  `name` and splice it into that agent's `IDENTITY.md`; every read derives it
+  back out, falling back to the id when the file names nothing. So an operator
+  renaming an agent and the agent renaming itself are the *same* write to the
+  *same* line, and no synchronisation exists to go wrong. The cost is honest
+  and priced: `GET /v1/agents` becomes one query plus a concurrent file read
+  per agent, names are no longer unique or SQL-sortable, and the roster's
+  order is computed after the reads. None of that touches correctness — the
+  **id** is the identity everything else keys off, so a duplicate name is a
+  display ambiguity, not a collision.
+
   **`version` is a compare-and-set token**, not an optimisation. Clients here
   are *routinely* stale by design — the page neither polls nor subscribes, and
   the agent rewrites these files mid-conversation through `Edit`. Without the

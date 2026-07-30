@@ -21,8 +21,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 ```rust
 // crates/store/src/agent_profile.rs
 pub struct AgentProfileRow {
-    pub id: AgentProfileId,            // opaque string, ULID at genesis (mirrors FolderId)
-    pub name: String,                  // display name; unique, ASCII case-insensitive
+    pub id: AgentProfileId,            // ULID at genesis; also the persona dir name
     pub description: String,
     pub avatar_blob_id: Option<String>,// full blob id incl. read token, from POST /v1/blobs
     pub framework: AgentFramework,     // baybo | claude | codex
@@ -41,12 +40,24 @@ pub struct AgentProfileRow {
 |---|---|---|
 | `llm` | follow `default-llm` | pin to this `baybo.json` entry name |
 
-**There is no prompt column.** An agent's prompt is its own
-`personas/<id>/SOUL.md` — a file, so the agent can rewrite it through `Edit`
-and git keeps the history (see
-[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md)). A database
-created before that keeps an inert `system_prompt` column, since `init_db`
-never drops; nothing reads or writes it.
+**There is no prompt column, and no name column.** An agent's prompt is its
+own `personas/<id>/SOUL.md`, and its name is the `Name:` line in its
+`personas/<id>/IDENTITY.md` — files, so the agent rewrites both through
+`Edit` and git keeps the history (see
+[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md)).
+
+That makes the name **not unique and not sortable in SQL**, which is not a
+loss: no constraint could have held one, since the agent may rename itself to
+anything at any moment. The **id** is the identity — every binding, memory
+partition, skill overlay and API path keys off it — so a duplicate name is a
+display ambiguity, never a correctness problem. `list` therefore orders by
+`builtin DESC, id` and the gateway re-sorts by the name it reads from each
+agent's file.
+
+A database created before this keeps inert `system_prompt` / `name` columns,
+since `init_db` never drops. `name` was `NOT NULL UNIQUE` there, so the store
+detects it at open and fills it with the row's id — a table rebuild at boot
+is exactly the destructive surgery `init_db` refuses to do.
 
 `llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. Nothing is consumed yet (v1 is management-only).
 
@@ -78,9 +89,11 @@ Web CRUD is the primary interface, avatars are binary, and edits are concurrent 
 
 Nullable fields where `NULL` is meaningful make a partial `PATCH` need absent-vs-null tri-state, which serde/utoipa express badly. So content updates are a **full replace**: the body carries the complete content state — `name`/`description`/`framework` **required** (so an omitted `framework` can't silently reset a profile to `baybo`), absent nullable fields reset to `NULL`. Racing `PUT`s are last-write-wins, no version precondition. The avatar is excluded and lives on its own targeted endpoint (house style: `…/model`, `…/pin`, `…/folder`) — that is what maps "builtin is locked except avatar" onto endpoints instead of per-field conditional validation.
 
-### Uniqueness and identity
+### Identity
 
-`id` is an opaque string minted server-side (`AgentProfileId::generate()`, a ULID — the `FolderId` pattern); `name` is the mutable display name, free-form after trim, non-empty, at most `MAX_AGENT_PROFILE_NAME_CHARS` (64) characters, and unique via `UNIQUE` + `COLLATE NOCASE` (ASCII case-insensitive — good enough to keep "Baybo" from shadowing the builtin `baybo`). A violation surfaces as `StorageError::Conflict` → 400. Unique names keep the list legible next to the builtin and leave room for later @-mention-style selection.
+`id` is minted server-side (`AgentProfileId::generate()`, a ULID — the `FolderId` pattern) and, unlike `FolderId`, is **not** opaque: it becomes the persona directory's name, so it carries the skill-name grammar enforced by `AgentProfileId::parse` and by a validating `Deserialize` (a guard only on the constructor would be bypassed by every request body and stored row that parses one).
+
+The **name** is not stored. `POST` / `PUT /v1/agents` still accept one — free-form after trim, non-empty, at most `MAX_AGENT_PROFILE_NAME_CHARS` (64) characters — but the handler splices it into the `Name:` line of that agent's `IDENTITY.md` rather than a column, preserving every other line the agent wrote. Reads derive it back the same way, falling back to the id when the file carries no usable name (the shipped template's state — it invites the agent to choose). Editing the name is therefore the same operation whether the operator or the agent does it, and there is nothing to keep in sync.
 
 ### Avatars ride the existing blob pipeline
 

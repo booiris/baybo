@@ -43,7 +43,7 @@ impl MemoryAgentProfileStore {
 impl AgentProfileStore for MemoryAgentProfileStore {
     async fn list(&self) -> Result<Vec<AgentProfileRow>> {
         let mut rows: Vec<AgentProfileRow> = self.rows.lock().values().cloned().collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(rows)
     }
 
@@ -61,7 +61,6 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         let Some(row) = rows.get_mut(id) else {
             return Ok(false);
         };
-        row.name = update.name.clone();
         row.description = update.description.clone();
         row.framework = update.framework;
         row.llm = update.llm.clone();
@@ -82,13 +81,13 @@ impl AgentProfileStore for MemoryAgentProfileStore {
     }
 }
 
-/// A profile row with everything defaulted except id and name — the fields a
-/// runtime test cares about.
-pub fn agent_profile_row(id: &AgentProfileId, name: &str) -> AgentProfileRow {
+/// A profile row with everything defaulted except its id — the fields a
+/// runtime test cares about. The display name is not here: it lives in the
+/// agent's own `IDENTITY.md`.
+pub fn agent_profile_row(id: &AgentProfileId) -> AgentProfileRow {
     let now = chrono::Utc::now();
     AgentProfileRow {
         id: id.clone(),
-        name: name.to_owned(),
         description: String::new(),
         avatar_blob_id: None,
         framework: baybo_model::AgentFramework::Baybo,

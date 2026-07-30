@@ -13,6 +13,7 @@ use baybo_store::agent_profile::{AgentProfileRow, AgentProfileUpdate};
 use baybo_workspace::IdentityKind;
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -91,11 +92,13 @@ pub struct AgentProfileDto {
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<AgentProfileRow> for AgentProfileDto {
-    fn from(r: AgentProfileRow) -> Self {
+impl AgentProfileDto {
+    /// Build the wire shape, pairing the row with the display name read out
+    /// of that agent's own `IDENTITY.md`.
+    fn from_parts(r: AgentProfileRow, name: String) -> Self {
         Self {
             id: r.id.into_inner(),
-            name: r.name,
+            name,
             description: r.description,
             avatar_blob_id: r.avatar_blob_id,
             framework: r.framework.into(),
@@ -105,6 +108,68 @@ impl From<AgentProfileRow> for AgentProfileDto {
             updated_at: r.updated_at,
         }
     }
+}
+
+/// The name to show for an agent whose `IDENTITY.md` has no usable `Name:`
+/// line — the shipped template's state, since it invites the agent to
+/// choose one. The id is stable, unique and already the thing every other
+/// surface keys off, so it beats a placeholder that several agents share.
+fn fallback_display_name(row: &AgentProfileRow) -> String {
+    row.id.as_str().to_owned()
+}
+
+/// Read one agent's chosen name from its own `IDENTITY.md`.
+///
+/// A file that is missing, unreadable, or has been reformatted past
+/// recognition falls back rather than failing the request: the roster must
+/// still render, and the agent owns that file.
+async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
+    let path = row
+        .id
+        .identity_file(&state.workspace_paths, IdentityKind::Identity);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(body) => baybo_workspace::display_name(&body).unwrap_or_else(|| {
+            debug!(agent_id = %row.id, "agent IDENTITY.md carries no name; showing its id");
+            fallback_display_name(row)
+        }),
+        Err(e) => {
+            debug!(agent_id = %row.id, error = %e, "agent IDENTITY.md unreadable; showing its id");
+            fallback_display_name(row)
+        }
+    }
+}
+
+/// Rewrite just the `Name:` line of an agent's `IDENTITY.md`, seeding the
+/// file first if it does not exist yet.
+///
+/// A read-modify-write on a file the agent also edits. It is deliberately
+/// *not* conditional: the caller renaming an agent is expressing intent about
+/// one field, not replacing the document, and the splice preserves every
+/// other line — so unlike a whole-file `PUT` it cannot delete what the agent
+/// wrote around it.
+async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str) -> Result<()> {
+    let path = row
+        .id
+        .identity_file(&state.workspace_paths, IdentityKind::Identity);
+    let current = baybo_workspace::load_identity(baybo_workspace::IdentitySource::new(
+        &path,
+        IdentityKind::Identity.default_content(),
+    ))
+    .await
+    .map_err(|e| GatewayError::Internal(format!("read agent identity: {e}")))?;
+    let updated = baybo_workspace::with_display_name(&current, name);
+    if updated == current {
+        return Ok(());
+    }
+    write_file_atomic(&path, &updated)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))
+}
+
+/// [`AgentProfileDto`] for one row, with its name read from disk.
+async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
+    let name = read_display_name(state, &row).await;
+    AgentProfileDto::from_parts(row, name)
 }
 
 /// Request body for `POST /v1/agents`. Absent nullable fields mean
@@ -242,14 +307,23 @@ const BUILTIN_UNDELETABLE: &str = "the built-in agent profile cannot be deleted"
 async fn list_agents(
     State(state): State<AdminState>,
 ) -> Result<Json<ListResponse<AgentProfileDto>>> {
-    let items = state
+    let rows = state
         .agent_profile_store
         .list()
         .await
-        .map_err(|e| GatewayError::Internal(format!("list agent profiles: {e}")))?
-        .into_iter()
-        .map(AgentProfileDto::from)
-        .collect();
+        .map_err(|e| GatewayError::Internal(format!("list agent profiles: {e}")))?;
+    // One file read per agent — the price of the name living where the agent
+    // can rewrite it. Concurrent, and the set is small (a roster, not a feed).
+    let mut items: Vec<AgentProfileDto> =
+        futures::future::join_all(rows.into_iter().map(|row| agent_dto(&state, row))).await;
+    // The store can only order by id; the display order is by the derived
+    // name, builtin first.
+    items.sort_by(|a, b| {
+        b.builtin
+            .cmp(&a.builtin)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(Json(ListResponse::new(items)))
 }
 
@@ -279,7 +353,6 @@ async fn create_agent(
     let now = Utc::now().trunc_subsecs(6);
     let row = AgentProfileRow {
         id: AgentProfileId::generate(),
-        name,
         description: req.description,
         avatar_blob_id: req.avatar_blob_id,
         framework: req.framework.into(),
@@ -303,7 +376,10 @@ async fn create_agent(
     baybo_workspace::ensure_persona_layout(&state.workspace_paths, row.id.as_str(), &seed)
         .await
         .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
-    Ok(Json(AgentProfileDto::from(row)))
+    // The requested name is written into the agent's own `IDENTITY.md`,
+    // which is where a name lives — the row has no column for one.
+    set_display_name(&state, &row, &name).await?;
+    Ok(Json(AgentProfileDto::from_parts(row, name)))
 }
 
 #[utoipa::path(
@@ -322,7 +398,7 @@ async fn get_agent(
     Path(agent_id): Path<String>,
 ) -> Result<Json<AgentProfileDto>> {
     let row = load_agent(&state, &agent_id).await?;
-    Ok(Json(AgentProfileDto::from(row)))
+    Ok(Json(agent_dto(&state, row).await))
 }
 
 #[utoipa::path(
@@ -347,8 +423,8 @@ async fn update_agent(
     if row.builtin {
         return Err(GatewayError::BadRequest(BUILTIN_READ_ONLY.to_owned()));
     }
+    let name = validate_name(&req.name)?;
     let update = AgentProfileUpdate {
-        name: validate_name(&req.name)?,
         description: req.description,
         framework: req.framework.into(),
         llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
@@ -363,6 +439,10 @@ async fn update_agent(
         // filtered it — it was deleted concurrently.
         return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
     }
+    // The name is not a column: renaming an agent rewrites the `Name:` line
+    // in its own `IDENTITY.md`, leaving everything else the agent wrote
+    // there untouched.
+    set_display_name(&state, &row, &name).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

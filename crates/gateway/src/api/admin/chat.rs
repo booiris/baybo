@@ -2566,8 +2566,8 @@ async fn resolve_agent_binding(
         // leg (turn dispatch, resume keys, working-dir materialisation); a
         // clear refusal beats binding a session nothing can run.
         return Err(GatewayError::BadRequest(format!(
-            "agent '{}' runs on {} , which cannot host a chat session yet",
-            row.name,
+            "agent {} runs on {}, which cannot host a chat session yet",
+            row.id,
             row.framework.as_str()
         )));
     }

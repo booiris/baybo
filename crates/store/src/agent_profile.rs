@@ -23,8 +23,6 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfileRow {
     pub id: AgentProfileId,
-    /// Display name; unique across profiles, ASCII case-insensitive.
-    pub name: String,
     pub description: String,
     /// Full blob id (`sha256:<digest>.<read-token>`) from the blob store.
     pub avatar_blob_id: Option<String>,
@@ -42,33 +40,34 @@ pub struct AgentProfileRow {
 /// [`AgentProfileStore::set_avatar`]), no `builtin`, no timestamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfileUpdate {
-    pub name: String,
     pub description: String,
     pub framework: AgentFramework,
     pub llm: Option<LlmEntryName>,
 }
 
-/// Agent-profile lifecycle persistence. The store is a dumb writer — name
-/// validation and the llm/avatar-blob checks live one layer up (the gateway
-/// handlers); the only policy baked in here is the structural builtin lock.
+/// Agent-profile lifecycle persistence. The store is a dumb writer — the
+/// llm/avatar-blob checks live one layer up (the gateway handlers); the only
+/// policy baked in here is the structural builtin lock.
+///
+/// There is no display name in this trait: an agent's name lives in its own
+/// `IDENTITY.md`, so it is neither stored nor unique. Rows order by id and
+/// the gateway sorts by the derived name after reading it.
 #[async_trait]
 pub trait AgentProfileStore: Send + Sync {
-    /// Every profile, builtin first then by case-insensitive name.
+    /// Every profile, builtin first then by id.
     async fn list(&self) -> Result<Vec<AgentProfileRow>>;
 
     /// Fetch a single profile, or `None` if it doesn't exist.
     async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>>;
 
     /// Insert a new profile row. Never binds `builtin` (the schema default
-    /// fills it with 0). A name collision (ASCII case-insensitive) is
+    /// fills it with 0). A duplicate id is
     /// [`StorageError::Conflict`].
     async fn create(&self, row: &AgentProfileRow) -> Result<()>;
 
     /// Full-replace the content fields and bump `updated_at`. Guarded
     /// `WHERE builtin = 0`; returns `Ok(false)` if no row matched (missing
-    /// id, or the builtin behind the guard). A rename onto another row's
-    /// name is [`StorageError::Conflict`]; renaming a row to its own name
-    /// (any casing) is not.
+    /// id, or the builtin behind the guard).
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>;
 
     /// Set or clear the avatar and bump `updated_at`. Deliberately not

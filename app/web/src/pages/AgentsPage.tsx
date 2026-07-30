@@ -612,17 +612,6 @@ function AgentEditorPanel({
         onSaved(data?.id);
         return;
       }
-      if (!isBuiltin) {
-        const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
-          params: { path: { agent_id: agent.id } },
-          body: content,
-        });
-        if (response.status === 401) return logout();
-        if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
-          return;
-        }
-      }
       for (const file of [
         {
           label: 'Soul',
@@ -662,6 +651,29 @@ function AgentEditorPanel({
         // Adopt the version we just created, so a second Save from this same
         // open editor does not conflict with its own write.
         file.setVersion(data.version);
+      }
+      // The profile PUT goes last on purpose: `name` is not a column, so the
+      // server splices it into IDENTITY.md. Running it before the file write
+      // above would let the whole-file replace overwrite the new name.
+      if (!isBuiltin) {
+        const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
+          params: { path: { agent_id: agent.id } },
+          body: content,
+        });
+        if (response.status === 401) return logout();
+        if (apiError || !response.ok) {
+          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          return;
+        }
+        // That write touched IDENTITY.md behind this editor's back, so the
+        // base it holds is stale — re-read rather than 409 on the next Save.
+        const reread = await client.GET('/v1/agents/{agent_id}/identity', {
+          params: { path: { agent_id: agent.id } },
+        });
+        if (reread.data) {
+          setIdentity(reread.data.content);
+          setIdentityVersion(reread.data.version);
+        }
       }
       setSoulDirty(false);
       setIdentityDirty(false);
