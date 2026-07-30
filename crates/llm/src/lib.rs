@@ -130,6 +130,7 @@ fn parse_audio_media_type(mime: &str) -> Option<AudioMediaType> {
 /// (`gpt-4o-audio-preview`, `gpt-4o-mini-realtime-preview`, `gpt-audio`,
 /// `gpt-realtime`). No non-audio OpenAI model is named for either.
 const OPENAI_AUDIO_MODEL_MARKERS: [&str; 2] = ["audio", "realtime"];
+pub(crate) const DOCUMENT_FILENAME_PARAM: &str = "filename";
 
 /// OpenAI takes `input_audio` on its audio / realtime model families
 /// only: `gpt-4o`, `gpt-4.1` and `o3` answer the WHOLE request with a
@@ -1223,16 +1224,16 @@ impl AnyCompletionModel {
     }
 
     /// Whether this provider's converter turns a base64
-    /// `UserContent::Document` into a real document part. The DeepSeek,
-    /// Ollama and HuggingFace converters instead `filter_map` the base64
-    /// payload straight into the joined user TEXT, so a PDF would reach
-    /// the model as megabytes of literal base64; Cohere and Perplexity
-    /// `Err` on any non-text user content, which rig collects over the
-    /// whole history; Mistral drops it silently; llamafile flattens the
-    /// file part away. Whitelist, not blacklist: a provider added later
-    /// gets the text stub until someone reads its converter.
+    /// `UserContent::Document` into a real document part. Anthropic and
+    /// Gemini do so in their native converters; the subscription adapter
+    /// emits OpenAI Responses `input_file`. The regular OpenAI adapter is
+    /// deliberately absent because it uses Chat Completions, whose rig
+    /// converter flattens a base64 PDF into ordinary text.
     fn accepts_pdf_document(&self) -> bool {
-        matches!(self, Self::OpenAI(_) | Self::Anthropic(_) | Self::Gemini(_))
+        matches!(
+            self,
+            Self::Anthropic(_) | Self::Gemini(_) | Self::OpenAiSubscription(_)
+        )
     }
 
     /// `effort` is the per-request reasoning-effort override from
@@ -1848,7 +1849,9 @@ impl LlmClient {
                         UserContent::Document(Document {
                             data: DocumentSourceKind::Base64(b64_encode(&bytes)),
                             media_type: Some(DocumentMediaType::PDF),
-                            additional_params: None,
+                            additional_params: Some(serde_json::json!({
+                                DOCUMENT_FILENAME_PARAM: filename,
+                            })),
                         })
                     }
                     DocumentDelivery::Text => match String::from_utf8(bytes) {
@@ -2386,6 +2389,13 @@ mod document_dispatch_tests {
         match out {
             UserContent::Document(doc) => {
                 assert_eq!(doc.media_type, Some(DocumentMediaType::PDF));
+                assert_eq!(
+                    doc.additional_params
+                        .as_ref()
+                        .and_then(|params| params.get(DOCUMENT_FILENAME_PARAM))
+                        .and_then(|value| value.as_str()),
+                    Some("report.pdf")
+                );
                 let DocumentSourceKind::Base64(b64) = doc.data else {
                     panic!("expected base64 data");
                 };
@@ -2590,6 +2600,14 @@ mod document_dispatch_tests {
     #[tokio::test]
     async fn pdf_stubs_without_vision() {
         let client = client_for("anthropic", "claude-sonnet-4-20250514", false)
+            .with_blob_fetcher(Arc::new(StaticFetcher(media_probe::fixture::classic(1))));
+        let text = rendered_text(&client, &file_block("report.pdf", "application/pdf")).await;
+        assert!(text.contains("[file:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_openai_does_not_flatten_pdf_base64_into_text() {
+        let client = vision_client("openai", "gpt-4o")
             .with_blob_fetcher(Arc::new(StaticFetcher(media_probe::fixture::classic(1))));
         let text = rendered_text(&client, &file_block("report.pdf", "application/pdf")).await;
         assert!(text.contains("[file:"), "{text}");
@@ -2892,6 +2910,54 @@ mod document_dispatch_tests {
             let out = client.user_content_for_block(&image_block()).await;
             assert!(matches!(out, UserContent::Image(_)), "{w}x{h}: {out:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn materialising_an_image_never_mutates_the_persistable_chat_message() {
+        let bytes = media_probe::fixture::png(64, 64);
+        let encoded = b64_encode(&bytes);
+        let client =
+            vision_client("openai", "gpt-4o").with_blob_fetcher(Arc::new(StaticFetcher(bytes)));
+        let request = ChatRequest {
+            messages: vec![baybo_model::ChatMessage::user(vec![image_block()])],
+            temperature: None,
+            tools: Vec::new(),
+            reasoning_effort: None,
+        };
+
+        let _ephemeral_wire_request = client.build_completion_request(&request).await;
+        let persistable = serde_json::to_string(&request.messages).unwrap();
+
+        assert!(persistable.contains("sha256:pic.tok"));
+        assert!(
+            !persistable.contains(&encoded),
+            "base64 bytes must remain confined to the ephemeral provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialising_a_pdf_never_mutates_the_persistable_chat_message() {
+        let bytes = media_probe::fixture::classic(1);
+        let encoded = b64_encode(&bytes);
+        let client = pdf_client(bytes);
+        let request = ChatRequest {
+            messages: vec![baybo_model::ChatMessage::user(vec![file_block(
+                "report.pdf",
+                "application/pdf",
+            )])],
+            temperature: None,
+            tools: Vec::new(),
+            reasoning_effort: None,
+        };
+
+        let _ephemeral_wire_request = client.build_completion_request(&request).await;
+        let persistable = serde_json::to_string(&request.messages).unwrap();
+
+        assert!(persistable.contains("sha256:doc.tok"));
+        assert!(
+            !persistable.contains(&encoded),
+            "base64 bytes must remain confined to the ephemeral provider request"
+        );
     }
 
     /// A format with no pixel grid to read cannot be priced, so it is not

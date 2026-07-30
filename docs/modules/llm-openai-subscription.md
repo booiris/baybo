@@ -178,6 +178,9 @@ Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.del
 |---|---|---|
 | `preamble` | `instructions` | system prompt |
 | `chat_history` (Vec<Message>) | `input` (Vec<ResponseItem>) | each rig `Message` → one or more `ResponseItem`s |
+| user `Image` | message content `input_image` | URL stays a URL; blob-backed base64 becomes a MIME-qualified `data:` URL; image detail is preserved |
+| user PDF `Document` | message content `input_file` | URL becomes `file_url`; blob-backed base64 becomes a `data:application/pdf;base64,…` `file_data` with the original filename |
+| user `Audio` / `Video` | descriptive text stub | Codex text/image models do not accept these input modalities; the adapter does not claim otherwise |
 | `tools` | `tools` | translate tool schema to the flat Responses-API shape (`{type: "function", name, description, parameters}` — no nested `function` object) |
 | `temperature` / `max_tokens` | dropped | Codex Responses rejects `temperature` with 400 "Unsupported parameter: temperature" (regression-tested: `body_drops_temperature_for_codex_responses`); `max_tokens` is likewise not forwarded |
 | (none) | `parallel_tool_calls: true`, `stream: true`, `store: false` | hard-coded |
@@ -218,7 +221,7 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 
 - Unit: PKCE codes well-formed; JWT exp parsing handles short/missing claims. The refresh-on-401 retry path is not yet covered by a test (it needs an HTTP mock).
 - Unit: `OAuthTokenBundle` round-trips through `SecretVault::store_typed` / `get_typed` (uses existing `MemorySecretStore` test_support).
-- Unit: rig→Codex request conversion produces the expected JSON for representative messages (text, tool call, tool result, image stub).
+- Unit: rig→Codex request conversion produces the expected JSON for representative messages (text, tool call, tool result, URL/base64 image, URL/base64 PDF).
 - Behaviour (not asserted by a test): `send()` concatenates only `/codex/responses` onto `base_url` and never silently rewrites the host — with `base_url` unset the request URL is exactly `https://chatgpt.com/backend-api/codex/responses`.
 - Integration: a manual live smoke test (real PKCE login + a single chat, env-gated, out of CI) is planned, not yet implemented.
 - No mock for the OpenAI auth endpoints in CI — too fragile, the official endpoints are stable enough that contract tests are low-value here.

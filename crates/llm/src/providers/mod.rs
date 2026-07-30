@@ -31,9 +31,7 @@ pub(crate) mod catalog {
 /// → operator override → these defaults`, and the gateway dashboard
 /// uses the same table to render "effective" values when nothing else
 /// is known. Without this consolidation the dashboard had to mirror
-/// five `unwrap_or(...)` literals by hand and silently flipped
-/// `supports_vision` `true` for minimax / openai-subscription where
-/// the runtime defaults to `false`.
+/// five `unwrap_or(...)` literals by hand.
 #[derive(Debug, Clone, Copy)]
 pub struct FactoryDefaults {
     pub context_window: usize,
@@ -63,15 +61,27 @@ pub fn factory_defaults_for(provider: &str) -> FactoryDefaults {
             context_window: 128_000,
             supports_vision: false,
         },
-        // Subscription billing is account-level, vision-off is a
-        // hard product fact for the Codex catalog.
+        // Codex Responses models advertise image input in the live
+        // catalog, and the subscription converter emits `input_image`.
         openai_subscription::PROVIDER_NAME => FactoryDefaults {
             context_window: 272_000,
-            supports_vision: false,
+            supports_vision: true,
         },
         _ => FactoryDefaults {
             context_window: 128_000,
-            supports_vision: true,
+            supports_vision: false,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vision_defaults_are_conservative_and_subscription_is_enabled() {
+        assert!(factory_defaults_for("openai").supports_vision);
+        assert!(factory_defaults_for(openai_subscription::PROVIDER_NAME).supports_vision);
+        assert!(!factory_defaults_for("unknown-provider").supports_vision);
     }
 }

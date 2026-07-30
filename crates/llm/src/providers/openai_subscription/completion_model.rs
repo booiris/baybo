@@ -9,7 +9,8 @@ use std::sync::Arc;
 use futures::stream::{self, Stream, StreamExt};
 use rig::OneOrMany;
 use rig::completion::message::{
-    AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, UserContent,
+    AssistantContent, Document, DocumentMediaType, DocumentSourceKind, Image, ImageDetail,
+    MimeType, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, UserContent,
 };
 use rig::completion::{self, CompletionError, CompletionRequest};
 use rig::message::Message;
@@ -21,7 +22,7 @@ use super::refresh_coordinator::{BackgroundRefresh, RefreshCoordinator};
 use super::token_bundle::OAuthTokenBundle;
 use super::token_store::VaultTokenStore;
 use crate::tool_name::{sanitize_tool_name, unsanitize_tool_name};
-use crate::{LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
+use crate::{DOCUMENT_FILENAME_PARAM, LlmError, LlmStream, StreamEvent, TokenUsage, ToolCallInfo};
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const RESPONSES_PATH: &str = "/codex/responses";
@@ -469,15 +470,16 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
                             "output": text_output,
                         }));
                     }
-                    UserContent::Image(_)
-                    | UserContent::Audio(_)
-                    | UserContent::Document(_)
-                    | UserContent::Video(_) => {
-                        // Multimodal not wired for the OAuth path yet — degrade
-                        // to a placeholder so the call doesn't fail outright.
+                    UserContent::Image(image) => {
+                        text_parts.push(convert_image(image)?);
+                    }
+                    UserContent::Document(document) => {
+                        text_parts.push(convert_document(document)?);
+                    }
+                    UserContent::Audio(_) | UserContent::Video(_) => {
                         text_parts.push(json!({
                             "type": "input_text",
-                            "text": "[non-text user content elided — openai-subscription does not yet pass binary blobs]",
+                            "text": "[unsupported non-text user content elided]",
                         }));
                     }
                 }
@@ -553,6 +555,70 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
         }
     }
     Ok(out)
+}
+
+fn convert_image(image: &Image) -> Result<Value, String> {
+    let detail = match image.detail.as_ref().unwrap_or(&ImageDetail::Auto) {
+        ImageDetail::Low => "low",
+        ImageDetail::High => "high",
+        ImageDetail::Auto => "auto",
+    };
+    match &image.data {
+        DocumentSourceKind::Url(image_url) => Ok(json!({
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": detail,
+        })),
+        DocumentSourceKind::Base64(data) => {
+            let mime_type = image.media_type.as_ref().ok_or_else(|| {
+                "openai-subscription: base64 image is missing its media type".to_string()
+            })?;
+            Ok(json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{};base64,{data}",
+                    mime_type.to_mime_type()
+                ),
+                "detail": detail,
+            }))
+        }
+        DocumentSourceKind::FileId(file_id) => Ok(json!({
+            "type": "input_image",
+            "file_id": file_id,
+            "detail": detail,
+        })),
+        _ => Err(
+            "openai-subscription: image source must be a URL, base64 payload, or file id"
+                .to_string(),
+        ),
+    }
+}
+
+fn convert_document(document: &Document) -> Result<Value, String> {
+    if document.media_type != Some(DocumentMediaType::PDF) {
+        return Err("openai-subscription: only PDF documents are supported".to_string());
+    }
+    match &document.data {
+        DocumentSourceKind::Base64(data) => {
+            let filename = document
+                .additional_params
+                .as_ref()
+                .and_then(|params| params.get(DOCUMENT_FILENAME_PARAM))
+                .and_then(Value::as_str)
+                .filter(|filename| !filename.is_empty())
+                .unwrap_or("document.pdf");
+            Ok(json!({
+                "type": "input_file",
+                "file_data": format!("data:application/pdf;base64,{data}"),
+                "filename": filename,
+            }))
+        }
+        DocumentSourceKind::Url(file_url) => Ok(json!({
+            "type": "input_file",
+            "file_url": file_url,
+        })),
+        _ => Err("openai-subscription: PDF source must be a URL or base64 payload".to_string()),
+    }
 }
 
 /// Combine streamed reasoning deltas + any complete `Thinking` blocks
@@ -981,6 +1047,108 @@ mod tests {
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn body_preserves_base64_image_as_input_image() {
+        let req = CompletionRequest {
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::many(vec![
+                    UserContent::Text(Text {
+                        text: "what is this?".into(),
+                    }),
+                    UserContent::Image(Image {
+                        data: DocumentSourceKind::Base64("AQID".into()),
+                        media_type: Some(rig::completion::message::ImageMediaType::PNG),
+                        detail: Some(ImageDetail::Auto),
+                        additional_params: None,
+                    }),
+                ])
+                .unwrap(),
+            }),
+            ..empty_request()
+        };
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AQID");
+        assert_eq!(content[1]["detail"], "auto");
+    }
+
+    #[test]
+    fn body_preserves_image_url_and_detail() {
+        let req = CompletionRequest {
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::one(UserContent::Image(Image {
+                    data: DocumentSourceKind::Url("https://example.test/image.webp".into()),
+                    media_type: None,
+                    detail: Some(ImageDetail::High),
+                    additional_params: None,
+                })),
+            }),
+            ..empty_request()
+        };
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let image = &body["input"][0]["content"][0];
+        assert_eq!(image["type"], "input_image");
+        assert_eq!(image["image_url"], "https://example.test/image.webp");
+        assert_eq!(image["detail"], "high");
+    }
+
+    #[test]
+    fn body_rejects_base64_image_without_media_type() {
+        let req = CompletionRequest {
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::one(UserContent::Image(Image {
+                    data: DocumentSourceKind::Base64("AQID".into()),
+                    media_type: None,
+                    detail: None,
+                    additional_params: None,
+                })),
+            }),
+            ..empty_request()
+        };
+        let err = build_responses_body("gpt-5", None, &req).unwrap_err();
+        assert!(err.contains("missing its media type"), "{err}");
+    }
+
+    #[test]
+    fn body_preserves_base64_pdf_as_named_input_file() {
+        let req = CompletionRequest {
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::one(UserContent::Document(Document {
+                    data: DocumentSourceKind::Base64("AQID".into()),
+                    media_type: Some(DocumentMediaType::PDF),
+                    additional_params: Some(json!({"filename": "quarterly-report.pdf"})),
+                })),
+            }),
+            ..empty_request()
+        };
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let document = &body["input"][0]["content"][0];
+        assert_eq!(document["type"], "input_file");
+        assert_eq!(document["file_data"], "data:application/pdf;base64,AQID");
+        assert_eq!(document["filename"], "quarterly-report.pdf");
+    }
+
+    #[test]
+    fn body_preserves_pdf_url_as_input_file() {
+        let req = CompletionRequest {
+            chat_history: OneOrMany::one(Message::User {
+                content: OneOrMany::one(UserContent::Document(Document {
+                    data: DocumentSourceKind::Url("https://example.test/report.pdf".into()),
+                    media_type: Some(DocumentMediaType::PDF),
+                    additional_params: None,
+                })),
+            }),
+            ..empty_request()
+        };
+        let body = build_responses_body("gpt-5", None, &req).unwrap();
+        let document = &body["input"][0]["content"][0];
+        assert_eq!(document["type"], "input_file");
+        assert_eq!(document["file_url"], "https://example.test/report.pdf");
+        assert!(document.get("file_data").is_none());
     }
 
     #[test]
