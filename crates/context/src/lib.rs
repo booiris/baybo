@@ -2809,14 +2809,24 @@ mod tests {
 
         let ctx = bound_ctx(&workspace, store, agent.clone());
         let prompt = ctx.resolve_system_prompt().await;
-        // Seeded from the template, which carries the profile's own name.
-        assert!(prompt.contains("Fresh"), "{prompt}");
-        assert!(
-            workspace
-                .persona_identity_file(agent.as_str(), IdentityKind::Soul)
-                .exists(),
-            "the seed must be written through to disk so the agent can Edit it"
-        );
+        // Seeded from the shipped template, verbatim.
+        assert!(prompt.contains("## Core Truths"), "{prompt}");
+        // The row's name and description are the operator's label for the
+        // roster, not the agent's self-concept: one name, one source, and
+        // that source is IDENTITY.md. Baking them here would go stale on the
+        // next rename.
+        assert!(!prompt.contains("Fresh"), "{prompt}");
+        assert!(!prompt.contains("A brand new agent"), "{prompt}");
+        // Both per-agent files are written through to disk, so the agent can
+        // Edit either one.
+        for kind in [IdentityKind::Soul, IdentityKind::Identity] {
+            assert!(
+                workspace
+                    .persona_identity_file(agent.as_str(), kind)
+                    .exists(),
+                "{kind:?} seed must be written through to disk"
+            );
+        }
     }
 
     #[tokio::test]

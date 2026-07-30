@@ -67,17 +67,18 @@ pub(crate) const DEFAULT_USER_CONTENT: &str = r#"# About Your Human
 
 /// Seed body for a newly-created agent's `personas/<id>/SOUL.md`.
 ///
-/// Substituted with [`String::replace`] at the call site (the gateway, which
-/// is the layer holding the profile row) rather than assembled with
-/// `format!`, so the markdown below stays literal.
-pub const PERSONA_SOUL_TEMPLATE: &str = r#"# {{name}}
-
-{{description}}
+/// Deliberately carries **no substitutions**. The profile row's name and
+/// description are the operator's label for the roster; what the agent calls
+/// itself lives in its own `IDENTITY.md`. Baking either into this file would
+/// mint a third copy that nothing maintains and that goes stale the moment
+/// the profile is renamed.
+pub const PERSONA_SOUL_TEMPLATE: &str = r#"# Soul
 
 *This file is this agent's soul: its personality, tone, and preferences. It is
 yours to rewrite — edit it directly, or let the agent update it as it learns.
-Sessions bound to any other agent never read it, and the workspace
-`profile/IDENTITY.md` and `profile/USER.md` still apply on top.*
+Sessions bound to any other agent never read it. This agent's name and
+self-image live beside it in `IDENTITY.md`; the workspace `profile/USER.md`
+(who your human is) applies on top.*
 
 ## Core Truths
 

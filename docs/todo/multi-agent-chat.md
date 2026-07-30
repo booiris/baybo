@@ -194,9 +194,15 @@ actor-build path (covers rows created before this ships, and a file an operator
 deleted). `workspace` stays a leaf crate: the seed *text* is passed in, because
 only the gateway knows the row.
 
-The seed is `PERSONA_SOUL_TEMPLATE` in `baybo_workspace::prompt` — a raw string
-with `{{name}}` / `{{description}}` placeholders substituted via
-`String::replace` at the call site.
+The seeds are `PERSONA_SOUL_TEMPLATE` and `DEFAULT_IDENTITY_CONTENT` in
+`baybo_workspace::prompt`, both written **verbatim** — no substitution from
+the profile row. The row's `name` is the operator's label (it is what the
+roster sorts, what the picker shows, and what the `UNIQUE COLLATE NOCASE`
+index protects); what the agent calls itself is the `Name:` slot in its own
+`IDENTITY.md`, which the template invites it to choose. Interpolating the row
+into either file would mint a copy nothing maintains, stale on the next
+rename — so the name has exactly one source in the prompt, and it is
+`<identity>`.
 
 ### `agent_profiles`
 

@@ -17,20 +17,21 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The soul text a newly-materialised `personas/<id>/SOUL.md` is created
 /// with: the profile's own legacy `system_prompt` when it has one, else the
-/// shipped template rendered with the profile's name and description.
+/// shipped template verbatim.
+///
+/// The row's `name` / `description` are deliberately **not** interpolated.
+/// They are the operator's label for the roster and the picker; what the
+/// agent calls itself is its own `IDENTITY.md`. One name, one source.
 ///
 /// Used once per agent — [`baybo_workspace::ensure_persona_layout`] seeds
 /// only when the file is absent — so an agent that has since rewritten its
 /// own soul is never affected by it.
 pub fn persona_soul_seed(row: &AgentProfileRow) -> String {
-    if let Some(prompt) = row.system_prompt.as_deref()
-        && !prompt.trim().is_empty()
-    {
-        return prompt.to_string();
-    }
-    baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE
-        .replace("{{name}}", &row.name)
-        .replace("{{description}}", &row.description)
+    row.system_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or(baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE)
+        .to_owned()
 }
 
 /// One row of `agent_profiles`.
