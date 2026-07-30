@@ -15,8 +15,14 @@
 import CryptoKit
 import Foundation
 import UserNotifications
+import os
 
 final class NotificationService: UNNotificationServiceExtension {
+    private static let logger = Logger(
+        subsystem: "com.baybo.app.NotificationExtension",
+        category: "preview"
+    )
+
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttempt: UNMutableNotificationContent?
 
@@ -55,6 +61,10 @@ final class NotificationService: UNNotificationServiceExtension {
             if let badge = preview.badge {
                 mutable.badge = NSNumber(value: badge)
             }
+        } else {
+            Self.logger.error(
+                "push preview payload/key/decrypt failed; delivering the generic fallback"
+            )
         }
         contentHandler(mutable)
     }

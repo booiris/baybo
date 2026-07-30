@@ -75,7 +75,8 @@ pub struct RegisterPushRequest {
     pub device_id: String,
     /// The client's current APNs device token (hex).
     pub apns_token: String,
-    /// APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`.
+    /// APNs environment: `"sandbox"` (development-signed) or `"production"`
+    /// (distribution-signed).
     pub apns_env: String,
     /// Lowercase hex of the 32-byte preview AEAD key the client also stored in
     /// its App-Group keychain (so its NSE can decrypt). Generated client-side and
@@ -98,7 +99,8 @@ pub struct RegisterPushResponse {
 pub struct UpdateDeviceApnsTokenRequest {
     /// The device's current APNs device token (hex).
     pub apns_token: String,
-    /// APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`.
+    /// APNs environment: `"sandbox"` (development-signed) or `"production"`
+    /// (distribution-signed).
     pub apns_env: String,
 }
 

@@ -6358,7 +6358,7 @@
         "properties": {
           "apns_env": {
             "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (debug / TestFlight) or `\"production\"`."
+            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"` (distribution-signed)."
           },
           "apns_token": {
             "type": "string",
@@ -6968,7 +6968,7 @@
         "properties": {
           "apns_env": {
             "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (debug / TestFlight) or `\"production\"`."
+            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"` (distribution-signed)."
           },
           "apns_token": {
             "type": "string",
