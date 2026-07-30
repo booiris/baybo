@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+unicode-width = { workspace = true }
 
 [features]
 # Gates the in-crate `MockPrompter` so it stays out of release builds.

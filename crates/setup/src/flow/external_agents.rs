@@ -1,4 +1,4 @@
-//! External-agent quick-setup. Probes `claude` + `codex` + `gemini` on
+//! External-agent setup. Probes `claude` + `codex` + `gemini` on
 //! PATH, then shows the detected ones in a single multi-select so the
 //! operator enables the set they want in one pass; if more than one
 //! ends up enabled, prompts for the default. Records each enabled
