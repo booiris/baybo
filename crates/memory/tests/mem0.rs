@@ -15,12 +15,14 @@ use baybo_memory::backends::mem0::{
     TOOL_LIST, TOOL_SEARCH, TOOL_UPDATE,
 };
 use baybo_memory::{Memory, RecalledMemory};
-use baybo_model::ContentBlock;
+use baybo_model::{AgentProfileId, ContentBlock};
 use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::common::{base_url, memory_context, spawn, tool_context};
+use crate::common::{
+    base_url, memory_context, memory_context_for_agent, spawn, tool_context, tool_context_for_agent,
+};
 
 #[derive(Default, Clone)]
 struct Captured {
@@ -282,10 +284,16 @@ async fn tool_search_builds_scoped_filter_and_caps_limit() {
     assert_eq!(body["top_k"], 3);
     assert_eq!(body["rerank"], true);
     assert_eq!(body["threshold"], 0.3);
+    // Every read is scoped by BOTH axes — one human, one agent — before any
+    // caller-supplied narrowing.
     assert_eq!(body["filters"]["AND"][0]["user_id"], "u-5");
-    assert_eq!(body["filters"]["AND"][1]["run_id"], "test-session");
     assert_eq!(
-        body["filters"]["AND"][2]["categories"]["in"][0],
+        body["filters"]["AND"][1]["agent_id"],
+        baybo_model::BUILTIN_AGENT_PROFILE_ID
+    );
+    assert_eq!(body["filters"]["AND"][2]["run_id"], "test-session");
+    assert_eq!(
+        body["filters"]["AND"][3]["categories"]["in"][0],
         "preference"
     );
 }
@@ -719,6 +727,125 @@ async fn tool_delete_all_cannot_target_another_user() {
         !q.contains("victim"),
         "must ignore userId override; got: {q}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// privacy: the agent partition is fixed to the calling session's agent
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_search_cannot_read_another_agents_partition() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v2/memories/search/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!([]))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    // `agentId` is no longer a parameter: the partition tracks the calling
+    // session, so a prompt-injected override cannot reach a sibling persona's
+    // memories.
+    let caller = AgentProfileId::parse("01JCALLER").unwrap();
+    let _ = tool_by_name(&m, TOOL_SEARCH)
+        .execute(
+            json!({"query": "x", "agentId": "01JVICTIM"}),
+            &tool_context_for_agent("owner", &caller),
+        )
+        .await
+        .unwrap();
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["filters"]["AND"][1]["agent_id"], "01JCALLER");
+    assert!(
+        !body.to_string().contains("01JVICTIM"),
+        "must ignore an agentId override; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn tool_delete_all_cannot_wipe_another_agents_partition() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/memories/",
+            delete(
+                |State(c): State<Captured>, RawQuery(q): RawQuery| async move {
+                    c.queries.lock().push(q.unwrap_or_default());
+                    Json(json!({}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    // The sharpest edge of the partition: a bulk wipe is always agent-scoped.
+    let caller = AgentProfileId::parse("01JCALLER").unwrap();
+    let _ = tool_by_name(&m, TOOL_DELETE)
+        .execute(
+            json!({"all": true, "confirm": true, "agentId": "01JVICTIM"}),
+            &tool_context_for_agent("owner", &caller),
+        )
+        .await
+        .unwrap();
+    let q = captured.queries.lock().last().cloned().unwrap();
+    assert!(
+        q.contains("agent_id=01JCALLER"),
+        "bulk delete must scope to the calling agent; got: {q}"
+    );
+    assert!(!q.contains("01JVICTIM"), "must ignore agentId; got: {q}");
+}
+
+#[tokio::test]
+async fn recall_and_write_carry_the_sessions_agent() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v2/memories/search/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!([]))
+                },
+            ),
+        )
+        .route(
+            "/v1/memories/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!({}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let agent = AgentProfileId::parse("01JAGENT").unwrap();
+    let ctx = memory_context_for_agent("alice", &agent, "s-1", StepKind::MemoryRecall).await;
+    m.recall(&ctx, &[ContentBlock::Text("hello".into())])
+        .await
+        .unwrap();
+    let read = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(read["filters"]["AND"][1]["agent_id"], "01JAGENT");
+
+    m.on_turn_complete(
+        &ctx,
+        &[ContentBlock::Text("q".into())],
+        &[ContentBlock::Text("a".into())],
+    )
+    .await
+    .unwrap();
+    let write = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(write["agent_id"], "01JAGENT");
 }
 
 // ---------------------------------------------------------------------------

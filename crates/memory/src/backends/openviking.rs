@@ -55,7 +55,10 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
-const DEFAULT_AGENT: &str = "baybo";
+/// Agent partition for the account-level `/health` probe, which belongs to
+/// no session. The built-in profile's id, so the probe looks like ordinary
+/// built-in traffic rather than minting a namespace of its own.
+const PROBE_AGENT: &str = baybo_model::BUILTIN_AGENT_PROFILE_ID;
 const DEFAULT_TOP_K: usize = 5;
 /// Per-request timeout budgets. Production uses [`OpenVikingTimeouts::default`];
 /// tests inject ms-scale values via [`OpenVikingMemory::with_timeouts`] to
@@ -201,6 +204,22 @@ pub async fn resolve_api_key(cfg: &OpenVikingConfig, vault: Option<&SecretVault>
     std::env::var(name).unwrap_or_default()
 }
 
+/// The identity every OpenViking request carries: which human, and which
+/// agent partition. One value so the two can never be passed in the wrong
+/// order, and so threading them does not push call signatures past their
+/// argument budget.
+#[derive(Clone, Copy)]
+struct VikingScope<'a> {
+    user: &'a str,
+    agent: &'a str,
+}
+
+impl<'a> VikingScope<'a> {
+    fn new(user: &'a str, agent: &'a str) -> Self {
+        Self { user, agent }
+    }
+}
+
 struct OpenVikingInner {
     client: reqwest::Client,
     endpoint: String,
@@ -216,15 +235,15 @@ impl OpenVikingInner {
         format!("{base}{path}")
     }
 
-    fn base_headers(&self, user_id: &str) -> HeaderMap {
+    fn base_headers(&self, scope: VikingScope<'_>) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Ok(v) = HeaderValue::from_str(&self.account) {
             h.insert(HeaderName::from_static("x-openviking-account"), v);
         }
-        if let Ok(v) = HeaderValue::from_str(user_id) {
+        if let Ok(v) = HeaderValue::from_str(scope.user) {
             h.insert(HeaderName::from_static("x-openviking-user"), v);
         }
-        if let Ok(v) = HeaderValue::from_str(DEFAULT_AGENT) {
+        if let Ok(v) = HeaderValue::from_str(scope.agent) {
             h.insert(HeaderName::from_static("x-openviking-agent"), v);
         }
         if !self.api_key.is_empty() {
@@ -238,8 +257,8 @@ impl OpenVikingInner {
         h
     }
 
-    fn json_headers(&self, user_id: &str) -> HeaderMap {
-        let mut h = self.base_headers(user_id);
+    fn json_headers(&self, scope: VikingScope<'_>) -> HeaderMap {
+        let mut h = self.base_headers(scope);
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h
     }
@@ -340,7 +359,7 @@ impl OpenVikingInner {
     async fn get(
         &self,
         path: &str,
-        user_id: &str,
+        scope: VikingScope<'_>,
         query: &[(&str, &str)],
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -350,7 +369,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .get(url)
-            .headers(self.base_headers(user_id))
+            .headers(self.base_headers(scope))
             .timeout(timeout);
         let preview = if query.is_empty() {
             None
@@ -364,7 +383,7 @@ impl OpenVikingInner {
     async fn post_json(
         &self,
         path: &str,
-        user_id: &str,
+        scope: VikingScope<'_>,
         body: &Value,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -372,7 +391,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .post(self.url(path))
-            .headers(self.json_headers(user_id))
+            .headers(self.json_headers(scope))
             .json(body)
             .timeout(timeout);
         self.run_request("POST", path, builder, Some(preview_value(body)), events)
@@ -382,14 +401,14 @@ impl OpenVikingInner {
     async fn post_empty(
         &self,
         path: &str,
-        user_id: &str,
+        scope: VikingScope<'_>,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<Value> {
         let builder = self
             .client
             .post(self.url(path))
-            .headers(self.json_headers(user_id))
+            .headers(self.json_headers(scope))
             .body("{}")
             .timeout(timeout);
         self.run_request("POST", path, builder, Some("{}".into()), events)
@@ -399,7 +418,7 @@ impl OpenVikingInner {
     async fn delete(
         &self,
         path: &str,
-        user_id: &str,
+        scope: VikingScope<'_>,
         query: &[(&str, &str)],
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -409,7 +428,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .delete(url)
-            .headers(self.base_headers(user_id))
+            .headers(self.base_headers(scope))
             .timeout(timeout);
         let preview = if query.is_empty() {
             None
@@ -423,13 +442,13 @@ impl OpenVikingInner {
     /// `POST /sessions/{session_id}/commit`, parsed into a [`CommitAck`].
     async fn commit(
         &self,
-        user_id: &str,
+        scope: VikingScope<'_>,
         session_id: &str,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<CommitAck> {
         let path = format!("/api/v1/sessions/{session_id}/commit");
-        let resp = self.post_empty(&path, user_id, timeout, events).await?;
+        let resp = self.post_empty(&path, scope, timeout, events).await?;
         Ok(CommitAck {
             status: resp
                 .get("status")
@@ -449,7 +468,7 @@ impl OpenVikingInner {
     /// `viking_store` and the public [`OpenVikingMemory::wait_commit_task`].
     async fn poll_commit_task(
         &self,
-        user_id: &str,
+        scope: VikingScope<'_>,
         task_id: &str,
         interval: Duration,
         timeout: Duration,
@@ -473,7 +492,7 @@ impl OpenVikingInner {
             }
             tokio::time::sleep(interval).await;
             match self
-                .get(&task_path, user_id, &[], self.timeouts.http, events)
+                .get(&task_path, scope, &[], self.timeouts.http, events)
                 .await
             {
                 Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
@@ -603,7 +622,10 @@ impl OpenVikingMemory {
             .inner
             .client
             .get(self.inner.url("/health"))
-            .headers(self.inner.base_headers("default"))
+            .headers(
+                self.inner
+                    .base_headers(VikingScope::new("default", PROBE_AGENT)),
+            )
             .timeout(self.inner.timeouts.health)
             .send()
             .await;
@@ -622,9 +644,15 @@ impl OpenVikingMemory {
     /// ([`Memory::on_session_end`]) commits fire-and-forget; callers that must
     /// know when server-side extraction actually *finished* — benchmarks,
     /// diagnostics — commit through this and then poll [`Self::wait_commit_task`].
-    pub async fn commit_session(&self, user_id: &str, session_id: &str) -> Result<CommitAck> {
+    pub async fn commit_session(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<CommitAck> {
+        let scope = VikingScope::new(user_id, agent_id);
         self.inner
-            .commit(user_id, session_id, self.inner.timeouts.write, None)
+            .commit(scope, session_id, self.inner.timeouts.write, None)
             .await
     }
 
@@ -633,12 +661,20 @@ impl OpenVikingMemory {
     pub async fn wait_commit_task(
         &self,
         user_id: &str,
+        agent_id: &str,
         task_id: &str,
         interval: Duration,
         timeout: Duration,
     ) -> CommitTaskOutcome {
         self.inner
-            .poll_commit_task(user_id, task_id, interval, timeout, None, || false)
+            .poll_commit_task(
+                VikingScope::new(user_id, agent_id),
+                task_id,
+                interval,
+                timeout,
+                None,
+                || false,
+            )
             .await
     }
 
@@ -646,7 +682,13 @@ impl OpenVikingMemory {
     /// the configured `top_k`, returning the recalled memory contents. The
     /// trait [`Memory::recall`] is this plus `MemoryContext` plumbing and
     /// failure-swallowing.
-    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+    pub async fn recall_for(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<Vec<RecalledMemory>> {
+        let scope = VikingScope::new(user_id, agent_id);
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -655,7 +697,7 @@ impl OpenVikingMemory {
             .inner
             .post_json(
                 "/api/v1/search/find",
-                user_id,
+                scope,
                 &body,
                 self.inner.timeouts.recall,
                 None,
@@ -670,14 +712,16 @@ impl OpenVikingMemory {
     pub async fn add_message(
         &self,
         user_id: &str,
+        agent_id: &str,
         session_id: &str,
         role: &str,
         content: &str,
     ) -> Result<()> {
+        let scope = VikingScope::new(user_id, agent_id);
         let path = format!("/api/v1/sessions/{session_id}/messages");
         let body = json!({"role": role, "content": content});
         self.inner
-            .post_json(&path, user_id, &body, self.inner.timeouts.write, None)
+            .post_json(&path, scope, &body, self.inner.timeouts.write, None)
             .await?;
         Ok(())
     }
@@ -788,7 +832,10 @@ impl Memory for OpenVikingMemory {
         ctx: &MemoryContext,
         query: &[ContentBlock],
     ) -> Result<Vec<RecalledMemory>> {
-        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+        match self
+            .recall_for(ctx.user_id(), ctx.agent_id().as_str(), &concat_text(query))
+            .await
+        {
             Ok(memories) => Ok(memories),
             Err(e) => {
                 warn!(error = %e, "openviking recall failed (timeout or backend)");
@@ -808,16 +855,18 @@ impl Memory for OpenVikingMemory {
         if user_text.is_empty() && assistant_text.is_empty() {
             return Ok(());
         }
-        let user_id = ctx.user_id();
+        let scope = VikingScope::new(ctx.user_id(), ctx.agent_id().as_str());
         let sid = ctx.session_id().as_str();
         if !user_text.is_empty()
-            && let Err(e) = self.add_message(user_id, sid, "user", &user_text).await
+            && let Err(e) = self
+                .add_message(scope.user, scope.agent, sid, "user", &user_text)
+                .await
         {
             debug!(error = %e, "openviking on_turn_complete user msg failed");
         }
         if !assistant_text.is_empty()
             && let Err(e) = self
-                .add_message(user_id, sid, "assistant", &assistant_text)
+                .add_message(scope.user, scope.agent, sid, "assistant", &assistant_text)
                 .await
         {
             debug!(error = %e, "openviking on_turn_complete assistant msg failed");
@@ -833,7 +882,11 @@ impl Memory for OpenVikingMemory {
         // discarded here (the user never waits on extraction). Callers needing
         // true completion go through `commit_session` + `wait_commit_task`.
         if let Err(e) = self
-            .commit_session(ctx.user_id(), ctx.session_id().as_str())
+            .commit_session(
+                ctx.user_id(),
+                ctx.agent_id().as_str(),
+                ctx.session_id().as_str(),
+            )
             .await
         {
             warn!(error = %e, "openviking session commit failed");
@@ -925,7 +978,7 @@ impl VikingRecallTool {
         query: &str,
         target_uri: &str,
         request_limit: usize,
-        user_id: &str,
+        scope: VikingScope<'_>,
         events: &Arc<dyn ToolEventSink>,
     ) -> Vec<Value> {
         let body = json!({
@@ -938,7 +991,7 @@ impl VikingRecallTool {
             .inner
             .post_json(
                 "/api/v1/search/find",
-                user_id,
+                scope,
                 &body,
                 self.inner.timeouts.http,
                 Some(events),
@@ -995,28 +1048,16 @@ impl Tool for VikingRecallTool {
             .unwrap_or(DEFAULT_SCORE_THRESHOLD);
         // Over-fetch then post-filter to leaves, like the official plugin.
         let request_limit = (limit * 4).max(20);
-        let user_id = ctx.user.id.as_str();
+        let scope = VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str());
 
         let merged = if let Some(target_uri) = params.get("targetUri").and_then(|v| v.as_str()) {
-            self.find(query, target_uri, request_limit, user_id, &ctx.events)
+            self.find(query, target_uri, request_limit, scope, &ctx.events)
                 .await
         } else {
             // Both roots concurrently; a failed leg contributes nothing.
             let (user_hits, agent_hits) = tokio::join!(
-                self.find(
-                    query,
-                    USER_MEMORIES_URI,
-                    request_limit,
-                    user_id,
-                    &ctx.events
-                ),
-                self.find(
-                    query,
-                    AGENT_MEMORIES_URI,
-                    request_limit,
-                    user_id,
-                    &ctx.events
-                ),
+                self.find(query, USER_MEMORIES_URI, request_limit, scope, &ctx.events),
+                self.find(query, AGENT_MEMORIES_URI, request_limit, scope, &ctx.events),
             );
             let mut all = user_hits;
             all.extend(agent_hits);
@@ -1079,7 +1120,7 @@ impl Tool for VikingStoreTool {
             .get("role")
             .and_then(|v| v.as_str())
             .unwrap_or("user");
-        let user_id = ctx.user.id.as_str();
+        let scope = VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str());
         let session_id = params
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -1091,7 +1132,7 @@ impl Tool for VikingStoreTool {
         self.inner
             .post_json(
                 &msg_path,
-                user_id,
+                scope,
                 &body,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1102,7 +1143,7 @@ impl Tool for VikingStoreTool {
         let ack = self
             .inner
             .commit(
-                user_id,
+                scope,
                 &session_id,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1122,7 +1163,7 @@ impl Tool for VikingStoreTool {
             let outcome = self
                 .inner
                 .poll_commit_task(
-                    user_id,
+                    scope,
                     task_id,
                     STORE_POLL_INTERVAL,
                     self.inner.timeouts.store_poll,
@@ -1161,7 +1202,7 @@ impl VikingForgetTool {
         self.inner
             .delete(
                 "/api/v1/fs",
-                ctx.user.id.as_str(),
+                VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str()),
                 &[("uri", uri), ("recursive", "false")],
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1239,7 +1280,7 @@ impl Tool for VikingForgetTool {
             .inner
             .post_json(
                 "/api/v1/search/find",
-                ctx.user.id.as_str(),
+                VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str()),
                 &body,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1317,7 +1358,7 @@ impl Tool for VikingArchiveExpandTool {
             .inner
             .get(
                 &path,
-                ctx.user.id.as_str(),
+                VikingScope::new(ctx.user.id.as_str(), ctx.agent_id.as_str()),
                 &[],
                 self.inner.timeouts.http,
                 Some(&ctx.events),
