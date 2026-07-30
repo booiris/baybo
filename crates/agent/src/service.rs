@@ -1,43 +1,40 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use async_trait::async_trait;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Coordinates graceful shutdown across all components.
 #[derive(Clone)]
 pub struct ShutdownSignal {
-    shutdown: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    token: CancellationToken,
 }
 
 impl ShutdownSignal {
     pub fn new() -> Self {
         Self {
-            shutdown: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
+            token: CancellationToken::new(),
         }
     }
 
     /// Check if shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+        self.token.is_cancelled()
     }
 
     /// Trigger shutdown — wakes all waiters.
     pub fn trigger(&self) {
         info!("shutdown triggered");
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.token.cancel();
     }
 
     /// Wait until shutdown is triggered.
     pub async fn wait(&self) {
-        if self.is_shutdown() {
-            return;
-        }
-        self.notify.notified().await;
+        self.token.cancelled().await;
+    }
+
+    /// Clone the process-wide cancellation token for components that need to
+    /// select shutdown alongside their own work.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.token.clone()
     }
 }
 
@@ -120,8 +117,10 @@ mod tests {
     async fn shutdown_signal_clone_shares_state() {
         let s1 = ShutdownSignal::new();
         let s2 = s1.clone();
+        let token = s2.cancellation_token();
         s1.trigger();
         assert!(s2.is_shutdown());
+        token.cancelled().await;
     }
 
     #[tokio::test]

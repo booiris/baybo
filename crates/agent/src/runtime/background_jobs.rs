@@ -37,6 +37,7 @@ const COMMAND_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
 /// the supervisor is built.
 pub struct BackgroundJobManager {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
+    shutdown: CancellationToken,
     /// The detached-group ledger dir (see [`baybo_tools::builtin::bash::detached_group_dir`]).
     /// Each backgrounded unsandboxed group is recorded here at detach and
     /// cleared when its escort finishes, so a boot after a hard kill can reap
@@ -45,10 +46,15 @@ pub struct BackgroundJobManager {
 }
 
 impl BackgroundJobManager {
-    pub fn new(supervisor: Arc<OnceLock<AgentSupervisor>>, groups_dir: PathBuf) -> Self {
+    pub fn new(
+        supervisor: Arc<OnceLock<AgentSupervisor>>,
+        groups_dir: PathBuf,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             supervisor,
             groups_dir,
+            shutdown,
         }
     }
 }
@@ -87,15 +93,19 @@ impl BackgroundJobSink for BackgroundJobManager {
         }
         let supervisor = Arc::clone(&self.supervisor);
         let groups_dir = self.groups_dir.clone();
+        let shutdown = self.shutdown.clone();
         let returned = handle_id.clone();
         tokio::spawn(async move {
             escort_command(
-                supervisor,
-                &groups_dir,
-                parent_id,
-                registry_id,
-                handle_id,
-                cancel,
+                CommandEscort {
+                    supervisor,
+                    groups_dir,
+                    parent_id,
+                    registry_id,
+                    handle_id,
+                    cancel,
+                    shutdown,
+                },
                 job,
             )
             .await;
@@ -136,30 +146,59 @@ impl BackgroundJobControl for BackgroundJobManager {
 /// output files, then route a completion notification to the parent —
 /// unless `/stop` already drained the in-flight entry, in which case the
 /// delivery is suppressed.
-async fn escort_command(
+struct CommandEscort {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
-    groups_dir: &Path,
+    groups_dir: PathBuf,
     parent_id: SessionId,
     registry_id: SessionId,
     handle_id: String,
     cancel: CancellationToken,
-    mut job: DetachedCommand,
-) {
-    let exit_code = tokio::select! {
-        code = job.child.wait() => code,
+    shutdown: CancellationToken,
+}
+
+async fn escort_command(escort: CommandEscort, mut job: DetachedCommand) {
+    let CommandEscort {
+        supervisor,
+        groups_dir,
+        parent_id,
+        registry_id,
+        handle_id,
+        cancel,
+        shutdown,
+    } = escort;
+    let outcome = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            job.child.start_kill();
+            let _ = job.child.wait().await;
+            CommandOutcome::Shutdown
+        }
         _ = cancel.cancelled() => {
             job.child.start_kill();
             let _ = job.child.wait().await;
-            -1
+            CommandOutcome::Stopped
         }
+        code = job.child.wait() => CommandOutcome::Exited(code),
     };
     // The group is reaped (clean exit or cancel-kill above), so drop its ledger
     // entry — a later boot must not try to reap an already-gone group.
-    clear_detached_group(groups_dir, &handle_id);
+    clear_detached_group(&groups_dir, &handle_id);
     // Drain the stdout/stderr → file copy tasks so the files are fully
     // flushed before we read their tails.
     for task in job.copy_tasks.drain(..) {
         let _ = task.await;
+    }
+
+    if matches!(outcome, CommandOutcome::Shutdown) || shutdown.is_cancelled() {
+        if let Some(sup) = supervisor.get() {
+            sup.note_background_subagent_finished(&parent_id, &registry_id);
+        }
+        debug!(
+            parent_session_id = %parent_id,
+            %handle_id,
+            "background command stopped during process shutdown; suppressing delivery"
+        );
+        return;
     }
 
     let Some(sup) = supervisor.get() else {
@@ -173,6 +212,11 @@ async fn escort_command(
         // drains the in-flight marker, so a cancelled command fails the peek
         // above and is suppressed — it never reaches this delivery branch.
         // Here the child ran to a real exit.
+        let exit_code = match outcome {
+            CommandOutcome::Exited(code) => code,
+            CommandOutcome::Stopped => -1,
+            CommandOutcome::Shutdown => return,
+        };
         let status = if exit_code == 0 {
             SubagentExitStatus::Completed
         } else {
@@ -209,6 +253,12 @@ async fn escort_command(
         );
     }
     sup.note_background_subagent_finished(&parent_id, &registry_id);
+}
+
+enum CommandOutcome {
+    Exited(i32),
+    Stopped,
+    Shutdown,
 }
 
 /// Combined tail of a command's stdout + stderr files for the completion

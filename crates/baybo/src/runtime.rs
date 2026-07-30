@@ -648,6 +648,7 @@ pub async fn build_managers(
     let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
         Arc::clone(&bg_supervisor_slot),
         bg_groups_dir,
+        shutdown.cancellation_token(),
     ));
     let background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>> = Some(bg_manager.clone());
     let background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>> = Some(bg_manager);

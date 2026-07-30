@@ -20,10 +20,11 @@
 //!      `shutdown()` to stop the actor cleanly.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use baybo_agent::actor::AgentMessage;
+use baybo_agent::{AgentSupervisor, BackgroundJobManager};
 use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
 use baybo_cost::SpendingLimits;
 use baybo_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
@@ -37,15 +38,40 @@ use baybo_model::{
     SubagentExitStatus, ThinkingContent, TriggerSource,
 };
 use baybo_tools::test_support::RecordingTool;
-use baybo_tools::{Tool, ToolOutput};
+use baybo_tools::{BackgroundJobSink, DetachedCommand, RunningChild, Tool, ToolOutput};
 use chrono::Utc;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
 const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 /// Generous enough to absorb scheduler jitter on a loaded CI host while
 /// still keeping a hung test from blocking the suite for long.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+struct LongRunningChild {
+    killed: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl RunningChild for LongRunningChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        None
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        None
+    }
+
+    async fn wait(&mut self) -> i32 {
+        self.killed.cancelled().await;
+        -1
+    }
+
+    fn start_kill(&mut self) {
+        self.killed.cancel();
+    }
+}
 
 #[tokio::test]
 async fn clean_conversation_streams_text_then_final_message() {
@@ -1283,6 +1309,115 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
                 ))
         )),
         "proactive reply must reach the channel"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_kills_background_command_without_persisting_notification() {
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(8);
+    let supervisor = AgentSupervisor::new(response_tx);
+    supervisor
+        .register_if_absent(session_id.clone(), harness.mailbox.clone())
+        .expect("harness actor is registered once");
+
+    let supervisor_slot = Arc::new(OnceLock::new());
+    assert!(
+        supervisor_slot.set(supervisor.clone()).is_ok(),
+        "supervisor slot is initialized once"
+    );
+    let shutdown = CancellationToken::new();
+    let temp = tempfile::tempdir().expect("temporary background directory");
+    let stdout_path = temp.path().join("long-running.out");
+    let stderr_path = temp.path().join("long-running.err");
+    tokio::fs::write(&stdout_path, b"partial output")
+        .await
+        .expect("seed stdout");
+    tokio::fs::write(&stderr_path, b"partial error")
+        .await
+        .expect("seed stderr");
+    let killed = CancellationToken::new();
+    let manager = BackgroundJobManager::new(
+        supervisor_slot,
+        temp.path().join("groups"),
+        shutdown.clone(),
+    );
+
+    let handle = manager
+        .detach_command(DetachedCommand {
+            handle_id: "bg-shutdown-test".into(),
+            session_id: session_id.clone(),
+            command: "python -m http.server 8877".into(),
+            child: Box::new(LongRunningChild {
+                killed: killed.clone(),
+            }),
+            copy_tasks: Vec::new(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+        })
+        .await;
+    assert_eq!(handle, "bg-shutdown-test");
+    assert!(
+        supervisor.has_in_flight_background_subagents(&session_id),
+        "long-running command is tracked before shutdown"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(DRAIN_TIMEOUT, killed.cancelled())
+        .await
+        .expect("shutdown kills the child");
+    tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while supervisor.has_in_flight_background_subagents(&session_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown clears the in-flight registry");
+
+    let outputs = harness.drain_outputs(Duration::from_millis(100)).await;
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| matches!(output.event, AgentEvent::Message(_))),
+        "shutdown must not emit a background completion message: {outputs:?}"
+    );
+    let transcript = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load transcript");
+    assert!(
+        transcript.is_empty(),
+        "shutdown must not append background notification rows"
+    );
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("session row");
+    assert!(
+        stored
+            .state
+            .background_notifications
+            .buffered_results
+            .is_empty(),
+        "shutdown must not retain a pending background result"
+    );
+    assert!(
+        stored
+            .state
+            .background_notifications
+            .active_delivery
+            .is_none(),
+        "shutdown must not open a delivery ledger"
+    );
+    assert!(
+        stdout_path.exists() && stderr_path.exists(),
+        "shutdown preserves partial command output for inspection"
     );
 
     harness.shutdown().await;

@@ -80,7 +80,11 @@ The detached wait task posts `AgentMessage::BackgroundJobFinished` to the
 parent actor. `/stop` removes still-running subagents from the supervisor's
 in-flight registry; their wait tasks observe the missing entry and suppress the
 terminal event. Results that completed before `/stop` remain valid and are not
-discarded.
+discarded. Process shutdown is also a suppressing cancellation edge for
+detached commands: the command escort kills the child, clears its registry, and
+never publishes `BackgroundJobFinished`. The partial stdout/stderr artifacts
+remain available for inspection. A command terminated by Baybo shutdown is not
+a failed task result owed to the user.
 
 The actor deduplicates `handle_id` across all three durable collecting/delivery
 locations: buffered results, group members, and the active delivery's
