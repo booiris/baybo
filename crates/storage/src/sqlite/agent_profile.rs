@@ -272,7 +272,13 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .pool
             .interact("agent_profiles.set_llm", move |conn| {
                 Ok(conn.execute(
-                    "UPDATE agent_profiles SET llm = ?2, updated_at = ?3 WHERE id = ?1",
+                    // The builtin follows `default-llm` by definition, so its
+                    // pin is forced empty rather than merely left alone —
+                    // that also clears anything an earlier build stored.
+                    "UPDATE agent_profiles SET \
+                     llm = CASE WHEN builtin = 1 THEN NULL ELSE ?2 END, \
+                     updated_at = ?3 \
+                     WHERE id = ?1",
                     rusqlite::params![id, llm, now],
                 )?)
             })
@@ -478,15 +484,27 @@ mod tests {
         assert!(!store.delete(&builtin).await.unwrap());
     }
 
+    /// A custom agent's pin is its own; the builtin's is always empty,
+    /// because that row *is* `default-llm`.
     #[tokio::test]
-    async fn set_llm_reaches_builtin_and_clears() {
+    async fn set_llm_pins_a_custom_agent_and_never_the_builtin() {
         let store = open_store().await;
-        let builtin = AgentProfileId::builtin();
         let pin = LlmEntryName::from("fast");
 
+        let row = custom_row();
+        store.create(&row).await.unwrap();
+        assert!(store.set_llm(&row.id, Some(&pin)).await.unwrap());
+        assert_eq!(
+            store.get(&row.id).await.unwrap().unwrap().llm,
+            Some(pin.clone())
+        );
+        assert!(store.set_llm(&row.id, None).await.unwrap());
+        assert!(store.get(&row.id).await.unwrap().unwrap().llm.is_none());
+
+        // The builtin absorbs the write and stays unpinned — which also
+        // normalises a row an earlier build allowed to drift.
+        let builtin = AgentProfileId::builtin();
         assert!(store.set_llm(&builtin, Some(&pin)).await.unwrap());
-        assert_eq!(store.get(&builtin).await.unwrap().unwrap().llm, Some(pin));
-        assert!(store.set_llm(&builtin, None).await.unwrap());
         assert!(store.get(&builtin).await.unwrap().unwrap().llm.is_none());
     }
 

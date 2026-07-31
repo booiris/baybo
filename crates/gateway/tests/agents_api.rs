@@ -194,22 +194,18 @@ async fn agents_api_round_trip() {
     // …but every field with a targeted endpoint is editable. What the lock
     // protects is the row's claim to *be* default behaviour — its framework
     // and description — not which model it runs on or what it calls itself.
-    put_expect(
+    // …its model is not one of them: the builtin *is* `default-llm`, so
+    // pinning it would put one decision in two places.
+    let err = put_expect(
         &router,
         "/v1/agents/baybo/model",
         json!({ "llm": llm_entry }),
-        StatusCode::NO_CONTENT,
+        StatusCode::BAD_REQUEST,
     )
     .await;
+    assert!(err["error"].as_str().unwrap_or("").contains("default-llm"));
     let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
-    assert_eq!(builtin["llm"].as_str(), Some(llm_entry.as_str()));
-    put_expect(
-        &router,
-        "/v1/agents/baybo/model",
-        json!({ "llm": null }),
-        StatusCode::NO_CONTENT,
-    )
-    .await;
+    assert!(builtin.get("llm").is_none(), "got {builtin:?}");
 
     put_expect(
         &router,

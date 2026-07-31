@@ -72,18 +72,20 @@ rebuilt shape against a fresh one so the two declarations cannot drift.
 
 Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the sqlite impl — the row *is* the default behavior. It cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and the session-binding UI gets a default target without special-casing "no profile".
 
-**Exactly one thing about the builtin is pinned: its framework.** `baybo` is what makes this row the default behaviour, so it cannot be moved. Everything else is ordinary editable content:
+**Two things about the builtin are fixed by what it *is*:** it runs on `baybo`, and it follows `default-llm`. Everything else is ordinary editable content:
 
 | Field | Builtin | Where it lives |
 |---|---|---|
 | name | editable (`…/name`) | `profile/IDENTITY.md`, the `Name:` line |
 | soul | editable (`…/soul`) | `profile/SOUL.md` |
-| model / llm | editable (`…/model`) | row column, via `set_llm` |
 | avatar | editable (`…/avatar`) | row column, via `set_avatar` |
 | description | editable (content `PUT`) | row column |
 | **framework** | **pinned to `baybo`** | row column |
+| **model / llm** | **pinned empty** — follows `default-llm` | row column |
 
-The pin is structural, not a handler check: `update`'s statement writes `framework = CASE WHEN builtin = 1 THEN framework ELSE ?N END`, so the column self-references for the builtin and no caller can move it. The gateway still 400s an *explicit* framework change rather than silently dropping it — a caller that asked deserves to hear no — and refuses before writing, so the rest of the body does not land either. `delete` keeps its plain `WHERE builtin = 0`.
+Both pins are structural rather than handler checks. `update` writes `framework = CASE WHEN builtin = 1 THEN framework ELSE ?N END`, so the builtin's column self-references and no caller can move it; `set_llm` writes `llm = CASE WHEN builtin = 1 THEN NULL ELSE ?N END`, which both refuses a pin and normalises a row an earlier build let drift. Pinning a model on the builtin would put one decision — "what does this deployment run on?" — in two places that could then disagree; `default-llm` is that decision, and the LLM page is where it lives.
+
+The gateway still answers an *explicit* attempt with a 400 rather than silently dropping it — a caller that asked deserves to hear no — and refuses before writing, so the rest of the body does not land either. `delete` keeps its plain `WHERE builtin = 0`.
 
 ## Design Decisions
 

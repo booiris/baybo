@@ -75,16 +75,21 @@ pub trait AgentProfileStore: Send + Sync {
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>;
 
     /// Set or clear the avatar and bump `updated_at`. Deliberately not
-    /// builtin-guarded — see [`Self::set_llm`] for why the builtin has
-    /// targeted setters at all. Returns `Ok(false)` if no row matched.
+    /// builtin-guarded: the avatar is the builtin's, and picking a face for
+    /// it says nothing about what "default behaviour" means. Returns
+    /// `Ok(false)` if no row matched.
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;
 
-    /// Set or clear the LLM pin and bump `updated_at`. Also not
-    /// builtin-guarded: which model the built-in assistant runs on is a
-    /// deployment choice, not part of the "this row *is* default behaviour"
-    /// contract that `update`'s `WHERE builtin = 0` protects. Fields the
-    /// builtin may change get a targeted setter each, so the lock stays
-    /// structural instead of becoming per-field validation in the gateway.
+    /// Set or clear the LLM pin and bump `updated_at`.
+    ///
+    /// **The builtin's pin is forced to `NULL`**, whatever is passed: that
+    /// row *is* default behaviour, so it follows `default-llm` by
+    /// definition. Pinning it would duplicate that setting into a second
+    /// place they could disagree — change `default-llm` instead. Like the
+    /// framework pin, the statement enforces this rather than a caller
+    /// remembering to, and it normalises a row an earlier build let drift.
+    ///
+    /// Returns `Ok(false)` if no row matched.
     async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool>;
 
     /// Plain row delete, guarded `WHERE builtin = 0`. Returns `Ok(false)`

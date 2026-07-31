@@ -305,6 +305,9 @@ pub(crate) fn parse_agent_id(agent_id: &str) -> Result<AgentProfileId> {
 
 const BUILTIN_FRAMEWORK_PINNED: &str =
     "the built-in agent always runs on baybo; its framework cannot be changed";
+
+const BUILTIN_MODEL_FOLLOWS_DEFAULT: &str =
+    "the built-in agent always follows `default-llm`; change that instead of pinning it";
 const BUILTIN_UNDELETABLE: &str = "the built-in agent profile cannot be deleted";
 
 // ── handlers ────────────────────────────────────────────────────────
@@ -506,11 +509,15 @@ async fn set_agent_model(
     Path(agent_id): Path<String>,
     Json(req): Json<SetAgentModelRequest>,
 ) -> Result<axum::http::StatusCode> {
-    // Also open to the builtin: which model the built-in assistant runs on is
-    // a deployment choice, not part of what makes its row "default
-    // behaviour". Its framework stays locked behind the full-replace PUT.
     let row = load_agent(&state, &agent_id).await?;
     let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    // The builtin follows `default-llm`; pinning it would put the same
+    // decision in two places. Clearing is a no-op it can accept.
+    if row.builtin && llm.is_some() {
+        return Err(GatewayError::BadRequest(
+            BUILTIN_MODEL_FOLLOWS_DEFAULT.to_owned(),
+        ));
+    }
     let matched = state
         .agent_profile_store
         .set_llm(&row.id, llm.as_ref())

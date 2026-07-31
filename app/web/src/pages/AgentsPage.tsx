@@ -28,6 +28,8 @@ const FRAMEWORKS: { value: AgentFramework; label: string }[] = [
 ];
 
 const BAYBO_ONLY_HINT = 'baybo framework only — ignored by external frameworks';
+const BUILTIN_FOLLOWS_DEFAULT_HINT =
+  'the built-in agent always follows default-llm — change it on the LLM page';
 
 // Mirrors `baybo_model::MAX_AGENT_PROFILE_NAME_CHARS` (the server cap).
 const MAX_AGENT_NAME_CHARS = 64;
@@ -498,10 +500,10 @@ function AgentEditorPanel({
   const [savedFlash, setSavedFlash] = useState(false);
 
   const externalFramework = framework !== 'baybo';
-  // The builtin pins exactly one field: its framework is baybo by
-  // definition. Everything else about it — name, description, model, soul,
-  // avatar — is ordinary editable content.
-  const frameworkLocked = isBuiltin;
+  // Two things about the builtin are fixed by what it *is*: it runs on baybo,
+  // and it follows `default-llm` (pinning a model here would duplicate that
+  // setting). Name, description, soul and avatar are ordinary content.
+  const builtinPinned = isBuiltin;
   const avatarChanged = avatarBlobId !== (agent?.avatar_blob_id ?? null);
 
   // The old preview URL is revoked whenever a new one replaces it (the
@@ -641,7 +643,8 @@ function AgentEditorPanel({
           body: { name } as Record<string, unknown>,
         },
         {
-          dirty: (llm === '' ? null : llm) !== (agent.llm ?? null),
+                // The builtin's pin is fixed empty, so there is nothing to send.
+          dirty: !isBuiltin && (llm === '' ? null : llm) !== (agent.llm ?? null),
           path: '/v1/agents/{agent_id}/model' as const,
           body: { llm: llm === '' ? null : llm } as Record<string, unknown>,
         },
@@ -805,9 +808,9 @@ function AgentEditorPanel({
             <div className="flex-1">
               <label className={fieldLabel}>Framework</label>
               <SelectBox
-                className={`w-full h-10 !border ${frameworkLocked ? 'opacity-60' : ''}`}
+                className={`w-full h-10 !border ${builtinPinned ? 'opacity-60' : ''}`}
                 value={framework}
-                disabled={frameworkLocked}
+                disabled={builtinPinned}
                 onChange={(e) => setFramework(e.target.value as AgentFramework)}
               >
                 {FRAMEWORKS.map((f) => (
@@ -817,14 +820,23 @@ function AgentEditorPanel({
                 ))}
               </SelectBox>
             </div>
-            <div className="flex-1" title={externalFramework ? BAYBO_ONLY_HINT : undefined}>
+            <div
+              className="flex-1"
+              title={
+                externalFramework
+                  ? BAYBO_ONLY_HINT
+                  : builtinPinned
+                    ? BUILTIN_FOLLOWS_DEFAULT_HINT
+                    : undefined
+              }
+            >
               <label className={fieldLabel}>
                 Model {externalFramework && <span className="normal-case">(baybo only)</span>}
               </label>
               <SelectBox
-                className={`w-full h-10 !border ${externalFramework ? 'opacity-60' : ''}`}
+                className={`w-full h-10 !border ${externalFramework || builtinPinned ? 'opacity-60' : ''}`}
                 value={llm ?? ''}
-                disabled={externalFramework}
+                disabled={externalFramework || builtinPinned}
                 onChange={(e) => setLlm(e.target.value)}
               >
                 {/* Not a model — the "don't pin one" choice. Naming the
