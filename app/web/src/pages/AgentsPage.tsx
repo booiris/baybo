@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   RiAddLine,
   RiDeleteBinLine,
@@ -19,7 +19,9 @@ import bayboAvatar from '../assets/baybo-avatar.webp';
 
 type AgentProfile = components['schemas']['AgentProfileDto'];
 type AgentFramework = components['schemas']['AgentFrameworkDto'];
-type SkillInfo = { name: string; description: string };
+// `GET /v1/skills` inlines its item schema, so this mirrors it by hand.
+// `universal` marks a skill every agent has regardless of persona.
+type SkillInfo = { name: string; description: string; universal: boolean };
 
 const FRAMEWORKS: { value: AgentFramework; label: string }[] = [
   { value: 'baybo', label: 'Baybo' },
@@ -55,6 +57,9 @@ export function AgentsPage() {
   const isMock = useMockMode();
 
   const [agents, setAgents] = useState<AgentProfile[]>([]);
+  // The shared listing, kept only to seed the create form: a not-yet-created
+  // agent has no id to scope by, and what it will start with is exactly the
+  // universal subset of this.
   const [registeredSkills, setRegisteredSkills] = useState<SkillInfo[]>([]);
   const [llmNames, setLlmNames] = useState<string[]>([]);
   // Which entry `default-llm` currently points at, so the unpinned option can
@@ -64,6 +69,12 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  // What a not-yet-created agent will start with: the universal subset of
+  // the shared listing, computed here so the panel needs no hard-coded names.
+  const universalSkills = useMemo(
+    () => registeredSkills.filter((s) => s.universal),
+    [registeredSkills],
+  );
   // Sidebar selection: an agent id, or 'new' for the create form.
   const [selected, setSelected] = useState<string | 'new' | null>(null);
   const [pendingDelete, setPendingDelete] = useState<AgentProfile | null>(null);
@@ -76,9 +87,26 @@ export function AgentsPage() {
       if (isMock) {
         setAgents(MOCK_AGENT_PROFILES);
         setRegisteredSkills([
-          { name: 'brainstorm', description: 'Generate and expand ideas quickly.' },
-          { name: 'commit-helper', description: 'Draft conventional-commit messages from a diff.' },
-          { name: 'weekly-report', description: "Summarize the week's work into a report." },
+          {
+            name: 'baybo-cli',
+            description: 'Introspect the running instance through the baybo CLI.',
+            universal: true,
+          },
+          {
+            name: 'brainstorm',
+            description: 'Generate and expand ideas quickly.',
+            universal: false,
+          },
+          {
+            name: 'commit-helper',
+            description: 'Draft conventional-commit messages from a diff.',
+            universal: false,
+          },
+          {
+            name: 'weekly-report',
+            description: "Summarize the week's work into a report.",
+            universal: false,
+          },
         ]);
         setLlmNames(['primary', 'fast']);
         setDefaultLlmName('primary');
@@ -251,9 +279,9 @@ export function AgentsPage() {
           <AgentEditorPanel
             key="new"
             agent={null}
-            registeredSkills={registeredSkills}
             llmNames={llmNames}
             defaultLlmName={defaultLlmName}
+            universalSkills={universalSkills}
             onSaved={(createdId) => {
               if (createdId) {
                 pendingSelectRef.current = createdId;
@@ -266,9 +294,9 @@ export function AgentsPage() {
           <AgentEditorPanel
             key={selectedAgent.id}
             agent={selectedAgent}
-            registeredSkills={registeredSkills}
             llmNames={llmNames}
             defaultLlmName={defaultLlmName}
+            universalSkills={universalSkills}
             onSaved={() => refresh()}
             onDelete={
               selectedAgent.builtin
@@ -453,16 +481,16 @@ function AgentFace({
 
 function AgentEditorPanel({
   agent,
-  registeredSkills,
   llmNames,
   defaultLlmName,
+  universalSkills,
   onSaved,
   onDelete,
 }: {
   agent: AgentProfile | null; // null = create
-  registeredSkills: SkillInfo[];
   llmNames: string[];
   defaultLlmName: string;
+  universalSkills: SkillInfo[];
   /** Called after a successful save; carries the new id on create. */
   onSaved: (createdId?: string) => void;
   /** Present only for existing non-builtin agents; hands off to the confirm dialog. */
@@ -489,6 +517,11 @@ function AgentEditorPanel({
   const [soul, setSoul] = useState('');
   const [soulPath, setSoulPath] = useState<string | null>(null);
   const [soulVersion, setSoulVersion] = useState<string | null>(null);
+  // A custom agent does not inherit the workspace's skills, so the readout
+  // has to be its scope — the page-wide list would be a different agent's.
+  const [scopedSkills, setScopedSkills] = useState<SkillInfo[]>(
+    universalSkills,
+  );
   const [filesLoaded, setFilesLoaded] = useState(false);
   const [soulDirty, setSoulDirty] = useState(false);
   const [llm, setLlm] = useState(agent?.llm ?? '');
@@ -519,6 +552,7 @@ function AgentEditorPanel({
   // lets the server seed the template.
   useEffect(() => {
     if (agent === null) {
+      setScopedSkills(universalSkills);
       setFilesLoaded(true);
       return;
     }
@@ -544,11 +578,21 @@ function AgentEditorPanel({
       setSoulVersion(data.version);
       setSoulDirty(false);
       setFilesLoaded(true);
+
+      const skills = await client.GET('/v1/skills', {
+        params: { query: { agent_id: agent.id } },
+      });
+      if (canceled) return;
+      setScopedSkills(
+        (skills.data?.items ?? [])
+          .slice()
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
     })();
     return () => {
       canceled = true;
     };
-  }, [agent, client, isMock, logout]);
+  }, [agent, client, isMock, logout, universalSkills]);
 
   const uploadAvatar = useCallback(
     async (file: File) => {
@@ -892,7 +936,7 @@ function AgentEditorPanel({
           </div>
 
           {/* ── skills (read-only, live from the registry, full width) ── */}
-          <SkillsDisplay registered={registeredSkills} />
+          <SkillsDisplay registered={scopedSkills} isNew={agent === null} />
 
           {/* actions pinned to the bottom of the card, right-aligned; the
               card content fades out behind them as it scrolls. */}
@@ -941,17 +985,17 @@ function AgentEditorPanel({
 // Not configured here: `null` (the v1 default) means the agent inherits
 // every registered skill, so we list the live registry; a stored list
 // resolves each name to its registry blurb.
-function SkillsDisplay({ registered }: { registered: SkillInfo[] }) {
+function SkillsDisplay({ registered, isNew }: { registered: SkillInfo[]; isNew: boolean }) {
   return (
     <div>
       <label className={fieldLabel}>
         Skills{' '}
         <span className="normal-case text-ink-soft">
-          (managed by the skill system — read-only)
+          (this agent&apos;s own — read-only here)
         </span>
       </label>
       {registered.length === 0 ? (
-        <p className="text-ink-soft text-sm font-mono">No skills registered.</p>
+        <p className="text-ink-soft text-sm font-mono">No skills.</p>
       ) : (
         <div className="border border-black rounded-md divide-y divide-black overflow-hidden">
           {registered.map((s) => (
@@ -964,6 +1008,11 @@ function SkillsDisplay({ registered }: { registered: SkillInfo[] }) {
           ))}
         </div>
       )}
+      <p className="mt-1 text-xs text-muted">
+        {isNew
+          ? 'A new agent starts with only the universal skills above — it does not inherit the workspace’s. Add one by putting it in the agent’s personas/<id>/skills/ folder.'
+          : 'This agent does not inherit the workspace’s skills. Add one by putting it in its personas/<id>/skills/ folder.'}
+      </p>
     </div>
   );
 }

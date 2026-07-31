@@ -5801,14 +5801,17 @@ export interface operations {
     };
     list_skills: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description List this agent's scope instead of the shared set */
+                agent_id?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Registered skills with descriptions */
+            /** @description Skills this scope can invoke */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5818,9 +5821,24 @@ export interface operations {
                         items: {
                             description: string;
                             name: string;
+                            /**
+                             * @description True for a skill every agent has regardless of persona (runtime
+                             *     infrastructure, not a granted capability). Lets a client show what a
+                             *     not-yet-created agent would start with, without hard-coding the list.
+                             */
+                            universal: boolean;
                         }[];
                         next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */

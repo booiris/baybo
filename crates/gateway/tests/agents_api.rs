@@ -456,6 +456,56 @@ async fn agents_api_round_trip() {
     )
     .await;
 
+    // ── 4e. The skills readout is per-agent ─────────────────────────
+    // The harness registry starts empty; the compiled-in skills are what
+    // make "shared vs scoped" observable at all.
+    assert!(tg.deps.skill_registry.register_builtins() > 0);
+    // The shared listing belongs to the built-in; a custom agent sees only
+    // its own overlay plus the universal skills, so the Agents page cannot
+    // show one agent's inventory while editing another.
+    let shared = get(&router, "/v1/skills", StatusCode::OK).await;
+    let shared_names: Vec<&str> = shared["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(shared_names.contains(&"deck"), "{shared_names:?}");
+
+    let scoped = get(
+        &router,
+        &format!("/v1/skills?agent_id={agent_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    let scoped_names: Vec<&str> = scoped["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !scoped_names.contains(&"deck"),
+        "a custom agent must not inherit the shared set: {scoped_names:?}"
+    );
+    assert!(scoped_names.contains(&"baybo-cli"), "{scoped_names:?}");
+    assert!(
+        scoped["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|s| s["universal"].as_bool() == Some(true)),
+        "a fresh agent has only universal skills: {scoped_names:?}",
+    );
+
+    // A malformed id is a 400 here too, not a silently global listing.
+    get(
+        &router,
+        "/v1/skills?agent_id=../escape",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
     // ── 5. PUT is a full replace of what the row still owns ─────────
     put_expect(
         &router,

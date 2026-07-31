@@ -4049,9 +4049,20 @@
           "skills"
         ],
         "operationId": "list_skills",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "query",
+            "description": "List this agent's scope instead of the shared set",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Registered skills with descriptions",
+            "description": "Skills this scope can invoke",
             "content": {
               "application/json": {
                 "schema": {
@@ -4068,7 +4079,8 @@
                         "description": "One registered skill: its invocation name and a short blurb of what it\ndoes (the `SKILL.md` `description`).",
                         "required": [
                           "name",
-                          "description"
+                          "description",
+                          "universal"
                         ],
                         "properties": {
                           "description": {
@@ -4076,6 +4088,10 @@
                           },
                           "name": {
                             "type": "string"
+                          },
+                          "universal": {
+                            "type": "boolean",
+                            "description": "True for a skill every agent has regardless of persona (runtime\ninfrastructure, not a granted capability). Lets a client show what a\nnot-yet-created agent would start with, without hard-coding the list."
                           }
                         }
                       }
@@ -4087,6 +4103,16 @@
                       ]
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
