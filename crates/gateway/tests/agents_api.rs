@@ -155,15 +155,34 @@ async fn agents_api_round_trip() {
     )
     .await;
 
-    // ── 4. Builtin is locked: content PUT and DELETE 400 ────────────
+    // ── 4. Builtin: only its framework is pinned ────────────────────
+    // Its description is ordinary editable text.
+    put_expect(
+        &router,
+        "/v1/agents/baybo",
+        json!({ "description": "my own words", "framework": "baybo" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(builtin["description"].as_str(), Some("my own words"));
+
+    // Its framework is not: baybo is what makes this row the default.
     let err = put_expect(
         &router,
         "/v1/agents/baybo",
-        json!({ "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "claude" }),
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert!(err["error"].as_str().unwrap_or("").contains("read-only"));
+    assert!(err["error"].as_str().unwrap_or("").contains("baybo"));
+    let unchanged = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(
+        unchanged["description"].as_str(),
+        Some("my own words"),
+        "a refused framework change must not have applied the rest",
+    );
+
     let err = delete_expect(&router, "/v1/agents/baybo", StatusCode::BAD_REQUEST).await;
     assert!(
         err["error"]

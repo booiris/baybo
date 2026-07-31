@@ -303,7 +303,8 @@ pub(crate) fn parse_agent_id(agent_id: &str) -> Result<AgentProfileId> {
     AgentProfileId::parse(agent_id).map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 
-const BUILTIN_READ_ONLY: &str = "the built-in agent profile is read-only (avatar excepted)";
+const BUILTIN_FRAMEWORK_PINNED: &str =
+    "the built-in agent always runs on baybo; its framework cannot be changed";
 const BUILTIN_UNDELETABLE: &str = "the built-in agent profile cannot be deleted";
 
 // ── handlers ────────────────────────────────────────────────────────
@@ -433,12 +434,19 @@ async fn update_agent(
     Json(req): Json<UpdateAgentProfileRequest>,
 ) -> Result<axum::http::StatusCode> {
     let row = load_agent(&state, &agent_id).await?;
-    if row.builtin {
-        return Err(GatewayError::BadRequest(BUILTIN_READ_ONLY.to_owned()));
+    // The builtin's description is ordinary editable text; only its framework
+    // is pinned. Refuse an explicit change rather than silently ignoring one
+    // — the store drops it either way, but a caller that asked deserves to
+    // hear no.
+    let requested: AgentFramework = req.framework.into();
+    if row.builtin && requested != row.framework {
+        return Err(GatewayError::BadRequest(
+            BUILTIN_FRAMEWORK_PINNED.to_owned(),
+        ));
     }
     let update = AgentProfileUpdate {
         description: req.description,
-        framework: req.framework.into(),
+        framework: requested,
     };
     let matched = state
         .agent_profile_store
@@ -446,8 +454,8 @@ async fn update_agent(
         .await
         .map_err(|e| store_err("update agent profile", e))?;
     if !matched {
-        // The row read as non-builtin above, so the guard can't have
-        // filtered it — it was deleted concurrently.
+        // The row was loaded a moment ago, so a miss means it was deleted
+        // concurrently.
         return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)

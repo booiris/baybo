@@ -64,9 +64,14 @@ pub trait AgentProfileStore: Send + Sync {
     /// [`StorageError::Conflict`].
     async fn create(&self, row: &AgentProfileRow) -> Result<()>;
 
-    /// Full-replace the content fields and bump `updated_at`. Guarded
-    /// `WHERE builtin = 0`; returns `Ok(false)` if no row matched (missing
-    /// id, or the builtin behind the guard).
+    /// Full-replace the content fields and bump `updated_at`.
+    ///
+    /// Reaches the builtin, with one carve-out: **its framework is never
+    /// written**. The built-in agent runs on baybo by definition — that is
+    /// what makes its row the default behaviour — so the statement leaves
+    /// that column alone for `builtin = 1` rather than trusting callers.
+    /// Its description is ordinary editable text. Returns `Ok(false)` only
+    /// when no row matched.
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>;
 
     /// Set or clear the avatar and bump `updated_at`. Deliberately not

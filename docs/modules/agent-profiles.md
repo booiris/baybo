@@ -72,7 +72,7 @@ rebuilt shape against a fresh one so the two declarations cannot drift.
 
 Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the sqlite impl — the row *is* the default behavior. It cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and the session-binding UI gets a default target without special-casing "no profile".
 
-**What the builtin lock actually protects** is the row's claim to *be* default behaviour: its `framework` (it is baybo, by definition) and its `description`. Those sit behind the full-replace `PUT`, which the store guards with `WHERE builtin = 0`. Everything else is reachable, because each has a targeted endpoint the guard does not cover:
+**Exactly one thing about the builtin is pinned: its framework.** `baybo` is what makes this row the default behaviour, so it cannot be moved. Everything else is ordinary editable content:
 
 | Field | Builtin | Where it lives |
 |---|---|---|
@@ -80,9 +80,10 @@ Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `bui
 | soul | editable (`…/soul`) | `profile/SOUL.md` |
 | model / llm | editable (`…/model`) | row column, via `set_llm` |
 | avatar | editable (`…/avatar`) | row column, via `set_avatar` |
-| framework, description | **locked** | row columns, full-replace `PUT` only |
+| description | editable (content `PUT`) | row column |
+| **framework** | **pinned to `baybo`** | row column |
 
-Which model the built-in assistant runs on is a deployment choice, and what it calls itself is in a file the operator (or the agent) owns — neither is part of "this row is the default". Keeping those as targeted setters is what lets the lock stay structural instead of becoming per-field validation in the handler.
+The pin is structural, not a handler check: `update`'s statement writes `framework = CASE WHEN builtin = 1 THEN framework ELSE ?N END`, so the column self-references for the builtin and no caller can move it. The gateway still 400s an *explicit* framework change rather than silently dropping it — a caller that asked deserves to hear no — and refuses before writing, so the rest of the body does not land either. `delete` keeps its plain `WHERE builtin = 0`.
 
 ## Design Decisions
 

@@ -227,9 +227,14 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .pool
             .interact("agent_profiles.update", move |conn| {
                 match conn.execute(
+                    // The self-reference on the builtin's `framework` is the
+                    // guard: no caller can move it off baybo, while every
+                    // other row takes the requested value.
                     "UPDATE agent_profiles SET \
-                     description = ?2, framework = ?3, updated_at = ?4 \
-                     WHERE id = ?1 AND builtin = 0",
+                     description = ?2, \
+                     framework = CASE WHEN builtin = 1 THEN framework ELSE ?3 END, \
+                     updated_at = ?4 \
+                     WHERE id = ?1",
                     rusqlite::params![id, description, framework, now],
                 ) {
                     Ok(affected) => Ok(Ok(affected)),
@@ -390,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_full_replaces_content_and_skips_builtin() {
+    async fn update_full_replaces_content() {
         let store = open_store().await;
         let row = custom_row();
         store.create(&row).await.unwrap();
@@ -405,10 +410,8 @@ mod tests {
         assert_eq!(back.llm, row.llm);
         assert!(back.updated_at >= back.created_at);
 
-        // Builtin is unreachable behind the guard.
-        let builtin = AgentProfileId::builtin();
-        assert!(!store.update(&builtin, &content_update()).await.unwrap());
-        // Missing rows are indistinguishable at the store layer.
+        // Missing rows are the only `Ok(false)` — the builtin has its own
+        // test above, since it is reachable now except for its framework.
         assert!(
             !store
                 .update(
@@ -443,6 +446,38 @@ mod tests {
     /// The two fields the builtin may change each have a setter that skips
     /// the `builtin = 0` guard — which is what keeps the lock structural
     /// instead of per-field validation one layer up.
+    /// The builtin's description is ordinary editable text; only its
+    /// framework is pinned, and pinned by the statement rather than by a
+    /// caller remembering to ask nicely.
+    #[tokio::test]
+    async fn update_reaches_the_builtin_but_never_moves_its_framework() {
+        let store = open_store().await;
+        let builtin = AgentProfileId::builtin();
+
+        assert!(
+            store
+                .update(
+                    &builtin,
+                    &AgentProfileUpdate {
+                        description: "my own words".to_owned(),
+                        framework: AgentFramework::Claude,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let back = store.get(&builtin).await.unwrap().unwrap();
+        assert_eq!(back.description, "my own words");
+        assert_eq!(
+            back.framework,
+            AgentFramework::Baybo,
+            "the builtin runs on baybo by definition"
+        );
+
+        // …and it still cannot be deleted.
+        assert!(!store.delete(&builtin).await.unwrap());
+    }
+
     #[tokio::test]
     async fn set_llm_reaches_builtin_and_clears() {
         let store = open_store().await;
@@ -453,9 +488,6 @@ mod tests {
         assert_eq!(store.get(&builtin).await.unwrap().unwrap().llm, Some(pin));
         assert!(store.set_llm(&builtin, None).await.unwrap());
         assert!(store.get(&builtin).await.unwrap().unwrap().llm.is_none());
-
-        // A content update still cannot reach the builtin.
-        assert!(!store.update(&builtin, &content_update()).await.unwrap());
     }
 
     #[tokio::test]

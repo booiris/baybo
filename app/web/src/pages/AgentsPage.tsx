@@ -488,10 +488,10 @@ function AgentEditorPanel({
   const [savedFlash, setSavedFlash] = useState(false);
 
   const externalFramework = framework !== 'baybo';
-  // The builtin row's lock covers what makes it *be* default behaviour: its
-  // framework and description. Name, model, soul and avatar each have a
-  // targeted endpoint the lock does not reach, so they stay editable.
-  const contentLocked = isBuiltin;
+  // The builtin pins exactly one field: its framework is baybo by
+  // definition. Everything else about it — name, description, model, soul,
+  // avatar — is ordinary editable content.
+  const frameworkLocked = isBuiltin;
   const avatarChanged = avatarBlobId !== (agent?.avatar_blob_id ?? null);
 
   // The old preview URL is revoked whenever a new one replaces it (the
@@ -648,7 +648,7 @@ function AgentEditorPanel({
         }
       }
 
-      if (!isBuiltin) {
+      {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
           params: { path: { agent_id: agent.id } },
           body: content,
@@ -685,7 +685,6 @@ function AgentEditorPanel({
     client,
     description,
     framework,
-    isBuiltin,
     isMock,
     llm,
     logout,
@@ -784,7 +783,6 @@ function AgentEditorPanel({
                   className={`${textInput} resize-y`}
                   rows={2}
                   value={description}
-                  disabled={contentLocked}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="What does this agent do?"
                 />
@@ -797,9 +795,9 @@ function AgentEditorPanel({
             <div className="flex-1">
               <label className={fieldLabel}>Framework</label>
               <SelectBox
-                className={`w-full h-10 !border ${contentLocked ? 'opacity-60' : ''}`}
+                className={`w-full h-10 !border ${frameworkLocked ? 'opacity-60' : ''}`}
                 value={framework}
-                disabled={contentLocked}
+                disabled={frameworkLocked}
                 onChange={(e) => setFramework(e.target.value as AgentFramework)}
               >
                 {FRAMEWORKS.map((f) => (
