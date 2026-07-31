@@ -84,23 +84,38 @@ The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliS
 
 ### Per-agent overlays
 
-Beyond the shared set (builtins + `<workspace>/skills/`), each agent profile
-may own a private overlay at `<workspace>/personas/<agent_id>/skills/`, same
-one-directory-per-skill shape. `SkillRegistry` holds it in a second map keyed
-by profile id, and every session-scoped read goes through the scoped pair:
+**A custom agent does not inherit the shared set.** The built-in's skills
+*are* that set (builtins + `<workspace>/skills/`), and an unbound session is
+the built-in; a custom agent starts from nothing but its own overlay at
+`<workspace>/personas/<agent_id>/skills/`, same one-directory-per-skill shape.
+A persona someone curated should not silently acquire every skill the
+workspace happens to hold — granting one is a decision, so it is made by
+putting the skill in that agent's folder.
+
+The one exception is `UNIVERSAL_SKILLS`, currently just `baybo-cli`: it tells
+the agent how to introspect the instance it is running inside (the Bash tool
+injects `BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for exactly that), so it is
+runtime infrastructure rather than a capability anyone chose to grant.
+Withholding it would not make a persona narrower, only blinder. `deck` is
+deliberately *not* in the list — an authoring tool is a capability.
+
+`SkillRegistry` holds overlays in a second map keyed by profile id, and every
+session-scoped read goes through the scoped pair:
 
 - `get_scoped(agent, name)` — the agent's overlay first, then the shared set.
-- `summaries_for(agent)` — shared ∪ overlay, **overlay wins a name
-  collision**, for that agent only; sorted by name so ordering is stable
-  across turns. `ContextManager` routes the per-turn listing, the
+- `summaries_for(agent)` — the shared set for the built-in; for a custom
+  agent, its overlay ∪ `UNIVERSAL_SKILLS`, **overlay winning a name
+  collision**; sorted by name so ordering is stable across turns. `ContextManager` routes the per-turn listing, the
   post-compaction trailer, and slash candidates through it.
 - `load_agent_dir(agent, dir)` / `agent_dir_loaded(agent)` — the actor-build
   path loads one agent's folder on a cold start; `reload()` replays overlays
   after builtins and the shared dirs.
 
-A name that exists only in *another* agent's overlay simply misses, so the
-`Skill` tool answers "unknown skill" rather than a refusal that would leak
-another agent's inventory. Governance is unchanged: persona folders are
+A name that exists only in another agent's overlay — or in a shared set this
+agent does not inherit — simply misses, so the `Skill` tool answers "unknown
+skill" rather than a refusal that would leak an inventory. One consequence
+worth knowing: a custom agent has no `/deck`, because that builtin is a
+capability like any other. Governance is unchanged: persona folders are
 workspace content, so their skills are `Trusted` and the risk assessor judges
 them by content hash like any other. `SkillInstall` / `SkillUninstall` keep
 targeting the shared folder — overlays are hand-authored. The built-in

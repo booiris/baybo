@@ -44,9 +44,11 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
   `IDENTITY.md` (name, creature, vibe, emoji, avatar). Only `USER.md` (who the
   human is) stays workspace-shared — there is one person however many agents
   exist.
-- **Skills**: shared base (builtins + `<workspace>/skills/`) visible to every
-  agent, plus a per-agent overlay; same-name skills in the agent's folder win
-  for that agent only.
+- **Skills**: a custom agent starts with **only its own overlay** — it does not
+  inherit the shared set (builtins + `<workspace>/skills/`), which belongs to
+  the built-in. Granting a skill to a persona is a decision, made by putting it
+  in that agent's folder. The lone exception is `baybo-cli`, which is runtime
+  infrastructure rather than a capability.
 - **Memory**: one configured backend, partitioned per agent — every
   recall/write carries the session's agent id. Agent A never recalls agent B's
   memories.

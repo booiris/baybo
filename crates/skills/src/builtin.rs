@@ -17,6 +17,12 @@ use baybo_model::{ArtifactSource, TrustLevel};
 use crate::SkillDefinition;
 use crate::loader::parse_skill_md;
 
+/// Name of the CLI-introspection skill. Referenced by
+/// [`crate::registry::UNIVERSAL_SKILLS`] as well as the registration below,
+/// so it is a const rather than two literals.
+pub const BAYBO_CLI_SKILL_NAME: &str = "baybo-cli";
+const DECK_SKILL_NAME: &str = "deck";
+
 const BAYBO_CLI_SKILL_MD: &str = include_str!("builtin/baybo-cli/SKILL.md");
 const DECK_SKILL_MD: &str = include_str!("builtin/deck/SKILL.md");
 
@@ -32,7 +38,10 @@ const BAYBO_BIN_TOKEN: &str = "{{BAYBO_BIN}}";
 /// [`crate::SkillRegistry::register`] is keyed by `name`.
 pub(crate) fn all() -> Vec<SkillDefinition> {
     let bin = resolve_baybo_bin();
-    let raw = [("baybo-cli", BAYBO_CLI_SKILL_MD), ("deck", DECK_SKILL_MD)];
+    let raw = [
+        (BAYBO_CLI_SKILL_NAME, BAYBO_CLI_SKILL_MD),
+        (DECK_SKILL_NAME, DECK_SKILL_MD),
+    ];
     raw.into_iter()
         .filter_map(|(name, md)| parse(name, md, &bin))
         .collect()
