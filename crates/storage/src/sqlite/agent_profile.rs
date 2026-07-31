@@ -222,17 +222,15 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let id = id.as_str().to_string();
         let description = update.description.clone();
         let framework = update.framework.as_str();
-        let llm = update.llm.as_ref().map(|l| l.as_str().to_string());
         let now = super::time::now_us();
         let outcome = self
             .pool
             .interact("agent_profiles.update", move |conn| {
                 match conn.execute(
                     "UPDATE agent_profiles SET \
-                     description = ?2, framework = ?3, \
-                     llm = ?4, updated_at = ?5 \
+                     description = ?2, framework = ?3, updated_at = ?4 \
                      WHERE id = ?1 AND builtin = 0",
-                    rusqlite::params![id, description, framework, llm, now,],
+                    rusqlite::params![id, description, framework, now],
                 ) {
                     Ok(affected) => Ok(Ok(affected)),
                     Err(e) => Ok(Err(e.to_string())),
@@ -255,6 +253,22 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                 Ok(conn.execute(
                     "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 WHERE id = ?1",
                     rusqlite::params![id, blob_id, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let llm = llm.map(|l| l.as_str().to_string());
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("agent_profiles.set_llm", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE agent_profiles SET llm = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, llm, now],
                 )?)
             })
             .await?;
@@ -323,7 +337,6 @@ mod tests {
         AgentProfileUpdate {
             description: String::new(),
             framework: AgentFramework::Baybo,
-            llm: None,
         }
     }
 
@@ -387,7 +400,9 @@ mod tests {
         let back = store.get(&row.id).await.unwrap().unwrap();
         assert_eq!(back.description, "");
         assert_eq!(back.framework, AgentFramework::Baybo);
-        assert!(back.llm.is_none());
+        // The pin is not part of the full replace any more — it has its own
+        // setter, so a content update leaves it alone.
+        assert_eq!(back.llm, row.llm);
         assert!(back.updated_at >= back.created_at);
 
         // Builtin is unreachable behind the guard.
@@ -423,6 +438,24 @@ mod tests {
         assert!(store.delete(&row.id).await.unwrap());
         assert!(store.get(&row.id).await.unwrap().is_none());
         assert!(!store.delete(&row.id).await.unwrap());
+    }
+
+    /// The two fields the builtin may change each have a setter that skips
+    /// the `builtin = 0` guard — which is what keeps the lock structural
+    /// instead of per-field validation one layer up.
+    #[tokio::test]
+    async fn set_llm_reaches_builtin_and_clears() {
+        let store = open_store().await;
+        let builtin = AgentProfileId::builtin();
+        let pin = LlmEntryName::from("fast");
+
+        assert!(store.set_llm(&builtin, Some(&pin)).await.unwrap());
+        assert_eq!(store.get(&builtin).await.unwrap().unwrap().llm, Some(pin));
+        assert!(store.set_llm(&builtin, None).await.unwrap());
+        assert!(store.get(&builtin).await.unwrap().unwrap().llm.is_none());
+
+        // A content update still cannot reach the builtin.
+        assert!(!store.update(&builtin, &content_update()).await.unwrap());
     }
 
     #[tokio::test]

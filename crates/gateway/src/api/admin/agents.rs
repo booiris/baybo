@@ -29,6 +29,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_agent))
         .routes(routes!(update_agent))
         .routes(routes!(set_agent_avatar))
+        .routes(routes!(set_agent_name))
+        .routes(routes!(set_agent_model))
         .routes(routes!(get_agent_soul))
         .routes(routes!(set_agent_soul))
         .routes(routes!(get_agent_identity))
@@ -203,9 +205,20 @@ pub struct CreateAgentProfileRequest {
 /// absent nullable fields reset to the inherit-default state.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateAgentProfileRequest {
-    pub name: String,
     pub description: String,
     pub framework: AgentFrameworkDto,
+}
+
+/// Request body for `PUT /v1/agents/{agent_id}/name`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetAgentNameRequest {
+    pub name: String,
+}
+
+/// Request body for `PUT /v1/agents/{agent_id}/model`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetAgentModelRequest {
+    /// `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`.
     #[serde(default)]
     pub llm: Option<String>,
 }
@@ -423,11 +436,9 @@ async fn update_agent(
     if row.builtin {
         return Err(GatewayError::BadRequest(BUILTIN_READ_ONLY.to_owned()));
     }
-    let name = validate_name(&req.name)?;
     let update = AgentProfileUpdate {
         description: req.description,
         framework: req.framework.into(),
-        llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
     };
     let matched = state
         .agent_profile_store
@@ -439,10 +450,67 @@ async fn update_agent(
         // filtered it — it was deleted concurrently.
         return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
     }
-    // The name is not a column: renaming an agent rewrites the `Name:` line
-    // in its own `IDENTITY.md`, leaving everything else the agent wrote
-    // there untouched.
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    put,
+    path = "/agents/{agent_id}/name",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    request_body = SetAgentNameRequest,
+    responses(
+        (status = 204, description = "Name set"),
+        (status = 400, description = "Malformed agent id or name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn set_agent_name(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<SetAgentNameRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Targeted, and open to the builtin: a name is not a row field at all,
+    // it is the `Name:` line of the agent's own `IDENTITY.md` — for the
+    // builtin, the workspace's. The splice leaves every other line alone.
+    let row = load_agent(&state, &agent_id).await?;
+    let name = validate_name(&req.name)?;
     set_display_name(&state, &row, &name).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    put,
+    path = "/agents/{agent_id}/model",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent profile id")),
+    request_body = SetAgentModelRequest,
+    responses(
+        (status = 204, description = "LLM pin set (or cleared)"),
+        (status = 400, description = "Malformed agent id or unknown LLM entry", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such agent profile", body = ErrorBody),
+    )
+)]
+async fn set_agent_model(
+    State(state): State<AdminState>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<SetAgentModelRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Also open to the builtin: which model the built-in assistant runs on is
+    // a deployment choice, not part of what makes its row "default
+    // behaviour". Its framework stays locked behind the full-replace PUT.
+    let row = load_agent(&state, &agent_id).await?;
+    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let matched = state
+        .agent_profile_store
+        .set_llm(&row.id, llm.as_ref())
+        .await
+        .map_err(|e| store_err("set agent llm", e))?;
+    if !matched {
+        return Err(GatewayError::NotFound(format!("agent profile {agent_id}")));
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

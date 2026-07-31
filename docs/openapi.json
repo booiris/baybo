@@ -522,6 +522,134 @@
         }
       }
     },
+    "/v1/agents/{agent_id}/model": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_model",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "LLM pin set (or cleared)"
+          },
+          "400": {
+            "description": "Malformed agent id or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/name": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_name",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentNameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Name set"
+          },
+          "400": {
+            "description": "Malformed agent id or name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agents/{agent_id}/soul": {
       "get": {
         "tags": [
@@ -6735,6 +6863,31 @@
           }
         }
       },
+      "SetAgentModelRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/model`.",
+        "properties": {
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name, or `null`/absent to follow `default-llm`."
+          }
+        }
+      },
+      "SetAgentNameRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -7160,7 +7313,6 @@
         "type": "object",
         "description": "Request body for `PUT /v1/agents/{agent_id}` — the **complete** content\nstate (full replace). `name`/`description`/`framework` are required so\nan omitted `framework` can't silently reset a profile to `baybo`;\nabsent nullable fields reset to the inherit-default state.",
         "required": [
-          "name",
           "description",
           "framework"
         ],
@@ -7170,15 +7322,6 @@
           },
           "framework": {
             "$ref": "#/components/schemas/AgentFrameworkDto"
-          },
-          "llm": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
           }
         }
       },

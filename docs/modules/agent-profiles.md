@@ -70,7 +70,19 @@ rebuilt shape against a fresh one so the two declarations cannot drift.
 
 ### The built-in `baybo` profile
 
-Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `name = "baybo"`, `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the sqlite impl — the row *is* the default behavior. It is **read-only except its avatar** and cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and a future session-binding UI gets a default target without special-casing "no profile".
+Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the sqlite impl — the row *is* the default behavior. It cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and the session-binding UI gets a default target without special-casing "no profile".
+
+**What the builtin lock actually protects** is the row's claim to *be* default behaviour: its `framework` (it is baybo, by definition) and its `description`. Those sit behind the full-replace `PUT`, which the store guards with `WHERE builtin = 0`. Everything else is reachable, because each has a targeted endpoint the guard does not cover:
+
+| Field | Builtin | Where it lives |
+|---|---|---|
+| name | editable (`…/name`) | `profile/IDENTITY.md`, the `Name:` line |
+| soul | editable (`…/soul`) | `profile/SOUL.md` |
+| model / llm | editable (`…/model`) | row column, via `set_llm` |
+| avatar | editable (`…/avatar`) | row column, via `set_avatar` |
+| framework, description | **locked** | row columns, full-replace `PUT` only |
+
+Which model the built-in assistant runs on is a deployment choice, and what it calls itself is in a file the operator (or the agent) owns — neither is part of "this row is the default". Keeping those as targeted setters is what lets the lock stay structural instead of becoming per-field validation in the handler.
 
 ## Design Decisions
 

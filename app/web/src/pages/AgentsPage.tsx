@@ -464,24 +464,21 @@ function AgentEditorPanel({
   const [name, setName] = useState(agent?.name ?? '');
   const [description, setDescription] = useState(agent?.description ?? '');
   const [framework, setFramework] = useState<AgentFramework>(agent?.framework ?? 'baybo');
-  // Soul (personality) and identity (self-image) are files the agent owns —
-  // `personas/<id>/{SOUL,IDENTITY}.md` — not profile fields, so each loads and
-  // saves on its own endpoint. The paths are shown to the operator because
-  // both live in a git repo they may want to commit.
+  // The soul is a file the agent owns (`personas/<id>/SOUL.md`), not a
+  // profile field, so it loads and saves on its own endpoint; its path is
+  // shown because that file lives in a git repo the operator may want to
+  // commit. `IDENTITY.md` is deliberately not surfaced — the only thing this
+  // page wants from it is the name, which has its own field.
   //
   // The page never polls or subscribes, so what it shows can be stale — the
-  // agent rewrites these files mid-conversation. `version` is what keeps that
+  // agent rewrites this file mid-conversation. `version` is what keeps that
   // safe: it rides back on Save, and the server refuses a write whose base
   // has moved rather than deleting the agent's own edit.
   const [soul, setSoul] = useState('');
   const [soulPath, setSoulPath] = useState<string | null>(null);
   const [soulVersion, setSoulVersion] = useState<string | null>(null);
-  const [identity, setIdentity] = useState('');
-  const [identityPath, setIdentityPath] = useState<string | null>(null);
-  const [identityVersion, setIdentityVersion] = useState<string | null>(null);
   const [filesLoaded, setFilesLoaded] = useState(false);
   const [soulDirty, setSoulDirty] = useState(false);
-  const [identityDirty, setIdentityDirty] = useState(false);
   const [llm, setLlm] = useState(agent?.llm ?? '');
   const [avatarBlobId, setAvatarBlobId] = useState<string | null>(agent?.avatar_blob_id ?? null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -491,9 +488,10 @@ function AgentEditorPanel({
   const [savedFlash, setSavedFlash] = useState(false);
 
   const externalFramework = framework !== 'baybo';
+  // The builtin row's lock covers what makes it *be* default behaviour: its
+  // framework and description. Name, model, soul and avatar each have a
+  // targeted endpoint the lock does not reach, so they stay editable.
   const contentLocked = isBuiltin;
-  // The avatar is the builtin's only writable field, so its Save is live
-  // only once the avatar actually differs from the stored one.
   const avatarChanged = avatarBlobId !== (agent?.avatar_blob_id ?? null);
 
   // The old preview URL is revoked whenever a new one replaces it (the
@@ -515,35 +513,24 @@ function AgentEditorPanel({
     if (isMock) {
       setSoul(`# ${agent.name}\n\n${agent.description}`);
       setSoulPath(`personas/${agent.id}/SOUL.md`);
-      setIdentity('# Who Am I?\n\n* **Name:**\n* **Vibe:**\n');
-      setIdentityPath(`personas/${agent.id}/IDENTITY.md`);
       setFilesLoaded(true);
       return;
     }
     let canceled = false;
     void (async () => {
-      const [soulRes, identityRes] = await Promise.all([
-        client.GET('/v1/agents/{agent_id}/soul', { params: { path: { agent_id: agent.id } } }),
-        client.GET('/v1/agents/{agent_id}/identity', { params: { path: { agent_id: agent.id } } }),
-      ]);
+      const { data, error: apiError, response } = await client.GET('/v1/agents/{agent_id}/soul', {
+        params: { path: { agent_id: agent.id } },
+      });
       if (canceled) return;
-      if (soulRes.response.status === 401 || identityRes.response.status === 401) return logout();
-      if (soulRes.error || !soulRes.data || identityRes.error || !identityRes.data) {
-        setSaveError(
-          soulRes.error?.error ||
-            identityRes.error?.error ||
-            `HTTP Error ${soulRes.response.status}`,
-        );
+      if (response.status === 401) return logout();
+      if (apiError || !data) {
+        setSaveError(apiError?.error || `HTTP Error ${response.status}`);
         return;
       }
-      setSoul(soulRes.data.content);
-      setSoulPath(soulRes.data.path);
-      setSoulVersion(soulRes.data.version);
-      setIdentity(identityRes.data.content);
-      setIdentityPath(identityRes.data.path);
-      setIdentityVersion(identityRes.data.version);
+      setSoul(data.content);
+      setSoulPath(data.path);
+      setSoulVersion(data.version);
       setSoulDirty(false);
-      setIdentityDirty(false);
       setFilesLoaded(true);
     })();
     return () => {
@@ -590,16 +577,15 @@ function AgentEditorPanel({
     setSaving(true);
     setSaveError(null);
     try {
-      const content = {
-        name,
-        description,
-        framework,
-        llm: llm === '' ? null : llm,
-      };
+      // What the row still owns. Name and llm ride targeted endpoints (the
+      // builtin lock does not reach those), so they are absent here.
+      const content = { description, framework };
       if (agent === null) {
         const { data, error: apiError, response } = await client.POST('/v1/agents', {
           body: {
             ...content,
+            name,
+            llm: llm === '' ? null : llm,
             avatar_blob_id: avatarBlobId,
             soul: soul.trim() === '' ? null : soul,
           },
@@ -612,35 +598,19 @@ function AgentEditorPanel({
         onSaved(data?.id);
         return;
       }
-      for (const file of [
-        {
-          label: 'Soul',
-          dirty: soulDirty,
-          path: '/v1/agents/{agent_id}/soul' as const,
-          content: soul,
-          version: soulVersion,
-          setVersion: setSoulVersion,
-        },
-        {
-          label: 'Identity',
-          dirty: identityDirty,
-          path: '/v1/agents/{agent_id}/identity' as const,
-          content: identity,
-          version: identityVersion,
-          setVersion: setIdentityVersion,
-        },
-      ]) {
-        if (!file.dirty) continue;
-        const { data, error: apiError, response } = await client.PUT(file.path, {
-          params: { path: { agent_id: agent.id } },
-          body: { content: file.content, version: file.version },
-        });
+      if (soulDirty) {
+        const { data, error: apiError, response } = await client.PUT(
+          '/v1/agents/{agent_id}/soul',
+          {
+            params: { path: { agent_id: agent.id } },
+            body: { content: soul, version: soulVersion },
+          },
+        );
         if (response.status === 401) return logout();
         if (response.status === 409) {
           setSaveError(
-            `${file.label} was rewritten by the agent since this page loaded. ` +
-              'Reopen the agent to see the current version, then reapply your edit — ' +
-              'saving now would delete what it wrote.',
+            'The soul was rewritten by the agent since this page loaded. Reopen the agent to ' +
+              'see the current version, then reapply your edit — saving now would delete it.',
           );
           return;
         }
@@ -650,11 +620,34 @@ function AgentEditorPanel({
         }
         // Adopt the version we just created, so a second Save from this same
         // open editor does not conflict with its own write.
-        file.setVersion(data.version);
+        setSoulVersion(data.version);
       }
-      // The profile PUT goes last on purpose: `name` is not a column, so the
-      // server splices it into IDENTITY.md. Running it before the file write
-      // above would let the whole-file replace overwrite the new name.
+
+      // Targeted endpoints, so these run for the builtin too.
+      for (const targeted of [
+        {
+          dirty: name !== agent.name,
+          path: '/v1/agents/{agent_id}/name' as const,
+          body: { name } as Record<string, unknown>,
+        },
+        {
+          dirty: (llm === '' ? null : llm) !== (agent.llm ?? null),
+          path: '/v1/agents/{agent_id}/model' as const,
+          body: { llm: llm === '' ? null : llm } as Record<string, unknown>,
+        },
+      ]) {
+        if (!targeted.dirty) continue;
+        const { error: apiError, response } = await client.PUT(targeted.path, {
+          params: { path: { agent_id: agent.id } },
+          body: targeted.body,
+        });
+        if (response.status === 401) return logout();
+        if (apiError || !response.ok) {
+          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          return;
+        }
+      }
+
       if (!isBuiltin) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
           params: { path: { agent_id: agent.id } },
@@ -665,18 +658,7 @@ function AgentEditorPanel({
           setSaveError(apiError?.error || `HTTP Error ${response.status}`);
           return;
         }
-        // That write touched IDENTITY.md behind this editor's back, so the
-        // base it holds is stale — re-read rather than 409 on the next Save.
-        const reread = await client.GET('/v1/agents/{agent_id}/identity', {
-          params: { path: { agent_id: agent.id } },
-        });
-        if (reread.data) {
-          setIdentity(reread.data.content);
-          setIdentityVersion(reread.data.version);
-        }
       }
-      setSoulDirty(false);
-      setIdentityDirty(false);
       if (avatarChanged) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}/avatar', {
           params: { path: { agent_id: agent.id } },
@@ -712,9 +694,6 @@ function AgentEditorPanel({
     soul,
     soulDirty,
     soulVersion,
-    identity,
-    identityDirty,
-    identityVersion,
   ]);
 
   return (
@@ -779,7 +758,6 @@ function AgentEditorPanel({
                   className={`${textInput} !text-base font-bold`}
                   value={name}
                   maxLength={MAX_AGENT_NAME_CHARS}
-                  disabled={contentLocked}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="e.g. Code Reviewer"
                 />
@@ -790,7 +768,7 @@ function AgentEditorPanel({
                 <div className="min-h-6 flex flex-wrap items-center gap-2 mt-1.5">
                   {isBuiltin && (
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.65rem] font-bold uppercase border border-black bg-white">
-                      <RiLockLine /> built-in · read-only except avatar
+                      <RiLockLine /> built-in · framework fixed
                     </span>
                   )}
                   {agent && (
@@ -836,9 +814,9 @@ function AgentEditorPanel({
                 Model {externalFramework && <span className="normal-case">(baybo only)</span>}
               </label>
               <SelectBox
-                className={`w-full h-10 !border ${contentLocked || externalFramework ? 'opacity-60' : ''}`}
+                className={`w-full h-10 !border ${externalFramework ? 'opacity-60' : ''}`}
                 value={llm ?? ''}
-                disabled={contentLocked || externalFramework}
+                disabled={externalFramework}
                 onChange={(e) => setLlm(e.target.value)}
               >
                 <option value="">Default model</option>
@@ -886,35 +864,6 @@ function AgentEditorPanel({
             </p>
           </div>
 
-          {/* ── identity (self-image) ── */}
-          <div>
-            <label className={fieldLabel}>
-              Identity{' '}
-              <span className="normal-case">
-                {identityPath
-                  ? `(${identityPath})`
-                  : agent === null
-                    ? '(seeded from a template)'
-                    : '(loading…)'}
-              </span>
-            </label>
-            <textarea
-              className={`${textInput} resize-y`}
-              rows={8}
-              value={identity}
-              disabled={agent === null || !filesLoaded}
-              onChange={(e) => {
-                setIdentity(e.target.value);
-                setIdentityDirty(true);
-              }}
-              placeholder="Who am I — name, creature, vibe, emoji, avatar…"
-            />
-            <p className="mt-1 text-xs text-muted">
-              How this agent sees itself. Per-agent, like the soul — only the workspace USER.md
-              (who you are) is shared across every agent.
-            </p>
-          </div>
-
           {/* ── skills (read-only, live from the registry, full width) ── */}
           <SkillsDisplay registered={registeredSkills} />
 
@@ -947,8 +896,7 @@ function AgentEditorPanel({
                 isMock ||
                 saving ||
                 uploadingAvatar ||
-                (agent === null && name.trim() === '') ||
-                (isBuiltin && !avatarChanged)
+                (agent === null && name.trim() === '')
               }
               onClick={() => void save()}
             >

@@ -159,7 +159,7 @@ async fn agents_api_round_trip() {
     let err = put_expect(
         &router,
         "/v1/agents/baybo",
-        json!({ "name": "baybo", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "baybo" }),
         StatusCode::BAD_REQUEST,
     )
     .await;
@@ -172,7 +172,40 @@ async fn agents_api_round_trip() {
             .contains("cannot be deleted")
     );
 
-    // …but its avatar is editable, and clearable.
+    // …but every field with a targeted endpoint is editable. What the lock
+    // protects is the row's claim to *be* default behaviour — its framework
+    // and description — not which model it runs on or what it calls itself.
+    put_expect(
+        &router,
+        "/v1/agents/baybo/model",
+        json!({ "llm": llm_entry }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(builtin["llm"].as_str(), Some(llm_entry.as_str()));
+    put_expect(
+        &router,
+        "/v1/agents/baybo/model",
+        json!({ "llm": null }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    put_expect(
+        &router,
+        "/v1/agents/baybo/name",
+        json!({ "name": "Aster" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(
+        builtin["name"].as_str(),
+        Some("Aster"),
+        "the builtin's name is the workspace IDENTITY.md, and it is editable",
+    );
+
     put_expect(
         &router,
         "/v1/agents/baybo/avatar",
@@ -333,8 +366,8 @@ async fn agents_api_round_trip() {
     .await;
     put_expect(
         &router,
-        &format!("/v1/agents/{agent_id}"),
-        json!({ "name": "Renamed", "description": "", "framework": "baybo" }),
+        &format!("/v1/agents/{agent_id}/name"),
+        json!({ "name": "Renamed" }),
         StatusCode::NO_CONTENT,
     )
     .await;
@@ -408,36 +441,40 @@ async fn agents_api_round_trip() {
     )
     .await;
 
-    // ── 5. PUT is a full replace: absent nullables reset to inherit ──
+    // ── 5. PUT is a full replace of what the row still owns ─────────
     put_expect(
         &router,
         &format!("/v1/agents/{agent_id}"),
-        json!({ "name": "Helper 2", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "baybo" }),
         StatusCode::NO_CONTENT,
     )
     .await;
     let replaced = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
-    assert_eq!(replaced["name"].as_str(), Some("Helper 2"));
     assert_eq!(replaced["framework"].as_str(), Some("baybo"));
-    assert!(
-        replaced.get("llm").is_none(),
-        "full replace must reset llm to inherit, got {replaced:?}",
-    );
+    // Three things the content PUT does NOT touch, each because it has its
+    // own targeted endpoint: the avatar, the LLM pin, and the name (which is
+    // not a row field at all).
     assert_eq!(
         replaced["avatar_blob_id"].as_str(),
         Some(png_blob.blob_id.as_str()),
-        "avatar is not touched by the content PUT",
+    );
+    assert_eq!(replaced["llm"].as_str(), Some(llm_entry.as_str()));
+    assert_eq!(
+        replaced["name"].as_str(),
+        Some(agent_id.as_str()),
+        "the file was left without a Name: line above, so it falls back to the id",
     );
 
-    // Renames conflict case-insensitively against other rows only: a
-    // case-only self-rename is fine, taking another profile's name 400s.
     put_expect(
         &router,
-        &format!("/v1/agents/{agent_id}"),
-        json!({ "name": "HELPER 2", "description": "", "framework": "baybo" }),
+        &format!("/v1/agents/{agent_id}/name"),
+        json!({ "name": "Helper 2" }),
         StatusCode::NO_CONTENT,
     )
     .await;
+    let named = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(named["name"].as_str(), Some("Helper 2"));
+
     let beta = post_expect(
         &router,
         "/v1/agents",
@@ -449,8 +486,8 @@ async fn agents_api_round_trip() {
     // A rename onto another agent's name is allowed — see above.
     put_expect(
         &router,
-        &format!("/v1/agents/{beta_id}"),
-        json!({ "name": "helper 2", "description": "", "framework": "baybo" }),
+        &format!("/v1/agents/{beta_id}/name"),
+        json!({ "name": "helper 2" }),
         StatusCode::NO_CONTENT,
     )
     .await;
@@ -466,7 +503,7 @@ async fn agents_api_round_trip() {
     put_expect(
         &router,
         "/v1/agents/missing",
-        json!({ "name": "x", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "baybo" }),
         StatusCode::NOT_FOUND,
     )
     .await;
@@ -495,9 +532,10 @@ fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
     baybo_gateway::server::AdminState {
-        workspace_paths: std::sync::Arc::new(baybo_workspace::WorkspacePaths::new(
-            std::env::temp_dir().join("baybo-test-workspace"),
-        )),
+        // Per-test workspace, from the same tempdir the deps were built
+        // with: the agents surface writes identity files under it, so a
+        // shared path would leak one test's persona into the next.
+        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),

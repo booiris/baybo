@@ -68,6 +68,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/agents/{agent_id}/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_model"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_name"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/agents/{agent_id}/soul": {
         parameters: {
             query?: never;
@@ -2261,6 +2293,15 @@ export interface components {
              */
             version?: string | null;
         };
+        /** @description Request body for `PUT /v1/agents/{agent_id}/model`. */
+        SetAgentModelRequest: {
+            /** @description `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`. */
+            llm?: string | null;
+        };
+        /** @description Request body for `PUT /v1/agents/{agent_id}/name`. */
+        SetAgentNameRequest: {
+            name: string;
+        };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -2457,8 +2498,6 @@ export interface components {
         UpdateAgentProfileRequest: {
             description: string;
             framework: components["schemas"]["AgentFrameworkDto"];
-            llm?: string | null;
-            name: string;
         };
         /**
          * @description `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
@@ -2930,6 +2969,110 @@ export interface operations {
             };
             /** @description The file changed since it was read */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentModelRequest"];
+            };
+        };
+        responses: {
+            /** @description LLM pin set (or cleared) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_name: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentNameRequest"];
+            };
+        };
+        responses: {
+            /** @description Name set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id or name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
