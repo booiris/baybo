@@ -55,6 +55,10 @@ export function AgentsPage() {
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [registeredSkills, setRegisteredSkills] = useState<SkillInfo[]>([]);
   const [llmNames, setLlmNames] = useState<string[]>([]);
+  // Which entry `default-llm` currently points at, so the unpinned option can
+  // name it instead of saying "Default model" and leaving the operator to go
+  // look it up.
+  const [defaultLlmName, setDefaultLlmName] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -75,6 +79,7 @@ export function AgentsPage() {
           { name: 'weekly-report', description: "Summarize the week's work into a report." },
         ]);
         setLlmNames(['primary', 'fast']);
+        setDefaultLlmName('primary');
         setLoading(false);
         setError(null);
         return;
@@ -103,6 +108,7 @@ export function AgentsPage() {
           (skillsRes.data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
         );
         setLlmNames((llmRes.data?.items ?? []).map((m) => m.name));
+        setDefaultLlmName(llmRes.data?.default_name ?? '');
         // A dead picker source must not masquerade as "nothing registered".
         const failed: string[] = [];
         if (skillsRes.error || !skillsRes.response.ok) failed.push('skills');
@@ -245,6 +251,7 @@ export function AgentsPage() {
             agent={null}
             registeredSkills={registeredSkills}
             llmNames={llmNames}
+            defaultLlmName={defaultLlmName}
             onSaved={(createdId) => {
               if (createdId) {
                 pendingSelectRef.current = createdId;
@@ -259,6 +266,7 @@ export function AgentsPage() {
             agent={selectedAgent}
             registeredSkills={registeredSkills}
             llmNames={llmNames}
+            defaultLlmName={defaultLlmName}
             onSaved={() => refresh()}
             onDelete={
               selectedAgent.builtin
@@ -445,12 +453,14 @@ function AgentEditorPanel({
   agent,
   registeredSkills,
   llmNames,
+  defaultLlmName,
   onSaved,
   onDelete,
 }: {
   agent: AgentProfile | null; // null = create
   registeredSkills: SkillInfo[];
   llmNames: string[];
+  defaultLlmName: string;
   /** Called after a successful save; carries the new id on create. */
   onSaved: (createdId?: string) => void;
   /** Present only for existing non-builtin agents; hands off to the confirm dialog. */
@@ -817,7 +827,14 @@ function AgentEditorPanel({
                 disabled={externalFramework}
                 onChange={(e) => setLlm(e.target.value)}
               >
-                <option value="">Default model</option>
+                {/* Not a model — the "don't pin one" choice. Naming the
+                    entry `default-llm` currently points at saves the operator
+                    a trip to the LLM page to find out what it resolves to. */}
+                <option value="">
+                  {defaultLlmName === ''
+                    ? 'Follow default'
+                    : `Follow default (${defaultLlmName})`}
+                </option>
                 {llmNames.map((n) => (
                   <option key={n} value={n}>
                     {n}
