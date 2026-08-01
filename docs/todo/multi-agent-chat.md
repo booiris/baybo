@@ -1,10 +1,10 @@
 # Multi-agent chat — one chat surface, many agents, each with its own soul, skills, and memory
 
-Design spec, 2026-07-30. **Phase 1 is built** (see [Phasing](#phasing) for
-what that covers and what it does not); Phase 2 is unstarted. Makes the
-runtime consume the `AgentProfile` entity
-([`../modules/agent-profiles.md`](../modules/agent-profiles.md), management-only
-today): a chat session is bound to one **agent** at creation, and that agent
+Design spec, 2026-07-30. **Phase 1 is built except the chat-side picker** —
+see [Phasing](#phasing) for exactly what remains; Phase 2 is unstarted. Makes
+the runtime consume the `AgentProfile` entity
+([`../modules/agent-profiles.md`](../modules/agent-profiles.md)): a chat
+session is bound to one **agent** at creation, and that agent
 brings its own soul, its own skill overlay, its own memory partition, its own
 LLM pin, and its own execution framework — including `claude` / `codex` running
 as the top-level chat agent.
@@ -509,28 +509,56 @@ cleanup of any kind.
 
 ## Phasing
 
-1. **Phase 1 — binding + baybo consumption.** *Built*: `sessions` columns and
-   the write-once binding, `POST /v1/chat/sessions { agent_id }` with
-   validation and persona materialization, the `personas/` layout, soul
-   assembly by path (with the deleted-profile and unreadable-file
-   fallbacks), the skill overlay and its scoped lookups, the memory partition
-   across both backends plus the removal of the `agentId` override, the
-   `…/soul` endpoints, and the Agents-page soul editor.
-   *Also built since*: the per-agent `IDENTITY.md`, the name living in it
-   rather than a column, conditional writes on the identity files, skills no
-   longer inherited by a custom agent, the agent-scoped `GET /v1/skills`, LLM
-   precedence through the shared `resolve_spawn_pins`, and agent inheritance
-   for subagent children and cron fires.
-   *Still open in Phase 1*: the web new-chat picker and session chip,
-   `SessionView` carrying the binding, and the agent-scoped slash-manifest.
-2. **Phase 1.5 (optional, small).** Authoring an overlay skill from the web:
-   `PUT /v1/agents/{id}/skills/{name}` writing one `SKILL.md` through the same
-   scoped-file seam as the soul endpoint, then `reload()`. Closes the "owner has
-   no shell" gap without taking on multi-file skill upload.
-3. **Phase 2 — external chat leg.** Turn dispatch through
-   `ExternalAgent::run()`, `external_resume_key`, working-dir materialization,
-   turn wrap, memory at the turn seam, creation gate on backend enablement,
-   model-switch UI hiding.
+**Phase 1 — binding + baybo consumption. Built**, except the web entry point
+below: `sessions` columns and the write-once binding; `POST /v1/chat/sessions
+{ agent_id }` with validation and persona materialization; the `personas/`
+layout carrying each agent's `SOUL.md`, `IDENTITY.md` and `skills/`; soul and
+self-image assembled by path, with the deleted-profile and unreadable-file
+fallbacks; the display name living in `IDENTITY.md` rather than a column;
+conditional (compare-and-set) writes on both identity files; a custom agent no
+longer inheriting the workspace's skills; the memory partition across both
+backends plus the removal of the `agentId` override; LLM precedence through
+the shared `resolve_spawn_pins`; agent inheritance for subagent children and
+cron fires; the `…/soul`, `…/identity`, `…/name`, `…/model` endpoints and the
+agent-scoped `GET /v1/skills`; and the Agents page rebuilt around all of it.
+
+### Still to do: the chat-side entry point
+
+Everything above is reachable over REST. What is missing is the affordance the
+feature is named for — **picking an agent when you start a conversation** — so
+today the web new-chat button still mints a built-in session.
+
+- **New-chat picker** (`app/web/src/pages/ChatPage.tsx`). Avatar cards from
+  `GET /v1/agents`, built-in first and **preselected**, so Enter keeps today's
+  one-keystroke new-chat flow. The chosen id rides `POST /v1/chat/sessions
+  { agent_id }`, which already validates it. Agents whose external backend is
+  disabled render greyed with the reason (Phase 2 makes those creatable at
+  all; until then creation 400s on a non-baybo framework).
+- **Session chip** — the conversation header and sidebar row show the agent's
+  avatar and name for non-built-in sessions. Name and avatar come from the
+  cached `GET /v1/agents` roster, so a stale one after a profile edit is a
+  refetch, not a live push (there is deliberately no WS frame for profiles).
+- **`SessionView` carries `agent_id` / `agent_framework`** so a client renders
+  that chip without a join. Standard openapi + `check-ts-bindings.sh` regen.
+- **Agent-scoped slash completion.** `GET /v1/chat/slash-manifest` is fetched
+  **once at chat bootstrap** and is session-independent, so it currently
+  advertises the shared set to every conversation. It needs `?agent_id=` plus
+  a refetch on conversation switch (cache per agent client-side). Until then a
+  custom agent's private `/command` still *expands* when typed — expansion is
+  scoped through `ContextManager` — it is only invisible in the completion
+  menu. `GET /v1/skills?agent_id=` is the model for the query param.
+
+Channels and TUI stay untouched: they create unbound sessions, which read as
+the built-in, so their process-global slash menu is already correct.
+
+**Phase 1.5 (optional, small).** Authoring an overlay skill from the web:
+`PUT /v1/agents/{id}/skills/{name}` writing one `SKILL.md` through the same
+scoped-file seam as the soul endpoint, then `reload()`. Closes the "owner has
+no shell" gap without taking on multi-file skill upload.
+
+**Phase 2 — external chat leg.** Turn dispatch through `ExternalAgent::run()`,
+`external_resume_key`, working-dir materialization, turn wrap, memory at the
+turn seam, creation gate on backend enablement, model-switch UI hiding.
 
 ## Deferred
 
