@@ -158,10 +158,6 @@ the built-in is simply the directory named `baybo`, which is what makes "the
 assistant you already have" an honest roster entry rather than a special case.
 It keeps no skill overlay, because the shared `skills/` set *is* its set.
 
-A workspace created before this had a `profile/` holding the single
-assistant's three files; `ensure_layout` carries it across once, copying
-rather than moving so the audit history stays readable.
-
 Three new `WorkspacePaths` methods carry that rule so no call site branches:
 
 ```rust

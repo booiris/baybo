@@ -105,11 +105,6 @@ The stable facts the operator curates live in `personas/USER.md`, which every
 agent reads as a separate `<shared_user_profile>` section alongside its own
 `<user_notes>`.
 
-A workspace created before this layout is carried across once at
-`ensure_layout`: the old `profile/{SOUL,IDENTITY}.md` become the built-in's,
-`profile/USER.md` becomes the shared profile, and `profile/` is **copied, not
-moved**, so its git audit history stays readable.
-
 The built-in profile has no `personas/` directory at all — its pair *is*
 `profile/{SOUL,IDENTITY}.md`, so an unbound session and a built-in-bound one
 assemble byte-identical prompts. `load_identity_files` therefore takes an

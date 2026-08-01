@@ -20,7 +20,6 @@ impl WorkspaceManager {
     /// safe to call on every boot.
     pub async fn ensure_layout(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
-        migrate_profile_into_personas(&paths).await?;
         for dir in [
             paths.config_dir(),
             paths.skills_dir(),
@@ -123,57 +122,6 @@ impl WorkspaceManager {
     }
 }
 
-/// One-time move of a pre-personas `profile/` into the persona layout.
-///
-/// `profile/` held the single assistant's three identity files back when
-/// there was one assistant. `SOUL.md` and `IDENTITY.md` are that assistant's
-/// — they become the built-in's, at `personas/baybo/`. `USER.md` is about
-/// the human, so it becomes the *shared* `personas/USER.md` that every agent
-/// reads; the built-in starts its own private notes fresh beside the others.
-///
-/// **Copies, never moves.** `profile/` is left where it is, `.git` history
-/// and all, so the five weeks of `Baybo <baybo@local>` audit commits stay
-/// readable and nothing is destroyed if this reading of the old layout turns
-/// out to be wrong. A file already present at the destination is never
-/// overwritten, which is also what makes the pass a no-op on every later
-/// boot.
-async fn migrate_profile_into_personas(paths: &WorkspacePaths) -> anyhow::Result<()> {
-    let legacy = paths.root().join("profile");
-    if !tokio::fs::try_exists(&legacy).await.unwrap_or(false) {
-        return Ok(());
-    }
-    let builtin = crate::paths::BUILTIN_PERSONA_DIR;
-    let moves = [
-        (
-            IdentityKind::Soul,
-            paths.persona_identity_file(builtin, IdentityKind::Soul),
-        ),
-        (
-            IdentityKind::Identity,
-            paths.persona_identity_file(builtin, IdentityKind::Identity),
-        ),
-        // The human's profile is nobody's private notes.
-        (IdentityKind::User, paths.shared_user_file()),
-    ];
-    for (kind, target) in moves {
-        let source = legacy.join(kind.file_name());
-        if !tokio::fs::try_exists(&source).await.unwrap_or(false)
-            || tokio::fs::try_exists(&target).await.unwrap_or(false)
-        {
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::copy(&source, &target).await.map_err(|e| {
-            anyhow::anyhow!("migrate {} to {}: {e}", source.display(), target.display())
-        })?;
-        // No `tracing` in this leaf crate; the copy is idempotent and the
-        // source stays put, so a silent success is safe to re-observe.
-    }
-    Ok(())
-}
-
 /// Initialise a standalone git repository inside `dir` if one isn't
 /// already there. Idempotent — a no-op when `<dir>/.git` exists.
 ///
@@ -223,64 +171,6 @@ mod tests {
         // process should have permission to create it.
         let mgr = WorkspaceManager::new(PathBuf::from("/nonexistent/path"));
         assert!(mgr.load_identity_files().await.is_err());
-    }
-
-    /// A workspace from before personas keeps working: its assistant's soul
-    /// and self-image become the built-in's, and its notes about the human
-    /// become the shared profile every agent reads. Nothing is moved.
-    #[tokio::test]
-    async fn a_pre_personas_workspace_is_carried_across() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().to_path_buf();
-        let legacy = dir.join("profile");
-        tokio::fs::create_dir_all(&legacy).await.unwrap();
-        for (kind, body) in [
-            (IdentityKind::Soul, "OLD_SOUL"),
-            (IdentityKind::Identity, "OLD_IDENTITY"),
-            (IdentityKind::User, "OLD_USER"),
-        ] {
-            tokio::fs::write(legacy.join(kind.file_name()), body)
-                .await
-                .unwrap();
-        }
-
-        WorkspaceManager::new(dir.clone())
-            .ensure_layout()
-            .await
-            .expect("layout");
-        let paths = WorkspacePaths::new(dir.clone());
-        let read = async |p: PathBuf| tokio::fs::read_to_string(p).await.unwrap();
-
-        let builtin = crate::paths::BUILTIN_PERSONA_DIR;
-        assert_eq!(
-            read(paths.persona_identity_file(builtin, IdentityKind::Soul)).await,
-            "OLD_SOUL"
-        );
-        assert_eq!(
-            read(paths.persona_identity_file(builtin, IdentityKind::Identity)).await,
-            "OLD_IDENTITY"
-        );
-        // The human's profile becomes the shared one, not the built-in's
-        // private notes.
-        assert_eq!(read(paths.shared_user_file()).await, "OLD_USER");
-        assert!(
-            !paths
-                .persona_identity_file(builtin, IdentityKind::User)
-                .exists(),
-            "the built-in starts its private notes fresh"
-        );
-        // Copied, not moved: the old repo and its audit history stay.
-        assert!(legacy.join("SOUL.md").exists());
-
-        // Idempotent, and never overwrites what is already there.
-        tokio::fs::write(paths.shared_user_file(), "EDITED")
-            .await
-            .unwrap();
-        WorkspaceManager::new(dir.clone())
-            .ensure_layout()
-            .await
-            .expect("layout again");
-        assert_eq!(read(paths.shared_user_file()).await, "EDITED");
     }
 
     #[tokio::test]
