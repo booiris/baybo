@@ -10,8 +10,7 @@ pub mod validation;
 pub use gate::{AlwaysPass, SkillGate, SkillRiskCheck};
 pub use linked_files::LinkedFiles;
 pub use registry::{
-    SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillSummary, SkillValidation,
-    UNIVERSAL_SKILLS,
+    SkillIssue, SkillIssueKind, SkillRegistry, SkillSummary, SkillValidation, UNIVERSAL_SKILLS,
 };
 pub use tools::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, build as build_skill_tool, render_skill_body,

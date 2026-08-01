@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::identity::{self, IdentityFiles};
+use crate::identity;
 use crate::paths::{IdentityKind, WorkspacePaths};
 
 /// Manages the workspace root directory and its identity/configuration files.
@@ -97,35 +97,6 @@ impl WorkspaceManager {
         }
         Ok(())
     }
-
-    /// Loads the built-in agent's identity files. Any missing one is
-    /// atomically seeded with its default template (see
-    /// [`identity::load_identity_files`]), so the returned [`IdentityFiles`]
-    /// is always fully populated; its directory is created on demand.
-    pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
-        let paths = WorkspacePaths::new(self.root.clone());
-        let (soul, identity, user) = identity::builtin_identity_paths(&paths);
-        identity::load_identity_files(
-            &self.root,
-            identity::IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
-            identity::IdentitySource::new(&identity, IdentityKind::Identity.default_content()),
-            identity::IdentitySource::new(&user, IdentityKind::User.default_content()),
-        )
-        .await
-    }
-
-    /// Atomically write one of the built-in agent's identity documents.
-    ///
-    /// Overwrites the previous copy. Returns the absolute path that was
-    /// written. The new content is not picked up by any already-loaded
-    /// `Soul` / agent context until the process is restarted.
-    pub async fn write_identity_file(
-        &self,
-        kind: IdentityKind,
-        content: &str,
-    ) -> anyhow::Result<PathBuf> {
-        identity::write_identity_file(&self.root, kind, content).await
-    }
 }
 
 /// Initialise a standalone git repository inside `dir` if one isn't
@@ -168,15 +139,12 @@ async fn ensure_git_repo(_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn load_identity_files_errors_when_root_is_unwritable() {
-        // Auto-seed needs to create the profile dir; if the root path
-        // can't be created (e.g. unwritable parent), the call must
-        // surface the error rather than silently returning empty
-        // content. `/nonexistent/path` is chosen because no test
-        // process should have permission to create it.
-        let mgr = WorkspaceManager::new(PathBuf::from("/nonexistent/path"));
-        assert!(mgr.load_identity_files().await.is_err());
+    async fn read_builtin(root: &Path, kind: IdentityKind) -> String {
+        let path = WorkspacePaths::new(root.to_path_buf())
+            .persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
+        tokio::fs::read_to_string(&path)
+            .await
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     #[tokio::test]
@@ -250,10 +218,15 @@ mod tests {
         mgr.ensure_layout().await.expect("layout");
         mgr.seed_default_identity_files().await.expect("seed");
 
-        let loaded = mgr.load_identity_files().await.expect("load");
-        assert_eq!(loaded.soul, IdentityKind::Soul.default_content());
-        assert_eq!(loaded.user, IdentityKind::User.default_content());
-        assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
+        for kind in IdentityKind::all() {
+            assert_eq!(read_builtin(&dir, kind).await, kind.default_content());
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(WorkspacePaths::new(dir).shared_user_file())
+                .await
+                .expect("shared USER.md"),
+            IdentityKind::User.default_content(),
+        );
     }
 
     #[tokio::test]
@@ -266,15 +239,19 @@ mod tests {
         mgr.seed_default_identity_files().await.expect("first seed");
 
         const CUSTOM: &str = "# Soul\n\nHand-edited by the operator.\n";
-        mgr.write_identity_file(IdentityKind::Soul, CUSTOM)
+        let soul = WorkspacePaths::new(dir.clone())
+            .persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, IdentityKind::Soul);
+        tokio::fs::write(&soul, CUSTOM)
             .await
             .expect("operator edit");
 
         // A second seed must keep the operator edit intact and leave
         // the rest of the defaults alone.
         mgr.seed_default_identity_files().await.expect("re-seed");
-        let loaded = mgr.load_identity_files().await.expect("load");
-        assert_eq!(loaded.soul, CUSTOM);
-        assert_eq!(loaded.identity, IdentityKind::Identity.default_content());
+        assert_eq!(read_builtin(&dir, IdentityKind::Soul).await, CUSTOM);
+        assert_eq!(
+            read_builtin(&dir, IdentityKind::Identity).await,
+            IdentityKind::Identity.default_content(),
+        );
     }
 }

@@ -11,13 +11,6 @@ use crate::SkillDefinition;
 use crate::loader::load_skill_from_dir;
 use crate::validation::{validate_skill_name, validate_skill_version};
 
-/// A matched skill with its relevance score.
-#[derive(Debug, Clone)]
-pub struct SkillCandidate {
-    pub skill: SkillDefinition,
-    pub score: f64,
-}
-
 /// Lightweight projection over a [`SkillDefinition`] for callers that
 /// only need to display, list, or dispatch by name — agent loop's
 /// per-turn skill reminder and slash-command detector being the
@@ -224,7 +217,30 @@ impl SkillRegistry {
         self.skills.len()
     }
 
-    /// Load one agent's private overlay from `dir`
+    /// Load `agent`'s private overlay if this process has not already, and
+    /// report how many skills the scan registered.
+    ///
+    /// This is the only way the overlay is ever populated, so every reader of
+    /// an agent's scope — the actor build, the agents API — must call it
+    /// first. The built-in has no overlay (its skills *are* the shared set),
+    /// and a second call for the same agent is a no-op rather than a rescan:
+    /// picking up on-disk edits is `reload`'s job, which replays these scans
+    /// alongside the shared ones.
+    pub fn ensure_agent_overlay(
+        &self,
+        agent: &AgentProfileId,
+        paths: &baybo_workspace::WorkspacePaths,
+    ) -> usize {
+        let Some(dir) = agent.skills_overlay_dir(paths) else {
+            return 0;
+        };
+        if self.agent_dir_loaded(agent) {
+            return 0;
+        }
+        self.load_agent_dir(agent, &dir)
+    }
+
+    /// Scan one agent's overlay from `dir`
     /// (`<workspace>/personas/<id>/skills/`), remembering it so `reload` can
     /// replay the scan. Same on-disk shape and same governance as the shared
     /// tree — persona folders are workspace content, so their skills are
@@ -232,7 +248,7 @@ impl SkillRegistry {
     ///
     /// A missing directory is not an error: an agent with no private skills
     /// simply sees the shared set.
-    pub fn load_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+    fn load_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
         {
             let mut dirs = self.agent_dirs.write();
             if !dirs.iter().any(|(a, d)| a == agent && d == dir) {
@@ -242,10 +258,8 @@ impl SkillRegistry {
         self.scan_agent_dir(agent, dir)
     }
 
-    /// Whether this agent's overlay has already been scanned in this
-    /// process. The actor-build path uses it to load one agent's folder on a
-    /// cold start without paying for a global `reload`.
-    pub fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
+    /// Whether this agent's overlay has already been scanned in this process.
+    fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
         self.agent_dirs.read().iter().any(|(a, _)| a == agent)
     }
 
@@ -343,11 +357,6 @@ impl SkillRegistry {
         out
     }
 
-    /// Remove a skill by name.
-    pub fn remove(&self, name: &str) -> Option<SkillDefinition> {
-        self.skills.remove(name).map(|(_, v)| v)
-    }
-
     /// Look up a skill by name, returning a cloned definition.
     pub fn get(&self, name: &str) -> Option<SkillDefinition> {
         self.skills.get(name).map(|e| e.value().clone())
@@ -435,45 +444,6 @@ impl SkillRegistry {
     /// Validate a single skill by name.
     pub fn validate(&self, name: &str) -> Option<SkillValidation> {
         self.skills.get(name).map(|e| validate_one(e.value()))
-    }
-
-    /// Select skills for a given user message.
-    ///
-    /// Two cases:
-    /// 1. The trimmed message equals `/<cmd>` exactly — return only that
-    ///    skill, so an explicit slash invocation narrows context to the
-    ///    one the user asked for.
-    /// 2. Otherwise — return every registered skill, leaving the choice
-    ///    to the downstream risk assessor and the model. No ranking,
-    ///    mention scanning, or description match happens here; `score`
-    ///    is always `1.0` and kept in the type for the caller to weight
-    ///    if it ever needs to.
-    ///
-    /// Selection reads no prompt bodies, so a loaded skill can never
-    /// bias which skill loads next.
-    pub fn select(&self, message_text: &str) -> Vec<SkillCandidate> {
-        let trimmed = message_text.trim_start();
-        let mut candidates: Vec<SkillCandidate> = Vec::new();
-        for entry in self.skills.iter() {
-            let skill = entry.value();
-            let command_hit = skill.command.as_ref().is_some_and(|cmd| {
-                let full = format!("/{cmd}");
-                trimmed == full
-            });
-            if command_hit {
-                return vec![SkillCandidate {
-                    skill: skill.clone(),
-                    score: 1.0,
-                }];
-            }
-
-            candidates.push(SkillCandidate {
-                skill: skill.clone(),
-                score: 1.0,
-            });
-        }
-
-        candidates
     }
 }
 
@@ -722,50 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn select_exact_slash_command_returns_only_that_skill() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("greet", "say hi"));
-        reg.register(mk("deploy", "ship it"));
-        let hits = reg.select("/greet");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].skill.name, "greet");
-        assert_eq!(hits[0].score, 1.0);
-    }
-
-    #[test]
-    fn select_slash_with_args_returns_full_set() {
-        // `/<cmd> <args>` is not an exact match, so we fall through to
-        // the "return everything" branch instead of narrowing.
-        let reg = SkillRegistry::new();
-        reg.register(mk("fix-issue", "fix a GitHub issue"));
-        reg.register(mk("other", "some other skill"));
-        let hits = reg.select("/fix-issue 123");
-        assert_eq!(hits.len(), 2);
-    }
-
-    #[test]
-    fn select_non_slash_message_returns_all_registered_skills() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("explain", "explain code"));
-        reg.register(mk("summarise", "condense text"));
-        let hits = reg.select("how does this work?");
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|c| c.score == 1.0));
-    }
-
-    #[test]
-    fn select_does_not_command_match_on_substring() {
-        // `/greetings everyone` doesn't exactly equal `/greet`, so
-        // `greet` is returned as part of the full-set fall-through
-        // rather than as an exclusive slash-command hit.
-        let reg = SkillRegistry::new();
-        reg.register(mk("greet", "say hi"));
-        let hits = reg.select("/greetings everyone");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].skill.name, "greet");
-    }
-
-    #[test]
     fn load_dir_reads_skill_md_per_subdirectory() {
         let dir =
             std::env::temp_dir().join(format!("baybo-skills-load-dir-{}", std::process::id()));
@@ -805,15 +731,6 @@ mod tests {
         let reg = SkillRegistry::new();
         let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/baybo-skills"));
         assert_eq!(loaded, 0);
-    }
-
-    #[test]
-    fn remove_drops_registered_skill() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("s", "something"));
-        assert!(reg.get("s").is_some());
-        reg.remove("s");
-        assert!(reg.get("s").is_none());
     }
 
     #[test]
@@ -902,7 +819,10 @@ mod tests {
             line!()
         ));
         let shared = dir.join("shared");
-        let overlay = dir.join("persona-a");
+        let paths = baybo_workspace::WorkspacePaths::new(dir.clone());
+        let agent_a = AgentProfileId::parse("01JAGENTA").unwrap();
+        let agent_b = AgentProfileId::parse("01JAGENTB").unwrap();
+        let overlay = paths.persona_skills_dir(&agent_a.to_string());
         let _ = std::fs::remove_dir_all(&dir);
         for (root, desc) in [(&shared, "shared version"), (&overlay, "agent version")] {
             let sub = root.join("deploy");
@@ -924,9 +844,19 @@ mod tests {
 
         let reg = SkillRegistry::new();
         reg.load_dir(&shared);
-        let agent_a = AgentProfileId::parse("01JAGENTA").unwrap();
-        let agent_b = AgentProfileId::parse("01JAGENTB").unwrap();
-        assert_eq!(reg.load_agent_dir(&agent_a, &overlay), 2);
+        // Through the production seam: it derives the overlay path from the
+        // id, so a call site that only has a session's agent is enough.
+        assert_eq!(reg.ensure_agent_overlay(&agent_a, &paths), 2);
+        assert_eq!(
+            reg.ensure_agent_overlay(&agent_a, &paths),
+            0,
+            "a second call must not rescan"
+        );
+        assert_eq!(
+            reg.ensure_agent_overlay(&AgentProfileId::builtin(), &paths),
+            0,
+            "the built-in has no overlay — its skills are the shared set"
+        );
 
         // The overlay wins for its own agent…
         assert_eq!(
@@ -1021,13 +951,8 @@ mod tests {
     fn a_missing_agent_overlay_is_empty_not_an_error() {
         let reg = SkillRegistry::new();
         let agent = AgentProfileId::parse("01JNOWHERE").unwrap();
-        assert_eq!(
-            reg.load_agent_dir(
-                &agent,
-                std::path::Path::new("/nonexistent/personas/x/skills")
-            ),
-            0
-        );
+        let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/nonexistent"));
+        assert_eq!(reg.ensure_agent_overlay(&agent, &paths), 0);
         assert!(reg.summaries_for(Some(&agent)).is_empty());
     }
 }

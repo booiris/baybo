@@ -62,6 +62,11 @@ async fn list_skills(
         .as_deref()
         .map(crate::api::admin::agents::parse_agent_id)
         .transpose()?;
+    if let Some(agent) = agent.as_ref() {
+        state
+            .skill_registry
+            .ensure_agent_overlay(agent, &state.workspace_paths);
+    }
     let items = state
         .skill_registry
         .summaries_for(agent.as_ref())

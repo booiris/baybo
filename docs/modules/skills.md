@@ -107,9 +107,20 @@ session-scoped read goes through the scoped pair:
   agent, its overlay ∪ `UNIVERSAL_SKILLS`, **overlay winning a name
   collision**; sorted by name so ordering is stable across turns. `ContextManager` routes the per-turn listing, the
   post-compaction trailer, and slash candidates through it.
-- `load_agent_dir(agent, dir)` / `agent_dir_loaded(agent)` — the actor-build
-  path loads one agent's folder on a cold start; `reload()` replays overlays
-  after builtins and the shared dirs.
+- `ensure_agent_overlay(agent, paths)` — **the only thing that fills that
+  map**, so every reader of an agent's scope calls it first: the actor build
+  (`runtime.rs`, on the cold spawn of a bound session) and `GET /v1/skills`
+  when the query names an agent. It derives `personas/<id>/skills/` from the
+  id, so a call site holding only a session's agent needs nothing else;
+  the built-in and an already-scanned agent are both no-ops. `reload()`
+  replays overlays after builtins and the shared dirs.
+
+Loading is lazy rather than part of boot because the set of agents is DB
+state: `ensure_layout` cannot enumerate persona folders to scan, and a scan at
+profile-creation time would miss every agent that already existed. The cost of
+getting this wrong is silent — an unloaded overlay is indistinguishable from an
+empty one, and the agent simply has no skills — so the seam is one function
+with no separate "is it loaded" question for a caller to forget.
 
 A name that exists only in another agent's overlay — or in a shared set this
 agent does not inherit — simply misses, so the `Skill` tool answers "unknown
@@ -163,13 +174,10 @@ tool call this deliberately skips the risk assessor — an explicit user
 slash command is treated as authorized. Sub-file fetches the model
 issues afterwards still go through the gated `Skill` tool.
 
-`SkillRegistry::select` still exists with the same two cases (exact
-`/<cmd>` narrows to one; anything else returns the full set) but
-currently has no production callers — slash matching goes through
-`detect_slash_invocation` in `baybo-context` and the per-turn list
-through `all_summaries_sorted`. `score` on every returned
-`SkillCandidate` is `1.0`; the method and field are kept for future
-ranking work.
+Slash matching goes through `detect_slash_invocation` in `baybo-context`
+and the per-turn list through `all_summaries_sorted`. There is no ranking
+stage: no registry method scores or filters by relevance, and none is
+declared in anticipation of one.
 
 Downstream gating happens lazily, on call:
 

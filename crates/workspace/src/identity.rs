@@ -47,28 +47,6 @@ async fn read_or_seed(path: &Path, default: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Write one of the **built-in** agent's identity files atomically
-/// (tmpfile + rename).
-///
-/// Creates `personas/baybo/` if it does not already exist.
-/// Returns the absolute path the content was written to. The previous
-/// version, if any, is replaced.
-pub async fn write_identity_file(
-    root: &Path,
-    kind: IdentityKind,
-    content: &str,
-) -> anyhow::Result<PathBuf> {
-    let paths = WorkspacePaths::new(root.to_path_buf());
-    let target = paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = target.with_extension("md.tmp");
-    tokio::fs::write(&tmp, content).await?;
-    tokio::fs::rename(&tmp, &target).await?;
-    Ok(target)
-}
-
 /// Where one identity section is read from, and what to create it with if
 /// it is absent.
 ///
@@ -299,31 +277,6 @@ mod tests {
         )
         .await
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn write_identity_file_creates_dir_and_round_trips() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test_tmp")
-            .join("identity_write_test");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-
-        let path = write_identity_file(&dir, IdentityKind::Soul, "You are helpful.")
-            .await
-            .expect("write soul");
-        assert_eq!(path, dir.join("personas").join("baybo").join("SOUL.md"));
-
-        let loaded = load_workspace(&dir).await;
-        assert_eq!(loaded.soul, "You are helpful.");
-
-        write_identity_file(&dir, IdentityKind::Soul, "You are concise.")
-            .await
-            .expect("overwrite soul");
-        let loaded = load_workspace(&dir).await;
-        assert_eq!(loaded.soul, "You are concise.");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
