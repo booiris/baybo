@@ -41,15 +41,14 @@ const TAIL_HINT: &str = r#"Tool results and user messages may include <system-re
 /// files via the auto-seeding `load_identity_files`, so a deleted file is
 /// recreated rather than left half-formed.
 ///
-/// All three sources belong to the agent: a session bound to a custom agent
-/// reads `personas/<id>/{SOUL,IDENTITY,USER}.md`, everything else reads the
-/// workspace trio under `profile/`. Each carries what to create that file
-/// with if it does not exist yet.
+/// All three sources belong to the agent, which reads
+/// `personas/<id>/{SOUL,IDENTITY,USER}.md` — the built-in included, at
+/// `personas/baybo/`. Each carries what to create that file with if it does
+/// not exist yet.
 ///
-/// `user_notes` is the agent's *own* record of the human — the built-in's
-/// included, at `personas/baybo/USER.md`. The stable facts the operator
-/// curates live in the shared `profile/USER.md`, which belongs to no agent
-/// and is always emitted as its own `<shared_user_profile>` section.
+/// `user_notes` is the agent's *own* record of the human. The stable facts the
+/// operator curates live in the shared `personas/USER.md`, which belongs to no
+/// agent and is always emitted as its own `<shared_user_profile>` section.
 pub async fn assemble(
     paths: &WorkspacePaths,
     soul: IdentitySource<'_>,

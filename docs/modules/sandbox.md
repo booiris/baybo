@@ -314,7 +314,7 @@ Default Bash denylist (built by
 - `$BAYBO_HOME` (or `~/.baybo` if unset) — Baybo's own state, secrets,
   identity files. The whole tree is masked, then `skills/` alone is
   re-exposed read-only via `with_readable_paths` (above) so skill
-  scripts run in place; `config/`, `state/`, `profile/`, `.key/`, etc.
+  scripts run in place; `config/`, `state/`, `personas/`, `.key/`, etc.
   stay hidden.
 
 Trade-offs:

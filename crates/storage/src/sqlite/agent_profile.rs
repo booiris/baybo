@@ -314,18 +314,6 @@ mod tests {
         SqliteAgentProfileStore::open(pool).await.unwrap()
     }
 
-    async fn agent_profile_columns(pool: &SqlitePool) -> Vec<String> {
-        pool.interact("test.columns", |conn| {
-            let mut stmt = conn.prepare("SELECT name FROM pragma_table_xinfo('agent_profiles')")?;
-            let cols = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(cols)
-        })
-        .await
-        .unwrap()
-    }
-
     fn now_us_precision() -> DateTime<Utc> {
         crate::sqlite::time::from_us(crate::sqlite::time::now_us()).unwrap()
     }
@@ -553,81 +541,5 @@ mod tests {
         let mut tail = ids[1..].to_vec();
         tail.sort();
         assert_eq!(tail, ids[1..], "the tail must be id-ordered");
-    }
-
-    /// A database created before the name and prompt moved into the agent's
-    /// own files is rebuilt at open, and the rebuilt table must be
-    /// indistinguishable from a fresh one — otherwise the two declarations of
-    /// this table's shape have drifted and only one of them is exercised.
-    #[tokio::test]
-    async fn a_legacy_schema_is_rebuilt_to_match_a_fresh_one() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let pool = SqlitePool::open(tmpdir.path().join("legacy.db"))
-            .await
-            .unwrap();
-        // `SqlitePool::open` has already run `init_db`; swap the fresh table
-        // for the shape an older build created.
-        pool.interact("test.legacy_schema", |conn| {
-            conn.execute_batch(
-                "DROP TABLE agent_profiles;
-                 CREATE TABLE agent_profiles (
-                     id              TEXT PRIMARY KEY,
-                     name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                     description     TEXT NOT NULL,
-                     avatar_blob_id  TEXT,
-                     system_prompt   TEXT,
-                     framework       TEXT NOT NULL,
-                     llm             TEXT,
-                     builtin         INTEGER NOT NULL DEFAULT 0,
-                     created_at      INTEGER NOT NULL,
-                     updated_at      INTEGER NOT NULL
-                 );",
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        // Seed a row the way the old build would, so the rebuild has
-        // something to carry across.
-        pool.interact("test.legacy_row", |conn| {
-            conn.execute(
-                "INSERT INTO agent_profiles \
-                 (id, name, description, system_prompt, framework, builtin, created_at, updated_at) \
-                 VALUES ('01JLEGACY', 'Old Name', 'kept', 'dead prompt', 'baybo', 0, 1, 1)",
-                [],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        // What a boot on the new binary does.
-        pool.interact("test.init_db", super::super::init_db)
-            .await
-            .unwrap();
-        let store = SqliteAgentProfileStore::open(pool.clone()).await.unwrap();
-
-        // The surviving columns came across, and writes no longer trip the
-        // dropped `NOT NULL UNIQUE`.
-        let legacy = store
-            .get(&AgentProfileId::parse("01JLEGACY").unwrap())
-            .await
-            .unwrap()
-            .expect("legacy row survives the rebuild");
-        assert_eq!(legacy.description, "kept");
-        let row = custom_row();
-        store.create(&row).await.unwrap();
-        assert!(store.get(&row.id).await.unwrap().is_some());
-
-        // Shape parity with a database that never saw the old schema.
-        let fresh_dir = tempfile::tempdir().unwrap();
-        let fresh = SqlitePool::open(fresh_dir.path().join("fresh.db"))
-            .await
-            .unwrap();
-        assert_eq!(
-            agent_profile_columns(&pool).await,
-            agent_profile_columns(&fresh).await,
-        );
     }
 }

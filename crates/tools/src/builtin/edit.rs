@@ -195,7 +195,7 @@ impl Tool for EditTool {
         };
         let path = PathBuf::from(s);
         // Bypass the approval gate for edits inside the workspace's
-        // managed roots: identity files under `profile/` (audit trail
+        // managed roots: identity files under `personas/` (audit trail
         // is the per-edit git commit, not a user prompt), and any path
         // under `work/` or `skills/` (agent scratch / managed skill
         // content). Anything else still goes through the gate.
@@ -296,7 +296,7 @@ impl Tool for EditTool {
 
 /// The identity files an agent owns — all three, `USER.md` included: those
 /// are its own notes about the human, distinct from the shared
-/// `profile/USER.md` every agent reads.
+/// `personas/USER.md` every agent reads.
 const PERSONA_IDENTITY_KINDS: [IdentityKind; 3] = [
     IdentityKind::Soul,
     IdentityKind::Identity,
@@ -690,9 +690,10 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "A B c");
     }
 
-    /// A custom agent's soul lives under `personas/<id>/`, not `profile/`.
-    /// The self-edit the system prompt instructs must get the same treatment
-    /// there — no approval prompt, and an audit commit — or the instruction
+    /// Every agent's soul lives under its own `personas/<id>/`, the built-in
+    /// included. The self-edit the system prompt instructs must get the same
+    /// treatment for each — no approval prompt, and an audit commit — or the
+    /// instruction
     /// is only honest for the built-in agent.
     async fn make_persona_workspace(agent_id: &str) -> (tempfile::TempDir, WorkspacePaths) {
         let tmp = tempfile::tempdir().expect("tempdir");

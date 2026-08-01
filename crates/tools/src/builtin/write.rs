@@ -76,7 +76,7 @@ impl Tool for WriteTool {
         let path = PathBuf::from(s);
         // Writes targeting `<workspace>/work` skip the approval gate to
         // match Bash's bypass for non-destructive ops inside `work/`.
-        // Everything else (profile/, config/, $HOME, /tmp, …) keeps
+        // Everything else (personas/, config/, $HOME, /tmp, …) keeps
         // the prompt as a backstop.
         if self.is_inside_work_dir(&path) {
             return Vec::new();

@@ -4802,7 +4802,7 @@
           },
           "path": {
             "type": "string",
-            "description": "Absolute path this content came from — the agent's own\n`personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for\nthe built-in. Surfaced so an operator knows what to edit and what to\ncommit; both live inside a git repo."
+            "description": "Absolute path this content came from — the agent's own\n`personas/<id>/<FILE>.md`. Surfaced so an operator knows what to edit\nand what to commit; it lives inside a git repo."
           },
           "version": {
             "type": "string",

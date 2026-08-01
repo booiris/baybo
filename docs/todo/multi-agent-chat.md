@@ -25,7 +25,7 @@ edits are concurrent, so the row belongs in sqlite next to `sessions` and
 `cron_jobs`. A soul is multi-KB markdown that **the agent itself rewrites** —
 the system prompt names each identity file's absolute path and the framing tells
 the model to `Edit` it (`TOP_HINT` in `crates/context/src/prompts/soul.rs`) — so
-it belongs in a git repo next to `profile/`, `skills/`, and `agents/`. A soul in
+it belongs in a git repo next to `config/`, `skills/`, and `agents/`. A soul in
 a DB column would make that instruction a lie for every custom agent.
 
 **What an agent is NOT.** Not a `SubagentProfile` (`<workspace>/agents/<name>.md`
@@ -43,7 +43,7 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 - **Persona**: each agent owns all three identity files —  `SOUL.md`
   (personality), `IDENTITY.md` (name, creature, vibe, emoji, avatar) and
   `USER.md` (its **own** notes about the human). The stable facts the operator
-  curates stay in the shared `profile/USER.md`, which every agent also reads.
+  curates stay in the shared `personas/USER.md`, which every agent also reads.
 - **Skills**: a custom agent starts with **only its own overlay** — it does not
   inherit the shared set (builtins + `<workspace>/skills/`), which belongs to
   the built-in. Granting a skill to a persona is a decision, made by putting it
@@ -59,7 +59,7 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 
 | Facet | Source of truth | Resolved at | A live edit lands |
 |---|---|---|---|
-| soul | `personas/<id>/SOUL.md` (builtin: `profile/SOUL.md`) | context seed + every post-compaction reseed | next seed/reseed |
+| soul | `personas/<id>/SOUL.md` (builtin: `personas/baybo/SOUL.md`) | context seed + every post-compaction reseed | next seed/reseed |
 | skills | `personas/<id>/skills/` | per-turn listing, `Skill` tool lookup, slash expansion | next actor spawn, or `reload()` |
 | memory partition | `sessions.agent_id` | every recall / write / memory-tool call | immediately |
 | llm pin | `profile.llm` | actor spawn / hydration | next hydration, unless the session switched models explicitly |
@@ -166,13 +166,15 @@ It keeps no skill overlay, because the shared `skills/` set *is* its set.
 Three new `WorkspacePaths` methods carry that rule so no call site branches:
 
 ```rust
-pub fn personas_dir(&self) -> PathBuf;                                  // <root>/personas
-pub fn agent_soul_file(&self, agent: &AgentProfileId) -> PathBuf;        // builtin → profile/SOUL.md
-pub fn agent_skills_dir(&self, agent: &AgentProfileId) -> Option<PathBuf>; // builtin → None
+pub fn personas_dir(&self) -> PathBuf;                                    // <root>/personas
+pub fn persona_dir(&self, agent: &str) -> PathBuf;                        // <root>/personas/<id>
+pub fn persona_identity_file(&self, agent: &str, kind: IdentityKind) -> PathBuf;
+pub fn persona_skills_dir(&self, agent: &str) -> PathBuf;                 // <root>/personas/<id>/skills
+pub fn shared_user_file(&self) -> PathBuf;                                // <root>/personas/USER.md
 ```
 
-`agent_skills_dir` returns `None` for the builtin because the builtin *is* the
-base set — an overlay pointing at `skills/` would register the same dir twice.
+Every method keys on the id alone, builtin included — `"baybo"` is a persona
+directory name like any other, so no call site branches on it.
 
 **Path safety.** This is the first time a profile id reaches the filesystem. Ids
 are server-minted ULIDs, but `AgentProfileId` is an opaque newtype whose
@@ -236,10 +238,10 @@ five-week-old workspace: 98 self-edits to `USER.md`, 1 to `IDENTITY.md`, 0 to
 `SOUL.md`), so leaving it shared would have made it a write channel between
 agents that the memory partition explicitly does not allow.
 
-The operator's stable facts stay in `profile/USER.md` and every agent reads
-them as `<shared_user_profile>`. The built-in's own notes *are* that file, so
-it emits one user section rather than two — an unbound session and a
-built-in-bound one still assemble byte-identical prompts. The `path=`
+The operator's stable facts stay in `personas/USER.md` and every agent reads
+them as `<shared_user_profile>`, alongside its own `<user_notes>` — the
+built-in included, whose notes live at `personas/baybo/USER.md`. An unbound
+session and a built-in-bound one assemble byte-identical prompts. The `path=`
 attribute carries each file's absolute path, so an agent's self-edit rewrites
 its own persona and nobody else's — and the `Edit` tool now enforces that: a
 persona file belonging to a *different* agent is refused outright.
@@ -271,8 +273,8 @@ post-compaction reseed:
 1. **subagent profile** override (child sessions) — unchanged;
 2. **agent binding** — `assemble` over that agent's own `SOUL.md` and
    `IDENTITY.md`, resolved from the id alone;
-3. **no binding** — `assemble(paths, profile/SOUL.md, DEFAULT_SOUL_CONTENT)`,
-   byte-identical to today's behaviour.
+3. **no binding** — the same call against `personas/baybo/`, byte-identical to
+   what a built-in-bound session produces.
 
 Arms 2 and 3 are the same call with a different path, which is the point: there
 is no "agent prompt" code path to keep in sync with the soul path. Arms 1 and 2
@@ -397,8 +399,8 @@ Prompt caching is unaffected — the system row already varies per session.
   a full replace written tmp-file + rename, answering with the new state so an
   open editor holds a fresh base. Both resolve through
   `AgentProfileId::identity_file`, so for the builtin they edit
-  `profile/{SOUL,IDENTITY}.md`: the Agents page is the one place to edit *any*
-  agent's persona, and the builtin's "locked except avatar" rule is untouched
+  `personas/baybo/{SOUL,IDENTITY}.md`: the Agents page is the one place to edit
+  *any* agent's persona, and the builtin's "locked except avatar" rule is untouched
   (these are files, not row fields).
 
 - **The display name is not a column.** `POST` / `PUT /v1/agents` accept a
@@ -495,7 +497,7 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | External backend disabled or unprobed at creation | 400 "enable claude first" |
 | Backend disabled after sessions exist | turn fails with a clear in-chat error; the session survives and works again on re-enable |
 | Profile row deleted with bound sessions | the conversation keeps the agent's **own** persona and skill overlay — both are named by the id the session carries, so they outlive the row, exactly as its memory partition does. Only the row's own fields go: the LLM pin falls back to `default-llm` with a `warn!` at the next spawn, and the roster loses the entry |
-| `personas/<id>/SOUL.md` missing | re-seeded from the template (or the legacy row prompt) and used |
+| `personas/<id>/SOUL.md` missing | re-seeded from the shipped template and used |
 | `personas/<id>/SOUL.md` unreadable (I/O error) | `error!` naming both paths, then the minimal `FALLBACK_SYSTEM_PROMPT` — **never** the workspace persona |
 | Persona directory deleted while sessions live | empty overlay, soul re-seeded; no error |
 | Stale `profile.llm` pin | existing tolerance: `warn!` + default |

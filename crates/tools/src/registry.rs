@@ -41,7 +41,7 @@ impl ToolRegistry {
     /// [`crate::ToolContext::llm`], so no LLM client is threaded here;
     /// the agent layer binds the handle when it materialises each
     /// tool-call's context. `workspace_paths` is forwarded to `Edit`
-    /// so its approval-gate bypass for `profile/` writes can bind to
+    /// so its approval-gate bypass for `personas/` writes can bind to
     /// the real workspace rather than a heuristic on the path string.
     /// `permission` is the shared, hot-swappable handle that drives
     /// `BashTool`'s isolation/approval behavior and the description it

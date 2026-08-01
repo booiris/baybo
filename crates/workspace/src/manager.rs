@@ -56,8 +56,7 @@ impl WorkspaceManager {
     /// than on every boot, so a deliberately-deleted identity file
     /// stays deleted.
     ///
-    /// Assumes `profile/` already exists (i.e. `ensure_layout` has
-    /// run).
+    /// Assumes `personas/` already exists (i.e. `ensure_layout` has run).
     pub async fn seed_default_identity_files(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
         let targets = IdentityKind::all()
@@ -133,7 +132,7 @@ impl WorkspaceManager {
 /// already there. Idempotent — a no-op when `<dir>/.git` exists.
 ///
 /// These repos exist only for optional version history of the agent's
-/// skills/profile/agents. The `bench-bash` build skips them (see the no-op
+/// skills/personas/agents. The `bench-bash` build skips them (see the no-op
 /// below): the workspace is then an ephemeral, single-task container where that
 /// history is meaningless, and requiring `git` there only forces a slow
 /// per-task `apt-get install git`.
@@ -204,7 +203,7 @@ mod tests {
         }
         // No workspace-root .gitignore should exist anymore.
         assert!(!dir.join(".gitignore").exists());
-        // Each of config/, profile/, and skills/ is its own git repo.
+        // Each of config/, personas/, skills/, and agents/ is its own git repo.
         assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
         assert!(paths.agents_dir().join(".git").is_dir());

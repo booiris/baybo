@@ -1096,9 +1096,8 @@ export interface components {
             content: string;
             /**
              * @description Absolute path this content came from — the agent's own
-             *     `personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for
-             *     the built-in. Surfaced so an operator knows what to edit and what to
-             *     commit; both live inside a git repo.
+             *     `personas/<id>/<FILE>.md`. Surfaced so an operator knows what to edit
+             *     and what to commit; it lives inside a git repo.
              */
             path: string;
             /**

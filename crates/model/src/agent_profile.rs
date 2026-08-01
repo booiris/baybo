@@ -116,7 +116,7 @@ impl AgentProfileId {
     /// worked out about the human is its own accumulated notes, and sharing
     /// them would be a write channel between agents that the memory partition
     /// does not cover. The *shared* profile — the stable facts the operator
-    /// curates — stays at `profile/USER.md` and every agent reads it too; see
+    /// curates — stays at `personas/USER.md` and every agent reads it too; see
     /// `baybo_context::prompts::soul`.
     ///
     /// One rule, no special cases: an agent's files live in its own
@@ -308,7 +308,7 @@ mod tests {
 
         // Including USER.md: those are this agent's own notes about the
         // human. The shared profile every agent also reads is a separate
-        // section, assembled from `profile/USER.md`.
+        // section, assembled from `personas/USER.md`.
         for kind in IdentityKind::all() {
             assert_eq!(
                 custom.identity_file(&paths, kind),

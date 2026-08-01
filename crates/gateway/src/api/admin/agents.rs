@@ -538,9 +538,8 @@ pub struct AgentIdentityFileDto {
     /// the write conditional — see [`SetAgentIdentityFileRequest::version`].
     pub version: String,
     /// Absolute path this content came from — the agent's own
-    /// `personas/<id>/<FILE>.md`, or the workspace `profile/<FILE>.md` for
-    /// the built-in. Surfaced so an operator knows what to edit and what to
-    /// commit; both live inside a git repo.
+    /// `personas/<id>/<FILE>.md`. Surfaced so an operator knows what to edit
+    /// and what to commit; it lives inside a git repo.
     pub path: String,
 }
 
@@ -597,9 +596,8 @@ async fn read_agent_identity_file(
 /// Replace one of an agent's own identity files.
 ///
 /// Deliberately NOT behind the builtin lock: the built-in row is read-only,
-/// but these are files, not row fields — and editing the workspace
-/// `profile/` pair is exactly what an operator expects the built-in's entry
-/// to offer. Racing writes are last-write-wins; both files are
+/// but these are files, not row fields — and editing the built-in's own
+/// persona is exactly what an operator expects its entry to offer. Racing writes are last-write-wins; both files are
 /// git-versioned, so a clobber is recoverable.
 async fn write_agent_identity_file(
     state: &AdminState,

@@ -1,4 +1,4 @@
-//! Default identity-file templates seeded into `<workspace>/profile/`
+//! Default identity-file templates seeded into `<workspace>/personas/`
 //! by `baybo-setup::bootstrap` when an identity markdown file is
 //! missing. Source of truth for the template shape and intended voice
 //! is openclaw's reference templates:
@@ -91,7 +91,7 @@ self-image live beside it in `IDENTITY.md`; the shared `personas/USER.md`
 
 /// Seed body for a newly-created agent's `personas/<id>/USER.md`.
 ///
-/// Deliberately *not* [`DEFAULT_USER_CONTENT`]: the shared `profile/USER.md`
+/// Deliberately *not* [`DEFAULT_USER_CONTENT`]: the shared `personas/USER.md`
 /// holds the stable facts the operator curates, and every agent reads that
 /// too. This file is what one agent has worked out for itself, so its
 /// template asks for that rather than re-asking for a name and a timezone

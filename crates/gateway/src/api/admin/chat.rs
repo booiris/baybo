@@ -2545,8 +2545,8 @@ async fn create_or_load_chat_session(
 /// directory, so the first turn's soul assembly finds a `SOUL.md` rather than
 /// racing to create one.
 ///
-/// `None` (built-in) binds nothing: the built-in's persona *is* the workspace
-/// `profile/` + `skills/`, which already exist.
+/// `None` (built-in) binds nothing: an unbound session resolves to
+/// `personas/baybo/` plus the workspace `skills/`, which already exist.
 async fn resolve_agent_binding(
     state: &AdminState,
     requested: Option<&str>,

@@ -14,7 +14,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 - `crates/gateway/src/api/admin/agents.rs` — the `/v1/agents` handlers and DTOs.
 - `app/web/src/pages/AgentsPage.tsx` — the management page.
 
-**What this is NOT.** It is not `SubagentProfile` ([`subagent.md`](subagent.md)): that is the filesystem-authoritative registry (`<workspace>/agents/<name>.md`, `DashMap`, disk wins on `reload`) that types *spawned subagents*. Agent profiles are DB-authoritative, web-managed, and aimed at *top-level* sessions. The two registries do not read each other, share no types beyond `baybo-model`, and a name appearing in both means nothing. It is also not the Soul itself: a soul is a file, and the row only names which agent's file to read. The built-in profile's persona *is* the workspace `profile/`, so an unbound session and a built-in-bound one assemble byte-identical prompts.
+**What this is NOT.** It is not `SubagentProfile` ([`subagent.md`](subagent.md)): that is the filesystem-authoritative registry (`<workspace>/agents/<name>.md`, `DashMap`, disk wins on `reload`) that types *spawned subagents*. Agent profiles are DB-authoritative, web-managed, and aimed at *top-level* sessions. The two registries do not read each other, share no types beyond `baybo-model`, and a name appearing in both means nothing. It is also not the Soul itself: a soul is a file, and the row only names which agent's file to read. The built-in's persona is an ordinary directory, `personas/baybo/`, so an unbound session and a built-in-bound one assemble byte-identical prompts.
 
 ## Data model
 
@@ -54,16 +54,6 @@ display ambiguity, never a correctness problem. `list` therefore orders by
 `builtin DESC, id` and the gateway re-sorts by the name it reads from each
 agent's file.
 
-A database created before this is **rebuilt once at open**
-(`migrate_agent_profiles_to_file_owned_persona`, one of `init_db`'s
-self-disarming one-time passes). `name` was `NOT NULL UNIQUE`, so leaving it
-was not an option — an INSERT that omits it trips the constraint, and SQLite
-cannot `DROP COLUMN` one carrying a `UNIQUE` index. The pass is guarded on the
-column's presence, runs in a transaction, and copies every surviving column,
-so the only thing it destroys is two values nothing reads. It runs before the
-DDL batch, and `a_legacy_schema_is_rebuilt_to_match_a_fresh_one` pins the
-rebuilt shape against a fresh one so the two declarations cannot drift.
-
 `llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. Nothing is consumed yet (v1 is management-only).
 
 **Neither skills nor tools are stored on the profile.** Skills are managed by the skill system, not configured per agent — the editor reads them live from the skill registry (`GET /v1/skills`) and shows them read-only; when a future per-agent-workspace model lands, that readout reads the agent's own skill folder instead. Tools are a runtime-global concern (`ToolRegistry` is process-wide by design) and Claude Code / Codex manage their own tool permissions. Storing either as a per-agent allow-list would be dead data in v1, so both are left out.
@@ -76,8 +66,8 @@ Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `bui
 
 | Field | Builtin | Where it lives |
 |---|---|---|
-| name | editable (`…/name`) | `profile/IDENTITY.md`, the `Name:` line |
-| soul | editable (`…/soul`) | `profile/SOUL.md` |
+| name | editable (`…/name`) | `personas/baybo/IDENTITY.md`, the `Name:` line |
+| soul | editable (`…/soul`) | `personas/baybo/SOUL.md` |
 | avatar | editable (`…/avatar`) | row column, via `set_avatar` |
 | description | editable (content `PUT`) | row column |
 | **framework** | **pinned to `baybo`** | row column |
@@ -91,7 +81,7 @@ The gateway still answers an *explicit* attempt with a 400 rather than silently 
 
 ### DB-backed, not workspace files
 
-Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (Soul `profile/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
+Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (`personas/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
 
 ### The builtin row is locked structurally, not by convention
 

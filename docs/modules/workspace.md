@@ -4,7 +4,7 @@
 
 The `workspace` crate is the single source of truth for Baybo's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `personas/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
 - **Workspace exclusion** (`singleton` module, `io` feature): `WorkspaceLock` and `acquire_workspace_lock` — the advisory `flock` on `state/baybo.lock` that keeps two chat loops off one workspace. It lives here rather than in the binary because the path constant does, and because `baybo vault rotate` needs the same lock: `key_file::rotate` takes a `&WorkspaceLock` so holding it is a type-level obligation rather than something a caller remembers.
@@ -64,15 +64,15 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
-- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
+- Runs `git init --quiet` inside `config/`, `skills/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check).
 
 Per-agent subdirectories under `personas/` are created on demand by
 `ensure_persona_layout` (at profile creation, and defensively when a bound
 session's actor is built), not by `ensure_layout` — the set of agents is
 DB-state, not layout.
 
-`config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
+`config/`, `personas/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `personas/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
 ## Config file resolution
 
@@ -90,9 +90,9 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - **IDENTITY.md**: system or instance identity description
 
 **All three identity files are per-agent, and the built-in is an ordinary
-persona directory** (`personas/baybo/`). There is no `profile/`: one directory,
-one rule — `personas/<id>/` is an agent, and the single file directly inside
-`personas/` is the shared human profile that belongs to none of them.
+persona directory** (`personas/baybo/`). One directory, one rule:
+`personas/<id>/` is an agent, and the single file directly inside `personas/`
+is the shared human profile that belongs to none of them.
 
 `SOUL.md` (personality) and `IDENTITY.md` (self-image: name, creature, vibe,
 emoji, avatar) answer "who is this assistant". `USER.md` is the agent's **own
@@ -114,11 +114,11 @@ soul landed as a file addition: the one thing the audit history exists to show
 was the one thing it could not. Best-effort — a workspace without `git` still
 gets correct files, just no history.
 
-The built-in profile has no `personas/` directory at all — its pair *is*
-`profile/{SOUL,IDENTITY}.md`, so an unbound session and a built-in-bound one
-assemble byte-identical prompts. `load_identity_files` therefore takes an
-`IdentitySource` (path + seed) for each of the two agent-owned sections and
-resolves `USER.md` itself; `load_identity` reads one on its own. See
+A session with no binding resolves to `personas/baybo/`, the same directory
+a built-in-bound session resolves to, so the two assemble byte-identical
+prompts. `load_identity_files` takes an `IdentitySource` (path + seed) for each
+of the three agent-owned files and resolves the shared `USER.md` itself;
+`load_identity` reads one on its own. See
 [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md).
 
 Identity file changes usually affect the system prompt; memory changes usually affect recall.
@@ -145,9 +145,9 @@ number), measuring staleness with the shared
 `baybo_workspace::walk::tree_stats` walker (newest lstat mtime anywhere
 in the tree, symlinks never followed); see [`janitor.md`](janitor.md).
 
-### Why split state/work/logs from profile/skills
+### Why split state/work/logs from personas/skills
 
-The split exists so the user's git workflow stays clean: `config/`, `profile/`, `skills/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (sqlite DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the four declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+The split exists so the user's git workflow stays clean: `config/`, `personas/`, `skills/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (sqlite DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the four declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
 
 ## Constraints
 

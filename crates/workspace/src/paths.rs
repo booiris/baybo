@@ -99,7 +99,7 @@ pub const WORKSPACE_CONFIG_FILE: &str = "baybo.json";
 pub const MCP_CONFIG_FILE: &str = ".mcp.json";
 
 // ---------------------------------------------------------------------------
-// Files inside `profile/` (standalone git repo)
+// Identity file names, shared by every persona directory
 // ---------------------------------------------------------------------------
 
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
@@ -405,7 +405,7 @@ impl WorkspacePaths {
     ///
     /// Only `SOUL.md` and `IDENTITY.md` are ever addressed this way —
     /// personality and self-image belong to the agent, while `USER.md`
-    /// describes the human and stays in the shared `profile/`. This method
+    /// describes the human and also has a shared copy. This method
     /// takes any kind because it is pure address arithmetic; the routing
     /// rule lives with the agent id (`AgentProfileId::identity_file`).
     pub fn persona_identity_file(&self, agent_id: &str, kind: IdentityKind) -> PathBuf {
@@ -458,7 +458,7 @@ impl WorkspacePaths {
         self.config_dir().join(MCP_CONFIG_FILE)
     }
 
-    // -- profile/ contents --
+    // -- personas/ contents --
 
     /// The human's shared profile: `<root>/personas/USER.md`.
     pub fn shared_user_file(&self) -> PathBuf {
