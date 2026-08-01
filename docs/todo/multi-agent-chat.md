@@ -349,10 +349,13 @@ spawn closure in `crates/baybo/src/runtime.rs` gains two lines of resolution fro
 - `AgentLoopConfig` — the id, from which every `MemoryContext` and
   `ToolContext` the loop mints is stamped.
 
-`initial_llm` resolution reads `session.state.last_llm` at three sites today
-(`router/user_input.rs` twice, `router/cron.rs` once); the profile fallback goes
-in **one** shared `resolve_spawn_llm(session, store)` that all three call, rather
-than three copies of the precedence rule. Nothing else in the actor changes
+`initial_llm` resolution reads `session.state.last_llm` at three sites
+(`router/user_input.rs` twice, `router/cron.rs` once); all three now call one
+`resolve_spawn_pins(session, store)` rather than carrying three copies of the
+precedence rule. It resolves before the closure, because `route_or_spawn`
+takes a synchronous one and the fallback reads the store — and unbound or
+built-in sessions short-circuit without touching it at all. Nothing else in
+the actor changes
 for a baybo-framework agent: same loop, same tools, same sandbox, same approval
 gate, same compression.
 
@@ -513,10 +516,13 @@ cleanup of any kind.
    fallbacks), the skill overlay and its scoped lookups, the memory partition
    across both backends plus the removal of the `agentId` override, the
    `…/soul` endpoints, and the Agents-page soul editor.
-   *Still open in Phase 1*: LLM precedence through a shared
-   `resolve_spawn_llm`, agent inheritance for subagent children and cron
-   fires, the web new-chat picker and session chip, `SessionView` carrying
-   the binding, and the agent-scoped `GET /v1/skills` / slash-manifest.
+   *Also built since*: the per-agent `IDENTITY.md`, the name living in it
+   rather than a column, conditional writes on the identity files, skills no
+   longer inherited by a custom agent, the agent-scoped `GET /v1/skills`, LLM
+   precedence through the shared `resolve_spawn_pins`, and agent inheritance
+   for subagent children and cron fires.
+   *Still open in Phase 1*: the web new-chat picker and session chip,
+   `SessionView` carrying the binding, and the agent-scoped slash-manifest.
 2. **Phase 1.5 (optional, small).** Authoring an overlay skill from the web:
    `PUT /v1/agents/{id}/skills/{name}` writing one `SKILL.md` through the same
    scoped-file seam as the soul endpoint, then `reload()`. Closes the "owner has

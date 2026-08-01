@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
-    CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId, TriggerSource, User,
+    AgentBinding, CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId,
+    TriggerSource, User,
 };
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
@@ -89,7 +90,7 @@ impl Router {
         };
         let session = self
             .session_manager
-            .create_session_with_trigger(
+            .create_bound_session_with_trigger(
                 user,
                 event.channel.clone(),
                 TriggerSource::Cron {
@@ -98,9 +99,35 @@ impl Router {
                     conversation,
                     job_title: Some(event.title.clone()),
                 },
+                self.inherited_binding(event.origin_session_id.as_ref())
+                    .await,
             )
             .await?;
         Ok(session)
+    }
+
+    /// The agent a fire runs as: the one bound to the conversation that
+    /// scheduled the job.
+    ///
+    /// Derived at fire time from the origin session rather than stored on the
+    /// job — the same rule as cron grouping (`docs/cron-groups.md`), and it
+    /// means re-binding is impossible to get out of step because there is
+    /// nothing to keep in step. `None` for a job with no recorded origin (one
+    /// created before origins were stamped) or an origin that is itself
+    /// unbound, which reads as the built-in.
+    async fn inherited_binding(&self, origin: Option<&SessionId>) -> Option<AgentBinding> {
+        let origin = origin?;
+        let session = match self.session_manager.get(origin).await {
+            Ok(session) => session?,
+            Err(e) => {
+                warn!(session_id = %origin, error = %e, "failed to read a fire's origin; running it unbound");
+                return None;
+            }
+        };
+        Some(AgentBinding {
+            agent_id: session.state.agent_id?,
+            framework: session.state.agent_framework.unwrap_or_default(),
+        })
     }
 
     /// The task that will report a one-shot's result to the conversation that
@@ -260,6 +287,7 @@ impl Router {
             supervisor: self.supervisor.clone(),
             cron_store: Arc::clone(&self.cron_store),
             actor_spawner: Arc::clone(&self.actor_spawner),
+            agent_profiles: Arc::clone(&self.agent_profiles),
             actor_parent_token: self.actor_parent_token.clone(),
         }
     }
@@ -525,6 +553,9 @@ pub(super) struct CronResultDelivery {
     supervisor: AgentSupervisor,
     cron_store: Arc<dyn CronStore>,
     actor_spawner: ActorSpawner,
+    /// The origin conversation may be bound to an agent, so hydrating it has
+    /// the same pin resolution as any other cold spawn.
+    agent_profiles: Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
     actor_parent_token: CancellationToken,
 }
 
@@ -559,6 +590,7 @@ impl CronResultDelivery {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
+        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
         let delivered = self
             .supervisor
             .route_or_spawn(
@@ -566,14 +598,11 @@ impl CronResultDelivery {
                 AgentMessage::CronResultReady(Box::new(result)),
                 || {
                     let actor_token = parent_token.child_token();
-                    let pinned = origin.state.last_llm.clone();
-                    let pinned_model = origin.state.last_model.clone();
-                    let pinned_effort = origin.state.last_effort.clone();
                     actor_spawner(
                         origin,
-                        pinned,
-                        pinned_model,
-                        pinned_effort,
+                        pins.llm,
+                        pins.model,
+                        pins.effort,
                         response_tx,
                         actor_token,
                     )
@@ -741,6 +770,7 @@ mod tests {
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
             let router = Router::from_config(RouterConfig {
+                agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
                 session_manager: Arc::clone(&sessions),
                 supervisor: supervisor.clone(),
                 channels: Arc::new(ChannelRegistry::new()),

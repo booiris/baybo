@@ -168,6 +168,24 @@ impl SessionManager {
         channel: ChannelType,
         trigger: TriggerSource,
     ) -> Result<Session> {
+        self.create_bound_session_with_trigger(user, channel, trigger, None)
+            .await
+    }
+
+    /// [`Self::create_session_with_trigger`] carrying an agent binding.
+    ///
+    /// The cron path uses it so a fire inherits the agent of the conversation
+    /// that scheduled the job: a job created inside agent A's chat fires as
+    /// A, with A's soul, skills and memory partition, and its result lands
+    /// back in A's thread. `None` mints an unbound fire, which reads as the
+    /// built-in — what a job with no recorded origin gets.
+    pub async fn create_bound_session_with_trigger(
+        &self,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
         let prefix = match &trigger {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
@@ -177,7 +195,7 @@ impl SessionManager {
         } else {
             SessionId::with_prefix(prefix)
         };
-        self.create_session_with_id(id, user, channel, trigger)
+        self.create_bound_session(id, user, channel, trigger, binding)
             .await
     }
 
@@ -185,6 +203,12 @@ impl SessionManager {
     /// lineage (subagent). The child inherits its trigger from the
     /// parent's root session and gets a fresh session_id prefixed
     /// with `subagent-` as a hint.
+    ///
+    /// It also inherits the parent's **agent**: a worker doing agent A's work
+    /// writes into A's memory partition and sees A's skill overlay. Its
+    /// *soul* still comes from its subagent profile — a worker's contract is
+    /// its profile, not a persona — so this binding is about scope, not
+    /// identity.
     pub async fn create_spawned_session(
         &self,
         user: User,
@@ -203,7 +227,11 @@ impl SessionManager {
             channel,
             created_at: now,
             last_active: now,
-            state: baybo_model::SessionState::default(),
+            state: baybo_model::SessionState {
+                agent_id: parent.state.agent_id.clone(),
+                agent_framework: parent.state.agent_framework,
+                ..baybo_model::SessionState::default()
+            },
             // Spawned sessions inherit `root_session_id` from the
             // ultimate ancestor, not from their direct parent.
             root_session_id: parent.root_session_id.clone(),
@@ -1077,6 +1105,65 @@ mod tests {
         assert_eq!(session.channel, ChannelType::tui());
         assert_eq!(session.root_session_id, session.id);
         assert!(session.lineage.is_none());
+    }
+
+    /// A worker inherits the agent whose work it is doing, so its memory
+    /// writes and skill lookups land in that agent's scope. Its soul does
+    /// not follow — that comes from its subagent profile.
+    #[tokio::test]
+    async fn a_spawned_child_inherits_its_parents_agent() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
+
+        let agent = baybo_model::AgentProfileId::parse("01JAGENT").unwrap();
+        let parent = mgr
+            .create_session_with_agent(
+                test_user(),
+                ChannelType::tui(),
+                Some(baybo_model::AgentBinding {
+                    agent_id: agent.clone(),
+                    framework: baybo_model::AgentFramework::Baybo,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let child = mgr
+            .create_spawned_session(
+                test_user(),
+                ChannelType::tui(),
+                &parent,
+                baybo_model::Lineage {
+                    parent_session_id: parent.id.clone(),
+                    parent_turn_id: baybo_model::TurnId::new(),
+                    parent_span_id: None,
+                    kind: baybo_model::LineageKind::Subagent,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.state.agent_id, Some(agent));
+
+        // An unbound parent leaves the child unbound — i.e. the built-in.
+        let plain = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        let orphan = mgr
+            .create_spawned_session(
+                test_user(),
+                ChannelType::tui(),
+                &plain,
+                baybo_model::Lineage {
+                    parent_session_id: plain.id.clone(),
+                    parent_turn_id: baybo_model::TurnId::new(),
+                    parent_span_id: None,
+                    kind: baybo_model::LineageKind::Subagent,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(orphan.state.agent_id, None);
     }
 
     #[tokio::test]

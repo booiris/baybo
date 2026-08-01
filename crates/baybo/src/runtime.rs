@@ -1009,6 +1009,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // the chat model-switch endpoint can re-pin live actors.
     let supervisor_for_gateway = supervisor.clone();
     let router = Router::from_config(baybo_agent::router::RouterConfig {
+        agent_profiles: graph.stores.agent_profile.clone(),
         session_manager: Arc::clone(&graph.session_manager),
         supervisor,
         channels: Arc::clone(&graph.channels_registry),

@@ -149,6 +149,9 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
+        // Resolved before the closure because the fallback reads the store;
+        // `route_or_spawn` takes a synchronous one.
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let routed = self
             .supervisor
             .route_or_spawn(
@@ -156,14 +159,11 @@ impl Router {
                 AgentMessage::UserInput(Box::new(incoming)),
                 || {
                     let actor_token = parent_token.child_token();
-                    let pinned = session.state.last_llm.clone();
-                    let pinned_model = session.state.last_model.clone();
-                    let pinned_effort = session.state.last_effort.clone();
                     actor_spawner(
                         session,
-                        pinned,
-                        pinned_model,
-                        pinned_effort,
+                        pins.llm,
+                        pins.model,
+                        pins.effort,
                         response_tx,
                         actor_token,
                     )
@@ -328,17 +328,15 @@ impl Router {
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
         let session = session.clone();
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         self.supervisor
             .route_or_spawn(session_id, message, || {
                 let actor_token = parent_token.child_token();
-                let pinned = session.state.last_llm.clone();
-                let pinned_model = session.state.last_model.clone();
-                let pinned_effort = session.state.last_effort.clone();
                 actor_spawner(
                     session,
-                    pinned,
-                    pinned_model,
-                    pinned_effort,
+                    pins.llm,
+                    pins.model,
+                    pins.effort,
                     response_tx,
                     actor_token,
                 )
