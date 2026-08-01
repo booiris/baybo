@@ -959,11 +959,30 @@ impl ContextManager {
 
     /// Both halves come off one tokenizer over one block list, so the
     /// subtraction is exact rather than an approximation of the split.
+    ///
+    /// Media is charged only on the roles that actually carry it to the
+    /// provider, which [`baybo_llm::delivers_media`] answers because the
+    /// conversion it describes lives there. Re-deriving that rule here is
+    /// what let the price and the delivery decision drift apart in the
+    /// first place; [`baybo_llm::content_block_tokens`] cannot answer it
+    /// either, taking a bare block and never seeing a role.
+    ///
+    /// The case this exists for is the agent loop folding `AttachFile`
+    /// media onto the turn's final **assistant** row — so the file
+    /// persists and rebuilds on a cold start, not so the model re-reads
+    /// it. Charged anyway, one attachment spends up to
+    /// [`baybo_llm::IMAGE_TOKEN_CEILING`] of window on bytes no provider
+    /// receives, for as long as the row survives, and the overcharge never
+    /// self-corrects because [`TokenCalibration`] excludes media by design.
     fn split_tokens(&self, msg: &ChatMessage) -> MessageTokens {
-        let media = self.tokenizer.count_message_media(msg);
+        let priced = self.tokenizer.count_message_media(msg);
         MessageTokens {
-            text: self.tokenizer.count_message(msg).saturating_sub(media),
-            media,
+            text: self.tokenizer.count_message(msg).saturating_sub(priced),
+            media: if baybo_llm::delivers_media(msg.role) {
+                priced
+            } else {
+                0
+            },
         }
     }
 
@@ -2091,7 +2110,10 @@ mod tests {
     }
 
     fn make_msg(role: Role, text: &str) -> ChatMessage {
-        let content = vec![ContentBlock::Text(text.to_string())];
+        make_msg_with(role, vec![ContentBlock::Text(text.to_string())])
+    }
+
+    fn make_msg_with(role: Role, content: Vec<ContentBlock>) -> ChatMessage {
         match role {
             Role::User => ChatMessage::agent_context(content),
             Role::Assistant => ChatMessage::assistant(content),
@@ -3030,6 +3052,41 @@ mod tests {
         let delta = ctx.count_tokens() - empty;
         assert!(delta >= MEDIA_CEILING, "ceiling deflated to {delta}");
         assert!(delta < MEDIA_CEILING + 100, "{delta}");
+    }
+
+    /// The budget charges media exactly where `baybo_llm::delivers_media`
+    /// says the provider receives it — which is a user row and nothing
+    /// else (pinned against the real conversion by `baybo-llm`'s
+    /// `delivers_media_matches_the_conversion_for_every_role`).
+    ///
+    /// The live case is the agent loop folding `AttachFile` media onto the
+    /// turn's FINAL **assistant** row so the file persists and rebuilds on
+    /// a cold start. A dimensionless image — an attached SVG, whose
+    /// viewBox is not a pixel grid — prices at the ceiling, so one
+    /// attachment used to burn `IMAGE_TOKEN_CEILING` of window for as long
+    /// as the row survived, against a provider charge of zero.
+    #[tokio::test]
+    async fn media_is_budgeted_only_on_the_role_that_delivers_it() {
+        let blocks = image_msg().content;
+
+        for role in [Role::Assistant, Role::System, Role::Tool] {
+            let mut ctx = make_ctx(5, 100_000, 0.75);
+            let before = ctx.count_tokens();
+            ctx.append(&make_msg_with(role, blocks.clone())).await;
+
+            assert_eq!(ctx.raw_media_estimate(), 0, "{role:?}");
+            assert!(
+                ctx.count_tokens() - before < MEDIA_CEILING,
+                "{role:?}: the row must cost its text envelope, not a media ceiling"
+            );
+        }
+
+        // Same blocks on a user row: delivered, so charged in full.
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let before = ctx.count_tokens();
+        ctx.append(&make_msg_with(Role::User, blocks)).await;
+        assert_eq!(ctx.raw_media_estimate(), MEDIA_CEILING);
+        assert!(ctx.count_tokens() - before >= MEDIA_CEILING);
     }
 
     /// A `UserInterjection` row is sent wrapped in the `<user_interjection>`

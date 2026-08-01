@@ -222,6 +222,26 @@ pub fn delivers_pdf_document(mime: &str) -> bool {
     matches!(document_delivery(mime), Some(DocumentDelivery::Pdf))
 }
 
+/// Whether a row of this role carries its media blocks to the provider.
+///
+/// `build_completion_request` runs [`LlmClient::user_content_for_block`] —
+/// the only path that materialises bytes — on a **user** row alone. An
+/// assistant row keeps text, tool calls and thinking; a system row is
+/// flattened to text; a tool row keeps only its result. Media anywhere
+/// else is dropped without even a stub, so it costs the provider nothing.
+///
+/// Exported because the price and the delivery decision must not drift
+/// apart, and `baybo-context`'s budget cannot re-derive this:
+/// [`content_block_tokens`] takes a bare `&ContentBlock` and never sees a
+/// role. The agent loop folds `AttachFile` media onto the turn's final
+/// **assistant** row so the file persists across a reload, which is
+/// exactly the case that would otherwise be charged
+/// [`IMAGE_TOKEN_CEILING`] against a provider charge of zero.
+/// `delivers_media_matches_the_conversion` pins the two together.
+pub fn delivers_media(role: baybo_model::Role) -> bool {
+    matches!(role, baybo_model::Role::User)
+}
+
 /// Wrapper the model is asked to read as a delimiter around an inlined
 /// attachment. Every slot is client-controlled — the filename and MIME
 /// come off the wire and the body is the file itself — so all three are
@@ -2279,7 +2299,7 @@ mod document_dispatch_tests {
 
     use std::sync::Arc;
 
-    use baybo_model::{BlobRef, ContentBlock};
+    use baybo_model::{BlobRef, ContentBlock, Role};
     use rig::message::UserContent;
 
     use super::*;
@@ -2958,6 +2978,62 @@ mod document_dispatch_tests {
             !persistable.contains(&encoded),
             "base64 bytes must remain confined to the ephemeral provider request"
         );
+    }
+
+    /// [`delivers_media`] must say exactly what the conversion does, for
+    /// every role — `baybo-context`'s budget prices media off the
+    /// predicate and can see nothing else (`content_block_tokens` takes a
+    /// bare block). Identical blocks, identical client, only the role
+    /// differs.
+    ///
+    /// Drift here is asymmetric. A role that stops delivering and is
+    /// still charged over-counts, which only compacts early; a role that
+    /// starts delivering and is not charged under-counts, and an
+    /// over-window request is rejected by the provider on every turn —
+    /// `build_completion_request` re-walks the whole history, so the
+    /// rejection repeats until compaction evicts the row.
+    #[tokio::test]
+    async fn delivers_media_matches_the_conversion_for_every_role() {
+        let client = with_bytes(media_probe::fixture::png(640, 480));
+        let blocks = vec![ContentBlock::Text("here you go".into()), image_block()];
+
+        for role in [Role::User, Role::Assistant, Role::System, Role::Tool] {
+            let msg = match role {
+                Role::User => baybo_model::ChatMessage::user(blocks.clone()),
+                Role::Assistant => baybo_model::ChatMessage::assistant(blocks.clone()),
+                Role::System => baybo_model::ChatMessage::system(blocks.clone()),
+                Role::Tool => baybo_model::ChatMessage::tool(blocks.clone()),
+            };
+            let wire = client
+                .build_completion_request(&ChatRequest {
+                    messages: vec![msg],
+                    temperature: None,
+                    tools: Vec::new(),
+                    reasoning_effort: None,
+                })
+                .await;
+
+            let delivered = wire.chat_history.iter().any(|m| match m {
+                Message::User { content } => {
+                    content.iter().any(|p| matches!(p, UserContent::Image(_)))
+                }
+                _ => false,
+            });
+            assert_eq!(delivered, delivers_media(role), "{role:?}");
+
+            // A dropped block leaves nothing at all — not even the
+            // `[image: …]` stub an undeliverable *user* block degrades to.
+            // A stub would still cost real tokens and would have to be
+            // priced; the budget charges zero, so nothing may remain.
+            if !delivered {
+                let rendered = format!("{:?} {:?}", wire.preamble, wire.chat_history);
+                assert!(!rendered.contains("[image:"), "{role:?}: {rendered}");
+            }
+        }
+
+        // The stakes: this is what the budget would charge for a block no
+        // provider receives, since a dimensionless image prices at the cap.
+        assert_eq!(content_block_tokens(&image_block()), IMAGE_TOKEN_CEILING);
     }
 
     /// A format with no pixel grid to read cannot be priced, so it is not
