@@ -66,6 +66,15 @@ pub async fn seed_default_identity_files(paths: &WorkspacePaths) -> anyhow::Resu
         .chain([(
             paths.shared_user_file(),
             IdentityKind::User.default_content(),
+        )])
+        // The built-in's memory index. `ensure_persona_layout` seeds this for
+        // every *custom* agent and skips the built-in, so without it here the
+        // built-in's index appears lazily at first assembly and never enters
+        // the baseline — making its first real change read as the file being
+        // created, which is the one thing the baseline exists to prevent.
+        .chain([(
+            paths.persona_memory_index_file(crate::paths::BUILTIN_PERSONA_DIR),
+            crate::prompt::MEMORY_INDEX_TEMPLATE,
         )]);
     let mut seeded: Vec<String> = Vec::new();
     for (target, default) in targets {
@@ -200,6 +209,30 @@ mod tests {
                 kind.file_name()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn seed_default_identity_files_seeds_the_builtins_memory_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        ensure_layout(&paths).await.expect("layout");
+        seed_default_identity_files(&paths).await.expect("seed");
+
+        // The built-in is skipped by `ensure_persona_layout`, so this is its
+        // only chance to enter the baseline alongside its identity files.
+        let index = paths.persona_memory_index_file(crate::paths::BUILTIN_PERSONA_DIR);
+        assert!(index.is_file(), "missing {}", index.display());
+        let tracked = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(paths.personas_dir())
+            .args(["ls-files", "--error-unmatch", "baybo/memory/MEMORY.md"])
+            .status()
+            .await
+            .expect("git ls-files");
+        assert!(
+            tracked.success(),
+            "the index must be in the baseline commit"
+        );
     }
 
     #[tokio::test]

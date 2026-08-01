@@ -24,7 +24,8 @@ struct CronJobRowTests {
             timezone: timezone,
             status: status,
             nextTriggerAt: nextTriggerAt,
-            lastTriggeredAt: nil)
+            lastTriggeredAt: nil,
+            builtin: false)
     }
 
     @Test func aNamedJobShowsItsName() {

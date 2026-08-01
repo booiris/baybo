@@ -8,7 +8,9 @@ use baybo_model::{
     LineageKind, LlmEntryName, Session, SessionId,
 };
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
+use baybo_store::session::{
+    DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+};
 
 pub struct SqliteSessionStore {
     pool: SqlitePool,
@@ -1366,6 +1368,133 @@ impl SessionStore for SqliteSessionStore {
                 })
             })
             .collect()
+    }
+
+    async fn dream_candidates(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<DreamCandidate>> {
+        // Same human-authored `source` tags as `last_user_messages` below.
+        const HUMAN_SOURCES_SQL: &str = "'user', 'user_interjection'";
+        let since_us = super::time::to_us(since);
+        let until_us = super::time::to_us(until);
+        let rows = self
+            .pool
+            .interact("sessions.dream_candidates", move |conn| {
+                // Two arms over disjoint session sets, so `UNION ALL` needs
+                // no dedup pass. `latest_ordinal` comes from a correlated
+                // MAX over the primary key, which sqlite answers from the
+                // index's right edge.
+                //
+                // `compaction_inserted = 0` in both: compaction appends
+                // copies of rows that are still present as originals, so
+                // counting them fakes activity and reading them would
+                // consolidate one exchange twice.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, agent_id, title, last_at, human_msgs, read_from, latest \
+                     FROM ( \
+                       SELECT m.session_id AS session_id, s.agent_id AS agent_id, \
+                              s.title AS title, MAX(m.created_at) AS last_at, \
+                              COUNT(*) AS human_msgs, MIN(m.ordinal) AS read_from, \
+                              (SELECT MAX(z.ordinal) FROM session_messages z \
+                                WHERE z.session_id = m.session_id) AS latest \
+                       FROM session_messages m \
+                       JOIN sessions s ON s.id = m.session_id \
+                       WHERE s.dreamed_through_ordinal IS NULL \
+                         AND m.created_at >= ?1 AND m.created_at < ?2 \
+                         AND m.compaction_inserted = 0 \
+                         AND m.source IN ({HUMAN_SOURCES_SQL}) \
+                       GROUP BY m.session_id \
+                       UNION ALL \
+                       SELECT m.session_id, s.agent_id, s.title, MAX(m.created_at), \
+                              SUM(CASE WHEN m.source IN ({HUMAN_SOURCES_SQL}) THEN 1 ELSE 0 END), \
+                              MIN(m.ordinal), \
+                              (SELECT MAX(z.ordinal) FROM session_messages z \
+                                WHERE z.session_id = m.session_id) \
+                       FROM session_messages m \
+                       JOIN sessions s ON s.id = m.session_id \
+                       WHERE s.dreamed_through_ordinal IS NOT NULL \
+                         AND m.ordinal > s.dreamed_through_ordinal \
+                         AND m.compaction_inserted = 0 \
+                       GROUP BY m.session_id \
+                     ) \
+                     ORDER BY last_at DESC"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![since_us, until_us], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        rows.into_iter()
+            .map(
+                |(sid, agent_id, title, last_us, human, read_from_ordinal, latest_ordinal)| {
+                    let session_id = SessionId::from(sid);
+                    let last_activity_at = super::time::from_us(last_us).ok_or_else(|| {
+                        StorageError::Storage(format!(
+                            "session_messages.created_at out of range: {last_us}"
+                        ))
+                    })?;
+                    // A binding we cannot read means we do not know whose
+                    // conversation this is. The dream pass decides which memory
+                    // tree a conversation belongs to from exactly this field, so
+                    // guessing would file somebody's conversation under another
+                    // agent — drop the row instead.
+                    let agent_id =
+                        match decode_agent_id(&agent_id, &session_id, OnCorruptBinding::Fail) {
+                            Ok(agent_id) => agent_id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "skipping session with an unreadable agent binding: {e}"
+                                );
+                                return Ok(None);
+                            }
+                        };
+                    Ok(Some(DreamCandidate {
+                        agent_id,
+                        session_id,
+                        title,
+                        last_activity_at,
+                        human_message_count: human,
+                        read_from_ordinal,
+                        latest_ordinal,
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| rows.into_iter().flatten().collect())
+    }
+
+    async fn set_dreamed_through_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.set_dreamed_through_ordinal", move |conn| {
+                // MAX-wins so a slow writer cannot rewind the cursor and
+                // hand the same conversation to a later pass a second time.
+                Ok(conn.execute(
+                    "UPDATE sessions \
+                     SET dreamed_through_ordinal = MAX(COALESCE(dreamed_through_ordinal, -1), ?2) \
+                     WHERE id = ?1",
+                    rusqlite::params![sid, ordinal],
+                )? > 0)
+            })
+            .await
     }
 
     async fn last_user_messages(
@@ -3107,6 +3236,313 @@ mod tests {
         let title_map: std::collections::HashMap<_, _> = titles.into_iter().collect();
         assert_eq!(title_map[&a.id], Some("A".into()));
         assert_eq!(title_map[&b.id], None);
+    }
+
+    #[tokio::test]
+    async fn a_never_dreamt_session_is_selected_by_the_window_and_only_for_human_talk() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let spoken_in = make_root_session("had-a-conversation");
+        store.save(&spoken_in).await.unwrap();
+        let silent = make_root_session("machine-only");
+        store.save(&silent).await.unwrap();
+
+        let before = Utc::now();
+        store
+            .append_session_message(&spoken_in.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &spoken_in.id,
+                &baybo_model::ChatMessage::assistant(text("hello")),
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(&spoken_in.id, &baybo_model::ChatMessage::user(text("more")))
+            .await
+            .unwrap();
+        // A fire that ran entirely on its own — exactly the shape of a
+        // dream fire, which must never feed the next one.
+        store
+            .append_session_message(
+                &silent.id,
+                &baybo_model::ChatMessage::assistant(text("nothing to report")),
+            )
+            .await
+            .unwrap();
+        let after = Utc::now() + chrono::Duration::seconds(1);
+
+        let active = store.dream_candidates(before, after).await.unwrap();
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert_eq!(active[0].session_id, spoken_in.id);
+        assert_eq!(
+            active[0].human_message_count, 2,
+            "assistant rows don't count"
+        );
+        assert!(active[0].agent_id.is_none(), "NULL agent_id is the builtin");
+        assert_eq!(active[0].read_from_ordinal, 0);
+        assert_eq!(
+            active[0].latest_ordinal, 2,
+            "the cursor's next resting place"
+        );
+
+        // A row carrying a different `user.id` is still the same person's:
+        // one human holds several ids, one per code path that minted a
+        // session, so this query does not partition on it at all. See
+        // `docs/todo/user-identity.md`.
+        let mut other_id = make_root_session("same-human-other-id");
+        other_id.user.id = "device-7b26".to_string();
+        store.save(&other_id).await.unwrap();
+        store
+            .append_session_message(&other_id.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        let both = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 2, "{both:?}");
+
+        // The window is half-open on both ends: a pass that already ran
+        // must not re-read the same conversation.
+        assert!(
+            store
+                .dream_candidates(after, after + chrono::Duration::seconds(60))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The reason the cursor exists. Once a conversation has been offered,
+    /// selection stops asking about human messages and about time: rows a
+    /// still-running turn appends afterwards — or a background delivery
+    /// hours later — are `MessageSource::Agent`, and no window over human
+    /// messages would ever surface them again.
+    #[tokio::test]
+    async fn once_offered_a_session_is_selected_by_cursor_whoever_wrote_the_new_rows() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let session = make_root_session("long-runner");
+        store.save(&session).await.unwrap();
+        let before = Utc::now();
+        store
+            .append_session_message(&session.id, &baybo_model::ChatMessage::user(text("ask")))
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::assistant(text("partial")),
+            )
+            .await
+            .unwrap();
+
+        let first = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].read_from_ordinal, 0);
+        assert!(
+            store
+                .set_dreamed_through_ordinal(&session.id, first[0].latest_ordinal)
+                .await
+                .unwrap()
+        );
+
+        // Same window, nothing new: the cursor takes it out of the running.
+        assert!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The turn finishes, appending only machine rows. The human never
+        // comes back. A time-and-human-message window is blind to this.
+        store
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::assistant(text("the actual answer")),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(second[0].read_from_ordinal, 2, "starts at the new row");
+        assert_eq!(
+            second[0].human_message_count, 0,
+            "nobody spoke, but it counts"
+        );
+
+        // Max-wins: a stale writer cannot rewind the cursor and hand the
+        // same conversation over twice.
+        assert!(
+            store
+                .set_dreamed_through_ordinal(&session.id, 0)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()[0]
+                .read_from_ordinal,
+            2,
+            "a lower ordinal must not rewind the cursor"
+        );
+    }
+
+    /// Every router-level dream test runs against `MemorySessionStore`, and
+    /// the SQL runs in none of them — so a divergence between the two would
+    /// be invisible exactly where it decides what gets consolidated. One
+    /// fixture, both stores, identical output.
+    #[tokio::test]
+    async fn the_memory_fake_selects_what_the_sql_selects() {
+        use baybo_session::test_support::MemorySessionStore;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sqlite = SqliteSessionStore::new(pool);
+        let memory = MemorySessionStore::new();
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let quiet = make_root_session("machine-only");
+        let talked = make_root_session("had-a-conversation");
+        let before = Utc::now();
+        for store in [&sqlite as &dyn SessionStore, &memory as &dyn SessionStore] {
+            for session in [&quiet, &talked] {
+                store.save(session).await.unwrap();
+            }
+            store
+                .append_session_message(
+                    &quiet.id,
+                    &baybo_model::ChatMessage::assistant(text("nobody asked")),
+                )
+                .await
+                .unwrap();
+            store
+                .append_session_message(&talked.id, &baybo_model::ChatMessage::user(text("hi")))
+                .await
+                .unwrap();
+            store
+                .append_session_message(
+                    &talked.id,
+                    &baybo_model::ChatMessage::assistant(text("hello")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let shape = |c: &[baybo_store::DreamCandidate]| {
+            c.iter()
+                .map(|c| {
+                    (
+                        c.session_id.as_str().to_string(),
+                        c.human_message_count,
+                        c.read_from_ordinal,
+                        c.latest_ordinal,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let until = || Utc::now() + chrono::Duration::seconds(1);
+
+        // Arm one: never offered, so the time window and its human-message
+        // requirement decide.
+        let a = sqlite.dream_candidates(before, until()).await.unwrap();
+        let b = memory.dream_candidates(before, until()).await.unwrap();
+        assert_eq!(shape(&a), shape(&b), "sql {a:?} vs fake {b:?}");
+        assert_eq!(a.len(), 1, "the machine-only session is not activity");
+
+        // Arm two: offered, so the cursor decides — and a machine row above
+        // it counts, which is the arm the whole design turns on.
+        for store in [&sqlite as &dyn SessionStore, &memory as &dyn SessionStore] {
+            store
+                .set_dreamed_through_ordinal(&talked.id, 1)
+                .await
+                .unwrap();
+            store
+                .append_session_message(
+                    &talked.id,
+                    &baybo_model::ChatMessage::assistant(text("late tail")),
+                )
+                .await
+                .unwrap();
+        }
+        let a = sqlite.dream_candidates(before, until()).await.unwrap();
+        let b = memory.dream_candidates(before, until()).await.unwrap();
+        assert_eq!(shape(&a), shape(&b), "sql {a:?} vs fake {b:?}");
+        assert_eq!(shape(&a), vec![("had-a-conversation".to_string(), 0, 2, 2)]);
+    }
+
+    /// Compaction appends copies of rows that are still present as
+    /// originals. Counting them fakes activity; selecting on them would
+    /// re-offer a conversation nothing happened in.
+    #[tokio::test]
+    async fn compaction_alone_does_not_make_a_conversation_look_unconsolidated() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let session = make_root_session("compacted");
+        store.save(&session).await.unwrap();
+        let before = Utc::now();
+        store
+            .append_session_message(&session.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        let offered = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        store
+            .set_dreamed_through_ordinal(&session.id, offered[0].latest_ordinal)
+            .await
+            .unwrap();
+
+        store
+            .apply_session_compaction(
+                &session.id,
+                &[
+                    baybo_model::ChatMessage::agent_context(text("summary of the above")),
+                    baybo_model::ChatMessage::user(text("hi")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a compaction is not new activity"
+        );
     }
 
     #[tokio::test]

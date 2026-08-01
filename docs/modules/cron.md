@@ -69,6 +69,40 @@ The fire still ran and its reply row and transcript survive in the (hidden) sess
 
 **Visibility scope, not just a runtime no-op.** The tool is omitted from the LLM's tool list outside a recurring fire, via a trigger-scope axis on `ToolRegistry::tool_definitions_for_session` (`Tool::trigger_scope` → `ToolTriggerScope::CronFire`, keyed on `is_cron_conversation()`) that mirrors the manifest's `channels` axis. Both the channel and the trigger are fixed for a session's whole life, so the tool list stays byte-stable within a session and the prompt cache holds. The effect guard is separate: the fire's `NotifySilence` handle (`ToolContext::notify_silence`) is present only on a recurring fire turn, so a call on a user reply in a cron conversation — where the tool is visible for cache-stability but should not act — is a no-op.
 
+### Jobs the runtime owns
+
+`BuiltinCronJob` names the jobs the runtime owns — today only
+`Dream` — and each is seeded at boot by
+`CronScheduler::ensure_builtin_job` and carries `CronJob::builtin` — a flat
+`cron_jobs.builtin` column, never the `data` blob, for the same reason
+`pinned` is flat (every blob write reconstructs the row from a caller-held
+snapshot, so a bit in the blob is reverted by the next fire's `record_fire`).
+
+A built-in job is an ordinary job in two respects and not in two others. It
+pauses, resumes and reschedules like any other — and the way to switch it off
+for good is that job's own config switch (`memory.builtin.enabled` for the dream pass). But it **cannot be deleted**
+(`CronStore::delete` refuses it structurally; `CronScheduler::delete_job`
+refuses it earlier with `CronError::Builtin` so the gateway answers 400 rather
+than 500, and both the web and iOS cron lists hide the affordance), and its
+**title and prompt cannot be edited** (`update_job` refuses that patch): the
+instruction is the runtime's, and it is the only description of what an
+unattended, recurring fire may do to the files it can write. Because nothing
+can edit it, boot re-asserts
+the title and prompt from the binary — otherwise an install would run the
+wording it was seeded with forever — while leaving schedule, timezone and
+status exactly as the operator left them. Boot reconciliation is
+deliberately asymmetric — config **seeds** the schedule but never re-asserts
+it, so an operator who paused the job or moved it to another hour is not
+overridden by the next restart.
+
+Its fire also takes one detour no other job takes: the router computes a
+digest of what happened since the previous fire and **skips the fire
+entirely** when that window is empty. See
+[`memory-builtin.md`](memory-builtin.md), which also explains why the
+previous-fire cursor rides `CronExecution::previous_fire_at` rather than the
+job row: the row is advanced before the trigger is dispatched, so it already
+holds *this* fire's stamp by the time anything downstream reads it.
+
 ## Design Decisions
 
 ### Framing lives in the persisted content, not in a wire envelope

@@ -174,14 +174,18 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
     let tool_registry = Arc::new(baybo_tools::ToolRegistry::with_defaults(
-        stores.blob.clone(),
-        workspace_paths.clone(),
-        tool_proxy,
-        // argv one-shots (llm/doctor/status) barely touch Bash; there is no
-        // config reloader on this path, so use the default Bash permission policy.
-        Arc::new(baybo_tools::builtin::LivePermissionMode::new(
-            baybo_tools::builtin::BashPermissionMode::default(),
-        )),
+        baybo_tools::builtin::DefaultToolsConfig {
+            blob_store: stores.blob.clone(),
+            workspace_paths: workspace_paths.clone(),
+            proxy: tool_proxy,
+            // argv one-shots (llm/doctor/status) barely touch Bash; there is
+            // no config reloader on this path, so use the default Bash
+            // permission policy.
+            permission: Arc::new(baybo_tools::builtin::LivePermissionMode::new(
+                baybo_tools::builtin::BashPermissionMode::default(),
+            )),
+            builtin_memory: config.memory.builtin.enabled,
+        },
     ));
     let workspace = Arc::new(workspace_paths.clone());
     let channels_registry = Arc::new(baybo_channels::ChannelRegistry::new());

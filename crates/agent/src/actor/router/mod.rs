@@ -252,6 +252,10 @@ pub struct Router {
     /// each actor derives its `actor_token` as a child of this so
     /// process shutdown cascades into every in-flight turn.
     actor_parent_token: CancellationToken,
+    /// Workspace addresses. The dream fire's digest names each
+    /// conversation by its virtual transcript path and each agent by its
+    /// memory directory, and both are composed from here.
+    workspace: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 /// Construction bundle for [`Router`]. Every field is required — call
@@ -279,6 +283,8 @@ pub struct RouterConfig {
     /// rebuilding the router. Production wiring sources it from config;
     /// tests build one from whatever values they want.
     pub rate_limit: Arc<LiveRateLimit>,
+    /// Workspace addresses — see [`Router::workspace`].
+    pub workspace: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 impl Router {
@@ -296,6 +302,7 @@ impl Router {
             cron_trigger_rx,
             actor_parent_token,
             rate_limit,
+            workspace,
         } = config;
         Self {
             session_manager,
@@ -310,6 +317,7 @@ impl Router {
             agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
             actor_parent_token,
+            workspace,
         }
     }
 

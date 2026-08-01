@@ -17,6 +17,12 @@ The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
 `provider = noop`) wires `None` (the inert no-op path), so an unconfigured
 deployment recalls, writes, and bills nothing.
 
+**Not to be confused with the built-in file-based memory**
+([`memory-builtin.md`](memory-builtin.md)): the `memory/` tree the model writes
+with `Edit` / `Write` / `MemoryDelete` and the dream job tidies. That one is
+on by default and shares nothing with this trait — no impl, no slot, no
+config field. A deployment can run both.
+
 This supersedes the previous CRUD `MemoryManager` facade (now removed, along with
 `MemoryStore`/`MemoryEntry`/`MemoryCategory`, the sqlite impl, the `/v1/memory`
 admin REST, and the `memories` table — no longer created; the cleanup migration

@@ -35,6 +35,8 @@ pub mod bash;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
+pub(crate) mod managed_repo;
+pub mod memory_delete;
 pub mod now;
 pub(crate) mod paths;
 pub mod read;
@@ -54,6 +56,7 @@ pub use echo::EchoTool;
 pub use edit::EditTool;
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
+pub use memory_delete::MemoryDeleteTool;
 pub use now::NowTool;
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
@@ -72,12 +75,32 @@ pub use write::WriteTool;
 ///
 /// Browser tools are not listed here — they arrive dynamically when
 /// the embedded browser MCP server connects through the reconciler.
-pub fn default_tools(
-    blob_store: Arc<dyn BlobStore>,
-    workspace_paths: WorkspacePaths,
-    proxy: Option<reqwest::Proxy>,
-    permission: Arc<bash::LivePermissionMode>,
-) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+/// Everything the built-in tool set needs, named at the call site.
+///
+/// A struct rather than five positional parameters because the last one is a
+/// bare `bool`: `with_defaults(store, paths, None, permission, true)` says
+/// nothing about what `true` enables, and the two before it are an `Option`
+/// and an `Arc` that read the same way in any order.
+pub struct DefaultToolsConfig {
+    pub blob_store: Arc<dyn BlobStore>,
+    pub workspace_paths: WorkspacePaths,
+    pub proxy: Option<reqwest::Proxy>,
+    pub permission: Arc<bash::LivePermissionMode>,
+    /// `memory.builtin.enabled`. With built-in memory off nothing ever
+    /// mentions a memory directory to the model, so offering it a verb for
+    /// tidying one would describe a place that does not exist in its prompt.
+    pub builtin_memory: bool,
+}
+
+pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+    let DefaultToolsConfig {
+        blob_store,
+        workspace_paths,
+        proxy,
+        permission,
+        builtin_memory,
+    } = config;
+    let workspace_paths_for_memory = workspace_paths.clone();
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
@@ -107,6 +130,12 @@ pub fn default_tools(
         trusted(JobListTool, vec![]),
         trusted(JobStopTool, vec![]),
     ];
+    if builtin_memory {
+        tools.push(trusted(
+            MemoryDeleteTool::new(workspace_paths_for_memory),
+            vec![ToolCapability::WriteFile],
+        ));
+    }
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
     tools

@@ -21,6 +21,7 @@ baybo-tools = { workspace = true }
 
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+iana-time-zone = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

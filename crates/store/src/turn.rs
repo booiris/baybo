@@ -61,6 +61,18 @@ pub trait TurnStore: Send + Sync {
     /// a session's live turns without loading a long-lived session's entire
     /// turn history just to filter it down to the few in flight.
     async fn list_active_by_session(&self, session_id: &SessionId) -> Result<Vec<TurnRow>>;
+    /// Every session that has at least one non-terminal turn, as one
+    /// grouped query rather than a [`Self::list_active_by_session`] per
+    /// candidate.
+    ///
+    /// The dream pass asks this to leave a conversation alone while its
+    /// turn is still writing: read now and it consolidates half an
+    /// exchange, and the rows the turn appends afterwards carry
+    /// `MessageSource::Agent`, so nothing that selects on human messages
+    /// would ever offer them again. Deferring is only safe because the
+    /// pass's cursor is an ordinal it did not advance — see
+    /// [`crate::session::SessionStore::set_dreamed_through_ordinal`].
+    async fn sessions_with_live_turns(&self) -> Result<Vec<SessionId>>;
     /// Filter by the snake_case `TurnStatusKind` wire string.
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<TurnRow>>;
     async fn list_children(&self, parent_turn_id: &TurnId) -> Result<Vec<TurnRow>>;

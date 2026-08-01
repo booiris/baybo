@@ -24,6 +24,11 @@ pub enum CronError {
     /// the duplicate dispatch.
     #[error("cron execution already dispatched: {0}")]
     AlreadyDispatched(String),
+    /// A delete aimed at a job the runtime owns and seeds (the dream pass).
+    /// It has a switch in `baybo.json` and a pause button; deleting it would
+    /// leave nothing to recreate the user's schedule for it.
+    #[error("cron job {0} is built in: pause it, or switch the feature off in config")]
+    Builtin(String),
     #[error("cron storage error: {0}")]
     Storage(String),
     #[error(transparent)]

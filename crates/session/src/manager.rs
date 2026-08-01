@@ -383,15 +383,40 @@ impl SessionManager {
     /// before any compression folded earlier turns into a summary. Errors
     /// with `SessionError::NotFound` if the session row is missing.
     pub async fn full_transcript(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+        Ok(self
+            .transcript_from(session_id, 0)
+            .await?
+            .into_iter()
+            .map(|row| row.message)
+            .collect())
+    }
+
+    /// [`Self::full_transcript`] from `from_ordinal` on, each message paired
+    /// with its ordinal.
+    ///
+    /// The ordinals ride along because a caller that starts mid-conversation
+    /// still has to number what it renders by real position — a slice that
+    /// restarts at `[0]` reads as a whole conversation and misplaces every
+    /// reference into it.
+    ///
+    /// The bound is pushed into the query rather than applied to a loaded
+    /// `Vec`: `(session_id, ordinal)` is the primary key, so this is an
+    /// index range scan over the tail, and reading the last few messages of
+    /// a months-old conversation costs what those messages cost.
+    pub async fn transcript_from(
+        &self,
+        session_id: &SessionId,
+        from_ordinal: i64,
+    ) -> Result<Vec<StoredMessage>> {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        let rows = self
-            .store
-            .load_session_messages_with_supersede(session_id)
+        // The store's bound is exclusive; this one is inclusive, because
+        // "start at message N" is what the caller has.
+        self.store
+            .load_session_messages_with_supersede_since(session_id, from_ordinal.saturating_sub(1))
             .await
-            .map_err(SessionError::from)?;
-        Ok(rows.into_iter().map(|r| r.message).collect())
+            .map_err(SessionError::from)
     }
 
     /// Reverse-paginated slice of the active transcript: the

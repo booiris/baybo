@@ -1815,6 +1815,13 @@ export interface components {
         };
         /** @description Mirror of [`baybo_cron::CronJob`]. */
         CronJob: {
+            /**
+             * @description Whether the runtime owns this job (the dream pass). Such a job can be
+             *     paused and rescheduled like any other, but `DELETE` refuses it —
+             *     clients should present pause rather than delete. `#[serde(default)]`
+             *     so it is not required on the wire (defaults false).
+             */
+            builtin?: boolean;
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
             created_at: string;
@@ -4531,6 +4538,13 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /**
+                             * @description Whether the runtime owns this job (the dream pass). Such a job can be
+                             *     paused and rescheduled like any other, but `DELETE` refuses it —
+                             *     clients should present pause rather than delete. `#[serde(default)]`
+                             *     so it is not required on the wire (defaults false).
+                             */
+                            builtin?: boolean;
                             channel: components["schemas"]["ChannelType"];
                             /** Format: date-time */
                             created_at: string;
@@ -4695,6 +4709,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The job is built in (the dream pass) and cannot be deleted; pause it or switch it off in config */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Unauthorized */
             401: {
                 headers: {
@@ -4749,7 +4772,7 @@ export interface operations {
                     "application/json": components["schemas"]["CronJob"];
                 };
             };
-            /** @description The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed) */
+            /** @description The body sets no field, blanks the prompt, carries a schedule with no future fire time (an `at` whose moment has passed), or tries to rename or reword a **built-in** job (`builtin: true`) — its title and instruction belong to the runtime, while its schedule and timezone remain editable */
             400: {
                 headers: {
                     [name: string]: unknown;

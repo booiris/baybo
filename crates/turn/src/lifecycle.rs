@@ -366,6 +366,26 @@ impl TurnLifecycle {
             .collect()
     }
 
+    /// Every session with a turn still writing, as one grouped query.
+    ///
+    /// The dream pass asks this to leave those conversations alone: reading
+    /// one now consolidates half an exchange, and the rows the turn appends
+    /// afterwards are `MessageSource::Agent`, so no human-message predicate
+    /// would ever offer them again. Unfiltered by kind on purpose — a
+    /// `/compact` or a background-notification turn appends rows just as a
+    /// chat turn does, and it is the appending, not the visibility, that
+    /// makes reading early lossy.
+    pub async fn sessions_with_live_turns(
+        &self,
+    ) -> Result<std::collections::HashSet<baybo_model::SessionId>> {
+        Ok(self
+            .store
+            .sessions_with_live_turns()
+            .await?
+            .into_iter()
+            .collect())
+    }
+
     /// Non-terminal turns for one session that represent user-visible
     /// turn activity. This centralizes the `Turn::is_chat_turn` filter so
     /// callers such as `/stop`, crash recovery, and TurnState projection

@@ -179,6 +179,11 @@ struct WireCronJob {
     next_trigger_at: Option<String>,
     #[serde(default)]
     last_triggered_at: Option<String>,
+    /// Whether the runtime owns this job. Such a job pauses and reschedules
+    /// like any other but refuses `DELETE`, so the row must not offer one.
+    /// `#[serde(default)]`: absent from a gateway older than the field.
+    #[serde(default)]
+    builtin: bool,
 }
 
 #[derive(Deserialize)]
@@ -541,6 +546,7 @@ pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
                 },
                 next_trigger_at: job.next_trigger_at,
                 last_triggered_at: job.last_triggered_at,
+                builtin: job.builtin,
             })
         })
         .collect())

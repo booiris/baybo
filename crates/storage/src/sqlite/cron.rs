@@ -32,7 +32,12 @@ impl SqliteCronStore {
 // callback may only fail with a rusqlite error, so the queries below pull
 // the raw columns out and hand them here.
 
-fn job_from_row(deleted_us: Option<i64>, pinned_col: i64, data: &str) -> Result<CronJob> {
+fn job_from_row(
+    deleted_us: Option<i64>,
+    pinned_col: i64,
+    builtin_col: i64,
+    data: &str,
+) -> Result<CronJob> {
     let mut job: CronJob = serde_json::from_str(data)
         .map_err(|e| StorageError::Storage(format!("failed to deserialize cron job: {e}")))?;
     // The row-level `deleted_at` column is the source of truth — `delete` and
@@ -51,6 +56,9 @@ fn job_from_row(deleted_us: Option<i64>, pinned_col: i64, data: &str) -> Result<
     // `set_pinned` owns it, `save` never writes it, and it is `#[serde(skip)]`
     // so the blob never carries it either.
     job.pinned = pinned_col != 0;
+    // And for `builtin`: written once by the seed, never by `save`, and
+    // `#[serde(skip)]` so no blob write can invent it.
+    job.builtin = builtin_col != 0;
     Ok(job)
 }
 
@@ -67,8 +75,9 @@ fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
 }
 
 /// Columns every job query selects; [`job_from_row`] takes the `deleted_at`
-/// (index 4), `pinned` (index 5) and `data` (index 6) columns out of that list.
-const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, pinned, data";
+/// (index 4), `pinned` (index 5), `builtin` (index 6) and `data` (index 7)
+/// columns out of that list.
+const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, pinned, builtin, data";
 
 /// The predicate that keeps recycled jobs out of a query. Applied in SQL — not
 /// in the caller — so no listing can forget it.
@@ -103,8 +112,9 @@ impl From<&CronJob> for Unmoved {
     }
 }
 
-/// The `(deleted_at, pinned, data)` triple each job query lifts out of a row.
-type TurnRow = (Option<i64>, i64, String);
+/// The `(deleted_at, pinned, builtin, data)` tuple each job query lifts out
+/// of a row.
+type TurnRow = (Option<i64>, i64, i64, String);
 
 /// Columns every execution query selects; [`execution_from_row`] takes the
 /// `status` (index 5) and `data` (index 6) columns out of that list.
@@ -139,17 +149,20 @@ fn serialize_execution(exec: &CronExecution) -> Result<String> {
 
 fn decode_jobs(rows: Vec<TurnRow>) -> Result<Vec<CronJob>> {
     rows.iter()
-        .map(|(deleted_us, pinned, data)| job_from_row(*deleted_us, *pinned, data))
+        .map(|(deleted_us, pinned, builtin, data)| {
+            job_from_row(*deleted_us, *pinned, *builtin, data)
+        })
         .collect()
 }
 
-/// Lift the `(deleted_at, pinned, data)` triple out of a row selected with
-/// [`JOB_COLS`].
+/// Lift the `(deleted_at, pinned, builtin, data)` tuple out of a row
+/// selected with [`JOB_COLS`].
 fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
     Ok((
         row.get::<_, Option<i64>>(4)?,
         row.get::<_, i64>(5)?,
-        row.get::<_, String>(6)?,
+        row.get::<_, i64>(6)?,
+        row.get::<_, String>(7)?,
     ))
 }
 
@@ -169,11 +182,12 @@ impl CronStore for SqliteCronStore {
         let user_id = job.user_id.clone();
         let status = job.status.as_str().to_string();
         let pinned_flag: i64 = if job.pinned { 1 } else { 0 };
+        let builtin_flag: i64 = if job.builtin { 1 } else { 0 };
         self.pool
             .interact("cron.create", move |conn| {
                 conn.execute(
-                    "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, deleted_at, pinned, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![id, user_id, status, next_trigger_us, deleted_us, pinned_flag, data],
+                    "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, deleted_at, pinned, builtin, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![id, user_id, status, next_trigger_us, deleted_us, pinned_flag, builtin_flag, data],
                 )?;
                 Ok(())
             })
@@ -196,7 +210,9 @@ impl CronStore for SqliteCronStore {
             .await?;
 
         match row {
-            Some((deleted_us, pinned, data)) => Ok(Some(job_from_row(deleted_us, pinned, &data)?)),
+            Some((deleted_us, pinned, builtin, data)) => {
+                Ok(Some(job_from_row(deleted_us, pinned, builtin, &data)?))
+            }
             None => Ok(None),
         }
     }
@@ -290,7 +306,7 @@ impl CronStore for SqliteCronStore {
                 // cannot see it. `updated_at` is the one field every writer
                 // stamps, which makes it the row's version: a snapshot still
                 // carrying the stored one is a snapshot nothing has landed on.
-                if job_from_row(None, 0, &stored)?.updated_at != expected_updated_at {
+                if job_from_row(None, 0, 0, &stored)?.updated_at != expected_updated_at {
                     return Ok(false);
                 }
 
@@ -333,7 +349,7 @@ impl CronStore for SqliteCronStore {
                     return Ok(false);
                 };
 
-                let mut job = job_from_row(None, 0, &data)?;
+                let mut job = job_from_row(None, 0, 0, &data)?;
                 job.status = fire.status;
                 job.next_trigger_at = fire.next_trigger_at;
                 job.last_triggered_at = Some(fire.last_triggered_at);
@@ -356,7 +372,17 @@ impl CronStore for SqliteCronStore {
     }
 
     async fn delete(&self, job_id: &str) -> Result<()> {
-        if self.load_job(job_id).await?.is_deleted() {
+        let job = self.load_job(job_id).await?;
+        // A built-in job is part of the runtime, switched off in config and
+        // paused from the UI — never deleted, because nothing would recreate
+        // the user's schedule for it. Enforced here so no caller can route
+        // around the gateway's own refusal.
+        if job.builtin {
+            return Err(StorageError::Conflict(format!(
+                "cron job {job_id} is built in and cannot be deleted; pause it instead"
+            )));
+        }
+        if job.is_deleted() {
             return Ok(());
         }
         self.write_deleted_at(job_id, Some(Utc::now())).await
@@ -797,6 +823,7 @@ mod tests {
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
+            builtin: false,
         }
     }
 
@@ -1006,6 +1033,35 @@ mod tests {
         assert_eq!(store.list_by_user("u1").await.unwrap().len(), 1);
         assert_eq!(store.list_enabled().await.unwrap().len(), 1);
         assert!(store.list_deleted().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_builtin_job_survives_delete_but_is_otherwise_ordinary() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("baybo-dream", "owner", CronStatus::Enabled);
+        job.builtin = true;
+        store.create(&job).await.unwrap();
+
+        // The flat column round-trips even though the blob never carries it.
+        let loaded = store.get("baybo-dream").await.unwrap().expect("job");
+        assert!(loaded.builtin);
+
+        let err = store.delete("baybo-dream").await.unwrap_err();
+        assert!(matches!(err, StorageError::Conflict(_)), "got: {err:?}");
+        let still_live = store.get("baybo-dream").await.unwrap().expect("job");
+        assert!(!still_live.is_deleted(), "a built-in job is never binned");
+
+        // Pausing it, on the other hand, is exactly how it is switched off.
+        let mut paused = still_live.clone();
+        paused.status = CronStatus::Disabled;
+        store.save(&paused).await.unwrap();
+        let after = store.get("baybo-dream").await.unwrap().expect("job");
+        assert_eq!(after.status, CronStatus::Disabled);
+        assert!(after.builtin, "a save must not clear the flat column");
     }
 
     #[tokio::test]

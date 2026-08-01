@@ -1756,6 +1756,25 @@ mod tests {
                 .filter(|t| *t >= from && *t < to)
                 .collect())
         }
+        async fn dream_candidates(
+            &self,
+            _since: DateTime<Utc>,
+            _until: DateTime<Utc>,
+        ) -> std::result::Result<Vec<baybo_store::DreamCandidate>, baybo_store::StorageError>
+        {
+            // Not exercised by the query crate's tests — the dream digest
+            // is read through the real store.
+            Ok(Vec::new())
+        }
+
+        async fn set_dreamed_through_ordinal(
+            &self,
+            _session_id: &SessionId,
+            _ordinal: i64,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            Ok(false)
+        }
+
         async fn last_user_messages(
             &self,
             session_ids: &[SessionId],

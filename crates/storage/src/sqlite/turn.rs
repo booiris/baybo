@@ -20,6 +20,13 @@ impl SqliteTurnStore {
 const SELECT_COLS: &str = "id, session_id, parent_turn_id, kind, status_kind, \
      created_at, started_at, ended_at, data";
 
+/// `status_kind` values of a turn that has NOT settled — the SQL spelling of
+/// [`TurnStatusKind::needs_recovery`]. Three queries filter on exactly this
+/// set (recover at boot, list a session's live turns, find who is mid-turn
+/// right now), and the same three literals in three places is how they drift
+/// apart; `status_sql_matches_the_enum` pins this against the enum.
+const NON_TERMINAL_STATUS_SQL: &str = "'pending', 'in_progress', 'stuck'";
+
 /// The `turns` columns exactly as sqlite hands them over, before any fallible
 /// decoding (turn-id parse, µs → `DateTime`). The row closure of `query_map`
 /// can only surface `rusqlite` errors, so decoding happens after the collect.
@@ -159,12 +166,28 @@ impl TurnStore for SqliteTurnStore {
             "turns.list_active_by_session",
             format!(
                 "SELECT {SELECT_COLS} FROM turns \
-                 WHERE session_id = ?1 AND status_kind IN ('pending', 'in_progress', 'stuck') \
+                 WHERE session_id = ?1 AND status_kind IN ({NON_TERMINAL_STATUS_SQL}) \
                  ORDER BY created_at"
             ),
             vec![Value::from(session_id.as_str().to_string())],
         )
         .await
+    }
+
+    async fn sessions_with_live_turns(&self) -> Result<Vec<SessionId>> {
+        self.pool
+            .interact("turns.sessions_with_live_turns", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT DISTINCT session_id FROM turns \
+                     WHERE status_kind IN ({NON_TERMINAL_STATUS_SQL})"
+                ))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map(|rows| rows.into_iter().map(SessionId::from).collect())
     }
 
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<TurnRow>> {
@@ -181,7 +204,7 @@ impl TurnStore for SqliteTurnStore {
             "turns.list_recoverable",
             format!(
                 "SELECT {SELECT_COLS} FROM turns \
-                 WHERE status_kind IN ('pending', 'in_progress', 'stuck') ORDER BY created_at"
+                 WHERE status_kind IN ({NON_TERMINAL_STATUS_SQL}) ORDER BY created_at"
             ),
             vec![],
         )
@@ -326,6 +349,20 @@ impl SqliteTurnStore {
 #[cfg(test)]
 #[allow(unused_must_use)] // tests build state machines via direct calls; the TurnTransition audit record isn't the assertion target
 mod tests {
+
+    /// The SQL const and the enum are one fact in two places; the queries
+    /// that filter on it decide what gets recovered at boot and what the
+    /// dream pass leaves alone, so a drift here is silent and expensive.
+    #[test]
+    fn non_terminal_status_sql_matches_the_enum() {
+        use baybo_turn::TurnStatusKind::*;
+        let expected: Vec<String> = [Pending, InProgress, Stuck, Cancelled, Failed, Completed]
+            .into_iter()
+            .filter(|k| k.needs_recovery())
+            .map(|k| format!("'{}'", k.as_snake_case()))
+            .collect();
+        assert_eq!(NON_TERMINAL_STATUS_SQL, expected.join(", "));
+    }
     use super::*;
     use baybo_model::{ContentBlock, TriggerKind};
     use baybo_turn::{Turn, TurnInput, TurnStatus};
