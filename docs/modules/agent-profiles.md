@@ -186,7 +186,7 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 - Feature subsystem, not a crate: no `baybo-agent-profiles` crate until there is behavior beyond CRUD. Domain types in `model`, port in `store`, impl in `storage`, policy in `gateway` handlers.
 - **No runtime coupling in v1.** `ContextManager`, `AgentLoop`, the spawn router, and `SubagentRegistry` are untouched. Deleting a custom profile can strand nothing, because nothing references profiles yet.
 - Strictly disjoint from `SubagentProfile` and from the workspace Soul; the only shared vocabulary is `baybo-model` (`ExternalAgentKind`, `LlmEntryName`, the backend tag strings).
-- All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere.
+- All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere. Deleting a row does not touch `personas/<id>/`, and nothing in the persona path consults the row — so a bound conversation keeps the agent it has been talking to, the same way it keeps that agent's memories.
 - Only `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`); `description` and `system_prompt` are deliberately bounded only by the admin request-body limit.
 - Profile rows are user data with a normal delete affordance — the session never-delete rule does not apply — but there is still no background sweeper of any kind, and orphaned avatar blobs stay inert.
 

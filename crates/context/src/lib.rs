@@ -79,7 +79,6 @@ use baybo_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
     render_skill_for_slash,
 };
-use baybo_store::agent_profile::AgentProfileStore;
 use baybo_trace::LlmCallInputs;
 use baybo_workspace::{IdentityKind, IdentitySource};
 use parking_lot::RwLock;
@@ -281,11 +280,16 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
-    /// For an agent-bound session: `(profile store, agent id)`. Resolves the
-    /// agent's soul file and its skill scope. `None` for an unbound session,
-    /// which reads the workspace soul and the shared skill set — the same
-    /// thing a session bound to the built-in profile reads.
-    agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
+    /// The agent this session runs as, when it is bound to one. Names the
+    /// persona files to read and the skill overlay to see. `None` for an
+    /// unbound session, which reads the workspace persona and the shared
+    /// skill set — the same thing a session bound to the built-in reads.
+    ///
+    /// Deliberately just the id: the profile *row* has no say in the persona.
+    /// Its content moved into files years' worth of edits ago, and its
+    /// existence does not gate them either — see
+    /// [`Self::resolve_persona_sources`].
+    agent: Option<AgentProfileId>,
     /// Transcript length at which a compaction last came back with no
     /// savings, so the next threshold check can short-circuit instead of
     /// spending another full-transcript LLM call on the same input.
@@ -354,10 +358,10 @@ pub struct ContextManagerConfig {
     /// resolving it to a prompt is context's turn, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
-    /// For an agent-bound session: `(profile store, agent id)`. One field
-    /// feeds both the soul arm and the skill scope, so a session cannot end
-    /// up running one agent's soul with another's skills. `None` ⇒ unbound.
-    pub agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
+    /// The agent this session runs as. One field feeds both the persona arm
+    /// and the skill scope, so a session cannot end up running one agent's
+    /// soul with another's skills. `None` ⇒ unbound.
+    pub agent: Option<AgentProfileId>,
 }
 
 /// The two per-agent identity files a session assembles from, resolved to a
@@ -523,7 +527,7 @@ impl ContextManager {
             return resolved;
         }
 
-        let sources = self.resolve_persona_sources().await;
+        let sources = self.resolve_persona_sources();
         match crate::prompts::soul::assemble(
             &self.workspace,
             IdentitySource::new(&sources.soul_path, &sources.soul_seed),
@@ -553,43 +557,23 @@ impl ContextManager {
     /// Which `SOUL.md` and `IDENTITY.md` this session reads, and what to seed
     /// each with when it does not exist yet.
     ///
-    /// The profile row is fetched live on every call — at the seed and at
-    /// every post-compaction reseed — so an edit to the profile or to either
-    /// file lands on the next reseed.
-    async fn resolve_persona_sources(&self) -> PersonaSources {
-        let workspace = || PersonaSources {
-            soul_path: self.workspace.identity_file(IdentityKind::Soul),
-            soul_seed: IdentityKind::Soul.default_content().to_string(),
-            self_image_path: self.workspace.identity_file(IdentityKind::Identity),
+    /// Keyed on the binding alone. The profile row is not consulted — not
+    /// even for its existence: the files are named by the id the session
+    /// carries, so deleting a profile leaves every bound conversation with
+    /// the persona it has been talking to. Swapping it for the workspace one
+    /// would change who the assistant is mid-thread, with nothing on screen
+    /// to say so, and the memory partition already survives a delete for the
+    /// same reason. It also means no store read on the seed path.
+    fn resolve_persona_sources(&self) -> PersonaSources {
+        let path = |kind: IdentityKind| match &self.agent {
+            Some(agent) => agent.identity_file(&self.workspace, kind),
+            None => self.workspace.identity_file(kind),
+        };
+        PersonaSources {
+            soul_path: path(IdentityKind::Soul),
+            soul_seed: baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_string(),
+            self_image_path: path(IdentityKind::Identity),
             self_image_seed: IdentityKind::Identity.default_content().to_string(),
-        };
-        let Some((store, agent_id)) = &self.agent else {
-            return workspace();
-        };
-        if agent_id.is_builtin() {
-            return workspace();
-        }
-        // A deleted profile is tolerated, not an error: the session survives
-        // on workspace-persona behaviour, and its memories stay partitioned
-        // under the stored id.
-        match store.get(agent_id).await {
-            // The row's content no longer feeds the prompt at all; the
-            // lookup survives to tell "bound to a live profile" from "bound
-            // to one that has been deleted", which fall back differently.
-            Ok(Some(_)) => PersonaSources {
-                soul_path: agent_id.identity_file(&self.workspace, IdentityKind::Soul),
-                soul_seed: baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_string(),
-                self_image_path: agent_id.identity_file(&self.workspace, IdentityKind::Identity),
-                self_image_seed: IdentityKind::Identity.default_content().to_string(),
-            },
-            Ok(None) => {
-                tracing::warn!(agent_id = %agent_id, "bound agent profile is gone; using workspace persona");
-                workspace()
-            }
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using workspace persona");
-                workspace()
-            }
         }
     }
 
@@ -678,10 +662,7 @@ impl ContextManager {
     /// when it has no overlay of its own (unbound, or bound to the built-in
     /// whose skills *are* the shared set).
     pub(crate) fn skill_scope(&self) -> Option<&AgentProfileId> {
-        self.agent
-            .as_ref()
-            .map(|(_, id)| id)
-            .filter(|id| !id.is_builtin())
+        self.agent.as_ref().filter(|id| !id.is_builtin())
     }
 
     /// Skills a user `/command` may expand here: anything carrying a
@@ -2719,11 +2700,10 @@ mod tests {
     /// distinctive enough to prove it did NOT leak in.
     fn bound_ctx(
         workspace: &Arc<baybo_workspace::WorkspacePaths>,
-        store: Arc<dyn AgentProfileStore>,
         agent: AgentProfileId,
     ) -> ContextManager {
         ContextManager::from_config(ContextManagerConfig {
-            agent: Some((store, agent)),
+            agent: Some(agent),
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: Arc::clone(workspace),
             keep_recent: 2,
@@ -2754,14 +2734,12 @@ mod tests {
         let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_SHOULD_NOT_APPEAR");
 
         let agent = AgentProfileId::parse("01JAGENT").expect("valid id");
-        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
-        store.insert(baybo_store::test_support::agent_profile_row(&agent));
         let persona_soul = workspace.persona_identity_file(agent.as_str(), IdentityKind::Soul);
         std::fs::create_dir_all(persona_soul.parent().expect("persona parent"))
             .expect("persona dir");
         std::fs::write(&persona_soul, "PERSONA_SOUL_MARKER").expect("write persona soul");
 
-        let ctx = bound_ctx(&workspace, store, agent.clone());
+        let ctx = bound_ctx(&workspace, agent.clone());
         let prompt = ctx.resolve_system_prompt().await;
         assert!(prompt.contains("PERSONA_SOUL_MARKER"), "{prompt}");
         assert!(
@@ -2802,10 +2780,8 @@ mod tests {
         let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL");
 
         let agent = AgentProfileId::parse("01JFRESH").expect("valid id");
-        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
-        store.insert(baybo_store::test_support::agent_profile_row(&agent));
 
-        let ctx = bound_ctx(&workspace, store, agent.clone());
+        let ctx = bound_ctx(&workspace, agent.clone());
         let prompt = ctx.resolve_system_prompt().await;
         // Seeded from the shipped template, verbatim.
         assert!(prompt.contains("## Core Truths"), "{prompt}");
@@ -2831,8 +2807,6 @@ mod tests {
         let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_MUST_NOT_APPEAR");
 
         let agent = AgentProfileId::parse("01JBROKEN").expect("valid id");
-        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
-        store.insert(baybo_store::test_support::agent_profile_row(&agent));
         // A directory where the soul should be: present, and unreadable as a
         // file — the shape an I/O failure takes that seeding cannot repair.
         std::fs::create_dir_all(
@@ -2840,7 +2814,7 @@ mod tests {
         )
         .expect("soul dir");
 
-        let ctx = bound_ctx(&workspace, store, agent);
+        let ctx = bound_ctx(&workspace, agent);
         let prompt = ctx.resolve_system_prompt().await;
         assert_eq!(prompt, crate::prompts::soul::FALLBACK_SYSTEM_PROMPT);
         assert!(
@@ -2849,28 +2823,36 @@ mod tests {
         );
     }
 
+    /// Deleting a profile row must not change who a bound conversation has
+    /// been talking to. The files are named by the id the session carries, so
+    /// they outlive the row — exactly as that agent's memories do.
     #[tokio::test]
-    async fn a_deleted_profile_falls_back_to_the_workspace_soul() {
+    async fn a_deleted_profile_keeps_the_agents_own_persona() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_FALLBACK");
+        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_MUST_NOT_APPEAR");
 
-        // Bound to an agent whose row is gone — the binding survives on the
-        // session, so this is the ordinary read path, not an error path.
+        // No row anywhere — the store is not consulted at all now.
         let agent = AgentProfileId::parse("01JGONE").expect("valid id");
-        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+        let persona_soul = workspace.persona_identity_file(agent.as_str(), IdentityKind::Soul);
+        std::fs::create_dir_all(persona_soul.parent().expect("persona parent"))
+            .expect("persona dir");
+        std::fs::write(&persona_soul, "PERSONA_SURVIVES_THE_ROW").expect("write persona soul");
 
-        let ctx = bound_ctx(&workspace, store, agent);
+        let ctx = bound_ctx(&workspace, agent);
         let prompt = ctx.resolve_system_prompt().await;
-        assert!(prompt.contains("WORKSPACE_SOUL_FALLBACK"), "{prompt}");
+        assert!(prompt.contains("PERSONA_SURVIVES_THE_ROW"), "{prompt}");
+        assert!(
+            !prompt.contains("WORKSPACE_SOUL_MUST_NOT_APPEAR"),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]
     async fn the_builtin_binding_is_byte_identical_to_no_binding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = workspace_with_soul(dir.path(), "SHARED_SOUL");
-        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
 
-        let bound = bound_ctx(&workspace, store, AgentProfileId::builtin())
+        let bound = bound_ctx(&workspace, AgentProfileId::builtin())
             .resolve_system_prompt()
             .await;
         let unbound = ContextManager::from_config(ContextManagerConfig {

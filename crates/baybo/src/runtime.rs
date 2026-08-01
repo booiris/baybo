@@ -823,10 +823,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // appended it to the scheduling conversation.
         let cron_store_for_spawn = graph.stores.cron.clone();
         let subagent_registry = Arc::clone(&graph.subagent_registry);
-        // The bound agent's row is read live by `ContextManager` at every
-        // seed and post-compaction reseed, so a profile edit reaches running
-        // sessions without a restart.
-        let agent_profile_store = graph.stores.agent_profile.clone();
         let workspace_paths_arc = Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
@@ -884,13 +880,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
-                        // One field feeds both the soul arm and the skill
+                        // One field feeds both the persona arm and the skill
                         // scope, so a session can never run one agent's soul
                         // with another's skills.
-                        agent: Some((
-                            Arc::clone(&agent_profile_store),
-                            session.state.agent_id_or_builtin(),
-                        )),
+                        agent: Some(session.state.agent_id_or_builtin()),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

@@ -550,7 +550,6 @@ dependencies = [
  "baybo-session",
  "baybo-skills",
  "baybo-storage",
- "baybo-store",
  "baybo-subagent",
  "baybo-tools",
  "baybo-trace",

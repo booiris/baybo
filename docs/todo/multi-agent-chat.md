@@ -237,19 +237,24 @@ pub async fn load_shared_identity(root: &Path) -> anyhow::Result<SharedIdentity>
 pub async fn assemble(paths: &WorkspacePaths, soul_path: &Path, soul_seed: &str) -> anyhow::Result<String>;
 ```
 
-`ContextManagerConfig` gains one field, shaped exactly like the subagent one it
-sits beside:
+`ContextManagerConfig` gains one field:
 
 ```rust
-pub agent: Option<(Arc<dyn AgentProfileStore>, AgentProfileId)>,
+pub agent: Option<AgentProfileId>,
 ```
+
+Just the id — the profile *row* has no say in the persona. Its content lives
+in files, and its **existence** does not gate them either: the files are named
+by the id the session carries, so they outlive a deleted row. That keeps the
+seed path free of any store read, and it means deleting a profile never
+changes who a bound conversation has been talking to.
 
 Resolution order in `try_resolve_system_prompt`, at the seed and at every
 post-compaction reseed:
 
 1. **subagent profile** override (child sessions) — unchanged;
-2. **agent binding** — `assemble(paths, paths.agent_soul_file(&id), seed)`, with
-   the seed read live from the profile row;
+2. **agent binding** — `assemble` over that agent's own `SOUL.md` and
+   `IDENTITY.md`, resolved from the id alone;
 3. **no binding** — `assemble(paths, profile/SOUL.md, DEFAULT_SOUL_CONTENT)`,
    byte-identical to today's behaviour.
 
@@ -473,7 +478,7 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | `agent_id` failing the id grammar (corrupt row / crafted path) | hard error at parse; never touches the filesystem |
 | External backend disabled or unprobed at creation | 400 "enable claude first" |
 | Backend disabled after sessions exist | turn fails with a clear in-chat error; the session survives and works again on re-enable |
-| Profile row deleted with bound sessions | builtin fallback (workspace soul, default LLM, no overlay) + `warn!`; memory stays keyed to the stored `agent_id`, so it survives and stays partitioned |
+| Profile row deleted with bound sessions | the conversation keeps the agent's **own** persona and skill overlay — both are named by the id the session carries, so they outlive the row, exactly as its memory partition does. Only the row's own fields go: the LLM pin falls back to `default-llm` with a `warn!` at the next spawn, and the roster loses the entry |
 | `personas/<id>/SOUL.md` missing | re-seeded from the template (or the legacy row prompt) and used |
 | `personas/<id>/SOUL.md` unreadable (I/O error) | `error!` naming both paths, then the minimal `FALLBACK_SYSTEM_PROMPT` — **never** the workspace persona |
 | Persona directory deleted while sessions live | empty overlay, soul re-seeded; no error |
@@ -481,9 +486,10 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | External CLI crash / parse error / lost resume state | turn fails visibly; `resume_key` untouched, nothing auto-cleared |
 | `/stop` on an external turn | the cancel token kills the subprocess (existing `register_running` path) |
 
-Persona directories are never swept. A deleted profile leaves its folder inert,
-exactly like an orphaned avatar blob — per CLAUDE.md there is no background
-cleanup of any kind.
+Persona directories are never swept. A deleted profile leaves its folder in
+place — which is what lets its bound conversations keep their persona — and
+recreating a profile with the same id would adopt it. Per CLAUDE.md there is
+no background cleanup of any kind.
 
 ## Testing
 
@@ -498,7 +504,8 @@ cleanup of any kind.
   (mock HTTP), plus a regression test that the mem0 tools no longer accept
   `agentId`.
 - **Integration** — bind → seed carries the agent's soul; edit `SOUL.md` →
-  reseed after compaction picks it up; profile delete → builtin fallback; memory
+  reseed after compaction picks it up; profile delete → the agent's own persona
+  survives; memory
   partition e2e with a fake `Memory` recording `ctx.agent_id()`; a subagent
   spawned from a bound session inheriting the partition; a cron fire inheriting
   it from its origin session; the external leg driven by a fake `ExternalAgent`
@@ -514,8 +521,8 @@ cleanup of any kind.
 below: `sessions` columns and the write-once binding; `POST /v1/chat/sessions
 { agent_id }` with validation and persona materialization; the `personas/`
 layout carrying each agent's `SOUL.md`, `IDENTITY.md` and `skills/`; soul and
-self-image assembled by path, tolerating a deleted profile but never silently
-swapping in the workspace persona; the display name living in `IDENTITY.md`
+self-image assembled by path, with a deleted profile row changing nothing, and never a
+silent swap to the workspace persona; the display name living in `IDENTITY.md`
 rather than a column;
 conditional (compare-and-set) writes on both identity files; a custom agent no
 longer inheriting the workspace's skills; the memory partition across both
