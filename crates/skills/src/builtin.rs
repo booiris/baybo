@@ -156,4 +156,61 @@ mod tests {
         assert!(summary.allows_channel(&baybo_model::ChannelType::owner()));
         assert!(!summary.allows_channel(&baybo_model::ChannelType::telegram()));
     }
+
+    /// `html-gen` quotes the preview's Content-Security-Policy verbatim so
+    /// the model can resolve cases the skill's own bullet list does not
+    /// enumerate — "may I use a `<track>`?" is answered by `default-src
+    /// 'none'` alone. That only holds while the quote is true, and a stale
+    /// one is worse than the curated list it replaced: it reads as
+    /// authoritative and is wrong in the direction the model trusts.
+    ///
+    /// The policy's one home is the Swift handler that sets the header.
+    /// Reaching across into `app/ios` is unusual here, and deliberate: that
+    /// tree is its own cargo workspace whose CI jobs are all `if: false`
+    /// (see `/CLAUDE.md`), so a gate living there would never run. This one
+    /// rides the root workspace's gating `cargo test`.
+    ///
+    /// Compared as a SET of directives, so the skill stays free to wrap the
+    /// policy across lines for readability and neither side's trailing `;`
+    /// matters.
+    #[test]
+    fn html_gen_quotes_the_preview_csp_the_ios_handler_actually_sends() {
+        use std::collections::BTreeSet;
+
+        const HANDLER: &str = "../../app/ios/App/Web/TranscriptSchemeHandler.swift";
+
+        fn directives(csp: &str) -> BTreeSet<String> {
+            csp.split(';')
+                .map(|directive| directive.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|directive| !directive.is_empty())
+                .collect()
+        }
+
+        let handler_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(HANDLER);
+        let handler = std::fs::read_to_string(&handler_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", handler_path.display()));
+        let (_, after) = handler
+            .split_once("htmlPreviewCSP")
+            .expect("the handler declares htmlPreviewCSP");
+        let open = after.find('"').expect("its value is a string literal");
+        let close = open + 1 + after[open + 1..].find('"').expect("literal is closed");
+        let served = &after[open + 1..close];
+
+        let start = HTML_GEN_SKILL_MD
+            .find("default-src")
+            .expect("the skill quotes a policy");
+        let end = start
+            + HTML_GEN_SKILL_MD[start..]
+                .find("```")
+                .expect("the quote sits in a fenced block");
+        let quoted = &HTML_GEN_SKILL_MD[start..end];
+
+        assert_eq!(
+            directives(quoted),
+            directives(served),
+            "html-gen/SKILL.md quotes a policy the handler no longer sends; \
+             reconcile it with {}",
+            handler_path.display()
+        );
+    }
 }
