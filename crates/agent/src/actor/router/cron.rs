@@ -100,7 +100,7 @@ impl Router {
                     job_title: Some(event.title.clone()),
                 },
                 self.inherited_binding(event.origin_session_id.as_ref())
-                    .await,
+                    .await?,
             )
             .await?;
         Ok(session)
@@ -112,22 +112,40 @@ impl Router {
     /// Derived at fire time from the origin session rather than stored on the
     /// job — the same rule as cron grouping (`docs/cron-groups.md`), and it
     /// means re-binding is impossible to get out of step because there is
-    /// nothing to keep in step. `None` for a job with no recorded origin (one
-    /// created before origins were stamped) or an origin that is itself
-    /// unbound, which reads as the built-in.
-    async fn inherited_binding(&self, origin: Option<&SessionId>) -> Option<AgentBinding> {
-        let origin = origin?;
-        let session = match self.session_manager.get(origin).await {
-            Ok(session) => session?,
-            Err(e) => {
-                warn!(session_id = %origin, error = %e, "failed to read a fire's origin; running it unbound");
-                return None;
-            }
+    /// nothing to keep in step.
+    ///
+    /// `Ok(None)` covers the two ways a fire legitimately has no agent: the
+    /// job recorded no origin (created before origins were stamped), or the
+    /// origin is itself unbound and so reads as the built-in.
+    ///
+    /// A recorded origin that **cannot be read** is an error, not a third
+    /// flavour of "no agent". Session rows are never deleted, so a missing
+    /// one means the store is inconsistent — and running the fire unbound
+    /// would answer in the wrong persona, write into the wrong memory
+    /// partition, and leave nothing but a `warn!` to say so. Failing the
+    /// mint surfaces it and leaves the schedule to retry.
+    async fn inherited_binding(
+        &self,
+        origin: Option<&SessionId>,
+    ) -> anyhow::Result<Option<AgentBinding>> {
+        let Some(origin) = origin else {
+            return Ok(None);
         };
-        Some(AgentBinding {
-            agent_id: session.state.agent_id?,
+        let session = self
+            .session_manager
+            .get(origin)
+            .await
+            .map_err(|e| anyhow::anyhow!("read cron origin session {origin}: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cron origin session {origin} is missing; session rows are never deleted, \
+                     so refusing to fire this job as some other agent"
+                )
+            })?;
+        Ok(session.state.agent_id.map(|agent_id| AgentBinding {
+            agent_id,
             framework: session.state.agent_framework.unwrap_or_default(),
-        })
+        }))
     }
 
     /// The task that will report a one-shot's result to the conversation that
@@ -736,7 +754,20 @@ mod tests {
     }
 
     impl RouterHarness {
+        /// A harness whose store already holds the origin conversation every
+        /// [`Self::event`] names — the ordinary case, since session rows are
+        /// never deleted.
         fn new() -> Self {
+            Self::build(true)
+        }
+
+        /// A harness whose store does *not* hold that origin: the broken
+        /// invariant a fire must refuse rather than paper over.
+        fn without_origin_session() -> Self {
+            Self::build(false)
+        }
+
+        fn build(seed_origin: bool) -> Self {
             let (response_tx, response_rx) = mpsc::channel(64);
             let supervisor = AgentSupervisor::new(response_tx);
             let sessions = Arc::new(SessionManager::new(
@@ -766,6 +797,30 @@ mod tests {
                 Arc::new(LeakDetector::with_default_rules()),
                 vault,
             ));
+
+            if seed_origin {
+                futures::executor::block_on(sessions.store().save(&Session {
+                    id: SessionId::from("sess-user"),
+                    user: User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ChannelType::tui(),
+                    },
+                    channel: ChannelType::tui(),
+                    created_at: Utc::now(),
+                    last_active: Utc::now(),
+                    state: Default::default(),
+                    root_session_id: SessionId::from("sess-user"),
+                    trigger: TriggerSource::User,
+                    lineage: None,
+                    hidden: false,
+                    pinned: false,
+                    archived: false,
+                    folder_id: None,
+                    title: None,
+                }))
+                .expect("seed the origin conversation");
+            }
 
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
@@ -838,6 +893,25 @@ mod tests {
                 .pop()
                 .expect("the router must have spawned an actor for the fire")
         }
+    }
+
+    /// The event carries an origin the store does not have. Session rows are
+    /// never deleted, so that is a broken invariant — and firing anyway would
+    /// answer in the wrong persona and write into the wrong memory partition
+    /// with nothing but a log line to show for it.
+    #[tokio::test]
+    async fn a_fire_whose_origin_is_missing_fails_instead_of_running_unbound() {
+        let mut h = RouterHarness::without_origin_session();
+        let err = h
+            .router
+            .handle_cron_trigger(RouterHarness::event(false))
+            .await
+            .expect_err("a missing origin must not be treated as 'no agent'");
+        assert!(err.to_string().contains("never deleted"), "got: {err:#}");
+        assert!(
+            h.supervisor.registered_session_ids().is_empty(),
+            "nothing may be minted for a fire that cannot resolve its agent"
+        );
     }
 
     /// A recurring fire's session is a conversation the user can reply in, so

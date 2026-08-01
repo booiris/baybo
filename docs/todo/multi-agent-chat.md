@@ -108,7 +108,12 @@ seeded on every session whose work originates inside a bound one:
   fire time, nothing stored on `cron_jobs` — same derivation rule as
   [`cron-groups.md`](../cron-groups.md)). A job scheduled inside agent A's
   conversation fires as A, and its result lands back in A's thread with A's
-  soul.
+  soul. A job with no recorded origin, or one whose origin is itself unbound,
+  fires as the built-in; but a recorded origin that **cannot be read fails the
+  fire**. Session rows are never deleted, so a missing one is a broken
+  invariant rather than a third flavour of "no agent" — and firing anyway
+  would answer in the wrong persona and write into the wrong memory partition
+  with only a log line to show for it.
 
 Everything else (channel sessions, TUI) leaves the column `NULL`, which reads as
 the builtin.
