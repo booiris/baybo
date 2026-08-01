@@ -63,14 +63,13 @@ spans, a variant that does not exist. Whatever they were documenting has been re
 
 ### 5. `Compression` did not say which compression it was — fixed
 
-Resolved: `StepKind::Compression` now carries `trigger` (why: threshold / forced /
-background) and `applied` (how: stored-summary / live-summary / truncate).
+Resolved: `StepKind::Compression` carries `trigger` — why it ran (threshold / forced).
 
-The deeper problem it uncovered: the flow's stage 1 (swap in `summary.md`) and stage 3
-(truncate) make **no LLM call**, so `CompressionRunner` never ran for them and they were
-recorded nowhere. The threshold trim that actually cuts the context down — the moment the
-model's input changes — was completely absent from traces. The agent now records those
-compactions itself as spanless steps.
+It briefly carried an `applied` field too (how it shrank), because compactions that made no
+LLM call were recorded nowhere and the threshold trim that actually cuts the context down was
+absent from traces. Those no-LLM-call paths have since been removed — a live summary is now
+the only thing that shortens a transcript — so every `Compression` step wraps its own
+`LlmCall` span again and `applied` had nothing left to distinguish.
 
 ## The question underneath
 

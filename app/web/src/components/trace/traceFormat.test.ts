@@ -68,31 +68,21 @@ describe('stepSummaryText — compression', () => {
     output_tokens: 260,
   };
 
-  it('leads with why it ran and how it applied', () => {
+  it('leads with why it ran', () => {
     expect(
-      stepSummaryText(
-        step({ kind: 'compression', trigger: 'threshold', applied: 'live_summary' }),
-        [llmSpan(result)],
-      ),
-    ).toBe('threshold · live summary · 21,080 → 260 tokens');
+      stepSummaryText(step({ kind: 'compression', trigger: 'threshold' }), [llmSpan(result)]),
+    ).toBe('threshold · 21,080 → 260 tokens');
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'forced' }), [llmSpan(result)]),
     ).toBe('forced · 21,080 → 260 tokens');
   });
 
-  it('still describes a compaction that made no LLM call', () => {
-    // The truncate fallback has no span and no token figures, but it is the
-    // compaction that discarded the most — a bare "compression" would say
-    // nothing about the one row that matters most.
-    expect(
-      stepSummaryText(
-        step({ kind: 'compression', trigger: 'threshold', applied: 'truncate' }),
-        [],
-      ),
-    ).toBe('threshold · truncate');
-    expect(
-      stepSummaryText(step({ kind: 'compression', trigger: 'forced', applied: 'truncate' }), []),
-    ).toBe('forced · truncate');
+  it('still names a compaction whose summarizer call left no result', () => {
+    // A failed summarizer call has no token figures to report, but the row
+    // still has to say a compaction was attempted here.
+    expect(stepSummaryText(step({ kind: 'compression', trigger: 'threshold' }), [])).toBe(
+      'threshold',
+    );
   });
 
   it('omits the trigger on a legacy row that never recorded one', () => {
@@ -167,7 +157,7 @@ describe('turnInputText / turnOutputText — meta steps riding the turn', () => 
       replayStep('s1', { kind: 'progress_observer' }, [
         inlineLlmSpan('b', [userMsg('summarize progress')], 'Still checking CI…'),
       ]),
-      replayStep('s2', { kind: 'compression', trigger: 'threshold', applied: 'live_summary' }, [
+      replayStep('s2', { kind: 'compression', trigger: 'threshold' }, [
         inlineLlmSpan('c', [userMsg('summarize the transcript')], 'Earlier: CI triage.'),
       ]),
     ]);

@@ -295,8 +295,8 @@ impl TraceStore for SqliteTraceStore {
 mod tests {
     use super::*;
     use baybo_trace::{
-        CompressionApplied, CompressionTrigger, LifecycleOutcome, LifecycleState, LlmCallInputs,
-        Span, SpanEvent, SpanEventKind, SpanKind, Step, StepKind, ToolCallOrigin,
+        CompressionTrigger, LifecycleOutcome, LifecycleState, LlmCallInputs, Span, SpanEvent,
+        SpanEventKind, SpanKind, Step, StepKind, ToolCallOrigin,
     };
     use chrono::Utc;
 
@@ -550,10 +550,7 @@ mod tests {
         let step_with_open_span = Step {
             id: StepId::new(),
             turn_id: TurnId::new(),
-            kind: StepKind::compression(
-                CompressionTrigger::Threshold,
-                CompressionApplied::LiveSummary,
-            ),
+            kind: StepKind::compression(CompressionTrigger::Threshold),
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
             outcome: LifecycleState::Done(LifecycleOutcome::Ok),

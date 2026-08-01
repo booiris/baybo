@@ -74,10 +74,6 @@ pub enum StepKind {
         /// recorded — not a default, a legacy row genuinely does not say.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<CompressionTrigger>,
-        /// How the transcript was actually shrunk. Orthogonal to `trigger`:
-        /// a threshold trim and a `/compact` can each land on any stage.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        applied: Option<CompressionApplied>,
     },
     MemoryRecall,
     MemoryWrite,
@@ -103,24 +99,11 @@ pub enum CompressionTrigger {
     Forced,
 }
 
-/// How a compaction shrank the transcript. [`CompressionApplied::Truncate`] is
-/// the fallback taken when the summarizer failed, and makes no model
-/// round-trip — which is why its step carries no `LlmCall` span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompressionApplied {
-    /// Summarised the transcript with a live LLM call.
-    LiveSummary,
-    /// Dropped the middle of the transcript after the summarizer failed.
-    Truncate,
-}
-
 impl StepKind {
-    /// A compaction, tagged with why it ran and how it shrank the transcript.
-    pub fn compression(trigger: CompressionTrigger, applied: CompressionApplied) -> Self {
+    /// A compaction, tagged with why it ran.
+    pub fn compression(trigger: CompressionTrigger) -> Self {
         StepKind::Compression {
             trigger: Some(trigger),
-            applied: Some(applied),
         }
     }
 
@@ -190,10 +173,7 @@ mod tests {
 
     #[test]
     fn compression_round_trips() {
-        let s = fresh_step(StepKind::compression(
-            CompressionTrigger::Threshold,
-            CompressionApplied::LiveSummary,
-        ));
+        let s = fresh_step(StepKind::compression(CompressionTrigger::Threshold));
         let json = serde_json::to_string(&s).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);

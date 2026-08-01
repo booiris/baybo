@@ -63,7 +63,10 @@ pub struct ContextConfig {
     /// Fraction of the active model's context window at which
     /// compression triggers. Must be in `(0.0, 1.0]`.
     pub compression_threshold: f64,
-    /// Number of most recent messages to retain when truncating.
+    /// How many non-system messages still count as a *short* conversation.
+    /// Compaction declines outright below this count when the transcript is
+    /// also under the minimum compactable token size — a summary of that
+    /// little cannot come out smaller than what it replaces.
     pub keep_recent: usize,
 }
 

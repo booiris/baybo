@@ -45,20 +45,11 @@ export function isTerminal(state: LifecycleState): boolean {
  */
 export type CompressionTrigger = 'threshold' | 'forced';
 
-/**
- * How a compaction shrank the transcript (mirrors `baybo_trace::CompressionApplied`).
- * `truncate` is the fallback taken when the summarizer failed and makes no LLM
- * call, so its step carries no span. Absent on rows written before it was
- * recorded.
- */
-export type CompressionApplied = 'live_summary' | 'truncate';
-
 export type StepKind =
   | { kind: 'llm_iteration' }
   | {
       kind: 'compression';
       trigger?: CompressionTrigger | null;
-      applied?: CompressionApplied | null;
     }
   | { kind: 'memory_recall' }
   | { kind: 'memory_write' }
