@@ -107,16 +107,9 @@ impl EditTool {
             .is_some_and(|grandparent| grandparent == self.personas_dir)
     }
 
-    /// Whether this edit gets the identity treatment (approval bypass, and
-    /// — once resolved by [`Self::identity_target`] — the size cap and audit
-    /// commit).
-    fn is_identity_target(&self, file_path: &Path) -> bool {
-        self.is_persona_identity(file_path)
-    }
-
     /// Resolve an identity edit to the repo that audits it, rejecting a path
-    /// inside one of the two stores that is not an allowed file.
-    /// `None` when the path is in neither store.
+    /// under `personas/` that is not one of the calling agent's own files.
+    /// `None` when the path is outside `personas/` altogether.
     fn identity_target(
         &self,
         file_path: &Path,
@@ -199,7 +192,7 @@ impl Tool for EditTool {
         // is the per-edit git commit, not a user prompt), and any path
         // under `work/` or `skills/` (agent scratch / managed skill
         // content). Anything else still goes through the gate.
-        if self.is_identity_target(&path)
+        if self.is_persona_identity(&path)
             || self.is_inside_work_dir(&path)
             || self.is_inside_skills_dir(&path)
         {

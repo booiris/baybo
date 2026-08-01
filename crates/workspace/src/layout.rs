@@ -55,9 +55,17 @@ pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
 pub async fn seed_default_identity_files(paths: &WorkspacePaths) -> anyhow::Result<()> {
     let targets = IdentityKind::all()
         .map(|kind| {
+            // The built-in's *own* notes get the per-agent template, not
+            // `DEFAULT_USER_CONTENT` — that one seeds the shared profile
+            // below, and seeding both from it made a fresh install emit two
+            // byte-identical user sections in every prompt.
+            let seed = match kind {
+                IdentityKind::User => crate::prompt::PERSONA_USER_TEMPLATE,
+                _ => kind.default_content(),
+            };
             (
                 paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind),
-                kind.default_content(),
+                seed,
             )
         })
         .into_iter()
@@ -204,15 +212,24 @@ mod tests {
         ensure_layout(&paths).await.expect("layout");
         seed_default_identity_files(&paths).await.expect("seed");
 
-        for kind in IdentityKind::all() {
-            assert_eq!(read_builtin(&dir, kind).await, kind.default_content());
-        }
         assert_eq!(
-            tokio::fs::read_to_string(paths.shared_user_file())
-                .await
-                .expect("shared USER.md"),
-            IdentityKind::User.default_content(),
+            read_builtin(&dir, IdentityKind::Soul).await,
+            IdentityKind::Soul.default_content()
         );
+        assert_eq!(
+            read_builtin(&dir, IdentityKind::Identity).await,
+            IdentityKind::Identity.default_content()
+        );
+        let shared = tokio::fs::read_to_string(paths.shared_user_file())
+            .await
+            .expect("shared USER.md");
+        assert_eq!(shared, IdentityKind::User.default_content());
+        // The built-in's own notes are a different document from the shared
+        // profile. Seeding both from the same default made every prompt carry
+        // two byte-identical user sections.
+        let own = read_builtin(&dir, IdentityKind::User).await;
+        assert_eq!(own, crate::prompt::PERSONA_USER_TEMPLATE);
+        assert_ne!(own, shared);
     }
 
     #[tokio::test]

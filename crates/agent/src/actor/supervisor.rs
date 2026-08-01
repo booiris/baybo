@@ -269,6 +269,28 @@ impl AgentSupervisor {
     ///
     /// Returns `false` if the eventual `send().await` fails (mailbox
     /// closed); otherwise `true`.
+    /// Deliver to an actor that already exists, or report that none does.
+    ///
+    /// The spawn half of [`Self::route_or_spawn`] takes a *synchronous*
+    /// closure — deliberately, so no `.await` sits inside the `DashMap` entry
+    /// lock — which forces every caller to resolve its spawn arguments before
+    /// it knows whether a spawn is needed. Callers whose arguments cost
+    /// something to resolve (a store read) try this first and pay only on the
+    /// miss. Never spawns, so a concurrent reap between this call and the
+    /// fallback is just a miss, not a spawn with half-resolved arguments.
+    pub async fn route_existing(
+        &self,
+        session_id: &SessionId,
+        message: AgentMessage,
+    ) -> Option<bool> {
+        let sender = self.actors.get(session_id)?.sender.clone();
+        if let Err(e) = sender.send(message).await {
+            tracing::warn!(%session_id, error = %e, "failed to send message to actor");
+            return Some(false);
+        }
+        Some(true)
+    }
+
     pub async fn route_or_spawn<F>(
         &self,
         session_id: &SessionId,

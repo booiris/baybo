@@ -163,12 +163,19 @@ mod tests {
                 paths.persona_identity_file(baybo_workspace::paths::BUILTIN_PERSONA_DIR, kind);
             let body = std::fs::read_to_string(&target)
                 .unwrap_or_else(|e| panic!("read seeded {}: {e}", target.display()));
-            assert_eq!(
-                body,
-                kind.default_content(),
-                "{kind:?} must be seeded with its default template"
-            );
+            // `USER.md` is the built-in's *own* notes, so it gets the
+            // per-agent template; the operator-curated defaults seed the
+            // shared profile beside it.
+            let expected = match kind {
+                IdentityKind::User => baybo_workspace::prompt::PERSONA_USER_TEMPLATE,
+                _ => kind.default_content(),
+            };
+            assert_eq!(body, expected, "{kind:?} must be seeded with its template");
         }
+        assert_eq!(
+            std::fs::read_to_string(paths.shared_user_file()).unwrap(),
+            IdentityKind::User.default_content(),
+        );
     }
 
     #[tokio::test]

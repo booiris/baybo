@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Author on the commits Baybo makes into `personas/`. Matches the `Edit`
 /// tool's audit author, so `git log` reads as one voice.
@@ -63,17 +63,6 @@ impl<'a> IdentitySource<'a> {
     pub fn new(path: &'a Path, seed: &'a str) -> Self {
         Self { path, seed }
     }
-}
-
-/// The built-in agent's own three files, under `personas/baybo/`. Returned
-/// as paths because [`IdentitySource`] borrows them.
-pub fn builtin_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf, PathBuf) {
-    let file = |kind| paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
-    (
-        file(IdentityKind::Soul),
-        file(IdentityKind::Identity),
-        file(IdentityKind::User),
-    )
 }
 
 /// Read one identity file, seeding it with `source.seed` if it does not
@@ -146,6 +135,10 @@ pub async fn ensure_persona_layout(
             IdentityKind::Identity,
             IdentityKind::Identity.default_content(),
         ),
+        // Seeded here rather than left to the first prompt assembly, so it
+        // lands in the baseline commit below: a file that enters git only when
+        // the agent first rewrites it makes that first rewrite unreadable.
+        (IdentityKind::User, crate::prompt::PERSONA_USER_TEMPLATE),
     ] {
         let path = paths.persona_identity_file(agent_id, kind);
         read_or_seed(&path, seed)
@@ -168,7 +161,7 @@ pub async fn ensure_persona_layout(
 /// Best-effort. A workspace without `git`, or a `personas/` that is not a
 /// repo, must not stop an agent from being created — the files are already on
 /// disk and correct; only their history is missing.
-pub(crate) async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &str) {
+pub async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &str) {
     let repo = paths.personas_dir();
     if !repo.join(".git").exists() {
         return;
@@ -223,6 +216,24 @@ mod tests {
     /// A persona must have a baseline in git the moment it exists —
     /// otherwise the agent's first rewrite of its own soul lands as a file
     /// addition, and the audit trail cannot show what changed.
+    /// The persona is three files, not two. `USER.md` left to the first
+    /// prompt assembly would miss the baseline commit below it, which is the
+    /// one thing that makes the agent's first rewrite of its own notes
+    /// readable as a diff.
+    #[tokio::test]
+    async fn materialising_seeds_all_three_identity_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        ensure_persona_layout(&paths, "01JTHREE", "soul body")
+            .await
+            .expect("materialise");
+        for kind in IdentityKind::all() {
+            let path = paths.persona_identity_file("01JTHREE", kind);
+            assert!(path.exists(), "missing {}", path.display());
+        }
+        assert!(paths.persona_skills_dir("01JTHREE").is_dir());
+    }
+
     #[tokio::test]
     async fn materialising_a_persona_commits_a_baseline() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -268,7 +279,12 @@ mod tests {
     /// agent reads, all three coming from `personas/baybo/`.
     async fn load_workspace(dir: &Path) -> IdentityFiles {
         let paths = WorkspacePaths::new(dir.to_path_buf());
-        let (soul, identity, user) = builtin_identity_paths(&paths);
+        let file = |kind| paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
+        let (soul, identity, user) = (
+            file(IdentityKind::Soul),
+            file(IdentityKind::Identity),
+            file(IdentityKind::User),
+        );
         load_identity_files(
             dir,
             IdentitySource::new(&soul, IdentityKind::Soul.default_content()),

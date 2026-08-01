@@ -1064,12 +1064,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- agent's prompt and name are its own
                 -- `personas/<id>/{SOUL,IDENTITY}.md` — files it rewrites
                 -- itself, which no column could track (see
-                -- docs/modules/agent-profiles.md). A DB created earlier
-                -- keeps inert `system_prompt` / `name` columns, since
-                -- `init_db` never drops; nothing reads or writes them.
-                -- `name` was `NOT NULL UNIQUE` there, which an INSERT that
-                -- omits it would trip, so the store detects the legacy
-                -- column at open and fills it with the row's id.
+                -- docs/modules/agent-profiles.md).
                 CREATE TABLE IF NOT EXISTS agent_profiles (
                     id              TEXT PRIMARY KEY,
                     description     TEXT NOT NULL,

@@ -859,10 +859,12 @@ impl Tool for Mem0SearchTool {
                     .filter_map(|x| x.as_str().map(String::from))
                     .collect()
             });
-        // OSS scopes by user_id and ignores the Platform v2 filter shape
+        // OSS takes the partition as flat fields; Platform takes the v2
+        // filter shape. Both must carry `agent_id` — it is the memory
+        // partition, not a label.
         // (agent/run/category/advanced filters), so they degrade to user scope.
         let body = if self.inner.self_hosted {
-            json!({"query": query, "user_id": user_id, "limit": limit})
+            json!({"query": query, "user_id": user_id, "agent_id": agent_id, "limit": limit})
         } else {
             json!({
                 "query": query,
@@ -1131,7 +1133,14 @@ impl Tool for Mem0ListTool {
             .inner
             .self_hosted
         {
-            (Method::GET, None, vec![("user_id", user_id.to_string())])
+            (
+                Method::GET,
+                None,
+                vec![
+                    ("user_id", user_id.to_string()),
+                    ("agent_id", agent_id.to_string()),
+                ],
+            )
         } else {
             (
                 Method::POST,
@@ -1326,7 +1335,12 @@ impl Tool for Mem0DeleteTool {
 
         if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
             let body = if self.inner.self_hosted {
-                json!({"query": query, "user_id": user_id, "limit": DELETE_SEARCH_TOP_K})
+                json!({
+                    "query": query,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "limit": DELETE_SEARCH_TOP_K,
+                })
             } else {
                 json!({
                     "query": query,

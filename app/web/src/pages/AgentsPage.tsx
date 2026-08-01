@@ -705,7 +705,10 @@ function AgentEditorPanel({
         }
       }
 
-      {
+      // Only when the row's own fields moved. An unconditional PUT bumped
+      // `updated_at` on every Save, including one that touched nothing but
+      // the soul.
+      if (description !== agent.description || framework !== agent.framework) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
           params: { path: { agent_id: agent.id } },
           body: content,

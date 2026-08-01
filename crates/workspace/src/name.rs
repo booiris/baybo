@@ -55,8 +55,15 @@ pub fn with_display_name(identity_md: &str, name: &str) -> String {
             .iter()
             .position(|l| l.trim_start().starts_with('#'))
             .map_or(0, |i| i + 1);
-        out.insert(after_heading, String::new());
-        out.insert(after_heading + 1, format!("* **Name:** {name}"));
+        let line = format!("* **Name:** {name}");
+        // The blank line separates the entry from the heading above it; with
+        // no heading there is nothing to separate it from.
+        if after_heading > 0 {
+            out.insert(after_heading, String::new());
+            out.insert(after_heading + 1, line);
+        } else {
+            out.insert(0, line);
+        }
     }
     let mut joined = out.join("\n");
     if identity_md.ends_with('\n') || joined.is_empty() {

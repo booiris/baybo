@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use baybo_workspace::{IdentityKind, IdentitySource, WorkspacePaths, absolutise};
+use baybo_workspace::{IdentitySource, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
@@ -74,21 +74,6 @@ pub async fn assemble(
     Ok(parts.join("\n\n"))
 }
 
-/// [`assemble`] for a session with no agent binding: the **built-in**
-/// agent's own three files under `personas/baybo/`, each seeded from its
-/// shipped template. Byte-identical to what a session bound to the built-in
-/// produces, because it resolves to the same directory.
-pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let (soul, self_image, user) = baybo_workspace::identity::builtin_identity_paths(paths);
-    assemble(
-        paths,
-        IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
-        IdentitySource::new(&self_image, IdentityKind::Identity.default_content()),
-        IdentitySource::new(&user, baybo_workspace::prompt::PERSONA_USER_TEMPLATE),
-    )
-    .await
-}
-
 /// Wrap an identity-file body in an XML tag carrying the absolute on-disk
 /// path. Explicit boundaries keep arbitrary user-authored markdown inside one
 /// file from bleeding into a sibling section, and surfacing the path lets the
@@ -105,12 +90,27 @@ fn wrap_section(tag: &str, path: &Path, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_workspace::IdentityKind;
 
     #[tokio::test]
     async fn assembles_hint_sections_and_tail_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = WorkspacePaths::new(dir.path().to_path_buf());
-        let prompt = assemble_from_workspace(&paths).await.expect("assemble");
+        let file =
+            |kind| paths.persona_identity_file(baybo_workspace::paths::BUILTIN_PERSONA_DIR, kind);
+        let (soul_path, identity_path, user_path) = (
+            file(IdentityKind::Soul),
+            file(IdentityKind::Identity),
+            file(IdentityKind::User),
+        );
+        let prompt = assemble(
+            &paths,
+            IdentitySource::new(&soul_path, IdentityKind::Soul.default_content()),
+            IdentitySource::new(&identity_path, IdentityKind::Identity.default_content()),
+            IdentitySource::new(&user_path, IdentityKind::User.default_content()),
+        )
+        .await
+        .expect("assemble");
 
         assert!(prompt.starts_with("You are an intelligent AI assistant."));
         let soul = prompt.find("<soul ").expect("soul tag");

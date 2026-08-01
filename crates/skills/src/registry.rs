@@ -50,16 +50,6 @@ impl SkillSummary {
     }
 }
 
-/// Central registry for skill definitions.
-///
-/// Skills are loaded from workspace files or the extension registry.
-/// `select` returns the skill explicitly invoked by a `/<cmd>` message,
-/// or the full registered set for the model to consider otherwise.
-///
-/// Interior mutability keeps the public API `&self`: the registry is
-/// shared as `Arc<SkillRegistry>` across the agent, channels, and CLI
-/// layers, and `reload()` needs to rewrite state without demanding a
-/// `RwLock<SkillRegistry>` wrapping at every call site.
 /// Skills every agent sees regardless of persona, because they are runtime
 /// infrastructure rather than a capability someone chose to grant.
 ///
@@ -71,6 +61,13 @@ impl SkillSummary {
 /// overlay.
 pub const UNIVERSAL_SKILLS: &[&str] = &[crate::builtin::BAYBO_CLI_SKILL_NAME];
 
+/// Central registry for skill definitions.
+///
+/// Skills are loaded from workspace files or the extension registry.
+/// Interior mutability keeps the public API `&self`: the registry is
+/// shared as `Arc<SkillRegistry>` across the agent, channels, and CLI
+/// layers, and `reload()` needs to rewrite state without demanding a
+/// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
     skills: DashMap<String, SkillDefinition>,
     /// Per-agent private overlays, keyed by profile id. An agent sees
@@ -200,8 +197,8 @@ impl SkillRegistry {
     /// "authoritative disk state wins."
     pub fn reload(&self) -> usize {
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
-        // Snapshot before mutating: iterating a `DashMap` holds shard locks,
-        // and the scans below insert into the same shards.
+        // Snapshot both lists before mutating: the scans below take the same
+        // locks these reads hold.
         let agent_dirs: Vec<(AgentProfileId, PathBuf)> = self.agent_dirs.read().clone();
         self.skills.clear();
         self.agent_skills.clear();
@@ -248,7 +245,15 @@ impl SkillRegistry {
     ///
     /// A missing directory is not an error: an agent with no private skills
     /// simply sees the shared set.
+    ///
+    /// Only a directory that exists is remembered. `GET /v1/skills?agent_id=`
+    /// accepts any well-formed id so a client can preview a scope, so
+    /// recording every id asked about would let a caller grow `agent_dirs`
+    /// (and the `reload` scan behind it) without bound.
     fn load_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+        if !dir.is_dir() {
+            return 0;
+        }
         {
             let mut dirs = self.agent_dirs.write();
             if !dirs.iter().any(|(a, d)| a == agent && d == dir) {

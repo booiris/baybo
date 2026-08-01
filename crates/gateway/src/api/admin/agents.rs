@@ -165,7 +165,26 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
     }
     write_file_atomic(&path, &updated)
         .await
-        .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))
+        .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))?;
+    commit_persona_edit(state, row.id.as_str(), "name").await;
+    Ok(())
+}
+
+/// Commit an operator's dashboard edit into the `personas/` repo.
+///
+/// Not optional bookkeeping: the `Edit` tool commits with a pathspec, which
+/// picks up whatever is in the working tree at that path. An operator write
+/// left uncommitted is therefore absorbed into the agent's *next* audit
+/// commit, attributed to the agent. The history exists to tell those two
+/// apart, so each writer commits its own work. Best-effort, like every other
+/// write to that repo.
+async fn commit_persona_edit(state: &AdminState, agent_id: &str, what: &str) {
+    baybo_workspace::commit_personas(
+        &state.workspace_paths,
+        agent_id,
+        &format!("personas: operator edited {agent_id} {what}"),
+    )
+    .await;
 }
 
 /// [`AgentProfileDto`] for one row, with its name read from disk.
@@ -394,7 +413,8 @@ async fn create_agent(
         .await
         .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
     // The requested name is written into the agent's own `IDENTITY.md`,
-    // which is where a name lives — the row has no column for one.
+    // which is where a name lives — the row has no column for one. This
+    // commits on its own, so the fresh persona is never left dirty.
     set_display_name(&state, &row, &name).await?;
     Ok(Json(AgentProfileDto::from_parts(row, name)))
 }
@@ -597,8 +617,9 @@ async fn read_agent_identity_file(
 ///
 /// Deliberately NOT behind the builtin lock: the built-in row is read-only,
 /// but these are files, not row fields — and editing the built-in's own
-/// persona is exactly what an operator expects its entry to offer. Racing writes are last-write-wins; both files are
-/// git-versioned, so a clobber is recoverable.
+/// persona is exactly what an operator expects its entry to offer. Racing
+/// writes are refused rather than merged — see
+/// [`SetAgentIdentityFileRequest::version`].
 async fn write_agent_identity_file(
     state: &AdminState,
     agent_id: &str,
@@ -624,6 +645,7 @@ async fn write_agent_identity_file(
     write_file_atomic(&path, &req.content)
         .await
         .map_err(|e| GatewayError::Internal(format!("write agent {kind:?} file: {e}")))?;
+    commit_persona_edit(state, agent_id, kind.file_name()).await;
     // Return the new state, so an editor that stays open holds a fresh base
     // for its next conditional write instead of conflicting with itself.
     Ok(Json(AgentIdentityFileDto {

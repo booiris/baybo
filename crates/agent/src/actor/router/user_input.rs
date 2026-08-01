@@ -149,27 +149,34 @@ impl Router {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
-        // Resolved before the closure because the fallback reads the store;
-        // `route_or_spawn` takes a synchronous one.
-        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
-        let routed = self
+        let message = AgentMessage::UserInput(Box::new(incoming));
+        // A live actor already carries its pins, and resolving them reads the
+        // profile row — a query per message on a session that needs none of
+        // it. `route_or_spawn`'s closure is synchronous, so the only way to
+        // skip that read is to find out first whether a spawn is coming.
+        let routed = match self
             .supervisor
-            .route_or_spawn(
-                &session_id,
-                AgentMessage::UserInput(Box::new(incoming)),
-                || {
-                    let actor_token = parent_token.child_token();
-                    actor_spawner(
-                        session,
-                        pins.llm,
-                        pins.model,
-                        pins.effort,
-                        response_tx,
-                        actor_token,
-                    )
-                },
-            )
-            .await;
+            .route_existing(&session_id, message.clone())
+            .await
+        {
+            Some(routed) => routed,
+            None => {
+                let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
+                self.supervisor
+                    .route_or_spawn(&session_id, message, || {
+                        let actor_token = parent_token.child_token();
+                        actor_spawner(
+                            session,
+                            pins.llm,
+                            pins.model,
+                            pins.effort,
+                            response_tx,
+                            actor_token,
+                        )
+                    })
+                    .await
+            }
+        };
         if !routed {
             anyhow::bail!("failed to route user input to actor for session '{session_id}'");
         }
