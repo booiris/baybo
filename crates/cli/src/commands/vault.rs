@@ -80,7 +80,7 @@ async fn rotate(ctx: &CommandContext, yes: bool) -> Result<CommandOutput> {
     // cannot happen. Held for the whole rotation, not probed: a gateway
     // starting midway would write an entry under the outgoing key and lose it
     // at promotion.
-    let lock = baybo_workspace::acquire_workspace_lock(&ctx.workspace.root).map_err(|e| {
+    let lock = baybo_workspace::acquire_workspace_lock(ctx.workspace.root()).map_err(|e| {
         CliError::Config(format!(
             "cannot rotate while this workspace is in use — stop the gateway first ({e})"
         ))
@@ -99,12 +99,10 @@ async fn rotate(ctx: &CommandContext, yes: bool) -> Result<CommandOutput> {
         ));
     }
 
-    let backup_dir = baybo_workspace::WorkspacePaths::new(ctx.workspace.root.clone())
-        .state_dir()
-        .join(format!(
-            "vault-rotation-backup-{}",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S")
-        ));
+    let backup_dir = ctx.workspace.state_dir().join(format!(
+        "vault-rotation-backup-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
 
     let rotated =
         baybo_security::key_file::rotate(std::path::Path::new(key_path), vault, &backup_dir, &lock)

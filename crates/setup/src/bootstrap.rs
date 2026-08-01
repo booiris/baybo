@@ -7,7 +7,6 @@ use std::sync::Arc;
 use baybo_config::BayboConfig;
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_storage::Store;
-use baybo_workspace::WorkspaceManager;
 use baybo_workspace::WorkspacePaths;
 use baybo_workspace::paths::ENV_CONFIG_PATH;
 
@@ -23,17 +22,17 @@ pub struct SetupContext {
 pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<SetupContext> {
     let paths = WorkspacePaths::new(workspace_root.clone());
 
-    let workspace = WorkspaceManager::new(workspace_root.clone());
-    workspace
-        .ensure_layout()
+    baybo_workspace::ensure_layout(&paths)
         .await
         .map_err(|e| SetupError::io(workspace_root.clone(), format!("ensure_layout: {e}")))?;
-    workspace.seed_default_identity_files().await.map_err(|e| {
-        SetupError::io(
-            workspace_root.clone(),
-            format!("seed default identity files: {e}"),
-        )
-    })?;
+    baybo_workspace::seed_default_identity_files(&paths)
+        .await
+        .map_err(|e| {
+            SetupError::io(
+                workspace_root.clone(),
+                format!("seed default identity files: {e}"),
+            )
+        })?;
 
     let key_file = paths.encryption_key_file();
     if !key_file.exists() {

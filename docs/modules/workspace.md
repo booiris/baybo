@@ -5,7 +5,8 @@
 The `workspace` crate is the single source of truth for Baybo's workspace layout. It owns:
 
 - **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `personas/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
-- **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
+- **Skeleton materialisation** (`layout` module, `io` feature): `ensure_layout`, `seed_default_identity_files` — the two boot-time writes that turn a bare root into a usable workspace.
+- **Identity I/O** (`identity` module, `io` feature, default-on): `IdentityFiles`, `IdentitySource`, `load_identity`, `load_identity_files`, `ensure_persona_layout` — the async readers backing the identity documents, seeding any that is missing.
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
 - **Workspace exclusion** (`singleton` module, `io` feature): `WorkspaceLock` and `acquire_workspace_lock` — the advisory `flock` on `state/baybo.lock` that keeps two chat loops off one workspace. It lives here rather than in the binary because the path constant does, and because `baybo vault rotate` needs the same lock: `key_file::rotate` takes a `&WorkspaceLock` so holding it is a type-level obligation rather than something a caller remembers.
 - **Tree measurement** (`walk` module, always available, std-only): `tree_stats` — the one sync walker behind the janitor's `work/tmp` "newest in-tree mtime" staleness gate (called via `spawn_blocking`). Summed lstat file sizes + newest lstat mtime anywhere in the tree; symlinks are measured as links and never followed. The mtime back-dating fixtures for testing against it live in `test_support` behind the `test-support` feature.
@@ -62,7 +63,7 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 ## Initialization and version control
 
-`WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
+`ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
 - Creates `config/`, `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
 - Runs `git init --quiet` inside `config/`, `skills/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check).

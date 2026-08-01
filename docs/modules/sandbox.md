@@ -339,13 +339,13 @@ Trade-offs:
 These are **distinct scopes**, on purpose — though not disjoint paths:
 the sandbox FS root is a subdirectory of the Baybo state root.
 
-- `baybo_workspace::WorkspaceManager.root` is `config.workspace.path`
+- the workspace root is `config.workspace.path`
   (defaults to `~/.baybo`). It's where Baybo keeps its sqlite storage,
   identity files, lock file, and skill bundles. The agent reads from
   here in-process, not via subprocesses.
 - The sandbox FS root passed to `ToolExecutor::new` is the workspace
   **work dir** — `<workspace>/work/` (`WorkspacePaths::work_dir()`),
-  created by `WorkspaceManager::ensure_layout`. The gateway
+  created by `baybo_workspace::ensure_layout`. The gateway
   canonicalizes it at startup (`crates/baybo/src/runtime.rs`); if
   canonicalization fails it uses the literal path and logs a warning.
 - `SandboxAdapter` rejects any `cwd` that isn't a subpath of the

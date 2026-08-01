@@ -224,9 +224,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     // against the same workspace would race.
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
-    baybo_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
-        .ensure_layout()
-        .await?;
+    baybo_workspace::ensure_layout(&workspace_paths).await?;
     let _workspace_lock = baybo_workspace::acquire_workspace_lock(workspace_paths.root())?;
 
     // Register SIGHUP **before** the long boot work below (manager build,
@@ -535,7 +533,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         bot_reconciler: Arc::clone(&bot_reconciler),
         deck_manager: Arc::clone(&graph.deck_manager),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
-            graph.workspace.root.clone(),
+            graph.workspace.root().to_path_buf(),
         )),
     };
 

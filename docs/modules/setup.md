@@ -71,11 +71,11 @@ is *structurally* the same code, not a soft promise.
 
 Before showing any picker, `bootstrap_workspace_if_needed`:
 
-1. Calls `WorkspaceManager::ensure_layout`, which creates every
+1. Calls `baybo_workspace::ensure_layout`, which creates every
    workspace subdir and runs `git init` inside `config/`,
    `personas/`, `skills/`, and `agents/` (per-dir repos, no top-level
    repo).
-   Then calls `WorkspaceManager::seed_default_identity_files`, which
+   Then calls `seed_default_identity_files`, which
    re-seeds any missing identity file (e.g. a deleted `SOUL.md`) from
    its default template without clobbering operator edits — load-
    bearing on a re-run.
@@ -282,7 +282,7 @@ pub mod test_support {
   LLM step both write `llm.openai-subscription.tokens` as one
   bundle; running setup twice with `openai-subscription` rotates
   the refresh token (each login overwrites).
-- **`.key/` must never be committed**: `WorkspaceManager::ensure_layout`
+- **`.key/` must never be committed**: `ensure_layout`
   deliberately does *not* `git init` it; documented in
   `docs/modules/workspace.md`.
 
@@ -295,7 +295,7 @@ pub mod test_support {
 | `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (The provider picker is driven by `LlmProviderRegistry::with_default_providers().provider_names()`, so registry additions appear automatically.) |
 | `baybo-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
 | `baybo-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `baybo-store` and imported via `baybo_store::ChannelBotStore`.) |
-| `baybo-workspace`     | `WorkspacePaths`, `WorkspaceManager::ensure_layout`, `default_workspace_root` |
+| `baybo-workspace`     | `WorkspacePaths`, `ensure_layout`, `default_workspace_root` |
 | `baybo-agent`         | `external_agent::{claude_cli,codex_cli,gemini_cli}::*Agent::probe_and_build` for PATH detection |
 | `baybo-model`         | `ChannelType`, `ExternalAgentKind`                                      |
 | `baybo-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
