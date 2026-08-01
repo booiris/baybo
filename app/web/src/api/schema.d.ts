@@ -2230,7 +2230,10 @@ export interface components {
         };
         /** @description Request body for `POST /v1/push/register`. */
         RegisterPushRequest: {
-            /** @description APNs environment: `"sandbox"` (development-signed) or `"production"` (distribution-signed). */
+            /**
+             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
+             *     (distribution-signed).
+             */
             apns_env: string;
             /** @description The client's current APNs device token (hex). */
             apns_token: string;
@@ -2541,7 +2544,10 @@ export interface components {
         };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
         UpdateDeviceApnsTokenRequest: {
-            /** @description APNs environment: `"sandbox"` (development-signed) or `"production"` (distribution-signed). */
+            /**
+             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
+             *     (distribution-signed).
+             */
             apns_env: string;
             /** @description The device's current APNs device token (hex). */
             apns_token: string;
