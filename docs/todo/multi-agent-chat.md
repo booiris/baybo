@@ -143,6 +143,8 @@ for them** and custom agents partition under their ULID — rename-proof.
 ```text
 <workspace_root>/
   personas/                      # standalone git repo (ensure_layout: mkdir + git init)
+    USER.md                      # the human's profile — shared, owned by no agent
+    baybo/                       # the built-in is an ordinary persona directory
     01J.../                      # one dir per non-builtin agent, named by profile id
       SOUL.md                    # this agent's personality and tone
       IDENTITY.md                # this agent's self-image: name, vibe, emoji, avatar
@@ -151,10 +153,14 @@ for them** and custom agents partition under their ULID — rename-proof.
         deploy/SKILL.md          # private overlay; wins over a same-named shared skill
 ```
 
-Keyed by profile **id**, not name, so a rename never orphans a folder. The
-builtin agent's persona directory *is* the workspace's own declarative content —
-`profile/SOUL.md` and the shared `skills/` — which is what makes "the assistant
-you already have" an honest roster entry rather than a special case.
+Keyed by profile **id**, not name, so a rename never orphans a folder — and
+the built-in is simply the directory named `baybo`, which is what makes "the
+assistant you already have" an honest roster entry rather than a special case.
+It keeps no skill overlay, because the shared `skills/` set *is* its set.
+
+A workspace created before this had a `profile/` holding the single
+assistant's three files; `ensure_layout` carries it across once, copying
+rather than moving so the audit history stays readable.
 
 Three new `WorkspacePaths` methods carry that rule so no call site branches:
 

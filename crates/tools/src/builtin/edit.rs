@@ -1,16 +1,15 @@
 //! `Edit` — targeted string replacement inside an existing file.
 //!
-//! Edits that target an **identity file** pick up three extra guards
-//! before the write. Two locations qualify, because an agent's soul is
-//! wherever that agent's soul lives:
+//! Edits that target an **identity file** pick up four extra guards before
+//! the write:
 //!
-//! - `<workspace>/profile/{SOUL,USER,IDENTITY}.md` — the shared
-//!   three-slot store, and the built-in agent's own persona.
-//! - `<workspace>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` — one custom
-//!   agent's personality, self-image and own notes about the human. Only
-//!   directly under the agent's own directory: a persona's `skills/` tree is
-//!   skill content, not identity, and **another** agent's directory is not
-//!   reachable at all.
+//! `<workspace>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` — that agent's
+//! personality, self-image, and own notes about the human. The built-in is an
+//! ordinary agent here (`personas/baybo/`). Only directly under the agent's
+//! own directory: a persona's `skills/` tree is skill content rather than
+//! identity, **another** agent's directory is not reachable at all, and the
+//! shared `personas/USER.md` is nobody's identity file — an edit to it takes
+//! the ordinary approval gate.
 //!
 //! The guards:
 //!
@@ -19,12 +18,16 @@
 //! - **Size cap**: identity files are system-prompt-bound (~kB). A
 //!   multi-MiB file is corruption or symlink shenanigans — fail before
 //!   we slurp it.
-//! - **Audit commit**: after a successful write, the change is staged
-//!   and committed into the owning standalone git repo (`profile/` or
-//!   `personas/`) with a fixed `Baybo <baybo@local>` author, so the user
-//!   can later see what the agent rewrote and revert with `git`.
-//!   `--no-verify` is intentional: both are Baybo-managed audit history,
-//!   not hand-curated repos where pre-commit hooks would be authored. A
+//! - **The name survives**: an edit to `IDENTITY.md` may change the `Name:`
+//!   line but not remove it — that line is what every surface calls the
+//!   agent, and losing it fails nothing loudly, it just renders the agent as
+//!   a raw id.
+//! - **Audit commit**: after a successful write, the change is staged and
+//!   committed into the `personas/` repo with a fixed `Baybo <baybo@local>`
+//!   author, so the user can later see what the agent rewrote and revert
+//!   with `git`.
+//!   `--no-verify` is intentional: it is Baybo-managed audit history, not a
+//!   hand-curated repo where pre-commit hooks would be authored. A
 //!   commit failure (detached HEAD, missing git, etc.) leaves the file
 //!   write in place and surfaces a warning in the tool output.
 //!
