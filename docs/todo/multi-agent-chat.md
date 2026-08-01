@@ -475,7 +475,7 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | Backend disabled after sessions exist | turn fails with a clear in-chat error; the session survives and works again on re-enable |
 | Profile row deleted with bound sessions | builtin fallback (workspace soul, default LLM, no overlay) + `warn!`; memory stays keyed to the stored `agent_id`, so it survives and stays partitioned |
 | `personas/<id>/SOUL.md` missing | re-seeded from the template (or the legacy row prompt) and used |
-| `personas/<id>/SOUL.md` unreadable (I/O error) | fall back to the workspace soul + `warn!`; never fail the turn |
+| `personas/<id>/SOUL.md` unreadable (I/O error) | `error!` naming both paths, then the minimal `FALLBACK_SYSTEM_PROMPT` — **never** the workspace persona |
 | Persona directory deleted while sessions live | empty overlay, soul re-seeded; no error |
 | Stale `profile.llm` pin | existing tolerance: `warn!` + default |
 | External CLI crash / parse error / lost resume state | turn fails visibly; `resume_key` untouched, nothing auto-cleared |
@@ -488,7 +488,8 @@ cleanup of any kind.
 ## Testing
 
 - **Unit** — prompt resolution across all three arms (subagent > agent soul >
-  workspace soul) including the missing-file and unreadable-file fallbacks;
+  workspace soul), the missing-file seed, and the unreadable-file case
+  degrading to the minimal prompt rather than to another agent's persona;
   `agent_soul_file` / `agent_skills_dir` builtin-vs-custom mapping; the id
   grammar rejecting traversal; `ensure_persona_layout` idempotence and
   never-overwrite; skill scope merge plus collision override; LLM precedence;
@@ -513,8 +514,9 @@ cleanup of any kind.
 below: `sessions` columns and the write-once binding; `POST /v1/chat/sessions
 { agent_id }` with validation and persona materialization; the `personas/`
 layout carrying each agent's `SOUL.md`, `IDENTITY.md` and `skills/`; soul and
-self-image assembled by path, with the deleted-profile and unreadable-file
-fallbacks; the display name living in `IDENTITY.md` rather than a column;
+self-image assembled by path, tolerating a deleted profile but never silently
+swapping in the workspace persona; the display name living in `IDENTITY.md`
+rather than a column;
 conditional (compare-and-set) writes on both identity files; a custom agent no
 longer inheriting the workspace's skills; the memory partition across both
 backends plus the removal of the `agentId` override; LLM precedence through

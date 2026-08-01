@@ -533,19 +533,18 @@ impl ContextManager {
         {
             Ok(prompt) => Some(prompt),
             Err(e) => {
-                tracing::warn!(error = %e, soul = %sources.soul_path.display(), "failed to assemble persona");
-                // A custom agent's files can go missing or unreadable in ways
-                // the workspace ones cannot (they are created per profile).
-                // Falling back to the workspace persona keeps the turn alive
-                // with a coherent one instead of a bare one-line fallback.
-                if self.agent.is_some() {
-                    match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
-                        Ok(prompt) => return Some(prompt),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to assemble workspace soul")
-                        }
-                    }
-                }
+                // Deliberately no fall back to the workspace persona. Serving
+                // it would put a session bound to one agent in another
+                // agent's voice, with nothing on screen to say so — a chat
+                // that looks fine and is quietly the wrong assistant. The
+                // caller's own fallback is a bare one-liner, which is
+                // visibly broken, and this line says why.
+                tracing::error!(
+                    error = %e,
+                    soul = %sources.soul_path.display(),
+                    identity = %sources.self_image_path.display(),
+                    "failed to assemble the session's persona; falling back to the minimal prompt",
+                );
                 None
             }
         }
@@ -2820,6 +2819,34 @@ mod tests {
                 "{kind:?} seed must be written through to disk"
             );
         }
+    }
+
+    /// An unreadable persona does NOT quietly become the workspace one: a
+    /// session bound to an agent must never answer in another agent's voice
+    /// with nothing on screen to say so. It degrades to the visibly-broken
+    /// minimal prompt, and the error log carries the paths.
+    #[tokio::test]
+    async fn an_unreadable_persona_degrades_loudly_not_into_the_workspace_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "WORKSPACE_SOUL_MUST_NOT_APPEAR");
+
+        let agent = AgentProfileId::parse("01JBROKEN").expect("valid id");
+        let store = Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
+        store.insert(baybo_store::test_support::agent_profile_row(&agent));
+        // A directory where the soul should be: present, and unreadable as a
+        // file — the shape an I/O failure takes that seeding cannot repair.
+        std::fs::create_dir_all(
+            workspace.persona_identity_file(agent.as_str(), IdentityKind::Soul),
+        )
+        .expect("soul dir");
+
+        let ctx = bound_ctx(&workspace, store, agent);
+        let prompt = ctx.resolve_system_prompt().await;
+        assert_eq!(prompt, crate::prompts::soul::FALLBACK_SYSTEM_PROMPT);
+        assert!(
+            !prompt.contains("WORKSPACE_SOUL_MUST_NOT_APPEAR"),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]
