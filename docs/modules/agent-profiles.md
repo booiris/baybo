@@ -81,6 +81,8 @@ The gateway still answers an *explicit* attempt with a 400 rather than silently 
 
 ### DB-backed, not workspace files
 
+A create materialises the persona directory and writes the name **before** inserting the row: the row is what makes an agent visible and what a retry would duplicate, so a filesystem failure must not leave a half-made one in the roster. An orphaned directory is inert — nothing sweeps `personas/`, by design.
+
 Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (`personas/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
 
 ### The builtin row is locked structurally, not by convention
@@ -176,7 +178,7 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 - **The row is not the agent.** `ContextManager` reads the persona from `personas/<id>/`, the skill overlay from `personas/<id>/skills/`, and the memory partition from the id — all keyed by the id the session carries, none of them by the row. So deleting a row strands nothing: the conversation keeps the persona, the skills and the memories it has been talking to, and only the row's own fields (the llm pin, the roster entry) go.
 - Strictly disjoint from `SubagentProfile` and from the workspace Soul; the only shared vocabulary is `baybo-model` (`ExternalAgentKind`, `LlmEntryName`, the backend tag strings).
 - All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere. Deleting a row does not touch `personas/<id>/`, and nothing in the persona path consults the row — so a bound conversation keeps the agent it has been talking to, the same way it keeps that agent's memories.
-- `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`) on the way into `IDENTITY.md`; identity-file writes carry their own 1 MiB cap. `description` is deliberately bounded only by the admin request-body limit.
+- `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`) **and** a round-trip check — it is rejected unless `display_name(with_display_name(…))` returns it unchanged, so a create response and the next `GET` can never disagree about what the agent is called. Identity-file writes carry a 1 MiB cap enforced by the API and by the `Edit` tool alike. `description` is deliberately bounded only by the admin request-body limit.
 - Profile rows are user data with a normal delete affordance — the session never-delete rule does not apply — but there is still no background sweeper of any kind, and orphaned avatar blobs stay inert.
 
 ## Deferred
