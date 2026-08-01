@@ -17,8 +17,7 @@ use baybo_context::ContextError;
 use baybo_llm::{Attribution, BillableLlm, LlmResponse, ModelInfo};
 use baybo_model::{SessionId, TurnId};
 use baybo_trace::{
-    CompressionApplied, CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult,
-    SpanRecorder, StepKind,
+    CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -26,10 +25,11 @@ use tracing::{debug, warn};
 use crate::security::SecurityGateway;
 
 /// How many summarizer attempts one compaction gets. The second exists
-/// because the alternative to a summary is the truncate fallback, which
-/// throws away the middle of the conversation for good — worth one more
-/// round-trip before paying that. Bounded at two: the request is the whole
-/// transcript, so each attempt is the most expensive call the session makes.
+/// because the alternative to a summary is no compaction at all: the
+/// transcript stays over budget and the user gets told the conversation
+/// could not be compacted — worth one more round-trip first. Bounded at
+/// two: the request is the whole transcript, so each attempt is the most
+/// expensive call the session makes, and the next turn retries anyway.
 const MAX_COMPACTION_ATTEMPTS: usize = 2;
 
 /// Agent-side dependencies needed to execute the compression LLM call:
@@ -62,10 +62,11 @@ impl CompressionRunner {
     /// against each span while it is open, and returns the sanitized
     /// `LlmResponse`.
     ///
-    /// The compressor parses the content and applies its truncate fallback
-    /// if the response is empty or this returns [`ContextError::Compression`]
-    /// — but **not** on [`ContextError::Cancelled`], which leaves the
-    /// transcript alone.
+    /// A [`ContextError::Compression`] closes the step as `Failed` — with no
+    /// truncate fallback behind it, an unsummarized transcript is a real
+    /// failure of the compaction, not a degraded success. A
+    /// [`ContextError::Cancelled`] is not: the step closes `Ok` and the next
+    /// turn redoes the pass.
     pub(crate) async fn run(
         self,
         request: baybo_llm::ChatRequest,
@@ -93,9 +94,6 @@ impl CompressionRunner {
             turn_id,
             StepKind::Compression {
                 trigger: Some(trigger),
-                // The callback is only reached by the live-summary path; the
-                // truncate fallback never calls it.
-                applied: Some(CompressionApplied::LiveSummary),
             },
             cancel_ctx,
             |step| async move {
@@ -221,21 +219,27 @@ impl CompressionRunner {
                     }
                     let retriable = *retriable.lock();
                     if !retriable || attempt + 1 == MAX_COMPACTION_ATTEMPTS {
-                        return Ok((LifecycleOutcome::Ok, Err(ContextError::Compression(error))));
+                        return Ok((
+                            LifecycleOutcome::Failed {
+                                reason: error.clone(),
+                            },
+                            Err(ContextError::Compression(error)),
+                        ));
                     }
                     debug!(
                         attempt = attempt + 1,
                         max = MAX_COMPACTION_ATTEMPTS,
                         %error,
-                        "compaction call failed; retrying before the truncate fallback"
+                        "compaction call failed; retrying"
                     );
                     last_error = Some(error);
                 }
+                let reason = last_error.unwrap_or_else(|| "compaction failed".to_string());
                 Ok((
-                    LifecycleOutcome::Ok,
-                    Err(ContextError::Compression(
-                        last_error.unwrap_or_else(|| "compaction failed".to_string()),
-                    )),
+                    LifecycleOutcome::Failed {
+                        reason: reason.clone(),
+                    },
+                    Err(ContextError::Compression(reason)),
                 ))
             },
         )

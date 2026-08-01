@@ -3,15 +3,18 @@
 //! One summarizer LLM call replaces the conversation so far with
 //! `[system…, summary, verbatim recent slice]`. The slice is bounded by
 //! [`recent_slice_bounds`] and dropped when it would keep the result from
-//! shrinking; on a summarizer failure or an unusable response the
-//! transcript is truncated to `system + last keep_recent non-system`
-//! instead (pair-preserving, so tool_use / tool_result stays intact).
+//! shrinking.
 //!
-//! Two things short-circuit before any of that: a conversation already at
-//! or below `keep_recent` non-system messages returns
-//! [`CompressOutput::NoOp`] (even truncation couldn't shrink it), and a
-//! cancelled summarizer call returns [`CompressOutput::Cancelled`], leaving
-//! the transcript exactly as it was.
+//! **A summary is the only way a transcript shrinks.** When the summarizer
+//! call fails or comes back unusable the compaction returns
+//! [`CompressOutput::Failed`] and the transcript is left exactly as it was —
+//! still over budget, so the next turn's threshold check runs it again. There
+//! is deliberately no "drop the middle" fallback: a transient provider error
+//! is not a reason to destroy the conversation, and the user is told instead.
+//!
+//! Two things short-circuit before the call: a conversation short by both
+//! measures returns [`CompressOutput::NoOp`], and a cancelled summarizer call
+//! returns [`CompressOutput::Cancelled`].
 //!
 //! See `docs/modules/context.md`.
 
@@ -32,6 +35,11 @@ use crate::{
     ContextManager, MIN_COMPACTABLE_TOKENS, estimate_skill_trailer_tokens, recent_slice_bounds,
 };
 
+/// Stand-in reason when the summarizer answered but the answer carried no
+/// summary. There is no provider error to quote, and "" would render as a
+/// blank cause in the notice the user sees.
+pub(crate) const EMPTY_SUMMARY_REASON: &str = "the summarizer returned no usable summary";
+
 pub type ChatFuture =
     Pin<Box<dyn Future<Output = std::result::Result<LlmResponse, ContextError>> + Send>>;
 
@@ -45,36 +53,23 @@ pub type ChatFuture =
 pub type ChatCallback = Box<dyn FnOnce(ChatRequest, LlmCallInputs) -> ChatFuture + Send>;
 
 pub enum CompressOutput {
-    /// Pre-flight gate fired (non-system count ≤ keep_recent); even
-    /// the truncate fallback couldn't shrink. Surfaces as
+    /// Pre-flight gate fired: the conversation is short by both measures, so
+    /// a summary could not beat what it replaces. Surfaces as
     /// `CompressionOutcome::StrategyDeclined`.
     NoOp,
     /// The summariser call was aborted by a turn cancellation. Nothing is
     /// applied; the transcript is still over budget, so the next turn's
     /// threshold check runs the compaction again.
     Cancelled,
+    /// The summariser call errored, or returned nothing usable. Nothing is
+    /// applied — the transcript is worth more intact than shortened by
+    /// guesswork — and the caller tells the user.
+    Failed { reason: String },
     /// Compressor produced a new transcript. `ContextManager` always
-    /// re-attaches the skill trailer here, since every Replaced
-    /// branch can drop the historical `<system-reminder>` carrying
-    /// the skill list — summary stages by construction, and the
-    /// truncate fallback whenever the reminder lands in the dropped
-    /// middle.
-    Replaced {
-        messages: Vec<ChatMessage>,
-        /// Which path produced this replacement.
-        stage: CompressionStage,
-    },
-}
-
-/// How the transcript was actually shrunk. `Truncate` runs no LLM call, so it
-/// leaves no `LlmCall` span and has to be recorded by the caller to be visible
-/// in a trace at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionStage {
-    /// Summarised the transcript with a live LLM call.
-    LiveSummary,
-    /// Dropped the middle of the transcript after the summarizer failed.
-    Truncate,
+    /// re-attaches the skill trailer here, since the summary discards the
+    /// historical `<system-reminder>` carrying the skill list by
+    /// construction.
+    Replaced { messages: Vec<ChatMessage> },
 }
 
 fn find_tagged_block(text: &str, tag: &str) -> Option<std::ops::Range<usize>> {
@@ -199,9 +194,9 @@ where
 /// we never drop more, only pull additional `ToolUse` blocks back in.
 ///
 /// Anthropic / OpenAI both reject arrays where a `tool_use_id` shows
-/// up on the result side without the originating `tool_use`, so
-/// truncation paths that split on a fixed `keep_recent` boundary
-/// must call this before slicing.
+/// up on the result side without the originating `tool_use`, so any
+/// path that slices the transcript at a candidate boundary must call
+/// this before cutting.
 pub(crate) fn pair_preserving_cut(messages: &[ChatMessage], cut: usize) -> usize {
     let mut new_cut = cut.min(messages.len());
     if new_cut == 0 {
@@ -251,16 +246,14 @@ impl ContextManager {
         &self,
         chat: ChatCallback,
     ) -> crate::Result<CompressOutput> {
-        // Decline only when there is genuinely nothing to gain: too few
-        // messages for truncation to drop any, AND too little text for a
-        // summary to beat its own framing. Both, not either.
-        //
-        // The message count alone is the truncate fallback's question — it
-        // keeps the last `keep_recent`, so at or below that it can't shrink.
-        // It says nothing about the summariser, which collapses any number of
-        // messages into one. Gating on it alone refused to compact a
-        // transcript of a few pasted files: ten messages, 26k tokens, well
-        // past the budget, declined four turns running.
+        // Decline only when there is genuinely nothing to gain: few enough
+        // messages that collapsing them into one barely changes the shape,
+        // AND too little text for a summary to beat its own framing. Both,
+        // not either — the count alone says nothing about the summariser,
+        // which collapses any number of messages into one. Gating on it
+        // alone refused to compact a transcript of a few pasted files: ten
+        // messages, 26k tokens, well past the budget, declined four turns
+        // running.
         let (_, non_system) = partition_system(&self.messages);
         let non_system_tokens: usize = non_system
             .iter()
@@ -270,15 +263,14 @@ impl ContextManager {
             return Ok(CompressOutput::NoOp);
         }
 
-        Ok(self.summarize_or_truncate(chat).await)
+        Ok(self.summarize(chat).await)
     }
 
     /// The compaction itself: one summarizer call, then assemble.
     ///
-    /// Returns `Replaced` in every case but a cancellation — the pre-flight
-    /// gate already filtered "nothing to shrink", and the truncate fallback is
-    /// guaranteed to shorten when reached.
-    async fn summarize_or_truncate(&self, chat: ChatCallback) -> CompressOutput {
+    /// Anything short of a usable summary leaves the transcript untouched —
+    /// `Cancelled` for a `/stop`, `Failed` for an errored or unusable call.
+    async fn summarize(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
         let instruction =
@@ -311,33 +303,26 @@ impl ContextManager {
             reasoning_effort: None,
         };
 
-        let truncate_fallback = || {
-            let mut out = system_msgs.clone();
-            let initial_split = non_system.len().saturating_sub(self.keep_recent);
-            let split = pair_preserving_cut(&non_system, initial_split);
-            out.extend_from_slice(&non_system[split..]);
-            CompressOutput::Replaced {
-                messages: out,
-                stage: CompressionStage::Truncate,
-            }
-        };
-
         let summary = match chat(request, input_marker).await {
             Ok(response) => parse_summary_response(&response.content),
             // Not a failure to summarise — the call was cut short, so nothing
-            // was learned about the transcript. Truncating on that would
-            // destroy the middle of the conversation over a `/stop`.
+            // was learned about the transcript, and the next turn redoes it.
             Err(ContextError::Cancelled(reason)) => {
                 debug!(%reason, "compaction cancelled; leaving it for the next turn");
                 return CompressOutput::Cancelled;
             }
             Err(e) => {
-                warn!(error = %e, "summarization failed; falling back to truncation");
-                None
+                warn!(error = %e, "summarization failed; transcript left unchanged");
+                return CompressOutput::Failed {
+                    reason: e.to_string(),
+                };
             }
         };
         let Some(summary) = summary else {
-            return truncate_fallback();
+            warn!("summarizer returned no usable summary; transcript left unchanged");
+            return CompressOutput::Failed {
+                reason: EMPTY_SUMMARY_REASON.to_string(),
+            };
         };
 
         self.assemble_summary(system_msgs, &non_system, &summary)
@@ -389,7 +374,6 @@ impl ContextManager {
             if self.compaction_fits(&candidate) {
                 return CompressOutput::Replaced {
                     messages: candidate,
-                    stage: CompressionStage::LiveSummary,
                 };
             }
         }
@@ -398,7 +382,6 @@ impl ContextManager {
         // whether an apply is worth it.
         CompressOutput::Replaced {
             messages: with_slice(),
-            stage: CompressionStage::LiveSummary,
         }
     }
 

@@ -1,7 +1,10 @@
 # Remove background compression — implementation plan
 
 **Status:** implemented on `refactor/remove-background-compression`; the operator runbook in §8
-has NOT been run. Kept as the record of why each decision was made — the surviving design lives in
+has NOT been run. **Superseded in part:** the truncate fallback this plan preserves has since been
+deleted outright (a failed summariser now applies nothing and warns the user), taking
+`CompressionApplied`, `CompressionStage` and `record_spanless_compaction` with it — read every
+mention of them below as history, not as work to do. Kept as the record of why each decision was made — the surviving design lives in
 [`docs/modules/context.md`](../modules/context.md). One PR, spanning
 `baybo-context` / `baybo-agent` / `baybo-session` / `baybo-store` / `baybo-storage` /
 `baybo-workspace` / `baybo-trace` / `baybo-model` / `baybo-query`, `app/web`, `app/ios`, and docs.

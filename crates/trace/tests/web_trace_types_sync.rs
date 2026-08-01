@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use baybo_trace::{CompressionApplied, CompressionTrigger, SpanKind, StepKind};
+use baybo_trace::{CompressionTrigger, SpanKind, StepKind};
 use baybo_turn::TurnInputKind;
 
 /// Every hand-maintained frontend mirror of this crate's trace types.
@@ -73,10 +73,7 @@ fn assert_kind_listed(ts: &str, ty: &str, tag: &str, mirror: &str) {
 fn web_trace_types_cover_every_step_kind() {
     let kinds = [
         StepKind::LlmIteration,
-        StepKind::compression(
-            CompressionTrigger::Threshold,
-            CompressionApplied::LiveSummary,
-        ),
+        StepKind::compression(CompressionTrigger::Threshold),
         StepKind::MemoryRecall,
         StepKind::MemoryWrite,
         StepKind::SkillSelection,
@@ -136,10 +133,7 @@ fn span_kind_exhaustiveness(k: &SpanKind) {
 fn web_trace_types_declare_no_kinds_rust_lacks() {
     let step_tags = [
         StepKind::LlmIteration,
-        StepKind::compression(
-            CompressionTrigger::Threshold,
-            CompressionApplied::LiveSummary,
-        ),
+        StepKind::compression(CompressionTrigger::Threshold),
         StepKind::MemoryRecall,
         StepKind::MemoryWrite,
         StepKind::SkillSelection,
@@ -217,9 +211,9 @@ fn declared_literals(ts: &str, ty: &str) -> Vec<String> {
         .collect()
 }
 
-/// Both compression unions, both directions. `trigger` and `applied` are
-/// rendered as raw strings by the trace viewer, so a drift here shows up as a
-/// row labelled with a value that no longer means anything.
+/// The compression union, both directions. `trigger` is rendered as a raw
+/// string by the trace viewer, so a drift here shows up as a row labelled with
+/// a value that no longer means anything.
 #[test]
 fn web_trace_types_cover_the_compression_unions() {
     let ts = web_trace_types();
@@ -231,20 +225,8 @@ fn web_trace_types_cover_the_compression_unions() {
             CompressionTrigger::Threshold | CompressionTrigger::Forced => {}
         }
     }
-    let applied = [
-        CompressionApplied::LiveSummary,
-        CompressionApplied::Truncate,
-    ];
-    for a in applied {
-        match a {
-            CompressionApplied::LiveSummary | CompressionApplied::Truncate => {}
-        }
-    }
 
-    for (ty, wire) in [
-        ("CompressionTrigger", vec!["threshold", "forced"]),
-        ("CompressionApplied", vec!["live_summary", "truncate"]),
-    ] {
+    for (ty, wire) in [("CompressionTrigger", vec!["threshold", "forced"])] {
         let declared = declared_literals(&ts, ty);
         assert!(
             !declared.is_empty(),

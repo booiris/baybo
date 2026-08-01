@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
 use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
-    CompressionApplied, CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult,
-    SpanRecorder, StepHandle, StepKind,
+    CompressionTrigger, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
+    StepKind,
 };
 use tracing::{debug, info, warn};
 
@@ -573,6 +573,38 @@ pub struct AgentLoopConfig {
 const TURNS_SINCE_WRITE: u64 = 10;
 const TURNS_BETWEEN_REMINDERS: u64 = 10;
 
+/// User-facing line for a compaction that could not be applied because the
+/// summarizer call failed. Shared by the threshold path and `/compact` so the
+/// same event reads the same way wherever it surfaces. The conversation is
+/// deliberately left intact — nothing was dropped to make room.
+fn compaction_failed_text(reason: &str) -> String {
+    format!("Context compaction failed; the conversation is unchanged. Reason: {reason}")
+}
+
+/// What [`AgentLoop::compact_now`] hands back for the caller to ship as a
+/// notice. The severity travels with the text so a failed compaction cannot
+/// reach the user as an `Info` line that reads like a confirmation.
+pub struct CompactionNotice {
+    pub level: baybo_channels::NoticeLevel,
+    pub text: String,
+}
+
+impl CompactionNotice {
+    fn info(text: &str) -> Self {
+        Self {
+            level: baybo_channels::NoticeLevel::Info,
+            text: text.to_string(),
+        }
+    }
+
+    fn warn(text: &str) -> Self {
+        Self {
+            level: baybo_channels::NoticeLevel::Warn,
+            text: text.to_string(),
+        }
+    }
+}
+
 /// The throttle decision: inject the model-facing task reminder this turn iff the
 /// model has gone `TURNS_SINCE_WRITE` turns without managing tasks AND it has
 /// been `TURNS_BETWEEN_REMINDERS` turns since the last reminder.
@@ -922,6 +954,11 @@ impl AgentLoop {
 
         // Iterative LLM loop
         let mut iterations = 0;
+        // A compaction that fails leaves the transcript over threshold, so the
+        // gate re-fires on every remaining iteration. Retrying is right — the
+        // failure is usually a transient provider error and the transcript
+        // only grows — but telling the user again on each one is not.
+        let mut compaction_failure_reported = false;
         let turn_started = std::time::Instant::now();
         let mut observer_state = ObserverState::default();
         // Aborts an observer still in flight when the turn ends — the last
@@ -1008,6 +1045,7 @@ impl AgentLoop {
                 turn_id,
                 &cancel_token,
                 delta_tx.as_ref(),
+                &mut compaction_failure_reported,
             )
             .await?;
 
@@ -2531,15 +2569,21 @@ impl AgentLoop {
             .await;
     }
 
-    /// Compress if the budget calls for it. The `chat` closure is
-    /// invoked only when the strategy returns `NeedsLlmCall`; pure
-    /// strategies (Truncate, Summarize fallback) skip it entirely. The
-    /// closure brackets the real LLM call in a `Compression` step +
-    /// `LlmCall` span and records cost against that span — budget
-    /// enforcement on the call itself rides on the wrapped client.
+    /// Compress if the budget calls for it. The `chat` closure brackets the
+    /// summarizer call in a `Compression` step + `LlmCall` span and records
+    /// cost against that span — budget enforcement on the call itself rides
+    /// on the wrapped client.
     ///
     /// Reports the compaction phase as `Status(Compacting)` / `Compacted`
     /// when a pass actually runs, so the user sees why the turn paused.
+    ///
+    /// A failed compaction does **not** end the turn: the transcript is
+    /// simply not shortened, and the next iteration (or the next turn) tries
+    /// again. But the user is told, once per turn — the conversation is now
+    /// running over its compaction threshold, which is worth knowing before
+    /// the main call starts refusing oversized requests.
+    /// `failure_reported` is that once-per-turn latch, owned by `run_inner`;
+    /// it gates the `warn!` line as well, so a long turn does not repeat it.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
@@ -2547,6 +2591,7 @@ impl AgentLoop {
         turn_id: TurnId,
         cancel_token: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        failure_reported: &mut bool,
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(
             session,
@@ -2576,54 +2621,57 @@ impl AgentLoop {
             self.emit_status(delta_tx, session, StatusPhase::Compacted)
                 .await;
         }
-        if let Ok(baybo_context::CompressionOutcome::Compressed { stage }) = &result {
-            Self::record_spanless_compaction(
-                span_recorder,
-                turn_id,
-                CompressionTrigger::Threshold,
-                *stage,
-            )
-            .await;
+        if let Ok(baybo_context::CompressionOutcome::Failed { reason }) = &result {
+            if *failure_reported {
+                debug!(
+                    session_id = %session.id,
+                    reason = %reason,
+                    "context compaction failed again this turn"
+                );
+            } else {
+                *failure_reported = true;
+                warn!(
+                    session_id = %session.id,
+                    reason = %reason,
+                    "context compaction failed; transcript left unchanged"
+                );
+                self.emit_compaction_failed(delta_tx, session, reason).await;
+            }
         }
         result?;
         Ok(())
     }
 
-    /// Record a compaction that shrank the transcript without an LLM call.
+    /// Tell the user a compaction failed, as a mid-turn `Warn` notice.
     ///
-    /// The truncate fallback never invokes the chat callback, so
-    /// `CompressionRunner` — which owns the step for the live-summary path —
-    /// never runs for it. Without this, a compaction that fell back to
-    /// truncation leaves no trace at all, even though it is the one that
-    /// discarded the most. The step carries no span by design: there was no
-    /// model round-trip to span.
-    async fn record_spanless_compaction(
-        span_recorder: &Arc<SpanRecorder>,
-        turn_id: TurnId,
-        trigger: CompressionTrigger,
-        stage: baybo_context::CompressionStage,
+    /// Live-only (`durable_id: None`): `mid_turn` notices fold into the open
+    /// work block, which is the right shape here — the turn keeps running —
+    /// but that fold is not keyed by durable id, so persisting a twin would
+    /// render twice after a sync. The trace's failed `Compression` step is
+    /// the durable record.
+    ///
+    /// `reason` is already sanitized: [`CompressionRunner`] runs the provider
+    /// error through the same `SecurityGateway` as the main LLM path.
+    async fn emit_compaction_failed(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        reason: &str,
     ) {
-        let applied = match stage {
-            // The live-summary path already recorded its own step around the
-            // LLM call; recording a second one here would double-count it.
-            baybo_context::CompressionStage::LiveSummary => return,
-            baybo_context::CompressionStage::Truncate => CompressionApplied::Truncate,
-        };
-        let kind = StepKind::Compression {
-            trigger: Some(trigger),
-            applied: Some(applied),
-        };
-        match span_recorder.begin_step(turn_id, kind).await {
-            Ok(step) => {
-                if let Err(e) = span_recorder
-                    .end_step(step, baybo_trace::LifecycleOutcome::Ok)
-                    .await
-                {
-                    warn!(error = %e, "failed to close the spanless compaction step");
-                }
-            }
-            Err(e) => warn!(error = %e, "failed to record the spanless compaction step"),
-        }
+        let Some(tx) = delta_tx else { return };
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: baybo_channels::NoticeLevel::Warn,
+                    text: compaction_failed_text(reason),
+                    mid_turn: true,
+                    durable_id: None,
+                },
+            })
+            .await;
     }
 
     fn build_compression_runner(
@@ -2832,12 +2880,13 @@ impl AgentLoop {
         }
     }
 
-    /// Run an on-demand compression pass and return the confirmation
-    /// text for the caller to ship as an `AgentEvent::Notice`.
+    /// Run an on-demand compression pass and return the notice for the caller
+    /// to ship as an `AgentEvent::Notice`.
     /// The variants of `CompressionOutcome` map to specific user-facing
     /// messages so the caller (typically a `/compact` notice) can
-    /// distinguish "strategy declined", "no savings", and a real
-    /// compress — instead of one generic "nothing to compress" line.
+    /// distinguish "strategy declined", "no savings", a failed summarizer
+    /// call, and a real compress — instead of one generic "nothing to
+    /// compress" line.
     /// A fresh turn is minted so the compression step + LLM span land
     /// on a real lifecycle.
     pub async fn compact_now(
@@ -2847,7 +2896,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_turn_id: Option<TurnId>,
         cancel_token: CancellationToken,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CompactionNotice> {
         // `/compact` is a user-typed command, but it is not a chat turn: it
         // runs `force_compress` directly and emits a notice, not an assistant
         // reply.
@@ -2878,38 +2927,40 @@ impl AgentLoop {
                         runner.run(req, marker).await
                     })
                     .await?;
-                if let baybo_context::CompressionOutcome::Compressed { stage } = &outcome {
-                    Self::record_spanless_compaction(
-                        span_recorder,
-                        turn_id,
-                        CompressionTrigger::Forced,
-                        *stage,
-                    )
-                    .await;
-                }
-                let text = match outcome {
-                    baybo_context::CompressionOutcome::Compressed { .. } => {
-                        "Context compressed.".to_string()
-                    }
-                    baybo_context::CompressionOutcome::BelowThreshold => {
-                        "Context already under the compression threshold; skipped.".to_string()
-                    }
-                    baybo_context::CompressionOutcome::StrategyDeclined => {
-                        "Compression strategy declined: nothing to summarize (conversation too short).".to_string()
-                    }
-                    baybo_context::CompressionOutcome::NoSavings => {
-                        "Compression ran but produced no savings; kept the original.".to_string()
-                    }
-                    baybo_context::CompressionOutcome::Cancelled => {
-                        "Compaction cancelled; the conversation is unchanged.".to_string()
+                let notice = match outcome {
+                    baybo_context::CompressionOutcome::Compressed => CompactionNotice::info(
+                        "Context compressed.",
+                    ),
+                    baybo_context::CompressionOutcome::BelowThreshold => CompactionNotice::info(
+                        "Context already under the compression threshold; skipped.",
+                    ),
+                    baybo_context::CompressionOutcome::StrategyDeclined => CompactionNotice::info(
+                        "Compression strategy declined: nothing to summarize (conversation too short).",
+                    ),
+                    baybo_context::CompressionOutcome::NoSavings => CompactionNotice::info(
+                        "Compression ran but produced no savings; kept the original.",
+                    ),
+                    baybo_context::CompressionOutcome::Cancelled => CompactionNotice::info(
+                        "Compaction cancelled; the conversation is unchanged.",
+                    ),
+                    // The one arm the user has to act on — retype `/compact`,
+                    // or let the threshold path retry — so it is the one arm
+                    // that does not come back as `Info`.
+                    baybo_context::CompressionOutcome::Failed { reason } => {
+                        warn!(
+                            session_id = %session.id,
+                            reason = %reason,
+                            "/compact failed; transcript left unchanged"
+                        );
+                        CompactionNotice::warn(&compaction_failed_text(&reason))
                     }
                 };
                 let output = TurnOutput::Message {
-                    content: vec![ContentBlock::Text(text.clone())],
+                    content: vec![ContentBlock::Text(notice.text.clone())],
                     // `/compact` is not a user-chat turn — never pushed.
                     ordinal: None,
                 };
-                Ok((output, text))
+                Ok((output, notice))
             },
         )
         .await

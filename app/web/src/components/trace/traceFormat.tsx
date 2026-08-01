@@ -276,14 +276,11 @@ export function stepSummaryText(step: Step, spans: Span[]): string {
       return 'llm iteration';
     }
     case 'compression': {
-      // `trigger` (why) leads, `applied` (how) follows. A truncate compaction
-      // makes no LLM call, so it has no span and no token figures — it must
-      // still say what it did, because that spanless row is the compaction
-      // that discarded the most.
-      const { trigger, applied } = step.kind;
+      // `trigger` (why it ran) leads; the token figures come off the
+      // summarizer's own span, which a failed compaction does not have.
+      const { trigger } = step.kind;
       const parts: string[] = [];
       if (trigger != null) parts.push(trigger);
-      if (applied != null) parts.push(applied.replace('_', ' '));
       const llm = spans.find((s) => s.kind.kind === 'llm_call');
       if (llm?.kind.kind === 'llm_call' && llm.kind.result) {
         const { input, output } = compressionTokens(llm.kind.result);

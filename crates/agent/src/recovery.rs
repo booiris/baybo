@@ -485,8 +485,8 @@ mod tests {
         ApprovalDecision, ContentBlock, ParallelGroup, ResourceAccess, SessionId, SpanId, StepId,
         TriggerKind,
     };
+    use baybo_trace::CompressionTrigger;
     use baybo_trace::test_support::MemoryTraceStore;
-    use baybo_trace::{CompressionApplied, CompressionTrigger};
     use baybo_trace::{
         LlmCallBegin, LlmCallInputs, SpanEvent, SpanEventKind, SpanKind, StepKind, ToolCallBegin,
     };
@@ -890,10 +890,7 @@ mod tests {
         let step = Step {
             id: StepId::new(),
             turn_id: turn.id,
-            kind: StepKind::compression(
-                CompressionTrigger::Threshold,
-                CompressionApplied::LiveSummary,
-            ),
+            kind: StepKind::compression(CompressionTrigger::Threshold),
             started_at: t0 + Duration::seconds(20),
             ended_at: None,
             outcome: LifecycleState::Pending,

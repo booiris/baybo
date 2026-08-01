@@ -1384,8 +1384,8 @@ mod tests {
     use baybo_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use baybo_session::SessionStore;
     use baybo_store::TurnStore as _;
+    use baybo_trace::CompressionTrigger;
     use baybo_trace::test_support::MemoryTraceStore;
-    use baybo_trace::{CompressionApplied, CompressionTrigger};
     use baybo_turn::TurnInput;
     use baybo_turn::test_support::MemoryTurnStore;
     use std::sync::Arc;
@@ -2223,10 +2223,7 @@ mod tests {
         // Same shape, but tagged with a value this build's enum does not have
         // — exactly what a row written before a variant was retired looks like.
         step.id = StepId::new();
-        step.kind = baybo_trace::StepKind::compression(
-            CompressionTrigger::Threshold,
-            CompressionApplied::LiveSummary,
-        );
+        step.kind = baybo_trace::StepKind::compression(CompressionTrigger::Threshold);
         let legacy_row = baybo_store::StepRow {
             id: step.id,
             data: step
@@ -2501,10 +2498,7 @@ mod tests {
                 &Step {
                     id: step_id,
                     turn_id: j.id,
-                    kind: StepKind::compression(
-                        CompressionTrigger::Threshold,
-                        CompressionApplied::LiveSummary,
-                    ),
+                    kind: StepKind::compression(CompressionTrigger::Threshold),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,
@@ -2727,10 +2721,7 @@ mod tests {
                 &Step {
                     id: step_id,
                     turn_id: j.id,
-                    kind: StepKind::compression(
-                        CompressionTrigger::Threshold,
-                        CompressionApplied::LiveSummary,
-                    ),
+                    kind: StepKind::compression(CompressionTrigger::Threshold),
                     started_at: now,
                     ended_at: None,
                     outcome: LifecycleState::Pending,

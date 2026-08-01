@@ -345,12 +345,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
   // turn blocked on one summarizer call before continuing.
   const bgStarted = new Date(t0);
   const bgEnded = new Date(t0 + 80);
-  const bgStep = step(
-    turn1,
-    { kind: 'compression', trigger: 'threshold', applied: 'live_summary' },
-    bgStarted,
-    bgEnded,
-  );
+  const bgStep = step(turn1, { kind: 'compression', trigger: 'threshold' }, bgStarted, bgEnded);
   const bgLlm = llmSpan(
     bgStep.id,
     'claude-sonnet-4-6',
@@ -363,15 +358,27 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     bgEnded,
   );
 
-  // Step 2: a compaction whose summarizer failed, so it fell back to dropping
-  // the middle. NO LLM call, so this step carries no span — and without the
-  // row it records, the compaction that discarded the most would be invisible.
-  const trimAt = new Date(t0 + 90);
-  const trimStep = step(
-    turn1,
-    { kind: 'compression', trigger: 'forced', applied: 'truncate' },
-    trimAt,
-    new Date(t0 + 92),
+  // Step 2: a compaction whose summarizer call failed. Nothing was applied —
+  // the transcript is left intact and still over budget — so the step closes
+  // `failed` and the user was told; this row is how it stays visible after.
+  const failAt = new Date(t0 + 90);
+  const failEnd = new Date(t0 + 96);
+  const failReason = 'LLM transient error: Our servers are currently overloaded.';
+  const failStep = step(turn1, { kind: 'compression', trigger: 'forced' }, failAt, failEnd, {
+    outcome: 'failed',
+    reason: failReason,
+  });
+  const failLlm = llmSpan(
+    failStep.id,
+    'claude-sonnet-4-6',
+    [systemMsg('Summarize the conversation so far.')],
+    '',
+    [],
+    0,
+    0,
+    failAt,
+    failEnd,
+    { outcome: 'failed', reason: failReason },
   );
 
   // Step 2: LLM iteration with parallel tool calls
@@ -484,7 +491,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     ended_at: endedAt,
     steps: [
       { step: bgStep, spans: [bgLlm] },
-      { step: trimStep, spans: [] },
+      { step: failStep, spans: [failLlm] },
       { step: it1Step, spans: [it1Llm, tool1, tool2] },
       { step: it2Step, spans: [it2Llm] },
     ],

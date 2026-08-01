@@ -51,8 +51,8 @@ pub enum SpanKind {
 - Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: ParallelGroup`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
 - `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection`, `ProgressObserver`, and `TitleGeneration` are first-class Step kinds, not events on an LLM step.
-- `Compression` carries two orthogonal fields. `CompressionTrigger` says **why** it ran (`Threshold` / `Forced`) — the token threshold tripped, or the user typed `/compact`. `CompressionApplied` says **how** it shrank (`LiveSummary` / `Truncate`).
-- **Only `LiveSummary` makes an LLM call**, so only it produces a step with `LlmCall` spans — two of them when a transient failure was retried, both under the one step. `Truncate` rewrites the context with no model round-trip, so the agent records its step explicitly (`record_spanless_compaction`): without that, the compaction that discarded the most would be the only one leaving no trace at all. A `Compression` step with zero spans is therefore expected, not a defect.
+- `Compression` carries `CompressionTrigger`: **why** it ran (`Threshold` / `Forced`) — the token threshold tripped, or the user typed `/compact`. There is no "how" field, because a live summary is the only way a transcript is ever shortened.
+- Every `Compression` step therefore wraps at least one `LlmCall` span — two when a transient failure was retried, both under the one step. A compaction whose summariser call failed applies **nothing** (no truncate fallback exists), so its step closes `Failed` with the provider's reason rather than `Ok`, and the user is told.
 
 ### Provenance lives on Span variants, not on Step
 

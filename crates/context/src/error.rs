@@ -6,9 +6,9 @@ pub enum ContextError {
     Compression(String),
 
     /// The summariser call was aborted because the turn was cancelled.
-    /// Distinct from [`ContextError::Compression`] because the compressor must
-    /// NOT apply its truncate fallback here: nothing was learned about the
-    /// transcript, and the next turn re-runs the compaction from scratch.
+    /// Distinct from [`ContextError::Compression`] because a cancel is not a
+    /// failure: nothing went wrong, so the user is not told about it, and the
+    /// next turn re-runs the compaction from scratch.
     #[error("context compaction cancelled: {0}")]
     Cancelled(String),
 

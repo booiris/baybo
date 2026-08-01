@@ -263,12 +263,13 @@ fn status_phases(outputs: &[AgentOutput]) -> Vec<StatusPhase> {
         .collect()
 }
 
-/// The truncate fallback makes no LLM call, so `CompressionRunner` never runs
-/// for it and the step has to be recorded separately. Without that row, the
-/// compaction that discarded the most — the one that gave up on summarising —
-/// would be the only one leaving no trace at all.
+/// A summary is the only thing allowed to shorten a conversation. When the
+/// summariser call fails the transcript is left exactly as it was — the turn
+/// answers anyway — and the user is told, once, that the compaction did not
+/// happen. Dropping the middle of the conversation instead was the old
+/// behaviour, and it cost a real session its history over a provider blip.
 #[tokio::test]
-async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
+async fn a_failed_summariser_keeps_the_transcript_and_warns_the_user() {
     let mut harness = AgentTestHarness::builder()
         .with_model_context_window(200)
         .with_compression_threshold(0.1)
@@ -281,8 +282,7 @@ async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
     harness
         .stub_llm
         .push_stream(vec![StreamEvent::Text("second".into())]);
-    // Both summariser attempts fail: transient, so the retry is spent, and the
-    // compaction falls back to truncation.
+    // Both summariser attempts fail: transient, so the retry is spent too.
     for _ in 0..2 {
         harness
             .stub_llm
@@ -291,6 +291,11 @@ async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
 
     harness.send_text("hello").await.unwrap();
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let before = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load the active transcript");
     harness.send_text("again").await.unwrap();
     let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
@@ -307,8 +312,47 @@ async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
         "the status pair must still bracket a failed compaction"
     );
 
+    // Nothing was dropped to make room: turn 1 is still there in full.
+    let after = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load the active transcript");
+    assert!(
+        after.len() >= before.len(),
+        "a failed compaction must not shorten the transcript: {before:#?} -> {after:#?}"
+    );
+    assert!(
+        holds_text(&after, "hello"),
+        "the opening message must survive a failed compaction: {after:#?}"
+    );
+
+    // And the user hears about it — exactly once, not once per iteration.
+    let warnings: Vec<&String> = turn2
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Notice {
+                level: baybo_channels::NoticeLevel::Warn,
+                text,
+                ..
+            } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one compaction-failure warning, got {warnings:#?}"
+    );
+    assert!(
+        warnings[0].contains("Context compaction failed"),
+        "the warning must name what failed, got {:?}",
+        warnings[0]
+    );
+
+    // The step says so too: no fallback ran behind it, so it is a failure.
     let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
-    let mut truncate_steps = Vec::new();
+    let mut compression_steps = Vec::new();
     let mut summariser_spans = 0usize;
     for turn_id in harness
         .turn_lifecycle
@@ -320,27 +364,29 @@ async fn a_failed_summariser_still_records_a_spanless_truncate_step() {
     {
         for row in trace_store.list_steps_by_turn(&turn_id).await.unwrap() {
             let step = baybo_trace::Step::from_row(row).unwrap();
-            let StepKind::Compression { applied, .. } = step.kind else {
+            if !matches!(step.kind, StepKind::Compression { .. }) {
                 continue;
-            };
-            let spans = trace_store.list_spans_by_step(&step.id).await.unwrap();
-            match applied {
-                Some(baybo_trace::CompressionApplied::Truncate) => {
-                    assert!(
-                        spans.is_empty(),
-                        "a truncate compaction makes no LLM call, so it spans nothing"
-                    );
-                    truncate_steps.push(step);
-                }
-                // The live-summary step around the two failed attempts.
-                _ => summariser_spans += spans.len(),
             }
+            summariser_spans += trace_store
+                .list_spans_by_step(&step.id)
+                .await
+                .unwrap()
+                .len();
+            compression_steps.push(step);
         }
     }
     assert_eq!(
-        truncate_steps.len(),
+        compression_steps.len(),
         1,
-        "expected exactly one truncate compaction step; got {truncate_steps:#?}"
+        "expected exactly one compaction step; got {compression_steps:#?}"
+    );
+    assert!(
+        matches!(
+            compression_steps[0].outcome,
+            baybo_trace::LifecycleState::Done(baybo_trace::LifecycleOutcome::Failed { .. })
+        ),
+        "an unsummarized compaction is a failure, got {:#?}",
+        compression_steps[0].outcome
     );
     assert_eq!(
         summariser_spans, 2,
@@ -388,13 +434,7 @@ async fn a_non_retriable_summariser_failure_is_not_retried() {
     {
         for row in trace_store.list_steps_by_turn(&turn_id).await.unwrap() {
             let step = baybo_trace::Step::from_row(row).unwrap();
-            if !matches!(
-                step.kind,
-                StepKind::Compression {
-                    applied: Some(baybo_trace::CompressionApplied::LiveSummary),
-                    ..
-                }
-            ) {
+            if !matches!(step.kind, StepKind::Compression { .. }) {
                 continue;
             }
             summariser_spans += trace_store
@@ -523,9 +563,13 @@ async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
 }
 
 fn holds_summary(messages: &[baybo_model::ChatMessage]) -> bool {
+    holds_text(messages, "the earlier conversation")
+}
+
+fn holds_text(messages: &[baybo_model::ChatMessage], needle: &str) -> bool {
     messages.iter().any(|m| {
-        m.content.iter().any(|b| {
-            matches!(b, baybo_model::ContentBlock::Text(t) if t.contains("the earlier conversation"))
-        })
+        m.content
+            .iter()
+            .any(|b| matches!(b, baybo_model::ContentBlock::Text(t) if t.contains(needle)))
     })
 }

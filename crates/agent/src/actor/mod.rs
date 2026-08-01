@@ -1314,7 +1314,7 @@ impl AgentActor {
     ) -> anyhow::Result<()> {
         // `compact_now` mints its own maintenance turn and returns a control
         // notice; it does not emit a chat reply from the actor itself.
-        let text = self
+        let notice = self
             .volatile
             .agent_loop
             .compact_now(
@@ -1325,6 +1325,13 @@ impl AgentActor {
                 self.volatile.actor_token.child_token(),
             )
             .await?;
+        // A failed compaction is recorded — and re-rendered on reload — as the
+        // warning it is, not as a confirmation.
+        let event_kind = match notice.level {
+            NoticeLevel::Warn => ControlEventKind::NoticeWarn,
+            NoticeLevel::Error => ControlEventKind::NoticeError,
+            NoticeLevel::Info => ControlEventKind::NoticeInfo,
+        };
         // Record the `/compact` echo + its confirmation as out-of-band control
         // events (off the LLM transcript) so a reload shows them, anchored after
         // the (post-compaction) last row.
@@ -1341,29 +1348,23 @@ impl AgentActor {
                     &platform_msg_id,
                 )
                 .await;
-                self.persist_control_event(
-                    after,
-                    ControlEventKind::NoticeInfo,
-                    &text,
-                    chrono::Utc::now(),
-                    "",
-                )
-                .await
+                self.persist_control_event(after, event_kind, &notice.text, chrono::Utc::now(), "")
+                    .await
             }
             None => None,
         };
-        let notice = AgentOutput {
+        let output = AgentOutput {
             session_id: self.durable.session.id.clone(),
             user_id: self.durable.session.user.id.clone(),
             channel: self.durable.session.channel.clone(),
             event: AgentEvent::Notice {
-                level: NoticeLevel::Info,
-                text,
+                level: notice.level,
+                text: notice.text,
                 mid_turn: false,
                 durable_id,
             },
         };
-        self.send_response(notice, "compact").await;
+        self.send_response(output, "compact").await;
         Ok(())
     }
 

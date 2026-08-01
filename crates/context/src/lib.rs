@@ -8,7 +8,7 @@ mod transcript_repair;
 
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
-pub use compressor::{CompressOutput, CompressionStage, parse_summary_response};
+pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
@@ -122,20 +122,18 @@ struct TokenBaseline {
 /// invoke the supplied chat closure for any LLM call, and that closure
 /// is where the agent loop opens its trace span and records cost.
 /// Hence the outcome carries no LLM-call provenance.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum CompressionOutcome {
-    /// The transcript was replaced with a shorter list. `stage` says how —
-    /// only [`CompressionStage::LiveSummary`] involved an LLM call, so the
-    /// caller needs it to know whether a trace span already covers this
-    /// compaction or whether it has to record the event itself.
-    Compressed { stage: CompressionStage },
+    /// The transcript was replaced with a shorter list built from a live
+    /// summary.
+    Compressed,
     /// Budget was under the configured compression threshold; the
     /// compressor was not invoked. Only produced by `maybe_compress` —
     /// `force_compress` bypasses the threshold by design.
     BelowThreshold,
-    /// The compressor's pre-flight gate fired: the non-system message
-    /// count was already at or below `keep_recent`, so even the
-    /// truncate fallback couldn't shrink. No LLM call was made.
+    /// The compressor's pre-flight gate fired: the conversation is short by
+    /// both the message-count and the token measure, so a summary could not
+    /// come out smaller than what it replaces. No LLM call was made.
     StrategyDeclined,
     /// The compressor produced a candidate slice, but its post-tokenise
     /// total was not smaller than the original. The manager refused
@@ -146,6 +144,12 @@ pub enum CompressionOutcome {
     /// transcript is untouched and still over budget, so the next turn
     /// compacts it — nothing is lost but the abandoned call.
     Cancelled,
+    /// The summariser call failed, or answered with nothing usable. The
+    /// transcript is untouched and still over budget. `reason` has already
+    /// passed the leak boundary, so the caller may show it to the user —
+    /// which it must: this is the one outcome the user has to know about,
+    /// since the conversation now runs on without the compaction it needed.
+    Failed { reason: String },
 }
 
 /// One message's cost, split by what calibration is allowed to touch.
@@ -220,8 +224,8 @@ fn media_share_admits_sample(text: usize, media: usize) -> bool {
 }
 
 /// Manages a session's context: owns the conversation transcript,
-/// tracks the token budget, and runs the compaction flow (live LLM
-/// summary, truncate on failure). See [`compressor`] for the contract.
+/// tracks the token budget, and runs the compaction flow (one live LLM
+/// summary, or nothing at all). See [`compressor`] for the contract.
 ///
 /// This is the **single owner** of `messages` for the actor handling
 /// one session. `Session` (in `baybo-model`) carries only metadata.
@@ -234,7 +238,9 @@ pub struct ContextManager {
     /// continuation-summary message points at, the identity files, and the
     /// tool-spills dir.
     pub(crate) workspace: Arc<baybo_workspace::WorkspacePaths>,
-    /// Tail size for the truncate fallback and the pre-flight gate.
+    /// How many non-system messages still count as a *short* conversation
+    /// for the compaction pre-flight gate. One half of that gate; the other
+    /// is [`MIN_COMPACTABLE_TOKENS`].
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
     calibration: Arc<TokenCalibration>,
@@ -1158,9 +1164,10 @@ impl ContextManager {
     /// old provider).
     ///
     /// `chat` performs the summarizer request inside a trace span and
-    /// records cost against the ledger; the compressor owns parsing and
-    /// falls back to a truncate slice on failure or empty content, so a
-    /// transient summarizer failure never kills the user's turn.
+    /// records cost against the ledger; the compressor owns parsing. A
+    /// summarizer failure returns [`CompressionOutcome::Failed`] with the
+    /// transcript untouched — it never kills the user's turn, and never
+    /// shortens the conversation by any means but a summary.
     pub async fn maybe_compress<F, Fut>(
         &mut self,
         model_id: &str,
@@ -1210,10 +1217,11 @@ impl ContextManager {
         let chat_box: compressor::ChatCallback =
             Box::new(move |req, marker| Box::pin(chat(req, marker)));
         let plan = self.run_compression_flow(chat_box).await?;
-        let (mut new_messages, stage) = match plan {
+        let mut new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
             CompressOutput::Cancelled => return Ok(CompressionOutcome::Cancelled),
-            CompressOutput::Replaced { messages, stage } => (messages, stage),
+            CompressOutput::Failed { reason } => return Ok(CompressionOutcome::Failed { reason }),
+            CompressOutput::Replaced { messages } => messages,
         };
 
         // Refuse to apply an empty replacement: persist would mark
@@ -1229,11 +1237,10 @@ impl ContextManager {
         }
 
         // Re-broadcast the authoritative skill list right after the
-        // system block. The summary stages discard the historical
-        // `<system-reminder>` by construction; the truncate fallback
-        // can drop it too when it lands in the dropped middle.
-        // Cheaper to always re-insert than to track whether the kept
-        // slice still carries one.
+        // system block: the summary discards the historical
+        // `<system-reminder>` by construction. Cheaper to always
+        // re-insert than to track whether the kept slice still carries
+        // one.
         insert_skill_trailer(
             &mut new_messages,
             self.skill_registry.as_ref(),
@@ -1272,8 +1279,8 @@ impl ContextManager {
         self.per_message_tokens = new_per_message;
         // Rebuild called_skills from the freshly-applied slice: a summary
         // that folds away every `Skill` ToolUse and `/command` row leaves it
-        // empty (the trailer carries plain text), and a Truncate apply scopes
-        // it to whatever calls — ToolUse or slash — survived in the kept tail.
+        // empty (the trailer carries plain text), and a kept verbatim tail
+        // scopes it to whatever calls — ToolUse or slash — survived in it.
         let rebuilt = self.called_skills_in(&self.messages);
         self.called_skills = rebuilt;
         self.budget.update(after_tokens);
@@ -1300,7 +1307,7 @@ impl ContextManager {
         // above so a grown soul can't veto a real compaction, and after
         // `persist_compaction` so it stays an in-memory-only refresh.
         self.reseed_system_row().await;
-        Ok(CompressionOutcome::Compressed { stage })
+        Ok(CompressionOutcome::Compressed)
     }
 
     /// Failures are logged, not propagated: the in-memory window stays the
@@ -2227,10 +2234,17 @@ mod tests {
         }
     }
 
-    /// Padded message body so the truncate fallback's savings beat the
-    /// post-compression skill trailer overhead in budget-gated tests.
+    /// Padded message body, so a message costs enough tokens to move a
+    /// budget-gated test off its threshold.
     fn padded(prefix: &str) -> String {
         format!("{prefix} {}", "x".repeat(120))
+    }
+
+    /// Body large enough that a one-line summary is unambiguously smaller
+    /// than what it replaces — so a test exercises the compaction APPLY path
+    /// instead of tripping the savings gate on continuation framing.
+    fn bulky(prefix: &str) -> String {
+        format!("{prefix} {}", "x".repeat(2_400))
     }
 
     /// Chat closure that panics if invoked. Use in tests where
@@ -2243,9 +2257,9 @@ mod tests {
         panic!("test must not invoke the chat closure");
     }
 
-    /// Chat closure that errors so the compressor falls through to
-    /// the truncate stage. Use to exercise truncate fallback
-    /// deterministically.
+    /// Chat closure that errors, so the compaction fails deterministically.
+    /// Use to exercise the "summariser unavailable" path — nothing applied,
+    /// transcript untouched, reason handed back.
     async fn err_chat(
         _: ChatRequest,
         _: LlmCallInputs,
@@ -2555,6 +2569,9 @@ mod tests {
         }
     }
 
+    /// The threshold gate fires — and when the summariser behind it is
+    /// unavailable, the conversation is handed back whole. Nothing is dropped
+    /// to buy room; the caller gets the reason to show the user.
     #[tokio::test]
     async fn maybe_compress_on_token_threshold() {
         // max=200, threshold=0.25 → compress when > 50 tokens
@@ -2569,15 +2586,62 @@ mod tests {
             .await;
         ctx.append(&make_msg(Role::User, &padded("Second"))).await;
 
-        // `err_chat` makes the LLM-summary stage fail, so the
-        // compressor falls through to truncate. The test registry is
-        // empty, so no trailer reminder is inserted.
         let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-        // system + 2 most recent non-system.
-        assert_eq!(ctx.messages().len(), 3);
+        match outcome {
+            CompressionOutcome::Failed { reason } => {
+                assert!(reason.contains("chat unavailable"), "{reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.messages().len(),
+            4,
+            "a failed compaction drops nothing: {:#?}",
+            ctx.messages()
+        );
         assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    /// An answer the parser can make nothing of is a failed compaction, not a
+    /// licence to shorten the transcript some other way. There is no provider
+    /// error to quote here, so the reason is ours.
+    #[tokio::test]
+    async fn unusable_summariser_answer_fails_without_touching_the_transcript() {
+        let mut ctx = make_ctx(2, 200, 0.25);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        let outcome = ctx
+            .maybe_compress("test-model", empty_summary_chat)
+            .await
+            .unwrap();
+
+        match outcome {
+            CompressionOutcome::Failed { reason } => {
+                assert_eq!(reason, compressor::EMPTY_SUMMARY_REASON)
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(ctx.messages().len(), 4, "{:#?}", ctx.messages());
+    }
+
+    /// Chat closure whose answer parses to nothing: the `<analysis>` block is
+    /// stripped and no `<summary>` — nor any leftover — survives it.
+    async fn empty_summary_chat(
+        _: ChatRequest,
+        _: LlmCallInputs,
+    ) -> std::result::Result<LlmResponse, ContextError> {
+        Ok(LlmResponse {
+            content: "<analysis>thinking out loud</analysis>".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: Default::default(),
+            thinking: None,
+        })
     }
 
     #[tokio::test]
@@ -2597,30 +2661,34 @@ mod tests {
     #[tokio::test]
     async fn force_compress_runs_under_budget() {
         // Plenty of headroom — `maybe_compress` would skip — but
-        // `force_compress` runs the compressor regardless. With
-        // keep_recent=2 and 3 non-system messages the truncate
-        // fallback shrinks the slice, so the call returns
-        // `Compressed`.
+        // `force_compress` runs the compressor regardless.
         let mut ctx = make_ctx(2, 100_000, 0.75);
 
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, &padded("first"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("second")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
 
         // Sanity: budget-gated path is a no-op here.
         let baseline = ctx.maybe_compress("test-model", never_chat).await.unwrap();
         assert!(matches!(baseline, CompressionOutcome::BelowThreshold));
-        assert_eq!(ctx.messages().len(), 4);
+        assert_eq!(ctx.messages().len(), 13);
 
-        // `err_chat` makes the LLM stage fail, falling through to truncate.
-        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
 
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
-        // system + keep_recent=2 most recent non-system (empty test
-        // registry → no trailer reminder).
-        assert_eq!(ctx.messages().len(), 3);
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        assert!(
+            ctx.messages().len() < 13,
+            "the forced pass must actually shrink: {:#?}",
+            ctx.messages()
+        );
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
@@ -2629,13 +2697,13 @@ mod tests {
         // Regression (#1): the soul re-read happens AFTER the savings gate, on
         // committed state — never on the candidate before the shrink decision.
         // A large workspace soul must NOT inflate `after_tokens` and turn a
-        // real truncate compaction into a spurious NoSavings.
+        // real compaction into a spurious NoSavings.
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
             dir.path().to_path_buf(),
         ));
         // Distinctive + large: swapping it in before the savings gate (the old
-        // bug) would exceed the one-message truncate savings and veto the apply.
+        // bug) would eat the compaction's savings and veto the apply.
         let soul_path = workspace.persona_identity_file(
             baybo_workspace::paths::BUILTIN_PERSONA_DIR,
             baybo_workspace::IdentityKind::Soul,
@@ -2663,17 +2731,19 @@ mod tests {
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
-        ctx.append(&make_msg(Role::User, &padded("first"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("second")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
 
-        // err_chat → truncate fallback (drops 1 of 3 non-system messages).
-        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
         // Savings gate compared the old (small) soul on both sides, so the real
         // shrink is honoured rather than vetoed by the large workspace soul.
         assert!(
-            matches!(outcome, CompressionOutcome::Compressed { .. }),
+            matches!(outcome, CompressionOutcome::Compressed),
             "{outcome:?}"
         );
         // And the system row was refreshed from the workspace after the commit.
@@ -2732,14 +2802,17 @@ mod tests {
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
             .await;
-        ctx.append(&make_msg(Role::User, &padded("first"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("second")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
 
-        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
         assert!(
-            matches!(outcome, CompressionOutcome::Compressed { .. }),
+            matches!(outcome, CompressionOutcome::Compressed),
             "{outcome:?}"
         );
         match &ctx.messages()[0].content[0] {
@@ -3464,23 +3537,28 @@ mod tests {
     /// `count_tokens` falls back to a full sweep.
     #[tokio::test]
     async fn compression_invalidates_baseline() {
-        let mut ctx = make_ctx(2, 200, 0.25);
+        let mut ctx = make_ctx(2, 10_000, 0.5);
 
         ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, &padded("msg-1"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("reply-1")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("msg-2"))).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
         ctx.record_call_actual(9_999);
 
         // Pre-compression: baseline applies → big number.
         assert_eq!(ctx.count_tokens(), 9_999);
 
-        // Drive compression. With max=50, threshold=0.5 the budget
-        // says "compress" once the post-baseline estimate exceeds 25
-        // (here it's 9_999 + 0). `err_chat` forces the LLM stage to
-        // fail so the truncate fallback runs deterministically.
-        let _ = ctx.maybe_compress("test-model", err_chat).await.unwrap();
+        // Drive compression: the baseline (9_999) is past the 5_000
+        // ceiling, so the threshold gate fires and the summary applies.
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
 
         // Post-compression: baseline cleared → must re-tokenize the
         // (now-shrunken) message list, no 9_999 anywhere.
@@ -3523,20 +3601,24 @@ mod tests {
     /// After `maybe_compress` applies a new message list, the cache
     /// must reflect the **new** messages — even when the new length
     /// happens to equal the old (length-only sync would silently
-    /// return stale counts). The truncate fallback (driven via
-    /// `err_chat`) here keeps `[system, kept tail]`, exercising the
-    /// same-prefix replacement branch.
+    /// return stale counts).
     #[tokio::test]
     async fn cache_rebuilt_after_compression_apply() {
-        let mut ctx = make_ctx(2, 200, 0.25);
+        let mut ctx = make_ctx(2, 10_000, 0.5);
         ctx.append(&make_msg(Role::System, "You are helpful")).await;
-        ctx.append(&make_msg(Role::User, &padded("First"))).await;
-        ctx.append(&make_msg(Role::Assistant, &padded("Reply 1")))
-            .await;
-        ctx.append(&make_msg(Role::User, &padded("Second"))).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
 
-        let outcome = ctx.maybe_compress("test-model", err_chat).await.unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
 
         // Cache must be in lockstep with the post-compression slice.
         assert_eq!(ctx.per_message_tokens.len(), ctx.messages().len());
@@ -3923,7 +4005,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         let applied = ctx.messages();
         assert!(
@@ -3939,11 +4021,11 @@ mod tests {
     }
 
     /// A few pasted files is a real conversation shape: three messages, tens of
-    /// thousands of tokens, far past the budget. The pre-flight gate asks the
-    /// truncate fallback's question — "are there more messages than I keep?" —
-    /// which is `false` here and says nothing about whether a summary would
-    /// shrink it. Gating on that alone refused to compact such a transcript at
-    /// all, for as many turns as it stayed under `keep_recent` messages.
+    /// thousands of tokens, far past the budget. The pre-flight gate's message
+    /// count is `false` here and says nothing about whether a summary would
+    /// shrink it — the summariser collapses any number of messages into one.
+    /// Gating on the count alone refused to compact such a transcript at all,
+    /// for as many turns as it stayed under `keep_recent` messages.
     #[tokio::test]
     async fn few_but_huge_messages_still_compact() {
         let mut ctx = make_ctx(10, 10_000, 0.5);
@@ -3967,7 +4049,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, CompressionOutcome::Compressed { .. }),
+            matches!(outcome, CompressionOutcome::Compressed),
             "expected a compaction, got {outcome:?}"
         );
     }
@@ -4041,7 +4123,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         let surviving_originals = ctx
             .messages()
@@ -4173,7 +4255,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // [system, reminder, detail, summary]
         assert_eq!(ctx.messages().len(), 4);
@@ -4253,7 +4335,7 @@ mod tests {
             .maybe_compress("test-model", ok_summary_chat)
             .await
             .unwrap();
-        assert!(matches!(outcome, CompressionOutcome::Compressed { .. }));
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
 
         // The agent-context body row was folded into the summary; the full
         // definition is back only because the trailer detail block carries it.
