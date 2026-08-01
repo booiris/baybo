@@ -185,6 +185,10 @@ impl Router {
     /// resident and is reclaimed by the idle reaper, like every conversation's.
     async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) {
         let session_id = session.id.clone();
+        // A fresh cron session has no `last_llm` of its own, so without this
+        // a bound agent's scheduled work runs on the pool default rather than
+        // the model its profile pins.
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -192,7 +196,14 @@ impl Router {
             .supervisor
             .route_or_spawn(&session_id, trigger, || {
                 let actor_token = parent_token.child_token();
-                actor_spawner(session, None, None, None, response_tx, actor_token)
+                actor_spawner(
+                    session,
+                    pins.llm,
+                    pins.model,
+                    pins.effort,
+                    response_tx,
+                    actor_token,
+                )
             })
             .await;
         if !routed {
@@ -218,12 +229,13 @@ impl Router {
         waiter: CronResultWaiter,
     ) {
         let session_id = session.id.clone();
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            None,
-            None,
-            None,
+            pins.llm,
+            pins.model,
+            pins.effort,
             response_tx,
             &self.actor_parent_token,
         );

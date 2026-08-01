@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -86,6 +86,15 @@ pub struct SkillRegistry {
     /// reload silently dropped every builtin (the map is cleared and
     /// only `load_dirs` are rescanned).
     builtins: RwLock<Vec<SkillDefinition>>,
+    /// Held for the whole of `reload` and for the whole of an overlay load.
+    ///
+    /// `reload` snapshots the dir lists, clears the maps, then rescans. An
+    /// overlay load that lands inside that window records itself in
+    /// `agent_dirs` *after* the snapshot and inserts its skills *before* the
+    /// clear — so the clear removes them, the stale snapshot never restores
+    /// them, and `agent_dir_loaded` now answers "already loaded" forever. The
+    /// agent's private skills would be gone until the next reload.
+    rebuild: Mutex<()>,
 }
 
 impl Default for SkillRegistry {
@@ -102,6 +111,7 @@ impl SkillRegistry {
             load_dirs: RwLock::new(Vec::new()),
             agent_dirs: RwLock::new(Vec::new()),
             builtins: RwLock::new(Vec::new()),
+            rebuild: Mutex::new(()),
         }
     }
 
@@ -196,6 +206,7 @@ impl SkillRegistry {
     /// `register_builtins`) are cleared — for those, reload is
     /// "authoritative disk state wins."
     pub fn reload(&self) -> usize {
+        let _rebuild = self.rebuild.lock();
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
         // Snapshot both lists before mutating: the scans below take the same
         // locks these reads hold.
@@ -254,6 +265,7 @@ impl SkillRegistry {
         if !dir.is_dir() {
             return 0;
         }
+        let _rebuild = self.rebuild.lock();
         {
             let mut dirs = self.agent_dirs.write();
             if !dirs.iter().any(|(a, d)| a == agent && d == dir) {

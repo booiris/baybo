@@ -153,6 +153,7 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
     let path = row
         .id
         .identity_file(&state.workspace_paths, IdentityKind::Identity);
+    let _guard = identity_write_lock(&path).await;
     let current = baybo_workspace::load_identity(baybo_workspace::IdentitySource::new(
         &path,
         IdentityKind::Identity.default_content(),
@@ -166,8 +167,38 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
     write_file_atomic(&path, &updated)
         .await
         .map_err(|e| GatewayError::Internal(format!("write agent identity: {e}")))?;
-    commit_persona_edit(state, row.id.as_str(), "name").await;
+    commit_persona_edit(state, row.id.as_str(), IdentityKind::Identity.file_name()).await;
     Ok(())
+}
+
+/// Serializes this process's writers of one identity file.
+///
+/// Every gateway write to these files is read-modify-write — a compare-and-set
+/// on the whole-file `PUT`, a splice-one-line for a rename — and without a
+/// lock two of them interleave: both read the same base, both pass, and the
+/// second silently discards the first. Keyed by path, so unrelated agents
+/// never wait on each other.
+///
+/// Scope worth stating: it covers the **gateway's** writers. The `Edit` tool
+/// writes these files too, guarded by its own read-before-edit rule rather
+/// than this lock, so an agent self-edit interleaving with a dashboard save
+/// remains last-write-wins — recoverable from the persona repo's history,
+/// which is one of the reasons that history exists.
+async fn identity_write_lock(path: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+    static LOCKS: std::sync::LazyLock<
+        parking_lot::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let lock = {
+        let mut locks = LOCKS.lock();
+        std::sync::Arc::clone(
+            locks
+                .entry(path.to_path_buf())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    lock.lock_owned().await
 }
 
 /// Commit an operator's dashboard edit into the `personas/` repo.
@@ -178,11 +209,17 @@ async fn set_display_name(state: &AdminState, row: &AgentProfileRow, name: &str)
 /// commit, attributed to the agent. The history exists to tell those two
 /// apart, so each writer commits its own work. Best-effort, like every other
 /// write to that repo.
-async fn commit_persona_edit(state: &AdminState, agent_id: &str, what: &str) {
+async fn commit_persona_edit(state: &AdminState, agent_id: &str, file: &str) {
+    // The pathspec is what git stages, so it must name the single file this
+    // request wrote. Passing the agent's directory swept anything else dirty
+    // there — including an edit the agent had not committed yet — into a
+    // commit attributed to the operator, which is the attribution this
+    // history exists to keep straight.
+    let spec = format!("{agent_id}/{file}");
     baybo_workspace::commit_personas(
         &state.workspace_paths,
-        agent_id,
-        &format!("personas: operator edited {agent_id} {what}"),
+        &[spec.as_str()],
+        &format!("personas: operator edited {agent_id} {file}"),
     )
     .await;
 }
@@ -264,6 +301,24 @@ fn validate_name(raw: &str) -> Result<String> {
         return Err(GatewayError::BadRequest(format!(
             "agent name exceeds {MAX_AGENT_PROFILE_NAME_CHARS} characters"
         )));
+    }
+    // The name lives on one line of `IDENTITY.md`, and reads derive it back by
+    // parsing that line. A value that does not survive the round trip would
+    // make the create response and the next `GET` disagree — the write keeps
+    // the first line, the read strips surrounding markup — so it is rejected
+    // rather than silently rewritten into something the caller did not ask
+    // for. Checked by construction instead of by a character blocklist, so the
+    // rule cannot drift from the two functions that implement it.
+    let round_tripped = baybo_workspace::display_name(&baybo_workspace::with_display_name(
+        IdentityKind::Identity.default_content(),
+        name,
+    ));
+    if round_tripped.as_deref() != Some(name) {
+        return Err(GatewayError::BadRequest(
+            "agent name must be a single line of plain text (no newlines, and not markdown \
+             emphasis on its own)"
+                .to_owned(),
+        ));
     }
     Ok(name.to_owned())
 }
@@ -397,25 +452,25 @@ async fn create_agent(
         created_at: now,
         updated_at: now,
     };
+    // Materialise the persona *before* publishing the row, so a filesystem
+    // failure cannot leave a half-made agent in the roster. The row is what
+    // makes an agent visible and what a retry would duplicate; the directory
+    // is not — an orphaned one is inert (nothing sweeps persona folders, by
+    // design) and the next attempt mints a fresh id anyway.
+    let seed = req
+        .soul
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_owned());
+    reject_oversized_identity(&seed)?;
+    baybo_workspace::ensure_persona_layout(&state.workspace_paths, row.id.as_str(), &seed)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
+    set_display_name(&state, &row, &name).await?;
     state
         .agent_profile_store
         .create(&row)
         .await
         .map_err(|e| store_err("create agent profile", e))?;
-    // Materialise the persona directory now, so the agent has a soul and a
-    // skills folder before its first session — and so the operator can see
-    // where to edit them.
-    let seed = req
-        .soul
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_owned());
-    baybo_workspace::ensure_persona_layout(&state.workspace_paths, row.id.as_str(), &seed)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
-    // The requested name is written into the agent's own `IDENTITY.md`,
-    // which is where a name lives — the row has no column for one. This
-    // commits on its own, so the fresh persona is never left dirty.
-    set_display_name(&state, &row, &name).await?;
     Ok(Json(AgentProfileDto::from_parts(row, name)))
 }
 
@@ -613,6 +668,27 @@ async fn read_agent_identity_file(
     }))
 }
 
+/// The same ceiling the `Edit` tool enforces on an identity file
+/// (`MAX_IDENTITY_BYTES`). Declared here rather than imported because the two
+/// crates do not depend on each other; the number is the contract, and
+/// `docs/modules/agent-profiles.md` states it once.
+const MAX_IDENTITY_FILE_BYTES: usize = 1 << 20;
+
+/// Refuse content the `Edit` tool would refuse.
+///
+/// Without this the admin API is the wide door: bodies up to the extractor's
+/// limit were written straight through, and every one of those bytes then
+/// rides in the system prompt of every turn that agent takes.
+fn reject_oversized_identity(content: &str) -> Result<()> {
+    if content.len() > MAX_IDENTITY_FILE_BYTES {
+        return Err(GatewayError::BadRequest(format!(
+            "identity file exceeds {} MiB",
+            MAX_IDENTITY_FILE_BYTES >> 20
+        )));
+    }
+    Ok(())
+}
+
 /// Replace one of an agent's own identity files.
 ///
 /// Deliberately NOT behind the builtin lock: the built-in row is read-only,
@@ -627,7 +703,11 @@ async fn write_agent_identity_file(
     req: &SetAgentIdentityFileRequest,
 ) -> Result<Json<AgentIdentityFileDto>> {
     let row = load_agent(state, agent_id).await?;
+    reject_oversized_identity(&req.content)?;
     let path = row.id.identity_file(&state.workspace_paths, kind);
+    // Held across the read, the comparison and the write: a compare-and-set
+    // whose three steps another request can interleave with is not one.
+    let _guard = identity_write_lock(&path).await;
     if let Some(expected) = req.version.as_deref() {
         // Read what is actually on disk now, not what this request thinks was
         // there. A missing file hashes as empty, so a fresh write after a
@@ -737,16 +817,27 @@ async fn set_agent_identity(
     write_agent_identity_file(&state, &agent_id, IdentityKind::Identity, &req).await
 }
 
-/// Stage through a sibling `.tmp` and rename, so a concurrent reader (the
+/// Stage through a sibling temp file and rename, so a concurrent reader (the
 /// runtime assembling a system prompt) sees either the old file or the whole
 /// new one — never a partial write.
+///
+/// The temp name is unique per call. A fixed one is shared state between
+/// concurrent writers of the same file: one overwrites the other's staged
+/// bytes before it renames, so the first installs content it never wrote and
+/// the second fails on a temp file that is already gone.
 async fn write_file_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = path.with_extension("md.tmp");
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("md.{}.{nonce}.tmp", std::process::id()));
     tokio::fs::write(&tmp, content).await?;
-    tokio::fs::rename(&tmp, path).await
+    let renamed = tokio::fs::rename(&tmp, path).await;
+    if renamed.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    renamed
 }
 
 #[utoipa::path(

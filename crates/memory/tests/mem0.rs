@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use baybo_memory::backends::mem0::{
     Mem0Config, Mem0Memory, TOOL_ADD, TOOL_DELETE, TOOL_EVENT_LIST, TOOL_EVENT_STATUS, TOOL_GET,
@@ -378,11 +378,18 @@ async fn tool_add_rejects_empty_input() {
 
 #[tokio::test]
 async fn tool_get_fetches_by_id() {
-    // The tool calls GET /v1/memories/<id>/ — register the exact path.
+    // The tool calls GET /v1/memories/<id>/ — register the exact path. The
+    // response must state its partition; the tool refuses one that does not.
     let app = Router::new().route(
         "/v1/memories/mem-123/",
         get(|| async {
-            Json(json!({"id": "mem-123", "memory": "hello", "created_at": "2026-01-01"}))
+            Json(json!({
+                "id": "mem-123",
+                "memory": "hello",
+                "created_at": "2026-01-01",
+                "user_id": "u-7",
+                "agent_id": "baybo",
+            }))
         }),
     );
     let server = spawn(app).await;
@@ -462,7 +469,12 @@ async fn tool_update_puts_new_text() {
     let app = Router::new()
         .route(
             "/v1/memories/mem-1/",
-            put(
+            // The GET is the ownership check that precedes an id-addressed
+            // update; the PUT is what the test is actually about.
+            get(|| async {
+                Json(json!({"id": "mem-1", "memory": "old", "user_id": "u-9", "agent_id": "baybo"}))
+            })
+            .put(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body);
                     Json(json!({"message": "updated"}))
@@ -493,9 +505,13 @@ async fn tool_update_puts_new_text() {
 #[tokio::test]
 async fn tool_delete_by_id_hits_delete_endpoint() {
     // 204 No Content exercises the empty-body → success path in `request`.
+    // The GET is the ownership check that now precedes an id-addressed delete.
     let app = Router::new().route(
         "/v1/memories/mem-1/",
-        delete(|| async { StatusCode::NO_CONTENT }),
+        get(|| async {
+            Json(json!({"id": "mem-1", "memory": "x", "user_id": "u-10", "agent_id": "baybo"}))
+        })
+        .delete(|| async { StatusCode::NO_CONTENT }),
     );
     let server = spawn(app).await;
     let m = build(&base_url(&server));
@@ -508,6 +524,50 @@ async fn tool_delete_by_id_hits_delete_endpoint() {
         .unwrap();
     let v = expect_json(out);
     assert!(v["result"].as_str().unwrap().contains("deleted"));
+}
+
+/// An id from another agent's partition is not readable, editable or
+/// deletable — and the refusal says only "no such memory", because
+/// "that exists but is not yours" is itself a cross-partition read.
+#[tokio::test]
+async fn an_id_from_another_partition_is_refused() {
+    let app = Router::new().route(
+        "/v1/memories/mem-sibling/",
+        get(|| async {
+            Json(json!({
+                "id": "mem-sibling",
+                "memory": "the other persona's note",
+                "user_id": "u-11",
+                "agent_id": "01JOTHERAGENT",
+            }))
+        })
+        .delete(|| async { StatusCode::NO_CONTENT })
+        .put(|| async { StatusCode::NO_CONTENT }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+    let ctx = tool_context_for_agent("u-11", &AgentProfileId::parse("01JMINE").unwrap());
+
+    for (name, params) in [
+        (TOOL_GET, json!({"memoryId": "mem-sibling"})),
+        (TOOL_DELETE, json!({"memoryId": "mem-sibling"})),
+        (
+            TOOL_UPDATE,
+            json!({"memoryId": "mem-sibling", "text": "overwritten"}),
+        ),
+    ] {
+        let out = tool_by_name(&m, name).execute(params, &ctx).await.unwrap();
+        match out {
+            baybo_tools::ToolOutput::Error(msg) => {
+                assert!(msg.contains("no memory mem-sibling"), "{name}: {msg}");
+                assert!(
+                    !msg.contains("other persona"),
+                    "{name} leaked the content it refused: {msg}"
+                );
+            }
+            other => panic!("{name} must refuse a foreign id, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]

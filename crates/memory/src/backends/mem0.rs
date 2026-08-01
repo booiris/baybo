@@ -604,11 +604,6 @@ fn build_filters(
     categories: Option<&[String]>,
     extra: Option<&Value>,
 ) -> Value {
-    if let Some(extra) = extra
-        && (extra.get("AND").is_some() || extra.get("OR").is_some())
-    {
-        return extra.clone();
-    }
     let mut conds: Vec<Value> = vec![json!({"user_id": user_id})];
     if let Some(agent_id) = agent_id {
         conds.push(json!({"agent_id": agent_id}));
@@ -619,10 +614,22 @@ fn build_filters(
     if let Some(cats) = categories.filter(|c| !c.is_empty()) {
         conds.push(json!({"categories": {"in": cats}}));
     }
-    if let Some(obj) = extra.and_then(|e| e.as_object()) {
-        for (k, v) in obj {
-            conds.push(json!({ k: v }));
+    match extra {
+        // An advanced condition the model supplied. It is *nested* under the
+        // mandatory scope, never substituted for it: returning it verbatim
+        // dropped `user_id` and `agent_id` together, which made a tool
+        // parameter a way out of both the user's data and the agent's.
+        Some(extra) if extra.get("AND").is_some() || extra.get("OR").is_some() => {
+            conds.push(extra.clone());
         }
+        Some(extra) => {
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    conds.push(json!({ k: v }));
+                }
+            }
+        }
+        None => {}
     }
     json!({ "AND": conds })
 }
@@ -630,6 +637,65 @@ fn build_filters(
 /// The filter the recall hot path uses: `{AND: [{user_id}, {agent_id}]}`.
 /// Both axes are always present — memory is scoped by `(user, agent)`, and a
 /// recall that omitted the agent would read every persona's memories.
+/// Fetch one memory by id and refuse it unless it belongs to this
+/// `(user, agent)` partition.
+///
+/// The id-addressed endpoints (`GET`/`PUT`/`DELETE /v1/memories/{id}/`) carry
+/// no scope of their own — Mem0 resolves the id globally. Every other tool
+/// path filters, so an id from a sibling partition (surfaced in a transcript,
+/// or by any future filter hole) would otherwise be readable, editable and
+/// deletable across the partition the rest of the design maintains.
+///
+/// Fails **closed**: a response that does not state both ids is refused, not
+/// assumed to be ours.
+async fn fetch_owned(
+    inner: &Mem0Inner,
+    memory_id: &str,
+    user_id: &str,
+    agent_id: &str,
+    ctx: &ToolContext,
+) -> std::result::Result<Value, ToolOutput> {
+    let path = format!("/v1/memories/{memory_id}/");
+    let resp = match inner
+        .request(
+            Method::GET,
+            &path,
+            None,
+            &[],
+            HTTP_TIMEOUT,
+            Some(&ctx.events),
+        )
+        .await
+    {
+        Ok(resp) => {
+            inner.record_success();
+            resp
+        }
+        Err(e) => {
+            inner.record_failure();
+            return Err(ToolOutput::Error(format!("memory lookup failed: {e}")));
+        }
+    };
+    let field = |key: &str| {
+        resp.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                resp.get("metadata")
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_owned)
+    };
+    if field("user_id").as_deref() == Some(user_id)
+        && field("agent_id").as_deref() == Some(agent_id)
+    {
+        return Ok(resp);
+    }
+    // Deliberately the same answer as a genuinely absent id: telling the
+    // caller "that exists but is not yours" is itself a cross-partition read.
+    Err(ToolOutput::Error(format!("no memory {memory_id}")))
+}
+
 fn read_filters(user_id: &str, agent_id: &str) -> Value {
     build_filters(user_id, Some(agent_id), None, None, None)
 }
@@ -1064,31 +1130,26 @@ impl Tool for Mem0GetTool {
             .get("memoryId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("memoryId is required".into()))?;
-        let path = format!("/v1/memories/{memory_id}/");
-        match self
-            .inner
-            .request(
-                Method::GET,
-                &path,
-                None,
-                &[],
-                HTTP_TIMEOUT,
-                Some(&ctx.events),
-            )
-            .await
+        let resp = match fetch_owned(
+            &self.inner,
+            memory_id,
+            ctx.user.id.as_str(),
+            ctx.agent_id.as_str(),
+            ctx,
+        )
+        .await
         {
-            Ok(resp) => {
-                self.inner.record_success();
+            Ok(resp) => resp,
+            Err(out) => return Ok(out),
+        };
+        {
+            {
                 Ok(ToolOutput::Json(json!({
                     "id": resp.get("id").and_then(|v| v.as_str()).unwrap_or(memory_id),
                     "memory": resp.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
                     "created_at": resp.get("created_at").cloned().unwrap_or(Value::Null),
                     "updated_at": resp.get("updated_at").cloned().unwrap_or(Value::Null),
                 })))
-            }
-            Err(e) => {
-                self.inner.record_failure();
-                Ok(ToolOutput::Error(format!("{TOOL_GET} failed: {e}")))
             }
         }
     }
@@ -1238,6 +1299,17 @@ impl Tool for Mem0UpdateTool {
         if text.is_empty() {
             return Err(ToolError::InvalidParams("text cannot be empty".into()));
         }
+        if let Err(out) = fetch_owned(
+            &self.inner,
+            memory_id,
+            ctx.user.id.as_str(),
+            ctx.agent_id.as_str(),
+            ctx,
+        )
+        .await
+        {
+            return Ok(out);
+        }
         let path = format!("/v1/memories/{memory_id}/");
         let body = json!({"text": text});
         match self
@@ -1271,7 +1343,22 @@ struct Mem0DeleteTool {
 }
 
 impl Mem0DeleteTool {
-    async fn delete_by_id(&self, memory_id: &str, ctx: &ToolContext) -> ToolOutput {
+    /// `verify` is `false` only for an id this tool just found through a
+    /// scoped search — that search already proved the partition, and a second
+    /// lookup would only cost a round-trip.
+    async fn delete_by_id(&self, memory_id: &str, ctx: &ToolContext, verify: bool) -> ToolOutput {
+        if verify
+            && let Err(out) = fetch_owned(
+                &self.inner,
+                memory_id,
+                ctx.user.id.as_str(),
+                ctx.agent_id.as_str(),
+                ctx,
+            )
+            .await
+        {
+            return out;
+        }
         let path = format!("/v1/memories/{memory_id}/");
         match self
             .inner
@@ -1330,7 +1417,7 @@ impl Tool for Mem0DeleteTool {
         let agent_id = ctx.agent_id.as_str();
 
         if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
-            return Ok(self.delete_by_id(memory_id, ctx).await);
+            return Ok(self.delete_by_id(memory_id, ctx, true).await);
         }
 
         if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
@@ -1383,7 +1470,7 @@ impl Tool for Mem0DeleteTool {
                 if id.is_empty() {
                     return Ok(ToolOutput::Error("matched memory has no id".into()));
                 }
-                return Ok(self.delete_by_id(id, ctx).await);
+                return Ok(self.delete_by_id(id, ctx, false).await);
             }
             let candidates: Vec<Value> = items
                 .iter()
@@ -1759,11 +1846,22 @@ mod tests {
         assert_eq!(with_cats["AND"][1]["categories"]["in"][0], "identity");
     }
 
+    /// `filters` is a tool parameter, so it is model-controlled. It used to be
+    /// returned verbatim when it carried a top-level `AND`/`OR`, which dropped
+    /// the mandatory scope with it — a way to read another user's memories,
+    /// not merely another agent's. It is nested, never substituted.
     #[test]
-    fn build_filters_passes_through_prebuilt_and_or() {
-        let prebuilt = json!({"OR": [{"user_id": "a"}, {"user_id": "b"}]});
-        let f = build_filters("ignored", None, None, None, Some(&prebuilt));
-        assert_eq!(f, prebuilt);
+    fn a_model_supplied_filter_cannot_displace_the_mandatory_scope() {
+        let hostile = json!({"OR": [{"user_id": "someone-else"}, {"user_id": "a-third-party"}]});
+        let f = build_filters("u-1", Some("a-1"), None, None, Some(&hostile));
+
+        let conds = f["AND"].as_array().expect("scoped under AND");
+        assert_eq!(conds[0]["user_id"], "u-1");
+        assert_eq!(conds[1]["agent_id"], "a-1");
+        assert!(
+            conds.contains(&hostile),
+            "the caller's condition survives, as one more conjunct: {f}"
+        );
     }
 
     #[test]

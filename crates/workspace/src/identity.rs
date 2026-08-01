@@ -104,6 +104,33 @@ pub async fn load_identity_files(
     })
 }
 
+/// The seed for one agent's identity file.
+///
+/// One table, consulted by every writer — setup, profile creation, and the
+/// on-demand seed a prompt assembly does when a file is missing. They used to
+/// each carry their own answer, which meant deleting the built-in's `SOUL.md`
+/// silently replaced its persona with the custom-agent skeleton on the next
+/// turn, and deleting its `USER.md` reintroduced a duplicate of the shared
+/// profile.
+///
+/// The built-in ships a real persona; a custom agent starts from a skeleton
+/// that invites it to write its own. `USER.md` is per-agent for both — the
+/// operator-curated defaults belong to the shared `personas/USER.md`, which is
+/// not an agent's file and is not seeded here.
+pub fn persona_seed(agent_id: &str, kind: IdentityKind) -> &'static str {
+    let builtin = agent_id == crate::paths::BUILTIN_PERSONA_DIR;
+    match (kind, builtin) {
+        (IdentityKind::Soul, true) => IdentityKind::Soul.default_content(),
+        (IdentityKind::Soul, false) => crate::prompt::PERSONA_SOUL_TEMPLATE,
+        (IdentityKind::User, _) => crate::prompt::PERSONA_USER_TEMPLATE,
+        // The self-image template is seeded verbatim for everyone: it invites
+        // the agent to pick its own name and emoji, and pre-filling it from a
+        // profile row would only mint a copy that goes stale on the next
+        // rename.
+        (IdentityKind::Identity, _) => IdentityKind::Identity.default_content(),
+    }
+}
+
 /// Materialize one agent's persona directory: create
 /// `personas/<agent_id>/skills/`, then write `SOUL.md`, `IDENTITY.md` and
 /// `USER.md` **only if absent**, each staged through a sibling `.tmp` file
@@ -126,26 +153,31 @@ pub async fn ensure_persona_layout(
     tokio::fs::create_dir_all(&skills)
         .await
         .map_err(|e| anyhow::anyhow!("create persona skills dir {}: {e}", skills.display()))?;
-    for (kind, seed) in [
-        (IdentityKind::Soul, seed_soul),
-        // The self-image template is seeded verbatim: it invites the agent to
-        // pick its own name and emoji, and pre-filling it from the profile row
-        // would only mint a copy that goes stale on the next rename.
-        (
-            IdentityKind::Identity,
-            IdentityKind::Identity.default_content(),
-        ),
-        // Seeded here rather than left to the first prompt assembly, so it
-        // lands in the baseline commit below: a file that enters git only when
-        // the agent first rewrites it makes that first rewrite unreadable.
-        (IdentityKind::User, crate::prompt::PERSONA_USER_TEMPLATE),
-    ] {
+    let mut seeded: Vec<String> = Vec::new();
+    for kind in IdentityKind::all() {
+        let seed = match kind {
+            // The caller's soul only applies to the file the caller is
+            // creating; every other kind takes the shared seed table.
+            IdentityKind::Soul => seed_soul,
+            other => persona_seed(agent_id, other),
+        };
         let path = paths.persona_identity_file(agent_id, kind);
+        let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         read_or_seed(&path, seed)
             .await
             .map_err(|e| anyhow::anyhow!("seed persona {}: {e}", path.display()))?;
+        if !existed {
+            seeded.push(format!("{agent_id}/{}", kind.file_name()));
+        }
     }
-    commit_personas(paths, agent_id, &format!("personas: baseline {agent_id}")).await;
+    // Only the files this call created. The pathspec is what git stages, so
+    // passing the whole directory would sweep an agent's in-progress edit — or
+    // a hand-authored skill — into a commit labelled as a baseline. This runs
+    // defensively on every bound-session spawn, so that would be routine.
+    if !seeded.is_empty() {
+        let specs: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        commit_personas(paths, &specs, &format!("personas: baseline {agent_id}")).await;
+    }
     Ok(())
 }
 
@@ -161,7 +193,7 @@ pub async fn ensure_persona_layout(
 /// Best-effort. A workspace without `git`, or a `personas/` that is not a
 /// repo, must not stop an agent from being created — the files are already on
 /// disk and correct; only their history is missing.
-pub async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &str) {
+pub async fn commit_personas(paths: &WorkspacePaths, pathspecs: &[&str], subject: &str) {
     let repo = paths.personas_dir();
     if !repo.join(".git").exists() {
         return;
@@ -179,18 +211,23 @@ pub async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &s
                 .filter(|out| out.status.success())
         }
     };
-    if git(vec!["add".into(), "--".into(), pathspec.to_owned()])
-        .await
-        .is_none()
-    {
+    let specs: Vec<String> = pathspecs.iter().map(|s| (*s).to_owned()).collect();
+    let mut add = vec!["add".to_owned(), "--".to_owned()];
+    add.extend(specs.iter().cloned());
+    if git(add).await.is_none() {
         return;
     }
-    // An empty commit would be noise on every materialisation — and
-    // materialisation runs defensively on every bound spawn.
-    if git(vec!["diff".into(), "--cached".into(), "--quiet".into()])
-        .await
-        .is_some()
-    {
+    // Scope the emptiness check to the same pathspecs as the commit: with a
+    // narrow pathspec an unrelated dirty file would otherwise make this look
+    // like there is something to commit, and the commit would then be empty.
+    let mut staged = vec![
+        "diff".to_owned(),
+        "--cached".to_owned(),
+        "--quiet".to_owned(),
+        "--".to_owned(),
+    ];
+    staged.extend(specs.iter().cloned());
+    if git(staged).await.is_some() {
         return;
     }
     let _ = git(vec![
@@ -204,8 +241,10 @@ pub async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &s
         "-m".into(),
         subject.to_owned(),
         "--".into(),
-        pathspec.to_owned(),
-    ])
+    ]
+    .into_iter()
+    .chain(specs)
+    .collect())
     .await;
 }
 

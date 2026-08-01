@@ -573,20 +573,19 @@ impl ContextManager {
         // directory now — so there is one path rule, not two.
         let agent = self.agent.clone().unwrap_or_else(AgentProfileId::builtin);
         let path = |kind: IdentityKind| agent.identity_file(&self.workspace, kind);
-        // A custom agent's own notes seed from the persona template; the
-        // built-in's `USER.md` *is* the shared profile, so it keeps the
-        // shipped one.
-        let user_notes_seed = match &self.agent {
-            Some(agent) if !agent.is_builtin() => baybo_workspace::prompt::PERSONA_USER_TEMPLATE,
-            _ => IdentityKind::User.default_content(),
-        };
+        // The same table setup and profile creation seed from. A file the
+        // operator deleted must come back as what shipped, not as whatever
+        // this path happened to name — recreating the built-in's `SOUL.md`
+        // from the custom-agent skeleton would rewrite who the assistant is,
+        // permanently and silently.
+        let seed = |kind| baybo_workspace::identity::persona_seed(agent.as_str(), kind).to_string();
         PersonaSources {
             soul_path: path(IdentityKind::Soul),
-            soul_seed: baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_string(),
+            soul_seed: seed(IdentityKind::Soul),
             self_image_path: path(IdentityKind::Identity),
-            self_image_seed: IdentityKind::Identity.default_content().to_string(),
+            self_image_seed: seed(IdentityKind::Identity),
             user_notes_path: path(IdentityKind::User),
-            user_notes_seed: user_notes_seed.to_string(),
+            user_notes_seed: seed(IdentityKind::User),
         }
     }
 

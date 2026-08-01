@@ -55,25 +55,19 @@ pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
 pub async fn seed_default_identity_files(paths: &WorkspacePaths) -> anyhow::Result<()> {
     let targets = IdentityKind::all()
         .map(|kind| {
-            // The built-in's *own* notes get the per-agent template, not
-            // `DEFAULT_USER_CONTENT` — that one seeds the shared profile
-            // below, and seeding both from it made a fresh install emit two
-            // byte-identical user sections in every prompt.
-            let seed = match kind {
-                IdentityKind::User => crate::prompt::PERSONA_USER_TEMPLATE,
-                _ => kind.default_content(),
-            };
             (
                 paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind),
-                seed,
+                identity::persona_seed(crate::paths::BUILTIN_PERSONA_DIR, kind),
             )
         })
         .into_iter()
+        // The shared profile is nobody's persona file, so it is the one target
+        // here that does not come from the per-agent seed table.
         .chain([(
             paths.shared_user_file(),
             IdentityKind::User.default_content(),
         )]);
-    let mut seeded_any = false;
+    let mut seeded: Vec<String> = Vec::new();
     for (target, default) in targets {
         let exists = tokio::fs::try_exists(&target)
             .await
@@ -89,13 +83,18 @@ pub async fn seed_default_identity_files(paths: &WorkspacePaths) -> anyhow::Resu
         tokio::fs::write(&target, default)
             .await
             .map_err(|e| anyhow::anyhow!("seed default identity file {}: {e}", target.display()))?;
-        seeded_any = true;
+        if let Ok(rel) = target.strip_prefix(paths.personas_dir()) {
+            seeded.push(rel.to_string_lossy().into_owned());
+        }
     }
-    if seeded_any {
+    if !seeded.is_empty() {
         // Same reason the per-agent materialisation commits: a file that
-        // enters git only when the agent first rewrites it makes that
-        // first rewrite unreadable.
-        identity::commit_personas(paths, ".", "personas: seed defaults").await;
+        // enters git only when the agent first rewrites it makes that first
+        // rewrite unreadable. Only what this call wrote — an operator's
+        // uncommitted edit to a neighbouring file is not part of "seed
+        // defaults".
+        let specs: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        identity::commit_personas(paths, &specs, "personas: seed defaults").await;
     }
     Ok(())
 }

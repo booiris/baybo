@@ -296,10 +296,10 @@ const PERSONA_IDENTITY_KINDS: [IdentityKind; 3] = [
     IdentityKind::User,
 ];
 
-/// Resolve a `personas/`-relative edit to `<agent_id>/{SOUL,IDENTITY}.md`,
-/// or reject with `InvalidParams`. A persona directory holds those two
-/// identity files; its `skills/` tree is skill content and is not editable
-/// through this path.
+/// Resolve a `personas/`-relative edit to the calling agent's own
+/// `{SOUL,IDENTITY,USER}.md`, or reject with `InvalidParams`. A persona
+/// directory holds those three identity files; its `skills/` tree is skill
+/// content and is not editable through this path.
 fn check_persona_identity_target(
     path: &Path,
     personas_dir: &Path,
@@ -326,8 +326,41 @@ fn check_persona_identity_target(
             rel.display()
         )));
     }
+    reject_symlinked_path(path, personas_dir)?;
     reject_if_oversized(path)?;
     Ok(format!("{}/{}", components[0], components[1]))
+}
+
+/// Refuse an identity edit whose path traverses a symlink anywhere below
+/// `personas/`.
+///
+/// The check above is lexical: it proves the *string* names this agent's own
+/// file. A symlink at that name — or at any directory on the way to it —
+/// makes the string say one thing and the write land somewhere else, since
+/// `fs::write` follows links. That is the whole own-file restriction, and it
+/// would also carry the approval-gate bypass to a file outside `personas/`
+/// entirely. Cheap to close, and nothing legitimate creates one: every writer
+/// of this tree writes regular files.
+fn reject_symlinked_path(path: &Path, personas_dir: &Path) -> crate::Result<()> {
+    let mut cursor = path.to_path_buf();
+    while cursor.starts_with(personas_dir) {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ToolError::InvalidParams(format!(
+                    "{} is a symlink; identity files must be regular files inside \
+                     this agent's own persona directory",
+                    cursor.display()
+                )));
+            }
+            // Absent is fine — an identity file is seeded on first read, and a
+            // missing component cannot be a link.
+            _ => {}
+        }
+        if !cursor.pop() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Refuse an edit to `IDENTITY.md` that would leave it without a readable

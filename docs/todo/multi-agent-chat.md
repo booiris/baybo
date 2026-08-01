@@ -493,7 +493,7 @@ is the CLI's problem; the baybo-side transcript is display plus memory input).
 | Failure | Behaviour |
 |---|---|
 | Unknown `agent_id` at creation | 400 |
-| `agent_id` failing the id grammar (corrupt row / crafted path) | hard error at parse; never touches the filesystem |
+| `agent_id` failing the id grammar (corrupt row / crafted path) | hard error at parse; never touches the filesystem. A stored value that fails it fails **hydration** (`SessionStore::get`) rather than degrading to the built-in, which would put the session's writes in the wrong memory partition; listing still degrades with a `warn!` so the conversation stays in the user's chat list |
 | External backend disabled or unprobed at creation | 400 "enable claude first" |
 | Backend disabled after sessions exist | turn fails with a clear in-chat error; the session survives and works again on re-enable |
 | Profile row deleted with bound sessions | the conversation keeps the agent's **own** persona and skill overlay — both are named by the id the session carries, so they outlive the row, exactly as its memory partition does. Only the row's own fields go: the LLM pin falls back to `default-llm` with a `warn!` at the next spawn, and the roster loses the entry |

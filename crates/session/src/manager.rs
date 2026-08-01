@@ -299,8 +299,14 @@ impl SessionManager {
             title: None,
         };
         self.store.save(&session).await?;
-        debug!(session_id = %session.id, "created new session");
-        Ok(session)
+        // The binding is INSERT-seeded and omitted from `save`'s DO UPDATE, so
+        // a concurrent create on the same client-supplied id leaves the first
+        // writer's binding in place and this one silently loses. Returning the
+        // struct we just built would hand the caller an agent that the next
+        // hydration will not use; read back what actually persisted.
+        let stored = self.store.get(&session.id).await?.unwrap_or(session);
+        debug!(session_id = %stored.id, "created new session");
+        Ok(stored)
     }
 
     pub async fn get_or_create(

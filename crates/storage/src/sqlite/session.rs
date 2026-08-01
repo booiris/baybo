@@ -112,7 +112,25 @@ fn decode_message_row(row: RawMessageRow) -> Result<ChatMessage> {
 /// Rebuild a [`Session`] from a [`RawSessionListRow`], patching the flat
 /// columns over the JSON blob. Flat columns are authoritative; targeted setters
 /// leave the JSON blob untouched to avoid load/save races.
-fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
+/// What a read does with a binding column it cannot parse.
+///
+/// The two answers are both right, for different readers. A corrupt binding
+/// means this session's persona, skill overlay and memory partition are
+/// unknown — running it as the built-in would put its writes in the wrong
+/// partition, silently, so [`Self::Fail`] is what hydration takes. But a
+/// session row is user-facing core data that must stay listable, and a chat
+/// list that 500s because one row is damaged has turned a display problem into
+/// an outage; [`Self::Degrade`] keeps the row visible with a `warn!`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnCorruptBinding {
+    Fail,
+    Degrade,
+}
+
+fn decode_session_row(
+    row: &RawSessionListRow,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Session> {
     let (
         data,
         hidden_col,
@@ -136,9 +154,20 @@ fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
     session.folder_id = folder_id_col.clone().map(FolderId::from);
     session.archived = *archived_col != 0;
     session.title = title_col.clone();
-    session.state.agent_id = decode_agent_id(agent_id_col, &session.id);
-    session.state.agent_framework = decode_agent_framework(agent_framework_col, &session.id);
+    session.state.agent_id = decode_agent_id(agent_id_col, &session.id, on_corrupt)?;
+    session.state.agent_framework =
+        decode_agent_framework(agent_framework_col, &session.id, on_corrupt)?;
     Ok(session)
+}
+
+/// The parse failure both decoders raise under [`OnCorruptBinding::Fail`].
+/// A `serde_json::Error` because that is what this function already returns,
+/// and the caller maps every one of them to `StorageError::Storage`.
+fn corrupt_binding(column: &str, raw: &str) -> serde_json::Error {
+    serde::de::Error::custom(format!(
+        "sessions.{column} holds {raw:?}, which is not a valid binding; refusing to run this \
+         session as the built-in, which would write into the wrong memory partition"
+    ))
 }
 
 fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionListRow> {
@@ -162,31 +191,45 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
 /// dropped to `None` (built-in behaviour) with a `warn!` rather than failing
 /// the read: the column is a soft reference, and a session row is user data
 /// that must stay openable.
-fn decode_agent_id(raw: &Option<String>, session_id: &SessionId) -> Option<AgentProfileId> {
-    let raw = raw.as_ref()?;
+fn decode_agent_id(
+    raw: &Option<String>,
+    session_id: &SessionId,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Option<AgentProfileId>> {
+    let Some(raw) = raw.as_ref() else {
+        return Ok(None);
+    };
     match AgentProfileId::parse(raw.as_str()) {
-        Ok(id) => Some(id),
-        Err(e) => {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if on_corrupt == OnCorruptBinding::Degrade => {
             tracing::warn!(session_id = %session_id, "ignoring unusable sessions.agent_id: {e}");
-            None
+            Ok(None)
         }
+        Err(_) => Err(corrupt_binding("agent_id", raw)),
     }
 }
 
 /// Decode the flat `agent_framework` snapshot, degrading an unknown tag to
 /// `None` (baybo) with a `warn!` for the same reason as [`decode_agent_id`].
-fn decode_agent_framework(raw: &Option<String>, session_id: &SessionId) -> Option<AgentFramework> {
-    let raw = raw.as_ref()?;
+fn decode_agent_framework(
+    raw: &Option<String>,
+    session_id: &SessionId,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Option<AgentFramework>> {
+    let Some(raw) = raw.as_ref() else {
+        return Ok(None);
+    };
     match AgentFramework::parse(raw) {
-        Some(framework) => Some(framework),
-        None => {
+        Some(framework) => Ok(Some(framework)),
+        None if on_corrupt == OnCorruptBinding::Degrade => {
             tracing::warn!(
                 session_id = %session_id,
                 framework = %raw,
                 "ignoring unknown sessions.agent_framework"
             );
-            None
+            Ok(None)
         }
+        None => Err(corrupt_binding("agent_framework", raw)),
     }
 }
 
@@ -197,7 +240,10 @@ fn decode_agent_framework(raw: &Option<String>, session_id: &SessionId) -> Optio
 fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
     let mut sessions = Vec::with_capacity(rows.len());
     for row in &rows {
-        match decode_session_row(row) {
+        // Listing is display: a row whose binding is damaged still belongs in
+        // the user's chat list. Refusing it here would hide a conversation
+        // over a column the list never reads.
+        match decode_session_row(row, OnCorruptBinding::Degrade) {
             Ok(session) => sessions.push(session),
             Err(e) => tracing::warn!(
                 session_id = %row.4,
@@ -232,7 +278,9 @@ impl SessionStore for SqliteSessionStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        decode_session_row(&row)
+        // The hydration read: a binding it cannot trust must stop the read,
+        // not quietly become the built-in.
+        decode_session_row(&row, OnCorruptBinding::Fail)
             .map(Some)
             .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))
     }
@@ -2139,11 +2187,16 @@ mod tests {
         );
     }
 
+    /// The two readers of a damaged binding answer differently on purpose.
+    ///
+    /// `get` is what hydration uses, and a binding it cannot parse means the
+    /// session's persona, skills and **memory partition** are unknown —
+    /// running it as the built-in would put its writes somewhere they do not
+    /// belong, with nothing on screen to say so. Listing is display, and a
+    /// session row is user-facing core data: hiding the conversation, or
+    /// failing the whole list, would turn a damaged column into an outage.
     #[tokio::test]
-    async fn a_corrupt_agent_column_degrades_instead_of_failing_the_read() {
-        // Session rows are user data that must stay openable. A value that
-        // fails the id grammar (or an unknown framework tag) drops to the
-        // built-in with a warn rather than erroring the whole listing.
+    async fn a_corrupt_binding_fails_hydration_but_still_lists() {
         let tmpdir = tempfile::tempdir().unwrap();
         let pool = SqlitePool::open(tmpdir.path().join("test.db"))
             .await
@@ -2163,10 +2216,19 @@ mod tests {
         .await
         .unwrap();
 
-        let loaded = store.get(&s.id).await.unwrap().expect("row present");
-        assert_eq!(loaded.state.agent_id, None);
-        assert_eq!(loaded.state.agent_framework, None);
-        assert_eq!(store.list_all().await.unwrap().len(), 1);
+        let err = store
+            .get(&s.id)
+            .await
+            .expect_err("hydration must refuse a binding it cannot parse");
+        assert!(
+            err.to_string().contains("memory partition"),
+            "the error must say what refusing protects: {err}"
+        );
+        assert_eq!(
+            store.list_all().await.unwrap().len(),
+            1,
+            "the conversation stays in the user's list"
+        );
     }
 
     #[tokio::test]
