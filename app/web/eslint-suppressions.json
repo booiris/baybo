@@ -31,10 +31,10 @@
   },
   "src/pages/AgentsPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 5
+      "count": 1
     },
     "@typescript-eslint/strict-boolean-expressions": {
-      "count": 15
+      "count": 1
     }
   },
   "src/pages/AnalyticsPage.tsx": {

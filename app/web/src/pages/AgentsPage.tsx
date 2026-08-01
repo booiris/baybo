@@ -82,7 +82,7 @@ export function AgentsPage() {
   const [mutating, setMutating] = useState(false);
 
   useEffect(() => {
-    let canceled = false;
+    const alive = { current: true };
     async function fetchData() {
       if (isMock) {
         setAgents(MOCK_AGENT_PROFILES);
@@ -122,7 +122,7 @@ export function AgentsPage() {
           client.GET('/v1/skills'),
           client.GET('/v1/llm/models'),
         ]);
-        if (canceled) return;
+        if (!alive.current) return;
         for (const r of [agentsRes, skillsRes, llmRes]) {
           if (r.response.status === 401) {
             logout();
@@ -130,10 +130,10 @@ export function AgentsPage() {
           }
         }
         if (agentsRes.error || !agentsRes.response.ok) {
-          setError(agentsRes.error?.error || `HTTP Error ${agentsRes.response.status}`);
+          setError(agentsRes.error?.error ?? `HTTP Error ${agentsRes.response.status}`);
           return;
         }
-        setAgents(agentsRes.data?.items ?? []);
+        setAgents(agentsRes.data.items);
         setRegisteredSkills(
           (skillsRes.data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
         );
@@ -147,15 +147,15 @@ export function AgentsPage() {
           setError(`Failed to load ${failed.join(', ')} for the editor — retry Refresh.`);
         }
       } catch (e) {
-        if (canceled) return;
+        if (!alive.current) return;
         setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
       } finally {
-        if (!canceled) setLoading(false);
+        if (alive.current) setLoading(false);
       }
     }
     void fetchData();
     return () => {
-      canceled = true;
+      alive.current = false;
     };
   }, [client, logout, refreshKey, isMock]);
 
@@ -199,7 +199,7 @@ export function AgentsPage() {
           return;
         }
         if (apiError || !response.ok) {
-          setMutationError(apiError?.error || `HTTP Error ${response.status}`);
+          setMutationError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
         setPendingDelete(null);
@@ -270,7 +270,7 @@ export function AgentsPage() {
 
       {/* ── detail ── */}
       <main className="flex-1 min-w-0 flex flex-col overflow-hidden bg-surface">
-        {error && (
+        {error !== null && (
           <div className="m-4 mb-0 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
             {error}
           </div>
@@ -283,7 +283,7 @@ export function AgentsPage() {
             defaultLlmName={defaultLlmName}
             universalSkills={universalSkills}
             onSaved={(createdId) => {
-              if (createdId) {
+              if (createdId !== undefined) {
                 pendingSelectRef.current = createdId;
                 setSelected(createdId);
               }
@@ -333,7 +333,7 @@ export function AgentsPage() {
                 Delete <span className="font-bold">{pendingDelete.name}</span>? This cannot be
                 undone.
               </p>
-              {mutationError && (
+              {mutationError !== null && (
                 <p className="text-err font-mono text-sm border-2 border-err rounded-md px-3 py-2 break-words">
                   {mutationError}
                 </p>
@@ -372,7 +372,8 @@ function AgentRow({
   onSelect: () => void;
 }) {
   const framework = FRAMEWORKS.find((f) => f.value === agent.framework)?.label ?? agent.framework;
-  const subtitle = agent.llm ? `${framework} · ${agent.llm}` : framework;
+  const subtitle =
+    agent.llm !== undefined && agent.llm !== '' ? `${framework} · ${agent.llm}` : framework;
   return (
     <button
       type="button"
@@ -415,8 +416,8 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     setUrl(null);
-    if (!blobId) return;
-    let cancelled = false;
+    if (blobId === null || blobId === '') return;
+    const alive = { current: true };
     let objectUrl: string | null = null;
     void (async () => {
       try {
@@ -426,7 +427,7 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
         });
         if (!res.ok) throw new Error(`blob ${res.status}`);
         const blob = await res.blob();
-        if (cancelled) return;
+        if (!alive.current) return;
         objectUrl = URL.createObjectURL(blob);
         setUrl(objectUrl);
       } catch {
@@ -434,8 +435,8 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
       }
     })();
     return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      alive.current = false;
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
     };
   }, [blobId, baseUrl, token]);
   return url;
@@ -463,7 +464,7 @@ function AgentFace({
     size === 'sm'
       ? 'h-9 w-9 rounded-md border border-black'
       : 'h-32 w-32 rounded-md border-2 border-black shadow-brutal-sm';
-  if (face) {
+  if (face !== null) {
     return <img src={face} alt={agent.name} className={`${frame} shrink-0 object-cover`} />;
   }
   return (
@@ -543,7 +544,7 @@ function AgentEditorPanel({
   // cleanup sees the previous value) and on unmount.
   useEffect(() => {
     return () => {
-      if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+      if (avatarPreview !== null) URL.revokeObjectURL(avatarPreview);
     };
   }, [avatarPreview]);
 
@@ -562,15 +563,15 @@ function AgentEditorPanel({
       setFilesLoaded(true);
       return;
     }
-    let canceled = false;
+    const alive = { current: true };
     void (async () => {
       const { data, error: apiError, response } = await client.GET('/v1/agents/{agent_id}/soul', {
         params: { path: { agent_id: agent.id } },
       });
-      if (canceled) return;
+      if (!alive.current) return;
       if (response.status === 401) return logout();
-      if (apiError || !data) {
-        setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+      if (!response.ok || apiError !== undefined) {
+        setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
         return;
       }
       setSoul(data.content);
@@ -582,7 +583,7 @@ function AgentEditorPanel({
       const skills = await client.GET('/v1/skills', {
         params: { query: { agent_id: agent.id } },
       });
-      if (canceled) return;
+      if (!alive.current) return;
       setScopedSkills(
         (skills.data?.items ?? [])
           .slice()
@@ -590,7 +591,7 @@ function AgentEditorPanel({
       );
     })();
     return () => {
-      canceled = true;
+      alive.current = false;
     };
   }, [agent, client, isMock, logout, universalSkills]);
 
@@ -648,10 +649,10 @@ function AgentEditorPanel({
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
-        onSaved(data?.id);
+        onSaved(data.id);
         return;
       }
       if (soulDirty) {
@@ -670,8 +671,8 @@ function AgentEditorPanel({
           );
           return;
         }
-        if (apiError || !response.ok || !data) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+        if (!response.ok || apiError !== undefined) {
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
         // Adopt the version we just created, so a second Save from this same
@@ -700,7 +701,7 @@ function AgentEditorPanel({
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
       }
@@ -715,7 +716,7 @@ function AgentEditorPanel({
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
       }
@@ -726,7 +727,7 @@ function AgentEditorPanel({
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
       }
@@ -796,7 +797,7 @@ function AgentEditorPanel({
                     }}
                   />
                 </label>
-                {avatarBlobId && (
+                {avatarBlobId !== null && (
                   <button
                     type="button"
                     className="text-[0.7rem] font-bold uppercase text-ink-soft underline cursor-pointer"
@@ -882,7 +883,7 @@ function AgentEditorPanel({
               </label>
               <SelectBox
                 className={`w-full h-10 !border ${externalFramework || builtinPinned ? 'opacity-60' : ''}`}
-                value={llm ?? ''}
+                value={llm}
                 disabled={externalFramework || builtinPinned}
                 onChange={(e) => setLlm(e.target.value)}
               >
@@ -944,7 +945,7 @@ function AgentEditorPanel({
           {/* actions pinned to the bottom of the card, right-aligned; the
               card content fades out behind them as it scrolls. */}
           <div className="sticky bottom-0 -mx-6 -mb-6 flex items-center justify-end gap-2 px-6 pt-4 pb-5 bg-gradient-to-t from-surface via-surface to-transparent">
-            {saveError && (
+            {saveError !== null && (
               <p className="mr-auto max-w-md text-err font-mono text-xs border border-err bg-white rounded-md px-3 py-2 break-words">
                 {saveError}
               </p>
