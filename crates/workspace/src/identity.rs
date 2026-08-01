@@ -31,7 +31,7 @@ pub struct IdentityFiles {
 /// the same default. The write is staged via a sibling `.tmp` file and
 /// renamed so a concurrent reader observes either the previous state
 /// or the full default — never a partial.
-async fn read_or_seed(path: &Path, default: &str) -> anyhow::Result<String> {
+pub(crate) async fn read_or_seed(path: &Path, default: &str) -> anyhow::Result<String> {
     match tokio::fs::read_to_string(path).await {
         Ok(content) => Ok(content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -132,9 +132,10 @@ pub fn persona_seed(agent_id: &str, kind: IdentityKind) -> &'static str {
 }
 
 /// Materialize one agent's persona directory: create
-/// `personas/<agent_id>/skills/`, then write `SOUL.md`, `IDENTITY.md` and
-/// `USER.md` **only if absent**, each staged through a sibling `.tmp` file
-/// and renamed.
+/// `personas/<agent_id>/skills/` and `personas/<agent_id>/memory/`, then
+/// write `SOUL.md`, `IDENTITY.md`, `USER.md` and an empty `MEMORY.md`
+/// index **only if absent**, each staged through a sibling `.tmp` file and
+/// renamed.
 ///
 /// Idempotent and never destructive — files the agent has since rewritten
 /// survive every later call. Run at profile creation and again defensively
@@ -154,6 +155,19 @@ pub async fn ensure_persona_layout(
         .await
         .map_err(|e| anyhow::anyhow!("create persona skills dir {}: {e}", skills.display()))?;
     let mut seeded: Vec<String> = Vec::new();
+    // The memory index joins the baseline for the same reason the identity
+    // files do: its first real change should read as a change, not as the
+    // file appearing out of nowhere.
+    let memory_index = paths.persona_memory_index_file(agent_id);
+    let memory_existed = tokio::fs::try_exists(&memory_index).await.unwrap_or(false);
+    crate::memory::load_memory_index(&memory_index).await?;
+    if !memory_existed {
+        seeded.push(format!(
+            "{agent_id}/{}/{}",
+            crate::paths::PERSONA_MEMORY_DIR,
+            crate::paths::MEMORY_INDEX_FILE
+        ));
+    }
     for kind in IdentityKind::all() {
         let seed = match kind {
             // The caller's soul only applies to the file the caller is
@@ -181,6 +195,28 @@ pub async fn ensure_persona_layout(
     Ok(())
 }
 
+/// Serialises everything that runs `git` against `personas/`.
+///
+/// `add` + `commit` hold `.git/index.lock` for their whole run, and a `git`
+/// that loses the race exits rather than waiting. Two writers reach this
+/// repo — the baseline commits here and the per-write audit commits in
+/// `baybo-tools` — and the dream pass makes them concurrent by opening one
+/// fire per agent. The lock lives in this crate because it is the lower of
+/// the two, so both can share one.
+///
+/// Process-global because the repo is: one workspace, one `personas/`.
+///
+/// `tokio::sync::Mutex` rather than the `parking_lot` the style guide
+/// mandates everywhere else, and deliberately: this guard is **held across
+/// `.await`** — the whole point is to span a `git` subprocess — so a
+/// blocking mutex here would park a runtime worker for the length of a
+/// process spawn, and a second waiter on the same thread would deadlock.
+/// This is the exception the rule leaves room for, not an oversight to fix.
+pub fn personas_git_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Commit whatever is untracked or modified under `personas/<pathspec>`, so
 /// those files have a baseline in git before an agent starts rewriting them.
 ///
@@ -198,6 +234,7 @@ pub async fn commit_personas(paths: &WorkspacePaths, pathspecs: &[&str], subject
     if !repo.join(".git").exists() {
         return;
     }
+    let _guard = personas_git_lock().lock().await;
     let git = |args: Vec<String>| {
         let repo = repo.clone();
         async move {

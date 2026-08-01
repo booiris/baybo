@@ -1,13 +1,46 @@
 use async_trait::async_trait;
 use baybo_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName,
-    Session, SessionId,
+    AgentProfileId, ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    LineageKind, LlmEntryName, Session, SessionId,
 };
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// A conversation the dream pass has not consolidated yet, as
+/// [`SessionStore::dream_candidates`] reports it.
+///
+/// Flat projection: no session blob is decoded, because the caller only
+/// needs enough to decide whether the transcript is worth reading and which
+/// agent's memory it belongs to.
+#[derive(Debug, Clone)]
+pub struct DreamCandidate {
+    pub session_id: SessionId,
+    /// The agent this session was bound to. `None` is the built-in agent —
+    /// the same "NULL means built-in" rule the column carries everywhere.
+    pub agent_id: Option<AgentProfileId>,
+    pub title: Option<String>,
+    /// Newest unconsolidated row, whoever wrote it.
+    pub last_activity_at: DateTime<Utc>,
+    /// How many of the unconsolidated rows a human wrote — a cheap proxy
+    /// for "how much happened here", and zero for a session whose only new
+    /// rows are the agent's (a background delivery landing long after the
+    /// conversation went quiet).
+    pub human_message_count: i64,
+    /// Ordinal to start reading at: the oldest unconsolidated row.
+    ///
+    /// Without it a long-lived session is re-read from row 0 every pass —
+    /// selection says *which* conversations to read, not how much of each,
+    /// and a default-paginated read of a months-old transcript returns its
+    /// opening pages, the part already consolidated, while the new activity
+    /// sits past the end of the page.
+    pub read_from_ordinal: i64,
+    /// Highest ordinal in this session as of the query — what the pass's
+    /// cursor advances to once the conversation has been offered.
+    pub latest_ordinal: i64,
+}
 
 /// One row of `session_messages`, paired with its supersede marker.
 /// Yielded by [`SessionStore::load_session_messages_with_supersede`]
@@ -344,6 +377,54 @@ pub trait SessionStore: Send + Sync {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<DateTime<Utc>>>;
+
+    /// Conversations the dream pass has not consolidated yet, newest
+    /// activity first. Two disjoint arms, split on whether the session has
+    /// ever been offered to a pass (`sessions.dreamed_through_ordinal`):
+    ///
+    /// - **Never offered** → sessions carrying a human-authored message in
+    ///   `[since, until)`. "A person said something in this window" is what
+    ///   keeps the pass from feeding on itself: a dream fire, and a silent
+    ///   cron fire, contain no human message at all, and a subagent's prompt
+    ///   is `MessageSource::Agent`. It is also what bounds the first-ever
+    ///   pass, which would otherwise be handed all of history.
+    /// - **Offered before** → every row above the cursor, **whoever wrote
+    ///   it**. Dropping the human-message requirement here is the whole
+    ///   point: the rows a pass misses are the ones appended *after* it read
+    ///   — a turn that was still running, or a background-notification
+    ///   delivery, which opens no turn at all and lands
+    ///   `MessageSource::Agent` rows hours later. No predicate over human
+    ///   messages in any window will ever select those, so a session whose
+    ///   tail arrived late would stay unread forever.
+    ///
+    /// Compaction's own rows are excluded from both arms: they are copies of
+    /// material already present (the originals are never deleted), so
+    /// counting them would make a compaction look like activity and reading
+    /// them would consolidate the same exchange twice.
+    ///
+    /// Not scoped by identity: a deployment today serves a single human, and
+    /// `user.id` could not partition them anyway — one human routinely holds
+    /// several ids, one per code path that minted a session. See
+    /// `docs/todo/user-identity.md`.
+    async fn dream_candidates(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<DreamCandidate>>;
+
+    /// Advance the dream pass's cursor for `session_id` to `ordinal`
+    /// (max-wins, so a stale writer cannot rewind it). Returns `false` when
+    /// the session row is gone.
+    ///
+    /// Called once a conversation has actually been **offered** to a pass —
+    /// after its fire is dispatched, never before. Every earlier failure
+    /// (mint, digest, store) therefore leaves the cursor where it was, and
+    /// the next pass re-offers the conversation instead of losing it.
+    async fn set_dreamed_through_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<bool>;
 
     /// Newest human-authored active row (`source` `user` /
     /// `user_interjection`) for each requested session, one grouped

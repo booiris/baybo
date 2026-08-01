@@ -113,7 +113,7 @@ where
 
 /// Own a full `Turn` lifecycle: create the row via `start_turn`,
 /// register the cancellation token, transition `Pending → InProgress`,
-/// run the body, then `complete` on success or `fail` on error.
+/// run the body, then settle the row exactly once.
 ///
 /// Production callers must go through this helper rather than calling
 /// `TurnLifecycle::start_turn` directly, so the cancel state machine
@@ -127,20 +127,35 @@ where
 /// terminal events on the broadcast bus; this helper does not need
 /// to fire any extra notification.
 ///
+/// ## One settlement, one write
+///
+/// Past `start()` there is no `return`: the body's result and the token
+/// classify into a [`TurnSettlement`], and [`settle_turn`] is the only
+/// thing that writes a terminal state — the same shape as this module's
+/// other three guards. That is structural, not a convention: a new case
+/// has nowhere to exit from except by naming a settlement, so it cannot
+/// leave the row `InProgress` the way an early `return` once did. A row
+/// that leaks non-terminal is not merely untidy — a `/stop`, a shutdown,
+/// and the dream pass all read "is this session mid-turn?" from it.
+///
 /// ## Cancel-race handling
 ///
 /// `TurnLifecycle::cancel` first trips the registered token, *then*
-/// flips the row to `Cancelled`. Three windows are handled:
+/// flips the row to `Cancelled`, and the token can also be tripped by
+/// something that never touches this row at all (shutdown's parent
+/// token, `/stop` reaching a child's pre-dispatch token). Four windows:
 /// 1. cancel arrives before `start()` → start() succeeds (Pending →
 ///    InProgress is allowed even on a cancelled token; the body's
 ///    own cancel observation kicks in next).
-/// 2. cancel arrives during body → body returns Err, helper checks
-///    `cancel_token.is_cancelled()`, and skips `fail()` because the
-///    row is already Cancelled (calling fail() would log noise as
-///    InvalidTransition).
-/// 3. cancel arrives between body returning Ok and `complete()`'s
-///    write → complete() returns InvalidTransition; helper turns
-///    that into Err so the caller doesn't dispatch the response.
+/// 2. cancel arrives during body → body returns `Err`, and the
+///    settlement is `Cancel`.
+/// 3. cancel arrives while the body is finishing → body returns `Ok`,
+///    the token reads tripped, and the settlement is still `Cancel`:
+///    the value is being discarded, so the row must not claim the turn
+///    delivered anything.
+/// 4. cancel lands between that check and `complete()`'s write →
+///    `complete()` is rejected, and the settlement falls back to
+///    cancelling the row rather than leaving it running.
 pub(crate) async fn with_turn<F, Fut, T>(
     lifecycle: &TurnLifecycle,
     cancel_token: CancellationToken,
@@ -172,42 +187,72 @@ where
         return Err(e.into());
     }
 
-    let result = body(turn_id).await;
-
-    match result {
-        Ok((output, value)) => {
-            if cancel_token.is_cancelled() {
-                warn!(turn_id = %turn_id, "cancel observed after body returned Ok; suppressing complete");
-                return Err(anyhow::anyhow!("turn cancelled mid-flight"));
-            }
-            match lifecycle.complete(&turn_id, output).await {
-                Ok(()) => Ok(value),
-                Err(e) => {
-                    warn!(error = %e, turn_id = %turn_id, "complete() rejected; treating as cancelled");
-                    Err(anyhow::anyhow!("turn already terminal: {e}"))
-                }
-            }
+    let settlement = match (body(turn_id).await, cancel_token.is_cancelled()) {
+        (Ok((output, value)), false) => TurnSettlement::Complete(output, value),
+        (Ok(_), true) => {
+            warn!(turn_id = %turn_id, "cancel observed after body returned Ok; suppressing complete");
+            TurnSettlement::Cancel(anyhow::anyhow!("turn cancelled mid-flight"))
         }
-        Err(e) => {
-            if cancel_token.is_cancelled() {
-                // The token may have been cancelled BEFORE this turn's row
-                // existed (e.g. `/stop` tripping a child's pre-dispatch token),
-                // so the row can still be InProgress here, not Cancelled.
-                // `cancel` is idempotent on a terminal row (it preserves the
-                // canceller's original reason) and flips an InProgress row to
-                // Cancelled — so it both avoids `fail()`'s InvalidTransition and
-                // stops a pre-turn-window row leaking as forever-InProgress.
-                lifecycle
-                    .cancel(&turn_id, CancelReason::ParentCancelled, Vec::new())
-                    .await
-                    .ok();
-                return Err(e);
+        (Err(e), true) => TurnSettlement::Cancel(e),
+        (Err(e), false) => TurnSettlement::Fail(e),
+    };
+    settle_turn(lifecycle, turn_id, settlement).await
+}
+
+/// How a finished body settles its turn row. Every exit from
+/// [`with_turn`] past `start()` is one of these, so "which terminal
+/// state" is decided in one place and written in one place.
+enum TurnSettlement<T> {
+    Complete(TurnOutput, T),
+    /// The row settles as `Cancelled`, and the caller gets this error
+    /// instead of a value.
+    Cancel(anyhow::Error),
+    Fail(anyhow::Error),
+}
+
+/// The single terminal write for a turn.
+async fn settle_turn<T>(
+    lifecycle: &TurnLifecycle,
+    turn_id: TurnId,
+    settlement: TurnSettlement<T>,
+) -> anyhow::Result<T> {
+    match settlement {
+        TurnSettlement::Complete(output, value) => match lifecycle.complete(&turn_id, output).await
+        {
+            Ok(()) => Ok(value),
+            Err(e) => {
+                warn!(error = %e, turn_id = %turn_id, "complete() rejected; treating as cancelled");
+                cancel_row(lifecycle, turn_id).await;
+                Err(anyhow::anyhow!("turn already terminal: {e}"))
             }
+        },
+        TurnSettlement::Cancel(e) => {
+            cancel_row(lifecycle, turn_id).await;
+            Err(e)
+        }
+        TurnSettlement::Fail(e) => {
             if let Err(fe) = lifecycle.fail(&turn_id, e.to_string()).await {
-                warn!(error = %fe, "failed to mark turn failed");
+                warn!(error = %fe, turn_id = %turn_id, "failed to mark turn failed");
             }
             Err(e)
         }
+    }
+}
+
+/// Flip the row to `Cancelled`, tolerating a row that is already
+/// terminal.
+///
+/// `cancel` is the right verb even when the row might still be
+/// `InProgress`: it is idempotent on a terminal row (preserving the
+/// original canceller's reason) and flips a running one, whereas `fail`
+/// would be rejected as an invalid transition on the terminal case and
+/// log noise for it.
+async fn cancel_row(lifecycle: &TurnLifecycle, turn_id: TurnId) {
+    if let Err(e) = lifecycle
+        .cancel(&turn_id, CancelReason::ParentCancelled, Vec::new())
+        .await
+    {
+        warn!(error = %e, turn_id = %turn_id, "failed to settle turn as cancelled");
     }
 }
 
@@ -310,4 +355,104 @@ where
         }
     }
     value_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baybo_store::TurnStore;
+    use baybo_turn::test_support::MemoryTurnStore;
+    use std::sync::Arc;
+
+    fn spec() -> TurnSpec {
+        TurnSpec {
+            session_id: SessionId::from("sess"),
+            origin: TriggerKind::User,
+            input: TurnInput::UserChat {
+                content: Vec::new(),
+            },
+            parent_turn_id: None,
+        }
+    }
+
+    /// The row's status after the guard returns, whatever it returned.
+    async fn settled_status(
+        store: &Arc<MemoryTurnStore>,
+        lifecycle: &TurnLifecycle,
+        token: CancellationToken,
+        body: anyhow::Result<TurnOutput>,
+    ) -> String {
+        let _ = with_turn(lifecycle, token, spec(), |_| async move {
+            body.map(|output| (output, ()))
+        })
+        .await;
+        let rows = store
+            .list_by_session(&SessionId::from("sess"))
+            .await
+            .expect("list");
+        rows.last().expect("a turn row").status_kind.clone()
+    }
+
+    fn done() -> TurnOutput {
+        TurnOutput::Structured {
+            value: serde_json::Value::Null,
+        }
+    }
+
+    /// The regression this shape exists for. A token tripped by something
+    /// that never touches this row — shutdown's parent token, `/stop`
+    /// reaching a child — used to make the guard return early with no
+    /// terminal write at all, leaving the row `in_progress` for the rest of
+    /// the process. `/stop`, shutdown and the dream pass all read that
+    /// column to answer "is this session mid-turn?", so the row is not
+    /// bookkeeping — a leak silently freezes each of them on that session.
+    #[tokio::test]
+    async fn a_body_that_succeeds_under_an_externally_tripped_token_still_settles() {
+        let store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = TurnLifecycle::new(Arc::clone(&store) as Arc<dyn TurnStore>);
+        // Tripped without going through `TurnLifecycle::cancel`, so nothing
+        // else is going to flip the row on our behalf.
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let status = settled_status(&store, &lifecycle, token, Ok(done())).await;
+        assert_eq!(status, "cancelled", "the row must not be left running");
+    }
+
+    #[tokio::test]
+    async fn every_other_exit_settles_too() {
+        for (body, cancelled, expected) in [
+            (Ok(done()), false, "completed"),
+            (Err(anyhow::anyhow!("boom")), false, "failed"),
+            (Err(anyhow::anyhow!("boom")), true, "cancelled"),
+        ] {
+            let store = Arc::new(MemoryTurnStore::new());
+            let lifecycle = TurnLifecycle::new(Arc::clone(&store) as Arc<dyn TurnStore>);
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let status = settled_status(&store, &lifecycle, token, body).await;
+            assert_eq!(status, expected, "cancelled={cancelled}");
+        }
+    }
+
+    /// The value only survives the path where the turn actually completed —
+    /// a suppressed result must not reach the caller as success.
+    #[tokio::test]
+    async fn only_a_completed_turn_hands_its_value_back() {
+        let store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = TurnLifecycle::new(Arc::clone(&store) as Arc<dyn TurnStore>);
+        let token = CancellationToken::new();
+        let ok = with_turn(&lifecycle, token.clone(), spec(), |_| async {
+            Ok((done(), 42u8))
+        })
+        .await;
+        assert_eq!(ok.expect("completed"), 42);
+
+        token.cancel();
+        let suppressed =
+            with_turn(&lifecycle, token, spec(), |_| async { Ok((done(), 42u8)) }).await;
+        assert!(suppressed.is_err(), "a cancelled turn hands back no value");
+    }
 }

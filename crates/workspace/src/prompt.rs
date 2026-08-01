@@ -89,6 +89,18 @@ self-image live beside it in `IDENTITY.md`; the shared `personas/USER.md`
 *(Anything this agent must never touch, or must always confirm first.)*
 "#;
 
+/// Seed body for an empty memory index (`MEMORY.md`) in an agent's
+/// `personas/<id>/memory/`.
+///
+/// Deliberately tiny: this file is carried **verbatim** in every system
+/// prompt, so anything written here is a per-turn context cost forever.
+/// The rules for using it live in the runtime prompt framing, not on
+/// disk.
+pub const MEMORY_INDEX_TEMPLATE: &str = r#"# Memory Index
+
+*One line per memory file, newest concerns first. Nothing remembered yet.*
+"#;
+
 /// Seed body for a newly-created agent's `personas/<id>/USER.md`.
 ///
 /// Deliberately *not* [`DEFAULT_USER_CONTENT`]: the shared `personas/USER.md`

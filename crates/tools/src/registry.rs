@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use baybo_store::BlobStore;
-use baybo_workspace::WorkspacePaths;
 use parking_lot::RwLock;
 use serde_json::Value;
 
@@ -46,16 +44,9 @@ impl ToolRegistry {
     /// `permission` is the shared, hot-swappable handle that drives
     /// `BashTool`'s isolation/approval behavior and the description it
     /// advertises; a config reload swaps it live.
-    pub fn with_defaults(
-        blob_store: Arc<dyn BlobStore>,
-        workspace_paths: WorkspacePaths,
-        proxy: Option<reqwest::Proxy>,
-        permission: Arc<crate::builtin::LivePermissionMode>,
-    ) -> Self {
+    pub fn with_defaults(config: crate::builtin::DefaultToolsConfig) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in
-            crate::builtin::default_tools(blob_store, workspace_paths, proxy, permission)
-        {
+        for (tool, manifest) in crate::builtin::default_tools(config) {
             registry.register(tool, manifest);
         }
         registry
@@ -261,21 +252,40 @@ mod tests {
     use std::sync::Arc;
 
     use baybo_storage::test_support::MemoryBlobStore;
-    use baybo_store::BlobStore;
 
     use super::ToolRegistry;
     use crate::ToolConcurrency;
 
     fn default_registry() -> ToolRegistry {
-        let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        ToolRegistry::with_defaults(
+        let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>;
+        ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
             blob_store,
-            baybo_workspace::WorkspacePaths::new("/tmp"),
-            None,
-            Arc::new(crate::builtin::LivePermissionMode::new(
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
+            proxy: None,
+            permission: Arc::new(crate::builtin::LivePermissionMode::new(
                 crate::builtin::BashPermissionMode::Manual,
             )),
-        )
+            builtin_memory: true,
+        })
+    }
+
+    #[test]
+    fn memory_delete_is_absent_when_builtin_memory_is_off() {
+        // Nothing mentions a memory directory to the model with the feature
+        // off, so a verb for tidying one would name a place its prompt never
+        // describes.
+        let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>;
+        let registry = ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
+            blob_store,
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
+            proxy: None,
+            permission: Arc::new(crate::builtin::LivePermissionMode::new(
+                crate::builtin::BashPermissionMode::Manual,
+            )),
+            builtin_memory: false,
+        });
+        assert!(registry.get_manifest("MemoryDelete").is_none());
+        assert!(default_registry().get_manifest("MemoryDelete").is_some());
     }
 
     #[test]

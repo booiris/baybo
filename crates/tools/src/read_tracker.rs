@@ -57,8 +57,9 @@ impl ReadCheck {
             )),
             ReadCheck::Stale => Some(format!(
                 "{path} has changed on disk since you last read it (edited by the user, a \
-                 formatter, or another tool) — use the Read tool on it again before {action} \
-                 so your change applies to the current content."
+                 formatter, another tool, or — for a shared file — another agent) — use the \
+                 Read tool on it again before {action} so your change applies to the current \
+                 content."
             )),
         }
     }

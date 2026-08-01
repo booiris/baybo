@@ -5,8 +5,10 @@
 The `workspace` crate is the single source of truth for Baybo's workspace layout. It owns:
 
 - **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `personas/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
+
 - **Skeleton materialisation** (`layout` module, `io` feature): `ensure_layout`, `seed_default_identity_files` — the two boot-time writes that turn a bare root into a usable workspace.
 - **Identity I/O** (`identity` module, `io` feature, default-on): `IdentityFiles`, `IdentitySource`, `load_identity`, `load_identity_files`, `ensure_persona_layout` — the async readers backing the identity documents, seeding any that is missing.
+- **Memory addresses + seeding** (`memory` module, `io` feature): `load_memory_index` — a persona directory also holds that agent's `memory/` tree, one markdown file per remembered fact plus the `MEMORY.md` index that rides the system prompt. This crate owns where it lives and how an absent index is seeded; everything else about it is [`memory-builtin.md`](memory-builtin.md).
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
 - **Workspace exclusion** (`singleton` module, `io` feature): `WorkspaceLock` and `acquire_workspace_lock` — the advisory `flock` on `state/baybo.lock` that keeps two chat loops off one workspace. It lives here rather than in the binary because the path constant does, and because `baybo vault rotate` needs the same lock: `key_file::rotate` takes a `&WorkspaceLock` so holding it is a type-level obligation rather than something a caller remembers.
 - **Tree measurement** (`walk` module, always available, std-only): `tree_stats` — the one sync walker behind the janitor's `work/tmp` "newest in-tree mtime" staleness gate (called via `spawn_blocking`). Summed lstat file sizes + newest lstat mtime anywhere in the tree; symlinks are measured as links and never followed. The mtime back-dating fixtures for testing against it live in `test_support` behind the `test-support` feature.
@@ -57,7 +59,7 @@ checkout rather than polluting the real user home.
 | disposable scratch | `<workspace.path>/work/tmp/` (`WORK_TMP_SUBDIR`; janitor-swept, see below) |
 | gateway logs     | `<workspace.path>/logs/baybo.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
-| session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read) |
+| session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read). `…/<session_id>@<ordinal>.jsonl` serves the same transcript from that message on — `@` is a character `sanitize_session_id` rewrites, so it cannot occur in the id half |
 
 New subsystem files belong as a method on `WorkspacePaths`, not as another `workspace_root.join("…")` call site.
 
@@ -126,10 +128,17 @@ Identity file changes usually affect the system prompt; memory changes usually a
 
 ### Boundary with memory
 
-- **workspace**: persistent identity and strategy files
-- **memory**: retrievable, recallable, and expirable user memory
+Two different things are called memory, and only one of them is a boundary:
 
-They complement each other without overlapping.
+- The **pluggable `Memory` trait** ([`memory.md`](memory.md)) — an external,
+  retrievable store (mem0, OpenViking). That one genuinely does not overlap:
+  this crate holds files, that one holds recall.
+- The **file-based memory tree** ([`memory-builtin.md`](memory-builtin.md)) —
+  `personas/<id>/memory/`, which lives *inside* this crate's layout and is
+  addressed and seeded by it, exactly like the identity files. The split
+  there is not workspace-vs-memory but always-loaded-vs-loaded-on-demand:
+  identity files ride every prompt in full, memory files cost nothing until
+  read.
 
 ### Scratch hygiene: `work/tmp`
 

@@ -123,13 +123,18 @@ struct CronJobsScreen: View {
                             systemImage: paused ? "play.circle" : "pause.circle")
                     }
                     .tint(Theme.inkSoft)
-                    Button(role: .destructive) {
-                        appStore.promptDeleteCronJob(
-                            job.id, name: CronJobRowView.headline(job))
-                    } label: {
-                        Label(lang.t("list.delete"), systemImage: "trash")
+                    // A built-in job is part of Baybo: pause is the way to
+                    // stop it, and the server refuses DELETE outright — so
+                    // offering one would only ever produce a failed request.
+                    if !job.builtin {
+                        Button(role: .destructive) {
+                            appStore.promptDeleteCronJob(
+                                job.id, name: CronJobRowView.headline(job))
+                        } label: {
+                            Label(lang.t("list.delete"), systemImage: "trash")
+                        }
+                        .tint(Theme.err)
                     }
-                    .tint(Theme.err)
                 }
             }
         }
@@ -183,7 +188,8 @@ extension CronJobSummary {
             timezone: timezone,
             status: status,
             nextTriggerAt: nextTriggerAt,
-            lastTriggeredAt: lastTriggeredAt)
+            lastTriggeredAt: lastTriggeredAt,
+            builtin: builtin)
     }
 }
 

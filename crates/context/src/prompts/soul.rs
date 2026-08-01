@@ -35,9 +35,48 @@ When a subagent or command runs in the background — you spawned it with `backg
 /// first message that may carry one.
 const TAIL_HINT: &str = r#"Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear."#;
 
+/// Size past which a memory index is worth complaining about. Not a cap —
+/// see [`memory_parts`] for why truncating would be worse — just the point
+/// where "one line per memory" has stopped being a rounding error against a
+/// context window (~8 KiB is on the order of 2k tokens, spent on every
+/// single request the session makes).
+const MEMORY_INDEX_WARN_BYTES: usize = 8 * 1024;
+
+/// How to use the memory tree whose index the `<memory>` section carries.
+/// Follows that section so the rules arrive with the index they govern, and
+/// is omitted wholesale when file memory is disabled.
+///
+/// `{{memory_dir}}` is substituted with the absolute directory this session's
+/// memory lives in — per-agent, so the path differs between agents.
+const MEMORY_HINT: &str = r#"# Memory
+
+Your memory lives in `{{memory_dir}}`: one markdown file per remembered fact, indexed by the `<memory>` block above. The index is always in front of you; the files are not. When an index line looks relevant to what you are doing, `Read` that file — never answer from the one-line hook alone.
+
+Write a memory as soon as you learn something worth carrying into a later conversation: a durable fact about your human, a correction they gave you, the state of ongoing work, a pointer to something external. Do not record what the sections above already say, what matters only inside this conversation, or anything you could re-derive by looking it up.
+
+One fact per file. Create it at `{{memory_dir}}/<slug>.md`:
+
+---
+name: <short-kebab-case-slug>
+description: <one line — this is what the index shows>
+metadata:
+  type: user | feedback | project | reference
+---
+
+<the fact; link related memories with [[their-name]]>
+
+`user` — who your human is. `feedback` — how they have asked you to work, and why. `project` — ongoing work and where it stands; write dates absolutely, never "last week". `reference` — pointers to external things (URLs, dashboards, tickets).
+
+Then add its line to `{{memory_dir}}/MEMORY.md` in the same breath — `- [Title](file.md) — hook` — because a memory the index does not name will never be found again. Before creating a file, check whether one already covers the fact and update that one instead. When a memory turns out to be wrong or obsolete, delete it with `MemoryDelete` and drop its index line. Keep the index skimmable: it rides every prompt you will ever run."#;
+
 /// Assemble the system prompt: [`TOP_HINT`] up front (agent role + Edit
-/// affordance), the three identity sections (`soul` / `identity` /
-/// `user_profile`), then [`TAIL_HINT`] (tag-handling guidance). Reads the
+/// affordance), the identity sections, the `<memory>` index plus
+/// [`MEMORY_HINT`], then [`BACKGROUND_TASKS_HINT`] and [`TAIL_HINT`]
+/// (operating rules last, so the declarative content reads as one block).
+///
+/// `memory_index` is `None` when built-in memory is disabled, which drops the
+/// section and its rules together — a prompt that taught the model to write
+/// memories it has nowhere to put would be worse than silence. Reads the
 /// files via the auto-seeding `load_identity_files`, so a deleted file is
 /// recreated rather than left half-formed.
 ///
@@ -54,11 +93,12 @@ pub async fn assemble(
     soul: IdentitySource<'_>,
     self_image: IdentitySource<'_>,
     user_notes: IdentitySource<'_>,
+    memory_index: Option<&Path>,
 ) -> anyhow::Result<String> {
     let identity =
         baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
             .await?;
-    let parts = [
+    let mut parts = vec![
         TOP_HINT.to_string(),
         wrap_section("soul", soul.path, &identity.soul),
         wrap_section("identity", self_image.path, &identity.identity),
@@ -68,10 +108,54 @@ pub async fn assemble(
             &identity.shared_user,
         ),
         wrap_section("user_notes", user_notes.path, &identity.user),
-        BACKGROUND_TASKS_HINT.to_string(),
-        TAIL_HINT.to_string(),
     ];
+    if let Some(index_path) = memory_index {
+        parts.extend(memory_parts(index_path).await);
+    }
+    parts.push(BACKGROUND_TASKS_HINT.to_string());
+    parts.push(TAIL_HINT.to_string());
     Ok(parts.join("\n\n"))
+}
+
+/// The `<memory>` index section plus the rules for using it, or nothing at
+/// all if the index can't be read.
+///
+/// Memory is auxiliary to the persona: a workspace whose memory dir is
+/// unreadable should still get a coherent system prompt, so this failure
+/// warns and degrades to "no memory this session" instead of failing the
+/// assembly and dropping the session to [`FALLBACK_SYSTEM_PROMPT`].
+async fn memory_parts(index_path: &Path) -> Vec<String> {
+    let index = match baybo_workspace::load_memory_index(index_path).await {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %index_path.display(), "memory index unreadable; assembling without memory");
+            return Vec::new();
+        }
+    };
+    // The index rides message[0] of every call this session makes, so its
+    // size is a per-turn tax forever — and it grows by a line per memory
+    // with nothing but the prompt's own "keep it skimmable" to stop it.
+    // Warn rather than truncate: a cut index would point the model at
+    // memories it can no longer see, which is worse than an expensive one.
+    // The operator can prune, and the dream pass is asked to.
+    if index.len() > MEMORY_INDEX_WARN_BYTES {
+        tracing::warn!(
+            path = %index_path.display(),
+            bytes = index.len(),
+            "memory index is large and rides every request in this session; \
+             consider pruning it"
+        );
+    }
+    // The dir, not the index file: every instruction in the hint addresses
+    // a sibling of the index.
+    let dir = index_path
+        .parent()
+        .map(absolutise)
+        .unwrap_or_else(|| absolutise(index_path));
+    vec![
+        wrap_section("memory", index_path, &index),
+        MEMORY_HINT.replace("{{memory_dir}}", &dir.display().to_string()),
+    ]
 }
 
 /// Wrap an identity-file body in an XML tag carrying the absolute on-disk
@@ -108,6 +192,7 @@ mod tests {
             IdentitySource::new(&soul_path, IdentityKind::Soul.default_content()),
             IdentitySource::new(&identity_path, IdentityKind::Identity.default_content()),
             IdentitySource::new(&user_path, IdentityKind::User.default_content()),
+            None,
         )
         .await
         .expect("assemble");
@@ -128,5 +213,79 @@ mod tests {
         assert!(prompt.trim_end().ends_with(
             "They bear no direct relation to the specific tool results or user messages in which they appear."
         ));
+    }
+
+    #[tokio::test]
+    async fn the_memory_section_carries_the_index_and_names_its_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(dir.path().to_path_buf());
+        let index = paths.persona_memory_index_file("baybo");
+        tokio::fs::create_dir_all(paths.persona_memory_dir("baybo"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&index, "# Memory Index\n\n- [Cat](cat.md) — Mochi\n")
+            .await
+            .expect("write index");
+
+        let prompt = assemble(
+            &paths,
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::Soul),
+                "s",
+            ),
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::Identity),
+                "i",
+            ),
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::User),
+                "u",
+            ),
+            Some(&index),
+        )
+        .await
+        .expect("assemble");
+
+        assert!(prompt.contains("- [Cat](cat.md) — Mochi"));
+        // Operating rules come after the declarative content.
+        let memory = prompt.find("<memory ").expect("memory tag");
+        let hint = prompt.find("# Memory\n").expect("memory hint");
+        let background = prompt.find("# Background work").expect("background hint");
+        assert!(memory < hint && hint < background);
+        // A leftover placeholder would send every write to a literal path.
+        assert!(!prompt.contains("{{memory_dir}}"));
+        let memory_dir = absolutise(&paths.persona_memory_dir("baybo"));
+        assert!(prompt.contains(&format!("Your memory lives in `{}`", memory_dir.display())));
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_memory_drops_the_section_and_its_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(dir.path().to_path_buf());
+
+        let prompt = assemble(
+            &paths,
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::Soul),
+                "s",
+            ),
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::Identity),
+                "i",
+            ),
+            IdentitySource::new(
+                &paths.persona_identity_file("baybo", IdentityKind::User),
+                "u",
+            ),
+            None,
+        )
+        .await
+        .expect("assemble");
+
+        assert!(!prompt.contains("<memory "));
+        assert!(!prompt.contains("# Memory\n"));
+        // …and nothing is seeded on disk for a feature that is switched off.
+        assert!(!paths.persona_memory_dir("baybo").exists());
+        assert!(prompt.contains("<soul "));
     }
 }

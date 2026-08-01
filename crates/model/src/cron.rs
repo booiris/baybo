@@ -142,6 +142,51 @@ pub struct CronJob {
     /// flat-column discipline `deleted_at` and `sessions.pinned` use.
     #[serde(skip)]
     pub pinned: bool,
+    /// Whether this job is one the runtime seeds and owns (currently only
+    /// the dream pass — see [`BuiltinCronJob`]). Such a job can be
+    /// paused, resumed and rescheduled like any other, but not deleted:
+    /// it is a part of the assistant with a switch in `baybo.json`, not a
+    /// reminder the user typed.
+    ///
+    /// `#[serde(skip)]` + a flat column for exactly the reason
+    /// [`Self::pinned`] documents: every blob write reconstructs the row
+    /// from a caller-held snapshot, so a bit living in the blob is
+    /// reverted by the next fire's `record_fire`.
+    #[serde(skip)]
+    pub builtin: bool,
+}
+
+/// A cron job the runtime seeds and owns, rather than one a user asked for.
+///
+/// Each variant is a fixed id: seeding is `INSERT OR IGNORE` against it, so
+/// re-seeding is idempotent, and the router recognises its own fires by
+/// resolving the id back to a variant. A built-in job pauses and reschedules
+/// like any other but cannot be deleted, and its title and instruction are
+/// re-asserted from the binary at boot — see `CronJob::builtin`.
+///
+/// Adding one is: a variant here, its title/prompt beside the scheduler's
+/// seed, a boot call, and (if it needs fire-time material) an arm in the
+/// router's built-in dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCronJob {
+    /// Consolidates each agent's memory tree and rebalances it against that
+    /// agent's identity files. See `docs/modules/memory-builtin.md`.
+    Dream,
+}
+
+impl BuiltinCronJob {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Dream => "baybo-dream",
+        }
+    }
+
+    /// The built-in job this id names, or `None` for an ordinary job.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|job| job.id() == id)
+    }
+
+    pub const ALL: [Self; 1] = [Self::Dream];
 }
 
 impl CronJob {
@@ -376,6 +421,22 @@ pub struct CronExecution {
     /// converges instead of re-attempting a hopeless delivery on every boot.
     #[serde(default)]
     pub notified_at: Option<DateTime<Utc>>,
+
+    /// The job's `last_triggered_at` **as of the instant before this fire
+    /// advanced it** — i.e. when the previous fire happened, or `None` for
+    /// a job's first ever fire.
+    ///
+    /// It is recorded here because it cannot be recovered later: the
+    /// scheduler advances the job row *before* dispatching (so a crash can't
+    /// re-fire the slot), which means anything downstream that reads
+    /// `cron_jobs.last_triggered_at` sees *this* fire's stamp. Riding the
+    /// execution also keeps the window correct on the boot re-dispatch path,
+    /// which rebuilds the event from this row.
+    ///
+    /// The dream pass uses it as the "what happened since I last looked?"
+    /// cursor, which is why no separate cursor is stored anywhere.
+    #[serde(default)]
+    pub previous_fire_at: Option<DateTime<Utc>>,
 }
 
 impl CronExecution {
@@ -400,6 +461,9 @@ impl CronExecution {
             triggered_at,
             status: ExecutionStatus::Pending,
             origin_session_id: job.origin_session_id.clone(),
+            // Snapshotted as the execution is recorded, because advancing
+            // the job row is about to overwrite its copy with `triggered_at`.
+            previous_fire_at: job.last_triggered_at,
             fire_session_id: None,
             completed_at: None,
             outcome: None,
@@ -476,6 +540,7 @@ mod tests {
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
+            builtin: false,
         }
     }
 
@@ -520,6 +585,7 @@ mod tests {
             origin_session_id: Some(SessionId::from("sess-1")),
             deleted_at: None,
             pinned: false,
+            builtin: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -554,6 +620,7 @@ mod tests {
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
+            builtin: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();

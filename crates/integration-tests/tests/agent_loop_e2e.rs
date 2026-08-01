@@ -2559,6 +2559,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     harness
         .mailbox
         .send(AgentMessage::CronTrigger {
+            builtin: None,
             job_id: "cj-demo".into(),
             title: "greeting".into(),
             prompt: "你好".into(),
@@ -2703,6 +2704,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
     harness
         .mailbox
         .send(AgentMessage::CronTrigger {
+            builtin: None,
             job_id: "cj-watch".into(),
             title: "Watcher".into(),
             prompt: "check the build; report only if it broke".into(),
@@ -2816,6 +2818,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
+        builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
@@ -2971,6 +2974,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
+        builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness
@@ -3102,6 +3106,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
     harness
         .mailbox
         .send(AgentMessage::CronTrigger {
+            builtin: None,
             job_id: "cj-news".into(),
             title: "Daily news".into(),
             prompt: "Summarise the news".into(),
@@ -3185,6 +3190,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
+        builtin: false,
     };
     let execution = CronExecution::pending(&turn, chrono::Utc::now(), chrono::Utc::now());
     harness

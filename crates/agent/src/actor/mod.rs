@@ -60,6 +60,20 @@ fn is_turn_cancelled(err: &anyhow::Error) -> bool {
     err.downcast_ref::<TurnCancelled>().is_some()
 }
 
+/// What a **built-in** cron fire carries beyond an ordinary one: material
+/// the runtime computed at fire time.
+///
+/// A struct rather than a bare `Option<String>` because it is the named seam
+/// a second runtime-owned job extends — the dream pass is only its first
+/// user, and what one of these fires needs to be told is not going to stay
+/// one string forever.
+#[derive(Debug, Clone, Default)]
+pub struct BuiltinFireContext {
+    /// Spliced into the framed prompt ahead of the job's instruction, so
+    /// `original_cron_prompt` still recovers the instruction as configured.
+    pub prompt_context: String,
+}
+
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
 pub enum AgentMessage {
@@ -81,6 +95,9 @@ pub enum AgentMessage {
         title: String,
         prompt: String,
         delivery: CronDelivery,
+        /// Present only for a runtime-owned job's fire — see
+        /// [`BuiltinFireContext`]. `None` for every job a user created.
+        builtin: Option<BuiltinFireContext>,
     },
     /// A one-shot cron fire finished, and its result belongs in **this**
     /// conversation (the one that scheduled the turn). Handled at a turn
@@ -455,10 +472,11 @@ impl AgentActor {
                 title,
                 prompt,
                 delivery,
+                builtin,
             } => {
                 debug!(session_id = %session_id, job_id = %job_id, ?delivery, "received cron trigger");
                 if let Err(e) = self
-                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery)
+                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery, builtin)
                     .await
                 {
                     if is_turn_cancelled(&e) {
@@ -541,8 +559,8 @@ impl AgentActor {
         // otherwise leave to run as follow-up turns. Caught after the loop fully
         // returns, so it covers every cancellation path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
-        // A recurring cron fire's silence handle for `report_nothing`; `None`
-        // for every other turn. See `dispatch_cron_prompt`.
+        // A recurring cron fire's silence handle for `report_nothing`;
+        // `None` for every other turn. See `dispatch_cron_prompt`.
         notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
@@ -627,6 +645,7 @@ impl AgentActor {
         job_id: &str,
         title: &str,
         delivery: CronDelivery,
+        builtin: Option<BuiltinFireContext>,
     ) -> anyhow::Result<()> {
         let turn_input = TurnInput::Cron {
             action_payload: serde_json::json!({
@@ -634,9 +653,10 @@ impl AgentActor {
                 "prompt": prompt,
             }),
         };
+        let prompt_context = builtin.map(|ctx| ctx.prompt_context);
         self.volatile
             .agent_loop
-            .append_cron_fire(job_id, prompt)
+            .append_cron_fire(job_id, prompt, prompt_context.as_deref())
             .await?;
         // Only a recurring fire (which owns a listed conversation) can be
         // silenced by `report_nothing`; a one-shot always reports back, so it
@@ -1652,6 +1672,7 @@ mod tests {
 
         let (tx, mut rx) = mailbox::channel::<AgentMessage>(16);
         tx.send(AgentMessage::CronTrigger {
+            builtin: None,
             job_id: "j".into(),
             title: "t".into(),
             prompt: "p".into(),

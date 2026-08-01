@@ -13,7 +13,7 @@
 //!   config/            # standalone git repo: baybo.json, .mcp.json
 //!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
-//!   personas/          # standalone git repo: USER.md (shared) + <agent>/{SOUL,IDENTITY,USER}.md + skills/
+//!   personas/          # standalone git repo: USER.md (shared) + <agent>/{SOUL,IDENTITY,USER}.md + skills/ + memory/
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), tmp/ (disposable, swept), other scratch
@@ -24,7 +24,7 @@
 //! repo on first `ensure_layout`; the workspace root itself is not
 //! git-tracked.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::prompt::*;
 
@@ -68,6 +68,17 @@ pub const SHARED_USER_FILE: &str = "USER.md";
 /// Same one-directory-per-skill shape as the shared `skills/` tree.
 pub const PERSONA_SKILLS_DIR: &str = "skills";
 
+/// One agent's long-term memory, at `<root>/personas/<id>/memory/` — one
+/// markdown file per remembered fact, indexed by [`MEMORY_INDEX_FILE`].
+/// Agent-authored: the model writes here through `Edit` / `Write` and
+/// prunes through `MemoryDelete`, and every write is audit-committed into
+/// the `personas/` repo.
+///
+/// Per agent with no shared tree, because the built-in is just another
+/// persona directory ([`BUILTIN_PERSONA_DIR`]) — the same reason its soul
+/// has no special home either.
+pub const PERSONA_MEMORY_DIR: &str = "memory";
+
 /// Deck card bundles at `<root>/deck/<uuid>/` — agent-authored plain
 /// files (docs/modules/deck.md). Installed atomically via a `.staging/`
 /// sibling inside this dir so the rename stays same-filesystem.
@@ -105,6 +116,15 @@ pub const MCP_CONFIG_FILE: &str = ".mcp.json";
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
 pub const IDENTITY_USER_FILE: &str = "USER.md";
 pub const IDENTITY_IDENTITY_FILE: &str = "IDENTITY.md";
+
+// ---------------------------------------------------------------------------
+// Files inside a memory dir (`personas/<id>/memory/`)
+// ---------------------------------------------------------------------------
+
+/// The one file in a memory dir that is not a memory: the index the
+/// system prompt carries verbatim. One line per memory file; the bodies
+/// are read on demand.
+pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 
 // ---------------------------------------------------------------------------
 // Files inside `.key/` (not version-controlled)
@@ -189,6 +209,12 @@ pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
 /// Extension of the virtual per-session transcript path inside
 /// [`SESSIONS_LOG_SUBDIR`]: `<session_id>.<SESSION_LOG_EXTENSION>`.
 pub const SESSION_LOG_EXTENSION: &str = "jsonl";
+
+/// Separates a session id from the ordinal a transcript read starts at
+/// (see [`WorkspacePaths::session_log_file_from`]). Deliberately a
+/// character [`sanitize_session_id`] rewrites, so it cannot occur inside
+/// the id half and the split is unambiguous.
+pub const SESSION_ORDINAL_SEPARATOR: char = '@';
 
 // ---------------------------------------------------------------------------
 // Cache (XDG-style, outside the workspace root)
@@ -286,6 +312,83 @@ pub fn baybo_cache_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .map(|base| base.join(CACHE_SUBDIR))
+}
+
+/// True when any component of `path` is `..`.
+///
+/// The other half of [`absolutise`]'s warning: it leaves `..` intact, and
+/// [`Path::starts_with`] is purely lexical, so a prefix test alone will
+/// happily accept `<root>/a/../../elsewhere`. Anything deciding "is this
+/// path inside that directory" needs both.
+pub fn escapes_upward(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+/// True when any component of `path` is `.git`.
+///
+/// Several of the workspace's directories *are* standalone git repos
+/// (see the layout above), so their own `.git/` sits inside the tree they
+/// version. Anything granting write access to such a tree has to exclude
+/// it: `git` reads its configuration from the repo it runs in, and options
+/// like `core.fsmonitor` or a `filter.*.clean` command run arbitrary
+/// programs on the next `git add` — which the writer itself performs when
+/// it commits.
+pub fn has_git_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+}
+
+/// What a path under `personas/` is, recognised from its shape.
+///
+/// The recognising half of [`WorkspacePaths::shared_user_file`],
+/// [`WorkspacePaths::persona_identity_file`] and
+/// [`WorkspacePaths::persona_memory_dir`]. It lives beside them on purpose:
+/// a recogniser that drifted from its constructor would keep matching a
+/// layout that no longer exists, and callers use this to decide who may
+/// write what.
+///
+/// Shape only. Whether *this* caller may write *this* path — ownership — is
+/// the caller's to decide, by matching the variant it cares about and
+/// comparing the `agent_id` it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonaPath<'a> {
+    /// `personas/USER.md` — the human profile every agent shares.
+    SharedUser,
+    /// `personas/<agent_id>/{SOUL,IDENTITY,USER}.md`. Which of the three
+    /// is deliberately not carried: every caller so far asks only whose the
+    /// file is, and a field nobody reads is a field nobody maintains.
+    Identity { agent_id: &'a str },
+    /// A file under `personas/<agent_id>/memory/`.
+    Memory { agent_id: &'a str },
+    /// Anything else: a skills overlay, a directory, a stray file, or a
+    /// path this crate cannot read as UTF-8.
+    Other,
+}
+
+/// Classify a path already known to be under `personas/`, given relative to
+/// it. Non-UTF-8 components read as [`PersonaPath::Other`] rather than
+/// being lossily coerced — two different byte sequences must never collapse
+/// onto one recognised name.
+pub fn classify_persona_path(relative: &Path) -> PersonaPath<'_> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component.as_os_str().to_str() {
+            Some(part) => parts.push(part),
+            None => return PersonaPath::Other,
+        }
+    }
+    match parts.as_slice() {
+        [SHARED_USER_FILE] => PersonaPath::SharedUser,
+        [agent_id, name] if IdentityKind::all().iter().any(|k| k.file_name() == *name) => {
+            PersonaPath::Identity { agent_id }
+        }
+        // `<agent_id>/memory/<something>` — a bare `<agent_id>/memory` is
+        // the directory itself, not a file in it.
+        [agent_id, dir, _rest @ ..] if *dir == PERSONA_MEMORY_DIR && parts.len() >= 3 => {
+            PersonaPath::Memory { agent_id }
+        }
+        _ => PersonaPath::Other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +521,18 @@ impl WorkspacePaths {
         self.persona_dir(agent_id).join(PERSONA_SKILLS_DIR)
     }
 
+    /// One agent's private memory tree:
+    /// `<root>/personas/<agent_id>/memory/`.
+    pub fn persona_memory_dir(&self, agent_id: &str) -> PathBuf {
+        self.persona_dir(agent_id).join(PERSONA_MEMORY_DIR)
+    }
+
+    /// Index of one agent's memory:
+    /// `<root>/personas/<agent_id>/memory/MEMORY.md`.
+    pub fn persona_memory_index_file(&self, agent_id: &str) -> PathBuf {
+        self.persona_memory_dir(agent_id).join(MEMORY_INDEX_FILE)
+    }
+
     pub fn key_dir(&self) -> PathBuf {
         self.root.join(KEY_DIR)
     }
@@ -505,6 +620,29 @@ impl WorkspacePaths {
         ))
     }
 
+    /// Virtual transcript path that starts at a message rather than at the
+    /// beginning: `<root>/logs/sessions/<sanitized_session_id>@<ordinal>.jsonl`.
+    ///
+    /// The suffix is what keeps a recurring pass over a long-lived
+    /// conversation from re-reading — and re-paying for — everything it
+    /// already consolidated. Reading from ordinal 0 is what
+    /// [`Self::session_log_file`] already spells, so that case composes the
+    /// plain path instead of a redundant `@0`.
+    ///
+    /// [`SESSION_ORDINAL_SEPARATOR`] cannot collide with the id: it is not
+    /// one of the characters [`sanitize_session_id`] keeps, so a sanitized
+    /// id never contains it.
+    pub fn session_log_file_from(&self, session_id: &str, from_ordinal: i64) -> PathBuf {
+        if from_ordinal <= 0 {
+            return self.session_log_file(session_id);
+        }
+        self.sessions_log_dir().join(format!(
+            "{}{SESSION_ORDINAL_SEPARATOR}{from_ordinal}.{}",
+            sanitize_session_id(session_id),
+            SESSION_LOG_EXTENSION
+        ))
+    }
+
     // -- work/ contents --
 
     /// Workspace-scoped uv state parent: `<root>/work/.uv/`.
@@ -570,6 +708,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_transcript_path_can_name_where_to_start_reading() {
+        let p = WorkspacePaths::new("/var/baybo");
+        assert_eq!(
+            p.session_log_file_from("sess-a", 312),
+            PathBuf::from("/var/baybo/logs/sessions/sess-a@312.jsonl")
+        );
+        // Reading from the beginning is what the plain path already means;
+        // an `@0` would be a second spelling of it, and the reader's
+        // round-trip check would then have two right answers.
+        assert_eq!(
+            p.session_log_file_from("sess-a", 0),
+            p.session_log_file("sess-a")
+        );
+        assert_eq!(
+            p.session_log_file_from("sess-a", -1),
+            p.session_log_file("sess-a")
+        );
+        // The separator survives no id, because it survives no id: the
+        // sanitiser keeps only alphanumerics and `_-.`, so the split is
+        // always at the ordinal.
+        assert!(!sanitize_session_id("a@b").contains(SESSION_ORDINAL_SEPARATOR));
+    }
+
+    #[test]
     fn workspace_paths_compose_under_root() {
         let p = WorkspacePaths::new("/var/baybo");
         assert_eq!(p.config_dir(), PathBuf::from("/var/baybo/config"));
@@ -612,6 +774,14 @@ mod tests {
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/baybo/skills"));
         assert_eq!(p.agents_dir(), PathBuf::from("/var/baybo/agents"));
+        assert_eq!(
+            p.persona_memory_dir("agt_1"),
+            PathBuf::from("/var/baybo/personas/agt_1/memory"),
+        );
+        assert_eq!(
+            p.persona_memory_index_file("agt_1"),
+            PathBuf::from("/var/baybo/personas/agt_1/memory/MEMORY.md"),
+        );
         assert_eq!(p.uv_state_dir(), PathBuf::from("/var/baybo/work/.uv"));
         assert_eq!(p.uv_cache_dir(), PathBuf::from("/var/baybo/work/.uv/cache"));
         assert_eq!(
@@ -636,6 +806,64 @@ mod tests {
             PathBuf::from("/var/baybo/work/.baybo-tool-spills"),
         );
         assert_eq!(p.work_tmp_dir(), PathBuf::from("/var/baybo/work/tmp"));
+    }
+
+    #[test]
+    fn persona_paths_are_recognised_as_their_constructors_build_them() {
+        let p = WorkspacePaths::new("/w");
+        let personas = p.personas_dir();
+        let rel = |full: PathBuf| {
+            full.strip_prefix(&personas)
+                .expect("under personas")
+                .to_path_buf()
+        };
+
+        assert_eq!(
+            classify_persona_path(&rel(p.shared_user_file())),
+            PersonaPath::SharedUser
+        );
+        for kind in IdentityKind::all() {
+            assert_eq!(
+                classify_persona_path(&rel(p.persona_identity_file("agt_1", kind))),
+                PersonaPath::Identity { agent_id: "agt_1" },
+                "{kind:?}",
+            );
+        }
+        assert_eq!(
+            classify_persona_path(&rel(p.persona_memory_index_file("agt_1"))),
+            PersonaPath::Memory { agent_id: "agt_1" }
+        );
+
+        // The tree root is a directory, not a file in it; a skills overlay
+        // is neither identity nor memory.
+        assert_eq!(
+            classify_persona_path(&rel(p.persona_memory_dir("agt_1"))),
+            PersonaPath::Other
+        );
+        assert_eq!(
+            classify_persona_path(&rel(p.persona_skills_dir("agt_1").join("deploy/SKILL.md"))),
+            PersonaPath::Other
+        );
+        // A decoy named like an identity file, one level too deep.
+        assert_eq!(
+            classify_persona_path(Path::new("agt_1/skills/SOUL.md")),
+            PersonaPath::Other
+        );
+    }
+
+    #[test]
+    fn path_guards_catch_what_a_prefix_test_cannot() {
+        assert!(escapes_upward(Path::new(
+            "/w/personas/agt/memory/../SOUL.md"
+        )));
+        assert!(!escapes_upward(Path::new("/w/personas/agt/memory/note.md")));
+        assert!(has_git_component(Path::new("/w/personas/.git/config")));
+        assert!(has_git_component(Path::new(
+            "/w/personas/agt/memory/.git/HEAD"
+        )));
+        assert!(!has_git_component(Path::new(
+            "/w/personas/agt/memory/gitlog.md"
+        )));
     }
 
     #[test]

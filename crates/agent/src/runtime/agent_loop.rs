@@ -2110,9 +2110,15 @@ impl AgentLoop {
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
-    pub async fn append_cron_fire(&mut self, turn_id: &str, prompt: &str) -> anyhow::Result<()> {
+    pub async fn append_cron_fire(
+        &mut self,
+        turn_id: &str,
+        prompt: &str,
+        context: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
-        let framed = baybo_context::prompts::cron::frame_cron_prompt(turn_id, prompt);
+        let framed =
+            baybo_context::prompts::cron::frame_cron_prompt_with_context(turn_id, prompt, context);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
         self.context_manager.append(&msg).await;
         Ok(())

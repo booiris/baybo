@@ -133,6 +133,20 @@ impl AgentProfileId {
     pub fn skills_overlay_dir(&self, paths: &WorkspacePaths) -> Option<PathBuf> {
         (!self.is_builtin()).then(|| paths.persona_skills_dir(&self.0))
     }
+
+    /// This agent's memory tree. Unlike the skill overlay there is no
+    /// shared-vs-private question to answer — memory is partitioned per
+    /// agent by construction, with no shared tree for one agent's writes to
+    /// land in — so this needs no special case for the built-in either.
+    pub fn memory_dir(&self, paths: &WorkspacePaths) -> PathBuf {
+        paths.persona_memory_dir(&self.0)
+    }
+
+    /// The index of this agent's memory — the one memory file the system
+    /// prompt carries verbatim.
+    pub fn memory_index_file(&self, paths: &WorkspacePaths) -> PathBuf {
+        paths.persona_memory_index_file(&self.0)
+    }
 }
 
 impl fmt::Display for AgentProfileId {

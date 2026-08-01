@@ -290,6 +290,11 @@ pub struct ContextManager {
     /// existence does not gate them either — see
     /// [`Self::resolve_persona_sources`].
     agent: Option<AgentProfileId>,
+    /// Whether the built-in memory tree is injected into the system prompt
+    /// (`memory.builtin.enabled`). Read at every seed and reseed, but the
+    /// value itself is fixed for the process — memory config is not
+    /// hot-reloadable.
+    builtin_memory: bool,
     /// Transcript length at which a compaction last came back with no
     /// savings, so the next threshold check can short-circuit instead of
     /// spending another full-transcript LLM call on the same input.
@@ -362,6 +367,9 @@ pub struct ContextManagerConfig {
     /// and the skill scope, so a session cannot end up running one agent's
     /// soul with another's skills. `None` ⇒ unbound.
     pub agent: Option<AgentProfileId>,
+    /// `memory.builtin.enabled`: whether this session's system prompt carries
+    /// the `<memory>` index and the rules for maintaining it.
+    pub builtin_memory: bool,
 }
 
 /// The two per-agent identity files a session assembles from, resolved to a
@@ -373,6 +381,10 @@ struct PersonaSources {
     self_image_seed: String,
     user_notes_path: PathBuf,
     user_notes_seed: String,
+    /// This agent's `MEMORY.md`, or `None` when file memory is disabled.
+    /// Resolved from the same binding as the identity files, so a session
+    /// can never read one agent's soul with another's memory.
+    memory_index: Option<PathBuf>,
 }
 
 impl ContextManager {
@@ -398,6 +410,7 @@ impl ContextManager {
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
             agent: config.agent,
+            builtin_memory: config.builtin_memory,
             compaction_declined_at_len: None,
             task_reminder: None,
             task_reminder_raw: 0,
@@ -535,6 +548,7 @@ impl ContextManager {
             IdentitySource::new(&sources.soul_path, &sources.soul_seed),
             IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
             IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
+            sources.memory_index.as_deref(),
         )
         .await
         {
@@ -586,6 +600,9 @@ impl ContextManager {
             self_image_seed: seed(IdentityKind::Identity),
             user_notes_path: path(IdentityKind::User),
             user_notes_seed: seed(IdentityKind::User),
+            memory_index: self
+                .builtin_memory
+                .then(|| agent.memory_index_file(&self.workspace)),
         }
     }
 
@@ -2252,6 +2269,7 @@ mod tests {
             session_id: test_session_id(),
             sessions,
             subagent_profile: None,
+            builtin_memory: false,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -2279,6 +2297,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            builtin_memory: false,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -2618,6 +2637,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            builtin_memory: false,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -2685,6 +2705,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
+            builtin_memory: false,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -2722,6 +2743,7 @@ mod tests {
     ) -> ContextManager {
         ContextManager::from_config(ContextManagerConfig {
             agent: Some(agent),
+            builtin_memory: false,
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: Arc::clone(workspace),
             keep_recent: 2,
@@ -2901,6 +2923,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            builtin_memory: false,
         })
         .resolve_system_prompt()
         .await;
@@ -3606,6 +3629,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            builtin_memory: false,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

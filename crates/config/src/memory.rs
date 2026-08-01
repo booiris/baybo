@@ -23,6 +23,63 @@ pub enum MemoryProvider {
     OpenViking,
 }
 
+/// Default dream schedule: twice a week, 04:00 in the job's own timezone.
+///
+/// Named days, not numbers: the pinned `cron` crate rejects a day-of-week
+/// `0` and counts Sunday as `1`, so every numeric form of "Sunday and
+/// Wednesday" is either a parse error or the wrong pair of days.
+pub const DEFAULT_DREAM_SCHEDULE: &str = "0 4 * * SUN,WED";
+
+/// The memory that ships with the assistant: a tree per agent at
+/// `<workspace>/personas/<id>/memory/`, and the scheduled dream pass that
+/// tends it.
+///
+/// Independent of the pluggable [`MemoryProvider`] above, and named for the
+/// real distinction between them — both are stores of remembered things;
+/// only this one is built in rather than an integration to configure. A
+/// deployment can run both, either, or neither. **On by default.**
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BuiltinMemoryConfig {
+    /// Whether the memory index is injected into the system prompt and the
+    /// dream job runs. **Default: `true`.** Turning it off leaves every
+    /// memory file on disk untouched — it only stops reading and writing
+    /// them.
+    pub enabled: bool,
+
+    /// The scheduled consolidation pass.
+    pub dream: DreamConfig,
+}
+
+impl Default for BuiltinMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dream: DreamConfig::default(),
+        }
+    }
+}
+
+/// Scheduling of the dream pass — the recurring job that consolidates
+/// memory and rebalances it against the profile identity files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DreamConfig {
+    /// Cron expression for the built-in dream job, in the job's timezone.
+    /// Applied to the seeded job at boot; an operator who reschedules the
+    /// job from the UI is not overridden (see the cron store's builtin
+    /// seed).
+    pub schedule: String,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            schedule: DEFAULT_DREAM_SCHEDULE.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct MemoryConfig {
@@ -54,6 +111,14 @@ pub struct MemoryConfig {
     /// opaque to the core, which only passes it through. **Default: `null`.**
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub extra: serde_json::Value,
+
+    /// The memory that ships with the assistant, plus its dream pass.
+    /// Orthogonal to every field above: [`enabled`] and [`provider`] govern
+    /// the pluggable backend only.
+    ///
+    /// [`enabled`]: Self::enabled
+    /// [`provider`]: Self::provider
+    pub builtin: BuiltinMemoryConfig,
 }
 
 #[cfg(test)]
@@ -70,6 +135,49 @@ mod tests {
         assert_eq!(c.provider, MemoryProvider::Noop);
         assert!(c.llm.is_none());
         assert!(c.extra.is_null());
+    }
+
+    #[test]
+    fn builtin_memory_defaults_on() {
+        let c = MemoryConfig::default();
+        assert!(
+            c.builtin.enabled,
+            "the built-in memory tree is part of the assistant, not an opt-in integration"
+        );
+        assert_eq!(c.builtin.dream.schedule, DEFAULT_DREAM_SCHEDULE);
+    }
+
+    #[test]
+    fn builtin_memory_survives_an_absent_section() {
+        // A config written before this feature existed must not silently
+        // switch it off.
+        let c: MemoryConfig = serde_json::from_str(r#"{"enabled":true,"provider":"mem0"}"#)
+            .expect("legacy config parses");
+        assert!(c.builtin.enabled);
+        assert_eq!(c.builtin.dream.schedule, DEFAULT_DREAM_SCHEDULE);
+    }
+
+    #[test]
+    fn builtin_memory_can_be_switched_off_without_touching_the_backend() {
+        let c: MemoryConfig =
+            serde_json::from_str(r#"{"builtin":{"enabled":false}}"#).expect("parse");
+        assert!(!c.builtin.enabled);
+        // Partial sections keep their sibling defaults.
+        assert_eq!(c.builtin.dream.schedule, DEFAULT_DREAM_SCHEDULE);
+        // …and the pluggable backend is unaffected.
+        assert_eq!(c.provider, MemoryProvider::Noop);
+    }
+
+    #[test]
+    fn dream_schedule_is_overridable() {
+        let c: MemoryConfig =
+            serde_json::from_str(r#"{"builtin":{"dream":{"schedule":"0 5 * * MON"}}}"#)
+                .expect("parse");
+        assert_eq!(c.builtin.dream.schedule, "0 5 * * MON");
+        assert!(
+            c.builtin.enabled,
+            "an override must not disable the feature"
+        );
     }
 
     #[test]
@@ -93,6 +201,7 @@ mod tests {
             provider: MemoryProvider::Mem0,
             llm: Some(LlmEntryName::from("cheap-model")),
             extra: serde_json::json!({ "max_entries": 5000, "namespace": "team-a" }),
+            builtin: BuiltinMemoryConfig::default(),
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: MemoryConfig = serde_json::from_str(&json).unwrap();

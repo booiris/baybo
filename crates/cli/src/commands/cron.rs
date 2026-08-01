@@ -31,6 +31,7 @@ fn job_summary(j: &CronJob) -> Value {
         "timezone": j.timezone,
         "next_trigger_at": j.format_time_opt(j.next_trigger_at),
         "last_triggered_at": j.format_time_opt(j.last_triggered_at),
+        "builtin": j.builtin,
     })
 }
 
@@ -101,9 +102,15 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     }
 
     let human = format!(
-        "id:                {}\ntitle:             {}\nuser:              {}\nchannel:           {:?}\nstatus:            {}\nschedule:          {}\ntimezone:          {}\none_shot:          {}\nnext_trigger:      {}\nlast_triggered:    {}\norigin_session:    {}\ncreated:           {}\nupdated:           {}\nprompt:            {}",
+        "id:                {}\ntitle:             {}\nowned_by:          {}\nuser:              {}\nchannel:           {:?}\nstatus:            {}\nschedule:          {}\ntimezone:          {}\none_shot:          {}\nnext_trigger:      {}\nlast_triggered:    {}\norigin_session:    {}\ncreated:           {}\nupdated:           {}\nprompt:            {}",
         job.id,
         job.display_title(),
+        if job.builtin {
+            "baybo (built in: pausable and reschedulable, but its name, instruction \
+             and existence are the runtime's)"
+        } else {
+            "you"
+        },
         job.user_id,
         job.channel,
         job.status.as_str(),
