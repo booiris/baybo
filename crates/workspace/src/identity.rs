@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+/// Author on the commits Baybo makes into `personas/`. Matches the `Edit`
+/// tool's audit author, so `git log` reads as one voice.
+const GIT_AUTHOR_NAME: &str = "Baybo";
+const GIT_AUTHOR_EMAIL: &str = "baybo@local";
+
 pub use crate::paths::IdentityKind;
 use crate::paths::WorkspacePaths;
 
@@ -141,6 +146,10 @@ pub async fn load_identity_files(
 /// survive every later call. Run at profile creation and again defensively
 /// when an actor for a bound session is built, which is what covers rows
 /// created before this existed and files an operator deleted.
+///
+/// Finishes by committing the directory into the `personas/` repo, so the
+/// agent's own later edits show up as diffs against a real baseline rather
+/// than as file additions.
 pub async fn ensure_persona_layout(
     paths: &WorkspacePaths,
     agent_id: &str,
@@ -165,12 +174,117 @@ pub async fn ensure_persona_layout(
             .await
             .map_err(|e| anyhow::anyhow!("seed persona {}: {e}", path.display()))?;
     }
+    commit_personas(paths, agent_id, &format!("personas: baseline {agent_id}")).await;
     Ok(())
+}
+
+/// Commit whatever is untracked or modified under `personas/<pathspec>`, so
+/// those files have a baseline in git before an agent starts rewriting them.
+///
+/// Without this a persona's files stay untracked until the agent's first
+/// `Edit`, and that commit then reads as an *addition* — so the one thing the
+/// audit trail exists for, seeing what the agent changed, is unavailable for
+/// exactly the first change it makes. Idempotent: with nothing staged it
+/// commits nothing.
+///
+/// Best-effort. A workspace without `git`, or a `personas/` that is not a
+/// repo, must not stop an agent from being created — the files are already on
+/// disk and correct; only their history is missing.
+pub(crate) async fn commit_personas(paths: &WorkspacePaths, pathspec: &str, subject: &str) {
+    let repo = paths.personas_dir();
+    if !repo.join(".git").exists() {
+        return;
+    }
+    let git = |args: Vec<String>| {
+        let repo = repo.clone();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|out| out.status.success())
+        }
+    };
+    if git(vec!["add".into(), "--".into(), pathspec.to_owned()])
+        .await
+        .is_none()
+    {
+        return;
+    }
+    // An empty commit would be noise on every materialisation — and
+    // materialisation runs defensively on every bound spawn.
+    if git(vec!["diff".into(), "--cached".into(), "--quiet".into()])
+        .await
+        .is_some()
+    {
+        return;
+    }
+    let _ = git(vec![
+        "-c".into(),
+        format!("user.name={GIT_AUTHOR_NAME}"),
+        "-c".into(),
+        format!("user.email={GIT_AUTHOR_EMAIL}"),
+        "commit".into(),
+        "--no-verify".into(),
+        "--quiet".into(),
+        "-m".into(),
+        subject.to_owned(),
+        "--".into(),
+        pathspec.to_owned(),
+    ])
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A persona must have a baseline in git the moment it exists —
+    /// otherwise the agent's first rewrite of its own soul lands as a file
+    /// addition, and the audit trail cannot show what changed.
+    #[tokio::test]
+    async fn materialising_a_persona_commits_a_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+        let personas = paths.personas_dir();
+        tokio::fs::create_dir_all(&personas).await.unwrap();
+        let git = async |args: Vec<&str>| {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&personas)
+                .args(args)
+                .output()
+                .await
+                .unwrap()
+        };
+        git(vec!["init", "--quiet", "-b", "main"]).await;
+
+        ensure_persona_layout(&paths, "01JAGENT", "SEED")
+            .await
+            .unwrap();
+
+        let status = git(vec!["status", "--porcelain"]).await;
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "nothing may be left untracked: {}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+        let log = git(vec!["log", "--format=%an <%ae>%n%s", "--name-only"]).await;
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("Baybo <baybo@local>"), "{log}");
+        assert!(log.contains("personas: baseline 01JAGENT"), "{log}");
+        assert!(log.contains("01JAGENT/SOUL.md"), "{log}");
+
+        // Idempotent: a second materialisation has nothing to say.
+        ensure_persona_layout(&paths, "01JAGENT", "SEED")
+            .await
+            .unwrap();
+        let count = git(vec!["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    }
 
     /// Load the workspace's own three sections — i.e. what the built-in
     /// agent reads, all three coming from `personas/baybo/`.

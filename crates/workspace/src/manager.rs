@@ -72,6 +72,7 @@ impl WorkspaceManager {
                 paths.shared_user_file(),
                 IdentityKind::User.default_content(),
             )]);
+        let mut seeded_any = false;
         for (target, default) in targets {
             let exists = tokio::fs::try_exists(&target)
                 .await
@@ -87,15 +88,21 @@ impl WorkspaceManager {
             tokio::fs::write(&target, default).await.map_err(|e| {
                 anyhow::anyhow!("seed default identity file {}: {e}", target.display())
             })?;
+            seeded_any = true;
+        }
+        if seeded_any {
+            // Same reason the per-agent materialisation commits: a file that
+            // enters git only when the agent first rewrites it makes that
+            // first rewrite unreadable.
+            identity::commit_personas(&paths, ".", "personas: seed defaults").await;
         }
         Ok(())
     }
 
-    /// Loads all identity files from the workspace `profile/` directory.
-    /// Any missing file is atomically seeded with its default template
-    /// (see [`identity::load_identity_files`]), so the returned
-    /// [`IdentityFiles`] is always fully populated. The `profile/` dir
-    /// itself is created on demand if absent.
+    /// Loads the built-in agent's identity files. Any missing one is
+    /// atomically seeded with its default template (see
+    /// [`identity::load_identity_files`]), so the returned [`IdentityFiles`]
+    /// is always fully populated; its directory is created on demand.
     pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
         let paths = WorkspacePaths::new(self.root.clone());
         let (soul, identity, user) = identity::builtin_identity_paths(&paths);

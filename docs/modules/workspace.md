@@ -105,6 +105,15 @@ The stable facts the operator curates live in `personas/USER.md`, which every
 agent reads as a separate `<shared_user_profile>` section alongside its own
 `<user_notes>`.
 
+**`personas/` is committed as it is written.** `ensure_persona_layout` ends by
+committing the directory it just materialised, and `seed_default_identity_files`
+does the same for the shipped defaults — both as `Baybo <baybo@local>`, both
+no-ops when there is nothing staged. Without that, files entered git only when
+the `Edit` tool first rewrote one, so the agent's *first* change to its own
+soul landed as a file addition: the one thing the audit history exists to show
+was the one thing it could not. Best-effort — a workspace without `git` still
+gets correct files, just no history.
+
 The built-in profile has no `personas/` directory at all — its pair *is*
 `profile/{SOUL,IDENTITY}.md`, so an unbound session and a built-in-bound one
 assemble byte-identical prompts. `load_identity_files` therefore takes an

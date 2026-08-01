@@ -27,7 +27,9 @@
 //!   author, so the user can later see what the agent rewrote and revert
 //!   with `git`.
 //!   `--no-verify` is intentional: it is Baybo-managed audit history, not a
-//!   hand-curated repo where pre-commit hooks would be authored. A
+//!   hand-curated repo where pre-commit hooks would be authored. The
+//!   directory is committed when it is materialised, so this commit is a
+//!   diff against a real baseline rather than a file addition. A
 //!   commit failure (detached HEAD, missing git, etc.) leaves the file
 //!   write in place and surfaces a warning in the tool output.
 //!
