@@ -34,6 +34,15 @@ content-addressed on-device cache used by downloads (`blob_helper.rs`), the outg
 `Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored image
 attachments render via `blob_download_bytes` into that cache.
 
+The same cache-first core serve also backs transcript HTML previews:
+`baybo-html` fenced text carries a capability blob id, and the iOS custom-scheme
+handler serves at most 16 MiB from `/html-preview/<id>` directly into an
+opaque-origin, CSP-network-blocked iframe. Unlike attachment thumbnails, the
+bytes do not cross the Swift→JavaScript bridge as base64. The owner-only
+`html-gen` skill stages the source through the content-generic `PutBlob` tool,
+then places the returned `blob_id` in this fenced marker without creating an
+attachment.
+
 The shape in one line: a **dedicated relay leg per blob transfer** (separate TCP + Noise +
 pump from chat), metered against the **same** per-tenant bandwidth budget as chat but as a
 **background class** that leaves chat a reserved headroom — so a 100 MiB transfer never

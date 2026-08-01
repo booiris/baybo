@@ -8,18 +8,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use baybo_model::{BlobRef, ContentBlock, TrustLevel};
 use baybo_store::BlobStore;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_util::io::ReaderStream;
 
-use super::paths::require_absolute;
+use super::blob_upload::{LocalBlobFile, MAX_LOCAL_BLOB_BYTES, guess_mime};
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 
 const TOOL_NAME: &str = "AttachFile";
-const MAX_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
 const MAX_MIB: u64 = MAX_BYTES / 1024 / 1024;
 
 const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
@@ -112,32 +110,8 @@ impl Tool for AttachFileTool {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        require_absolute(&p.path, TOOL_NAME, "path")?;
-
-        if baybo_security::is_sensitive_path(&p.path) {
-            tracing::warn!(path = %p.path.display(), "{TOOL_NAME} refused sensitive path");
-            return Err(ToolError::Execution(format!(
-                "refused to attach sensitive path {} — credential-bearing files are blocked by security policy",
-                p.path.display()
-            )));
-        }
-
-        let meta = tokio::fs::metadata(&p.path)
-            .await
-            .map_err(|e| ToolError::Execution(format!("stat {}: {e}", p.path.display())))?;
-        if !meta.is_file() {
-            return Err(ToolError::Execution(format!(
-                "{} is not a regular file",
-                p.path.display()
-            )));
-        }
-        let size = meta.len();
-        if size > MAX_BYTES {
-            return Err(ToolError::Execution(format!(
-                "{} is {size} bytes, exceeds the {MAX_BYTES}-byte cap",
-                p.path.display()
-            )));
-        }
+        let source = LocalBlobFile::inspect(&p.path, TOOL_NAME, "attach", MAX_BYTES).await?;
+        let size = source.size();
 
         let filename = p.filename.unwrap_or_else(|| {
             p.path
@@ -151,16 +125,9 @@ impl Tool for AttachFileTool {
         let page_count = probe_pdf_page_count(&p.path, &mime, size).await;
         let dimensions = probe_image_dimensions(&p.path, &mime, size).await;
 
-        let file = tokio::fs::File::open(&p.path)
-            .await
-            .map_err(|e| ToolError::Execution(format!("open {}: {e}", p.path.display())))?;
-        let stream = ReaderStream::new(file).boxed();
-
-        let blob_ref = self
-            .blob_store
-            .put_stream(stream, &mime, None, MAX_BYTES)
-            .await
-            .map_err(|e| ToolError::Execution(format!("blob upload: {e}")))?;
+        let blob_ref = source
+            .put(self.blob_store.as_ref(), &mime, MAX_BYTES)
+            .await?;
 
         // The agent loop hoists these attachments onto the turn's final
         // assistant message, so the file persists with the transcript and
@@ -378,41 +345,6 @@ pub fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {
         channels: Vec::new(),
     };
     (Arc::new(attach), manifest)
-}
-
-fn guess_mime(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("pdf") => "application/pdf",
-        Some("zip") => "application/zip",
-        Some("tar") => "application/x-tar",
-        Some("gz" | "tgz") => "application/gzip",
-        Some("json") => "application/json",
-        Some("yaml" | "yml") => "application/yaml",
-        Some("xml") => "application/xml",
-        Some("txt" | "log" | "md") => "text/plain",
-        Some("html" | "htm") => "text/html",
-        Some("css") => "text/css",
-        Some("csv") => "text/csv",
-        Some("js" | "mjs") => "application/javascript",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        Some("mp3") => "audio/mpeg",
-        Some("ogg" | "opus") => "audio/ogg",
-        Some("wav") => "audio/wav",
-        Some("m4a") => "audio/mp4",
-        Some("flac") => "audio/flac",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mov") => "video/quicktime",
-        _ => "application/octet-stream",
-    }
 }
 
 #[cfg(test)]

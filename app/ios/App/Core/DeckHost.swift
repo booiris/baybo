@@ -20,7 +20,7 @@ final class DeckHost {
         let config = WKWebViewConfiguration()
         config.userContentController.add(bridge, name: DeckBridge.messageHandlerName)
         config.setURLSchemeHandler(
-            TranscriptSchemeHandler(blobRouteEnabled: true),
+            TranscriptSchemeHandler(dynamicRoute: .deckBlob),
             forURLScheme: TranscriptSchemeHandler.scheme)
 
         let webView = WKWebView(frame: .zero, configuration: config)

@@ -279,11 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_register_attach_file() {
+    fn defaults_register_blob_delivery_tools() {
         let registry = default_registry();
 
         assert!(registry.get("AttachFile").is_some());
         assert!(registry.get_manifest("AttachFile").is_some());
+        assert!(registry.get("PutBlob").is_some());
+        assert!(registry.get_manifest("PutBlob").is_some());
     }
 
     #[test]
@@ -307,7 +309,14 @@ mod tests {
                 "{name} should be concurrent"
             );
         }
-        for name in ["Write", "Edit", "Bash", "AttachFile", "SecretAdd"] {
+        for name in [
+            "Write",
+            "Edit",
+            "Bash",
+            "AttachFile",
+            "PutBlob",
+            "SecretAdd",
+        ] {
             assert_eq!(
                 registry.concurrency(name),
                 ToolConcurrency::Exclusive,
@@ -342,16 +351,18 @@ mod tests {
             &baybo_model::TriggerSource::User,
         ));
         assert!(owner.contains(&"OwnerOnly".to_string()));
+        assert!(owner.contains(&"PutBlob".to_string()));
 
         let telegram = names(registry.tool_definitions_for_session(
             &baybo_model::ChannelType::telegram(),
             &baybo_model::TriggerSource::User,
         ));
         assert!(!telegram.contains(&"OwnerOnly".to_string()));
+        assert!(!telegram.contains(&"PutBlob".to_string()));
         // Unrestricted tools are unaffected, and the two lists differ by
-        // exactly the restricted entry.
+        // exactly the two restricted entries.
         assert!(telegram.contains(&"AttachFile".to_string()));
-        assert_eq!(owner.len(), telegram.len() + 1);
+        assert_eq!(owner.len(), telegram.len() + 2);
         // The unfiltered listing still carries everything.
         assert_eq!(registry.tool_definitions().len(), owner.len());
     }

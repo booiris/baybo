@@ -388,10 +388,10 @@ pub enum ApprovalDecision {
     Deny,
 }
 
-/// Outcome of [`crate::BayboClient::blob_bytes_for_display`] — the deck scheme
-/// handler maps each case to a `WKURLSchemeTask` response. Collapses the shape
-/// check, the cache-first read, the leg-bound download, and the display-cap
-/// decisions into one call so Swift stays a thin WebKit adapter.
+/// Outcome of [`crate::BayboClient::blob_bytes_for_display`] — the iOS scheme
+/// handler maps each case to a `WKURLSchemeTask` response for deck imagery or
+/// an HTML preview. Collapses the shape check, cache-first read, leg-bound
+/// download, and display-cap decisions into one call so Swift stays thin.
 #[derive(Debug, uniffi::Enum)]
 pub enum BlobServeOutcome {
     /// The blob's bytes, within the display cap.

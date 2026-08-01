@@ -5,6 +5,7 @@ import WebKit
 final class TranscriptHost {
     let bridge: TranscriptBridge
     let webView: WKWebView
+    private let navigationPolicy = TranscriptNavigationPolicy()
 
     init(store: ChatStore) {
         let bridge = TranscriptBridge(store: store)
@@ -14,9 +15,11 @@ final class TranscriptHost {
         config.userContentController.add(bridge, name: TranscriptBridge.messageHandlerName)
         // Vite module scripts fail CORS from a file origin.
         config.setURLSchemeHandler(
-            TranscriptSchemeHandler(), forURLScheme: TranscriptSchemeHandler.scheme)
+            TranscriptSchemeHandler(dynamicRoute: .htmlPreview),
+            forURLScheme: TranscriptSchemeHandler.scheme)
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = navigationPolicy
         webView.isOpaque = false
         webView.backgroundColor = .white
         webView.scrollView.backgroundColor = .white
@@ -38,5 +41,21 @@ final class TranscriptHost {
         webView.configuration.userContentController
             .removeScriptMessageHandler(forName: TranscriptBridge.messageHandlerName)
         webView.removeFromSuperview()
+    }
+}
+
+@MainActor
+private final class TranscriptNavigationPolicy: NSObject, WKNavigationDelegate {
+    func webView(
+        _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction
+    ) async -> WKNavigationActionPolicy {
+        guard let url = navigationAction.request.url,
+            let targetFrame = navigationAction.targetFrame,
+            TranscriptSchemeHandler.permitsNavigation(
+                to: url, isMainFrame: targetFrame.isMainFrame)
+        else {
+            return .cancel
+        }
+        return .allow
     }
 }

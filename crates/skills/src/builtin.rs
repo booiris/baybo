@@ -19,6 +19,7 @@ use crate::loader::parse_skill_md;
 
 const BAYBO_CLI_SKILL_MD: &str = include_str!("builtin/baybo-cli/SKILL.md");
 const DECK_SKILL_MD: &str = include_str!("builtin/deck/SKILL.md");
+const HTML_GEN_SKILL_MD: &str = include_str!("builtin/html-gen/SKILL.md");
 
 /// Template token in built-in SKILL.md bodies that gets substituted
 /// with the absolute path of the running `baybo` binary at register
@@ -32,7 +33,11 @@ const BAYBO_BIN_TOKEN: &str = "{{BAYBO_BIN}}";
 /// [`crate::SkillRegistry::register`] is keyed by `name`.
 pub(crate) fn all() -> Vec<SkillDefinition> {
     let bin = resolve_baybo_bin();
-    let raw = [("baybo-cli", BAYBO_CLI_SKILL_MD), ("deck", DECK_SKILL_MD)];
+    let raw = [
+        ("baybo-cli", BAYBO_CLI_SKILL_MD),
+        ("deck", DECK_SKILL_MD),
+        ("html-gen", HTML_GEN_SKILL_MD),
+    ];
     raw.into_iter()
         .filter_map(|(name, md)| parse(name, md, &bin))
         .collect()
@@ -128,5 +133,20 @@ mod tests {
     fn sh_quote_escapes_internal_single_quotes() {
         assert_eq!(sh_quote("/a/b"), "'/a/b'");
         assert_eq!(sh_quote("/a's/b"), "'/a'\\''s/b'");
+    }
+
+    #[test]
+    fn html_gen_metadata_is_visible_only_on_owner() {
+        let skill = all()
+            .into_iter()
+            .find(|skill| skill.name == "html-gen")
+            .expect("html-gen builtin parses");
+        let summary = crate::SkillSummary::from(&skill);
+
+        assert!(skill.agent_invocable);
+        assert_eq!(skill.command.as_deref(), Some("html-gen"));
+        assert!(skill.allowed_tools.contains(&"PutBlob".to_string()));
+        assert!(summary.allows_channel(&baybo_model::ChannelType::owner()));
+        assert!(!summary.allows_channel(&baybo_model::ChannelType::telegram()));
     }
 }

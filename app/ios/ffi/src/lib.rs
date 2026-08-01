@@ -953,10 +953,10 @@ impl BayboClient {
         .await
     }
 
-    /// One-shot deck-display serve (`baybo-transcript://…/blob/<id>`): validate
-    /// the id shape, then return cache-first bytes under `max_bytes`. Collapses
-    /// the scheme handler's shape check + cache stat + cache read + leg-bound
-    /// download + display-cap decisions into a single call so
+    /// One-shot iOS display serve (deck imagery or a transcript HTML preview):
+    /// validate the id shape, then return cache-first bytes under `max_bytes`.
+    /// Collapses the scheme handler's shape check + cache stat + cache read +
+    /// leg-bound download + display-cap decisions into a single call so
     /// `TranscriptSchemeHandler` stays a thin WebKit adapter. An over-cap CACHED
     /// blob is refused by its stat (never read); an over-cap DOWNLOADED blob is
     /// materialized once, then refused. Never throws — every terminal state is a
@@ -1012,8 +1012,8 @@ impl BayboClient {
     }
 
     /// Read a cached blob's bytes with NO network and NO active-binding check.
-    /// The deck display path's fast path (`baybo-transcript://…/blob/<id>`): a
-    /// cached card image renders even while the device is unbound/offline,
+    /// The iOS display routes' fast path: cached deck imagery and HTML previews
+    /// render even while the device is unbound/offline,
     /// where [`Self::blob_download_bytes`] would fail on the missing leg. `None`
     /// when the id is malformed or not cached — the caller then falls back to a
     /// full download.

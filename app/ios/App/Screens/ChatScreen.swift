@@ -51,25 +51,30 @@ struct ChatScreen: View {
                 .opacity(bridge.contentVisible ? 1 : 0)
                 .animation(.easeOut(duration: 0.15), value: bridge.contentVisible)
 
-            ChatHeaderView(
-                store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
-                indexOpen: $messageIndexOpen
-            ) {
-                dismiss()
-            }
+            Group {
+                ChatHeaderView(
+                    store: store, bridge: bridge, catalog: .shared, menuOpen: $modelMenuOpen,
+                    indexOpen: $messageIndexOpen
+                ) {
+                    dismiss()
+                }
 
-            if modelMenuOpen {
-                ModelMenuPanel(store: store, catalog: .shared, isPresented: $modelMenuOpen)
-                    .zIndex(2)
-            }
+                if modelMenuOpen {
+                    ModelMenuPanel(store: store, catalog: .shared, isPresented: $modelMenuOpen)
+                        .zIndex(2)
+                }
 
-            // Only the attach panel's SCRIM lands here — the panel itself rides
-            // with the dock (below), which is the one layer that can stack above
-            // the dock's own content. `AttachMenuScrim` explains the split.
-            if attach.isOpen {
-                AttachMenuScrim(isPresented: $attach.isOpen)
-                    .zIndex(2)
+                // Only the attach panel's SCRIM lands here — the panel itself rides
+                // with the dock (below), which is the one layer that can stack above
+                // the dock's own content. `AttachMenuScrim` explains the split.
+                if attach.isOpen {
+                    AttachMenuScrim(isPresented: $attach.isOpen)
+                        .zIndex(2)
+                }
             }
+            .opacity(bridge.htmlPreviewMaximized ? 0 : 1)
+            .allowsHitTesting(!bridge.htmlPreviewMaximized)
+            .accessibilityHidden(bridge.htmlPreviewMaximized)
         }
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
@@ -125,6 +130,12 @@ struct ChatScreen: View {
             // Inside this, so the panel travels with the dock the jump disc
             // pushes up rather than stepping to the new position on its own.
             .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
+            .opacity(bridge.htmlPreviewMaximized ? 0 : 1)
+            .allowsHitTesting(!bridge.htmlPreviewMaximized)
+            .accessibilityHidden(bridge.htmlPreviewMaximized)
+            // Keep ComposerView mounted: its unsent text is local @State.
+            .frame(height: bridge.htmlPreviewMaximized ? 0 : nil)
+            .clipped()
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
@@ -164,6 +175,12 @@ struct ChatScreen: View {
         .onChange(of: attach.isOpen) { _, open in
             guard open, modelMenuOpen else { return }
             withAnimation(.easeOut(duration: 0.15)) { modelMenuOpen = false }
+        }
+        .onChange(of: bridge.htmlPreviewMaximized) { _, maximized in
+            guard maximized else { return }
+            modelMenuOpen = false
+            attach.isOpen = false
+            messageIndexOpen = false
         }
         .onAppear {
             host.bridge.retarget(to: store)

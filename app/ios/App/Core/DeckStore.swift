@@ -903,9 +903,9 @@ private final class ScopedFile {
 /// deliberately not named `DeckSinkImpl`, which UniFFI generates). Hops each
 /// callback to the main actor and forwards to the app's `DeckStore`.
 final class DeckEventsRelay: DeckSink {
-    private let store: @MainActor () -> DeckStore?
+    private let store: @MainActor @Sendable () -> DeckStore?
 
-    init(store: @escaping @MainActor () -> DeckStore?) {
+    init(store: @escaping @MainActor @Sendable () -> DeckStore?) {
         self.store = store
     }
 

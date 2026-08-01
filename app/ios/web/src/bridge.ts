@@ -4,6 +4,7 @@
 // dev browser (no window.webkit) outbound posts degrade to console.log stubs.
 
 import type { OutlineEntry, PersistedState, WireAttachment } from "./types";
+import { HTML_PREVIEW_COLLAPSE_EVENT } from "./htmlPreviewProtocol";
 
 export type InitPayload = {
   language: string;
@@ -96,6 +97,8 @@ type BayboGlobal = {
   /// (offscreen buffer overflow re-attach; any native-side "go sync" edge).
   /// The web side answers by posting `{type:"sync"}` back with the cursor.
   requestSync(): void;
+  /// Collapse an inline HTML preview before the transcript is detached.
+  collapseHtmlPreview(): void;
   /// Native invokes this just before it detaches the bridge (back-out) so the
   /// debounced transcript mirror is written up to that instant — otherwise
   /// steps delivered live since the last debounce sit in neither the mirror nor
@@ -254,6 +257,13 @@ export function postOutlineHere(rowId: string | null): void {
 /// side. Fire-and-forget; native dedups.
 export function postRunState(running: boolean): void {
   postSafe({ type: "runState", running });
+}
+
+/// An iframe expanded over the transcript needs native chrome out of its way.
+/// Only the trusted main frame can reach the native handler; the sandboxed
+/// preview subframe is rejected by TranscriptBridge's main-frame gate.
+export function postHtmlPreviewMaximized(maximized: boolean): void {
+  postSafe({ type: "htmlPreviewMaximized", maximized });
 }
 
 /// Markdown links must not navigate the transcript webview away — native opens
@@ -630,6 +640,7 @@ window.baybo = {
     outlinePosted = false;
     connEpoch = payload.connEpoch;
     initPayload = payload;
+    window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
     onInitCb?.(payload);
   },
   pushFrame(frameJson) {
@@ -681,6 +692,9 @@ window.baybo = {
   },
   requestSync() {
     dispatch({ kind: "syncRequested" });
+  },
+  collapseHtmlPreview() {
+    window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
   },
   flushPersist() {
     flushPersist();

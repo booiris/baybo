@@ -178,14 +178,14 @@ concurrent dials.
 `init` / `pushFrame` / `setConnEpoch` / `userSent` / `sendFailed` / `blobResult` /
 `fileState` / `audioState` / `videoPoster` / `setLanguage` / `setBottomInset` /
 `jumpToLatest` / `jumpToMessage` / `outlineLoadOlder` / `requestOutlineHere` /
-`requestSync` / `flushPersist`.
+`requestSync` / `collapseHtmlPreview` / `flushPersist`.
 
 **web→native:**
 `ready` / `shown` / `sync` / `mark_read` / `persist` / `fetchHistory` / `requestBlob` /
 `queryFileState` / `downloadFile` / `previewFile` / `shareFile` / `viewImage` /
 `audioToggle` / `audioSeek` / `queryAudioState` / `playVideo` / `requestVideoPoster` /
 `retry` / `openUrl` / `copy` / `log` / `jumpVisible` / `runState` / `outline` /
-`outlineHere`.
+`outlineHere` / `htmlPreviewMaximized`.
 
 (The blob/file/audio/video messages are covered in [attachments.md](attachments.md).)
 
@@ -299,6 +299,52 @@ a mirror written before this existed simply have none.
 
 Markdown links post `openUrl` to native (system browser) — an in-webview navigation would
 replace the thread.
+
+### Agent-authored HTML previews
+
+An assistant opts into a live preview with one fenced marker whose body is a blob
+capability id, never the HTML source:
+
+````markdown
+```baybo-html
+sha256:<64-lower-hex-digest>.<lower-hex-read-token>
+```
+````
+
+The owner-only built-in `html-gen` skill authors a self-contained page and calls
+the owner-only, content-generic `PutBlob` tool with `mime_type: "text/html"` and
+a 16 MiB caller cap. The tool returns structured metadata; the skill takes its
+`blob_id` and writes this marker into the final reply. `PutBlob` returns no
+attachment, so `AttachFile` keeps its normal send-file semantics and no duplicate
+file card is added. Ordinary `html` fences remain ordinary source code.
+
+`HtmlPreview` renders the marker as a 420pt inline iframe from
+`baybo-transcript://localhost/html-preview/<blob-id>`. The scheme handler reads
+the blob cache-first (no base64 bridge copy), fixes the response MIME to
+`text/html`, and supplies the CSP:
+
+```
+default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';
+img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none';
+base-uri 'none'; form-action 'none'
+```
+
+The iframe is `sandbox="allow-scripts"` with no `allow-same-origin`, so it has
+an opaque origin: no storage/cookies, parent DOM, or same-origin access.
+`TranscriptBridge` also rejects every non-main-frame script message because
+WKWebView exposes native handlers inside subframes; the preview cannot bypass
+the sandbox by calling `window.webkit.messageHandlers.baybo`. The response is
+not stored in WebKit's cache and its Permissions Policy disables device-facing
+APIs. Finally, `TranscriptNavigationPolicy` permits only the transcript index
+in the main frame and `/html-preview/` in a subframe, so page code cannot
+replace its frame with an external URL to escape the no-network CSP.
+
+The toolbar reloads and expands the SAME iframe. Fullscreen is CSS-fixed rather
+than reparented (no page reload or JS-state loss), while
+`htmlPreviewMaximized` hides the native header/composer; the trusted parent
+toolbar owns the close button. Detach/session-switch sends
+`collapseHtmlPreview`, so a reopened chat never gets stranded behind an old
+fullscreen preview.
 
 ### LaTeX math
 
