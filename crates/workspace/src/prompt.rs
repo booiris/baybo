@@ -89,6 +89,30 @@ self-image live beside it in `IDENTITY.md`; the workspace `profile/USER.md`
 *(Anything this agent must never touch, or must always confirm first.)*
 "#;
 
+/// Seed body for a newly-created agent's `personas/<id>/USER.md`.
+///
+/// Deliberately *not* [`DEFAULT_USER_CONTENT`]: the shared `profile/USER.md`
+/// holds the stable facts the operator curates, and every agent reads that
+/// too. This file is what one agent has worked out for itself, so its
+/// template asks for that rather than re-asking for a name and a timezone
+/// somebody already filled in.
+pub const PERSONA_USER_TEMPLATE: &str = r#"# What I've Learned About Them
+
+*Your own notes, not shared with the other agents. The workspace
+`profile/USER.md` already covers who they are — this is for what working with
+them has taught you: how they like this kind of work done, what they have
+already told you not to do, what context recurs.*
+
+## Working With Them
+
+*(Preferences that showed up in practice. Update as you go.)*
+
+## Context
+
+*(Projects, constraints, people and systems that keep coming up in your work
+together.)*
+"#;
+
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?
 
 *Fill this in during your first conversation. Make it yours.*

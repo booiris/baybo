@@ -6,11 +6,11 @@
 //!
 //! - `<workspace>/profile/{SOUL,USER,IDENTITY}.md` — the shared
 //!   three-slot store, and the built-in agent's own persona.
-//! - `<workspace>/personas/<agent_id>/{SOUL,IDENTITY}.md` — one custom
-//!   agent's personality and self-image. Not `USER.md`: the human is
-//!   shared, so that slot only exists under `profile/`. And only directly
-//!   under the agent's own directory — a persona's `skills/` tree is skill
-//!   content, not identity.
+//! - `<workspace>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` — one custom
+//!   agent's personality, self-image and own notes about the human. Only
+//!   directly under the agent's own directory: a persona's `skills/` tree is
+//!   skill content, not identity, and **another** agent's directory is not
+//!   reachable at all.
 //!
 //! The guards:
 //!
@@ -42,6 +42,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use baybo_model::AgentProfileId;
 use baybo_workspace::{IdentityKind, WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -107,6 +108,11 @@ impl EditTool {
     /// The grandparent check is what keeps a persona's `skills/` tree out:
     /// `personas/<id>/skills/x/SOUL.md` is skill content that happens to be
     /// named like a soul, and must not inherit the identity treatment.
+    /// Shape only — *some* agent's identity file. Ownership ("is it this
+    /// agent's?") is checked in [`check_persona_identity_target`] at execute
+    /// time, because the approval declaration has no call context to check
+    /// it against. A cross-agent edit therefore skips the gate and is then
+    /// refused outright, which writes nothing.
     fn is_persona_identity(&self, file_path: &Path) -> bool {
         if !file_path.starts_with(&self.personas_dir) {
             return false;
@@ -133,7 +139,11 @@ impl EditTool {
     /// Resolve an identity edit to the repo that audits it, rejecting a path
     /// inside one of the two stores that is not an allowed file.
     /// `None` when the path is in neither store.
-    fn identity_target(&self, file_path: &Path) -> crate::Result<Option<IdentityTarget>> {
+    fn identity_target(
+        &self,
+        file_path: &Path,
+        agent: &AgentProfileId,
+    ) -> crate::Result<Option<IdentityTarget>> {
         if file_path.starts_with(&self.profile_dir) {
             let name = check_profile_target(file_path)?;
             return Ok(Some(IdentityTarget {
@@ -143,7 +153,7 @@ impl EditTool {
             }));
         }
         if file_path.starts_with(&self.personas_dir) {
-            let rel_path = check_persona_identity_target(file_path, &self.personas_dir)?;
+            let rel_path = check_persona_identity_target(file_path, &self.personas_dir, agent)?;
             return Ok(Some(IdentityTarget {
                 repo: self.personas_dir.clone(),
                 rel_path,
@@ -246,7 +256,7 @@ impl Tool for EditTool {
             ));
         }
 
-        let identity_target = self.identity_target(Path::new(&p.file_path))?;
+        let identity_target = self.identity_target(Path::new(&p.file_path), &ctx.agent_id)?;
 
         // Read-before-write contract: the file must have been read in this
         // session and be unchanged since. `stat` it for the current
@@ -338,16 +348,24 @@ fn check_profile_target(path: &Path) -> crate::Result<&'static str> {
     Ok(canonical)
 }
 
-/// The identity files an agent owns. `USER.md` is absent on purpose: it
-/// describes the human, of whom there is one however many agents exist, so
-/// it lives only in the shared `profile/`.
-const PERSONA_IDENTITY_KINDS: [IdentityKind; 2] = [IdentityKind::Soul, IdentityKind::Identity];
+/// The identity files an agent owns — all three, `USER.md` included: those
+/// are its own notes about the human, distinct from the shared
+/// `profile/USER.md` every agent reads.
+const PERSONA_IDENTITY_KINDS: [IdentityKind; 3] = [
+    IdentityKind::Soul,
+    IdentityKind::Identity,
+    IdentityKind::User,
+];
 
 /// Resolve a `personas/`-relative edit to `<agent_id>/{SOUL,IDENTITY}.md`,
 /// or reject with `InvalidParams`. A persona directory holds those two
 /// identity files; its `skills/` tree is skill content and is not editable
 /// through this path.
-fn check_persona_identity_target(path: &Path, personas_dir: &Path) -> crate::Result<String> {
+fn check_persona_identity_target(
+    path: &Path,
+    personas_dir: &Path,
+    agent: &AgentProfileId,
+) -> crate::Result<String> {
     let rel = path.strip_prefix(personas_dir).map_err(|_| {
         ToolError::InvalidParams(format!("{} is not under personas/", path.display()))
     })?;
@@ -358,12 +376,14 @@ fn check_persona_identity_target(path: &Path, personas_dir: &Path) -> crate::Res
     // Exactly `<agent_id>/<FILE>.md` — a longer path is either the persona's
     // `skills/` tree or a `..` walk, and neither is an identity file.
     let allowed = components.len() == 2
+        && components[0] == agent.as_str()
         && PERSONA_IDENTITY_KINDS
             .iter()
             .any(|k| k.file_name() == components[1]);
     if !allowed {
         return Err(ToolError::InvalidParams(format!(
-            "edits under personas/ are restricted to <agent_id>/{{SOUL,IDENTITY}}.md; got {}",
+            "edits under personas/ are restricted to this agent's own \
+             {{SOUL,IDENTITY,USER}}.md; got {}",
             rel.display()
         )));
     }
@@ -820,7 +840,7 @@ mod tests {
         tokio::fs::create_dir_all(paths.persona_skills_dir(agent_id))
             .await
             .unwrap();
-        for kind in [IdentityKind::Soul, IdentityKind::Identity] {
+        for kind in IdentityKind::all() {
             tokio::fs::write(
                 paths.persona_identity_file(agent_id, kind),
                 "## seed\nalpha\n",
@@ -856,7 +876,10 @@ mod tests {
         );
         assert!(matches!(declared[0], ResourceAccess::ReadFile { .. }));
 
-        let ctx = ctx_with_paths(paths.clone());
+        let ctx = ToolContext {
+            agent_id: AgentProfileId::parse(agent).unwrap(),
+            ..ctx_with_paths(paths.clone())
+        };
         let out = tool_with(paths.clone())
             .execute(
                 json!({
@@ -895,57 +918,75 @@ mod tests {
         );
     }
 
-    /// An agent's self-image is its own file too, so it gets the same
-    /// treatment as its soul — and `USER.md` is deliberately not part of the
-    /// set, because the human is shared.
+    /// All three of an agent's identity files get the same treatment — and
+    /// `USER.md` is in the set because those are *this* agent's notes about
+    /// the human, not the shared profile.
     #[tokio::test]
-    async fn a_personas_identity_file_is_editable_but_a_persona_user_file_is_not() {
-        let agent = "01JAGENT";
-        let (_tmp, paths) = make_persona_workspace(agent).await;
-        let target = paths.persona_identity_file(agent, IdentityKind::Identity);
+    async fn every_persona_identity_file_is_editable_by_its_own_agent() {
+        let agent_id = "01JAGENT";
+        let (_tmp, paths) = make_persona_workspace(agent_id).await;
+        let agent = AgentProfileId::parse(agent_id).unwrap();
+        let ctx = ToolContext {
+            agent_id: agent.clone(),
+            ..ctx_with_paths(paths.clone())
+        };
 
-        let declared = tool_with(paths.clone()).accessed_resources(&json!({ "file_path": target }));
-        assert_eq!(
-            declared.len(),
-            1,
-            "persona IDENTITY.md must bypass the write gate"
-        );
+        for kind in [IdentityKind::Identity, IdentityKind::User] {
+            let target = paths.persona_identity_file(agent_id, kind);
+            let declared =
+                tool_with(paths.clone()).accessed_resources(&json!({ "file_path": target }));
+            assert_eq!(declared.len(), 1, "{kind:?} must bypass the write gate");
 
-        let ctx = ctx_with_paths(paths.clone());
-        let out = tool_with(paths.clone())
+            let out = tool_with(paths.clone())
+                .execute(
+                    json!({
+                        "file_path": target,
+                        "old_string": "alpha",
+                        "new_string": format!("{kind:?}-rewritten"),
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let ToolOutput::Text(text) = out else {
+                panic!("expected text output")
+            };
+            assert!(text.contains("committed to personas/"), "{text}");
+        }
+    }
+
+    /// One agent must not reach into another's persona. The approval
+    /// declaration is shape-based (it has no call context), so the guard that
+    /// matters is the refusal here — nothing is written.
+    #[tokio::test]
+    async fn one_agent_cannot_edit_anothers_identity_files() {
+        let victim_id = "01JVICTIM";
+        let (_tmp, paths) = make_persona_workspace(victim_id).await;
+        let target = paths.persona_identity_file(victim_id, IdentityKind::Soul);
+        let ctx = ToolContext {
+            agent_id: AgentProfileId::parse("01JATTACKER").unwrap(),
+            ..ctx_with_paths(paths.clone())
+        };
+
+        let err = tool_with(paths.clone())
             .execute(
                 json!({
                     "file_path": target,
                     "old_string": "alpha",
-                    "new_string": "Aster",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let ToolOutput::Text(text) = out else {
-            panic!("expected text output")
-        };
-        assert!(text.contains("committed to personas/"), "{text}");
-
-        // USER.md describes the human, not the agent: there is no per-agent
-        // copy, so an edit that invents one is refused.
-        let stray = paths.persona_identity_file(agent, IdentityKind::User);
-        tokio::fs::write(&stray, "alpha\n").await.unwrap();
-        let err = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": stray,
-                    "old_string": "alpha",
-                    "new_string": "bravo",
+                    "new_string": "hijacked",
                 }),
                 &ctx,
             )
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL,IDENTITY")),
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("this agent's own")),
             "got: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "## seed\nalpha\n",
+            "the other agent's file must be untouched"
         );
     }
 

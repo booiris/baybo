@@ -11,11 +11,15 @@ use crate::paths::WorkspacePaths;
 pub struct IdentityFiles {
     /// SOUL.md - personality, tone, and preferences.
     pub soul: String,
-    /// USER.md - long-term user profile.
-    pub user: String,
     /// IDENTITY.md - the agent's self-image: name, creature, vibe, emoji,
-    /// avatar. Per-agent, like the soul.
+    /// avatar.
     pub identity: String,
+    /// This agent's own USER.md - what it has worked out about the human.
+    pub user: String,
+    /// The shared `profile/USER.md` every agent reads: the stable facts the
+    /// operator curates. `None` when it *is* [`Self::user`] — the built-in's
+    /// own notes are the shared profile, so there is nothing to add.
+    pub shared_user: Option<String>,
 }
 
 /// Read `path`; if it is missing, seed it with `default` and return
@@ -153,13 +157,14 @@ fn strip_emphasis(fragment: &str) -> &str {
         .trim()
 }
 
-/// The two per-agent sections as the *workspace* holds them: the built-in
+/// The per-agent sections as the *workspace* holds them: the built-in
 /// agent's own files under `profile/`, each seeded from its shipped
 /// template. Returned as paths because [`IdentitySource`] borrows them.
-pub fn workspace_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf) {
+pub fn workspace_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf, PathBuf) {
     (
         paths.identity_file(IdentityKind::Soul),
         paths.identity_file(IdentityKind::Identity),
+        paths.identity_file(IdentityKind::User),
     )
 }
 
@@ -169,11 +174,11 @@ pub async fn load_identity(source: IdentitySource<'_>) -> anyhow::Result<String>
     read_or_seed(source.path, source.seed).await
 }
 
-/// Load the three identity sections. `SOUL.md` (personality) and
-/// `IDENTITY.md` (self-image: name, creature, vibe, emoji, avatar) are read
-/// from the caller-supplied sources, because both belong to the agent.
-/// `USER.md` always comes from `<root>/profile/` — it describes the human,
-/// and there is one of those however many agents exist.
+/// Load the identity sections. All three per-agent files come from the
+/// caller-supplied sources; the shared `profile/USER.md` is read here, and
+/// returned only when it is a different file from the agent's own — the
+/// built-in's notes *are* the shared profile, and emitting it twice would
+/// just spend tokens saying the same thing.
 ///
 /// Auto-seeding here means a deleted identity file is recreated on the
 /// next session boot. That matches what we want for runtime correctness
@@ -184,26 +189,33 @@ pub async fn load_identity_files(
     root: &Path,
     soul: IdentitySource<'_>,
     identity: IdentitySource<'_>,
+    user: IdentitySource<'_>,
 ) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
-    let user_path = paths.identity_file(IdentityKind::User);
-    let (soul, user, identity) = tokio::try_join!(
+    let shared_user_path = paths.identity_file(IdentityKind::User);
+    let (soul, identity, own_user) = tokio::try_join!(
         read_or_seed(soul.path, soul.seed),
-        read_or_seed(&user_path, IdentityKind::User.default_content()),
         read_or_seed(identity.path, identity.seed),
+        read_or_seed(user.path, user.seed),
     )?;
+    let shared_user = if user.path == shared_user_path {
+        None
+    } else {
+        Some(read_or_seed(&shared_user_path, IdentityKind::User.default_content()).await?)
+    };
 
     Ok(IdentityFiles {
         soul,
-        user,
         identity,
+        user: own_user,
+        shared_user,
     })
 }
 
 /// Materialize one agent's persona directory: create
-/// `personas/<agent_id>/skills/`, then write `SOUL.md` and `IDENTITY.md`
-/// **only if absent**, each staged through a sibling `.tmp` file and
-/// renamed.
+/// `personas/<agent_id>/skills/`, then write `SOUL.md`, `IDENTITY.md` and
+/// `USER.md` **only if absent**, each staged through a sibling `.tmp` file
+/// and renamed.
 ///
 /// Idempotent and never destructive — files the agent has since rewritten
 /// survive every later call. Run at profile creation and again defensively
@@ -298,11 +310,12 @@ mod tests {
     /// agent reads, both per-agent files coming from `profile/`.
     async fn load_workspace(dir: &Path) -> IdentityFiles {
         let paths = WorkspacePaths::new(dir.to_path_buf());
-        let (soul, identity) = workspace_identity_paths(&paths);
+        let (soul, identity, user) = workspace_identity_paths(&paths);
         load_identity_files(
             dir,
             IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
             IdentitySource::new(&identity, IdentityKind::Identity.default_content()),
+            IdentitySource::new(&user, IdentityKind::User.default_content()),
         )
         .await
         .unwrap()

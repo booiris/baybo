@@ -40,10 +40,10 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
 - **Selection**: the agent is chosen when the session is created and is
   **immutable** for that session's life. Web chat gets the picker; channels and
   TUI keep creating builtin sessions.
-- **Soul + self-image**: each agent owns its own `SOUL.md` (personality) and
-  `IDENTITY.md` (name, creature, vibe, emoji, avatar). Only `USER.md` (who the
-  human is) stays workspace-shared — there is one person however many agents
-  exist.
+- **Persona**: each agent owns all three identity files —  `SOUL.md`
+  (personality), `IDENTITY.md` (name, creature, vibe, emoji, avatar) and
+  `USER.md` (its **own** notes about the human). The stable facts the operator
+  curates stay in the shared `profile/USER.md`, which every agent also reads.
 - **Skills**: a custom agent starts with **only its own overlay** — it does not
   inherit the shared set (builtins + `<workspace>/skills/`), which belongs to
   the built-in. Granting a skill to a persona is a decision, made by putting it
@@ -146,6 +146,7 @@ for them** and custom agents partition under their ULID — rename-proof.
     01J.../                      # one dir per non-builtin agent, named by profile id
       SOUL.md                    # this agent's personality and tone
       IDENTITY.md                # this agent's self-image: name, vibe, emoji, avatar
+      USER.md                    # what THIS agent has worked out about the human
       skills/
         deploy/SKILL.md          # private overlay; wins over a same-named shared skill
 ```
@@ -218,15 +219,23 @@ exactly one consumer: `ensure_persona_layout`'s seed for an agent whose
 `SOUL.md` does not exist yet. So a prompt an owner typed into the v1 editor
 becomes that agent's first soul, once, and nothing writes the column again.
 
-## Soul + self-image swap; the user profile stays shared
+## Every identity file is the agent's; the shared profile rides alongside
 
-The assembled system prompt keeps its current shape — `TOP_HINT`, `<soul>`,
-`<identity>`, `<user_profile>`, `BACKGROUND_TASKS_HINT`, `TAIL_HINT` — and what
-an agent changes is **which files the `<soul>` and `<identity>` sections
-read**. Both answer "who is this assistant"; `<user_profile>` answers "who is
-the human", so it is the one section that cannot belong to an agent. The
-`path=` attribute carries each file's absolute path, so an agent's self-edit
-loop rewrites its own persona and nobody else's.
+The assembled prompt is `TOP_HINT`, `<soul>`, `<identity>`, then the user
+sections, `BACKGROUND_TASKS_HINT`, `TAIL_HINT`. All three identity files are
+read from the agent's own directory. `USER.md` is per-agent too, and that is
+the one worth justifying: it is the file agents actually maintain (on one
+five-week-old workspace: 98 self-edits to `USER.md`, 1 to `IDENTITY.md`, 0 to
+`SOUL.md`), so leaving it shared would have made it a write channel between
+agents that the memory partition explicitly does not allow.
+
+The operator's stable facts stay in `profile/USER.md` and every agent reads
+them as `<shared_user_profile>`. The built-in's own notes *are* that file, so
+it emits one user section rather than two — an unbound session and a
+built-in-bound one still assemble byte-identical prompts. The `path=`
+attribute carries each file's absolute path, so an agent's self-edit rewrites
+its own persona and nobody else's — and the `Edit` tool now enforces that: a
+persona file belonging to a *different* agent is refused outright.
 
 ```rust
 // baybo-workspace::identity

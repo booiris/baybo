@@ -371,6 +371,8 @@ struct PersonaSources {
     soul_seed: String,
     self_image_path: PathBuf,
     self_image_seed: String,
+    user_notes_path: PathBuf,
+    user_notes_seed: String,
 }
 
 impl ContextManager {
@@ -532,6 +534,7 @@ impl ContextManager {
             &self.workspace,
             IdentitySource::new(&sources.soul_path, &sources.soul_seed),
             IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
+            IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
         )
         .await
         {
@@ -547,6 +550,7 @@ impl ContextManager {
                     error = %e,
                     soul = %sources.soul_path.display(),
                     identity = %sources.self_image_path.display(),
+                    user_notes = %sources.user_notes_path.display(),
                     "failed to assemble the session's persona; falling back to the minimal prompt",
                 );
                 None
@@ -569,11 +573,20 @@ impl ContextManager {
             Some(agent) => agent.identity_file(&self.workspace, kind),
             None => self.workspace.identity_file(kind),
         };
+        // A custom agent's own notes seed from the persona template; the
+        // built-in's `USER.md` *is* the shared profile, so it keeps the
+        // shipped one.
+        let user_notes_seed = match &self.agent {
+            Some(agent) if !agent.is_builtin() => baybo_workspace::prompt::PERSONA_USER_TEMPLATE,
+            _ => IdentityKind::User.default_content(),
+        };
         PersonaSources {
             soul_path: path(IdentityKind::Soul),
             soul_seed: baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE.to_string(),
             self_image_path: path(IdentityKind::Identity),
             self_image_seed: IdentityKind::Identity.default_content().to_string(),
+            user_notes_path: path(IdentityKind::User),
+            user_notes_seed: user_notes_seed.to_string(),
         }
     }
 
@@ -2746,8 +2759,9 @@ mod tests {
             !prompt.contains("WORKSPACE_SOUL_SHOULD_NOT_APPEAR"),
             "{prompt}"
         );
-        // The agent's self-image is its own file too; only the user profile
-        // is shared, because there is one human however many agents exist.
+        // Every identity file is the agent's own, including its notes about
+        // the human — and the shared profile rides alongside as its own
+        // section rather than replacing them.
         assert!(
             prompt.contains(
                 &workspace
@@ -2757,6 +2771,19 @@ mod tests {
             ),
             "the identity section must name the agent's own file: {prompt}"
         );
+        for kind in [IdentityKind::Identity, IdentityKind::User] {
+            assert!(
+                prompt.contains(
+                    &workspace
+                        .persona_identity_file(agent.as_str(), kind)
+                        .display()
+                        .to_string()
+                ),
+                "{kind:?} must name the agent's own file: {prompt}"
+            );
+        }
+        // …and the shared profile is still there, as its own section.
+        assert!(prompt.contains("<shared_user_profile "), "{prompt}");
         assert!(
             prompt.contains(
                 &workspace
@@ -2764,7 +2791,7 @@ mod tests {
                     .display()
                     .to_string()
             ),
-            "the user profile stays shared: {prompt}"
+            "{prompt}"
         );
         // And the path in the tag is the agent's own file, so its self-edit
         // rewrites its persona and nobody else's.
@@ -2855,6 +2882,9 @@ mod tests {
         let bound = bound_ctx(&workspace, AgentProfileId::builtin())
             .resolve_system_prompt()
             .await;
+        // The built-in's own notes *are* the shared profile, so it gets one
+        // user section, not two.
+        assert!(!bound.contains("<shared_user_profile "), "{bound}");
         let unbound = ContextManager::from_config(ContextManagerConfig {
             agent: None,
             tokenizer: Arc::new(SimpleTokenizer),

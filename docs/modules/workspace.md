@@ -45,6 +45,8 @@ checkout rather than polluting the real user home.
 | skills           | `<workspace.path>/skills/`                 |
 | agent soul       | `<workspace.path>/personas/<agent_id>/SOUL.md` |
 | agent self-image | `<workspace.path>/personas/<agent_id>/IDENTITY.md` |
+| agent's user notes | `<workspace.path>/personas/<agent_id>/USER.md` |
+| shared user profile | `<workspace.path>/profile/USER.md` (read by every agent) |
 | agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
@@ -90,12 +92,19 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - **USER.md**: long-term user profile
 - **IDENTITY.md**: system or instance identity description
 
-**SOUL.md and IDENTITY.md are per-agent; USER.md is shared.** Both of the
-first two answer "who is this assistant" — personality, and self-image
-(name, creature, vibe, emoji, avatar) — so a chat session bound to a custom
-agent reads them from `personas/<agent_id>/`. `USER.md` answers "who is the
-human", and there is one of those however many agents exist, so it always
-comes from `profile/`.
+**All three identity files are per-agent.** `SOUL.md` (personality) and
+`IDENTITY.md` (self-image: name, creature, vibe, emoji, avatar) answer "who is
+this assistant". `USER.md` is the agent's **own notes** about the human — what
+working with them taught *it* — and it is per-agent for the same reason memory
+is partitioned: one agent's accumulated read on the user is not another's, and
+sharing the file would be a write channel between agents that the partition
+does not cover. Empirically it is also the only one agents actually maintain.
+
+The stable facts the operator curates stay in the **shared** `profile/USER.md`,
+which every agent reads as a separate `<shared_user_profile>` section. The
+built-in's own notes *are* that file, so it sees one user section rather than
+two — an unbound session and a built-in-bound one still assemble byte-identical
+prompts.
 
 The built-in profile has no `personas/` directory at all — its pair *is*
 `profile/{SOUL,IDENTITY}.md`, so an unbound session and a built-in-bound one

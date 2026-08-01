@@ -112,15 +112,18 @@ impl AgentProfileId {
 
     /// Where this agent reads one identity file from.
     ///
-    /// `SOUL.md` (personality) and `IDENTITY.md` (self-image: name, creature,
-    /// vibe, emoji, avatar) belong to the agent, so a custom agent reads them
-    /// from its own persona directory. `USER.md` describes the human and is
-    /// always the shared one — there is one person however many agents exist.
+    /// All three belong to the agent, including `USER.md`: what an agent has
+    /// worked out about the human is its own accumulated notes, and sharing
+    /// them would be a write channel between agents that the memory partition
+    /// does not cover. The *shared* profile — the stable facts the operator
+    /// curates — stays at `profile/USER.md` and every agent reads it too; see
+    /// `baybo_context::prompts::soul`.
     ///
     /// The built-in resolves everything to `profile/`, so an unbound session
-    /// and a session bound to the built-in take byte-identical paths.
+    /// and a session bound to the built-in take byte-identical paths, and its
+    /// own notes *are* the shared profile.
     pub fn identity_file(&self, paths: &WorkspacePaths, kind: IdentityKind) -> PathBuf {
-        if self.is_builtin() || matches!(kind, IdentityKind::User) {
+        if self.is_builtin() {
             paths.identity_file(kind)
         } else {
             paths.persona_identity_file(&self.0, kind)
@@ -296,22 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_agent_owns_its_soul_and_self_image_but_shares_the_user() {
+    fn a_custom_agent_owns_all_three_identity_files() {
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
         let custom = AgentProfileId::parse("01JCUSTOM").unwrap();
 
-        for kind in [IdentityKind::Soul, IdentityKind::Identity] {
+        // Including USER.md: those are this agent's own notes about the
+        // human. The shared profile every agent also reads is a separate
+        // section, assembled from `profile/USER.md`.
+        for kind in IdentityKind::all() {
             assert_eq!(
                 custom.identity_file(&paths, kind),
                 paths.persona_identity_file("01JCUSTOM", kind),
                 "{kind:?} belongs to the agent"
             );
         }
-        // One human however many agents exist.
-        assert_eq!(
-            custom.identity_file(&paths, IdentityKind::User),
-            paths.identity_file(IdentityKind::User),
-        );
         assert_eq!(
             custom.skills_overlay_dir(&paths),
             Some(paths.persona_skills_dir("01JCUSTOM"))

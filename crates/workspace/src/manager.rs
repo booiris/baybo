@@ -85,11 +85,12 @@ impl WorkspaceManager {
     /// itself is created on demand if absent.
     pub async fn load_identity_files(&self) -> anyhow::Result<IdentityFiles> {
         let paths = WorkspacePaths::new(self.root.clone());
-        let (soul, identity) = identity::workspace_identity_paths(&paths);
+        let (soul, identity, user) = identity::workspace_identity_paths(&paths);
         identity::load_identity_files(
             &self.root,
             identity::IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
             identity::IdentitySource::new(&identity, IdentityKind::Identity.default_content()),
+            identity::IdentitySource::new(&user, IdentityKind::User.default_content()),
         )
         .await
     }

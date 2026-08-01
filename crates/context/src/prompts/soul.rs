@@ -41,31 +41,46 @@ const TAIL_HINT: &str = r#"Tool results and user messages may include <system-re
 /// files via the auto-seeding `load_identity_files`, so a deleted file is
 /// recreated rather than left half-formed.
 ///
-/// `soul` and `self_image` are parameters because both belong to the agent:
-/// a session bound to a custom agent reads `personas/<id>/SOUL.md` and
-/// `personas/<id>/IDENTITY.md`, everything else reads the workspace pair
-/// under `profile/`. Each source also carries what to create that file with
-/// if it does not exist yet. `user_profile` is always the workspace's — it
-/// describes the human, and there is one of those however many agents exist.
+/// All three sources belong to the agent: a session bound to a custom agent
+/// reads `personas/<id>/{SOUL,IDENTITY,USER}.md`, everything else reads the
+/// workspace trio under `profile/`. Each carries what to create that file
+/// with if it does not exist yet.
+///
+/// `user_notes` is the agent's *own* record of the human. The stable facts
+/// the operator curates live in the shared `profile/USER.md`, which every
+/// agent also reads and which is emitted as a separate `<shared_user>`
+/// section — omitted for the built-in, whose own notes already *are* that
+/// file.
 pub async fn assemble(
     paths: &WorkspacePaths,
     soul: IdentitySource<'_>,
     self_image: IdentitySource<'_>,
+    user_notes: IdentitySource<'_>,
 ) -> anyhow::Result<String> {
     let identity =
-        baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image).await?;
-    let parts = [
+        baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
+            .await?;
+    let mut parts = vec![
         TOP_HINT.to_string(),
         wrap_section("soul", soul.path, &identity.soul),
         wrap_section("identity", self_image.path, &identity.identity),
-        wrap_section(
-            "user_profile",
-            &paths.identity_file(IdentityKind::User),
-            &identity.user,
-        ),
-        BACKGROUND_TASKS_HINT.to_string(),
-        TAIL_HINT.to_string(),
     ];
+    if let Some(shared) = &identity.shared_user {
+        parts.push(wrap_section(
+            "shared_user_profile",
+            &paths.identity_file(IdentityKind::User),
+            shared,
+        ));
+        parts.push(wrap_section("user_notes", user_notes.path, &identity.user));
+    } else {
+        parts.push(wrap_section(
+            "user_profile",
+            user_notes.path,
+            &identity.user,
+        ));
+    }
+    parts.push(BACKGROUND_TASKS_HINT.to_string());
+    parts.push(TAIL_HINT.to_string());
     Ok(parts.join("\n\n"))
 }
 
@@ -74,11 +89,12 @@ pub async fn assemble(
 /// Byte-identical to what a session bound to the built-in profile produces,
 /// because the built-in's persona *is* the workspace `profile/`.
 pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let (soul, self_image) = baybo_workspace::identity::workspace_identity_paths(paths);
+    let (soul, self_image, user) = baybo_workspace::identity::workspace_identity_paths(paths);
     assemble(
         paths,
         IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
         IdentitySource::new(&self_image, IdentityKind::Identity.default_content()),
+        IdentitySource::new(&user, IdentityKind::User.default_content()),
     )
     .await
 }
