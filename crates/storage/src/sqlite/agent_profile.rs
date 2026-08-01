@@ -14,7 +14,7 @@ use baybo_store::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfil
 const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
     "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.";
 
-const SELECT_COLS: &str = "id, name, description, avatar_blob_id, system_prompt, framework, \
+const SELECT_COLS: &str = "id, description, avatar_blob_id, framework, \
                            llm, builtin, created_at, updated_at";
 
 pub struct SqliteAgentProfileStore {
@@ -34,8 +34,8 @@ impl SqliteAgentProfileStore {
             .interact("agent_profiles.seed_builtin", move |conn| {
                 conn.execute(
                     "INSERT OR IGNORE INTO agent_profiles \
-                     (id, name, description, framework, builtin, created_at, updated_at) \
-                     VALUES (?1, ?1, ?2, ?3, 1, ?4, ?4)",
+                     (id, description, framework, builtin, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, 1, ?4, ?4)",
                     rusqlite::params![
                         BUILTIN_AGENT_PROFILE_ID,
                         BUILTIN_AGENT_PROFILE_DESCRIPTION,
@@ -55,17 +55,18 @@ fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("sqlite {ctx}: {e}"))
 }
 
-/// Map a sqlite write error to [`StorageError::Conflict`] when it tripped
-/// the case-insensitive `UNIQUE` on `agent_profiles.name`, else a generic
-/// internal error. Same message-sniff as the device store.
+/// Map a sqlite write error to [`StorageError::Conflict`] when it tripped a
+/// constraint, else a generic internal error. Same message-sniff as the
+/// device store.
 ///
-/// The sniff assumes a constraint trip is the name `UNIQUE`: the only other
-/// constraint on the table is `PRIMARY KEY(id)`, and ids are freshly-minted
-/// ULIDs, so a PK collision is astronomically unlikely.
-fn name_conflict_err(ctx: &str, name: &str, e: impl std::fmt::Display) -> StorageError {
+/// The only constraint left on the table is `PRIMARY KEY(id)`, and ids are
+/// freshly-minted ULIDs, so this is a backstop rather than a path anything
+/// reaches — the name `UNIQUE` went away with the column, since a name now
+/// lives in a file the agent may rewrite to anything at any time.
+fn write_conflict_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     let msg = e.to_string();
     if msg.contains("constraint") || msg.contains("UNIQUE") {
-        StorageError::Conflict(format!("an agent named {name:?} already exists"))
+        StorageError::Conflict(format!("{ctx}: conflicting write"))
     } else {
         col_err(ctx, e)
     }
@@ -78,8 +79,6 @@ fn name_conflict_err(ctx: &str, name: &str, e: impl std::fmt::Display) -> Storag
 type RawProfileRow = (
     String,
     String,
-    String,
-    Option<String>,
     Option<String>,
     String,
     Option<String>,
@@ -98,18 +97,14 @@ fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
     ))
 }
 
 fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
     let (
         id,
-        name,
         description,
         avatar_blob_id,
-        system_prompt,
         framework_raw,
         llm,
         builtin_col,
@@ -132,11 +127,12 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         ))
     })?;
     Ok(AgentProfileRow {
-        id: AgentProfileId::from(id),
-        name,
+        // A stored id that fails the grammar is a hard error, not a warn:
+        // this id names the profile's persona directory, and every consumer
+        // of the row joins it back onto the filesystem.
+        id: AgentProfileId::parse(id).map_err(|e| StorageError::Storage(e.to_string()))?,
         description,
         avatar_blob_id,
-        system_prompt,
         framework,
         llm: llm.map(LlmEntryName::from),
         builtin: builtin_col != 0,
@@ -153,7 +149,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .interact("agent_profiles.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {SELECT_COLS} FROM agent_profiles \
-                     ORDER BY builtin DESC, name COLLATE NOCASE, id"
+                     ORDER BY builtin DESC, id"
                 ))?;
                 let raws = stmt
                     .query_map([], read_raw_row)?
@@ -182,16 +178,13 @@ impl AgentProfileStore for SqliteAgentProfileStore {
     }
 
     async fn create(&self, row: &AgentProfileRow) -> Result<()> {
-        let name = row.name.clone();
         let id = row.id.as_str().to_string();
         let description = row.description.clone();
         let avatar_blob_id = row.avatar_blob_id.clone();
-        let system_prompt = row.system_prompt.clone();
         let framework = row.framework.as_str();
         let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
-        let insert_name = name.clone();
         // The write error has to survive the closure as data: `Conflict` is a
         // non-`Internal` variant and can't be built inside it.
         let outcome = self
@@ -201,15 +194,13 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                 // DEFAULT 0 fills it, so the seed stays the only writer of 1.
                 match conn.execute(
                     "INSERT INTO agent_profiles \
-                     (id, name, description, avatar_blob_id, system_prompt, framework, \
+                     (id, description, avatar_blob_id, framework, \
                       llm, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         id,
-                        insert_name,
                         description,
                         avatar_blob_id,
-                        system_prompt,
                         framework,
                         llm,
                         created_at,
@@ -223,36 +214,28 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .await?;
         match outcome {
             None => Ok(()),
-            Some(e) => Err(name_conflict_err("create agent profile", &name, e)),
+            Some(e) => Err(write_conflict_err("create agent profile", e)),
         }
     }
 
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool> {
         let id = id.as_str().to_string();
-        let name = update.name.clone();
-        let update_name = name.clone();
         let description = update.description.clone();
-        let system_prompt = update.system_prompt.clone();
         let framework = update.framework.as_str();
-        let llm = update.llm.as_ref().map(|l| l.as_str().to_string());
         let now = super::time::now_us();
         let outcome = self
             .pool
             .interact("agent_profiles.update", move |conn| {
                 match conn.execute(
+                    // The self-reference on the builtin's `framework` is the
+                    // guard: no caller can move it off baybo, while every
+                    // other row takes the requested value.
                     "UPDATE agent_profiles SET \
-                     name = ?2, description = ?3, system_prompt = ?4, framework = ?5, \
-                     llm = ?6, updated_at = ?7 \
-                     WHERE id = ?1 AND builtin = 0",
-                    rusqlite::params![
-                        id,
-                        update_name,
-                        description,
-                        system_prompt,
-                        framework,
-                        llm,
-                        now,
-                    ],
+                     description = ?2, \
+                     framework = CASE WHEN builtin = 1 THEN framework ELSE ?3 END, \
+                     updated_at = ?4 \
+                     WHERE id = ?1",
+                    rusqlite::params![id, description, framework, now],
                 ) {
                     Ok(affected) => Ok(Ok(affected)),
                     Err(e) => Ok(Err(e.to_string())),
@@ -261,7 +244,7 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .await?;
         match outcome {
             Ok(affected) => Ok(affected > 0),
-            Err(e) => Err(name_conflict_err("update agent profile", &name, e)),
+            Err(e) => Err(write_conflict_err("update agent profile", e)),
         }
     }
 
@@ -275,6 +258,28 @@ impl AgentProfileStore for SqliteAgentProfileStore {
                 Ok(conn.execute(
                     "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 WHERE id = ?1",
                     rusqlite::params![id, blob_id, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let llm = llm.map(|l| l.as_str().to_string());
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("agent_profiles.set_llm", move |conn| {
+                Ok(conn.execute(
+                    // The builtin follows `default-llm` by definition, so its
+                    // pin is forced empty rather than merely left alone —
+                    // that also clears anything an earlier build stored.
+                    "UPDATE agent_profiles SET \
+                     llm = CASE WHEN builtin = 1 THEN NULL ELSE ?2 END, \
+                     updated_at = ?3 \
+                     WHERE id = ?1",
+                    rusqlite::params![id, llm, now],
                 )?)
             })
             .await?;
@@ -313,14 +318,12 @@ mod tests {
         crate::sqlite::time::from_us(crate::sqlite::time::now_us()).unwrap()
     }
 
-    fn custom_row(name: &str) -> AgentProfileRow {
+    fn custom_row() -> AgentProfileRow {
         let now = now_us_precision();
         AgentProfileRow {
             id: AgentProfileId::generate(),
-            name: name.to_owned(),
             description: "a test persona".to_owned(),
             avatar_blob_id: None,
-            system_prompt: Some("You are terse.".to_owned()),
             framework: AgentFramework::Claude,
             llm: Some(LlmEntryName::from("primary")),
             builtin: false,
@@ -329,13 +332,10 @@ mod tests {
         }
     }
 
-    fn content_update(name: &str) -> AgentProfileUpdate {
+    fn content_update() -> AgentProfileUpdate {
         AgentProfileUpdate {
-            name: name.to_owned(),
             description: String::new(),
-            system_prompt: None,
             framework: AgentFramework::Baybo,
-            llm: None,
         }
     }
 
@@ -346,11 +346,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let b = &rows[0];
         assert_eq!(b.id.as_str(), BUILTIN_AGENT_PROFILE_ID);
-        assert_eq!(b.name, "baybo");
+        assert_eq!(b.id, AgentProfileId::builtin());
         assert_eq!(b.description, BUILTIN_AGENT_PROFILE_DESCRIPTION);
         assert!(b.builtin);
         assert_eq!(b.framework, AgentFramework::Baybo);
-        assert!(b.system_prompt.is_none());
         assert!(b.llm.is_none());
         assert!(b.avatar_blob_id.is_none());
     }
@@ -378,91 +377,50 @@ mod tests {
     #[tokio::test]
     async fn create_get_round_trips_and_never_binds_builtin() {
         let store = open_store().await;
-        let mut row = custom_row("Reviewer");
+        let mut row = custom_row();
         row.builtin = true; // must be ignored by the insert
         store.create(&row).await.unwrap();
 
         let back = store.get(&row.id).await.unwrap().unwrap();
         assert!(!back.builtin, "create must never mint a builtin row");
-        assert_eq!(back.name, "Reviewer");
         assert_eq!(back.framework, AgentFramework::Claude);
         assert_eq!(back.llm, Some(LlmEntryName::from("primary")));
-        assert_eq!(back.system_prompt.as_deref(), Some("You are terse."));
         assert_eq!(back.created_at, row.created_at);
     }
 
     #[tokio::test]
-    async fn duplicate_name_is_case_insensitive_conflict() {
+    async fn update_full_replaces_content() {
         let store = open_store().await;
-        store.create(&custom_row("Helper")).await.unwrap();
-        let err = store.create(&custom_row("hElPeR")).await.unwrap_err();
-        assert!(matches!(err, StorageError::Conflict(_)), "got {err:?}");
-
-        // The builtin's name is reserved too.
-        let err = store.create(&custom_row("Baybo")).await.unwrap_err();
-        assert!(matches!(err, StorageError::Conflict(_)), "got {err:?}");
-    }
-
-    #[tokio::test]
-    async fn update_full_replaces_content_and_skips_builtin() {
-        let store = open_store().await;
-        let row = custom_row("Helper");
+        let row = custom_row();
         store.create(&row).await.unwrap();
 
         // Full replace resets every optional field to the update's state.
-        assert!(
-            store
-                .update(&row.id, &content_update("Helper 2"))
-                .await
-                .unwrap()
-        );
+        assert!(store.update(&row.id, &content_update()).await.unwrap());
         let back = store.get(&row.id).await.unwrap().unwrap();
-        assert_eq!(back.name, "Helper 2");
         assert_eq!(back.description, "");
-        assert!(back.system_prompt.is_none());
         assert_eq!(back.framework, AgentFramework::Baybo);
-        assert!(back.llm.is_none());
+        // The pin is not part of the full replace any more — it has its own
+        // setter, so a content update leaves it alone.
+        assert_eq!(back.llm, row.llm);
         assert!(back.updated_at >= back.created_at);
 
-        // Builtin is unreachable behind the guard.
-        let builtin = AgentProfileId::builtin();
+        // Missing rows are the only `Ok(false)` — the builtin has its own
+        // test above, since it is reachable now except for its framework.
         assert!(
             !store
-                .update(&builtin, &content_update("renamed"))
+                .update(
+                    &AgentProfileId::parse("missing").expect("valid id"),
+                    &content_update()
+                )
                 .await
                 .unwrap()
         );
-        // Missing rows are indistinguishable at the store layer.
-        assert!(
-            !store
-                .update(&AgentProfileId::from("missing"), &content_update("x"))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn rename_conflicts_only_against_other_rows() {
-        let store = open_store().await;
-        let a = custom_row("Alpha");
-        let b = custom_row("Beta");
-        store.create(&a).await.unwrap();
-        store.create(&b).await.unwrap();
-
-        // Case-only self-rename is fine.
-        assert!(store.update(&a.id, &content_update("ALPHA")).await.unwrap());
-        // Renaming onto another row's name (any casing) conflicts.
-        let err = store
-            .update(&b.id, &content_update("alpha"))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StorageError::Conflict(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn delete_skips_builtin_and_removes_customs() {
         let store = open_store().await;
-        let row = custom_row("Helper");
+        let row = custom_row();
         store.create(&row).await.unwrap();
 
         assert!(!store.delete(&AgentProfileId::builtin()).await.unwrap());
@@ -477,6 +435,65 @@ mod tests {
         assert!(store.delete(&row.id).await.unwrap());
         assert!(store.get(&row.id).await.unwrap().is_none());
         assert!(!store.delete(&row.id).await.unwrap());
+    }
+
+    /// The two fields the builtin may change each have a setter that skips
+    /// the `builtin = 0` guard — which is what keeps the lock structural
+    /// instead of per-field validation one layer up.
+    /// The builtin's description is ordinary editable text; only its
+    /// framework is pinned, and pinned by the statement rather than by a
+    /// caller remembering to ask nicely.
+    #[tokio::test]
+    async fn update_reaches_the_builtin_but_never_moves_its_framework() {
+        let store = open_store().await;
+        let builtin = AgentProfileId::builtin();
+
+        assert!(
+            store
+                .update(
+                    &builtin,
+                    &AgentProfileUpdate {
+                        description: "my own words".to_owned(),
+                        framework: AgentFramework::Claude,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let back = store.get(&builtin).await.unwrap().unwrap();
+        assert_eq!(back.description, "my own words");
+        assert_eq!(
+            back.framework,
+            AgentFramework::Baybo,
+            "the builtin runs on baybo by definition"
+        );
+
+        // …and it still cannot be deleted.
+        assert!(!store.delete(&builtin).await.unwrap());
+    }
+
+    /// A custom agent's pin is its own; the builtin's is always empty,
+    /// because that row *is* `default-llm`.
+    #[tokio::test]
+    async fn set_llm_pins_a_custom_agent_and_never_the_builtin() {
+        let store = open_store().await;
+        let pin = LlmEntryName::from("fast");
+
+        let row = custom_row();
+        store.create(&row).await.unwrap();
+        assert!(store.set_llm(&row.id, Some(&pin)).await.unwrap());
+        assert_eq!(
+            store.get(&row.id).await.unwrap().unwrap().llm,
+            Some(pin.clone())
+        );
+        assert!(store.set_llm(&row.id, None).await.unwrap());
+        assert!(store.get(&row.id).await.unwrap().unwrap().llm.is_none());
+
+        // The builtin absorbs the write and stays unpinned — which also
+        // normalises a row an earlier build allowed to drift.
+        let builtin = AgentProfileId::builtin();
+        assert!(store.set_llm(&builtin, Some(&pin)).await.unwrap());
+        assert!(store.get(&builtin).await.unwrap().unwrap().llm.is_none());
     }
 
     #[tokio::test]
@@ -498,24 +515,31 @@ mod tests {
 
         assert!(
             !store
-                .set_avatar(&AgentProfileId::from("missing"), None)
+                .set_avatar(&AgentProfileId::parse("missing").expect("valid id"), None)
                 .await
                 .unwrap()
         );
     }
 
+    /// The store no longer knows a display name, so ordering it can only
+    /// promise the builtin first and a stable tail — the gateway sorts by
+    /// the name it derives from each agent's `IDENTITY.md`.
     #[tokio::test]
-    async fn list_orders_builtin_first_then_name_nocase() {
+    async fn list_puts_the_builtin_first_and_is_otherwise_stable() {
         let store = open_store().await;
-        store.create(&custom_row("zeta")).await.unwrap();
-        store.create(&custom_row("Alpha")).await.unwrap();
-        let names: Vec<String> = store
+        store.create(&custom_row()).await.unwrap();
+        store.create(&custom_row()).await.unwrap();
+        let ids: Vec<AgentProfileId> = store
             .list()
             .await
             .unwrap()
             .into_iter()
-            .map(|r| r.name)
+            .map(|r| r.id)
             .collect();
-        assert_eq!(names, vec!["baybo", "Alpha", "zeta"]);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], AgentProfileId::builtin());
+        let mut tail = ids[1..].to_vec();
+        tail.sort();
+        assert_eq!(tail, ids[1..], "the tail must be id-ordered");
     }
 }

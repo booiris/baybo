@@ -4,6 +4,15 @@
 
 The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The sqlite implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
 
+A session may be **bound to an agent profile** at creation:
+`create_session_with_agent` / `get_or_create_with_agent` seed
+`SessionState::{agent_id, agent_framework}` on the creation INSERT, and there
+is deliberately no setter — `save`'s `DO UPDATE` omits both columns, so the
+binding is write-once structurally. `agent_id_or_builtin()` is the only
+correct read: `None` is not "no agent", it is the built-in profile, whose id
+is also the memory partition every pre-binding memory was written under. See
+[`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md).
+
 A `Session` is the top of one trace tree. There is exactly one trace per session — subagent spawn creates new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
 The conversation transcript itself is **not** carried on `Session`. It lives in `baybo_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the actor's run loop seeds it on cold start via `ContextManager::restore_from_store`, which calls `load_active_session_messages`.

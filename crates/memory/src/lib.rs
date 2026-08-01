@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use baybo_llm::Attribution;
-use baybo_model::{ChatMessage, ContentBlock, SessionId, TurnId};
+use baybo_model::{AgentProfileId, ChatMessage, ContentBlock, SessionId, TurnId};
 use baybo_tools::{Tool, ToolManifest};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
@@ -53,43 +53,58 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 /// (via [`Self::session_id`] / [`Self::turn_id`]) are what an impl keys its own
 /// per-session / per-turn de-duplication off.
 pub struct MemoryContext {
-    user_id: String,
-    session_id: SessionId,
-    turn_id: TurnId,
+    scope: MemoryScope,
     recorder: Arc<SpanRecorder>,
     step: StepHandle,
+}
+
+/// Who a memory operation belongs to: the real user, session and turn it
+/// bills and traces against, plus the agent partition it reads and writes.
+///
+/// One value because the four always travel together — the agent loop
+/// captures them before detaching a background write, and
+/// [`MemoryContext::new`] consumes exactly this set.
+#[derive(Debug, Clone)]
+pub struct MemoryScope {
+    pub user_id: String,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub agent_id: AgentProfileId,
 }
 
 impl MemoryContext {
     /// Build the context for one memory call. The core calls this **inside** the
     /// `MemoryRecall` / `MemoryWrite` trace step, so `step` is that step and
     /// every [`Self::scoped_llm_call`] span nests under it.
-    pub fn new(
-        user_id: String,
-        session_id: SessionId,
-        turn_id: TurnId,
-        recorder: Arc<SpanRecorder>,
-        step: StepHandle,
-    ) -> Self {
+    pub fn new(scope: MemoryScope, recorder: Arc<SpanRecorder>, step: StepHandle) -> Self {
         Self {
-            user_id,
-            session_id,
-            turn_id,
+            scope,
             recorder,
             step,
         }
     }
 
     pub fn user_id(&self) -> &str {
-        &self.user_id
+        &self.scope.user_id
+    }
+
+    /// The agent partition every recall and write in this call belongs to.
+    ///
+    /// Memory is scoped by `(user, agent)`: one human, many personas. The
+    /// built-in's id is what pre-binding memories were already written
+    /// under, so an unbound session keeps seeing exactly what it always saw.
+    /// An impl must send this on every request; there is deliberately no way
+    /// for the *model* to override it (see `docs/modules/memory.md`).
+    pub fn agent_id(&self) -> &AgentProfileId {
+        &self.scope.agent_id
     }
 
     pub fn session_id(&self) -> &SessionId {
-        &self.session_id
+        &self.scope.session_id
     }
 
     pub fn turn_id(&self) -> TurnId {
-        self.turn_id
+        self.scope.turn_id
     }
 
     /// Record a billed LLM sub-call as an `LlmCall` span under this operation's
@@ -117,9 +132,9 @@ impl MemoryContext {
             .await
             .map_err(|e| MemoryError::Internal(anyhow::Error::new(e)))?;
         let attribution = Attribution {
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            turn_id: self.turn_id,
+            user_id: self.scope.user_id.clone(),
+            session_id: self.scope.session_id.clone(),
+            turn_id: self.scope.turn_id,
             span_id: span.span_id,
             reason: baybo_llm::CallReason::Memory,
         };
@@ -134,7 +149,7 @@ impl MemoryContext {
             .recorder
             .end_span(
                 span,
-                self.turn_id,
+                self.scope.turn_id,
                 SpanFinalize::LlmCall(call_result),
                 outcome,
             )

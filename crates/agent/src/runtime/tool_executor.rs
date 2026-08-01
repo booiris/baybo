@@ -453,6 +453,10 @@ impl ToolExecutor {
         // [`ToolContext::session_trigger`]; `CronCreate` reads it so a turn
         // created inside a cron fire inherits the fire's origin conversation.
         session_trigger: &baybo_model::TriggerSource,
+        // The agent this session runs as — the tool's memory partition and
+        // its `Skill` overlay. Passed per call (not held on the executor,
+        // which is process-wide) exactly like `session_trigger`.
+        agent_id: &baybo_model::AgentProfileId,
         user: &User,
         approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
         recorder: &Arc<SpanRecorder>,
@@ -723,6 +727,7 @@ impl ToolExecutor {
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
                     session_trigger: session_trigger.clone(),
+                    agent_id: agent_id.clone(),
                     turn_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),

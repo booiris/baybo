@@ -7,7 +7,6 @@ use std::sync::Arc;
 use baybo_config::BayboConfig;
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_storage::Store;
-use baybo_workspace::WorkspaceManager;
 use baybo_workspace::WorkspacePaths;
 use baybo_workspace::paths::ENV_CONFIG_PATH;
 
@@ -23,17 +22,17 @@ pub struct SetupContext {
 pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<SetupContext> {
     let paths = WorkspacePaths::new(workspace_root.clone());
 
-    let workspace = WorkspaceManager::new(workspace_root.clone());
-    workspace
-        .ensure_layout()
+    baybo_workspace::ensure_layout(&paths)
         .await
         .map_err(|e| SetupError::io(workspace_root.clone(), format!("ensure_layout: {e}")))?;
-    workspace.seed_default_identity_files().await.map_err(|e| {
-        SetupError::io(
-            workspace_root.clone(),
-            format!("seed default identity files: {e}"),
-        )
-    })?;
+    baybo_workspace::seed_default_identity_files(&paths)
+        .await
+        .map_err(|e| {
+            SetupError::io(
+                workspace_root.clone(),
+                format!("seed default identity files: {e}"),
+            )
+        })?;
 
     let key_file = paths.encryption_key_file();
     if !key_file.exists() {
@@ -132,7 +131,7 @@ mod tests {
         let ctx = bootstrap_workspace_if_needed(root.clone()).await.unwrap();
 
         assert!(paths.config_dir().exists());
-        assert!(paths.profile_dir().exists());
+        assert!(paths.personas_dir().exists());
         assert!(paths.key_dir().exists());
         assert!(paths.encryption_key_file().exists());
         assert!(paths.config_file().exists());
@@ -160,15 +159,23 @@ mod tests {
         bootstrap_workspace_if_needed(root.clone()).await.unwrap();
 
         for kind in IdentityKind::all() {
-            let target = paths.identity_file(kind);
+            let target =
+                paths.persona_identity_file(baybo_workspace::paths::BUILTIN_PERSONA_DIR, kind);
             let body = std::fs::read_to_string(&target)
                 .unwrap_or_else(|e| panic!("read seeded {}: {e}", target.display()));
-            assert_eq!(
-                body,
-                kind.default_content(),
-                "{kind:?} must be seeded with its default template"
-            );
+            // `USER.md` is the built-in's *own* notes, so it gets the
+            // per-agent template; the operator-curated defaults seed the
+            // shared profile beside it.
+            let expected = match kind {
+                IdentityKind::User => baybo_workspace::prompt::PERSONA_USER_TEMPLATE,
+                _ => kind.default_content(),
+            };
+            assert_eq!(body, expected, "{kind:?} must be seeded with its template");
         }
+        assert_eq!(
+            std::fs::read_to_string(paths.shared_user_file()).unwrap(),
+            IdentityKind::User.default_content(),
+        );
     }
 
     #[tokio::test]
@@ -182,7 +189,10 @@ mod tests {
         let paths = WorkspacePaths::new(root.clone());
 
         bootstrap_workspace_if_needed(root.clone()).await.unwrap();
-        let soul_path = paths.identity_file(IdentityKind::Soul);
+        let soul_path = paths.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
         std::fs::remove_file(&soul_path).expect("remove SOUL.md");
 
         bootstrap_workspace_if_needed(root.clone()).await.unwrap();
@@ -201,7 +211,10 @@ mod tests {
         let paths = WorkspacePaths::new(root.clone());
 
         bootstrap_workspace_if_needed(root.clone()).await.unwrap();
-        let soul_path = paths.identity_file(IdentityKind::Soul);
+        let soul_path = paths.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
         const CUSTOM: &str = "# Soul\n\nOperator override.\n";
         std::fs::write(&soul_path, CUSTOM).expect("operator edit");
 

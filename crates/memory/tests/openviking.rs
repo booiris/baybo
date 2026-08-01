@@ -11,12 +11,12 @@ use baybo_memory::backends::openviking::{
     OpenVikingConfig, OpenVikingMemory, OpenVikingTimeouts, TOOL_ARCHIVE_EXPAND, TOOL_FORGET,
     TOOL_RECALL, TOOL_STORE,
 };
-use baybo_model::{ChatMessage, ContentBlock};
+use baybo_model::{AgentProfileId, ChatMessage, ContentBlock};
 use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::common::{base_url, memory_context, spawn, tool_context};
+use crate::common::{base_url, memory_context, memory_context_for_agent, spawn, tool_context};
 
 #[derive(Default, Clone)]
 struct Captured {
@@ -100,6 +100,37 @@ async fn recall_sends_query_and_returns_abstract_with_uri() {
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["query"], "rust");
     assert_eq!(body["top_k"], 5);
+}
+
+/// The agent header is per-request, not baked into the client — a custom
+/// agent's recall must not read the built-in partition.
+#[tokio::test]
+async fn recall_sends_the_sessions_agent_partition() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/api/v1/search/find",
+            post(
+                |State(c): State<Captured>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    c.headers.lock().push(headers);
+                    c.bodies.lock().push(body);
+                    Json(json!({"result": {"memories": [], "resources": []}}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let agent = AgentProfileId::parse("01JAGENT").unwrap();
+    let ctx = memory_context_for_agent("alice", &agent, "s-1", StepKind::MemoryRecall).await;
+    m.recall(&ctx, &[ContentBlock::Text("rust".into())])
+        .await
+        .unwrap();
+
+    let headers = captured.headers.lock().last().cloned().unwrap();
+    assert_eq!(headers.get("x-openviking-user").unwrap(), "alice");
+    assert_eq!(headers.get("x-openviking-agent").unwrap(), "01JAGENT");
 }
 
 #[tokio::test]

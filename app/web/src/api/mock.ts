@@ -652,7 +652,6 @@ export const MOCK_AGENT_PROFILES: AgentProfileDto[] = import.meta.env.DEV
         id: '01JMOCKAGENTREVIEWER000000',
         name: 'Code Reviewer',
         description: 'Reviews diffs with a security-first eye. Terse, actionable findings only.',
-        system_prompt: 'You are a rigorous code reviewer. Report only defects.',
         framework: 'claude',
         builtin: false,
         created_at: '2026-02-10T09:30:00Z',

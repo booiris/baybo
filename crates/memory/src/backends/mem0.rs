@@ -75,7 +75,6 @@ use tracing::{debug, info, warn};
 use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
-const DEFAULT_AGENT_ID: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
 /// Default minimum similarity for `mem0_search` / search-and-delete. Mirrors
 /// the openclaw plugin's `searchThreshold` default.
@@ -495,16 +494,21 @@ impl Mem0Memory {
     /// Context-free recall for harnesses/diagnostics: `POST /v2/memories/search/`
     /// scoped to `user_id`. The trait [`Memory::recall`] is this plus the
     /// circuit breaker and failure-swallowing.
-    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+    pub async fn recall_for(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<Vec<RecalledMemory>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
         let body = if self.inner.self_hosted {
-            json!({"query": query, "user_id": user_id, "limit": self.inner.top_k})
+            json!({"query": query, "user_id": user_id, "agent_id": agent_id, "limit": self.inner.top_k})
         } else {
             json!({
                 "query": query,
-                "filters": read_filters(user_id),
+                "filters": read_filters(user_id, agent_id),
                 "rerank": self.inner.rerank,
                 "top_k": self.inner.top_k,
             })
@@ -522,6 +526,7 @@ impl Mem0Memory {
     pub async fn add_turn(
         &self,
         user_id: &str,
+        agent_id: &str,
         user_text: &str,
         assistant_text: &str,
     ) -> Result<()> {
@@ -531,7 +536,7 @@ impl Mem0Memory {
                 {"role": "assistant", "content": assistant_text},
             ],
             "user_id": user_id,
-            "agent_id": DEFAULT_AGENT_ID,
+            "agent_id": agent_id,
         });
         self.inner
             .post_json("/v1/memories/", &body, WRITE_TIMEOUT, None)
@@ -599,11 +604,6 @@ fn build_filters(
     categories: Option<&[String]>,
     extra: Option<&Value>,
 ) -> Value {
-    if let Some(extra) = extra
-        && (extra.get("AND").is_some() || extra.get("OR").is_some())
-    {
-        return extra.clone();
-    }
     let mut conds: Vec<Value> = vec![json!({"user_id": user_id})];
     if let Some(agent_id) = agent_id {
         conds.push(json!({"agent_id": agent_id}));
@@ -614,17 +614,90 @@ fn build_filters(
     if let Some(cats) = categories.filter(|c| !c.is_empty()) {
         conds.push(json!({"categories": {"in": cats}}));
     }
-    if let Some(obj) = extra.and_then(|e| e.as_object()) {
-        for (k, v) in obj {
-            conds.push(json!({ k: v }));
+    match extra {
+        // An advanced condition the model supplied. It is *nested* under the
+        // mandatory scope, never substituted for it: returning it verbatim
+        // dropped `user_id` and `agent_id` together, which made a tool
+        // parameter a way out of both the user's data and the agent's.
+        Some(extra) if extra.get("AND").is_some() || extra.get("OR").is_some() => {
+            conds.push(extra.clone());
         }
+        Some(extra) => {
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    conds.push(json!({ k: v }));
+                }
+            }
+        }
+        None => {}
     }
     json!({ "AND": conds })
 }
 
-/// The user-only filter the recall hot path uses (`{AND: [{user_id}]}`).
-fn read_filters(user_id: &str) -> Value {
-    build_filters(user_id, None, None, None, None)
+/// The filter the recall hot path uses: `{AND: [{user_id}, {agent_id}]}`.
+/// Both axes are always present — memory is scoped by `(user, agent)`, and a
+/// recall that omitted the agent would read every persona's memories.
+/// Fetch one memory by id and refuse it unless it belongs to this
+/// `(user, agent)` partition.
+///
+/// The id-addressed endpoints (`GET`/`PUT`/`DELETE /v1/memories/{id}/`) carry
+/// no scope of their own — Mem0 resolves the id globally. Every other tool
+/// path filters, so an id from a sibling partition (surfaced in a transcript,
+/// or by any future filter hole) would otherwise be readable, editable and
+/// deletable across the partition the rest of the design maintains.
+///
+/// Fails **closed**: a response that does not state both ids is refused, not
+/// assumed to be ours.
+async fn fetch_owned(
+    inner: &Mem0Inner,
+    memory_id: &str,
+    user_id: &str,
+    agent_id: &str,
+    ctx: &ToolContext,
+) -> std::result::Result<Value, ToolOutput> {
+    let path = format!("/v1/memories/{memory_id}/");
+    let resp = match inner
+        .request(
+            Method::GET,
+            &path,
+            None,
+            &[],
+            HTTP_TIMEOUT,
+            Some(&ctx.events),
+        )
+        .await
+    {
+        Ok(resp) => {
+            inner.record_success();
+            resp
+        }
+        Err(e) => {
+            inner.record_failure();
+            return Err(ToolOutput::Error(format!("memory lookup failed: {e}")));
+        }
+    };
+    let field = |key: &str| {
+        resp.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                resp.get("metadata")
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_owned)
+    };
+    if field("user_id").as_deref() == Some(user_id)
+        && field("agent_id").as_deref() == Some(agent_id)
+    {
+        return Ok(resp);
+    }
+    // Deliberately the same answer as a genuinely absent id: telling the
+    // caller "that exists but is not yours" is itself a cross-partition read.
+    Err(ToolOutput::Error(format!("no memory {memory_id}")))
+}
+
+fn read_filters(user_id: &str, agent_id: &str) -> Value {
+    build_filters(user_id, Some(agent_id), None, None, None)
 }
 
 /// Resolve the optional `scope` param into a run-id filter. `"session"`
@@ -671,7 +744,10 @@ impl Memory for Mem0Memory {
         if self.inner.breaker_open() {
             return Ok(Vec::new());
         }
-        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+        match self
+            .recall_for(ctx.user_id(), ctx.agent_id().as_str(), &concat_text(query))
+            .await
+        {
             Ok(memories) => {
                 self.inner.record_success();
                 Ok(memories)
@@ -699,7 +775,12 @@ impl Memory for Mem0Memory {
             return Ok(());
         }
         match self
-            .add_turn(ctx.user_id(), &user_text, &assistant_text)
+            .add_turn(
+                ctx.user_id(),
+                ctx.agent_id().as_str(),
+                &user_text,
+                &assistant_text,
+            )
             .await
         {
             Ok(()) => {
@@ -812,7 +893,6 @@ impl Tool for Mem0SearchTool {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
                 "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
-                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
             },
             "required": ["query"]
         })
@@ -832,7 +912,7 @@ impl Tool for Mem0SearchTool {
             .map(|n| n.min(50) as usize)
             .unwrap_or(self.inner.top_k);
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = ctx.agent_id.as_str();
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
@@ -845,17 +925,19 @@ impl Tool for Mem0SearchTool {
                     .filter_map(|x| x.as_str().map(String::from))
                     .collect()
             });
-        // OSS scopes by user_id and ignores the Platform v2 filter shape
+        // OSS takes the partition as flat fields; Platform takes the v2
+        // filter shape. Both must carry `agent_id` — it is the memory
+        // partition, not a label.
         // (agent/run/category/advanced filters), so they degrade to user scope.
         let body = if self.inner.self_hosted {
-            json!({"query": query, "user_id": user_id, "limit": limit})
+            json!({"query": query, "user_id": user_id, "agent_id": agent_id, "limit": limit})
         } else {
             json!({
                 "query": query,
                 "top_k": limit,
                 "threshold": DEFAULT_SEARCH_THRESHOLD,
                 "rerank": self.inner.rerank,
-                "filters": build_filters(user_id, agent_id, run_id, categories.as_deref(), params.get("filters")),
+                "filters": build_filters(user_id, Some(agent_id), run_id, categories.as_deref(), params.get("filters")),
             })
         };
         match self
@@ -928,7 +1010,6 @@ impl Tool for Mem0AddTool {
                 "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
                 "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
-                "agentId": {"type": "string", "description": "Agent namespace (default: baybo)."}
             },
             "required": []
         })
@@ -958,10 +1039,7 @@ impl Tool for Mem0AddTool {
             ));
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params
-            .get("agentId")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_AGENT_ID);
+        let agent_id = ctx.agent_id.as_str();
         let long_term = params
             .get("longTerm")
             .and_then(|v| v.as_bool())
@@ -1052,31 +1130,26 @@ impl Tool for Mem0GetTool {
             .get("memoryId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("memoryId is required".into()))?;
-        let path = format!("/v1/memories/{memory_id}/");
-        match self
-            .inner
-            .request(
-                Method::GET,
-                &path,
-                None,
-                &[],
-                HTTP_TIMEOUT,
-                Some(&ctx.events),
-            )
-            .await
+        let resp = match fetch_owned(
+            &self.inner,
+            memory_id,
+            ctx.user.id.as_str(),
+            ctx.agent_id.as_str(),
+            ctx,
+        )
+        .await
         {
-            Ok(resp) => {
-                self.inner.record_success();
+            Ok(resp) => resp,
+            Err(out) => return Ok(out),
+        };
+        {
+            {
                 Ok(ToolOutput::Json(json!({
                     "id": resp.get("id").and_then(|v| v.as_str()).unwrap_or(memory_id),
                     "memory": resp.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
                     "created_at": resp.get("created_at").cloned().unwrap_or(Value::Null),
                     "updated_at": resp.get("updated_at").cloned().unwrap_or(Value::Null),
                 })))
-            }
-            Err(e) => {
-                self.inner.record_failure();
-                Ok(ToolOutput::Error(format!("{TOOL_GET} failed: {e}")))
             }
         }
     }
@@ -1101,7 +1174,6 @@ impl Tool for Mem0ListTool {
             "type": "object",
             "properties": {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
-                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
             },
             "required": []
         })
@@ -1112,25 +1184,36 @@ impl Tool for Mem0ListTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = ctx.agent_id.as_str();
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
         );
         // OSS lists via GET /memories?user_id=; Platform POSTs a v2 filter + page.
-        let (method, body, qp): (Method, Option<Value>, Vec<(&str, String)>) =
-            if self.inner.self_hosted {
-                (Method::GET, None, vec![("user_id", user_id.to_string())])
-            } else {
-                (
-                    Method::POST,
-                    Some(json!({"filters": build_filters(user_id, agent_id, run_id, None, None)})),
-                    vec![
-                        ("page", "1".to_string()),
-                        ("page_size", MAX_LIST_ENTRIES.to_string()),
-                    ],
-                )
-            };
+        let (method, body, qp): (Method, Option<Value>, Vec<(&str, String)>) = if self
+            .inner
+            .self_hosted
+        {
+            (
+                Method::GET,
+                None,
+                vec![
+                    ("user_id", user_id.to_string()),
+                    ("agent_id", agent_id.to_string()),
+                ],
+            )
+        } else {
+            (
+                Method::POST,
+                Some(
+                    json!({"filters": build_filters(user_id, Some(agent_id), run_id, None, None)}),
+                ),
+                vec![
+                    ("page", "1".to_string()),
+                    ("page_size", MAX_LIST_ENTRIES.to_string()),
+                ],
+            )
+        };
         match self
             .inner
             .request(
@@ -1216,6 +1299,17 @@ impl Tool for Mem0UpdateTool {
         if text.is_empty() {
             return Err(ToolError::InvalidParams("text cannot be empty".into()));
         }
+        if let Err(out) = fetch_owned(
+            &self.inner,
+            memory_id,
+            ctx.user.id.as_str(),
+            ctx.agent_id.as_str(),
+            ctx,
+        )
+        .await
+        {
+            return Ok(out);
+        }
         let path = format!("/v1/memories/{memory_id}/");
         let body = json!({"text": text});
         match self
@@ -1249,7 +1343,22 @@ struct Mem0DeleteTool {
 }
 
 impl Mem0DeleteTool {
-    async fn delete_by_id(&self, memory_id: &str, ctx: &ToolContext) -> ToolOutput {
+    /// `verify` is `false` only for an id this tool just found through a
+    /// scoped search — that search already proved the partition, and a second
+    /// lookup would only cost a round-trip.
+    async fn delete_by_id(&self, memory_id: &str, ctx: &ToolContext, verify: bool) -> ToolOutput {
+        if verify
+            && let Err(out) = fetch_owned(
+                &self.inner,
+                memory_id,
+                ctx.user.id.as_str(),
+                ctx.agent_id.as_str(),
+                ctx,
+            )
+            .await
+        {
+            return out;
+        }
         let path = format!("/v1/memories/{memory_id}/");
         match self
             .inner
@@ -1295,7 +1404,6 @@ impl Tool for Mem0DeleteTool {
                 "query": {"type": "string", "description": "Search query to find and delete a memory."},
                 "all": {"type": "boolean", "description": "Delete ALL of the user's memories. Requires confirm: true."},
                 "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."},
-                "agentId": {"type": "string", "description": "Agent namespace scope."}
             },
             "required": []
         })
@@ -1306,21 +1414,26 @@ impl Tool for Mem0DeleteTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = ctx.agent_id.as_str();
 
         if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
-            return Ok(self.delete_by_id(memory_id, ctx).await);
+            return Ok(self.delete_by_id(memory_id, ctx, true).await);
         }
 
         if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
             let body = if self.inner.self_hosted {
-                json!({"query": query, "user_id": user_id, "limit": DELETE_SEARCH_TOP_K})
+                json!({
+                    "query": query,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "limit": DELETE_SEARCH_TOP_K,
+                })
             } else {
                 json!({
                     "query": query,
                     "top_k": DELETE_SEARCH_TOP_K,
                     "threshold": DEFAULT_SEARCH_THRESHOLD,
-                    "filters": build_filters(user_id, agent_id, None, None, None),
+                    "filters": build_filters(user_id, Some(agent_id), None, None, None),
                 })
             };
             let resp = match self
@@ -1357,7 +1470,7 @@ impl Tool for Mem0DeleteTool {
                 if id.is_empty() {
                     return Ok(ToolOutput::Error("matched memory has no id".into()));
                 }
-                return Ok(self.delete_by_id(id, ctx).await);
+                return Ok(self.delete_by_id(id, ctx, false).await);
             }
             let candidates: Vec<Value> = items
                 .iter()
@@ -1385,10 +1498,12 @@ impl Tool for Mem0DeleteTool {
                     "Bulk deletion requires confirm: true.".into(),
                 ));
             }
-            let mut qp = vec![("user_id", user_id.to_string())];
-            if let Some(agent_id) = agent_id {
-                qp.push(("agent_id", agent_id.to_string()));
-            }
+            // Always agent-scoped: a bulk delete must not be able to reach
+            // past this session's partition into another persona's memories.
+            let qp = vec![
+                ("user_id", user_id.to_string()),
+                ("agent_id", agent_id.to_string()),
+            ];
             return match self
                 .inner
                 .request(
@@ -1731,11 +1846,22 @@ mod tests {
         assert_eq!(with_cats["AND"][1]["categories"]["in"][0], "identity");
     }
 
+    /// `filters` is a tool parameter, so it is model-controlled. It used to be
+    /// returned verbatim when it carried a top-level `AND`/`OR`, which dropped
+    /// the mandatory scope with it — a way to read another user's memories,
+    /// not merely another agent's. It is nested, never substituted.
     #[test]
-    fn build_filters_passes_through_prebuilt_and_or() {
-        let prebuilt = json!({"OR": [{"user_id": "a"}, {"user_id": "b"}]});
-        let f = build_filters("ignored", None, None, None, Some(&prebuilt));
-        assert_eq!(f, prebuilt);
+    fn a_model_supplied_filter_cannot_displace_the_mandatory_scope() {
+        let hostile = json!({"OR": [{"user_id": "someone-else"}, {"user_id": "a-third-party"}]});
+        let f = build_filters("u-1", Some("a-1"), None, None, Some(&hostile));
+
+        let conds = f["AND"].as_array().expect("scoped under AND");
+        assert_eq!(conds[0]["user_id"], "u-1");
+        assert_eq!(conds[1]["agent_id"], "a-1");
+        assert!(
+            conds.contains(&hostile),
+            "the caller's condition survives, as one more conjunct: {f}"
+        );
     }
 
     #[test]

@@ -82,6 +82,56 @@ A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invoc
 
 The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `ContextManager::expand_slash_command` matches the leading `/<cmd>` against the invocable skill set and injects the skill body. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#slash-completion) for the full wiring.
 
+### Per-agent overlays
+
+**A custom agent does not inherit the shared set.** The built-in's skills
+*are* that set (builtins + `<workspace>/skills/`), and an unbound session is
+the built-in; a custom agent starts from nothing but its own overlay at
+`<workspace>/personas/<agent_id>/skills/`, same one-directory-per-skill shape.
+A persona someone curated should not silently acquire every skill the
+workspace happens to hold — granting one is a decision, so it is made by
+putting the skill in that agent's folder.
+
+The one exception is `UNIVERSAL_SKILLS`, currently just `baybo-cli`: it tells
+the agent how to introspect the instance it is running inside (the Bash tool
+injects `BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for exactly that), so it is
+runtime infrastructure rather than a capability anyone chose to grant.
+Withholding it would not make a persona narrower, only blinder. `deck` is
+deliberately *not* in the list — an authoring tool is a capability.
+
+`SkillRegistry` holds overlays in a second map keyed by profile id, and every
+session-scoped read goes through the scoped pair:
+
+- `get_scoped(agent, name)` — the agent's overlay first, then the shared set.
+- `summaries_for(agent)` — the shared set for the built-in; for a custom
+  agent, its overlay ∪ `UNIVERSAL_SKILLS`, **overlay winning a name
+  collision**; sorted by name so ordering is stable across turns. `ContextManager` routes the per-turn listing, the
+  post-compaction trailer, and slash candidates through it.
+- `ensure_agent_overlay(agent, paths)` — **the only thing that fills that
+  map**, so every reader of an agent's scope calls it first: the actor build
+  (`runtime.rs`, on the cold spawn of a bound session) and `GET /v1/skills`
+  when the query names an agent. It derives `personas/<id>/skills/` from the
+  id, so a call site holding only a session's agent needs nothing else;
+  the built-in and an already-scanned agent are both no-ops. `reload()`
+  replays overlays after builtins and the shared dirs.
+
+Loading is lazy rather than part of boot because the set of agents is DB
+state: `ensure_layout` cannot enumerate persona folders to scan, and a scan at
+profile-creation time would miss every agent that already existed. The cost of
+getting this wrong is silent — an unloaded overlay is indistinguishable from an
+empty one, and the agent simply has no skills — so the seam is one function
+with no separate "is it loaded" question for a caller to forget.
+
+A name that exists only in another agent's overlay — or in a shared set this
+agent does not inherit — simply misses, so the `Skill` tool answers "unknown
+skill" rather than a refusal that would leak an inventory. One consequence
+worth knowing: a custom agent has no `/deck`, because that builtin is a
+capability like any other. Governance is unchanged: persona folders are
+workspace content, so their skills are `Trusted` and the risk assessor judges
+them by content hash like any other. `SkillInstall` / `SkillUninstall` keep
+targeting the shared folder — overlays are hand-authored. The built-in
+profile has no overlay: its skills *are* the shared set.
+
 ### Three-tier trust model
 
 - **Trusted**: workspace or admin-placed skills. May hot-reload and request full tool set.
@@ -124,13 +174,10 @@ tool call this deliberately skips the risk assessor — an explicit user
 slash command is treated as authorized. Sub-file fetches the model
 issues afterwards still go through the gated `Skill` tool.
 
-`SkillRegistry::select` still exists with the same two cases (exact
-`/<cmd>` narrows to one; anything else returns the full set) but
-currently has no production callers — slash matching goes through
-`detect_slash_invocation` in `baybo-context` and the per-turn list
-through `all_summaries_sorted`. `score` on every returned
-`SkillCandidate` is `1.0`; the method and field are kept for future
-ranking work.
+Slash matching goes through `detect_slash_invocation` in `baybo-context`
+and the per-turn list through `all_summaries_sorted`. There is no ranking
+stage: no registry method scores or filters by relevance, and none is
+declared in anticipation of one.
 
 Downstream gating happens lazily, on call:
 

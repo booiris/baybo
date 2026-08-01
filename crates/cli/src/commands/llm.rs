@@ -775,8 +775,7 @@ fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
 fn notify_running_gateway(ctx: &CommandContext) -> String {
     use std::fs::{OpenOptions, TryLockError};
 
-    let lock_path =
-        baybo_workspace::WorkspacePaths::new(ctx.workspace.root.clone()).singleton_lock();
+    let lock_path = ctx.workspace.singleton_lock();
     let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
         return RESTART_HINT.to_string();
     };

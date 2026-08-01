@@ -60,6 +60,10 @@ async fn router_with_reloader(
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let config_reloader = reloader_override.unwrap_or_else(|| tg.deps.config_reloader.clone());
     let state = baybo_gateway::server::AdminState {
+        // Per-test workspace, from the same tempdir the deps were built
+        // with: the agents surface writes identity files under it, so a
+        // shared path would leak one test's persona into the next.
+        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
         config: Arc::new(seed),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
@@ -422,6 +426,10 @@ async fn get_usage_aggregates_by_model() {
     use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let state = baybo_gateway::server::AdminState {
+        // Per-test workspace, from the same tempdir the deps were built
+        // with: the agents surface writes identity files under it, so a
+        // shared path would leak one test's persona into the next.
+        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
         config: Arc::new(seed_two_entries()),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),

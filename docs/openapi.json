@@ -31,7 +31,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+                        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
                         "required": [
                           "id",
                           "name",
@@ -73,12 +73,6 @@
                           },
                           "name": {
                             "type": "string"
-                          },
-                          "system_prompt": {
-                            "type": [
-                              "string",
-                              "null"
-                            ]
                           },
                           "updated_at": {
                             "type": "string",
@@ -377,6 +371,414 @@
           },
           "404": {
             "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/identity": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent_identity",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent's self-image (name, creature, vibe, emoji, avatar)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_identity",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentIdentityFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Self-image replaced; carries the new version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The file changed since it was read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/model": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_model",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "LLM pin set (or cleared)"
+          },
+          "400": {
+            "description": "Malformed agent id or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/name": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_name",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentNameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Name set"
+          },
+          "400": {
+            "description": "Malformed agent id or name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/soul": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent_soul",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent's soul (personality, tone)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_soul",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentIdentityFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Soul replaced; carries the new version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentIdentityFileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The file changed since it was read",
             "content": {
               "application/json": {
                 "schema": {
@@ -3647,9 +4049,20 @@
           "skills"
         ],
         "operationId": "list_skills",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "query",
+            "description": "List this agent's scope instead of the shared set",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Registered skills with descriptions",
+            "description": "Skills this scope can invoke",
             "content": {
               "application/json": {
                 "schema": {
@@ -3666,7 +4079,8 @@
                         "description": "One registered skill: its invocation name and a short blurb of what it\ndoes (the `SKILL.md` `description`).",
                         "required": [
                           "name",
-                          "description"
+                          "description",
+                          "universal"
                         ],
                         "properties": {
                           "description": {
@@ -3674,6 +4088,10 @@
                           },
                           "name": {
                             "type": "string"
+                          },
+                          "universal": {
+                            "type": "boolean",
+                            "description": "True for a skill every agent has regardless of persona (runtime\ninfrastructure, not a granted capability). Lets a client show what a\nnot-yet-created agent would start with, without hard-coding the list."
                           }
                         }
                       }
@@ -3685,6 +4103,16 @@
                       ]
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed agent id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -4359,9 +4787,32 @@
           "codex"
         ]
       },
+      "AgentIdentityFileDto": {
+        "type": "object",
+        "description": "Response body for the per-agent identity-file reads.",
+        "required": [
+          "content",
+          "version",
+          "path"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The markdown as it stands on disk."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path this content came from — the agent's own\n`personas/<id>/<FILE>.md`. Surfaced so an operator knows what to edit\nand what to commit; it lives inside a git repo."
+          },
+          "version": {
+            "type": "string",
+            "description": "Hash of exactly the bytes in `content`. Pass it back on `PUT` to make\nthe write conditional — see [`SetAgentIdentityFileRequest::version`]."
+          }
+        }
+      },
       "AgentProfileDto": {
         "type": "object",
-        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+        "description": "One agent profile. Absent `llm` = follow `default-llm`.\n\nNeither the soul nor the skills are fields here. An agent's soul is its\nown `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are\nread live from the registry (`GET /v1/skills?agent_id=`) — both are\nfiles, so they stay editable by hand, by git, and by the agent itself.",
         "required": [
           "id",
           "name",
@@ -4403,12 +4854,6 @@
           },
           "name": {
             "type": "string"
-          },
-          "system_prompt": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "updated_at": {
             "type": "string",
@@ -5326,11 +5771,12 @@
           "name": {
             "type": "string"
           },
-          "system_prompt": {
+          "soul": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Initial soul body. Written once into `personas/<id>/SOUL.md`;\nabsent seeds the shipped template. Later edits go through\n`PUT /v1/agents/{agent_id}/soul` — this field is a convenience for\ncreating an agent in one call, not a second source of truth."
           }
         }
       },
@@ -5402,6 +5848,13 @@
         "type": "object",
         "description": "Request body for `POST /v1/chat/sessions`.",
         "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent this conversation runs as: its soul, its private skills,\nits memory partition. Omitted or `null` ⇒ the built-in profile, which\nis what every channel and TUI session gets.\n\nFixed for the session's life — there is no endpoint that changes it,\nbecause a mid-thread swap would split the memory partition and leave\ntwo personas' output in one transcript. To talk to another agent,\nstart another conversation."
+          },
           "session_id": {
             "type": [
               "string",
@@ -6358,7 +6811,7 @@
         "properties": {
           "apns_env": {
             "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"` (distribution-signed)."
+            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"`\n(distribution-signed)."
           },
           "apns_token": {
             "type": "string",
@@ -6466,6 +6919,50 @@
               "null"
             ],
             "description": "Full blob id from `POST /v1/blobs`, or `null`/absent to clear\nthe avatar."
+          }
+        }
+      },
+      "SetAgentIdentityFileRequest": {
+        "type": "object",
+        "description": "Request body for the per-agent identity-file writes.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `version` from the `GET` this edit started from. When present the\nwrite is compare-and-set: a file that changed underneath returns 409\nand nothing is written.\n\nThis is what makes it safe for a client to render *stale* content —\nwhich the web deliberately does, since it neither polls nor\nsubscribes. Without it, an editor opened before the agent rewrote its\nown file would silently delete that rewrite on the next Save. Absent\nmeans unconditional last-write-wins, for a caller that genuinely\nmeans \"set it to this\" (a script, a restore)."
+          }
+        }
+      },
+      "SetAgentModelRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/model`.",
+        "properties": {
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name, or `null`/absent to follow `default-llm`."
+          }
+        }
+      },
+      "SetAgentNameRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/name`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -6894,7 +7391,6 @@
         "type": "object",
         "description": "Request body for `PUT /v1/agents/{agent_id}` — the **complete** content\nstate (full replace). `name`/`description`/`framework` are required so\nan omitted `framework` can't silently reset a profile to `baybo`;\nabsent nullable fields reset to the inherit-default state.",
         "required": [
-          "name",
           "description",
           "framework"
         ],
@@ -6904,21 +7400,6 @@
           },
           "framework": {
             "$ref": "#/components/schemas/AgentFrameworkDto"
-          },
-          "llm": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "system_prompt": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
@@ -6968,7 +7449,7 @@
         "properties": {
           "apns_env": {
             "type": "string",
-            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"` (distribution-signed)."
+            "description": "APNs environment: `\"sandbox\"` (development-signed) or `\"production\"`\n(distribution-signed)."
           },
           "apns_token": {
             "type": "string",

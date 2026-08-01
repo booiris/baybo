@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
-    CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId, TriggerSource, User,
+    AgentBinding, CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId,
+    TriggerSource, User,
 };
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
@@ -89,7 +90,7 @@ impl Router {
         };
         let session = self
             .session_manager
-            .create_session_with_trigger(
+            .create_bound_session_with_trigger(
                 user,
                 event.channel.clone(),
                 TriggerSource::Cron {
@@ -98,9 +99,53 @@ impl Router {
                     conversation,
                     job_title: Some(event.title.clone()),
                 },
+                self.inherited_binding(event.origin_session_id.as_ref())
+                    .await?,
             )
             .await?;
         Ok(session)
+    }
+
+    /// The agent a fire runs as: the one bound to the conversation that
+    /// scheduled the job.
+    ///
+    /// Derived at fire time from the origin session rather than stored on the
+    /// job — the same rule as cron grouping (`docs/cron-groups.md`), and it
+    /// means re-binding is impossible to get out of step because there is
+    /// nothing to keep in step.
+    ///
+    /// `Ok(None)` covers the two ways a fire legitimately has no agent: the
+    /// job recorded no origin (created before origins were stamped), or the
+    /// origin is itself unbound and so reads as the built-in.
+    ///
+    /// A recorded origin that **cannot be read** is an error, not a third
+    /// flavour of "no agent". Session rows are never deleted, so a missing
+    /// one means the store is inconsistent — and running the fire unbound
+    /// would answer in the wrong persona, write into the wrong memory
+    /// partition, and leave nothing but a `warn!` to say so. Failing the
+    /// mint surfaces it and leaves the schedule to retry.
+    async fn inherited_binding(
+        &self,
+        origin: Option<&SessionId>,
+    ) -> anyhow::Result<Option<AgentBinding>> {
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        let session = self
+            .session_manager
+            .get(origin)
+            .await
+            .map_err(|e| anyhow::anyhow!("read cron origin session {origin}: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cron origin session {origin} is missing; session rows are never deleted, \
+                     so refusing to fire this job as some other agent"
+                )
+            })?;
+        Ok(session.state.agent_id.map(|agent_id| AgentBinding {
+            agent_id,
+            framework: session.state.agent_framework.unwrap_or_default(),
+        }))
     }
 
     /// The task that will report a one-shot's result to the conversation that
@@ -140,6 +185,10 @@ impl Router {
     /// resident and is reclaimed by the idle reaper, like every conversation's.
     async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) {
         let session_id = session.id.clone();
+        // A fresh cron session has no `last_llm` of its own, so without this
+        // a bound agent's scheduled work runs on the pool default rather than
+        // the model its profile pins.
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -147,7 +196,14 @@ impl Router {
             .supervisor
             .route_or_spawn(&session_id, trigger, || {
                 let actor_token = parent_token.child_token();
-                actor_spawner(session, None, None, None, response_tx, actor_token)
+                actor_spawner(
+                    session,
+                    pins.llm,
+                    pins.model,
+                    pins.effort,
+                    response_tx,
+                    actor_token,
+                )
             })
             .await;
         if !routed {
@@ -173,12 +229,13 @@ impl Router {
         waiter: CronResultWaiter,
     ) {
         let session_id = session.id.clone();
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            None,
-            None,
-            None,
+            pins.llm,
+            pins.model,
+            pins.effort,
             response_tx,
             &self.actor_parent_token,
         );
@@ -260,6 +317,7 @@ impl Router {
             supervisor: self.supervisor.clone(),
             cron_store: Arc::clone(&self.cron_store),
             actor_spawner: Arc::clone(&self.actor_spawner),
+            agent_profiles: Arc::clone(&self.agent_profiles),
             actor_parent_token: self.actor_parent_token.clone(),
         }
     }
@@ -525,6 +583,9 @@ pub(super) struct CronResultDelivery {
     supervisor: AgentSupervisor,
     cron_store: Arc<dyn CronStore>,
     actor_spawner: ActorSpawner,
+    /// The origin conversation may be bound to an agent, so hydrating it has
+    /// the same pin resolution as any other cold spawn.
+    agent_profiles: Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
     actor_parent_token: CancellationToken,
 }
 
@@ -559,6 +620,7 @@ impl CronResultDelivery {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
+        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
         let delivered = self
             .supervisor
             .route_or_spawn(
@@ -566,14 +628,11 @@ impl CronResultDelivery {
                 AgentMessage::CronResultReady(Box::new(result)),
                 || {
                     let actor_token = parent_token.child_token();
-                    let pinned = origin.state.last_llm.clone();
-                    let pinned_model = origin.state.last_model.clone();
-                    let pinned_effort = origin.state.last_effort.clone();
                     actor_spawner(
                         origin,
-                        pinned,
-                        pinned_model,
-                        pinned_effort,
+                        pins.llm,
+                        pins.model,
+                        pins.effort,
                         response_tx,
                         actor_token,
                     )
@@ -707,7 +766,20 @@ mod tests {
     }
 
     impl RouterHarness {
+        /// A harness whose store already holds the origin conversation every
+        /// [`Self::event`] names — the ordinary case, since session rows are
+        /// never deleted.
         fn new() -> Self {
+            Self::build(true)
+        }
+
+        /// A harness whose store does *not* hold that origin: the broken
+        /// invariant a fire must refuse rather than paper over.
+        fn without_origin_session() -> Self {
+            Self::build(false)
+        }
+
+        fn build(seed_origin: bool) -> Self {
             let (response_tx, response_rx) = mpsc::channel(64);
             let supervisor = AgentSupervisor::new(response_tx);
             let sessions = Arc::new(SessionManager::new(
@@ -738,9 +810,34 @@ mod tests {
                 vault,
             ));
 
+            if seed_origin {
+                futures::executor::block_on(sessions.store().save(&Session {
+                    id: SessionId::from("sess-user"),
+                    user: User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ChannelType::tui(),
+                    },
+                    channel: ChannelType::tui(),
+                    created_at: Utc::now(),
+                    last_active: Utc::now(),
+                    state: Default::default(),
+                    root_session_id: SessionId::from("sess-user"),
+                    trigger: TriggerSource::User,
+                    lineage: None,
+                    hidden: false,
+                    pinned: false,
+                    archived: false,
+                    folder_id: None,
+                    title: None,
+                }))
+                .expect("seed the origin conversation");
+            }
+
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
             let router = Router::from_config(RouterConfig {
+                agent_profiles: Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new()),
                 session_manager: Arc::clone(&sessions),
                 supervisor: supervisor.clone(),
                 channels: Arc::new(ChannelRegistry::new()),
@@ -808,6 +905,25 @@ mod tests {
                 .pop()
                 .expect("the router must have spawned an actor for the fire")
         }
+    }
+
+    /// The event carries an origin the store does not have. Session rows are
+    /// never deleted, so that is a broken invariant — and firing anyway would
+    /// answer in the wrong persona and write into the wrong memory partition
+    /// with nothing but a log line to show for it.
+    #[tokio::test]
+    async fn a_fire_whose_origin_is_missing_fails_instead_of_running_unbound() {
+        let mut h = RouterHarness::without_origin_session();
+        let err = h
+            .router
+            .handle_cron_trigger(RouterHarness::event(false))
+            .await
+            .expect_err("a missing origin must not be treated as 'no agent'");
+        assert!(err.to_string().contains("never deleted"), "got: {err:#}");
+        assert!(
+            h.supervisor.registered_session_ids().is_empty(),
+            "nothing may be minted for a fire that cannot resolve its agent"
+        );
     }
 
     /// A recurring fire's session is a conversation the user can reply in, so

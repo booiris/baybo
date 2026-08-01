@@ -42,7 +42,6 @@ use baybo_tools::ToolRegistry;
 use baybo_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use baybo_trace::{SpanRecorder, TraceEventStream};
 use baybo_turn::TurnLifecycle;
-use baybo_workspace::WorkspaceManager;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -163,7 +162,7 @@ pub struct ManagerGraph {
     /// endpoints + the SIGHUP handler can trigger a reload; owns the
     /// pricing-refresh loop. See `docs/config-hot-reload.md`.
     pub config_reloader: Arc<dyn baybo_gateway::ConfigReloader>,
-    pub workspace: Arc<WorkspaceManager>,
+    pub workspace: Arc<baybo_workspace::WorkspacePaths>,
     pub channels_registry: Arc<ChannelRegistry>,
     pub secret_vault: Arc<SecretVault>,
     /// Deck card manager (`/v1/deck/*` + the DeckCard* tools). Boot and
@@ -279,7 +278,7 @@ pub async fn build_managers(
         }
         reg
     };
-    let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
+    let workspace = Arc::new(workspace_paths.clone());
     let channels_registry = Arc::new(ChannelRegistry::new());
     // Eagerly install every enabled channel from config so connections
     // can attach to a pre-existing slot rather than racing on lazy
@@ -824,7 +823,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let cron_store_for_spawn = graph.stores.cron.clone();
         let subagent_registry = Arc::clone(&graph.subagent_registry);
         let workspace_paths_arc = Arc::new(baybo_workspace::WorkspacePaths::new(
-            graph.workspace.root.clone(),
+            graph.workspace.root().to_path_buf(),
         ));
         let supervisor_for_spawn = supervisor.clone();
         // Memory subsystem. Constructed in `build_managers` via
@@ -858,6 +857,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // `initial_model` is the chat pick WITHIN that entry
                 // (`session.state.last_model`); `None` ⇒ entry default.
 
+                // The overlay is loaded lazily, here, because the set of
+                // agents is DB state: boot cannot enumerate the persona
+                // folders to scan, and nothing else populates the map that
+                // `summaries_for` / `get_scoped` read.
+                let agent_id = session.state.agent_id_or_builtin();
+                skill_registry.ensure_agent_overlay(&agent_id, &workspace_paths_arc);
+
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
@@ -880,6 +886,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
+                        // One field feeds both the persona arm and the skill
+                        // scope, so a session can never run one agent's soul
+                        // with another's skills.
+                        agent: Some(agent_id),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
@@ -957,7 +967,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     );
 
     let workspace_paths_for_router = Arc::new(baybo_workspace::WorkspacePaths::new(
-        graph.workspace.root.clone(),
+        graph.workspace.root().to_path_buf(),
     ));
 
     // External-agent registry: only kinds the operator has explicitly
@@ -998,6 +1008,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // the chat model-switch endpoint can re-pin live actors.
     let supervisor_for_gateway = supervisor.clone();
     let router = Router::from_config(baybo_agent::router::RouterConfig {
+        agent_profiles: graph.stores.agent_profile.clone(),
         session_manager: Arc::clone(&graph.session_manager),
         supervisor,
         channels: Arc::clone(&graph.channels_registry),

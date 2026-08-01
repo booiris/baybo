@@ -15,7 +15,7 @@ use baybo_store::{ChannelBotStore, ChannelPairingStore};
 use baybo_tools::ToolRegistry;
 use baybo_trace::TraceStore;
 use baybo_turn::TurnLifecycle;
-use baybo_workspace::WorkspaceManager;
+use baybo_workspace::WorkspacePaths;
 
 use crate::format::OutputFormat;
 
@@ -39,7 +39,7 @@ pub struct CommandContext {
     pub tools: Arc<ToolRegistry>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Option<Arc<BillableLlm>>,
-    pub workspace: Arc<WorkspaceManager>,
+    pub workspace: Arc<WorkspacePaths>,
     pub session: Option<Arc<SessionManager>>,
     pub turn: Option<Arc<TurnLifecycle>>,
     pub cron: Option<Arc<CronScheduler>>,
@@ -113,7 +113,7 @@ pub struct ContextBuilder {
     tools: Option<Arc<ToolRegistry>>,
     channels: Option<Arc<ChannelRegistry>>,
     llm: Option<Arc<BillableLlm>>,
-    workspace: Option<Arc<WorkspaceManager>>,
+    workspace: Option<Arc<WorkspacePaths>>,
     session: Option<Arc<SessionManager>>,
     turn: Option<Arc<TurnLifecycle>>,
     cron: Option<Arc<CronScheduler>>,
@@ -178,7 +178,7 @@ impl ContextBuilder {
         self
     }
 
-    pub fn workspace(mut self, workspace: Arc<WorkspaceManager>) -> Self {
+    pub fn workspace(mut self, workspace: Arc<WorkspacePaths>) -> Self {
         self.workspace = Some(workspace);
         self
     }
@@ -268,7 +268,7 @@ impl ContextBuilder {
             llm: self.llm,
             workspace: self
                 .workspace
-                .unwrap_or_else(|| Arc::new(WorkspaceManager::new(PathBuf::from(".")))),
+                .unwrap_or_else(|| Arc::new(WorkspacePaths::new(PathBuf::from(".")))),
             session: self.session,
             turn: self.turn,
             cron: self.cron,

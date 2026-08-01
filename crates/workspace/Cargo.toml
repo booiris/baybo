@@ -12,7 +12,7 @@ anyhow = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
-# `io` brings in async identity-file readers/writers and `WorkspaceManager`.
+# `io` brings in the async identity-file readers and the layout initialiser.
 # Pure-data consumers (baybo-config and similar leaf crates) opt out via
 # `default-features = false` to avoid a transitive tokio/anyhow dep when
 # they only need path constants and `WorkspacePaths`.

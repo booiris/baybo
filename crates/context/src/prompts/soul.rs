@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use baybo_workspace::{IdentityKind, WorkspacePaths, absolutise};
+use baybo_workspace::{IdentitySource, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
@@ -35,31 +35,39 @@ When a subagent or command runs in the background — you spawned it with `backg
 /// first message that may carry one.
 const TAIL_HINT: &str = r#"Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear."#;
 
-/// Assemble the system prompt from the workspace identity files: [`TOP_HINT`]
-/// up front (agent role + Edit affordance), the three identity sections
-/// (`soul` / `identity` / `user_profile`), then [`TAIL_HINT`]
-/// (tag-handling guidance). Reads the files via the auto-seeding free
-/// `load_identity_files`, so a deleted file is recreated rather than left
-/// half-formed.
-pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let identity = baybo_workspace::identity::load_identity_files(paths.root()).await?;
+/// Assemble the system prompt: [`TOP_HINT`] up front (agent role + Edit
+/// affordance), the three identity sections (`soul` / `identity` /
+/// `user_profile`), then [`TAIL_HINT`] (tag-handling guidance). Reads the
+/// files via the auto-seeding `load_identity_files`, so a deleted file is
+/// recreated rather than left half-formed.
+///
+/// All three sources belong to the agent, which reads
+/// `personas/<id>/{SOUL,IDENTITY,USER}.md` — the built-in included, at
+/// `personas/baybo/`. Each carries what to create that file with if it does
+/// not exist yet.
+///
+/// `user_notes` is the agent's *own* record of the human. The stable facts the
+/// operator curates live in the shared `personas/USER.md`, which belongs to no
+/// agent and is always emitted as its own `<shared_user_profile>` section.
+pub async fn assemble(
+    paths: &WorkspacePaths,
+    soul: IdentitySource<'_>,
+    self_image: IdentitySource<'_>,
+    user_notes: IdentitySource<'_>,
+) -> anyhow::Result<String> {
+    let identity =
+        baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
+            .await?;
     let parts = [
         TOP_HINT.to_string(),
+        wrap_section("soul", soul.path, &identity.soul),
+        wrap_section("identity", self_image.path, &identity.identity),
         wrap_section(
-            "soul",
-            &paths.identity_file(IdentityKind::Soul),
-            &identity.soul,
+            "shared_user_profile",
+            &paths.shared_user_file(),
+            &identity.shared_user,
         ),
-        wrap_section(
-            "identity",
-            &paths.identity_file(IdentityKind::Identity),
-            &identity.identity,
-        ),
-        wrap_section(
-            "user_profile",
-            &paths.identity_file(IdentityKind::User),
-            &identity.user,
-        ),
+        wrap_section("user_notes", user_notes.path, &identity.user),
         BACKGROUND_TASKS_HINT.to_string(),
         TAIL_HINT.to_string(),
     ];
@@ -82,22 +90,41 @@ fn wrap_section(tag: &str, path: &Path, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_workspace::IdentityKind;
 
     #[tokio::test]
     async fn assembles_hint_sections_and_tail_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = WorkspacePaths::new(dir.path().to_path_buf());
-        let prompt = assemble_from_workspace(&paths).await.expect("assemble");
+        let file =
+            |kind| paths.persona_identity_file(baybo_workspace::paths::BUILTIN_PERSONA_DIR, kind);
+        let (soul_path, identity_path, user_path) = (
+            file(IdentityKind::Soul),
+            file(IdentityKind::Identity),
+            file(IdentityKind::User),
+        );
+        let prompt = assemble(
+            &paths,
+            IdentitySource::new(&soul_path, IdentityKind::Soul.default_content()),
+            IdentitySource::new(&identity_path, IdentityKind::Identity.default_content()),
+            IdentitySource::new(&user_path, IdentityKind::User.default_content()),
+        )
+        .await
+        .expect("assemble");
 
         assert!(prompt.starts_with("You are an intelligent AI assistant."));
         let soul = prompt.find("<soul ").expect("soul tag");
         let identity = prompt.find("<identity ").expect("identity tag");
-        let user = prompt.find("<user_profile ").expect("user_profile tag");
+        let shared = prompt
+            .find("<shared_user_profile ")
+            .expect("shared_user_profile tag");
+        let notes = prompt.find("<user_notes ").expect("user_notes tag");
         let background = prompt.find("# Background work").expect("background hint");
         let tail = prompt
             .find("Tool results and user messages may include <system-reminder>")
             .expect("tail hint");
-        assert!(soul < identity && identity < user && user < background && background < tail);
+        assert!(soul < identity && identity < shared && shared < notes);
+        assert!(notes < background && background < tail);
         assert!(prompt.trim_end().ends_with(
             "They bear no direct relation to the specific tool results or user messages in which they appear."
         ));

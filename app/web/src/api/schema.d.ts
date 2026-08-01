@@ -52,6 +52,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/agents/{agent_id}/identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent_identity"];
+        put: operations["set_agent_identity"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_model"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_name"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/soul": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent_soul"];
+        put: operations["set_agent_soul"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/analytics": {
         parameters: {
             query?: never;
@@ -1026,10 +1090,29 @@ export interface components {
          * @enum {string}
          */
         AgentFrameworkDto: "baybo" | "claude" | "codex";
+        /** @description Response body for the per-agent identity-file reads. */
+        AgentIdentityFileDto: {
+            /** @description The markdown as it stands on disk. */
+            content: string;
+            /**
+             * @description Absolute path this content came from — the agent's own
+             *     `personas/<id>/<FILE>.md`. Surfaced so an operator knows what to edit
+             *     and what to commit; it lives inside a git repo.
+             */
+            path: string;
+            /**
+             * @description Hash of exactly the bytes in `content`. Pass it back on `PUT` to make
+             *     the write conditional — see [`SetAgentIdentityFileRequest::version`].
+             */
+            version: string;
+        };
         /**
-         * @description One agent profile. Absent `system_prompt` = workspace Soul; absent
-         *     `llm` = follow `default-llm`. Skills are not part of the profile — they
-         *     are read live from the skill registry (`GET /v1/skills`).
+         * @description One agent profile. Absent `llm` = follow `default-llm`.
+         *
+         *     Neither the soul nor the skills are fields here. An agent's soul is its
+         *     own `SOUL.md` (`GET`/`PUT /v1/agents/{agent_id}/soul`) and its skills are
+         *     read live from the registry (`GET /v1/skills?agent_id=`) — both are
+         *     files, so they stay editable by hand, by git, and by the agent itself.
          */
         AgentProfileDto: {
             avatar_blob_id?: string | null;
@@ -1045,7 +1128,6 @@ export interface components {
             id: string;
             llm?: string | null;
             name: string;
-            system_prompt?: string | null;
             /** Format: date-time */
             updated_at: string;
         };
@@ -1678,7 +1760,13 @@ export interface components {
              */
             llm?: string | null;
             name: string;
-            system_prompt?: string | null;
+            /**
+             * @description Initial soul body. Written once into `personas/<id>/SOUL.md`;
+             *     absent seeds the shipped template. Later edits go through
+             *     `PUT /v1/agents/{agent_id}/soul` — this field is a convenience for
+             *     creating an agent in one call, not a second source of truth.
+             */
+            soul?: string | null;
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
@@ -1711,6 +1799,17 @@ export interface components {
         };
         /** @description Request body for `POST /v1/chat/sessions`. */
         CreateSessionRequest: {
+            /**
+             * @description The agent this conversation runs as: its soul, its private skills,
+             *     its memory partition. Omitted or `null` ⇒ the built-in profile, which
+             *     is what every channel and TUI session gets.
+             *
+             *     Fixed for the session's life — there is no endpoint that changes it,
+             *     because a mid-thread swap would split the memory partition and leave
+             *     two personas' output in one transcript. To talk to another agent,
+             *     start another conversation.
+             */
+            agent_id?: string | null;
             /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
             session_id?: string | null;
         };
@@ -2131,7 +2230,10 @@ export interface components {
         };
         /** @description Request body for `POST /v1/push/register`. */
         RegisterPushRequest: {
-            /** @description APNs environment: `"sandbox"` (development-signed) or `"production"` (distribution-signed). */
+            /**
+             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
+             *     (distribution-signed).
+             */
             apns_env: string;
             /** @description The client's current APNs device token (hex). */
             apns_token: string;
@@ -2193,6 +2295,32 @@ export interface components {
              *     the avatar.
              */
             blob_id?: string | null;
+        };
+        /** @description Request body for the per-agent identity-file writes. */
+        SetAgentIdentityFileRequest: {
+            content: string;
+            /**
+             * @description The `version` from the `GET` this edit started from. When present the
+             *     write is compare-and-set: a file that changed underneath returns 409
+             *     and nothing is written.
+             *
+             *     This is what makes it safe for a client to render *stale* content —
+             *     which the web deliberately does, since it neither polls nor
+             *     subscribes. Without it, an editor opened before the agent rewrote its
+             *     own file would silently delete that rewrite on the next Save. Absent
+             *     means unconditional last-write-wins, for a caller that genuinely
+             *     means "set it to this" (a script, a restore).
+             */
+            version?: string | null;
+        };
+        /** @description Request body for `PUT /v1/agents/{agent_id}/model`. */
+        SetAgentModelRequest: {
+            /** @description `baybo.json` LLM entry name, or `null`/absent to follow `default-llm`. */
+            llm?: string | null;
+        };
+        /** @description Request body for `PUT /v1/agents/{agent_id}/name`. */
+        SetAgentNameRequest: {
+            name: string;
         };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
@@ -2390,9 +2518,6 @@ export interface components {
         UpdateAgentProfileRequest: {
             description: string;
             framework: components["schemas"]["AgentFrameworkDto"];
-            llm?: string | null;
-            name: string;
-            system_prompt?: string | null;
         };
         /**
          * @description `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
@@ -2419,7 +2544,10 @@ export interface components {
         };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
         UpdateDeviceApnsTokenRequest: {
-            /** @description APNs environment: `"sandbox"` (development-signed) or `"production"` (distribution-signed). */
+            /**
+             * @description APNs environment: `"sandbox"` (development-signed) or `"production"`
+             *     (distribution-signed).
+             */
             apns_env: string;
             /** @description The device's current APNs device token (hex). */
             apns_token: string;
@@ -2507,7 +2635,6 @@ export interface operations {
                             id: string;
                             llm?: string | null;
                             name: string;
-                            system_prompt?: string | null;
                             /** Format: date-time */
                             updated_at: string;
                         }[];
@@ -2752,6 +2879,336 @@ export interface operations {
             };
             /** @description No such agent profile */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_agent_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent's self-image (name, creature, vibe, emoji, avatar) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentIdentityFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Self-image replaced; carries the new version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The file changed since it was read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentModelRequest"];
+            };
+        };
+        responses: {
+            /** @description LLM pin set (or cleared) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_name: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentNameRequest"];
+            };
+        };
+        responses: {
+            /** @description Name set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed agent id or name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_agent_soul: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent's soul (personality, tone) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_soul: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentIdentityFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Soul replaced; carries the new version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentIdentityFileDto"];
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The file changed since it was read */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5367,14 +5824,17 @@ export interface operations {
     };
     list_skills: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description List this agent's scope instead of the shared set */
+                agent_id?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Registered skills with descriptions */
+            /** @description Skills this scope can invoke */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5384,9 +5844,24 @@ export interface operations {
                         items: {
                             description: string;
                             name: string;
+                            /**
+                             * @description True for a skill every agent has regardless of persona (runtime
+                             *     infrastructure, not a granted capability). Lets a client show what a
+                             *     not-yet-created agent would start with, without hard-coding the list.
+                             */
+                            universal: boolean;
                         }[];
                         next_cursor?: string | null;
                     };
+                };
+            };
+            /** @description Malformed agent id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */

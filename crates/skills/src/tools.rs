@@ -156,9 +156,12 @@ impl Tool for SkillTool {
             )));
         }
 
+        // Scoped lookup: this agent's overlay first, then the shared set. A
+        // name that exists only in another agent's overlay is simply not
+        // found — the miss must not reveal that it exists elsewhere.
         let skill = self
             .registry
-            .get(&p.skill)
+            .get_scoped(Some(&ctx.agent_id), &p.skill)
             .ok_or_else(|| ToolError::NotFound(format!("skill '{}'", p.skill)))?;
 
         if !skill.agent_invocable {

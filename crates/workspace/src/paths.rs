@@ -11,17 +11,18 @@
 //! ```text
 //! <root>/
 //!   config/            # standalone git repo: baybo.json, .mcp.json
-//!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
+//!   personas/          # standalone git repo: USER.md (shared) + <agent>/{SOUL,IDENTITY,USER}.md + skills/
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), tmp/ (disposable, swept), other scratch
 //!   logs/              # not version-controlled: baybo.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
-//! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
-//! first `ensure_layout`; the workspace root itself is not git-tracked.
+//! `config/`, `skills/`, `agents/` and `personas/` each get their own `.git`
+//! repo on first `ensure_layout`; the workspace root itself is not
+//! git-tracked.
 
 use std::path::{Path, PathBuf};
 
@@ -35,9 +36,11 @@ use crate::prompt::*;
 /// Operator-edited, version-controlled.
 pub const CONFIG_DIR: &str = "config";
 
-/// Standalone git repo at `<root>/profile/`: identity markdown files
-/// (AGENTS, SOUL, USER, IDENTITY).
-pub const PROFILE_DIR: &str = "profile";
+/// Directory name of the built-in agent's persona inside [`PERSONAS_DIR`].
+/// Mirrors `baybo_model::BUILTIN_AGENT_PROFILE_ID`, which is defined as this
+/// const — the built-in's id *is* its directory name, and paths are this
+/// crate's job.
+pub const BUILTIN_PERSONA_DIR: &str = "baybo";
 
 /// Standalone git repo at `<root>/skills/`: workspace-local skill definitions.
 pub const SKILLS_DIR: &str = "skills";
@@ -47,6 +50,23 @@ pub const SKILLS_DIR: &str = "skills";
 /// directory-per-profile ceremony — a profile has no linked-files
 /// concern, only a frontmatter + system-prompt body).
 pub const AGENTS_DIR: &str = "agents";
+
+/// Standalone git repo at `<root>/personas/`: one directory per agent —
+/// the built-in included, at `personas/baybo/` — each carrying that agent's
+/// `SOUL.md`, `IDENTITY.md`, `USER.md` and its private `skills/` overlay.
+///
+/// The one file directly inside it, [`SHARED_USER_FILE`], belongs to no
+/// agent: it is the human's profile, which every agent reads.
+pub const PERSONAS_DIR: &str = "personas";
+
+/// The shared human profile at `<root>/personas/USER.md`. Read by every
+/// agent alongside its own `USER.md` notes, and owned by none of them —
+/// which is why it sits beside the agent directories rather than inside one.
+pub const SHARED_USER_FILE: &str = "USER.md";
+
+/// Per-agent private skill overlay, at `<root>/personas/<id>/skills/`.
+/// Same one-directory-per-skill shape as the shared `skills/` tree.
+pub const PERSONA_SKILLS_DIR: &str = "skills";
 
 /// Deck card bundles at `<root>/deck/<uuid>/` — agent-authored plain
 /// files (docs/modules/deck.md). Installed atomically via a `.staging/`
@@ -79,7 +99,7 @@ pub const WORKSPACE_CONFIG_FILE: &str = "baybo.json";
 pub const MCP_CONFIG_FILE: &str = ".mcp.json";
 
 // ---------------------------------------------------------------------------
-// Files inside `profile/` (standalone git repo)
+// Identity file names, shared by every persona directory
 // ---------------------------------------------------------------------------
 
 pub const IDENTITY_SOUL_FILE: &str = "SOUL.md";
@@ -354,10 +374,6 @@ impl WorkspacePaths {
         self.root.join(CONFIG_DIR)
     }
 
-    pub fn profile_dir(&self) -> PathBuf {
-        self.root.join(PROFILE_DIR)
-    }
-
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(SKILLS_DIR)
     }
@@ -368,6 +384,38 @@ impl WorkspacePaths {
 
     pub fn deck_dir(&self) -> PathBuf {
         self.root.join(DECK_DIR)
+    }
+
+    /// Root of the per-agent persona tree: `<root>/personas/`.
+    pub fn personas_dir(&self) -> PathBuf {
+        self.root.join(PERSONAS_DIR)
+    }
+
+    /// One agent's persona directory: `<root>/personas/<agent_id>/`.
+    ///
+    /// Callers hold an `AgentProfileId`, whose grammar is what keeps the
+    /// joined component inside `personas/`; this crate is leaf-level and
+    /// takes the id as a `&str`.
+    pub fn persona_dir(&self, agent_id: &str) -> PathBuf {
+        self.personas_dir().join(agent_id)
+    }
+
+    /// One agent's own copy of an identity file:
+    /// `<root>/personas/<agent_id>/<FILE>.md`.
+    ///
+    /// Only `SOUL.md` and `IDENTITY.md` are ever addressed this way —
+    /// personality and self-image belong to the agent, while `USER.md`
+    /// describes the human and also has a shared copy. This method
+    /// takes any kind because it is pure address arithmetic; the routing
+    /// rule lives with the agent id (`AgentProfileId::identity_file`).
+    pub fn persona_identity_file(&self, agent_id: &str, kind: IdentityKind) -> PathBuf {
+        self.persona_dir(agent_id).join(kind.file_name())
+    }
+
+    /// One agent's private skill overlay:
+    /// `<root>/personas/<agent_id>/skills/`.
+    pub fn persona_skills_dir(&self, agent_id: &str) -> PathBuf {
+        self.persona_dir(agent_id).join(PERSONA_SKILLS_DIR)
     }
 
     pub fn key_dir(&self) -> PathBuf {
@@ -410,10 +458,11 @@ impl WorkspacePaths {
         self.config_dir().join(MCP_CONFIG_FILE)
     }
 
-    // -- profile/ contents --
+    // -- personas/ contents --
 
-    pub fn identity_file(&self, kind: IdentityKind) -> PathBuf {
-        self.profile_dir().join(kind.file_name())
+    /// The human's shared profile: `<root>/personas/USER.md`.
+    pub fn shared_user_file(&self) -> PathBuf {
+        self.personas_dir().join(SHARED_USER_FILE)
     }
 
     // -- .key/ contents --
@@ -529,10 +578,14 @@ mod tests {
             PathBuf::from("/var/baybo/config/baybo.json")
         );
         assert_eq!(p.mcp_config(), PathBuf::from("/var/baybo/config/.mcp.json"));
-        assert_eq!(p.profile_dir(), PathBuf::from("/var/baybo/profile"));
+        assert_eq!(p.personas_dir(), PathBuf::from("/var/baybo/personas"));
         assert_eq!(
-            p.identity_file(IdentityKind::Soul),
-            PathBuf::from("/var/baybo/profile/SOUL.md"),
+            p.shared_user_file(),
+            PathBuf::from("/var/baybo/personas/USER.md")
+        );
+        assert_eq!(
+            p.persona_identity_file(BUILTIN_PERSONA_DIR, IdentityKind::Soul),
+            PathBuf::from("/var/baybo/personas/baybo/SOUL.md"),
         );
         assert_eq!(p.key_dir(), PathBuf::from("/var/baybo/.key"));
         assert_eq!(

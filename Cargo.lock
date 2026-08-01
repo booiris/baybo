@@ -404,6 +404,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "baybo-memory",
+ "baybo-model",
  "chrono",
  "clap",
  "futures",
@@ -828,6 +829,7 @@ dependencies = [
 name = "baybo-model"
 version = "0.1.0"
 dependencies = [
+ "baybo-workspace",
  "chrono",
  "chrono-tz",
  "serde",
@@ -1053,6 +1055,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "parking_lot",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",

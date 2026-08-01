@@ -20,7 +20,8 @@ mod task;
 mod tool_output;
 
 pub use agent_profile::{
-    AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, MAX_AGENT_PROFILE_NAME_CHARS,
+    AgentBinding, AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, InvalidAgentProfileId,
+    MAX_AGENT_PROFILE_ID_CHARS, MAX_AGENT_PROFILE_NAME_CHARS,
 };
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 pub use control_event::{ControlEvent, ControlEventKind, control_event_row_id};

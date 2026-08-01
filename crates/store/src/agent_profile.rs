@@ -18,18 +18,14 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// One row of `agent_profiles`.
 ///
 /// `None` on a nullable field consistently means "inherit the default":
-/// `system_prompt` → workspace Soul, `llm` → `default-llm`. Skills are not
-/// a profile field — they are read live from the skill registry (see
-/// `docs/modules/agent-profiles.md`).
+/// `llm` → `default-llm`. Skills are not a profile field — they are read
+/// live from the skill registry (see `docs/modules/agent-profiles.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfileRow {
     pub id: AgentProfileId,
-    /// Display name; unique across profiles, ASCII case-insensitive.
-    pub name: String,
     pub description: String,
     /// Full blob id (`sha256:<digest>.<read-token>`) from the blob store.
     pub avatar_blob_id: Option<String>,
-    pub system_prompt: Option<String>,
     pub framework: AgentFramework,
     pub llm: Option<LlmEntryName>,
     /// Read-side state only — never bound on insert; the sqlite seed is
@@ -44,40 +40,57 @@ pub struct AgentProfileRow {
 /// [`AgentProfileStore::set_avatar`]), no `builtin`, no timestamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfileUpdate {
-    pub name: String,
     pub description: String,
-    pub system_prompt: Option<String>,
     pub framework: AgentFramework,
-    pub llm: Option<LlmEntryName>,
 }
 
-/// Agent-profile lifecycle persistence. The store is a dumb writer — name
-/// validation and the llm/avatar-blob checks live one layer up (the gateway
-/// handlers); the only policy baked in here is the structural builtin lock.
+/// Agent-profile lifecycle persistence. The store is a dumb writer — the
+/// llm/avatar-blob checks live one layer up (the gateway handlers); the only
+/// policy baked in here is the structural builtin lock.
+///
+/// There is no display name in this trait: an agent's name lives in its own
+/// `IDENTITY.md`, so it is neither stored nor unique. Rows order by id and
+/// the gateway sorts by the derived name after reading it.
 #[async_trait]
 pub trait AgentProfileStore: Send + Sync {
-    /// Every profile, builtin first then by case-insensitive name.
+    /// Every profile, builtin first then by id.
     async fn list(&self) -> Result<Vec<AgentProfileRow>>;
 
     /// Fetch a single profile, or `None` if it doesn't exist.
     async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>>;
 
     /// Insert a new profile row. Never binds `builtin` (the schema default
-    /// fills it with 0). A name collision (ASCII case-insensitive) is
+    /// fills it with 0). A duplicate id is
     /// [`StorageError::Conflict`].
     async fn create(&self, row: &AgentProfileRow) -> Result<()>;
 
-    /// Full-replace the content fields and bump `updated_at`. Guarded
-    /// `WHERE builtin = 0`; returns `Ok(false)` if no row matched (missing
-    /// id, or the builtin behind the guard). A rename onto another row's
-    /// name is [`StorageError::Conflict`]; renaming a row to its own name
-    /// (any casing) is not.
+    /// Full-replace the content fields and bump `updated_at`.
+    ///
+    /// Reaches the builtin, with one carve-out: **its framework is never
+    /// written**. The built-in agent runs on baybo by definition — that is
+    /// what makes its row the default behaviour — so the statement leaves
+    /// that column alone for `builtin = 1` rather than trusting callers.
+    /// Its description is ordinary editable text. Returns `Ok(false)` only
+    /// when no row matched.
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool>;
 
     /// Set or clear the avatar and bump `updated_at`. Deliberately not
-    /// builtin-guarded — the avatar is the one field the builtin allows.
-    /// Returns `Ok(false)` if no row matched.
+    /// builtin-guarded: the avatar is the builtin's, and picking a face for
+    /// it says nothing about what "default behaviour" means. Returns
+    /// `Ok(false)` if no row matched.
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool>;
+
+    /// Set or clear the LLM pin and bump `updated_at`.
+    ///
+    /// **The builtin's pin is forced to `NULL`**, whatever is passed: that
+    /// row *is* default behaviour, so it follows `default-llm` by
+    /// definition. Pinning it would duplicate that setting into a second
+    /// place they could disagree — change `default-llm` instead. Like the
+    /// framework pin, the statement enforces this rather than a caller
+    /// remembering to, and it normalises a row an earlier build let drift.
+    ///
+    /// Returns `Ok(false)` if no row matched.
+    async fn set_llm(&self, id: &AgentProfileId, llm: Option<&LlmEntryName>) -> Result<bool>;
 
     /// Plain row delete, guarded `WHERE builtin = 0`. Returns `Ok(false)`
     /// if no row matched (missing id, or the builtin behind the guard).

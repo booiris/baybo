@@ -385,6 +385,16 @@ const ADD_COLUMNS: &[AddColumn] = &[
     },
     AddColumn {
         table: "sessions",
+        column: "agent_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "agent_framework",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
         column: "last_model",
         definition: "TEXT",
     },
@@ -668,6 +678,20 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     read_cursor           INTEGER,
                     -- Auto-generated conversation title; owned by set_title.
                     title                 TEXT,
+                    -- The agent profile this session's work belongs to: its
+                    -- soul, skill overlay and memory partition. NULL ⇒ the
+                    -- built-in `baybo` profile, which is what every
+                    -- pre-binding row and every channel/TUI session reads as.
+                    -- Unlike the other flat columns these two have NO setter
+                    -- at all: `save`'s INSERT seeds them and its DO UPDATE
+                    -- omits them, which is what makes the binding write-once
+                    -- structurally rather than by convention.
+                    agent_id              TEXT,
+                    -- The bound profile's framework as it stood at creation
+                    -- (AgentFramework::as_str()). A snapshot on purpose: a
+                    -- transcript written by baybo's own loop cannot later be
+                    -- served by an external CLI. NULL ⇒ baybo.
+                    agent_framework       TEXT,
                     data                  TEXT NOT NULL
                 );
                 -- idx_sessions_root is no longer created (2026-07
@@ -1043,14 +1067,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- impl and create never binds `builtin`, so the open()-time
                 -- seed is the only writer of 1. avatar_blob_id is a soft
                 -- reference into blobs (FKs are off — see set_wal_mode).
-                -- Skills are not stored here — they are read live from the
-                -- skill registry (see docs/modules/agent-profiles.md).
+                -- Skills, prompt and display NAME are all absent on
+                -- purpose: skills come live from the registry, and an
+                -- agent's prompt and name are its own
+                -- `personas/<id>/{SOUL,IDENTITY}.md` — files it rewrites
+                -- itself, which no column could track (see
+                -- docs/modules/agent-profiles.md).
                 CREATE TABLE IF NOT EXISTS agent_profiles (
                     id              TEXT PRIMARY KEY,
-                    name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     description     TEXT NOT NULL,
                     avatar_blob_id  TEXT,
-                    system_prompt   TEXT,
                     framework       TEXT NOT NULL,
                     llm             TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
