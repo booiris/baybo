@@ -40,7 +40,8 @@ fn cron_err(e: CronError) -> GatewayError {
         CronError::NotFound(m) => GatewayError::NotFound(m),
         caller_bug @ (CronError::InvalidSchedule(_)
         | CronError::EmptyUpdate(_)
-        | CronError::BlankPrompt) => GatewayError::BadRequest(caller_bug.to_string()),
+        | CronError::BlankPrompt
+        | CronError::Builtin(_)) => GatewayError::BadRequest(caller_bug.to_string()),
         contended @ CronError::Contended(_) => GatewayError::Conflict(contended.to_string()),
         other => GatewayError::Cron(other.to_string()),
     }
@@ -168,7 +169,7 @@ async fn get_cron(
     request_body = UpdateCronRequest,
     responses(
         (status = 200, description = "The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future", body = CronJob),
-        (status = 400, description = "The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed)", body = ErrorBody),
+        (status = 400, description = "The body sets no field, blanks the prompt, carries a schedule with no future fire time (an `at` whose moment has passed), or tries to rename or reword a **built-in** job (`builtin: true`) — its title and instruction belong to the runtime, while its schedule and timezone remain editable", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it", body = ErrorBody),
         (status = 409, description = "The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry", body = ErrorBody),
@@ -197,6 +198,7 @@ async fn update_cron(
     ),
     responses(
         (status = 204, description = "Cron job moved to the recycle bin: it stops firing and leaves the default list, but the row survives — `GET /v1/cron/{id}` still resolves it, `GET /v1/cron?deleted=true` lists it, and `POST /v1/cron/{id}/restore` brings it back"),
+        (status = 400, description = "The job is built in (the dream pass) and cannot be deleted; pause it or switch it off in config", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 500, description = "Scheduler error", body = ErrorBody),

@@ -130,7 +130,7 @@ ENVIRONMENT:
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Baybo state dir under `~/.baybo`/`$BAYBO_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `personas/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
 
 SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
 
@@ -242,7 +242,7 @@ pub struct BashTool {
     bench_description: String,
     /// Absolute workspace root (`<workspace>`). Used together with
     /// [`Self::work_dir`] to reject path arguments that would touch
-    /// non-`work/` subtrees (`profile/`, `config/`, `state/`, …).
+    /// non-`work/` subtrees (`personas/`, `config/`, `state/`, …).
     workspace_root: PathBuf,
     /// Absolute work directory (`<workspace>/work`). Sole writable area
     /// for Bash invocations.
@@ -1327,7 +1327,7 @@ fn spawn_copy_to_file(
 /// Reject an absolute path that lives inside the workspace root but
 /// outside the work directory. Bash invocations are scoped to the
 /// `work/` subtree so the agent can't accidentally clobber the
-/// gateway's own `config/`, `state/`, `profile/`, `logs/`, `skills/`,
+/// gateway's own `config/`, `state/`, `personas/`, `logs/`, `skills/`,
 /// or `.key/` subdirectories from a shell call. Paths that are not
 /// absolute, or that fall entirely outside the workspace root (FHS
 /// roots, `$HOME`, `/tmp`, …) are left to the OS sandbox.
@@ -1346,7 +1346,7 @@ fn require_within_work_dir(
              directory. Only `{}` is writable for shell operations (and \
              `skills/` is bound read-only so installed skill scripts can run \
              in place) — move the action under `{}/` or use Read/Edit/Write \
-             for the read-only workspace subtrees (profile/, config/, state/, \
+             for the read-only workspace subtrees (personas/, config/, state/, \
              logs/, .key/).",
             path.display(),
             work_dir.display(),

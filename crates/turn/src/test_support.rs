@@ -73,6 +73,19 @@ impl TurnStore for MemoryTurnStore {
             .collect())
     }
 
+    async fn sessions_with_live_turns(&self) -> Result<Vec<SessionId>> {
+        let mut out: Vec<SessionId> = self
+            .turns
+            .lock()
+            .values()
+            .filter(|j| matches!(j.status_kind.as_str(), "pending" | "in_progress" | "stuck"))
+            .map(|j| j.session_id.clone())
+            .collect();
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        out.dedup();
+        Ok(out)
+    }
+
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<TurnRow>> {
         Ok(self
             .turns

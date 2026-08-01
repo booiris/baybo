@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 # The only Baybo dependency: the OpenViking memory backend under test, driven
 # through its concrete (context-free) methods.
 baybo-memory = { workspace = true }
+baybo-model = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }

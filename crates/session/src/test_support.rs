@@ -16,7 +16,9 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
+use baybo_store::session::{
+    DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+};
 use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
@@ -45,6 +47,8 @@ pub struct MemorySessionStore {
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
     read_cursors: Mutex<HashMap<SessionId, i64>>,
+    /// Mirrors the `sessions.dreamed_through_ordinal` flat column.
+    dream_cursors: Mutex<HashMap<SessionId, i64>>,
     /// Fault injection: when set, every `append_session_message` fails. Lets a
     /// test drive the paths that must treat an unpersisted row as a failed
     /// write rather than a silent success — a transcript append is the one
@@ -495,6 +499,65 @@ impl SessionStore for MemorySessionStore {
             .map(|s| s.created_at)
             .filter(|t| *t >= from && *t < to)
             .collect())
+    }
+
+    async fn dream_candidates(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<DreamCandidate>> {
+        let transcripts = self.transcripts.lock();
+        let sessions = self.data.lock();
+        let cursors = self.dream_cursors.lock();
+        let mut out: Vec<DreamCandidate> = transcripts
+            .iter()
+            .filter_map(|(id, log)| {
+                let session = sessions.get(id);
+                let watermark = cursors.get(id).copied();
+                let live = log.iter().filter(|m| !m.compaction_inserted);
+                // Mirrors the sqlite arms: an ordinal cursor once the
+                // conversation has been offered, the time window before that.
+                let unread: Vec<_> = match watermark {
+                    Some(w) => live.filter(|m| m.ordinal as i64 > w).collect(),
+                    None => live
+                        .filter(|m| {
+                            m.message.from_user() && m.created_at >= since && m.created_at < until
+                        })
+                        .collect(),
+                };
+                if unread.is_empty() {
+                    return None;
+                }
+                Some(DreamCandidate {
+                    session_id: id.clone(),
+                    agent_id: session.and_then(|s| s.state.agent_id.clone()),
+                    title: session.and_then(|s| s.title.clone()),
+                    last_activity_at: unread.iter().map(|m| m.created_at).max()?,
+                    human_message_count: unread.iter().filter(|m| m.message.from_user()).count()
+                        as i64,
+                    read_from_ordinal: unread.iter().map(|m| m.ordinal as i64).min()?,
+                    latest_ordinal: log.iter().map(|m| m.ordinal as i64).max()?,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+        Ok(out)
+    }
+
+    async fn set_dreamed_through_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<bool> {
+        if !self.data.lock().contains_key(session_id) {
+            return Ok(false);
+        }
+        let mut cursors = self.dream_cursors.lock();
+        let entry = cursors.entry(session_id.clone()).or_insert(ordinal);
+        if ordinal > *entry {
+            *entry = ordinal;
+        }
+        Ok(true)
     }
 
     async fn last_user_messages(

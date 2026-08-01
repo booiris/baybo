@@ -99,6 +99,11 @@ pub fn build_backend(backend: Backend, opts: &BackendOpts) -> Result<BackendHand
     }
 }
 
+/// The bench measures the default deployment, so every read and write runs
+/// in the built-in profile's memory partition — the same one an unbound
+/// session uses.
+const BENCH_AGENT: &str = baybo_model::BUILTIN_AGENT_PROFILE_ID;
+
 impl BackendHandle {
     pub fn backend(&self) -> Backend {
         match self {
@@ -112,8 +117,8 @@ impl BackendHandle {
     /// question into the store.
     pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
         let memories = match self {
-            BackendHandle::Mem0(m) => m.recall_for(user_id, query).await?,
-            BackendHandle::OpenViking(o) => o.recall_for(user_id, query).await?,
+            BackendHandle::Mem0(m) => m.recall_for(user_id, BENCH_AGENT, query).await?,
+            BackendHandle::OpenViking(o) => o.recall_for(user_id, BENCH_AGENT, query).await?,
         };
         Ok(memories)
     }
@@ -135,7 +140,7 @@ impl BackendHandle {
                     let sid = scope_session_id(user_id, session.index);
                     for (user_text, assistant_text) in &pairs {
                         if !user_text.is_empty() {
-                            ov.add_message(user_id, &sid, "user", user_text)
+                            ov.add_message(user_id, BENCH_AGENT, &sid, "user", user_text)
                                 .await
                                 .with_context(|| {
                                     format!(
@@ -145,7 +150,7 @@ impl BackendHandle {
                                 })?;
                         }
                         if !assistant_text.is_empty() {
-                            ov.add_message(user_id, &sid, "assistant", assistant_text)
+                            ov.add_message(user_id, BENCH_AGENT, &sid, "assistant", assistant_text)
                                 .await
                                 .with_context(|| {
                                     format!(
@@ -159,7 +164,7 @@ impl BackendHandle {
                 }
                 BackendHandle::Mem0(m) => {
                     for (user_text, assistant_text) in &pairs {
-                        m.add_turn(user_id, user_text, assistant_text)
+                        m.add_turn(user_id, BENCH_AGENT, user_text, assistant_text)
                             .await
                             .with_context(|| {
                                 format!("add turn (conv {conv_idx}, session {})", session.index)
@@ -236,7 +241,7 @@ async fn commit_and_wait(
     let mut pending = Vec::new();
     for sid in session_ids {
         let ack = ov
-            .commit_session(user_id, sid)
+            .commit_session(user_id, BENCH_AGENT, sid)
             .await
             .with_context(|| format!("openviking commit {sid}"))?;
         if ack.status != "completed"
@@ -248,7 +253,7 @@ async fn commit_and_wait(
     let mut all_completed = true;
     for (sid, task_id) in &pending {
         let outcome = ov
-            .wait_commit_task(user_id, task_id, opts.interval, opts.timeout)
+            .wait_commit_task(user_id, BENCH_AGENT, task_id, opts.interval, opts.timeout)
             .await;
         if outcome.status != "completed" {
             all_completed = false;

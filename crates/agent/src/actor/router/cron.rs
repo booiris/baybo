@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
-    CronExecution, ExecutionOutcome, PendingCronResult, Session, SessionId, TriggerSource, User,
+    AgentBinding, AgentFramework, AgentProfileId, BuiltinCronJob, CronExecution, ExecutionOutcome,
+    PendingCronResult, Session, SessionId, TriggerSource, User,
 };
 use baybo_session::SessionManager;
 use baybo_store::CronStore;
@@ -14,9 +17,54 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::actor::supervisor::AgentSupervisor;
-use crate::actor::{AgentMessage, CronDelivery};
+use crate::actor::{AgentMessage, BuiltinFireContext, CronDelivery};
 
 use super::{ActorSpawner, Router};
+
+/// How far back a **first** dream pass looks. There is no previous fire to
+/// bound the window, and "all of history" would hand the model every
+/// conversation the deployment has ever had; a fortnight is enough to make
+/// the first pass useful without making it a migration.
+const DREAM_FIRST_PASS_LOOKBACK_DAYS: i64 = 14;
+
+/// Most conversations one fire's digest will name.
+///
+/// The digest is one line per conversation and the model is invited to read
+/// each — so an unbounded list is an unbounded prompt and an unbounded number
+/// of `Read`s. The first pass after an upgrade is where this bites: it looks
+/// back [`DREAM_FIRST_PASS_LOOKBACK_DAYS`] over a store that has been running
+/// for months, and would otherwise hand over every conversation in a
+/// fortnight at once.
+///
+/// Newest first, and the overflow is **not** dropped: the cursor only
+/// advances over what was listed, so what does not fit here is offered again
+/// next pass. The digest says how many it is holding back so the omission is
+/// visible rather than inferred.
+const DREAM_MAX_SESSIONS_PER_FIRE: usize = 40;
+
+/// One agent's share of a dream pass: the digest its fire is given, and the
+/// conversations that digest names.
+///
+/// `offered` is carried separately from the rendered digest because the
+/// cursor must advance over exactly what was listed, and only once the fire
+/// is dispatched — the digest is a string by then.
+struct DreamGroup {
+    binding: AgentBinding,
+    context: BuiltinFireContext,
+    /// `(session, highest ordinal listed)`, in digest order.
+    offered: Vec<(SessionId, i64)>,
+}
+
+/// The two halves of a group as it is being accumulated, before the agent is
+/// known to be one that dreams at all.
+#[derive(Default)]
+struct DreamAgentWork {
+    sessions: Vec<DreamDigestSession>,
+    offered: Vec<(SessionId, i64)>,
+    /// Conversations past [`DREAM_MAX_SESSIONS_PER_FIRE`]. They are neither
+    /// listed nor marked offered, so the next pass sees them again.
+    held_back: usize,
+}
 
 impl Router {
     /// Handle a cron trigger by minting a fresh session and routing a
@@ -52,6 +100,15 @@ impl Router {
         &mut self,
         event: CronTriggerEvent,
     ) -> anyhow::Result<()> {
+        // A runtime-owned job may need fire-time material an ordinary one
+        // does not — and the dream pass is not even one fire but one per
+        // agent that has something to think about, so it takes its own path
+        // entirely.
+        match BuiltinCronJob::from_id(&event.job_id) {
+            Some(BuiltinCronJob::Dream) => return self.fan_out_dream(&event).await,
+            None => {}
+        }
+
         // A recurring fire's session IS the notification, so it is a listed,
         // titled conversation; a one-shot's is a private workspace whose result
         // is reported elsewhere. Everything below forks on that one fact.
@@ -65,15 +122,367 @@ impl Router {
             "routing cron trigger to fresh session"
         );
 
-        let trigger = cron_trigger(&event);
+        let trigger = cron_trigger(&event, None);
         if conversation {
             self.title_cron_conversation(&session.id, &event).await;
-            self.run_conversation_fire(session, trigger).await;
+            // An ordinary fire has nothing downstream of delivery: the warn
+            // inside is the whole report.
+            let _routed = self.run_conversation_fire(session, trigger).await;
         } else {
             let waiter = self.cron_result_waiter(&event, session.id.clone());
             self.run_oneshot_fire(session, trigger, waiter).await;
         }
         Ok(())
+    }
+
+    /// Open one dream conversation per agent that has something to tend.
+    ///
+    /// Each agent keeps its own memory and its own identity files, and the
+    /// write tier refuses one agent's writes into another's — so a single
+    /// fire could only ever tend whichever agent it happened to run as. The
+    /// pass is therefore per agent: each fire is bound to that agent and is
+    /// shown only its own conversations. (Shown, not granted — the
+    /// transcript resolver enforces nothing; see `SessionTranscriptReader`.)
+    /// They share one job, one schedule and one cron group, so what the user
+    /// sees is still a single pass.
+    ///
+    /// An agent with no activity gets no fire — an idle deployment spends
+    /// nothing and leaves no empty conversation behind. When *no* agent has
+    /// any, nothing is minted at all. The execution row is already recorded
+    /// and `next_trigger_at` already advanced by the time we run, so
+    /// skipping costs the ledger nothing.
+    async fn fan_out_dream(&self, event: &CronTriggerEvent) -> anyhow::Result<()> {
+        let groups = match self.dream_groups(event).await {
+            Ok(groups) => groups,
+            // The window is lost, not retried: the scheduler has already
+            // advanced the job, so the next pass starts after this one.
+            // Named as a lost window rather than an idle one, because the
+            // two look identical from outside and only this one is a problem.
+            Err(e) => {
+                warn!(
+                    job_id = %event.job_id,
+                    error = %e,
+                    "dream skipped: could not read what is unconsolidated; \
+                     nothing is lost, the next pass sees the same work"
+                );
+                return Ok(());
+            }
+        };
+        if groups.is_empty() {
+            info!(
+                job_id = %event.job_id,
+                "dream skipped: nobody has said anything since the last pass"
+            );
+            return Ok(());
+        }
+
+        for group in groups {
+            let binding = group.binding;
+            // Degrade like every other failure in this pass: one agent's bad
+            // luck must not cost the others their pass. Nothing is lost by
+            // continuing — this agent's cursor stays where it is, so the next
+            // pass offers the same conversations again.
+            let session = match self.mint_dream_session(event, binding.clone()).await {
+                Ok(session) => session,
+                Err(e) => {
+                    warn!(
+                        agent_id = %binding.agent_id,
+                        error = %e,
+                        "dream skipped for this agent: could not open its conversation; \
+                         its conversations stay queued for the next pass"
+                    );
+                    continue;
+                }
+            };
+            debug!(
+                session_id = %session.id,
+                agent_id = %binding.agent_id,
+                offered = group.offered.len(),
+                "opening a dream conversation"
+            );
+            self.title_dream_conversation(&session.id, event, &binding.agent_id)
+                .await;
+            // Only a fire that actually reached a mailbox may move the
+            // cursor. `route_or_spawn` returning false — a closed mailbox, a
+            // spawn that failed — means this pass never happened for these
+            // conversations, and stepping over them would be the one failure
+            // in this path that loses content instead of costing a re-read.
+            if self
+                .run_conversation_fire(session, cron_trigger(event, Some(group.context)))
+                .await
+            {
+                self.advance_dream_cursor(&group.offered).await;
+            } else {
+                warn!(
+                    agent_id = %binding.agent_id,
+                    offered = group.offered.len(),
+                    "dream trigger was not delivered; its conversations stay queued for the next pass"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Title a dream conversation with the agent it tends, because one pass
+    /// opens several and they would otherwise be N identical rows in the
+    /// cron group the spec sells as a browsable journal.
+    ///
+    /// The name comes from the agent's own `IDENTITY.md` — the one source
+    /// for what an agent is called — falling back to its id when it has not
+    /// named itself yet.
+    async fn title_dream_conversation(
+        &self,
+        session_id: &SessionId,
+        event: &CronTriggerEvent,
+        agent: &AgentProfileId,
+    ) {
+        let name = tokio::fs::read_to_string(
+            agent.identity_file(&self.workspace, baybo_workspace::IdentityKind::Identity),
+        )
+        .await
+        .ok()
+        .and_then(|body| baybo_workspace::display_name(&body))
+        .unwrap_or_else(|| agent.as_str().to_string());
+        let titled = format!("{} · {name}", event.title);
+        let title = cron_conversation_title(&titled, &event.timezone);
+        if let Err(e) = self
+            .session_manager
+            .set_title(session_id, Some(&title))
+            .await
+        {
+            warn!(session_id = %session_id, error = %e, "failed to title dream conversation");
+        }
+    }
+
+    /// A dream fire's session, bound to the agent whose memory it tends.
+    ///
+    /// Unlike an ordinary fire this binding is not inherited from an origin
+    /// conversation — the job has none — it *is* the thing being fanned out
+    /// over.
+    async fn mint_dream_session(
+        &self,
+        event: &CronTriggerEvent,
+        binding: AgentBinding,
+    ) -> anyhow::Result<Session> {
+        let user = User {
+            id: event.user_id.clone(),
+            name: None,
+            channel: event.channel.clone(),
+        };
+        Ok(self
+            .session_manager
+            .create_bound_session_with_trigger(
+                user,
+                event.channel.clone(),
+                TriggerSource::Cron {
+                    cron_job_id: event.job_id.clone(),
+                    origin_session_id: None,
+                    conversation: true,
+                    job_title: Some(event.title.clone()),
+                },
+                Some(binding),
+            )
+            .await?)
+    }
+
+    /// What each agent has to work with this time round: one entry per
+    /// agent with unconsolidated conversations, in no particular order.
+    /// Empty when there is nothing anywhere.
+    ///
+    /// Selection is [`SessionStore::dream_candidates`]: an ordinal cursor per
+    /// session, falling back to a time window for one never offered before.
+    /// The window's lower bound is [`CronTriggerEvent::previous_fire_at`],
+    /// which rides the execution row precisely because the job row's own
+    /// `last_triggered_at` has already been advanced to *this* fire by the
+    /// time we get here. A first-ever pass has no previous one, so it looks
+    /// back over [`DREAM_FIRST_PASS_LOOKBACK_DAYS`] rather than over all of
+    /// history.
+    ///
+    /// A session whose turn is still writing is left for the next pass.
+    /// Reading it now would consolidate half an exchange and then advance
+    /// past the rest — and the rest is `MessageSource::Agent`, which no
+    /// human-message predicate would ever surface again. Deferring is only
+    /// safe because the cursor is an ordinal this pass simply does not
+    /// advance; a time cursor could not express "not yet".
+    async fn dream_groups(&self, event: &CronTriggerEvent) -> anyhow::Result<Vec<DreamGroup>> {
+        let until = Utc::now();
+        let since = event
+            .previous_fire_at
+            .unwrap_or_else(|| until - chrono::Duration::days(DREAM_FIRST_PASS_LOOKBACK_DAYS));
+        let candidates = self
+            .session_manager
+            .store()
+            .dream_candidates(since, until)
+            .await?;
+        // Failing this query defers everything rather than reading anyway:
+        // an unknown turn state plus a cursor that advances is how rows go
+        // missing, and a deferral costs one skipped pass.
+        let busy = self.turn_lifecycle.sessions_with_live_turns().await?;
+
+        // Group by owning agent, preserving the store's newest-first order
+        // within each group. An undecodable binding was already dropped by
+        // the store — filing somebody's conversation under the wrong agent is
+        // exactly what the partition exists to prevent.
+        let mut order: Vec<AgentProfileId> = Vec::new();
+        let mut by_agent: HashMap<AgentProfileId, DreamAgentWork> = HashMap::new();
+        let mut deferred: Vec<SessionId> = Vec::new();
+        for candidate in candidates {
+            if busy.contains(&candidate.session_id) {
+                // Deferral has no timeout on purpose — the safe direction is
+                // to wait — but a turn that never settles would then skip
+                // this conversation for the life of the process, silently.
+                // Say so once per pass: a stuck turn is an operator problem,
+                // and this is the only place that can see it as one.
+                debug!(
+                    session_id = %candidate.session_id,
+                    "dream deferring a conversation whose turn is still writing"
+                );
+                deferred.push(candidate.session_id);
+                continue;
+            }
+            let owner = candidate
+                .agent_id
+                .clone()
+                .unwrap_or_else(AgentProfileId::builtin);
+            let work = by_agent.entry(owner.clone()).or_insert_with(|| {
+                order.push(owner.clone());
+                DreamAgentWork::default()
+            });
+            if work.sessions.len() >= DREAM_MAX_SESSIONS_PER_FIRE {
+                work.held_back += 1;
+                continue;
+            }
+            work.sessions.push(DreamDigestSession {
+                title: candidate
+                    .title
+                    .unwrap_or_else(|| candidate.session_id.as_str().to_string()),
+                // Starting where this pass's reading starts, so a
+                // conversation that has been running for months costs it
+                // only what is new. The composer collapses ordinal 0 back to
+                // the plain path, so a conversation with nothing consolidated
+                // before it reads whole.
+                transcript_path: self
+                    .workspace
+                    .session_log_file_from(
+                        candidate.session_id.as_str(),
+                        candidate.read_from_ordinal,
+                    )
+                    .display()
+                    .to_string(),
+                earlier_messages: candidate.read_from_ordinal,
+                user_message_count: candidate.human_message_count,
+                last_spoken_on: candidate.last_activity_at.format("%Y-%m-%d").to_string(),
+            });
+            work.offered
+                .push((candidate.session_id, candidate.latest_ordinal));
+        }
+
+        if !deferred.is_empty() {
+            warn!(
+                count = deferred.len(),
+                sessions = ?deferred,
+                "dream deferred conversations that were mid-turn; a turn that never \
+                 settles will keep deferring its conversation until the next restart"
+            );
+        }
+
+        let mut groups = Vec::new();
+        for agent in order {
+            let Some(framework) = self.dream_framework(&agent).await else {
+                continue;
+            };
+            let Some(work) = by_agent.remove(&agent) else {
+                continue;
+            };
+            let digest = DreamDigestGroup {
+                // Absolutised like every other producer of this string (the
+                // prompt's own `<memory>` section, and the tools'
+                // `ManagedRoots`), so a symlinked workspace root does not
+                // hand the model a path that fails the tools' own prefix
+                // test.
+                memory_dir: baybo_workspace::absolutise(&agent.memory_dir(&self.workspace))
+                    .display()
+                    .to_string(),
+                agent_label: agent.as_str().to_string(),
+                sessions: work.sessions,
+                held_back: work.held_back,
+            };
+            let Some(digest) = frame_dream_digest(&digest) else {
+                continue;
+            };
+            groups.push(DreamGroup {
+                binding: AgentBinding {
+                    agent_id: agent,
+                    framework,
+                },
+                context: BuiltinFireContext {
+                    prompt_context: digest,
+                },
+                offered: work.offered,
+            });
+        }
+        Ok(groups)
+    }
+
+    /// Advance the dream cursor over everything a dispatched fire was shown.
+    ///
+    /// After dispatch, never before: every earlier failure — the digest, the
+    /// mint, the store — then leaves the cursor untouched, so the next pass
+    /// re-offers those conversations instead of stepping over them. What it
+    /// records is "offered", not "consumed": the model chooses which of the
+    /// listed transcripts to read, exactly as the time cursor advanced
+    /// whether or not it read anything.
+    async fn advance_dream_cursor(&self, offered: &[(SessionId, i64)]) {
+        for (session_id, ordinal) in offered {
+            if let Err(e) = self
+                .session_manager
+                .store()
+                .set_dreamed_through_ordinal(session_id, *ordinal)
+                .await
+            {
+                // Costs a re-read next pass, which is the direction this
+                // whole cursor errs in anyway.
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to advance the dream cursor; this conversation will be offered again"
+                );
+            }
+        }
+    }
+
+    /// The framework a dream fire for `agent` would run under, or `None`
+    /// when it should not run at all.
+    ///
+    /// Only `baybo` agents dream. An external framework runs its own CLI
+    /// with its own tools and never sees the `<memory>` injection at all, so
+    /// firing the pass at one would spend a turn asking a stranger to tidy a
+    /// room it cannot see.
+    async fn dream_framework(&self, agent: &AgentProfileId) -> Option<AgentFramework> {
+        if agent.is_builtin() {
+            return Some(AgentFramework::default());
+        }
+        match self.agent_profiles.get(agent).await {
+            Ok(Some(row)) if row.framework == AgentFramework::Baybo => Some(row.framework),
+            Ok(Some(row)) => {
+                debug!(
+                    agent_id = %agent, framework = %row.framework.as_str(),
+                    "skipping dream for a non-baybo agent: it never sees the memory injection"
+                );
+                None
+            }
+            // A profile row that is gone takes its memory tree out of reach
+            // with it: the tier is keyed on the id, and nothing would read
+            // what the pass wrote.
+            Ok(None) => {
+                debug!(agent_id = %agent, "skipping dream for an agent whose profile is gone");
+                None
+            }
+            Err(e) => {
+                warn!(agent_id = %agent, error = %e, "skipping dream: cannot read the agent profile");
+                None
+            }
+        }
     }
 
     /// The isolated session this fire runs in.
@@ -89,7 +498,7 @@ impl Router {
         };
         let session = self
             .session_manager
-            .create_session_with_trigger(
+            .create_bound_session_with_trigger(
                 user,
                 event.channel.clone(),
                 TriggerSource::Cron {
@@ -98,9 +507,53 @@ impl Router {
                     conversation,
                     job_title: Some(event.title.clone()),
                 },
+                self.inherited_binding(event.origin_session_id.as_ref())
+                    .await?,
             )
             .await?;
         Ok(session)
+    }
+
+    /// The agent a fire runs as: the one bound to the conversation that
+    /// scheduled the job.
+    ///
+    /// Derived at fire time from the origin session rather than stored on the
+    /// job — the same rule as cron grouping (`docs/cron-groups.md`), and it
+    /// means re-binding is impossible to get out of step because there is
+    /// nothing to keep in step.
+    ///
+    /// `Ok(None)` covers the two ways a fire legitimately has no agent: the
+    /// job recorded no origin (created before origins were stamped), or the
+    /// origin is itself unbound and so reads as the built-in.
+    ///
+    /// A recorded origin that **cannot be read** is an error, not a third
+    /// flavour of "no agent". Session rows are never deleted, so a missing
+    /// one means the store is inconsistent — and running the fire unbound
+    /// would answer in the wrong persona, write into the wrong memory
+    /// partition, and leave nothing but a `warn!` to say so. Failing the
+    /// mint surfaces it and leaves the schedule to retry.
+    async fn inherited_binding(
+        &self,
+        origin: Option<&SessionId>,
+    ) -> anyhow::Result<Option<AgentBinding>> {
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        let session = self
+            .session_manager
+            .get(origin)
+            .await
+            .map_err(|e| anyhow::anyhow!("read cron origin session {origin}: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cron origin session {origin} is missing; session rows are never deleted, \
+                     so refusing to fire this job as some other agent"
+                )
+            })?;
+        Ok(session.state.agent_id.map(|agent_id| AgentBinding {
+            agent_id,
+            framework: session.state.agent_framework.unwrap_or_default(),
+        }))
     }
 
     /// The task that will report a one-shot's result to the conversation that
@@ -138,8 +591,17 @@ impl Router {
     /// reply — and a reply that raced the stop would be routed into a mailbox
     /// nobody is reading, reported as delivered, and dropped. The actor stays
     /// resident and is reclaimed by the idle reaper, like every conversation's.
-    async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) {
+    ///
+    /// Returns whether the trigger actually reached a mailbox. A dropped one
+    /// means this fire never happened, which the dream pass has to know: its
+    /// cursor may only step over conversations a fire was really handed.
+    #[must_use]
+    async fn run_conversation_fire(&self, session: Session, trigger: AgentMessage) -> bool {
         let session_id = session.id.clone();
+        // A fresh cron session has no `last_llm` of its own, so without this
+        // a bound agent's scheduled work runs on the pool default rather than
+        // the model its profile pins.
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -147,12 +609,20 @@ impl Router {
             .supervisor
             .route_or_spawn(&session_id, trigger, || {
                 let actor_token = parent_token.child_token();
-                actor_spawner(session, None, None, None, response_tx, actor_token)
+                actor_spawner(
+                    session,
+                    pins.llm,
+                    pins.model,
+                    pins.effort,
+                    response_tx,
+                    actor_token,
+                )
             })
             .await;
         if !routed {
             warn!(session_id = %session_id, "failed to deliver cron trigger to its conversation");
         }
+        routed
     }
 
     /// A **one-shot** fire: it runs in a private workspace nobody will ever
@@ -173,12 +643,13 @@ impl Router {
         waiter: CronResultWaiter,
     ) {
         let session_id = session.id.clone();
+        let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, actor_token) = self.spawn_oneshot_actor(
             session,
-            None,
-            None,
-            None,
+            pins.llm,
+            pins.model,
+            pins.effort,
             response_tx,
             &self.actor_parent_token,
         );
@@ -260,6 +731,7 @@ impl Router {
             supervisor: self.supervisor.clone(),
             cron_store: Arc::clone(&self.cron_store),
             actor_spawner: Arc::clone(&self.actor_spawner),
+            agent_profiles: Arc::clone(&self.agent_profiles),
             actor_parent_token: self.actor_parent_token.clone(),
         }
     }
@@ -525,6 +997,9 @@ pub(super) struct CronResultDelivery {
     supervisor: AgentSupervisor,
     cron_store: Arc<dyn CronStore>,
     actor_spawner: ActorSpawner,
+    /// The origin conversation may be bound to an agent, so hydrating it has
+    /// the same pin resolution as any other cold spawn.
+    agent_profiles: Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
     actor_parent_token: CancellationToken,
 }
 
@@ -559,6 +1034,7 @@ impl CronResultDelivery {
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
+        let pins = super::resolve_spawn_pins(&origin, &self.agent_profiles).await;
         let delivered = self
             .supervisor
             .route_or_spawn(
@@ -566,14 +1042,11 @@ impl CronResultDelivery {
                 AgentMessage::CronResultReady(Box::new(result)),
                 || {
                     let actor_token = parent_token.child_token();
-                    let pinned = origin.state.last_llm.clone();
-                    let pinned_model = origin.state.last_model.clone();
-                    let pinned_effort = origin.state.last_effort.clone();
                     actor_spawner(
                         origin,
-                        pinned,
-                        pinned_model,
-                        pinned_effort,
+                        pins.llm,
+                        pins.model,
+                        pins.effort,
                         response_tx,
                         actor_token,
                     )
@@ -609,7 +1082,7 @@ impl CronResultDelivery {
 }
 
 /// The message that carries a fire to its actor.
-fn cron_trigger(event: &CronTriggerEvent) -> AgentMessage {
+fn cron_trigger(event: &CronTriggerEvent, builtin: Option<BuiltinFireContext>) -> AgentMessage {
     AgentMessage::CronTrigger {
         job_id: event.job_id.clone(),
         title: event.title.clone(),
@@ -619,6 +1092,7 @@ fn cron_trigger(event: &CronTriggerEvent) -> AgentMessage {
         } else {
             CronDelivery::Channel
         },
+        builtin,
     }
 }
 
@@ -695,8 +1169,12 @@ mod tests {
     struct RouterHarness {
         router: Router,
         sessions: Arc<SessionManager>,
+        agent_profiles: Arc<baybo_store::test_support::MemoryAgentProfileStore>,
         supervisor: AgentSupervisor,
         cron_store: Arc<InMemoryCronStore>,
+        /// The lifecycle the router reads live turns from; a test drives it
+        /// to put a session mid-turn.
+        turn_lifecycle: Arc<TurnLifecycle>,
         spawned: SpawnedActors,
         /// When set, the fake spawner drops each mailbox receiver immediately,
         /// so the sender it hands back is already closed — the state a
@@ -707,7 +1185,20 @@ mod tests {
     }
 
     impl RouterHarness {
+        /// A harness whose store already holds the origin conversation every
+        /// [`Self::event`] names — the ordinary case, since session rows are
+        /// never deleted.
         fn new() -> Self {
+            Self::build(true)
+        }
+
+        /// A harness whose store does *not* hold that origin: the broken
+        /// invariant a fire must refuse rather than paper over.
+        fn without_origin_session() -> Self {
+            Self::build(false)
+        }
+
+        fn build(seed_origin: bool) -> Self {
             let (response_tx, response_rx) = mpsc::channel(64);
             let supervisor = AgentSupervisor::new(response_tx);
             let sessions = Arc::new(SessionManager::new(
@@ -715,6 +1206,8 @@ mod tests {
                 Arc::new(MemorySessionFolderStore::new()),
             ));
 
+            let agent_profiles =
+                Arc::new(baybo_store::test_support::MemoryAgentProfileStore::new());
             let spawned: SpawnedActors = Arc::new(Mutex::new(Vec::new()));
             let spawned_for_closure = Arc::clone(&spawned);
             let drop_mailboxes = Arc::new(AtomicBool::new(false));
@@ -738,9 +1231,39 @@ mod tests {
                 vault,
             ));
 
+            if seed_origin {
+                futures::executor::block_on(sessions.store().save(&Session {
+                    id: SessionId::from("sess-user"),
+                    user: User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ChannelType::tui(),
+                    },
+                    channel: ChannelType::tui(),
+                    created_at: Utc::now(),
+                    last_active: Utc::now(),
+                    state: Default::default(),
+                    root_session_id: SessionId::from("sess-user"),
+                    trigger: TriggerSource::User,
+                    lineage: None,
+                    hidden: false,
+                    pinned: false,
+                    archived: false,
+                    folder_id: None,
+                    title: None,
+                }))
+                .expect("seed the origin conversation");
+            }
+
+            let turn_lifecycle = Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new())));
             let cron_store = Arc::new(InMemoryCronStore::new());
             let (trigger_tx, cron_trigger_rx) = mpsc::channel(16);
             let router = Router::from_config(RouterConfig {
+                agent_profiles: Arc::clone(&agent_profiles)
+                    as Arc<dyn baybo_store::AgentProfileStore>,
+                workspace: Arc::new(baybo_workspace::WorkspacePaths::new(
+                    "/tmp/baybo-router-test",
+                )),
                 session_manager: Arc::clone(&sessions),
                 supervisor: supervisor.clone(),
                 channels: Arc::new(ChannelRegistry::new()),
@@ -751,7 +1274,7 @@ mod tests {
                     SpendingLimits::default(),
                 ),
                 actor_spawner,
-                turn_lifecycle: Arc::new(TurnLifecycle::new(Arc::new(MemoryTurnStore::new()))),
+                turn_lifecycle: Arc::clone(&turn_lifecycle),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
                 cron_trigger_rx,
                 actor_parent_token: CancellationToken::new(),
@@ -761,8 +1284,10 @@ mod tests {
             Self {
                 router,
                 sessions,
+                agent_profiles,
                 supervisor,
                 cron_store,
+                turn_lifecycle,
                 spawned,
                 drop_mailboxes,
                 _trigger_tx: trigger_tx,
@@ -781,6 +1306,7 @@ mod tests {
                 prompt: "Summarise the news".into(),
                 one_shot,
                 origin_session_id: Some(SessionId::from("sess-user")),
+                previous_fire_at: None,
             }
         }
 
@@ -801,6 +1327,39 @@ mod tests {
                 .expect("record execution");
         }
 
+        /// Put `session` mid-turn, as a live reply would.
+        async fn open_turn(&self, session: &SessionId) -> baybo_model::TurnId {
+            let turn = self
+                .turn_lifecycle
+                .start_turn(
+                    session.clone(),
+                    baybo_model::TriggerKind::User,
+                    baybo_turn::TurnInput::UserChat {
+                        content: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("open a turn");
+            self.turn_lifecycle
+                .start(&turn.id)
+                .await
+                .expect("start the turn");
+            turn.id
+        }
+
+        async fn settle_turn(&self, turn_id: &baybo_model::TurnId) {
+            self.turn_lifecycle
+                .complete(
+                    turn_id,
+                    baybo_turn::TurnOutput::Structured {
+                        value: serde_json::Value::Null,
+                    },
+                )
+                .await
+                .expect("settle the turn");
+        }
+
         /// The session the fake spawner was handed, plus its mailbox.
         fn fire(&self) -> (SessionId, MailboxReceiver<AgentMessage>) {
             self.spawned
@@ -808,6 +1367,614 @@ mod tests {
                 .pop()
                 .expect("the router must have spawned an actor for the fire")
         }
+    }
+
+    /// The event carries an origin the store does not have. Session rows are
+    /// never deleted, so that is a broken invariant — and firing anyway would
+    /// answer in the wrong persona and write into the wrong memory partition
+    /// with nothing but a log line to show for it.
+    #[tokio::test]
+    async fn a_fire_whose_origin_is_missing_fails_instead_of_running_unbound() {
+        let mut h = RouterHarness::without_origin_session();
+        let err = h
+            .router
+            .handle_cron_trigger(RouterHarness::event(false))
+            .await
+            .expect_err("a missing origin must not be treated as 'no agent'");
+        assert!(err.to_string().contains("never deleted"), "got: {err:#}");
+        assert!(
+            h.supervisor.registered_session_ids().is_empty(),
+            "nothing may be minted for a fire that cannot resolve its agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dream_fire_with_nothing_to_read_mints_no_session_at_all() {
+        let mut h = RouterHarness::new();
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+
+        h.router
+            .handle_cron_trigger(event)
+            .await
+            .expect("the skip is not an error");
+
+        // No conversation, no actor, no tokens: an idle deployment must not
+        // pay for a pass over an empty window, nor leave an empty row in the
+        // user's chat list.
+        assert!(
+            h.spawned.lock().is_empty(),
+            "a skipped dream fire must spawn no actor"
+        );
+        assert!(
+            h.supervisor.registered_session_ids().is_empty(),
+            "a skipped dream fire must register nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dream_pass_opens_one_conversation_per_agent_that_has_activity() {
+        let h = RouterHarness::new();
+        let scout = AgentProfileId::parse("01JSCOUT").expect("valid id");
+
+        // Two conversations a human spoke in: one the built-in's, one a
+        // custom agent's. Each agent keeps its own memory, so each needs its
+        // own fire — a single one could only ever tend whichever it ran as.
+        for (id, agent) in [("sess-builtin", None), ("sess-scout", Some(scout.clone()))] {
+            let mut session = h
+                .sessions
+                .create_bound_session_with_trigger(
+                    User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ChannelType::tui(),
+                    },
+                    ChannelType::tui(),
+                    TriggerSource::User,
+                    agent.clone().map(|agent_id| AgentBinding {
+                        agent_id,
+                        framework: AgentFramework::Baybo,
+                    }),
+                )
+                .await
+                .expect("mint");
+            session.id = SessionId::from(id);
+            h.sessions.store().save(&session).await.expect("save");
+            h.sessions
+                .store()
+                .append_session_message(
+                    &session.id,
+                    &baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(
+                        "hello".into(),
+                    )]),
+                )
+                .await
+                .expect("append");
+        }
+        baybo_store::AgentProfileStore::create(
+            h.agent_profiles.as_ref(),
+            &baybo_store::AgentProfileRow {
+                id: scout.clone(),
+                description: String::new(),
+                avatar_blob_id: None,
+                framework: AgentFramework::Baybo,
+                llm: None,
+                builtin: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("seed profile");
+
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        let mut h = h;
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+
+        let spawned = h.spawned.lock();
+        assert_eq!(spawned.len(), 2, "one dream conversation per agent");
+        drop(spawned);
+
+        // The partition is the whole point of fanning out: each fire is told
+        // about its own agent's conversations and no one else's. Naming
+        // another agent's would invite a refused write, and point the pass
+        // at material it has no business consolidating.
+        let mut digests: Vec<String> = Vec::new();
+        for (_, mailbox) in h.spawned.lock().iter_mut() {
+            let Ok(AgentMessage::CronTrigger { builtin, .. }) = mailbox.try_recv() else {
+                panic!("each dream fire must carry a trigger")
+            };
+            digests.push(
+                builtin
+                    .expect("a dream fire carries its digest")
+                    .prompt_context,
+            );
+        }
+        let builtin = digests
+            .iter()
+            .find(|d| d.contains("sess-builtin"))
+            .expect("the built-in's fire");
+        let scouts = digests
+            .iter()
+            .find(|d| d.contains("sess-scout"))
+            .expect("the custom agent's fire");
+        assert!(
+            !builtin.contains("sess-scout"),
+            "the built-in's digest named another agent's conversation: {builtin}"
+        );
+        assert!(
+            !scouts.contains("sess-builtin"),
+            "the custom agent's digest named another agent's conversation: {scouts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dream_window_starts_where_the_previous_fire_left_off() {
+        // The scheduler advances the job row *before* dispatching, so the
+        // row's own `last_triggered_at` is useless downstream — it already
+        // reads as this fire. The window therefore rests entirely on the
+        // value the execution snapshotted.
+        let h = RouterHarness::new();
+        let long_ago = Utc::now() - chrono::Duration::days(30);
+        let mut session = h
+            .sessions
+            .create_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-old");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text("hi".into())]),
+            )
+            .await
+            .expect("append");
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        // A cursor *after* the conversation: nothing new to think about.
+        event.previous_fire_at = Some(Utc::now() + chrono::Duration::seconds(1));
+        h.router
+            .handle_cron_trigger(event.clone())
+            .await
+            .expect("skip");
+        assert!(
+            h.spawned.lock().is_empty(),
+            "a window that starts after the activity must see nothing"
+        );
+
+        // The same conversation, with the cursor moved back before it.
+        event.previous_fire_at = Some(long_ago);
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+        assert_eq!(
+            h.spawned.lock().len(),
+            1,
+            "the window's lower bound is the previous fire, not the job row"
+        );
+    }
+
+    /// A conversation that predates the window is listed with a transcript
+    /// path anchored at its *new* messages. Handing out the plain path would
+    /// make every pass re-render — and re-pay for — the whole history, and a
+    /// default-paginated read of a long one returns its opening pages rather
+    /// than the activity that got it listed.
+    #[tokio::test]
+    async fn a_long_running_conversation_is_listed_from_its_new_messages_on() {
+        let h = RouterHarness::new();
+        let say = |s: &str| {
+            baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(s.into())])
+        };
+        let mut session = h
+            .sessions
+            .create_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-long");
+        h.sessions.store().save(&session).await.expect("save");
+        for old in ["first", "second", "third"] {
+            h.sessions
+                .store()
+                .append_session_message(&session.id, &say(old))
+                .await
+                .expect("append");
+        }
+        let cursor = Utc::now();
+        h.sessions
+            .store()
+            .append_session_message(&session.id, &say("new since the last pass"))
+            .await
+            .expect("append");
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        event.previous_fire_at = Some(cursor);
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+
+        let (_, mut mailbox) = h.fire();
+        let Ok(AgentMessage::CronTrigger { builtin, .. }) = mailbox.try_recv() else {
+            panic!("a dream fire must carry a trigger")
+        };
+        let digest = builtin
+            .expect("a dream fire carries its digest")
+            .prompt_context;
+        assert!(digest.contains("sess-long@3"), "{digest}");
+        assert!(digest.contains("3 earlier"), "{digest}");
+    }
+
+    /// The deferral. Reading a conversation while its turn is still writing
+    /// consolidates half an exchange and then steps over the rest — and the
+    /// rest is `MessageSource::Agent`, which nothing that selects on human
+    /// messages would ever offer again. Leaving the cursor alone is what
+    /// makes "not yet" expressible at all.
+    #[tokio::test]
+    async fn a_conversation_whose_turn_is_still_writing_waits_for_the_next_pass() {
+        let h = RouterHarness::new();
+        let say = |s: &str| {
+            baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(s.into())])
+        };
+        let mut session = h
+            .sessions
+            .create_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-busy");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(&session.id, &say("mid-conversation"))
+            .await
+            .expect("append");
+        let live = h.open_turn(&session.id).await;
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router
+            .handle_cron_trigger(event.clone())
+            .await
+            .expect("the deferral is not an error");
+        assert!(
+            h.spawned.lock().is_empty(),
+            "a session mid-turn is the only activity, so there is nothing to dream about yet"
+        );
+
+        // The turn settles; the same conversation is still on offer, from
+        // the same left edge. Nothing had to remember that it was deferred —
+        // the cursor simply never moved.
+        h.settle_turn(&live).await;
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+        let (_, mut mailbox) = h.fire();
+        let Ok(AgentMessage::CronTrigger { builtin, .. }) = mailbox.try_recv() else {
+            panic!("a dream fire must carry a trigger")
+        };
+        let digest = builtin
+            .expect("a dream fire carries its digest")
+            .prompt_context;
+        assert!(digest.contains("sess-busy"), "{digest}");
+    }
+
+    /// A capped digest must read as capped. The pass prunes memories it
+    /// believes are superseded, so a list that silently stops at the cap
+    /// invites it to conclude a conversation no longer exists.
+    #[tokio::test]
+    async fn a_capped_digest_says_how_many_it_is_holding_back() {
+        let h = RouterHarness::new();
+        let say = |s: &str| {
+            baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(s.into())])
+        };
+        for i in 0..DREAM_MAX_SESSIONS_PER_FIRE + 3 {
+            let mut session = h
+                .sessions
+                .create_session_with_trigger(
+                    User {
+                        id: "u1".into(),
+                        name: None,
+                        channel: ChannelType::tui(),
+                    },
+                    ChannelType::tui(),
+                    TriggerSource::User,
+                )
+                .await
+                .expect("mint");
+            session.id = SessionId::from(format!("sess-{i:03}"));
+            h.sessions.store().save(&session).await.expect("save");
+            h.sessions
+                .store()
+                .append_session_message(&session.id, &say("hello"))
+                .await
+                .expect("append");
+        }
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+
+        let (_, mut mailbox) = h.fire();
+        let Ok(AgentMessage::CronTrigger { builtin, .. }) = mailbox.try_recv() else {
+            panic!("a dream fire must carry a trigger")
+        };
+        let digest = builtin
+            .expect("a dream fire carries its digest")
+            .prompt_context;
+        assert_eq!(
+            digest.lines().filter(|l| l.starts_with("- ")).count(),
+            DREAM_MAX_SESSIONS_PER_FIRE,
+            "{digest}"
+        );
+        assert!(digest.contains("3 more not shown"), "{digest}");
+    }
+
+    /// A fire whose trigger never reached a mailbox must not move the cursor.
+    /// Every other failure in this pass costs a re-read; this one would lose
+    /// the content outright, because nothing else will ever offer those
+    /// conversations again.
+    #[tokio::test]
+    async fn an_undelivered_fire_leaves_its_conversations_queued() {
+        let h = RouterHarness::new();
+        let say = |s: &str| {
+            baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(s.into())])
+        };
+        let mut session = h
+            .sessions
+            .create_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-undelivered");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(&session.id, &say("hello"))
+            .await
+            .expect("append");
+
+        // Every mailbox the spawner hands out is already closed — the state a
+        // shutdown race leaves behind.
+        h.close_spawned_mailboxes();
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router
+            .handle_cron_trigger(event.clone())
+            .await
+            .expect("an undelivered fire is not an error");
+
+        // The next pass must still see it. If the cursor had advanced, this
+        // conversation would be gone for good.
+        h.drop_mailboxes.store(false, Ordering::Relaxed);
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+        let (_, mut mailbox) = h.fire();
+        let Ok(AgentMessage::CronTrigger { builtin, .. }) = mailbox.try_recv() else {
+            panic!("a dream fire must carry a trigger")
+        };
+        let digest = builtin
+            .expect("a dream fire carries its digest")
+            .prompt_context;
+        assert!(digest.contains("sess-undelivered"), "{digest}");
+    }
+
+    /// The cursor advances only over what a *dispatched* fire was shown, and
+    /// then that conversation stops being offered. Without the second half a
+    /// consolidated conversation would ride every subsequent digest forever.
+    #[tokio::test]
+    async fn a_dispatched_pass_advances_the_cursor_and_stops_re_offering() {
+        let h = RouterHarness::new();
+        let say = |s: &str| {
+            baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(s.into())])
+        };
+        let mut session = h
+            .sessions
+            .create_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-once");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(&session.id, &say("hello"))
+            .await
+            .expect("append");
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router
+            .handle_cron_trigger(event.clone())
+            .await
+            .expect("fan out");
+        assert_eq!(h.spawned.lock().len(), 1, "the first pass sees it");
+
+        h.router
+            .handle_cron_trigger(event.clone())
+            .await
+            .expect("the second pass has nothing to do");
+        assert_eq!(
+            h.spawned.lock().len(),
+            1,
+            "a consolidated conversation must not ride the next digest"
+        );
+
+        // A machine row lands afterwards — a turn finishing late, or a
+        // background delivery. The human never comes back, so only the
+        // ordinal cursor can surface this.
+        h.sessions
+            .store()
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::assistant(vec![baybo_model::ContentBlock::Text(
+                    "the tail nobody asked for".into(),
+                )]),
+            )
+            .await
+            .expect("append");
+        h.router.handle_cron_trigger(event).await.expect("fan out");
+        assert_eq!(
+            h.spawned.lock().len(),
+            2,
+            "rows appended after the pass read must be offered next time"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_framework_agent_is_not_dreamt_for() {
+        // It runs its own CLI with its own tools and never sees the
+        // `<memory>` injection, so a fire would ask a stranger to tidy a
+        // room it cannot see.
+        let h = RouterHarness::new();
+        let codex = AgentProfileId::parse("01JCODEX").expect("valid id");
+        let mut session = h
+            .sessions
+            .create_bound_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+                Some(AgentBinding {
+                    agent_id: codex.clone(),
+                    framework: AgentFramework::Codex,
+                }),
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-codex");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text("hi".into())]),
+            )
+            .await
+            .expect("append");
+        baybo_store::AgentProfileStore::create(
+            h.agent_profiles.as_ref(),
+            &baybo_store::AgentProfileRow {
+                id: codex,
+                description: String::new(),
+                avatar_blob_id: None,
+                framework: AgentFramework::Codex,
+                llm: None,
+                builtin: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("seed profile");
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router.handle_cron_trigger(event).await.expect("skip");
+
+        assert!(h.spawned.lock().is_empty(), "no fire for an external agent");
+    }
+
+    #[tokio::test]
+    async fn an_agent_whose_profile_is_gone_is_not_dreamt_for() {
+        // The write tier is keyed on the id, so nothing would read what the
+        // pass wrote — and the profile row is what says the agent exists.
+        let h = RouterHarness::new();
+        let ghost = AgentProfileId::parse("01JGHOST").expect("valid id");
+        let mut session = h
+            .sessions
+            .create_bound_session_with_trigger(
+                User {
+                    id: "u1".into(),
+                    name: None,
+                    channel: ChannelType::tui(),
+                },
+                ChannelType::tui(),
+                TriggerSource::User,
+                Some(AgentBinding {
+                    agent_id: ghost,
+                    framework: AgentFramework::Baybo,
+                }),
+            )
+            .await
+            .expect("mint");
+        session.id = SessionId::from("sess-ghost");
+        h.sessions.store().save(&session).await.expect("save");
+        h.sessions
+            .store()
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text("hi".into())]),
+            )
+            .await
+            .expect("append");
+
+        let mut h = h;
+        let mut event = RouterHarness::event(false);
+        event.job_id = BuiltinCronJob::Dream.id().to_string();
+        h.router.handle_cron_trigger(event).await.expect("skip");
+
+        assert!(h.spawned.lock().is_empty(), "no fire without a profile row");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_job_never_takes_the_dream_path() {
+        // The skip is keyed on the built-in job id alone; a user's own job
+        // must fire whether or not anyone has spoken lately.
+        let mut h = RouterHarness::new();
+        h.router
+            .handle_cron_trigger(RouterHarness::event(false))
+            .await
+            .expect("route the fire");
+
+        let (_, mut mailbox) = h.fire();
+        assert!(matches!(
+            mailbox.try_recv(),
+            Ok(AgentMessage::CronTrigger { builtin: None, .. })
+        ));
     }
 
     /// A recurring fire's session is a conversation the user can reply in, so
@@ -981,6 +2148,7 @@ mod tests {
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
+            builtin: false,
         }
     }
 

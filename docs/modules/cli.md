@@ -7,7 +7,7 @@ The `baybo-cli` crate is the **operator-facing command layer** for Baybo. It doe
 1. **Argv mode** — `baybo <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `baybo config show`, `baybo turn list`, `baybo session export <id>`.
 2. **Slash mode** — while a user is chatting over any channel, lines starting with `/` (e.g. `/config show`, `/cron list`) are intercepted by the channel adapter, dispatched through the same parser and handlers as Argv mode, and their output returned to the user as a normal response. Slash commands **do not** enter the agent's conversation context.
 
-`baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `TurnLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
+`baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `TurnLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspacePaths`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
 The command taxonomy is organized by subsystem: one family per manager exposed in `crates/baybo/src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. browser control, node fabric, `mcp serve`) get no command family at all.
 

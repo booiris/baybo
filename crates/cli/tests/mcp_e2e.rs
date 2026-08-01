@@ -23,7 +23,7 @@ fn make_ctx(tmpdir: &tempfile::TempDir) -> baybo_cli::CommandContext {
     ));
     ContextBuilder::new(Arc::new(config))
         .secret_vault(vault)
-        .workspace(Arc::new(baybo_workspace::WorkspaceManager::new(
+        .workspace(Arc::new(baybo_workspace::WorkspacePaths::new(
             tmpdir.path().to_path_buf(),
         )))
         .build()

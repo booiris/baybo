@@ -29,7 +29,7 @@ async fn agents_api_round_trip() {
     assert_eq!(builtin["builtin"].as_bool(), Some(true));
     assert_eq!(builtin["framework"].as_str(), Some("baybo"));
     // NULL = inherit-default fields are absent on the wire.
-    for inherit in ["system_prompt", "llm", "avatar_blob_id"] {
+    for inherit in ["llm", "avatar_blob_id"] {
         assert!(
             builtin.get(inherit).is_none(),
             "builtin {inherit} must be absent (inherit), got {builtin:?}",
@@ -119,7 +119,7 @@ async fn agents_api_round_trip() {
             "name": "  Helper  ",
             "description": "test persona",
             "framework": "claude",
-            "system_prompt": "Be terse.",
+            "soul": "Be terse.",
             "llm": llm_entry,
             "avatar_blob_id": png_blob.blob_id,
         }),
@@ -136,37 +136,53 @@ async fn agents_api_round_trip() {
     assert_eq!(fetched["name"].as_str(), Some("Helper"));
     assert_eq!(fetched["created_at"], created["created_at"]);
 
-    // Duplicate names are rejected case-insensitively (builtin's too).
-    let err = post_expect(
+    // Names are not unique any more, and cannot be: they live in a file the
+    // agent rewrites at will, so no constraint could hold. The id is the
+    // identity — every binding, partition and lookup keys off it — and a
+    // duplicate name is only a display ambiguity.
+    let twin = post_expect(
         &router,
         "/v1/agents",
         json!({ "name": "hELPer" }),
-        StatusCode::BAD_REQUEST,
+        StatusCode::OK,
     )
     .await;
-    assert!(
-        err["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("already exists")
-    );
-    post_expect(
+    assert_ne!(twin["id"].as_str(), created["id"].as_str());
+    delete_expect(
         &router,
-        "/v1/agents",
-        json!({ "name": "Baybo" }),
-        StatusCode::BAD_REQUEST,
+        &format!("/v1/agents/{}", twin["id"].as_str().expect("id")),
+        StatusCode::NO_CONTENT,
     )
     .await;
 
-    // ── 4. Builtin is locked: content PUT and DELETE 400 ────────────
+    // ── 4. Builtin: only its framework is pinned ────────────────────
+    // Its description is ordinary editable text.
+    put_expect(
+        &router,
+        "/v1/agents/baybo",
+        json!({ "description": "my own words", "framework": "baybo" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(builtin["description"].as_str(), Some("my own words"));
+
+    // Its framework is not: baybo is what makes this row the default.
     let err = put_expect(
         &router,
         "/v1/agents/baybo",
-        json!({ "name": "baybo", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "claude" }),
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert!(err["error"].as_str().unwrap_or("").contains("read-only"));
+    assert!(err["error"].as_str().unwrap_or("").contains("baybo"));
+    let unchanged = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(
+        unchanged["description"].as_str(),
+        Some("my own words"),
+        "a refused framework change must not have applied the rest",
+    );
+
     let err = delete_expect(&router, "/v1/agents/baybo", StatusCode::BAD_REQUEST).await;
     assert!(
         err["error"]
@@ -175,7 +191,36 @@ async fn agents_api_round_trip() {
             .contains("cannot be deleted")
     );
 
-    // …but its avatar is editable, and clearable.
+    // …but every field with a targeted endpoint is editable. What the lock
+    // protects is the row's claim to *be* default behaviour — its framework
+    // and description — not which model it runs on or what it calls itself.
+    // …its model is not one of them: the builtin *is* `default-llm`, so
+    // pinning it would put one decision in two places.
+    let err = put_expect(
+        &router,
+        "/v1/agents/baybo/model",
+        json!({ "llm": llm_entry }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(err["error"].as_str().unwrap_or("").contains("default-llm"));
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert!(builtin.get("llm").is_none(), "got {builtin:?}");
+
+    put_expect(
+        &router,
+        "/v1/agents/baybo/name",
+        json!({ "name": "Aster" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let builtin = get(&router, "/v1/agents/baybo", StatusCode::OK).await;
+    assert_eq!(
+        builtin["name"].as_str(),
+        Some("Aster"),
+        "the builtin's name is the workspace IDENTITY.md, and it is editable",
+    );
+
     put_expect(
         &router,
         "/v1/agents/baybo/avatar",
@@ -197,38 +242,305 @@ async fn agents_api_round_trip() {
     )
     .await;
 
-    // ── 5. PUT is a full replace: absent nullables reset to inherit ──
+    // ── 4b. The soul is a file, edited on its own endpoint ──────────
+    // Created with the body's `soul`, so a one-call create still gives the
+    // agent a persona.
+    let soul = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(soul["content"].as_str(), Some("Be terse."));
+    assert!(
+        soul["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&format!("personas/{agent_id}/SOUL.md")),
+        "soul must live in the agent's own persona dir, got {soul:?}",
+    );
+
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        json!({ "content": "# Helper\n\nRewritten." }),
+        StatusCode::OK,
+    )
+    .await;
+    let soul = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/soul"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(soul["content"].as_str(), Some("# Helper\n\nRewritten."));
+
+    // The self-image is a second per-agent file with the same treatment.
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        identity["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&format!("personas/{agent_id}/IDENTITY.md")),
+        "self-image must live in the agent's own persona dir, got {identity:?}",
+    );
+    assert!(
+        identity["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Who Am I"),
+        "seeded from the shipped template, got {identity:?}",
+    );
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Vega\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(identity["content"].as_str(), Some("* **Name:** Vega\n"));
+
+    // ── 4c. A stale editor cannot delete what the agent wrote ───────
+    // The web renders these files without polling or subscribing, so it is
+    // routinely stale. The version token is what makes that safe: a Save
+    // from an editor opened before a self-edit is refused, not applied.
+    let stale = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    let stale_version = stale["version"].as_str().expect("version").to_owned();
+    // …the agent rewrites the file underneath (what `Edit` does mid-turn).
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Chosen by the agent\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "clobber", "version": stale_version }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let survived = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        survived["content"].as_str(),
+        Some("* **Name:** Chosen by the agent\n"),
+        "the agent's self-edit must survive a stale Save",
+    );
+    // Re-reading yields a version that writes cleanly.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({
+            "content": "* **Name:** Vega\n",
+            "version": survived["version"].as_str().expect("version"),
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    // An omitted version is still an unconditional write, for callers that
+    // genuinely mean "set it to this".
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "* **Name:** Vega\n" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // ── 4d. The name is IDENTITY.md, from both directions ───────────
+    // Renaming through the API rewrites the `Name:` line and leaves every
+    // other line the agent wrote alone.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\n* **Name:** Vega\n* **Vibe:** dry\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/name"),
+        json!({ "name": "Renamed" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let identity = get(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        StatusCode::OK,
+    )
+    .await;
+    let body = identity["content"].as_str().unwrap_or_default();
+    assert!(body.contains("* **Name:** Renamed"), "{body}");
+    assert!(
+        body.contains("* **Vibe:** dry"),
+        "the rest survives: {body}"
+    );
+
+    // And the other direction — what the agent writes into the file is what
+    // the roster shows, with no column to keep in step.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\n* **Name:** Chosen by the agent\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(fetched["name"].as_str(), Some("Chosen by the agent"));
+
+    // An unnamed agent falls back to its id rather than rendering blank.
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}/identity"),
+        json!({ "content": "# Who Am I?\n\nno name line at all\n" }),
+        StatusCode::OK,
+    )
+    .await;
+    let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(fetched["name"].as_str(), Some(agent_id.as_str()));
+
+    // The built-in's files sit in `personas/baybo/` like everyone else's —
+    // editable, even though its row is locked, because these are files, not
+    // row fields.
+    let builtin_soul = get(&router, "/v1/agents/baybo/soul", StatusCode::OK).await;
+    assert!(
+        builtin_soul["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("personas/baybo/SOUL.md"),
+        "the builtin is an ordinary persona directory, got {builtin_soul:?}",
+    );
+    put_expect(
+        &router,
+        "/v1/agents/baybo/soul",
+        json!({ "content": "workspace soul, edited" }),
+        StatusCode::OK,
+    )
+    .await;
+    let builtin_identity = get(&router, "/v1/agents/baybo/identity", StatusCode::OK).await;
+    assert!(
+        builtin_identity["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("personas/baybo/IDENTITY.md"),
+        "got {builtin_identity:?}",
+    );
+
+    // A malformed id can never reach the filesystem.
+    get(
+        &router,
+        "/v1/agents/..%2F..%2Fetc/soul",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // ── 4e. The skills readout is per-agent ─────────────────────────
+    // The harness registry starts empty; the compiled-in skills are what
+    // make "shared vs scoped" observable at all.
+    assert!(tg.deps.skill_registry.register_builtins() > 0);
+    // The shared listing belongs to the built-in; a custom agent sees only
+    // its own overlay plus the universal skills, so the Agents page cannot
+    // show one agent's inventory while editing another.
+    let shared = get(&router, "/v1/skills", StatusCode::OK).await;
+    let shared_names: Vec<&str> = shared["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(shared_names.contains(&"deck"), "{shared_names:?}");
+
+    let scoped = get(
+        &router,
+        &format!("/v1/skills?agent_id={agent_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    let scoped_names: Vec<&str> = scoped["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !scoped_names.contains(&"deck"),
+        "a custom agent must not inherit the shared set: {scoped_names:?}"
+    );
+    assert!(scoped_names.contains(&"baybo-cli"), "{scoped_names:?}");
+    assert!(
+        scoped["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|s| s["universal"].as_bool() == Some(true)),
+        "a fresh agent has only universal skills: {scoped_names:?}",
+    );
+
+    // A malformed id is a 400 here too, not a silently global listing.
+    get(
+        &router,
+        "/v1/skills?agent_id=../escape",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // ── 5. PUT is a full replace of what the row still owns ─────────
     put_expect(
         &router,
         &format!("/v1/agents/{agent_id}"),
-        json!({ "name": "Helper 2", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "baybo" }),
         StatusCode::NO_CONTENT,
     )
     .await;
     let replaced = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
-    assert_eq!(replaced["name"].as_str(), Some("Helper 2"));
     assert_eq!(replaced["framework"].as_str(), Some("baybo"));
-    for reset in ["system_prompt", "llm"] {
-        assert!(
-            replaced.get(reset).is_none(),
-            "full replace must reset {reset} to inherit, got {replaced:?}",
-        );
-    }
+    // Three things the content PUT does NOT touch, each because it has its
+    // own targeted endpoint: the avatar, the LLM pin, and the name (which is
+    // not a row field at all).
     assert_eq!(
         replaced["avatar_blob_id"].as_str(),
         Some(png_blob.blob_id.as_str()),
-        "avatar is not touched by the content PUT",
+    );
+    assert_eq!(replaced["llm"].as_str(), Some(llm_entry.as_str()));
+    assert_eq!(
+        replaced["name"].as_str(),
+        Some(agent_id.as_str()),
+        "the file was left without a Name: line above, so it falls back to the id",
     );
 
-    // Renames conflict case-insensitively against other rows only: a
-    // case-only self-rename is fine, taking another profile's name 400s.
     put_expect(
         &router,
-        &format!("/v1/agents/{agent_id}"),
-        json!({ "name": "HELPER 2", "description": "", "framework": "baybo" }),
+        &format!("/v1/agents/{agent_id}/name"),
+        json!({ "name": "Helper 2" }),
         StatusCode::NO_CONTENT,
     )
     .await;
+    let named = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(named["name"].as_str(), Some("Helper 2"));
+
     let beta = post_expect(
         &router,
         "/v1/agents",
@@ -237,19 +549,14 @@ async fn agents_api_round_trip() {
     )
     .await;
     let beta_id = beta["id"].as_str().expect("id").to_owned();
-    let err = put_expect(
+    // A rename onto another agent's name is allowed — see above.
+    put_expect(
         &router,
-        &format!("/v1/agents/{beta_id}"),
-        json!({ "name": "helper 2", "description": "", "framework": "baybo" }),
-        StatusCode::BAD_REQUEST,
+        &format!("/v1/agents/{beta_id}/name"),
+        json!({ "name": "helper 2" }),
+        StatusCode::NO_CONTENT,
     )
     .await;
-    assert!(
-        err["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("already exists")
-    );
     delete_expect(
         &router,
         &format!("/v1/agents/{beta_id}"),
@@ -262,7 +569,7 @@ async fn agents_api_round_trip() {
     put_expect(
         &router,
         "/v1/agents/missing",
-        json!({ "name": "x", "description": "", "framework": "baybo" }),
+        json!({ "description": "", "framework": "baybo" }),
         StatusCode::NOT_FOUND,
     )
     .await;
@@ -291,6 +598,10 @@ fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
     baybo_gateway::server::AdminState {
+        // Per-test workspace, from the same tempdir the deps were built
+        // with: the agents surface writes identity files under it, so a
+        // shared path would leak one test's persona into the next.
+        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),

@@ -1,20 +1,15 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use baybo_model::AgentProfileId;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::SkillDefinition;
 use crate::loader::load_skill_from_dir;
 use crate::validation::{validate_skill_name, validate_skill_version};
-
-/// A matched skill with its relevance score.
-#[derive(Debug, Clone)]
-pub struct SkillCandidate {
-    pub skill: SkillDefinition,
-    pub score: f64,
-}
 
 /// Lightweight projection over a [`SkillDefinition`] for callers that
 /// only need to display, list, or dispatch by name — agent loop's
@@ -55,26 +50,51 @@ impl SkillSummary {
     }
 }
 
+/// Skills every agent sees regardless of persona, because they are runtime
+/// infrastructure rather than a capability someone chose to grant.
+///
+/// `baybo-cli` is the whole list: it tells the agent how to introspect the
+/// instance it is running inside (the Bash tool injects `BAYBO_HELP_AGENT`
+/// and `BAYBO_CONFIG_PATH` for exactly this). Withholding it would not make
+/// a persona narrower, only blinder. Everything else in the shared set is a
+/// capability, so a custom agent gets it only by having it in its own
+/// overlay.
+pub const UNIVERSAL_SKILLS: &[&str] = &[crate::builtin::BAYBO_CLI_SKILL_NAME];
+
 /// Central registry for skill definitions.
 ///
 /// Skills are loaded from workspace files or the extension registry.
-/// `select` returns the skill explicitly invoked by a `/<cmd>` message,
-/// or the full registered set for the model to consider otherwise.
-///
 /// Interior mutability keeps the public API `&self`: the registry is
 /// shared as `Arc<SkillRegistry>` across the agent, channels, and CLI
 /// layers, and `reload()` needs to rewrite state without demanding a
 /// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
     skills: DashMap<String, SkillDefinition>,
+    /// Per-agent private overlays, keyed by profile id. An agent sees
+    /// `shared ∪ its own map`, its own entry winning a name collision — for
+    /// that agent only. The built-in profile has no entry here: its skills
+    /// *are* the shared set.
+    agent_skills: DashMap<AgentProfileId, HashMap<String, SkillDefinition>>,
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
+    /// Agent overlay roots passed to `load_agent_dir`, so `reload` can
+    /// replay those scans alongside `load_dirs`.
+    agent_dirs: RwLock<Vec<(AgentProfileId, PathBuf)>>,
     /// Skills registered via `register_builtins`, kept so `reload` can
     /// replay them. Without this, the first `SkillInstall`-triggered
     /// reload silently dropped every builtin (the map is cleared and
     /// only `load_dirs` are rescanned).
     builtins: RwLock<Vec<SkillDefinition>>,
+    /// Held for the whole of `reload` and for the whole of an overlay load.
+    ///
+    /// `reload` snapshots the dir lists, clears the maps, then rescans. An
+    /// overlay load that lands inside that window records itself in
+    /// `agent_dirs` *after* the snapshot and inserts its skills *before* the
+    /// clear — so the clear removes them, the stale snapshot never restores
+    /// them, and `agent_dir_loaded` now answers "already loaded" forever. The
+    /// agent's private skills would be gone until the next reload.
+    rebuild: Mutex<()>,
 }
 
 impl Default for SkillRegistry {
@@ -87,8 +107,11 @@ impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: DashMap::new(),
+            agent_skills: DashMap::new(),
             load_dirs: RwLock::new(Vec::new()),
+            agent_dirs: RwLock::new(Vec::new()),
             builtins: RwLock::new(Vec::new()),
+            rebuild: Mutex::new(()),
         }
     }
 
@@ -183,20 +206,172 @@ impl SkillRegistry {
     /// `register_builtins`) are cleared — for those, reload is
     /// "authoritative disk state wins."
     pub fn reload(&self) -> usize {
+        let _rebuild = self.rebuild.lock();
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
+        // Snapshot both lists before mutating: the scans below take the same
+        // locks these reads hold.
+        let agent_dirs: Vec<(AgentProfileId, PathBuf)> = self.agent_dirs.read().clone();
         self.skills.clear();
+        self.agent_skills.clear();
         for skill in self.builtins.read().iter() {
             self.register(skill.clone());
         }
         for dir in &dirs {
             self.scan_dir(dir);
         }
+        for (agent, dir) in &agent_dirs {
+            self.scan_agent_dir(agent, dir);
+        }
         self.skills.len()
     }
 
-    /// Remove a skill by name.
-    pub fn remove(&self, name: &str) -> Option<SkillDefinition> {
-        self.skills.remove(name).map(|(_, v)| v)
+    /// Load `agent`'s private overlay if this process has not already, and
+    /// report how many skills the scan registered.
+    ///
+    /// This is the only way the overlay is ever populated, so every reader of
+    /// an agent's scope — the actor build, the agents API — must call it
+    /// first. The built-in has no overlay (its skills *are* the shared set),
+    /// and a second call for the same agent is a no-op rather than a rescan:
+    /// picking up on-disk edits is `reload`'s job, which replays these scans
+    /// alongside the shared ones.
+    pub fn ensure_agent_overlay(
+        &self,
+        agent: &AgentProfileId,
+        paths: &baybo_workspace::WorkspacePaths,
+    ) -> usize {
+        let Some(dir) = agent.skills_overlay_dir(paths) else {
+            return 0;
+        };
+        if self.agent_dir_loaded(agent) {
+            return 0;
+        }
+        self.load_agent_dir(agent, &dir)
+    }
+
+    /// Scan one agent's overlay from `dir`
+    /// (`<workspace>/personas/<id>/skills/`), remembering it so `reload` can
+    /// replay the scan. Same on-disk shape and same governance as the shared
+    /// tree — persona folders are workspace content, so their skills are
+    /// `Trusted` and the risk assessor judges them like any other.
+    ///
+    /// A missing directory is not an error: an agent with no private skills
+    /// simply sees the shared set.
+    ///
+    /// Only a directory that exists is remembered. `GET /v1/skills?agent_id=`
+    /// accepts any well-formed id so a client can preview a scope, so
+    /// recording every id asked about would let a caller grow `agent_dirs`
+    /// (and the `reload` scan behind it) without bound.
+    fn load_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+        if !dir.is_dir() {
+            return 0;
+        }
+        let _rebuild = self.rebuild.lock();
+        {
+            let mut dirs = self.agent_dirs.write();
+            if !dirs.iter().any(|(a, d)| a == agent && d == dir) {
+                dirs.push((agent.clone(), dir.to_path_buf()));
+            }
+        }
+        self.scan_agent_dir(agent, dir)
+    }
+
+    /// Whether this agent's overlay has already been scanned in this process.
+    fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
+        self.agent_dirs.read().iter().any(|(a, _)| a == agent)
+    }
+
+    fn scan_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(err) => {
+                debug!(
+                    path = %dir.display(),
+                    agent_id = %agent,
+                    error = %err,
+                    "agent skill directory not available; skipping"
+                );
+                return 0;
+            }
+        };
+
+        let mut loaded = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("SKILL.md").is_file() {
+                continue;
+            }
+            match load_skill_from_dir(&path) {
+                Ok(skill) => {
+                    loaded.insert(skill.name.clone(), skill);
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), agent_id = %agent, error = %e, "failed to load agent skill");
+                }
+            }
+        }
+        let count = loaded.len();
+        self.agent_skills.insert(agent.clone(), loaded);
+        count
+    }
+
+    /// Whether this scope sees the whole shared set.
+    ///
+    /// The built-in agent's skills *are* the shared set (builtins +
+    /// `<workspace>/skills/`), and an unbound session is the built-in. A
+    /// custom agent is the deliberate case: it starts from nothing but its
+    /// own overlay, because a persona someone curated should not silently
+    /// acquire every skill the workspace happens to hold.
+    fn sees_shared_set(agent: Option<&AgentProfileId>) -> bool {
+        agent.is_none_or(AgentProfileId::is_builtin)
+    }
+
+    /// Look up a skill in one agent's scope: its private overlay first, then
+    /// the shared set — which a custom agent reaches only for a
+    /// [`UNIVERSAL_SKILLS`] entry.
+    ///
+    /// A name that exists only in *another* agent's overlay, or in a shared
+    /// set this agent does not inherit, simply misses — the caller reports
+    /// "unknown skill", never a refusal that would leak an inventory.
+    pub fn get_scoped(
+        &self,
+        agent: Option<&AgentProfileId>,
+        name: &str,
+    ) -> Option<SkillDefinition> {
+        if let Some(agent) = agent
+            && let Some(overlay) = self.agent_skills.get(agent)
+            && let Some(skill) = overlay.get(name)
+        {
+            return Some(skill.clone());
+        }
+        if Self::sees_shared_set(agent) || UNIVERSAL_SKILLS.contains(&name) {
+            return self.get(name);
+        }
+        None
+    }
+
+    /// [`Self::all_summaries_sorted`] for one agent's scope.
+    ///
+    /// The built-in sees the shared set. A custom agent sees its own overlay
+    /// plus [`UNIVERSAL_SKILLS`], the overlay winning a name collision.
+    /// Sorted by name so ordering is stable across turns.
+    pub fn summaries_for(&self, agent: Option<&AgentProfileId>) -> Vec<SkillSummary> {
+        if Self::sees_shared_set(agent) {
+            return self.all_summaries_sorted();
+        }
+        let mut merged: HashMap<String, SkillSummary> = self
+            .skills
+            .iter()
+            .filter(|e| UNIVERSAL_SKILLS.contains(&e.key().as_str()))
+            .map(|e| (e.key().clone(), SkillSummary::from(e.value())))
+            .collect();
+        if let Some(overlay) = agent.and_then(|a| self.agent_skills.get(a)) {
+            for (name, skill) in overlay.iter() {
+                merged.insert(name.clone(), SkillSummary::from(skill));
+            }
+        }
+        let mut out: Vec<SkillSummary> = merged.into_values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Look up a skill by name, returning a cloned definition.
@@ -286,45 +461,6 @@ impl SkillRegistry {
     /// Validate a single skill by name.
     pub fn validate(&self, name: &str) -> Option<SkillValidation> {
         self.skills.get(name).map(|e| validate_one(e.value()))
-    }
-
-    /// Select skills for a given user message.
-    ///
-    /// Two cases:
-    /// 1. The trimmed message equals `/<cmd>` exactly — return only that
-    ///    skill, so an explicit slash invocation narrows context to the
-    ///    one the user asked for.
-    /// 2. Otherwise — return every registered skill, leaving the choice
-    ///    to the downstream risk assessor and the model. No ranking,
-    ///    mention scanning, or description match happens here; `score`
-    ///    is always `1.0` and kept in the type for the caller to weight
-    ///    if it ever needs to.
-    ///
-    /// Selection reads no prompt bodies, so a loaded skill can never
-    /// bias which skill loads next.
-    pub fn select(&self, message_text: &str) -> Vec<SkillCandidate> {
-        let trimmed = message_text.trim_start();
-        let mut candidates: Vec<SkillCandidate> = Vec::new();
-        for entry in self.skills.iter() {
-            let skill = entry.value();
-            let command_hit = skill.command.as_ref().is_some_and(|cmd| {
-                let full = format!("/{cmd}");
-                trimmed == full
-            });
-            if command_hit {
-                return vec![SkillCandidate {
-                    skill: skill.clone(),
-                    score: 1.0,
-                }];
-            }
-
-            candidates.push(SkillCandidate {
-                skill: skill.clone(),
-                score: 1.0,
-            });
-        }
-
-        candidates
     }
 }
 
@@ -573,50 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn select_exact_slash_command_returns_only_that_skill() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("greet", "say hi"));
-        reg.register(mk("deploy", "ship it"));
-        let hits = reg.select("/greet");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].skill.name, "greet");
-        assert_eq!(hits[0].score, 1.0);
-    }
-
-    #[test]
-    fn select_slash_with_args_returns_full_set() {
-        // `/<cmd> <args>` is not an exact match, so we fall through to
-        // the "return everything" branch instead of narrowing.
-        let reg = SkillRegistry::new();
-        reg.register(mk("fix-issue", "fix a GitHub issue"));
-        reg.register(mk("other", "some other skill"));
-        let hits = reg.select("/fix-issue 123");
-        assert_eq!(hits.len(), 2);
-    }
-
-    #[test]
-    fn select_non_slash_message_returns_all_registered_skills() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("explain", "explain code"));
-        reg.register(mk("summarise", "condense text"));
-        let hits = reg.select("how does this work?");
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|c| c.score == 1.0));
-    }
-
-    #[test]
-    fn select_does_not_command_match_on_substring() {
-        // `/greetings everyone` doesn't exactly equal `/greet`, so
-        // `greet` is returned as part of the full-set fall-through
-        // rather than as an exclusive slash-command hit.
-        let reg = SkillRegistry::new();
-        reg.register(mk("greet", "say hi"));
-        let hits = reg.select("/greetings everyone");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].skill.name, "greet");
-    }
-
-    #[test]
     fn load_dir_reads_skill_md_per_subdirectory() {
         let dir =
             std::env::temp_dir().join(format!("baybo-skills-load-dir-{}", std::process::id()));
@@ -656,15 +748,6 @@ mod tests {
         let reg = SkillRegistry::new();
         let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/baybo-skills"));
         assert_eq!(loaded, 0);
-    }
-
-    #[test]
-    fn remove_drops_registered_skill() {
-        let reg = SkillRegistry::new();
-        reg.register(mk("s", "something"));
-        assert!(reg.get("s").is_some());
-        reg.remove("s");
-        assert!(reg.get("s").is_none());
     }
 
     #[test]
@@ -743,5 +826,150 @@ mod tests {
         assert_eq!(reg.get("deck").unwrap().description, "patched");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_overlay_wins_for_its_own_agent_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "baybo-agent-skills-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let shared = dir.join("shared");
+        let paths = baybo_workspace::WorkspacePaths::new(dir.clone());
+        let agent_a = AgentProfileId::parse("01JAGENTA").unwrap();
+        let agent_b = AgentProfileId::parse("01JAGENTB").unwrap();
+        let overlay = paths.persona_skills_dir(&agent_a.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        for (root, desc) in [(&shared, "shared version"), (&overlay, "agent version")] {
+            let sub = root.join("deploy");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(
+                sub.join("SKILL.md"),
+                format!("---\nname: deploy\ndescription: {desc}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        // One skill only this agent can see.
+        let private = overlay.join("secret-recipe");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(
+            private.join("SKILL.md"),
+            "---\nname: secret-recipe\ndescription: private\n---\nbody\n",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::new();
+        reg.load_dir(&shared);
+        // Through the production seam: it derives the overlay path from the
+        // id, so a call site that only has a session's agent is enough.
+        assert_eq!(reg.ensure_agent_overlay(&agent_a, &paths), 2);
+        assert_eq!(
+            reg.ensure_agent_overlay(&agent_a, &paths),
+            0,
+            "a second call must not rescan"
+        );
+        assert_eq!(
+            reg.ensure_agent_overlay(&AgentProfileId::builtin(), &paths),
+            0,
+            "the built-in has no overlay — its skills are the shared set"
+        );
+
+        // The overlay wins for its own agent…
+        assert_eq!(
+            reg.get_scoped(Some(&agent_a), "deploy")
+                .unwrap()
+                .description,
+            "agent version"
+        );
+        // …and a custom agent does NOT inherit the shared set: agent B has no
+        // overlay, so `deploy` is simply not one of its skills.
+        assert!(reg.get_scoped(Some(&agent_b), "deploy").is_none());
+        // The built-in's skills *are* the shared set.
+        assert_eq!(
+            reg.get_scoped(Some(&AgentProfileId::builtin()), "deploy")
+                .unwrap()
+                .description,
+            "shared version"
+        );
+        assert_eq!(reg.get("deploy").unwrap().description, "shared version");
+
+        // A private skill is invisible to every other scope, and the miss is
+        // an ordinary "not found" — it must not leak that it exists.
+        assert!(reg.get_scoped(Some(&agent_a), "secret-recipe").is_some());
+        assert!(reg.get_scoped(Some(&agent_b), "secret-recipe").is_none());
+        assert!(reg.get_scoped(None, "secret-recipe").is_none());
+
+        // Listings follow the same rule.
+        let names_a: Vec<String> = reg
+            .summaries_for(Some(&agent_a))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names_a, vec!["deploy", "secret-recipe"]);
+        let names_b: Vec<String> = reg
+            .summaries_for(Some(&agent_b))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names_b.is_empty(),
+            "an agent with no overlay starts empty, not with the workspace's set: {names_b:?}"
+        );
+        let unbound: Vec<String> = reg
+            .summaries_for(None)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(unbound, vec!["deploy"]);
+
+        // reload() replays overlays, not just the shared dirs.
+        reg.reload();
+        assert_eq!(
+            reg.get_scoped(Some(&agent_a), "deploy")
+                .unwrap()
+                .description,
+            "agent version"
+        );
+        assert!(reg.agent_dir_loaded(&agent_a));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Infrastructure, not a capability: every agent can introspect the
+    /// instance it runs inside, however narrow its persona.
+    #[test]
+    fn a_custom_agent_still_reaches_the_universal_skills() {
+        let reg = SkillRegistry::new();
+        assert!(reg.register_builtins() > 0);
+        let agent = AgentProfileId::parse("01JNARROW").unwrap();
+
+        for name in UNIVERSAL_SKILLS {
+            assert!(
+                reg.get_scoped(Some(&agent), name).is_some(),
+                "{name} must reach every agent"
+            );
+        }
+        let listed: Vec<String> = reg
+            .summaries_for(Some(&agent))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for name in UNIVERSAL_SKILLS {
+            assert!(listed.contains(&(*name).to_owned()), "{listed:?}");
+        }
+        // …but nothing else the binary ships with. `deck` is an authoring
+        // tool, which is a capability, not infrastructure.
+        assert!(!listed.contains(&"deck".to_owned()), "{listed:?}");
+        assert!(reg.get_scoped(Some(&agent), "deck").is_none());
+    }
+
+    #[test]
+    fn a_missing_agent_overlay_is_empty_not_an_error() {
+        let reg = SkillRegistry::new();
+        let agent = AgentProfileId::parse("01JNOWHERE").unwrap();
+        let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/nonexistent"));
+        assert_eq!(reg.ensure_agent_overlay(&agent, &paths), 0);
+        assert!(reg.summaries_for(Some(&agent)).is_empty());
     }
 }

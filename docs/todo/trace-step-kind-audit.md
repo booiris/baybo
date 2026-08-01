@@ -16,6 +16,13 @@ description of what a trace contains, and PR2 of the viewer redesign has to buil
 
 ### 1. `StepKind::SkillSelection` is declared but never constructed
 
+**Narrowed:** the registry-side half is gone — `SkillRegistry::select` and
+`SkillCandidate` were deleted (no production caller ever existed), so nothing
+is waiting to be wired *to*. What remains is the enum variant and its web
+counterpart; the decision is now delete-or-keep on the trace side alone, and a
+variant removal hard-errors on stored rows (see the retirement note in
+`docs/modules/trace.md`).
+
 `crates/trace/src/step.rs:71` declares it; no production path calls `begin_step` with it.
 A skill is pulled in through the `Skill` tool (`SKILL_TOOL_NAME`, `crates/skills/src/tools.rs:30`),
 so in a trace it appears as an ordinary `SpanKind::ToolCall` named `Skill` — never as a step.

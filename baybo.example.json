@@ -50,6 +50,14 @@
       "window_secs": 60
     }
   },
+  "memory": {
+    "builtin": {
+      "enabled": true,
+      "dream": {
+        "schedule": "0 4 * * SUN,WED"
+      }
+    }
+  },
   "workspace": {
     "path": "/home/YOUR_USER/.baybo"
   },

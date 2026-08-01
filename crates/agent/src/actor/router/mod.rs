@@ -25,9 +25,10 @@ use std::time::Instant;
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
 use baybo_model::{LlmEntryName, Session};
+use baybo_store::agent_profile::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::mailbox::MailboxSender;
@@ -165,6 +166,66 @@ pub(crate) fn build_oneshot_actor(
     (mailbox, actor_token)
 }
 
+/// The model a cold spawn — or a post-eviction hydration — pins its loop to.
+///
+/// Only `llm` has a fallback beyond the session: the entry name can come from
+/// the bound agent's profile. The model-within-entry and the reasoning effort
+/// stay session-only, because those are the chat header's per-conversation
+/// choices, not part of what an agent *is*.
+pub(crate) struct SpawnPins {
+    pub llm: Option<LlmEntryName>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Resolve what a cold spawn pins to: `last_llm ?? profile.llm ?? default`.
+///
+/// An explicit per-session switch always wins — the user pressed that button
+/// for this conversation. Otherwise a session bound to a custom agent follows
+/// that agent's pin, so editing a profile reaches its sessions at their next
+/// hydration (a cold start or an idle reap), which is the same latency a
+/// profile edit already has for the soul.
+///
+/// Unbound and built-in sessions short-circuit without touching the store:
+/// the built-in follows `default-llm` by definition, so there is nothing of
+/// its own to read. A deleted profile, or a store that errors, degrades to
+/// the default with a `warn!` rather than failing the spawn.
+pub(crate) async fn resolve_spawn_pins(
+    session: &Session,
+    agent_profiles: &Arc<dyn AgentProfileStore>,
+) -> SpawnPins {
+    let llm = match session.state.last_llm.clone() {
+        Some(pinned) => Some(pinned),
+        None => agent_profile_llm(session, agent_profiles).await,
+    };
+    SpawnPins {
+        llm,
+        model: session.state.last_model.clone(),
+        effort: session.state.last_effort.clone(),
+    }
+}
+
+async fn agent_profile_llm(
+    session: &Session,
+    agent_profiles: &Arc<dyn AgentProfileStore>,
+) -> Option<LlmEntryName> {
+    let agent_id = session.state.agent_id.as_ref()?;
+    if agent_id.is_builtin() {
+        return None;
+    }
+    match agent_profiles.get(agent_id).await {
+        Ok(Some(row)) => row.llm,
+        Ok(None) => {
+            warn!(agent_id = %agent_id, "bound agent profile is gone; using the default llm");
+            None
+        }
+        Err(e) => {
+            warn!(agent_id = %agent_id, error = %e, "failed to read bound agent profile; using the default llm");
+            None
+        }
+    }
+}
+
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
     session_manager: Arc<SessionManager>,
@@ -181,6 +242,7 @@ pub struct Router {
     /// fire's outcome here, and `run()` scans it at boot to re-drive results
     /// that never reached their conversation.
     cron_store: Arc<dyn CronStore>,
+    agent_profiles: Arc<dyn AgentProfileStore>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` it out of
     /// `self` to drive in a `select!` arm; populated unconditionally from
     /// `RouterConfig` at construction.
@@ -190,6 +252,10 @@ pub struct Router {
     /// each actor derives its `actor_token` as a child of this so
     /// process shutdown cascades into every in-flight turn.
     actor_parent_token: CancellationToken,
+    /// Workspace addresses. The dream fire's digest names each
+    /// conversation by its virtual transcript path and each agent by its
+    /// memory directory, and both are composed from here.
+    workspace: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 /// Construction bundle for [`Router`]. Every field is required — call
@@ -205,6 +271,9 @@ pub struct RouterConfig {
     pub turn_lifecycle: Arc<TurnLifecycle>,
     /// Delivery ledger for one-shot cron results — see [`Router::cron_store`].
     pub cron_store: Arc<dyn CronStore>,
+    /// Read at cold spawn to fall back to a bound agent's LLM pin — see
+    /// [`resolve_spawn_pins`].
+    pub agent_profiles: Arc<dyn AgentProfileStore>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
@@ -214,6 +283,8 @@ pub struct RouterConfig {
     /// rebuilding the router. Production wiring sources it from config;
     /// tests build one from whatever values they want.
     pub rate_limit: Arc<LiveRateLimit>,
+    /// Workspace addresses — see [`Router::workspace`].
+    pub workspace: Arc<baybo_workspace::WorkspacePaths>,
 }
 
 impl Router {
@@ -227,9 +298,11 @@ impl Router {
             actor_spawner,
             turn_lifecycle,
             cron_store,
+            agent_profiles,
             cron_trigger_rx,
             actor_parent_token,
             rate_limit,
+            workspace,
         } = config;
         Self {
             session_manager,
@@ -241,8 +314,10 @@ impl Router {
             actor_spawner,
             turn_lifecycle,
             cron_store,
+            agent_profiles,
             cron_trigger_rx: Some(cron_trigger_rx),
             actor_parent_token,
+            workspace,
         }
     }
 

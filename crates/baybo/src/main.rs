@@ -91,10 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
-    let workspace_root = workspace_paths.root().to_path_buf();
-    baybo_workspace::WorkspaceManager::new(workspace_root.clone())
-        .ensure_layout()
-        .await?;
+    baybo_workspace::ensure_layout(&workspace_paths).await?;
 
     // One-shot `baybo prompt`: stream a single answer and exit. Sits
     // beside the `tui` early-return because both drive the agent runtime
@@ -177,18 +174,20 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
     let tool_registry = Arc::new(baybo_tools::ToolRegistry::with_defaults(
-        stores.blob.clone(),
-        workspace_paths.clone(),
-        tool_proxy,
-        // argv one-shots (llm/doctor/status) barely touch Bash; there is no
-        // config reloader on this path, so use the default Bash permission policy.
-        Arc::new(baybo_tools::builtin::LivePermissionMode::new(
-            baybo_tools::builtin::BashPermissionMode::default(),
-        )),
+        baybo_tools::builtin::DefaultToolsConfig {
+            blob_store: stores.blob.clone(),
+            workspace_paths: workspace_paths.clone(),
+            proxy: tool_proxy,
+            // argv one-shots (llm/doctor/status) barely touch Bash; there is
+            // no config reloader on this path, so use the default Bash
+            // permission policy.
+            permission: Arc::new(baybo_tools::builtin::LivePermissionMode::new(
+                baybo_tools::builtin::BashPermissionMode::default(),
+            )),
+            builtin_memory: config.memory.builtin.enabled,
+        },
     ));
-    let workspace = Arc::new(baybo_workspace::WorkspaceManager::new(
-        workspace_root.clone(),
-    ));
+    let workspace = Arc::new(workspace_paths.clone());
     let channels_registry = Arc::new(baybo_channels::ChannelRegistry::new());
     // Only `llm`, `doctor`, and `status` touch `ctx.llm` in the argv
     // path. Building the client unconditionally meant every run of

@@ -683,18 +683,24 @@ export function CronPage() {
                                 {toggle === 'pause' ? <RiPauseLine /> : <RiPlayLine />}
                               </IconButton>
                             )}
-                            <IconButton
-                              aria-label="Move cron job to recycle bin"
-                              title="Move to the recycle bin"
-                              onClick={() => {
-                                setMutationError(null);
-                                setPendingDeleteId(job.id);
-                              }}
-                              disabled={isMock || mutating}
-                              className="!border-err !text-err hover:!bg-err/10"
-                            >
-                              <RiDeleteBinLine />
-                            </IconButton>
+                            {/* A built-in job has a config switch and a
+                                pause button; the server refuses to delete
+                                it, so offering the affordance would only
+                                produce a 400. */}
+                            {job.builtin !== true && (
+                              <IconButton
+                                aria-label="Move cron job to recycle bin"
+                                title="Move to the recycle bin"
+                                onClick={() => {
+                                  setMutationError(null);
+                                  setPendingDeleteId(job.id);
+                                }}
+                                disabled={isMock || mutating}
+                                className="!border-err !text-err hover:!bg-err/10"
+                              >
+                                <RiDeleteBinLine />
+                              </IconButton>
+                            )}
                           </>
                         )}
                       </div>
@@ -764,7 +770,7 @@ export function CronPage() {
           }}
           onEdit={selected.deleted_at ? undefined : () => openEditor(selected)}
           onTrash={
-            selected.deleted_at
+            selected.deleted_at || selected.builtin === true
               ? undefined
               : () => {
                   setMutationError(null);
@@ -1016,6 +1022,14 @@ function CronEditModal({
             </div>
           )}
 
+          {job.builtin === true && (
+            <div className="rounded-md border border-line bg-surface-2 px-3 py-2 text-[0.8rem] text-ink-soft">
+              This job is part of Baybo. Its schedule is yours to change; its name
+              and instruction are the runtime's, and the server refuses edits to
+              them. Switch it off for good in <code>baybo.json</code>.
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-4">
             <div className="col-span-2">
               <label className={fieldLabel} htmlFor="cron-edit-title">
@@ -1025,7 +1039,7 @@ function CronEditModal({
                 id="cron-edit-title"
                 className={textInput}
                 value={form.title}
-                disabled={submitting}
+                disabled={submitting || job.builtin === true}
                 onChange={(e) => set('title', e.target.value)}
                 placeholder="e.g. Morning digest"
               />
@@ -1111,7 +1125,7 @@ function CronEditModal({
               className={`${textInput} resize-y`}
               rows={4}
               value={form.prompt}
-              disabled={submitting}
+              disabled={submitting || job.builtin === true}
               onChange={(e) => set('prompt', e.target.value)}
               placeholder="What the job should do when it fires"
             />

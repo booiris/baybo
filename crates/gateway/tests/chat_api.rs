@@ -21,6 +21,86 @@ use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+/// Picking an agent at creation is the whole entry point of multi-agent
+/// chat: the binding is stamped on the row, echoed to clients, and refused
+/// when it names nothing.
+#[tokio::test]
+async fn a_chat_session_can_be_created_bound_to_an_agent() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let created = post(
+        &router,
+        "/v1/agents",
+        Body::from(
+            serde_json::to_vec(&json!({ "name": "Reviewer", "soul": "Be terse." })).unwrap(),
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_id = created["id"].as_str().expect("id").to_owned();
+
+    let cred = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(serde_json::to_vec(&json!({ "agent_id": agent_id })).unwrap()),
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+
+    let session = tg
+        .deps
+        .session_manager
+        .get(&baybo_model::SessionId::from(session_id.as_str()))
+        .await
+        .expect("load session")
+        .expect("session row");
+    assert_eq!(
+        session.state.agent_id.as_ref().map(|a| a.as_str()),
+        Some(agent_id.as_str()),
+    );
+    assert_eq!(
+        session.state.agent_framework,
+        Some(baybo_model::AgentFramework::Baybo),
+    );
+
+    // Omitting the field keeps today's behaviour: the built-in.
+    let plain = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let plain_id = plain["session_id"].as_str().expect("session_id").to_owned();
+    let plain_session = tg
+        .deps
+        .session_manager
+        .get(&baybo_model::SessionId::from(plain_id.as_str()))
+        .await
+        .expect("load session")
+        .expect("session row");
+    assert_eq!(plain_session.state.agent_id, None);
+    assert_eq!(
+        plain_session.state.agent_id_or_builtin(),
+        baybo_model::AgentProfileId::builtin(),
+    );
+
+    // An id that names no row is a 400, not a silently-unbound session:
+    // binding at creation is the only chance to get it right.
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(serde_json::to_vec(&json!({ "agent_id": "01JNOSUCHAGENT" })).unwrap()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // And a malformed one never reaches the persona directory.
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(serde_json::to_vec(&json!({ "agent_id": "../escape" })).unwrap()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn chat_api_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -1466,6 +1546,10 @@ fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,
 ) -> baybo_gateway::server::AdminState {
     baybo_gateway::server::AdminState {
+        // Per-test workspace, from the same tempdir the deps were built
+        // with: the agents surface writes identity files under it, so a
+        // shared path would leak one test's persona into the next.
+        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),

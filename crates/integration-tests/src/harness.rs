@@ -485,6 +485,7 @@ impl AgentTestHarnessBuilder {
             source_path: None,
         });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
+            agent: None,
             tokenizer,
             workspace,
             keep_recent,
@@ -495,6 +496,7 @@ impl AgentTestHarnessBuilder {
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),
+            builtin_memory: false,
         });
 
         let guarded_llm =

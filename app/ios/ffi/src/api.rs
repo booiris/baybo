@@ -255,6 +255,10 @@ pub struct CronJobSummary {
     pub next_trigger_at: Option<String>,
     /// RFC 3339. `None` until the job first fires.
     pub last_triggered_at: Option<String>,
+    /// Whether the runtime owns this job (the dream pass). It pauses and
+    /// reschedules like any other, but the server refuses to delete it — so
+    /// the UI must not offer a delete the user can only be told "no" to.
+    pub builtin: bool,
 }
 
 /// A live job's run state, mirroring the gateway's `CronStatus`. Orthogonal to

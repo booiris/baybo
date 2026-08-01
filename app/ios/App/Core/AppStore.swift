@@ -824,7 +824,8 @@ final class AppStore: ObservableObject {
                     timezone: "Asia/Shanghai",
                     status: .enabled,
                     nextTriggerAt: iso.string(from: now.addingTimeInterval(3 * 3600)),
-                    lastTriggeredAt: iso.string(from: now.addingTimeInterval(-21 * 3600))),
+                    lastTriggeredAt: iso.string(from: now.addingTimeInterval(-21 * 3600)),
+                    builtin: false),
                 CronJobSummary(
                     id: "demo-job-paused",
                     title: "Weekly digest",
@@ -833,7 +834,8 @@ final class AppStore: ObservableObject {
                     timezone: "UTC",
                     status: .disabled,
                     nextTriggerAt: nil,
-                    lastTriggeredAt: nil),
+                    lastTriggeredAt: nil,
+                    builtin: false),
                 CronJobSummary(
                     id: "demo-job-nameless",
                     title: "",
@@ -842,7 +844,8 @@ final class AppStore: ObservableObject {
                     timezone: "UTC",
                     status: .enabled,
                     nextTriggerAt: iso.string(from: now.addingTimeInterval(12 * 60)),
-                    lastTriggeredAt: nil),
+                    lastTriggeredAt: nil,
+                    builtin: false),
             ]
         }
     #endif

@@ -304,6 +304,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "TEXT",
     },
     AddColumn {
+        table: "cron_jobs",
+        column: "builtin",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
         table: "sessions",
         column: "folder_id",
         definition: "TEXT",
@@ -385,6 +390,16 @@ const ADD_COLUMNS: &[AddColumn] = &[
     },
     AddColumn {
         table: "sessions",
+        column: "agent_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "agent_framework",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "sessions",
         column: "last_model",
         definition: "TEXT",
     },
@@ -397,6 +412,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         table: "session_messages",
         column: "compaction_inserted",
         definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "sessions",
+        column: "dreamed_through_ordinal",
+        definition: "INTEGER",
     },
 ];
 
@@ -668,6 +688,35 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     read_cursor           INTEGER,
                     -- Auto-generated conversation title; owned by set_title.
                     title                 TEXT,
+                    -- The agent profile this session's work belongs to: its
+                    -- soul, skill overlay and memory partition. NULL ⇒ the
+                    -- built-in `baybo` profile, which is what every
+                    -- pre-binding row and every channel/TUI session reads as.
+                    -- Unlike the other flat columns these two have NO setter
+                    -- at all: `save`'s INSERT seeds them and its DO UPDATE
+                    -- omits them, which is what makes the binding write-once
+                    -- structurally rather than by convention.
+                    agent_id              TEXT,
+                    -- The bound profile's framework as it stood at creation
+                    -- (AgentFramework::as_str()). A snapshot on purpose: a
+                    -- transcript written by baybo's own loop cannot later be
+                    -- served by an external CLI. NULL ⇒ baybo.
+                    agent_framework       TEXT,
+                    -- Highest session_messages.ordinal the dream pass has
+                    -- been offered for this session; NULL means never
+                    -- offered. It is the pass's cursor, and the only one it
+                    -- has: rows above it are what new-since-I-last-looked
+                    -- means, whoever wrote them. A time window cannot answer
+                    -- that, because the rows a pass misses are the ones
+                    -- appended AFTER it read -- by a turn that was still
+                    -- running, or by a background-notification delivery that
+                    -- opens no turn at all -- and those carry
+                    -- MessageSource::Agent, so no human-message predicate
+                    -- over any window will ever select them. Owned by a
+                    -- targeted UPDATE (set_dreamed_through_ordinal,
+                    -- max-wins) and omitted from save's DO UPDATE like every
+                    -- other flat column. See docs/modules/memory-builtin.md.
+                    dreamed_through_ordinal INTEGER,
                     data                  TEXT NOT NULL
                 );
                 -- idx_sessions_root is no longer created (2026-07
@@ -758,6 +807,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_session_messages_superseded
                     ON session_messages(session_id, superseded_by)
                     WHERE superseded_by IS NOT NULL;
+                -- Cross-session, time-ranged lookup of human messages —
+                -- what the dream pass asks for: who spoke to me since the
+                -- last pass. Both indexes above are keyed on
+                -- `session_id` first, so neither can serve a global
+                -- `created_at` range scan; without this the query reads the
+                -- whole message log. Plain composite rather than partial:
+                -- sqlite will not reliably match a query's `source IN (…)`
+                -- against a partial index's identical WHERE clause.
+                CREATE INDEX IF NOT EXISTS idx_session_messages_source_created
+                    ON session_messages(source, created_at);
 
                 -- Identity of the pipeline that produced `message_fts`, so a
                 -- changed segmenter rebuilds instead of leaving half the index
@@ -947,6 +1006,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- re-serializes it on every fire, so a pin in the blob would
                     -- be reverted by the next tick. Written only by `set_pinned`.
                     pinned          INTEGER NOT NULL DEFAULT 0,
+                    -- Whether the runtime seeds and owns this job (the dream
+                    -- pass). Flat, never the blob, for the same reason
+                    -- `pinned` is. A built-in job is pausable and
+                    -- reschedulable but not deletable — `delete` refuses it.
+                    builtin         INTEGER NOT NULL DEFAULT 0,
                     data            TEXT    NOT NULL
                 );
                 -- idx_cron_jobs_user_id is no longer created (2026-07
@@ -1043,14 +1107,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- impl and create never binds `builtin`, so the open()-time
                 -- seed is the only writer of 1. avatar_blob_id is a soft
                 -- reference into blobs (FKs are off — see set_wal_mode).
-                -- Skills are not stored here — they are read live from the
-                -- skill registry (see docs/modules/agent-profiles.md).
+                -- Skills, prompt and display NAME are all absent on
+                -- purpose: skills come live from the registry, and an
+                -- agent's prompt and name are its own
+                -- `personas/<id>/{SOUL,IDENTITY}.md` — files it rewrites
+                -- itself, which no column could track (see
+                -- docs/modules/agent-profiles.md).
                 CREATE TABLE IF NOT EXISTS agent_profiles (
                     id              TEXT PRIMARY KEY,
-                    name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     description     TEXT NOT NULL,
                     avatar_blob_id  TEXT,
-                    system_prompt   TEXT,
                     framework       TEXT NOT NULL,
                     llm             TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,

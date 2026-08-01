@@ -839,7 +839,7 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 `TurnLifecycle`, `CronScheduler`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
-`llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
+`llm_pool: LlmPoolHandle` it's the default client of), `WorkspacePaths`,
 `LeakDetector`, `ChannelRegistry`, `CostManager`, `DeckManager` (its
 `DeckCard*` agent tools register at build; `gateway_cmd` boots/stops the
 card services — [`deck.md`](./deck.md)) — plus a

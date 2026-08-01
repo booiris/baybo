@@ -1,4 +1,4 @@
-//! Default identity-file templates seeded into `<workspace>/profile/`
+//! Default identity-file templates seeded into `<workspace>/personas/`
 //! by `baybo-setup::bootstrap` when an identity markdown file is
 //! missing. Source of truth for the template shape and intended voice
 //! is openclaw's reference templates:
@@ -63,6 +63,66 @@ pub(crate) const DEFAULT_USER_CONTENT: &str = r#"# About Your Human
 ## Context
 
 *(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)*
+"#;
+
+/// Seed body for a newly-created agent's `personas/<id>/SOUL.md`.
+///
+/// Deliberately carries **no substitutions**. The profile row's name and
+/// description are the operator's label for the roster; what the agent calls
+/// itself lives in its own `IDENTITY.md`. Baking either into this file would
+/// mint a third copy that nothing maintains and that goes stale the moment
+/// the profile is renamed.
+pub const PERSONA_SOUL_TEMPLATE: &str = r#"# Soul
+
+*This file is this agent's soul: its personality, tone, and preferences. It is
+yours to rewrite — edit it directly, or let the agent update it as it learns.
+Sessions bound to any other agent never read it. This agent's name and
+self-image live beside it in `IDENTITY.md`; the shared `personas/USER.md`
+(who your human is) applies on top.*
+
+## Core Truths
+
+*(What is this agent for? How should it come across? What does it refuse to do?)*
+
+## Boundaries
+
+*(Anything this agent must never touch, or must always confirm first.)*
+"#;
+
+/// Seed body for an empty memory index (`MEMORY.md`) in an agent's
+/// `personas/<id>/memory/`.
+///
+/// Deliberately tiny: this file is carried **verbatim** in every system
+/// prompt, so anything written here is a per-turn context cost forever.
+/// The rules for using it live in the runtime prompt framing, not on
+/// disk.
+pub const MEMORY_INDEX_TEMPLATE: &str = r#"# Memory Index
+
+*One line per memory file, newest concerns first. Nothing remembered yet.*
+"#;
+
+/// Seed body for a newly-created agent's `personas/<id>/USER.md`.
+///
+/// Deliberately *not* [`DEFAULT_USER_CONTENT`]: the shared `personas/USER.md`
+/// holds the stable facts the operator curates, and every agent reads that
+/// too. This file is what one agent has worked out for itself, so its
+/// template asks for that rather than re-asking for a name and a timezone
+/// somebody already filled in.
+pub const PERSONA_USER_TEMPLATE: &str = r#"# What I've Learned About Them
+
+*Your own notes, not shared with the other agents. The shared
+`personas/USER.md` already covers who they are — this is for what working with
+them has taught you: how they like this kind of work done, what they have
+already told you not to do, what context recurs.*
+
+## Working With Them
+
+*(Preferences that showed up in practice. Update as you go.)*
+
+## Context
+
+*(Projects, constraints, people and systems that keep coming up in your work
+together.)*
 "#;
 
 pub(crate) const DEFAULT_IDENTITY_CONTENT: &str = r#"# Who Am I?

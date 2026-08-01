@@ -8,6 +8,7 @@
 //! sqlite adapter, and keeps the dependency graph acyclic.
 
 pub mod agent_profile;
+
 pub mod blob;
 pub mod channel_bot;
 pub mod channel_pairing;
@@ -23,6 +24,8 @@ pub mod session;
 pub mod session_folder;
 pub mod skill_risk;
 pub mod task;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trace;
 pub mod turn;
 
@@ -38,7 +41,7 @@ pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
 pub use secret::{SecretStore, StoreIdentity};
-pub use session::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
+pub use session::{DreamCandidate, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use task::{TaskPatch, TaskStore};

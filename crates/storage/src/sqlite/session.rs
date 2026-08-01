@@ -4,11 +4,13 @@ use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_model::{
-    ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
-    SessionId,
+    AgentFramework, AgentProfileId, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    LineageKind, LlmEntryName, Session, SessionId,
 };
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
+use baybo_store::session::{
+    DreamCandidate, Result, SessionMessageAppendOutcome, SessionStore, StoredMessage,
+};
 
 pub struct SqliteSessionStore {
     pool: SqlitePool,
@@ -38,7 +40,8 @@ type RawMessageRow = (String, String, String, String);
 type RawMessageRowWithMeta = (i64, String, String, String, i64, String);
 
 /// Raw `sessions` columns projected by the list/get reads:
-/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort)`.
+/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model,
+/// last_effort, agent_id, agent_framework)`.
 type RawSessionListRow = (
     String,
     i64,
@@ -50,7 +53,15 @@ type RawSessionListRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
+
+/// Column list shared by every `sessions` read that decodes a
+/// [`RawSessionListRow`] — the projection order *is* the tuple order, so the
+/// two must never drift.
+pub(super) const SESSION_LIST_COLUMNS: &str = "data, hidden, last_llm, pinned, id, folder_id, \
+     archived, title, last_model, last_effort, agent_id, agent_framework";
 
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
@@ -103,7 +114,25 @@ fn decode_message_row(row: RawMessageRow) -> Result<ChatMessage> {
 /// Rebuild a [`Session`] from a [`RawSessionListRow`], patching the flat
 /// columns over the JSON blob. Flat columns are authoritative; targeted setters
 /// leave the JSON blob untouched to avoid load/save races.
-fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
+/// What a read does with a binding column it cannot parse.
+///
+/// The two answers are both right, for different readers. A corrupt binding
+/// means this session's persona, skill overlay and memory partition are
+/// unknown — running it as the built-in would put its writes in the wrong
+/// partition, silently, so [`Self::Fail`] is what hydration takes. But a
+/// session row is user-facing core data that must stay listable, and a chat
+/// list that 500s because one row is damaged has turned a display problem into
+/// an outage; [`Self::Degrade`] keeps the row visible with a `warn!`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnCorruptBinding {
+    Fail,
+    Degrade,
+}
+
+fn decode_session_row(
+    row: &RawSessionListRow,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Session> {
     let (
         data,
         hidden_col,
@@ -115,6 +144,8 @@ fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
         title_col,
         last_model_col,
         last_effort_col,
+        agent_id_col,
+        agent_framework_col,
     ) = row;
     let mut session: Session = serde_json::from_str(data)?;
     session.hidden = *hidden_col != 0;
@@ -125,7 +156,20 @@ fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
     session.folder_id = folder_id_col.clone().map(FolderId::from);
     session.archived = *archived_col != 0;
     session.title = title_col.clone();
+    session.state.agent_id = decode_agent_id(agent_id_col, &session.id, on_corrupt)?;
+    session.state.agent_framework =
+        decode_agent_framework(agent_framework_col, &session.id, on_corrupt)?;
     Ok(session)
+}
+
+/// The parse failure both decoders raise under [`OnCorruptBinding::Fail`].
+/// A `serde_json::Error` because that is what this function already returns,
+/// and the caller maps every one of them to `StorageError::Storage`.
+fn corrupt_binding(column: &str, raw: &str) -> serde_json::Error {
+    serde::de::Error::custom(format!(
+        "sessions.{column} holds {raw:?}, which is not a valid binding; refusing to run this \
+         session as the built-in, which would write into the wrong memory partition"
+    ))
 }
 
 fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionListRow> {
@@ -140,7 +184,55 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
+}
+
+/// Decode the flat `agent_id` column. A value that fails the id grammar is
+/// dropped to `None` (built-in behaviour) with a `warn!` rather than failing
+/// the read: the column is a soft reference, and a session row is user data
+/// that must stay openable.
+fn decode_agent_id(
+    raw: &Option<String>,
+    session_id: &SessionId,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Option<AgentProfileId>> {
+    let Some(raw) = raw.as_ref() else {
+        return Ok(None);
+    };
+    match AgentProfileId::parse(raw.as_str()) {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if on_corrupt == OnCorruptBinding::Degrade => {
+            tracing::warn!(session_id = %session_id, "ignoring unusable sessions.agent_id: {e}");
+            Ok(None)
+        }
+        Err(_) => Err(corrupt_binding("agent_id", raw)),
+    }
+}
+
+/// Decode the flat `agent_framework` snapshot, degrading an unknown tag to
+/// `None` (baybo) with a `warn!` for the same reason as [`decode_agent_id`].
+fn decode_agent_framework(
+    raw: &Option<String>,
+    session_id: &SessionId,
+    on_corrupt: OnCorruptBinding,
+) -> serde_json::Result<Option<AgentFramework>> {
+    let Some(raw) = raw.as_ref() else {
+        return Ok(None);
+    };
+    match AgentFramework::parse(raw) {
+        Some(framework) => Ok(Some(framework)),
+        None if on_corrupt == OnCorruptBinding::Degrade => {
+            tracing::warn!(
+                session_id = %session_id,
+                framework = %raw,
+                "ignoring unknown sessions.agent_framework"
+            );
+            Ok(None)
+        }
+        None => Err(corrupt_binding("agent_framework", raw)),
+    }
 }
 
 /// Decode a batch of session-list rows into `Session`s, skipping (with a
@@ -150,7 +242,10 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
 fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
     let mut sessions = Vec::with_capacity(rows.len());
     for row in &rows {
-        match decode_session_row(row) {
+        // Listing is display: a row whose binding is damaged still belongs in
+        // the user's chat list. Refusing it here would hide a conversation
+        // over a column the list never reads.
+        match decode_session_row(row, OnCorruptBinding::Degrade) {
             Ok(session) => sessions.push(session),
             Err(e) => tracing::warn!(
                 session_id = %row.4,
@@ -169,58 +264,27 @@ fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> 
 impl SessionStore for SqliteSessionStore {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
         let sid = session_id.as_str().to_string();
+        // Same projection and decode as the list reads (`decode_session_row`
+        // patches the flat columns over the JSON blob), so the two can never
+        // disagree about which columns are authoritative.
+        let sql = format!("SELECT {SESSION_LIST_COLUMNS} FROM sessions WHERE id = ?1");
         let row = self
             .pool
             .interact("sessions.get", move |conn| {
                 Ok(conn
-                    .query_row(
-                        "SELECT data, hidden, last_llm, pinned, folder_id, archived, title, last_model, last_effort FROM sessions WHERE id = ?1",
-                        rusqlite::params![sid],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                                row.get::<_, i64>(5)?,
-                                row.get::<_, Option<String>>(6)?,
-                                row.get::<_, Option<String>>(7)?,
-                                row.get::<_, Option<String>>(8)?,
-                            ))
-                        },
-                    )
+                    .query_row(&sql, rusqlite::params![sid], read_session_list_row)
                     .optional()?)
             })
             .await?;
 
-        let Some((
-            data,
-            hidden_col,
-            last_llm_col,
-            pinned_col,
-            folder_id_col,
-            archived_col,
-            title_col,
-            last_model_col,
-            last_effort_col,
-        )) = row
-        else {
+        let Some(row) = row else {
             return Ok(None);
         };
-        let mut session: Session = serde_json::from_str(&data)
-            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-        // Flat columns are authoritative; targeted setters leave the
-        // JSON blob untouched to avoid load/save races.
-        session.hidden = hidden_col != 0;
-        session.state.last_llm = last_llm_col.map(LlmEntryName::from);
-        session.state.last_model = last_model_col;
-        session.state.last_effort = last_effort_col;
-        session.pinned = pinned_col != 0;
-        session.folder_id = folder_id_col.map(FolderId::from);
-        session.archived = archived_col != 0;
-        session.title = title_col;
-        Ok(Some(session))
+        // The hydration read: a binding it cannot trust must stop the read,
+        // not quietly become the built-in.
+        decode_session_row(&row, OnCorruptBinding::Fail)
+            .map(Some)
+            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
@@ -253,6 +317,15 @@ impl SessionStore for SqliteSessionStore {
         let channel = session.channel.as_str().to_string();
         let created_us = super::time::to_us(session.created_at);
         let last_active_us = super::time::to_us(session.last_active);
+        let agent_id = session
+            .state
+            .agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        let agent_framework = session
+            .state
+            .agent_framework
+            .map(|f| f.as_str().to_string());
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
         // the row). The DO UPDATE clause omits the flat columns owned by
         // targeted setters (`hidden`, `last_llm`, `pinned`, `folder_id`,
@@ -261,14 +334,20 @@ impl SessionStore for SqliteSessionStore {
         // archived the conversation) cannot clobber them. `hidden` / `pinned` /
         // `archived` are seeded only on a brand-new row (`?10`–`?12`); `get`
         // reads all flat columns as authoritative over the JSON blob.
+        //
+        // `agent_id` / `agent_framework` (`?15`/`?16`) follow the same
+        // INSERT-seeding rule for a stronger reason: there is no setter for
+        // them anywhere, so omitting them from DO UPDATE is what makes the
+        // binding structurally write-once rather than write-once by
+        // convention.
         self.pool
             .interact("sessions.save", move |conn| {
                 conn.execute(
                     "INSERT INTO sessions \
                      (id, root_session_id, trigger_kind, parent_session_id, parent_turn_id, \
                       parent_span_id, lineage_kind, created_at, last_active, \
-                      hidden, pinned, archived, channel, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13) \
+                      hidden, pinned, archived, channel, data, agent_id, agent_framework) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14, ?13, ?15, ?16) \
                      ON CONFLICT(id) DO UPDATE SET \
                        root_session_id = excluded.root_session_id, \
                        trigger_kind = excluded.trigger_kind, \
@@ -294,6 +373,8 @@ impl SessionStore for SqliteSessionStore {
                         archived_flag,
                         data,
                         channel,
+                        agent_id,
+                        agent_framework,
                     ],
                 )?;
                 Ok(())
@@ -537,10 +618,9 @@ impl SessionStore for SqliteSessionStore {
         let rows = self
             .pool
             .interact("sessions.list_all", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
-                     ORDER BY last_active DESC",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions ORDER BY last_active DESC"
+                ))?;
                 let rows = stmt
                     .query_map([], read_session_list_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -560,11 +640,11 @@ impl SessionStore for SqliteSessionStore {
         let rows = self
             .pool
             .interact("sessions.list_by_channel", move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title, last_model, last_effort FROM sessions \
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
                      WHERE channel = ?1 \
-                     ORDER BY last_active DESC",
-                )?;
+                     ORDER BY last_active DESC"
+                ))?;
                 let rows = stmt
                     .query_map(rusqlite::params![channel], read_session_list_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1288,6 +1368,133 @@ impl SessionStore for SqliteSessionStore {
                 })
             })
             .collect()
+    }
+
+    async fn dream_candidates(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<DreamCandidate>> {
+        // Same human-authored `source` tags as `last_user_messages` below.
+        const HUMAN_SOURCES_SQL: &str = "'user', 'user_interjection'";
+        let since_us = super::time::to_us(since);
+        let until_us = super::time::to_us(until);
+        let rows = self
+            .pool
+            .interact("sessions.dream_candidates", move |conn| {
+                // Two arms over disjoint session sets, so `UNION ALL` needs
+                // no dedup pass. `latest_ordinal` comes from a correlated
+                // MAX over the primary key, which sqlite answers from the
+                // index's right edge.
+                //
+                // `compaction_inserted = 0` in both: compaction appends
+                // copies of rows that are still present as originals, so
+                // counting them fakes activity and reading them would
+                // consolidate one exchange twice.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT session_id, agent_id, title, last_at, human_msgs, read_from, latest \
+                     FROM ( \
+                       SELECT m.session_id AS session_id, s.agent_id AS agent_id, \
+                              s.title AS title, MAX(m.created_at) AS last_at, \
+                              COUNT(*) AS human_msgs, MIN(m.ordinal) AS read_from, \
+                              (SELECT MAX(z.ordinal) FROM session_messages z \
+                                WHERE z.session_id = m.session_id) AS latest \
+                       FROM session_messages m \
+                       JOIN sessions s ON s.id = m.session_id \
+                       WHERE s.dreamed_through_ordinal IS NULL \
+                         AND m.created_at >= ?1 AND m.created_at < ?2 \
+                         AND m.compaction_inserted = 0 \
+                         AND m.source IN ({HUMAN_SOURCES_SQL}) \
+                       GROUP BY m.session_id \
+                       UNION ALL \
+                       SELECT m.session_id, s.agent_id, s.title, MAX(m.created_at), \
+                              SUM(CASE WHEN m.source IN ({HUMAN_SOURCES_SQL}) THEN 1 ELSE 0 END), \
+                              MIN(m.ordinal), \
+                              (SELECT MAX(z.ordinal) FROM session_messages z \
+                                WHERE z.session_id = m.session_id) \
+                       FROM session_messages m \
+                       JOIN sessions s ON s.id = m.session_id \
+                       WHERE s.dreamed_through_ordinal IS NOT NULL \
+                         AND m.ordinal > s.dreamed_through_ordinal \
+                         AND m.compaction_inserted = 0 \
+                       GROUP BY m.session_id \
+                     ) \
+                     ORDER BY last_at DESC"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![since_us, until_us], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        rows.into_iter()
+            .map(
+                |(sid, agent_id, title, last_us, human, read_from_ordinal, latest_ordinal)| {
+                    let session_id = SessionId::from(sid);
+                    let last_activity_at = super::time::from_us(last_us).ok_or_else(|| {
+                        StorageError::Storage(format!(
+                            "session_messages.created_at out of range: {last_us}"
+                        ))
+                    })?;
+                    // A binding we cannot read means we do not know whose
+                    // conversation this is. The dream pass decides which memory
+                    // tree a conversation belongs to from exactly this field, so
+                    // guessing would file somebody's conversation under another
+                    // agent — drop the row instead.
+                    let agent_id =
+                        match decode_agent_id(&agent_id, &session_id, OnCorruptBinding::Fail) {
+                            Ok(agent_id) => agent_id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "skipping session with an unreadable agent binding: {e}"
+                                );
+                                return Ok(None);
+                            }
+                        };
+                    Ok(Some(DreamCandidate {
+                        agent_id,
+                        session_id,
+                        title,
+                        last_activity_at,
+                        human_message_count: human,
+                        read_from_ordinal,
+                        latest_ordinal,
+                    }))
+                },
+            )
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| rows.into_iter().flatten().collect())
+    }
+
+    async fn set_dreamed_through_ordinal(
+        &self,
+        session_id: &SessionId,
+        ordinal: i64,
+    ) -> Result<bool> {
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.set_dreamed_through_ordinal", move |conn| {
+                // MAX-wins so a slow writer cannot rewind the cursor and
+                // hand the same conversation to a later pass a second time.
+                Ok(conn.execute(
+                    "UPDATE sessions \
+                     SET dreamed_through_ordinal = MAX(COALESCE(dreamed_through_ordinal, -1), ?2) \
+                     WHERE id = ?1",
+                    rusqlite::params![sid, ordinal],
+                )? > 0)
+            })
+            .await
     }
 
     async fn last_user_messages(
@@ -2045,6 +2252,112 @@ mod tests {
         assert!(store.set_last_llm(&s.id, None).await.unwrap());
         let cleared = store.get(&s.id).await.unwrap().expect("row present");
         assert_eq!(cleared.state.last_llm, None);
+    }
+
+    #[tokio::test]
+    async fn the_agent_binding_is_seeded_once_and_then_unwritable() {
+        // The binding decides soul, skills and memory partition, so it must
+        // be fixed for the session's life. There is no setter; the guarantee
+        // is that `save`'s DO UPDATE omits both columns, so even a save that
+        // carries a DIFFERENT binding cannot move it.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        let bound = AgentProfileId::parse("01JAGENT").unwrap();
+        let mut s = make_root_session("bound-session");
+        s.state.agent_id = Some(bound.clone());
+        s.state.agent_framework = Some(AgentFramework::Baybo);
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, Some(bound.clone()));
+        assert_eq!(loaded.state.agent_framework, Some(AgentFramework::Baybo));
+
+        // A later save carrying a different (or absent) binding must not
+        // move the columns.
+        let mut rebind = s.clone();
+        rebind.state.agent_id = Some(AgentProfileId::parse("01JOTHER").unwrap());
+        rebind.state.agent_framework = Some(AgentFramework::Claude);
+        store.save(&rebind).await.unwrap();
+        let mut unbind = s.clone();
+        unbind.state.agent_id = None;
+        unbind.state.agent_framework = None;
+        store.save(&unbind).await.unwrap();
+
+        let after = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(
+            after.state.agent_id,
+            Some(bound),
+            "the binding must survive every later save"
+        );
+        assert_eq!(after.state.agent_framework, Some(AgentFramework::Baybo));
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_reads_as_the_builtin() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        // Every pre-binding row, and every channel/TUI session.
+        let s = make_root_session("unbound");
+        store.save(&s).await.unwrap();
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, None);
+        assert_eq!(
+            loaded.state.agent_id_or_builtin(),
+            AgentProfileId::builtin(),
+            "NULL is the built-in, which is the partition old memories live in"
+        );
+    }
+
+    /// The two readers of a damaged binding answer differently on purpose.
+    ///
+    /// `get` is what hydration uses, and a binding it cannot parse means the
+    /// session's persona, skills and **memory partition** are unknown —
+    /// running it as the built-in would put its writes somewhere they do not
+    /// belong, with nothing on screen to say so. Listing is display, and a
+    /// session row is user-facing core data: hiding the conversation, or
+    /// failing the whole list, would turn a damaged column into an outage.
+    #[tokio::test]
+    async fn a_corrupt_binding_fails_hydration_but_still_lists() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
+
+        let s = make_root_session("corrupt-binding");
+        store.save(&s).await.unwrap();
+        let sid = s.id.as_str().to_string();
+        pool.interact("test.corrupt", move |conn| {
+            conn.execute(
+                "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 WHERE id = ?1",
+                rusqlite::params![sid, "../escape", "borked"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let err = store
+            .get(&s.id)
+            .await
+            .expect_err("hydration must refuse a binding it cannot parse");
+        assert!(
+            err.to_string().contains("memory partition"),
+            "the error must say what refusing protects: {err}"
+        );
+        assert_eq!(
+            store.list_all().await.unwrap().len(),
+            1,
+            "the conversation stays in the user's list"
+        );
     }
 
     #[tokio::test]
@@ -2923,6 +3236,313 @@ mod tests {
         let title_map: std::collections::HashMap<_, _> = titles.into_iter().collect();
         assert_eq!(title_map[&a.id], Some("A".into()));
         assert_eq!(title_map[&b.id], None);
+    }
+
+    #[tokio::test]
+    async fn a_never_dreamt_session_is_selected_by_the_window_and_only_for_human_talk() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let spoken_in = make_root_session("had-a-conversation");
+        store.save(&spoken_in).await.unwrap();
+        let silent = make_root_session("machine-only");
+        store.save(&silent).await.unwrap();
+
+        let before = Utc::now();
+        store
+            .append_session_message(&spoken_in.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &spoken_in.id,
+                &baybo_model::ChatMessage::assistant(text("hello")),
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(&spoken_in.id, &baybo_model::ChatMessage::user(text("more")))
+            .await
+            .unwrap();
+        // A fire that ran entirely on its own — exactly the shape of a
+        // dream fire, which must never feed the next one.
+        store
+            .append_session_message(
+                &silent.id,
+                &baybo_model::ChatMessage::assistant(text("nothing to report")),
+            )
+            .await
+            .unwrap();
+        let after = Utc::now() + chrono::Duration::seconds(1);
+
+        let active = store.dream_candidates(before, after).await.unwrap();
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert_eq!(active[0].session_id, spoken_in.id);
+        assert_eq!(
+            active[0].human_message_count, 2,
+            "assistant rows don't count"
+        );
+        assert!(active[0].agent_id.is_none(), "NULL agent_id is the builtin");
+        assert_eq!(active[0].read_from_ordinal, 0);
+        assert_eq!(
+            active[0].latest_ordinal, 2,
+            "the cursor's next resting place"
+        );
+
+        // A row carrying a different `user.id` is still the same person's:
+        // one human holds several ids, one per code path that minted a
+        // session, so this query does not partition on it at all. See
+        // `docs/todo/user-identity.md`.
+        let mut other_id = make_root_session("same-human-other-id");
+        other_id.user.id = "device-7b26".to_string();
+        store.save(&other_id).await.unwrap();
+        store
+            .append_session_message(&other_id.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        let both = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 2, "{both:?}");
+
+        // The window is half-open on both ends: a pass that already ran
+        // must not re-read the same conversation.
+        assert!(
+            store
+                .dream_candidates(after, after + chrono::Duration::seconds(60))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The reason the cursor exists. Once a conversation has been offered,
+    /// selection stops asking about human messages and about time: rows a
+    /// still-running turn appends afterwards — or a background delivery
+    /// hours later — are `MessageSource::Agent`, and no window over human
+    /// messages would ever surface them again.
+    #[tokio::test]
+    async fn once_offered_a_session_is_selected_by_cursor_whoever_wrote_the_new_rows() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let session = make_root_session("long-runner");
+        store.save(&session).await.unwrap();
+        let before = Utc::now();
+        store
+            .append_session_message(&session.id, &baybo_model::ChatMessage::user(text("ask")))
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::assistant(text("partial")),
+            )
+            .await
+            .unwrap();
+
+        let first = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].read_from_ordinal, 0);
+        assert!(
+            store
+                .set_dreamed_through_ordinal(&session.id, first[0].latest_ordinal)
+                .await
+                .unwrap()
+        );
+
+        // Same window, nothing new: the cursor takes it out of the running.
+        assert!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The turn finishes, appending only machine rows. The human never
+        // comes back. A time-and-human-message window is blind to this.
+        store
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::assistant(text("the actual answer")),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(second[0].read_from_ordinal, 2, "starts at the new row");
+        assert_eq!(
+            second[0].human_message_count, 0,
+            "nobody spoke, but it counts"
+        );
+
+        // Max-wins: a stale writer cannot rewind the cursor and hand the
+        // same conversation over twice.
+        assert!(
+            store
+                .set_dreamed_through_ordinal(&session.id, 0)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()[0]
+                .read_from_ordinal,
+            2,
+            "a lower ordinal must not rewind the cursor"
+        );
+    }
+
+    /// Every router-level dream test runs against `MemorySessionStore`, and
+    /// the SQL runs in none of them — so a divergence between the two would
+    /// be invisible exactly where it decides what gets consolidated. One
+    /// fixture, both stores, identical output.
+    #[tokio::test]
+    async fn the_memory_fake_selects_what_the_sql_selects() {
+        use baybo_session::test_support::MemorySessionStore;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let sqlite = SqliteSessionStore::new(pool);
+        let memory = MemorySessionStore::new();
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let quiet = make_root_session("machine-only");
+        let talked = make_root_session("had-a-conversation");
+        let before = Utc::now();
+        for store in [&sqlite as &dyn SessionStore, &memory as &dyn SessionStore] {
+            for session in [&quiet, &talked] {
+                store.save(session).await.unwrap();
+            }
+            store
+                .append_session_message(
+                    &quiet.id,
+                    &baybo_model::ChatMessage::assistant(text("nobody asked")),
+                )
+                .await
+                .unwrap();
+            store
+                .append_session_message(&talked.id, &baybo_model::ChatMessage::user(text("hi")))
+                .await
+                .unwrap();
+            store
+                .append_session_message(
+                    &talked.id,
+                    &baybo_model::ChatMessage::assistant(text("hello")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let shape = |c: &[baybo_store::DreamCandidate]| {
+            c.iter()
+                .map(|c| {
+                    (
+                        c.session_id.as_str().to_string(),
+                        c.human_message_count,
+                        c.read_from_ordinal,
+                        c.latest_ordinal,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let until = || Utc::now() + chrono::Duration::seconds(1);
+
+        // Arm one: never offered, so the time window and its human-message
+        // requirement decide.
+        let a = sqlite.dream_candidates(before, until()).await.unwrap();
+        let b = memory.dream_candidates(before, until()).await.unwrap();
+        assert_eq!(shape(&a), shape(&b), "sql {a:?} vs fake {b:?}");
+        assert_eq!(a.len(), 1, "the machine-only session is not activity");
+
+        // Arm two: offered, so the cursor decides — and a machine row above
+        // it counts, which is the arm the whole design turns on.
+        for store in [&sqlite as &dyn SessionStore, &memory as &dyn SessionStore] {
+            store
+                .set_dreamed_through_ordinal(&talked.id, 1)
+                .await
+                .unwrap();
+            store
+                .append_session_message(
+                    &talked.id,
+                    &baybo_model::ChatMessage::assistant(text("late tail")),
+                )
+                .await
+                .unwrap();
+        }
+        let a = sqlite.dream_candidates(before, until()).await.unwrap();
+        let b = memory.dream_candidates(before, until()).await.unwrap();
+        assert_eq!(shape(&a), shape(&b), "sql {a:?} vs fake {b:?}");
+        assert_eq!(shape(&a), vec![("had-a-conversation".to_string(), 0, 2, 2)]);
+    }
+
+    /// Compaction appends copies of rows that are still present as
+    /// originals. Counting them fakes activity; selecting on them would
+    /// re-offer a conversation nothing happened in.
+    #[tokio::test]
+    async fn compaction_alone_does_not_make_a_conversation_look_unconsolidated() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(tmpdir.path().join("test.db"))
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::new(pool);
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
+
+        let session = make_root_session("compacted");
+        store.save(&session).await.unwrap();
+        let before = Utc::now();
+        store
+            .append_session_message(&session.id, &baybo_model::ChatMessage::user(text("hi")))
+            .await
+            .unwrap();
+        let offered = store
+            .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        store
+            .set_dreamed_through_ordinal(&session.id, offered[0].latest_ordinal)
+            .await
+            .unwrap();
+
+        store
+            .apply_session_compaction(
+                &session.id,
+                &[
+                    baybo_model::ChatMessage::agent_context(text("summary of the above")),
+                    baybo_model::ChatMessage::user(text("hi")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .dream_candidates(before, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a compaction is not new activity"
+        );
     }
 
     #[tokio::test]

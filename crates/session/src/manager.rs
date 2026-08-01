@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
-    LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState, TriggerSource, User,
+    AgentBinding, ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    FolderSummary, LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState,
+    TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -108,6 +109,51 @@ impl SessionManager {
             .await
     }
 
+    /// Mint a session bound to an agent. The binding is seeded by this
+    /// INSERT and never written again — there is no setter, so a session's
+    /// agent is fixed for its life (see `docs/todo/multi-agent-chat.md`).
+    /// `None` mints an unbound session, which reads as the built-in.
+    pub async fn create_session_with_agent(
+        &self,
+        user: User,
+        channel: ChannelType,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
+        self.create_bound_session(
+            SessionId::new(),
+            user,
+            channel,
+            TriggerSource::User,
+            binding,
+        )
+        .await
+    }
+
+    /// [`Self::get_or_create`] for a client-supplied id, carrying an agent
+    /// binding for the create half. An existing row is returned as-is: its
+    /// binding was decided at its own creation and cannot be changed, so a
+    /// mismatched request is not an error — it is simply the session the
+    /// caller asked for.
+    pub async fn get_or_create_with_agent(
+        &self,
+        session_id: &SessionId,
+        user: User,
+        channel: ChannelType,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
+        if let Some(session) = self.store.get(session_id).await? {
+            return Ok(session);
+        }
+        self.create_bound_session(
+            session_id.clone(),
+            user,
+            channel,
+            TriggerSource::User,
+            binding,
+        )
+        .await
+    }
+
     /// Mint a brand-new session with an explicit `TriggerSource`. Used
     /// by the cron router so each fire gets an isolated session
     /// (`TriggerSource::Cron { cron_job_id }` stamped at creation,
@@ -122,6 +168,24 @@ impl SessionManager {
         channel: ChannelType,
         trigger: TriggerSource,
     ) -> Result<Session> {
+        self.create_bound_session_with_trigger(user, channel, trigger, None)
+            .await
+    }
+
+    /// [`Self::create_session_with_trigger`] carrying an agent binding.
+    ///
+    /// The cron path uses it so a fire inherits the agent of the conversation
+    /// that scheduled the job: a job created inside agent A's chat fires as
+    /// A, with A's soul, skills and memory partition, and its result lands
+    /// back in A's thread. `None` mints an unbound fire, which reads as the
+    /// built-in — what a job with no recorded origin gets.
+    pub async fn create_bound_session_with_trigger(
+        &self,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
         let prefix = match &trigger {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
@@ -131,7 +195,7 @@ impl SessionManager {
         } else {
             SessionId::with_prefix(prefix)
         };
-        self.create_session_with_id(id, user, channel, trigger)
+        self.create_bound_session(id, user, channel, trigger, binding)
             .await
     }
 
@@ -139,6 +203,12 @@ impl SessionManager {
     /// lineage (subagent). The child inherits its trigger from the
     /// parent's root session and gets a fresh session_id prefixed
     /// with `subagent-` as a hint.
+    ///
+    /// It also inherits the parent's **agent**: a worker doing agent A's work
+    /// writes into A's memory partition and sees A's skill overlay. Its
+    /// *soul* still comes from its subagent profile — a worker's contract is
+    /// its profile, not a persona — so this binding is about scope, not
+    /// identity.
     pub async fn create_spawned_session(
         &self,
         user: User,
@@ -157,7 +227,11 @@ impl SessionManager {
             channel,
             created_at: now,
             last_active: now,
-            state: baybo_model::SessionState::default(),
+            state: baybo_model::SessionState {
+                agent_id: parent.state.agent_id.clone(),
+                agent_framework: parent.state.agent_framework,
+                ..baybo_model::SessionState::default()
+            },
             // Spawned sessions inherit `root_session_id` from the
             // ultimate ancestor, not from their direct parent.
             root_session_id: parent.root_session_id.clone(),
@@ -186,14 +260,35 @@ impl SessionManager {
         channel: ChannelType,
         trigger: TriggerSource,
     ) -> Result<Session> {
+        self.create_bound_session(id, user, channel, trigger, None)
+            .await
+    }
+
+    /// The one creation path. `binding` is applied to `SessionState` before
+    /// the first `save`, which is what makes the flat `agent_id` /
+    /// `agent_framework` columns write-once: `save`'s `DO UPDATE` omits them,
+    /// so nothing can set them afterwards.
+    async fn create_bound_session(
+        &self,
+        id: SessionId,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+        binding: Option<AgentBinding>,
+    ) -> Result<Session> {
         let now = Utc::now();
+        let mut state = SessionState::default();
+        if let Some(binding) = binding {
+            state.agent_id = Some(binding.agent_id);
+            state.agent_framework = Some(binding.framework);
+        }
         let session = Session {
             id: id.clone(),
             user,
             channel,
             created_at: now,
             last_active: now,
-            state: SessionState::default(),
+            state,
             root_session_id: id,
             trigger,
             lineage: None,
@@ -204,8 +299,14 @@ impl SessionManager {
             title: None,
         };
         self.store.save(&session).await?;
-        debug!(session_id = %session.id, "created new session");
-        Ok(session)
+        // The binding is INSERT-seeded and omitted from `save`'s DO UPDATE, so
+        // a concurrent create on the same client-supplied id leaves the first
+        // writer's binding in place and this one silently loses. Returning the
+        // struct we just built would hand the caller an agent that the next
+        // hydration will not use; read back what actually persisted.
+        let stored = self.store.get(&session.id).await?.unwrap_or(session);
+        debug!(session_id = %stored.id, "created new session");
+        Ok(stored)
     }
 
     pub async fn get_or_create(
@@ -282,15 +383,40 @@ impl SessionManager {
     /// before any compression folded earlier turns into a summary. Errors
     /// with `SessionError::NotFound` if the session row is missing.
     pub async fn full_transcript(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+        Ok(self
+            .transcript_from(session_id, 0)
+            .await?
+            .into_iter()
+            .map(|row| row.message)
+            .collect())
+    }
+
+    /// [`Self::full_transcript`] from `from_ordinal` on, each message paired
+    /// with its ordinal.
+    ///
+    /// The ordinals ride along because a caller that starts mid-conversation
+    /// still has to number what it renders by real position — a slice that
+    /// restarts at `[0]` reads as a whole conversation and misplaces every
+    /// reference into it.
+    ///
+    /// The bound is pushed into the query rather than applied to a loaded
+    /// `Vec`: `(session_id, ordinal)` is the primary key, so this is an
+    /// index range scan over the tail, and reading the last few messages of
+    /// a months-old conversation costs what those messages cost.
+    pub async fn transcript_from(
+        &self,
+        session_id: &SessionId,
+        from_ordinal: i64,
+    ) -> Result<Vec<StoredMessage>> {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        let rows = self
-            .store
-            .load_session_messages_with_supersede(session_id)
+        // The store's bound is exclusive; this one is inclusive, because
+        // "start at message N" is what the caller has.
+        self.store
+            .load_session_messages_with_supersede_since(session_id, from_ordinal.saturating_sub(1))
             .await
-            .map_err(SessionError::from)?;
-        Ok(rows.into_iter().map(|r| r.message).collect())
+            .map_err(SessionError::from)
     }
 
     /// Reverse-paginated slice of the active transcript: the
@@ -1010,6 +1136,65 @@ mod tests {
         assert_eq!(session.channel, ChannelType::tui());
         assert_eq!(session.root_session_id, session.id);
         assert!(session.lineage.is_none());
+    }
+
+    /// A worker inherits the agent whose work it is doing, so its memory
+    /// writes and skill lookups land in that agent's scope. Its soul does
+    /// not follow — that comes from its subagent profile.
+    #[tokio::test]
+    async fn a_spawned_child_inherits_its_parents_agent() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionFolderStore::new()));
+
+        let agent = baybo_model::AgentProfileId::parse("01JAGENT").unwrap();
+        let parent = mgr
+            .create_session_with_agent(
+                test_user(),
+                ChannelType::tui(),
+                Some(baybo_model::AgentBinding {
+                    agent_id: agent.clone(),
+                    framework: baybo_model::AgentFramework::Baybo,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let child = mgr
+            .create_spawned_session(
+                test_user(),
+                ChannelType::tui(),
+                &parent,
+                baybo_model::Lineage {
+                    parent_session_id: parent.id.clone(),
+                    parent_turn_id: baybo_model::TurnId::new(),
+                    parent_span_id: None,
+                    kind: baybo_model::LineageKind::Subagent,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.state.agent_id, Some(agent));
+
+        // An unbound parent leaves the child unbound — i.e. the built-in.
+        let plain = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+        let orphan = mgr
+            .create_spawned_session(
+                test_user(),
+                ChannelType::tui(),
+                &plain,
+                baybo_model::Lineage {
+                    parent_session_id: plain.id.clone(),
+                    parent_turn_id: baybo_model::TurnId::new(),
+                    parent_span_id: None,
+                    kind: baybo_model::LineageKind::Subagent,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(orphan.state.agent_id, None);
     }
 
     #[tokio::test]

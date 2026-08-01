@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use baybo_workspace::WorkspacePaths;
 use baybo_workspace::paths::LOG_FILE_PREFIX;
 use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
@@ -42,10 +41,6 @@ fn resolve_date(raw: Option<&str>) -> Result<NaiveDate> {
     }
 }
 
-fn paths(ctx: &CommandContext) -> WorkspacePaths {
-    WorkspacePaths::new(ctx.workspace.root.clone())
-}
-
 async fn read_main(
     ctx: &CommandContext,
     date: Option<&str>,
@@ -53,7 +48,8 @@ async fn read_main(
     follow: bool,
 ) -> Result<CommandOutput> {
     let date = resolve_date(date)?;
-    let path = paths(ctx)
+    let path = ctx
+        .workspace
         .logs_dir()
         .join(format!("{LOG_FILE_PREFIX}.{date}"));
     read_log_file(ctx, "main", &path, limit, follow).await
@@ -67,7 +63,8 @@ async fn read_channel(
     follow: bool,
 ) -> Result<CommandOutput> {
     let date = resolve_date(date)?;
-    let path = paths(ctx)
+    let path = ctx
+        .workspace
         .channel_logs_dir()
         .join(format!("{channel}.log.{date}"));
     read_log_file(ctx, channel, &path, limit, follow).await

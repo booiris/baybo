@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   RiAddLine,
   RiDeleteBinLine,
@@ -19,7 +19,9 @@ import bayboAvatar from '../assets/baybo-avatar.webp';
 
 type AgentProfile = components['schemas']['AgentProfileDto'];
 type AgentFramework = components['schemas']['AgentFrameworkDto'];
-type SkillInfo = { name: string; description: string };
+// `GET /v1/skills` inlines its item schema, so this mirrors it by hand.
+// `universal` marks a skill every agent has regardless of persona.
+type SkillInfo = { name: string; description: string; universal: boolean };
 
 const FRAMEWORKS: { value: AgentFramework; label: string }[] = [
   { value: 'baybo', label: 'Baybo' },
@@ -28,6 +30,8 @@ const FRAMEWORKS: { value: AgentFramework; label: string }[] = [
 ];
 
 const BAYBO_ONLY_HINT = 'baybo framework only — ignored by external frameworks';
+const BUILTIN_FOLLOWS_DEFAULT_HINT =
+  'the built-in agent always follows default-llm — change it on the LLM page';
 
 // Mirrors `baybo_model::MAX_AGENT_PROFILE_NAME_CHARS` (the server cap).
 const MAX_AGENT_NAME_CHARS = 64;
@@ -53,11 +57,24 @@ export function AgentsPage() {
   const isMock = useMockMode();
 
   const [agents, setAgents] = useState<AgentProfile[]>([]);
+  // The shared listing, kept only to seed the create form: a not-yet-created
+  // agent has no id to scope by, and what it will start with is exactly the
+  // universal subset of this.
   const [registeredSkills, setRegisteredSkills] = useState<SkillInfo[]>([]);
   const [llmNames, setLlmNames] = useState<string[]>([]);
+  // Which entry `default-llm` currently points at, so the unpinned option can
+  // name it instead of saying "Default model" and leaving the operator to go
+  // look it up.
+  const [defaultLlmName, setDefaultLlmName] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  // What a not-yet-created agent will start with: the universal subset of
+  // the shared listing, computed here so the panel needs no hard-coded names.
+  const universalSkills = useMemo(
+    () => registeredSkills.filter((s) => s.universal),
+    [registeredSkills],
+  );
   // Sidebar selection: an agent id, or 'new' for the create form.
   const [selected, setSelected] = useState<string | 'new' | null>(null);
   const [pendingDelete, setPendingDelete] = useState<AgentProfile | null>(null);
@@ -65,16 +82,34 @@ export function AgentsPage() {
   const [mutating, setMutating] = useState(false);
 
   useEffect(() => {
-    let canceled = false;
+    const alive = { current: true };
     async function fetchData() {
       if (isMock) {
         setAgents(MOCK_AGENT_PROFILES);
         setRegisteredSkills([
-          { name: 'brainstorm', description: 'Generate and expand ideas quickly.' },
-          { name: 'commit-helper', description: 'Draft conventional-commit messages from a diff.' },
-          { name: 'weekly-report', description: "Summarize the week's work into a report." },
+          {
+            name: 'baybo-cli',
+            description: 'Introspect the running instance through the baybo CLI.',
+            universal: true,
+          },
+          {
+            name: 'brainstorm',
+            description: 'Generate and expand ideas quickly.',
+            universal: false,
+          },
+          {
+            name: 'commit-helper',
+            description: 'Draft conventional-commit messages from a diff.',
+            universal: false,
+          },
+          {
+            name: 'weekly-report',
+            description: "Summarize the week's work into a report.",
+            universal: false,
+          },
         ]);
         setLlmNames(['primary', 'fast']);
+        setDefaultLlmName('primary');
         setLoading(false);
         setError(null);
         return;
@@ -87,7 +122,7 @@ export function AgentsPage() {
           client.GET('/v1/skills'),
           client.GET('/v1/llm/models'),
         ]);
-        if (canceled) return;
+        if (!alive.current) return;
         for (const r of [agentsRes, skillsRes, llmRes]) {
           if (r.response.status === 401) {
             logout();
@@ -95,14 +130,15 @@ export function AgentsPage() {
           }
         }
         if (agentsRes.error || !agentsRes.response.ok) {
-          setError(agentsRes.error?.error || `HTTP Error ${agentsRes.response.status}`);
+          setError(agentsRes.error?.error ?? `HTTP Error ${agentsRes.response.status}`);
           return;
         }
-        setAgents(agentsRes.data?.items ?? []);
+        setAgents(agentsRes.data.items);
         setRegisteredSkills(
           (skillsRes.data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
         );
         setLlmNames((llmRes.data?.items ?? []).map((m) => m.name));
+        setDefaultLlmName(llmRes.data?.default_name ?? '');
         // A dead picker source must not masquerade as "nothing registered".
         const failed: string[] = [];
         if (skillsRes.error || !skillsRes.response.ok) failed.push('skills');
@@ -111,15 +147,15 @@ export function AgentsPage() {
           setError(`Failed to load ${failed.join(', ')} for the editor — retry Refresh.`);
         }
       } catch (e) {
-        if (canceled) return;
+        if (!alive.current) return;
         setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
       } finally {
-        if (!canceled) setLoading(false);
+        if (alive.current) setLoading(false);
       }
     }
     void fetchData();
     return () => {
-      canceled = true;
+      alive.current = false;
     };
   }, [client, logout, refreshKey, isMock]);
 
@@ -163,7 +199,7 @@ export function AgentsPage() {
           return;
         }
         if (apiError || !response.ok) {
-          setMutationError(apiError?.error || `HTTP Error ${response.status}`);
+          setMutationError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
         setPendingDelete(null);
@@ -234,7 +270,7 @@ export function AgentsPage() {
 
       {/* ── detail ── */}
       <main className="flex-1 min-w-0 flex flex-col overflow-hidden bg-surface">
-        {error && (
+        {error !== null && (
           <div className="m-4 mb-0 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
             {error}
           </div>
@@ -243,10 +279,11 @@ export function AgentsPage() {
           <AgentEditorPanel
             key="new"
             agent={null}
-            registeredSkills={registeredSkills}
             llmNames={llmNames}
+            defaultLlmName={defaultLlmName}
+            universalSkills={universalSkills}
             onSaved={(createdId) => {
-              if (createdId) {
+              if (createdId !== undefined) {
                 pendingSelectRef.current = createdId;
                 setSelected(createdId);
               }
@@ -257,8 +294,9 @@ export function AgentsPage() {
           <AgentEditorPanel
             key={selectedAgent.id}
             agent={selectedAgent}
-            registeredSkills={registeredSkills}
             llmNames={llmNames}
+            defaultLlmName={defaultLlmName}
+            universalSkills={universalSkills}
             onSaved={() => refresh()}
             onDelete={
               selectedAgent.builtin
@@ -295,7 +333,7 @@ export function AgentsPage() {
                 Delete <span className="font-bold">{pendingDelete.name}</span>? This cannot be
                 undone.
               </p>
-              {mutationError && (
+              {mutationError !== null && (
                 <p className="text-err font-mono text-sm border-2 border-err rounded-md px-3 py-2 break-words">
                   {mutationError}
                 </p>
@@ -334,7 +372,8 @@ function AgentRow({
   onSelect: () => void;
 }) {
   const framework = FRAMEWORKS.find((f) => f.value === agent.framework)?.label ?? agent.framework;
-  const subtitle = agent.llm ? `${framework} · ${agent.llm}` : framework;
+  const subtitle =
+    agent.llm !== undefined && agent.llm !== '' ? `${framework} · ${agent.llm}` : framework;
   return (
     <button
       type="button"
@@ -377,8 +416,8 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     setUrl(null);
-    if (!blobId) return;
-    let cancelled = false;
+    if (blobId === null || blobId === '') return;
+    const alive = { current: true };
     let objectUrl: string | null = null;
     void (async () => {
       try {
@@ -388,7 +427,7 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
         });
         if (!res.ok) throw new Error(`blob ${res.status}`);
         const blob = await res.blob();
-        if (cancelled) return;
+        if (!alive.current) return;
         objectUrl = URL.createObjectURL(blob);
         setUrl(objectUrl);
       } catch {
@@ -396,8 +435,8 @@ function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null
       }
     })();
     return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      alive.current = false;
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
     };
   }, [blobId, baseUrl, token]);
   return url;
@@ -425,7 +464,7 @@ function AgentFace({
     size === 'sm'
       ? 'h-9 w-9 rounded-md border border-black'
       : 'h-32 w-32 rounded-md border-2 border-black shadow-brutal-sm';
-  if (face) {
+  if (face !== null) {
     return <img src={face} alt={agent.name} className={`${frame} shrink-0 object-cover`} />;
   }
   return (
@@ -443,14 +482,16 @@ function AgentFace({
 
 function AgentEditorPanel({
   agent,
-  registeredSkills,
   llmNames,
+  defaultLlmName,
+  universalSkills,
   onSaved,
   onDelete,
 }: {
   agent: AgentProfile | null; // null = create
-  registeredSkills: SkillInfo[];
   llmNames: string[];
+  defaultLlmName: string;
+  universalSkills: SkillInfo[];
   /** Called after a successful save; carries the new id on create. */
   onSaved: (createdId?: string) => void;
   /** Present only for existing non-builtin agents; hands off to the confirm dialog. */
@@ -464,7 +505,26 @@ function AgentEditorPanel({
   const [name, setName] = useState(agent?.name ?? '');
   const [description, setDescription] = useState(agent?.description ?? '');
   const [framework, setFramework] = useState<AgentFramework>(agent?.framework ?? 'baybo');
-  const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? '');
+  // The soul is a file the agent owns (`personas/<id>/SOUL.md`), not a
+  // profile field, so it loads and saves on its own endpoint; its path is
+  // shown because that file lives in a git repo the operator may want to
+  // commit. `IDENTITY.md` is deliberately not surfaced — the only thing this
+  // page wants from it is the name, which has its own field.
+  //
+  // The page never polls or subscribes, so what it shows can be stale — the
+  // agent rewrites this file mid-conversation. `version` is what keeps that
+  // safe: it rides back on Save, and the server refuses a write whose base
+  // has moved rather than deleting the agent's own edit.
+  const [soul, setSoul] = useState('');
+  const [soulPath, setSoulPath] = useState<string | null>(null);
+  const [soulVersion, setSoulVersion] = useState<string | null>(null);
+  // A custom agent does not inherit the workspace's skills, so the readout
+  // has to be its scope — the page-wide list would be a different agent's.
+  const [scopedSkills, setScopedSkills] = useState<SkillInfo[]>(
+    universalSkills,
+  );
+  const [filesLoaded, setFilesLoaded] = useState(false);
+  const [soulDirty, setSoulDirty] = useState(false);
   const [llm, setLlm] = useState(agent?.llm ?? '');
   const [avatarBlobId, setAvatarBlobId] = useState<string | null>(agent?.avatar_blob_id ?? null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -474,18 +534,66 @@ function AgentEditorPanel({
   const [savedFlash, setSavedFlash] = useState(false);
 
   const externalFramework = framework !== 'baybo';
-  const contentLocked = isBuiltin;
-  // The avatar is the builtin's only writable field, so its Save is live
-  // only once the avatar actually differs from the stored one.
+  // Two things about the builtin are fixed by what it *is*: it runs on baybo,
+  // and it follows `default-llm` (pinning a model here would duplicate that
+  // setting). Name, description, soul and avatar are ordinary content.
+  const builtinPinned = isBuiltin;
   const avatarChanged = avatarBlobId !== (agent?.avatar_blob_id ?? null);
 
   // The old preview URL is revoked whenever a new one replaces it (the
   // cleanup sees the previous value) and on unmount.
   useEffect(() => {
     return () => {
-      if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+      if (avatarPreview !== null) URL.revokeObjectURL(avatarPreview);
     };
   }, [avatarPreview]);
+
+  // Load the selected agent's soul from its own file. The panel is keyed by
+  // selection, so this runs once per agent; a create form starts empty and
+  // lets the server seed the template.
+  useEffect(() => {
+    if (agent === null) {
+      setScopedSkills(universalSkills);
+      setFilesLoaded(true);
+      return;
+    }
+    if (isMock) {
+      setSoul(`# ${agent.name}\n\n${agent.description}`);
+      setSoulPath(`personas/${agent.id}/SOUL.md`);
+      setFilesLoaded(true);
+      return;
+    }
+    const alive = { current: true };
+    void (async () => {
+      const { data, error: apiError, response } = await client.GET('/v1/agents/{agent_id}/soul', {
+        params: { path: { agent_id: agent.id } },
+      });
+      if (!alive.current) return;
+      if (response.status === 401) return logout();
+      if (!response.ok || apiError !== undefined) {
+        setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
+        return;
+      }
+      setSoul(data.content);
+      setSoulPath(data.path);
+      setSoulVersion(data.version);
+      setSoulDirty(false);
+      setFilesLoaded(true);
+
+      const skills = await client.GET('/v1/skills', {
+        params: { query: { agent_id: agent.id } },
+      });
+      if (!alive.current) return;
+      setScopedSkills(
+        (skills.data?.items ?? [])
+          .slice()
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [agent, client, isMock, logout, universalSkills]);
 
   const uploadAvatar = useCallback(
     async (file: File) => {
@@ -526,33 +634,89 @@ function AgentEditorPanel({
     setSaving(true);
     setSaveError(null);
     try {
-      const content = {
-        name,
-        description,
-        framework,
-        system_prompt: systemPrompt.trim() === '' ? null : systemPrompt,
-        llm: llm === '' ? null : llm,
-      };
+      // What the row still owns. Name and llm ride targeted endpoints (the
+      // builtin lock does not reach those), so they are absent here.
+      const content = { description, framework };
       if (agent === null) {
         const { data, error: apiError, response } = await client.POST('/v1/agents', {
-          body: { ...content, avatar_blob_id: avatarBlobId },
+          body: {
+            ...content,
+            name,
+            llm: llm === '' ? null : llm,
+            avatar_blob_id: avatarBlobId,
+            soul: soul.trim() === '' ? null : soul,
+          },
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
-        onSaved(data?.id);
+        onSaved(data.id);
         return;
       }
-      if (!isBuiltin) {
+      if (soulDirty) {
+        const { data, error: apiError, response } = await client.PUT(
+          '/v1/agents/{agent_id}/soul',
+          {
+            params: { path: { agent_id: agent.id } },
+            body: { content: soul, version: soulVersion },
+          },
+        );
+        if (response.status === 401) return logout();
+        if (response.status === 409) {
+          setSaveError(
+            'The soul was rewritten by the agent since this page loaded. Reopen the agent to ' +
+              'see the current version, then reapply your edit — saving now would delete it.',
+          );
+          return;
+        }
+        if (!response.ok || apiError !== undefined) {
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
+          return;
+        }
+        // Adopt the version we just created, so a second Save from this same
+        // open editor does not conflict with its own write.
+        setSoulVersion(data.version);
+      }
+
+      // Targeted endpoints, so these run for the builtin too.
+      for (const targeted of [
+        {
+          dirty: name !== agent.name,
+          path: '/v1/agents/{agent_id}/name' as const,
+          body: { name } as Record<string, unknown>,
+        },
+        {
+                // The builtin's pin is fixed empty, so there is nothing to send.
+          dirty: !isBuiltin && (llm === '' ? null : llm) !== (agent.llm ?? null),
+          path: '/v1/agents/{agent_id}/model' as const,
+          body: { llm: llm === '' ? null : llm } as Record<string, unknown>,
+        },
+      ]) {
+        if (!targeted.dirty) continue;
+        const { error: apiError, response } = await client.PUT(targeted.path, {
+          params: { path: { agent_id: agent.id } },
+          body: targeted.body,
+        });
+        if (response.status === 401) return logout();
+        if (apiError || !response.ok) {
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
+          return;
+        }
+      }
+
+      // Only when the row's own fields moved. An unconditional PUT bumped
+      // `updated_at` on every Save, including one that touched nothing but
+      // the soul.
+      if (description !== agent.description || framework !== agent.framework) {
         const { error: apiError, response } = await client.PUT('/v1/agents/{agent_id}', {
           params: { path: { agent_id: agent.id } },
           body: content,
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
       }
@@ -563,7 +727,7 @@ function AgentEditorPanel({
         });
         if (response.status === 401) return logout();
         if (apiError || !response.ok) {
-          setSaveError(apiError?.error || `HTTP Error ${response.status}`);
+          setSaveError(apiError?.error ?? `HTTP Error ${response.status}`);
           return;
         }
       }
@@ -582,13 +746,14 @@ function AgentEditorPanel({
     client,
     description,
     framework,
-    isBuiltin,
     isMock,
     llm,
     logout,
     name,
     onSaved,
-    systemPrompt,
+    soul,
+    soulDirty,
+    soulVersion,
   ]);
 
   return (
@@ -632,7 +797,7 @@ function AgentEditorPanel({
                     }}
                   />
                 </label>
-                {avatarBlobId && (
+                {avatarBlobId !== null && (
                   <button
                     type="button"
                     className="text-[0.7rem] font-bold uppercase text-ink-soft underline cursor-pointer"
@@ -653,7 +818,6 @@ function AgentEditorPanel({
                   className={`${textInput} !text-base font-bold`}
                   value={name}
                   maxLength={MAX_AGENT_NAME_CHARS}
-                  disabled={contentLocked}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="e.g. Code Reviewer"
                 />
@@ -664,7 +828,7 @@ function AgentEditorPanel({
                 <div className="min-h-6 flex flex-wrap items-center gap-2 mt-1.5">
                   {isBuiltin && (
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.65rem] font-bold uppercase border border-black bg-white">
-                      <RiLockLine /> built-in · read-only except avatar
+                      <RiLockLine /> built-in · framework fixed
                     </span>
                   )}
                   {agent && (
@@ -680,7 +844,6 @@ function AgentEditorPanel({
                   className={`${textInput} resize-y`}
                   rows={2}
                   value={description}
-                  disabled={contentLocked}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="What does this agent do?"
                 />
@@ -693,9 +856,9 @@ function AgentEditorPanel({
             <div className="flex-1">
               <label className={fieldLabel}>Framework</label>
               <SelectBox
-                className={`w-full h-10 !border ${contentLocked ? 'opacity-60' : ''}`}
+                className={`w-full h-10 !border ${builtinPinned ? 'opacity-60' : ''}`}
                 value={framework}
-                disabled={contentLocked}
+                disabled={builtinPinned}
                 onChange={(e) => setFramework(e.target.value as AgentFramework)}
               >
                 {FRAMEWORKS.map((f) => (
@@ -705,17 +868,33 @@ function AgentEditorPanel({
                 ))}
               </SelectBox>
             </div>
-            <div className="flex-1" title={externalFramework ? BAYBO_ONLY_HINT : undefined}>
+            <div
+              className="flex-1"
+              title={
+                externalFramework
+                  ? BAYBO_ONLY_HINT
+                  : builtinPinned
+                    ? BUILTIN_FOLLOWS_DEFAULT_HINT
+                    : undefined
+              }
+            >
               <label className={fieldLabel}>
                 Model {externalFramework && <span className="normal-case">(baybo only)</span>}
               </label>
               <SelectBox
-                className={`w-full h-10 !border ${contentLocked || externalFramework ? 'opacity-60' : ''}`}
-                value={llm ?? ''}
-                disabled={contentLocked || externalFramework}
+                className={`w-full h-10 !border ${externalFramework || builtinPinned ? 'opacity-60' : ''}`}
+                value={llm}
+                disabled={externalFramework || builtinPinned}
                 onChange={(e) => setLlm(e.target.value)}
               >
-                <option value="">Default model</option>
+                {/* Not a model — the "don't pin one" choice. Naming the
+                    entry `default-llm` currently points at saves the operator
+                    a trip to the LLM page to find out what it resolves to. */}
+                <option value="">
+                  {defaultLlmName === ''
+                    ? 'Follow default'
+                    : `Follow default (${defaultLlmName})`}
+                </option>
                 {llmNames.map((n) => (
                   <option key={n} value={n}>
                     {n}
@@ -731,29 +910,42 @@ function AgentEditorPanel({
             </div>
           </div>
 
-          {/* ── system prompt ── */}
+          {/* ── soul ── */}
           <div>
             <label className={fieldLabel}>
-              System prompt{' '}
-              <span className="normal-case">(empty = workspace Soul default)</span>
+              Soul{' '}
+              <span className="normal-case">
+                {soulPath
+                  ? `(${soulPath})`
+                  : agent === null
+                    ? '(seeded from a template if left empty)'
+                    : '(loading…)'}
+              </span>
             </label>
             <textarea
               className={`${textInput} resize-y`}
-              rows={10}
-              value={systemPrompt}
-              disabled={contentLocked}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder="Markdown system prompt replacing the workspace Soul…"
+              rows={14}
+              value={soul}
+              disabled={agent !== null && !filesLoaded}
+              onChange={(e) => {
+                setSoul(e.target.value);
+                setSoulDirty(true);
+              }}
+              placeholder="Markdown persona: who this agent is, how it should come across, what it refuses to do…"
             />
+            <p className="mt-1 text-xs text-muted">
+              This agent&apos;s personality and tone. The agent can rewrite it during a
+              conversation.
+            </p>
           </div>
 
           {/* ── skills (read-only, live from the registry, full width) ── */}
-          <SkillsDisplay registered={registeredSkills} />
+          <SkillsDisplay registered={scopedSkills} isNew={agent === null} />
 
           {/* actions pinned to the bottom of the card, right-aligned; the
               card content fades out behind them as it scrolls. */}
           <div className="sticky bottom-0 -mx-6 -mb-6 flex items-center justify-end gap-2 px-6 pt-4 pb-5 bg-gradient-to-t from-surface via-surface to-transparent">
-            {saveError && (
+            {saveError !== null && (
               <p className="mr-auto max-w-md text-err font-mono text-xs border border-err bg-white rounded-md px-3 py-2 break-words">
                 {saveError}
               </p>
@@ -779,8 +971,7 @@ function AgentEditorPanel({
                 isMock ||
                 saving ||
                 uploadingAvatar ||
-                (agent === null && name.trim() === '') ||
-                (isBuiltin && !avatarChanged)
+                (agent === null && name.trim() === '')
               }
               onClick={() => void save()}
             >
@@ -798,17 +989,17 @@ function AgentEditorPanel({
 // Not configured here: `null` (the v1 default) means the agent inherits
 // every registered skill, so we list the live registry; a stored list
 // resolves each name to its registry blurb.
-function SkillsDisplay({ registered }: { registered: SkillInfo[] }) {
+function SkillsDisplay({ registered, isNew }: { registered: SkillInfo[]; isNew: boolean }) {
   return (
     <div>
       <label className={fieldLabel}>
         Skills{' '}
         <span className="normal-case text-ink-soft">
-          (managed by the skill system — read-only)
+          (this agent&apos;s own — read-only here)
         </span>
       </label>
       {registered.length === 0 ? (
-        <p className="text-ink-soft text-sm font-mono">No skills registered.</p>
+        <p className="text-ink-soft text-sm font-mono">No skills.</p>
       ) : (
         <div className="border border-black rounded-md divide-y divide-black overflow-hidden">
           {registered.map((s) => (
@@ -821,6 +1012,11 @@ function SkillsDisplay({ registered }: { registered: SkillInfo[] }) {
           ))}
         </div>
       )}
+      <p className="mt-1 text-xs text-muted">
+        {isNew
+          ? 'A new agent starts with only the universal skills above — it does not inherit the workspace’s. Add one by putting it in the agent’s personas/<id>/skills/ folder.'
+          : 'This agent does not inherit the workspace’s skills. Add one by putting it in its personas/<id>/skills/ folder.'}
+      </p>
     </div>
   );
 }

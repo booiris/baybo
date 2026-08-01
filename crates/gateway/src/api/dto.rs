@@ -758,6 +758,12 @@ pub struct CronJob {
     /// matching `cron_group_pinned` on the chat-list summary.
     #[serde(default)]
     pub pinned: bool,
+    /// Whether the runtime owns this job (the dream pass). Such a job can be
+    /// paused and rescheduled like any other, but `DELETE` refuses it —
+    /// clients should present pause rather than delete. `#[serde(default)]`
+    /// so it is not required on the wire (defaults false).
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 impl From<baybo_cron::CronJob> for CronJob {
@@ -778,6 +784,7 @@ impl From<baybo_cron::CronJob> for CronJob {
             deleted_at: v.deleted_at,
             origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
             pinned: v.pinned,
+            builtin: v.builtin,
         }
     }
 }

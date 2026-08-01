@@ -37,6 +37,7 @@ tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+baybo-session = { workspace = true, features = ["test-support"] }
 baybo-trace = { workspace = true }
 baybo-turn = { workspace = true }
 libc = { workspace = true }

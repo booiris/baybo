@@ -48,9 +48,9 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
-    ApprovalDecision, ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind,
-    FolderId, FolderSummary, LlmEntryName, Role, Session, SessionId, ThinkingContent,
-    TriggerSource, User,
+    AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
+    ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
+    SessionId, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -303,6 +303,16 @@ pub struct CreateSessionRequest {
     /// Optional client-supplied session id. If omitted, the gateway mints one.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The agent this conversation runs as: its soul, its private skills,
+    /// its memory partition. Omitted or `null` ⇒ the built-in profile, which
+    /// is what every channel and TUI session gets.
+    ///
+    /// Fixed for the session's life — there is no endpoint that changes it,
+    /// because a mid-thread swap would split the memory partition and leave
+    /// two personas' output in one transcript. To talk to another agent,
+    /// start another conversation.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, ToSchema)]
@@ -868,9 +878,14 @@ async fn create_session(
     let authed = authed.as_ref().map(|ext| &ext.0);
     let user = chat_user(authed);
     let channel_type = chat_list_channel(authed);
-    let session =
-        create_or_load_chat_session(&state, requested.session_id, user, channel_type.clone())
-            .await?;
+    let session = create_or_load_chat_session(
+        &state,
+        requested.session_id,
+        requested.agent_id,
+        user,
+        channel_type.clone(),
+    )
+    .await?;
     let session_id = session.id.clone();
     // Created emits a full patch — sibling tabs construct the row
     // straight from this without a list refetch.
@@ -2488,17 +2503,24 @@ fn parse_create_session_request(body: &Bytes) -> Result<CreateSessionRequest> {
 async fn create_or_load_chat_session(
     state: &AdminState,
     requested_session_id: Option<String>,
+    requested_agent_id: Option<String>,
     user: User,
     channel_type: ChannelType,
 ) -> Result<Session> {
     let Some(session_id) = requested_session_id else {
+        let binding = resolve_agent_binding(state, requested_agent_id.as_deref()).await?;
         return state
             .session_manager
-            .create_session(user, channel_type)
+            .create_session_with_agent(user, channel_type, binding)
             .await
             .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")));
     };
 
+    // Look the session up *before* validating the requested agent. The binding
+    // is immutable and outlives its profile row by design, so an idempotent
+    // retry carrying the original `agent_id` must still return the session even
+    // if that profile has since been deleted or moved to an external
+    // framework — validation belongs to the create half only.
     let sid = SessionId::from(session_id.as_str());
     if let Some(existing) = state
         .session_manager
@@ -2517,11 +2539,57 @@ async fn create_or_load_chat_session(
         return Ok(existing);
     }
 
+    let binding = resolve_agent_binding(state, requested_agent_id.as_deref()).await?;
     state
         .session_manager
-        .get_or_create(&sid, user, channel_type)
+        .get_or_create_with_agent(&sid, user, channel_type, binding)
         .await
         .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))
+}
+
+/// Validate a requested `agent_id` and materialise that agent's persona
+/// directory, so the first turn's soul assembly finds a `SOUL.md` rather than
+/// racing to create one.
+///
+/// `None` (built-in) binds nothing: an unbound session resolves to
+/// `personas/baybo/` plus the workspace `skills/`, which already exist.
+async fn resolve_agent_binding(
+    state: &AdminState,
+    requested: Option<&str>,
+) -> Result<Option<AgentBinding>> {
+    let Some(requested) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let agent_id = crate::api::admin::agents::parse_agent_id(requested)?;
+    let row = state
+        .agent_profile_store
+        .get(&agent_id)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load agent profile: {e}")))?
+        .ok_or_else(|| GatewayError::BadRequest(format!("unknown agent profile {requested}")))?;
+    if row.framework != AgentFramework::Baybo {
+        // Serving a top-level chat through an external CLI is a separate
+        // leg (turn dispatch, resume keys, working-dir materialisation); a
+        // clear refusal beats binding a session nothing can run.
+        return Err(GatewayError::BadRequest(format!(
+            "agent {} runs on {}, which cannot host a chat session yet",
+            row.id,
+            row.framework.as_str()
+        )));
+    }
+    if !agent_id.is_builtin() {
+        baybo_workspace::ensure_persona_layout(
+            &state.workspace_paths,
+            agent_id.as_str(),
+            baybo_workspace::prompt::PERSONA_SOUL_TEMPLATE,
+        )
+        .await
+        .map_err(|e| GatewayError::Internal(format!("materialise agent persona: {e}")))?;
+    }
+    Ok(Some(AgentBinding {
+        agent_id,
+        framework: row.framework,
+    }))
 }
 
 /// The channel every pooled chat surface operates on: the single shared
