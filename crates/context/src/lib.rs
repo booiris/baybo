@@ -569,10 +569,10 @@ impl ContextManager {
     /// to say so, and the memory partition already survives a delete for the
     /// same reason. It also means no store read on the seed path.
     fn resolve_persona_sources(&self) -> PersonaSources {
-        let path = |kind: IdentityKind| match &self.agent {
-            Some(agent) => agent.identity_file(&self.workspace, kind),
-            None => self.workspace.identity_file(kind),
-        };
+        // Unbound is the built-in, and the built-in is an ordinary persona
+        // directory now — so there is one path rule, not two.
+        let agent = self.agent.clone().unwrap_or_else(AgentProfileId::builtin);
+        let path = |kind: IdentityKind| agent.identity_file(&self.workspace, kind);
         // A custom agent's own notes seed from the persona template; the
         // built-in's `USER.md` *is* the shared profile, so it keeps the
         // shipped one.
@@ -2596,7 +2596,10 @@ mod tests {
         ));
         // Distinctive + large: swapping it in before the savings gate (the old
         // bug) would exceed the one-message truncate savings and veto the apply.
-        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
+        let soul_path = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            baybo_workspace::IdentityKind::Soul,
+        );
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(
             &soul_path,
@@ -2652,7 +2655,10 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         // A workspace soul that must NOT leak into a subagent session.
-        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
+        let soul_path = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            baybo_workspace::IdentityKind::Soul,
+        );
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(&soul_path, "WORKSPACE_SOUL_SHOULD_NOT_APPEAR").expect("write soul");
 
@@ -2735,7 +2741,10 @@ mod tests {
         soul: &str,
     ) -> Arc<baybo_workspace::WorkspacePaths> {
         let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(dir.to_path_buf()));
-        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
+        let soul_path = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            baybo_workspace::IdentityKind::Soul,
+        );
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(&soul_path, soul).expect("write soul");
         workspace
@@ -2785,12 +2794,7 @@ mod tests {
         // …and the shared profile is still there, as its own section.
         assert!(prompt.contains("<shared_user_profile "), "{prompt}");
         assert!(
-            prompt.contains(
-                &workspace
-                    .identity_file(IdentityKind::User)
-                    .display()
-                    .to_string()
-            ),
+            prompt.contains(&workspace.shared_user_file().display().to_string()),
             "{prompt}"
         );
         // And the path in the tag is the agent's own file, so its self-edit
@@ -2882,9 +2886,10 @@ mod tests {
         let bound = bound_ctx(&workspace, AgentProfileId::builtin())
             .resolve_system_prompt()
             .await;
-        // The built-in's own notes *are* the shared profile, so it gets one
-        // user section, not two.
-        assert!(!bound.contains("<shared_user_profile "), "{bound}");
+        // Two user sections for everyone, the built-in included: its own
+        // notes plus the shared profile it does not own.
+        assert!(bound.contains("<shared_user_profile "), "{bound}");
+        assert!(bound.contains("<user_notes "), "{bound}");
         let unbound = ContextManager::from_config(ContextManagerConfig {
             agent: None,
             tokenizer: Arc::new(SimpleTokenizer),

@@ -46,11 +46,10 @@ const TAIL_HINT: &str = r#"Tool results and user messages may include <system-re
 /// workspace trio under `profile/`. Each carries what to create that file
 /// with if it does not exist yet.
 ///
-/// `user_notes` is the agent's *own* record of the human. The stable facts
-/// the operator curates live in the shared `profile/USER.md`, which every
-/// agent also reads and which is emitted as a separate `<shared_user>`
-/// section — omitted for the built-in, whose own notes already *are* that
-/// file.
+/// `user_notes` is the agent's *own* record of the human — the built-in's
+/// included, at `personas/baybo/USER.md`. The stable facts the operator
+/// curates live in the shared `profile/USER.md`, which belongs to no agent
+/// and is always emitted as its own `<shared_user_profile>` section.
 pub async fn assemble(
     paths: &WorkspacePaths,
     soul: IdentitySource<'_>,
@@ -60,41 +59,33 @@ pub async fn assemble(
     let identity =
         baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
             .await?;
-    let mut parts = vec![
+    let parts = [
         TOP_HINT.to_string(),
         wrap_section("soul", soul.path, &identity.soul),
         wrap_section("identity", self_image.path, &identity.identity),
-    ];
-    if let Some(shared) = &identity.shared_user {
-        parts.push(wrap_section(
+        wrap_section(
             "shared_user_profile",
-            &paths.identity_file(IdentityKind::User),
-            shared,
-        ));
-        parts.push(wrap_section("user_notes", user_notes.path, &identity.user));
-    } else {
-        parts.push(wrap_section(
-            "user_profile",
-            user_notes.path,
-            &identity.user,
-        ));
-    }
-    parts.push(BACKGROUND_TASKS_HINT.to_string());
-    parts.push(TAIL_HINT.to_string());
+            &paths.shared_user_file(),
+            &identity.shared_user,
+        ),
+        wrap_section("user_notes", user_notes.path, &identity.user),
+        BACKGROUND_TASKS_HINT.to_string(),
+        TAIL_HINT.to_string(),
+    ];
     Ok(parts.join("\n\n"))
 }
 
-/// [`assemble`] for a session with no agent binding: the workspace's own
-/// soul and self-image, each seeded from its shipped template.
-/// Byte-identical to what a session bound to the built-in profile produces,
-/// because the built-in's persona *is* the workspace `profile/`.
+/// [`assemble`] for a session with no agent binding: the **built-in**
+/// agent's own three files under `personas/baybo/`, each seeded from its
+/// shipped template. Byte-identical to what a session bound to the built-in
+/// produces, because it resolves to the same directory.
 pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let (soul, self_image, user) = baybo_workspace::identity::workspace_identity_paths(paths);
+    let (soul, self_image, user) = baybo_workspace::identity::builtin_identity_paths(paths);
     assemble(
         paths,
         IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
         IdentitySource::new(&self_image, IdentityKind::Identity.default_content()),
-        IdentitySource::new(&user, IdentityKind::User.default_content()),
+        IdentitySource::new(&user, baybo_workspace::prompt::PERSONA_USER_TEMPLATE),
     )
     .await
 }
@@ -125,12 +116,16 @@ mod tests {
         assert!(prompt.starts_with("You are an intelligent AI assistant."));
         let soul = prompt.find("<soul ").expect("soul tag");
         let identity = prompt.find("<identity ").expect("identity tag");
-        let user = prompt.find("<user_profile ").expect("user_profile tag");
+        let shared = prompt
+            .find("<shared_user_profile ")
+            .expect("shared_user_profile tag");
+        let notes = prompt.find("<user_notes ").expect("user_notes tag");
         let background = prompt.find("# Background work").expect("background hint");
         let tail = prompt
             .find("Tool results and user messages may include <system-reminder>")
             .expect("tail hint");
-        assert!(soul < identity && identity < user && user < background && background < tail);
+        assert!(soul < identity && identity < shared && shared < notes);
+        assert!(notes < background && background < tail);
         assert!(prompt.trim_end().ends_with(
             "They bear no direct relation to the specific tool results or user messages in which they appear."
         ));

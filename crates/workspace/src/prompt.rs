@@ -77,7 +77,7 @@ pub const PERSONA_SOUL_TEMPLATE: &str = r#"# Soul
 *This file is this agent's soul: its personality, tone, and preferences. It is
 yours to rewrite — edit it directly, or let the agent update it as it learns.
 Sessions bound to any other agent never read it. This agent's name and
-self-image live beside it in `IDENTITY.md`; the workspace `profile/USER.md`
+self-image live beside it in `IDENTITY.md`; the shared `personas/USER.md`
 (who your human is) applies on top.*
 
 ## Core Truths
@@ -98,8 +98,8 @@ self-image live beside it in `IDENTITY.md`; the workspace `profile/USER.md`
 /// somebody already filled in.
 pub const PERSONA_USER_TEMPLATE: &str = r#"# What I've Learned About Them
 
-*Your own notes, not shared with the other agents. The workspace
-`profile/USER.md` already covers who they are — this is for what working with
+*Your own notes, not shared with the other agents. The shared
+`personas/USER.md` already covers who they are — this is for what working with
 them has taught you: how they like this kind of work done, what they have
 already told you not to do, what context recurs.*
 

@@ -422,15 +422,16 @@ async fn agents_api_round_trip() {
     let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
     assert_eq!(fetched["name"].as_str(), Some(agent_id.as_str()));
 
-    // The built-in's pair is the workspace's own — editable, even though its
-    // row is locked, because these are files, not row fields.
+    // The built-in's files sit in `personas/baybo/` like everyone else's —
+    // editable, even though its row is locked, because these are files, not
+    // row fields.
     let builtin_soul = get(&router, "/v1/agents/baybo/soul", StatusCode::OK).await;
     assert!(
         builtin_soul["path"]
             .as_str()
             .unwrap_or_default()
-            .ends_with("profile/SOUL.md"),
-        "the builtin's soul is the workspace one, got {builtin_soul:?}",
+            .ends_with("personas/baybo/SOUL.md"),
+        "the builtin is an ordinary persona directory, got {builtin_soul:?}",
     );
     put_expect(
         &router,
@@ -444,7 +445,7 @@ async fn agents_api_round_trip() {
         builtin_identity["path"]
             .as_str()
             .unwrap_or_default()
-            .ends_with("profile/IDENTITY.md"),
+            .ends_with("personas/baybo/IDENTITY.md"),
         "got {builtin_identity:?}",
     );
 

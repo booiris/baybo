@@ -22,7 +22,7 @@ use crate::{BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackendKind};
 /// is read-only except its avatar and cannot be deleted; the seed's
 /// `INSERT OR IGNORE` in the sqlite store is the only writer of
 /// `builtin = 1`.
-pub const BUILTIN_AGENT_PROFILE_ID: &str = "baybo";
+pub const BUILTIN_AGENT_PROFILE_ID: &str = baybo_workspace::paths::BUILTIN_PERSONA_DIR;
 
 /// Upper bound on an agent profile's display name (chars, after trim),
 /// enforced at the gateway before a create/update reaches the store.
@@ -119,15 +119,12 @@ impl AgentProfileId {
     /// curates — stays at `profile/USER.md` and every agent reads it too; see
     /// `baybo_context::prompts::soul`.
     ///
-    /// The built-in resolves everything to `profile/`, so an unbound session
-    /// and a session bound to the built-in take byte-identical paths, and its
-    /// own notes *are* the shared profile.
+    /// One rule, no special cases: an agent's files live in its own
+    /// directory, the built-in's at `personas/baybo/`. The shared human
+    /// profile (`personas/USER.md`) is not addressed here — it belongs to no
+    /// agent, so it is not one of anyone's identity files.
     pub fn identity_file(&self, paths: &WorkspacePaths, kind: IdentityKind) -> PathBuf {
-        if self.is_builtin() {
-            paths.identity_file(kind)
-        } else {
-            paths.persona_identity_file(&self.0, kind)
-        }
+        paths.persona_identity_file(&self.0, kind)
     }
 
     /// This agent's private skill overlay, or `None` for the built-in — whose
@@ -286,15 +283,21 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_reads_every_identity_file_from_the_workspace() {
+    fn the_builtin_is_just_another_persona_directory() {
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
         let builtin = AgentProfileId::builtin();
         for kind in IdentityKind::all() {
             assert_eq!(
                 builtin.identity_file(&paths, kind),
-                paths.identity_file(kind)
+                paths.persona_identity_file(BUILTIN_AGENT_PROFILE_ID, kind),
             );
         }
+        // The shared human profile is nobody's identity file.
+        assert_ne!(
+            builtin.identity_file(&paths, IdentityKind::User),
+            paths.shared_user_file()
+        );
+        // …but the built-in still has no skill overlay: it *is* the shared set.
         assert!(builtin.skills_overlay_dir(&paths).is_none());
     }
 

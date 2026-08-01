@@ -270,9 +270,12 @@ mod tests {
         let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
         let write = WriteTool::new(paths.clone());
 
-        let in_profile = paths.profile_dir().join("SOUL.md");
+        let in_personas = paths.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            baybo_workspace::IdentityKind::Soul,
+        );
         let resources =
-            write.accessed_resources(&json!({ "file_path": in_profile.to_string_lossy() }));
+            write.accessed_resources(&json!({ "file_path": in_personas.to_string_lossy() }));
         assert!(
             resources
                 .iter()

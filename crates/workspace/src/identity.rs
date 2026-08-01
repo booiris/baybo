@@ -16,10 +16,10 @@ pub struct IdentityFiles {
     pub identity: String,
     /// This agent's own USER.md - what it has worked out about the human.
     pub user: String,
-    /// The shared `profile/USER.md` every agent reads: the stable facts the
-    /// operator curates. `None` when it *is* [`Self::user`] — the built-in's
-    /// own notes are the shared profile, so there is nothing to add.
-    pub shared_user: Option<String>,
+    /// The shared `personas/USER.md` every agent reads: the stable facts the
+    /// operator curates. Owned by no agent, so it is always a section of its
+    /// own.
+    pub shared_user: String,
 }
 
 /// Read `path`; if it is missing, seed it with `default` and return
@@ -42,9 +42,10 @@ async fn read_or_seed(path: &Path, default: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Write a single identity file atomically (tmpfile + rename).
+/// Write one of the **built-in** agent's identity files atomically
+/// (tmpfile + rename).
 ///
-/// Creates the workspace `profile/` directory if it does not already exist.
+/// Creates `personas/baybo/` if it does not already exist.
 /// Returns the absolute path the content was written to. The previous
 /// version, if any, is replaced.
 pub async fn write_identity_file(
@@ -53,8 +54,10 @@ pub async fn write_identity_file(
     content: &str,
 ) -> anyhow::Result<PathBuf> {
     let paths = WorkspacePaths::new(root.to_path_buf());
-    tokio::fs::create_dir_all(paths.profile_dir()).await?;
-    let target = paths.identity_file(kind);
+    let target = paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let tmp = target.with_extension("md.tmp");
     tokio::fs::write(&tmp, content).await?;
     tokio::fs::rename(&tmp, &target).await?;
@@ -66,7 +69,7 @@ pub async fn write_identity_file(
 ///
 /// A parameter rather than a fixed path because `SOUL.md` and `IDENTITY.md`
 /// belong to the *agent*: a session bound to a custom agent reads them from
-/// `personas/<id>/`, everything else from `profile/`.
+/// `personas/<id>/`, and the built-in from `personas/baybo/`.
 #[derive(Clone, Copy)]
 pub struct IdentitySource<'a> {
     pub path: &'a Path,
@@ -79,92 +82,14 @@ impl<'a> IdentitySource<'a> {
     }
 }
 
-/// Pull the agent's chosen name out of an `IDENTITY.md` body.
-///
-/// The file is prose the agent rewrites freely, so this is a tolerant scan,
-/// not a parser: the first line carrying a `Name:` label wins, whatever
-/// bullet or emphasis surrounds it, and the value is whatever follows on
-/// that line. `None` when there is no such line or its value is empty —
-/// which is the shipped template's state, since it invites the agent to
-/// choose. Callers supply their own fallback rather than getting a
-/// placeholder baked in here.
-pub fn display_name(identity_md: &str) -> Option<String> {
-    identity_md.lines().find_map(|line| {
-        let (label, value) = line.split_once(':')?;
-        if !label_is_name(label) {
-            return None;
-        }
-        let value = strip_emphasis(value);
-        (!value.is_empty()).then(|| value.to_owned())
-    })
-}
-
-/// Rewrite (or introduce) the `Name:` line in an `IDENTITY.md` body.
-///
-/// Preserves everything else verbatim — this is a targeted edit to a file
-/// the agent owns, so it must not reformat the parts it was not asked to
-/// touch. When no `Name:` line exists the entry is inserted after the
-/// leading heading, where the template puts it.
-pub fn with_display_name(identity_md: &str, name: &str) -> String {
-    // A name is one line by construction; anything else would break the very
-    // line this function keys off.
-    let name = name.split(['\n', '\r']).next().unwrap_or_default().trim();
-    let mut out: Vec<String> = Vec::new();
-    let mut replaced = false;
-    for line in identity_md.lines() {
-        if !replaced
-            && let Some((label, rest)) = line.split_once(':')
-            && label_is_name(label)
-        {
-            // Splice the value only. The emphasis run right after the colon
-            // is the *closing* half of the label's bold (`* **Name:**`), so
-            // rebuilding the line from the label alone would eat it.
-            let closing = &rest[..rest.len() - rest.trim_start_matches(['*', '_']).len()];
-            out.push(format!("{label}:{closing} {name}"));
-            replaced = true;
-            continue;
-        }
-        out.push(line.to_owned());
-    }
-    if !replaced {
-        let after_heading = out
-            .iter()
-            .position(|l| l.trim_start().starts_with('#'))
-            .map_or(0, |i| i + 1);
-        out.insert(after_heading, String::new());
-        out.insert(after_heading + 1, format!("* **Name:** {name}"));
-    }
-    let mut joined = out.join("\n");
-    if identity_md.ends_with('\n') || joined.is_empty() {
-        joined.push('\n');
-    }
-    joined
-}
-
-/// Whether the text before a `:` is the name label, ignoring the markdown
-/// decoration the template ships with (`* **Name:**`) and any casing.
-fn label_is_name(label: &str) -> bool {
-    strip_emphasis(label).eq_ignore_ascii_case("name")
-}
-
-/// Strip list bullets and `*` / `_` emphasis from around a fragment.
-fn strip_emphasis(fragment: &str) -> &str {
-    fragment
-        .trim()
-        .trim_start_matches(['-', '*', '+'])
-        .trim()
-        .trim_matches(['*', '_'])
-        .trim()
-}
-
-/// The per-agent sections as the *workspace* holds them: the built-in
-/// agent's own files under `profile/`, each seeded from its shipped
-/// template. Returned as paths because [`IdentitySource`] borrows them.
-pub fn workspace_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf, PathBuf) {
+/// The built-in agent's own three files, under `personas/baybo/`. Returned
+/// as paths because [`IdentitySource`] borrows them.
+pub fn builtin_identity_paths(paths: &WorkspacePaths) -> (PathBuf, PathBuf, PathBuf) {
+    let file = |kind| paths.persona_identity_file(crate::paths::BUILTIN_PERSONA_DIR, kind);
     (
-        paths.identity_file(IdentityKind::Soul),
-        paths.identity_file(IdentityKind::Identity),
-        paths.identity_file(IdentityKind::User),
+        file(IdentityKind::Soul),
+        file(IdentityKind::Identity),
+        file(IdentityKind::User),
     )
 }
 
@@ -175,10 +100,9 @@ pub async fn load_identity(source: IdentitySource<'_>) -> anyhow::Result<String>
 }
 
 /// Load the identity sections. All three per-agent files come from the
-/// caller-supplied sources; the shared `profile/USER.md` is read here, and
-/// returned only when it is a different file from the agent's own — the
-/// built-in's notes *are* the shared profile, and emitting it twice would
-/// just spend tokens saying the same thing.
+/// caller-supplied sources; the shared `personas/USER.md` is read here and
+/// always returned, because it belongs to no agent — every one of them reads
+/// it alongside its own notes.
 ///
 /// Auto-seeding here means a deleted identity file is recreated on the
 /// next session boot. That matches what we want for runtime correctness
@@ -192,17 +116,13 @@ pub async fn load_identity_files(
     user: IdentitySource<'_>,
 ) -> anyhow::Result<IdentityFiles> {
     let paths = WorkspacePaths::new(root.to_path_buf());
-    let shared_user_path = paths.identity_file(IdentityKind::User);
+    let shared_user_path = paths.shared_user_file();
     let (soul, identity, own_user) = tokio::try_join!(
         read_or_seed(soul.path, soul.seed),
         read_or_seed(identity.path, identity.seed),
         read_or_seed(user.path, user.seed),
     )?;
-    let shared_user = if user.path == shared_user_path {
-        None
-    } else {
-        Some(read_or_seed(&shared_user_path, IdentityKind::User.default_content()).await?)
-    };
+    let shared_user = read_or_seed(&shared_user_path, IdentityKind::User.default_content()).await?;
 
     Ok(IdentityFiles {
         soul,
@@ -252,65 +172,11 @@ pub async fn ensure_persona_layout(
 mod tests {
     use super::*;
 
-    #[test]
-    fn display_name_reads_the_shipped_template_shape_and_tolerates_drift() {
-        // What the template produces once filled in.
-        assert_eq!(
-            display_name("# Who Am I?\n\n* **Name:** Aster\n* **Vibe:** dry\n").as_deref(),
-            Some("Aster")
-        );
-        // The agent owns this file, so the scan must survive it reformatting.
-        for drifted in [
-            "Name: Aster",
-            "- name: Aster",
-            "  * **NAME:**   Aster  ",
-            "## Who\n\n**Name**: Aster\n",
-        ] {
-            assert_eq!(
-                display_name(drifted).as_deref(),
-                Some("Aster"),
-                "failed on {drifted:?}"
-            );
-        }
-        // The shipped template is deliberately unnamed — it invites the agent
-        // to choose — so callers must supply their own fallback.
-        assert_eq!(display_name(IdentityKind::Identity.default_content()), None);
-        assert_eq!(display_name("no labels here"), None);
-        assert_eq!(display_name("* **Name:**"), None);
-    }
-
-    #[test]
-    fn with_display_name_edits_only_the_name_line() {
-        let original = "# Who Am I?\n\n* **Name:** Aster\n* **Vibe:** dry\n";
-        let renamed = with_display_name(original, "Vega");
-        assert_eq!(
-            renamed,
-            "# Who Am I?\n\n* **Name:** Vega\n* **Vibe:** dry\n"
-        );
-        assert_eq!(display_name(&renamed).as_deref(), Some("Vega"));
-
-        // Round-trips: naming an unnamed template makes it readable, and
-        // everything the agent wrote around it survives.
-        let seeded = with_display_name(IdentityKind::Identity.default_content(), "Vega");
-        assert_eq!(display_name(&seeded).as_deref(), Some("Vega"));
-        assert!(seeded.contains("**Creature:**"), "{seeded}");
-
-        // A file with no name line at all gains one under the heading.
-        let added = with_display_name("# Who Am I?\n\nfree prose\n", "Vega");
-        assert_eq!(display_name(&added).as_deref(), Some("Vega"));
-        assert!(added.contains("free prose"), "{added}");
-
-        // A multi-line value would destroy the line this keys off.
-        let sneaky = with_display_name(original, "Vega\n* **Vibe:** hijacked");
-        assert_eq!(display_name(&sneaky).as_deref(), Some("Vega"));
-        assert!(sneaky.contains("* **Vibe:** dry"), "{sneaky}");
-    }
-
     /// Load the workspace's own three sections — i.e. what the built-in
-    /// agent reads, both per-agent files coming from `profile/`.
+    /// agent reads, all three coming from `personas/baybo/`.
     async fn load_workspace(dir: &Path) -> IdentityFiles {
         let paths = WorkspacePaths::new(dir.to_path_buf());
-        let (soul, identity, user) = workspace_identity_paths(&paths);
+        let (soul, identity, user) = builtin_identity_paths(&paths);
         load_identity_files(
             dir,
             IdentitySource::new(&soul, IdentityKind::Soul.default_content()),
@@ -332,7 +198,7 @@ mod tests {
         let path = write_identity_file(&dir, IdentityKind::Soul, "You are helpful.")
             .await
             .expect("write soul");
-        assert_eq!(path, dir.join("profile").join("SOUL.md"));
+        assert_eq!(path, dir.join("personas").join("baybo").join("SOUL.md"));
 
         let loaded = load_workspace(&dir).await;
         assert_eq!(loaded.soul, "You are helpful.");
@@ -353,7 +219,7 @@ mod tests {
             .join("test_tmp")
             .join("workspace_identity_test");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        let profile = dir.join("profile");
+        let profile = dir.join("personas").join(crate::paths::BUILTIN_PERSONA_DIR);
         tokio::fs::create_dir_all(&profile).await.unwrap();
         // Only SOUL.md is hand-written; USER.md and IDENTITY.md are absent.
         tokio::fs::write(profile.join("SOUL.md"), "You are helpful.")
@@ -391,14 +257,14 @@ mod tests {
             .join("identity_fresh_seed_test");
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
-        // No `profile/` dir at all yet — load must create it and seed
+        // No persona dir at all yet — load must create it and seed
         // every file.
         let files = load_workspace(&dir).await;
         assert_eq!(files.soul, IdentityKind::Soul.default_content());
         assert_eq!(files.user, IdentityKind::User.default_content());
         assert_eq!(files.identity, IdentityKind::Identity.default_content());
 
-        let profile = dir.join("profile");
+        let profile = dir.join("personas").join(crate::paths::BUILTIN_PERSONA_DIR);
         for kind in IdentityKind::all() {
             assert!(profile.join(kind.file_name()).exists());
         }

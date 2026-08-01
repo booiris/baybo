@@ -19,7 +19,6 @@ The workspace root is the single **project root** for the entire runtime: every 
 ```text
 <workspace_root>/
   config/          # standalone git repo: baybo.json, .mcp.json
-  profile/         # standalone git repo: SOUL.md / USER.md / IDENTITY.md identity files
   skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
   personas/        # standalone git repo: one dir per agent — SOUL.md + IDENTITY.md + skills/
@@ -41,12 +40,10 @@ checkout rather than polluting the real user home.
 | ---------------- | ------------------------------------------ |
 | config           | `<workspace.path>/config/baybo.json`        |
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
-| identity files   | `<workspace.path>/profile/{SOUL,USER,IDENTITY}.md` |
 | skills           | `<workspace.path>/skills/`                 |
-| agent soul       | `<workspace.path>/personas/<agent_id>/SOUL.md` |
-| agent self-image | `<workspace.path>/personas/<agent_id>/IDENTITY.md` |
-| agent's user notes | `<workspace.path>/personas/<agent_id>/USER.md` |
-| shared user profile | `<workspace.path>/profile/USER.md` (read by every agent) |
+| agent identity files | `<workspace.path>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` |
+| built-in's identity files | `<workspace.path>/personas/baybo/…` — it is an ordinary persona dir |
+| shared user profile | `<workspace.path>/personas/USER.md` (owned by no agent) |
 | agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
@@ -92,19 +89,26 @@ The `ENV_CONFIG_PATH` constant holds the env-var name `BAYBO_CONFIG_PATH`; setti
 - **USER.md**: long-term user profile
 - **IDENTITY.md**: system or instance identity description
 
-**All three identity files are per-agent.** `SOUL.md` (personality) and
-`IDENTITY.md` (self-image: name, creature, vibe, emoji, avatar) answer "who is
-this assistant". `USER.md` is the agent's **own notes** about the human — what
-working with them taught *it* — and it is per-agent for the same reason memory
-is partitioned: one agent's accumulated read on the user is not another's, and
-sharing the file would be a write channel between agents that the partition
-does not cover. Empirically it is also the only one agents actually maintain.
+**All three identity files are per-agent, and the built-in is an ordinary
+persona directory** (`personas/baybo/`). There is no `profile/`: one directory,
+one rule — `personas/<id>/` is an agent, and the single file directly inside
+`personas/` is the shared human profile that belongs to none of them.
 
-The stable facts the operator curates stay in the **shared** `profile/USER.md`,
-which every agent reads as a separate `<shared_user_profile>` section. The
-built-in's own notes *are* that file, so it sees one user section rather than
-two — an unbound session and a built-in-bound one still assemble byte-identical
-prompts.
+`SOUL.md` (personality) and `IDENTITY.md` (self-image: name, creature, vibe,
+emoji, avatar) answer "who is this assistant". `USER.md` is the agent's **own
+notes** about the human, per-agent for the same reason memory is partitioned:
+one agent's accumulated read on the user is not another's, and sharing the file
+would be a write channel between agents that the partition does not cover.
+Empirically it is also the only one agents actually maintain.
+
+The stable facts the operator curates live in `personas/USER.md`, which every
+agent reads as a separate `<shared_user_profile>` section alongside its own
+`<user_notes>`.
+
+A workspace created before this layout is carried across once at
+`ensure_layout`: the old `profile/{SOUL,IDENTITY}.md` become the built-in's,
+`profile/USER.md` becomes the shared profile, and `profile/` is **copied, not
+moved**, so its git audit history stays readable.
 
 The built-in profile has no `personas/` directory at all — its pair *is*
 `profile/{SOUL,IDENTITY}.md`, so an unbound session and a built-in-bound one

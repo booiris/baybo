@@ -55,19 +55,13 @@ const GIT_AUTHOR_NAME: &str = "Baybo";
 const GIT_AUTHOR_EMAIL: &str = "baybo@local";
 const MAX_IDENTITY_BYTES: u64 = 1 << 20;
 
-/// An identity-file edit, resolved to the git repo that audits it and the
-/// path to stage inside that repo.
+/// An identity-file edit, resolved to the path to stage inside the
+/// `personas/` repo that audits it — `<agent_id>/SOUL.md` and friends.
 struct IdentityTarget {
-    repo: PathBuf,
-    /// Repo-relative, so `git add --` stages exactly this file:
-    /// `SOUL.md` under `profile/`, `<agent_id>/SOUL.md` under `personas/`.
     rel_path: String,
-    /// Dir name for the tool's own output line (`profile` / `personas`).
-    repo_label: &'static str,
 }
 
 pub struct EditTool {
-    profile_dir: PathBuf,
     personas_dir: PathBuf,
     work_dir: PathBuf,
     skills_dir: PathBuf,
@@ -81,33 +75,12 @@ impl EditTool {
         // file path the LLM passes from the system prompt's
         // `<soul path="...">` wrapper.
         Self {
-            profile_dir: absolutise(&workspace_paths.profile_dir()),
             personas_dir: absolutise(&workspace_paths.personas_dir()),
             work_dir: absolutise(&workspace_paths.work_dir()),
             skills_dir: absolutise(&workspace_paths.skills_dir()),
         }
     }
 
-    /// True when the requested edit targets one of the three identity
-    /// files inside the actual workspace `profile/` directory. Bound
-    /// to the absolutised profile dir so a spoofed path like
-    /// `/etc/profile/SOUL.md` cannot satisfy the check.
-    fn is_profile_target(&self, file_path: &Path) -> bool {
-        if !file_path.starts_with(&self.profile_dir) {
-            return false;
-        }
-        let Some(name) = file_path.file_name().and_then(|f| f.to_str()) else {
-            return false;
-        };
-        IdentityKind::all().iter().any(|k| k.file_name() == name)
-    }
-
-    /// True for exactly `<workspace>/personas/<agent_id>/{SOUL,IDENTITY}.md`
-    /// — one custom agent's personality or self-image.
-    ///
-    /// The grandparent check is what keeps a persona's `skills/` tree out:
-    /// `personas/<id>/skills/x/SOUL.md` is skill content that happens to be
-    /// named like a soul, and must not inherit the identity treatment.
     /// Shape only — *some* agent's identity file. Ownership ("is it this
     /// agent's?") is checked in [`check_persona_identity_target`] at execute
     /// time, because the approval declaration has no call context to check
@@ -133,7 +106,7 @@ impl EditTool {
     /// — once resolved by [`Self::identity_target`] — the size cap and audit
     /// commit).
     fn is_identity_target(&self, file_path: &Path) -> bool {
-        self.is_profile_target(file_path) || self.is_persona_identity(file_path)
+        self.is_persona_identity(file_path)
     }
 
     /// Resolve an identity edit to the repo that audits it, rejecting a path
@@ -144,23 +117,12 @@ impl EditTool {
         file_path: &Path,
         agent: &AgentProfileId,
     ) -> crate::Result<Option<IdentityTarget>> {
-        if file_path.starts_with(&self.profile_dir) {
-            let name = check_profile_target(file_path)?;
-            return Ok(Some(IdentityTarget {
-                repo: self.profile_dir.clone(),
-                rel_path: name.to_owned(),
-                repo_label: baybo_workspace::paths::PROFILE_DIR,
-            }));
+        if !file_path.starts_with(&self.personas_dir) {
+            return Ok(None);
         }
-        if file_path.starts_with(&self.personas_dir) {
-            let rel_path = check_persona_identity_target(file_path, &self.personas_dir, agent)?;
-            return Ok(Some(IdentityTarget {
-                repo: self.personas_dir.clone(),
-                rel_path,
-                repo_label: baybo_workspace::paths::PERSONAS_DIR,
-            }));
-        }
-        Ok(None)
+        Ok(Some(IdentityTarget {
+            rel_path: check_persona_identity_target(file_path, &self.personas_dir, agent)?,
+        }))
     }
 
     fn is_inside_work_dir(&self, file_path: &Path) -> bool {
@@ -291,6 +253,10 @@ impl Tool for EditTool {
             contents.replacen(&p.old_string, &p.new_string, 1)
         };
 
+        if let Some(target) = &identity_target {
+            reject_if_it_would_orphan_the_name(target, &contents, &updated)?;
+        }
+
         tokio::fs::write(&p.file_path, &updated)
             .await
             .map_err(|e| ToolError::Execution(format!("write {}: {e}", p.file_path.display())))?;
@@ -308,8 +274,9 @@ impl Tool for EditTool {
         );
 
         if let Some(target) = identity_target {
-            let label = target.repo_label;
-            match commit_identity_change(&target, ctx.session_id.as_str()).await {
+            let label = baybo_workspace::paths::PERSONAS_DIR;
+            match commit_identity_change(&self.personas_dir, &target, ctx.session_id.as_str()).await
+            {
                 Ok(sha) => text.push_str(&format!("\ncommitted to {label}/ ({sha})")),
                 Err(reason) => text.push_str(&format!("\n{label}/ commit_warning: {reason}")),
             }
@@ -320,32 +287,6 @@ impl Tool for EditTool {
 
         Ok(ToolOutput::Text(text))
     }
-}
-
-/// Resolve a `profile/`-relative edit to one of the three identity
-/// filenames, or reject with `InvalidParams`. Also enforces the size
-/// cap on the existing file so a corrupted multi-MiB blob can't be
-/// slurped into memory just to replace one byte.
-fn check_profile_target(path: &Path) -> crate::Result<&'static str> {
-    let raw_name = path.file_name().and_then(|f| f.to_str()).ok_or_else(|| {
-        ToolError::InvalidParams(format!(
-            "edits under profile/ require a filename; got {}",
-            path.display()
-        ))
-    })?;
-
-    let canonical = IdentityKind::all()
-        .into_iter()
-        .map(|k| k.file_name())
-        .find(|name| *name == raw_name)
-        .ok_or_else(|| {
-            ToolError::InvalidParams(format!(
-                "edits under profile/ are restricted to SOUL.md, USER.md, IDENTITY.md; got {raw_name}"
-            ))
-        })?;
-
-    reject_if_oversized(path)?;
-    Ok(canonical)
 }
 
 /// The identity files an agent owns — all three, `USER.md` included: those
@@ -391,6 +332,39 @@ fn check_persona_identity_target(
     Ok(format!("{}/{}", components[0], components[1]))
 }
 
+/// Refuse an edit to `IDENTITY.md` that would leave it without a readable
+/// `Name:` line.
+///
+/// That line is not prose: it is what every surface calls this agent — the
+/// roster, the picker, the delete confirmation. Losing it does not fail
+/// anything loudly, it just makes the agent render as its raw id, so an
+/// incidental reformat while updating some other field could quietly cost
+/// the agent its name. Only *removal* is refused: an edit is free to change
+/// the name, and a file that had no name to begin with (the shipped
+/// template, which invites the agent to choose one) is left alone.
+fn reject_if_it_would_orphan_the_name(
+    target: &IdentityTarget,
+    before: &str,
+    after: &str,
+) -> crate::Result<()> {
+    if !target
+        .rel_path
+        .ends_with(IdentityKind::Identity.file_name())
+    {
+        return Ok(());
+    }
+    if baybo_workspace::display_name(before).is_some()
+        && baybo_workspace::display_name(after).is_none()
+    {
+        return Err(ToolError::InvalidParams(
+            "this edit would remove the `Name:` line from IDENTITY.md, which is what every \
+             surface calls you — keep a `Name: <something>` line (renaming yourself is fine)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the size cap on an existing identity file so a corrupted
 /// multi-MiB blob can't be slurped into memory just to replace one byte.
 fn reject_if_oversized(path: &Path) -> crate::Result<()> {
@@ -406,28 +380,25 @@ fn reject_if_oversized(path: &Path) -> crate::Result<()> {
 }
 
 async fn commit_identity_change(
+    repo: &Path,
     target: &IdentityTarget,
     session_id: &str,
 ) -> Result<String, String> {
-    let IdentityTarget {
-        repo,
-        rel_path,
-        repo_label,
-    } = target;
-    let repo = repo.as_path();
-    let file_name = rel_path.as_str();
+    let file_name = target.rel_path.as_str();
     if !is_on_branch(repo).await? {
         return Err(format!(
-            "HEAD is detached; check out a branch in {repo_label}/ first"
+            "HEAD is detached; check out a branch in {} first",
+            baybo_workspace::paths::PERSONAS_DIR
         ));
     }
 
     run_git(repo, &[], &["add", "--", file_name]).await?;
 
     let commit_msg = format!(
-        "{repo_label}: update {file_name}\n\n\
+        "{}: update {file_name}\n\n\
          Tool: Edit\n\
          Session: {session_id}\n",
+        baybo_workspace::paths::PERSONAS_DIR,
     );
     run_git(
         repo,
@@ -525,6 +496,14 @@ mod tests {
         }
     }
 
+    fn tool() -> EditTool {
+        EditTool::new(WorkspacePaths::new("/tmp"))
+    }
+
+    fn tool_with(paths: WorkspacePaths) -> EditTool {
+        EditTool::new(paths)
+    }
+
     async fn run_git_quiet(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -534,69 +513,6 @@ mod tests {
             .await
             .expect("git");
         assert!(status.success(), "git {args:?} failed");
-    }
-
-    async fn make_profile_workspace() -> (tempfile::TempDir, WorkspacePaths) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
-        let profile = paths.profile_dir();
-        tokio::fs::create_dir_all(&profile).await.unwrap();
-        run_git_quiet(&profile, &["init", "--quiet", "-b", "main"]).await;
-        for kind in IdentityKind::all() {
-            tokio::fs::write(paths.identity_file(kind), "## seed\n")
-                .await
-                .unwrap();
-        }
-        run_git_quiet(
-            &profile,
-            &[
-                "-c",
-                "user.name=seed",
-                "-c",
-                "user.email=seed@local",
-                "add",
-                ".",
-            ],
-        )
-        .await;
-        run_git_quiet(
-            &profile,
-            &[
-                "-c",
-                "user.name=seed",
-                "-c",
-                "user.email=seed@local",
-                "commit",
-                "--no-verify",
-                "--quiet",
-                "-m",
-                "seed",
-            ],
-        )
-        .await;
-        (tmp, paths)
-    }
-
-    async fn make_fresh_profile_workspace() -> (tempfile::TempDir, WorkspacePaths) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
-        let profile = paths.profile_dir();
-        tokio::fs::create_dir_all(&profile).await.unwrap();
-        run_git_quiet(&profile, &["init", "--quiet", "-b", "main"]).await;
-        for kind in IdentityKind::all() {
-            tokio::fs::write(paths.identity_file(kind), "alpha bravo charlie\n")
-                .await
-                .unwrap();
-        }
-        (tmp, paths)
-    }
-
-    fn tool() -> EditTool {
-        EditTool::new(WorkspacePaths::new("/tmp"))
-    }
-
-    fn tool_with(paths: WorkspacePaths) -> EditTool {
-        EditTool::new(paths)
     }
 
     #[tokio::test]
@@ -769,66 +685,6 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "A B c");
     }
 
-    #[tokio::test]
-    async fn profile_edit_commits_with_baybo_author() {
-        let (_tmp, paths) = make_profile_workspace().await;
-        let target = paths.identity_file(IdentityKind::Soul);
-        tokio::fs::write(&target, "alpha bravo charlie\n")
-            .await
-            .unwrap();
-        run_git_quiet(
-            &paths.profile_dir(),
-            &[
-                "-c",
-                "user.name=seed",
-                "-c",
-                "user.email=seed@local",
-                "commit",
-                "--no-verify",
-                "--quiet",
-                "-am",
-                "set body",
-            ],
-        )
-        .await;
-
-        let ctx = ctx_with_paths(paths.clone());
-        let out = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": target,
-                    "old_string": "bravo",
-                    "new_string": "BRAVO",
-                }),
-                &ctx,
-            )
-            .await
-            .expect("execute");
-
-        let body = tokio::fs::read_to_string(&paths.identity_file(IdentityKind::Soul))
-            .await
-            .unwrap();
-        assert_eq!(body, "alpha BRAVO charlie\n");
-
-        let ToolOutput::Text(text) = out else {
-            panic!("expected Text output")
-        };
-        assert!(text.contains("committed to profile/"), "{text}");
-        assert!(text.contains("next compaction or new session"), "{text}");
-
-        let log = Command::new("git")
-            .arg("-C")
-            .arg(paths.profile_dir())
-            .args(["log", "-1", "--pretty=%an <%ae>%n%B"])
-            .output()
-            .await
-            .unwrap();
-        let log = String::from_utf8_lossy(&log.stdout);
-        assert!(log.contains("Baybo <baybo@local>"), "{log}");
-        assert!(log.contains("Tool: Edit"), "{log}");
-        assert!(log.contains("Session: sess-test"), "{log}");
-    }
-
     /// A custom agent's soul lives under `personas/<id>/`, not `profile/`.
     /// The self-edit the system prompt instructs must get the same treatment
     /// there — no approval prompt, and an audit commit — or the instruction
@@ -955,6 +811,72 @@ mod tests {
         }
     }
 
+    /// The `Name:` line is what every surface calls the agent, so an edit
+    /// may change it but not delete it — otherwise an incidental reformat
+    /// costs the agent its name and it silently renders as a raw id.
+    #[tokio::test]
+    async fn an_edit_cannot_strip_the_name_from_its_identity_file() {
+        let agent_id = "01JAGENT";
+        let (_tmp, paths) = make_persona_workspace(agent_id).await;
+        let target = paths.persona_identity_file(agent_id, IdentityKind::Identity);
+        let named = "# Who Am I?\n\n* **Name:** Aster\n* **Vibe:** dry\n";
+        tokio::fs::write(&target, named).await.unwrap();
+        let ctx = ToolContext {
+            agent_id: AgentProfileId::parse(agent_id).unwrap(),
+            ..ctx_with_paths(paths.clone())
+        };
+
+        let err = tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": target,
+                    "old_string": "* **Name:** Aster\n",
+                    "new_string": "",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParams(ref m) if m.contains("Name:")),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            named,
+            "a refused edit writes nothing"
+        );
+
+        // Renaming is fine — only losing the line is refused.
+        tool_with(paths.clone())
+            .execute(
+                json!({
+                    "file_path": target,
+                    "old_string": "Aster",
+                    "new_string": "Vega",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            baybo_workspace::display_name(&tokio::fs::read_to_string(&target).await.unwrap())
+                .as_deref(),
+            Some("Vega")
+        );
+
+        // And a file that never had a name is not held hostage by the guard.
+        let unnamed = paths.persona_identity_file(agent_id, IdentityKind::Soul);
+        tokio::fs::write(&unnamed, "alpha\n").await.unwrap();
+        tool_with(paths.clone())
+            .execute(
+                json!({ "file_path": unnamed, "old_string": "alpha", "new_string": "bravo" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+    }
+
     /// One agent must not reach into another's persona. The approval
     /// declaration is shape-based (it has no call context), so the guard that
     /// matters is the refusal here — nothing is written.
@@ -1033,211 +955,5 @@ mod tests {
             "alpha\n",
             "file must not be modified on guard reject"
         );
-    }
-
-    #[tokio::test]
-    async fn profile_edit_rejects_unknown_filename() {
-        let (_tmp, paths) = make_profile_workspace().await;
-        let stray = paths.profile_dir().join("notes.md");
-        tokio::fs::write(&stray, "hello").await.unwrap();
-        let ctx = ctx_with_paths(paths.clone());
-        let err = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": stray,
-                    "old_string": "hello",
-                    "new_string": "world",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::InvalidParams(ref m) if m.contains("SOUL.md")),
-            "got: {err:?}"
-        );
-        let body = tokio::fs::read_to_string(&stray).await.unwrap();
-        assert_eq!(body, "hello", "file must not be modified on guard reject");
-    }
-
-    #[tokio::test]
-    async fn profile_edit_rejects_oversized_file() {
-        let (_tmp, paths) = make_profile_workspace().await;
-        let target = paths.identity_file(IdentityKind::User);
-        let big = "x".repeat((MAX_IDENTITY_BYTES + 1) as usize);
-        tokio::fs::write(&target, &big).await.unwrap();
-        let ctx = ctx_with_paths(paths.clone());
-        let err = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": target,
-                    "old_string": "x",
-                    "new_string": "y",
-                    "replace_all": true,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::Execution(ref m) if m.contains("MiB cap")),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn profile_edit_fresh_workspace_creates_commit() {
-        let (_tmp, paths) = make_fresh_profile_workspace().await;
-        let target = paths.identity_file(IdentityKind::Soul);
-        let ctx = ctx_with_paths(paths.clone());
-        let out = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": target,
-                    "old_string": "bravo",
-                    "new_string": "BRAVO",
-                }),
-                &ctx,
-            )
-            .await
-            .expect("first call on fresh workspace");
-        let ToolOutput::Text(text) = out else {
-            panic!("expected Text")
-        };
-        assert!(
-            text.contains("committed to profile/"),
-            "first call must produce a real commit; got:\n{text}"
-        );
-
-        let log = Command::new("git")
-            .arg("-C")
-            .arg(paths.profile_dir())
-            .args(["log", "--oneline"])
-            .output()
-            .await
-            .unwrap();
-        let log = String::from_utf8_lossy(&log.stdout);
-        assert!(!log.is_empty(), "git log should show the new commit");
-    }
-
-    #[test]
-    fn accessed_resources_drops_writefile_for_profile_targets() {
-        let paths = WorkspacePaths::new("/var/baybo");
-        let edit = EditTool::new(paths.clone());
-
-        // Profile target → only ReadFile is declared; the WriteFile
-        // declaration that would otherwise force an approval prompt
-        // is omitted.
-        let in_profile = paths.identity_file(IdentityKind::Soul);
-        let resources =
-            edit.accessed_resources(&json!({ "file_path": in_profile.to_string_lossy() }));
-        assert_eq!(resources.len(), 1);
-        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
-
-        // Non-profile target → both Read and Write declared; gate still fires.
-        let resources = edit.accessed_resources(&json!({ "file_path": "/tmp/random.txt" }));
-        assert_eq!(resources.len(), 2);
-        assert!(
-            resources
-                .iter()
-                .any(|r| matches!(r, ResourceAccess::WriteFile { .. }))
-        );
-    }
-
-    #[test]
-    fn accessed_resources_drops_writefile_for_work_targets() {
-        let paths = WorkspacePaths::new("/var/baybo");
-        let edit = EditTool::new(paths.clone());
-
-        let in_work = paths.work_dir().join("scratch/notes.txt");
-        let resources = edit.accessed_resources(&json!({ "file_path": in_work.to_string_lossy() }));
-        assert_eq!(resources.len(), 1, "{resources:?}");
-        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
-    }
-
-    #[test]
-    fn accessed_resources_drops_writefile_for_skills_targets() {
-        let paths = WorkspacePaths::new("/var/baybo");
-        let edit = EditTool::new(paths.clone());
-
-        let in_skills = paths.skills_dir().join("my-skill/SKILL.md");
-        let resources =
-            edit.accessed_resources(&json!({ "file_path": in_skills.to_string_lossy() }));
-        assert_eq!(resources.len(), 1, "{resources:?}");
-        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
-    }
-
-    #[test]
-    fn accessed_resources_bypass_works_with_relative_workspace_root() {
-        // Regression: debug-build default is `./.baybo` — a relative
-        // workspace root. profile_dir() returns the relative
-        // `./.baybo/profile`, but the LLM passes file paths as absolute
-        // (the system prompt wraps each identity file with the
-        // absolutised on-disk path). Without absolutising the cached
-        // profile dir, `starts_with` never matched and the bypass
-        // silently failed in dev. Lock that in.
-        let cwd = std::env::current_dir().expect("cwd");
-        let edit = EditTool::new(WorkspacePaths::new("./.baybo"));
-
-        let absolute_target = cwd.join(".baybo/profile/SOUL.md");
-        let resources =
-            edit.accessed_resources(&json!({ "file_path": absolute_target.to_string_lossy() }));
-        assert_eq!(
-            resources.len(),
-            1,
-            "relative workspace root must still produce a profile bypass: {resources:?}"
-        );
-        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
-    }
-
-    #[test]
-    fn accessed_resources_does_not_bypass_spoofed_profile_path() {
-        // Path looks like a profile edit (ends in /profile/SOUL.md) but
-        // sits outside the actual workspace. Must NOT bypass approval —
-        // otherwise the LLM could write anywhere matching that shape.
-        let paths = WorkspacePaths::new("/var/baybo");
-        let edit = EditTool::new(paths);
-        let resources = edit.accessed_resources(&json!({ "file_path": "/etc/profile/SOUL.md" }));
-        assert_eq!(resources.len(), 2);
-        assert!(
-            resources
-                .iter()
-                .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
-            "spoofed profile-shaped path must still declare WriteFile",
-        );
-    }
-
-    #[tokio::test]
-    async fn profile_edit_detached_head_warns_in_output() {
-        let (_tmp, paths) = make_profile_workspace().await;
-        let head = Command::new("git")
-            .arg("-C")
-            .arg(paths.profile_dir())
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .await
-            .unwrap();
-        let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        run_git_quiet(&paths.profile_dir(), &["checkout", "--quiet", &sha]).await;
-
-        let target = paths.identity_file(IdentityKind::Soul);
-        let ctx = ctx_with_paths(paths.clone());
-        let out = tool_with(paths.clone())
-            .execute(
-                json!({
-                    "file_path": target,
-                    "old_string": "seed",
-                    "new_string": "SEED",
-                }),
-                &ctx,
-            )
-            .await
-            .expect("execute should still succeed with warning");
-        let ToolOutput::Text(text) = out else {
-            panic!("expected Text")
-        };
-        assert!(text.contains("profile/ commit_warning"), "{text}");
-        let body = tokio::fs::read_to_string(&target).await.unwrap();
-        assert!(body.contains("SEED"), "{body}");
     }
 }
