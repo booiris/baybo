@@ -51,6 +51,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // gateway all expect.
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         Self.hasToken = true
+        NSLog(
+            "baybo: APNs device token received — env=%@ token_len=%ld",
+            Baybo.apnsEnvironmentName,
+            hex.count)
         Baybo.client.setApnsToken(tokenHex: hex)
     }
 

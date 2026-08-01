@@ -24,6 +24,10 @@ settings:
   base:
     DEVELOPMENT_TEAM: KLK5BP5YS6
     CODE_SIGN_STYLE: Automatic
+    # One source of truth for both the signed entitlement and the runtime APNs
+    # route. Local/debugging exports use development even when optimized
+    # (`Release`); distribution builds override this to production.
+    BAYBO_APNS_ENVIRONMENT: development
     SWIFT_VERSION: "5.0"
     ENABLE_BITCODE: NO
     ARCHS: arm64
@@ -104,6 +108,7 @@ targets:
         UIBackgroundModes:
           - audio
         BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
+        BayboApnsEnvironment: "$(BAYBO_APNS_ENVIRONMENT)"
         # Space Mono (OFL, App/Resources/Fonts) — the style guide's chrome face.
         UIAppFonts:
           - SpaceMono-Regular.ttf
@@ -111,7 +116,7 @@ targets:
     entitlements:
       path: App/Baybo.entitlements
       properties:
-        aps-environment: development
+        aps-environment: "$(BAYBO_APNS_ENVIRONMENT)"
         com.apple.security.application-groups:
           - group.com.baybo.app
         keychain-access-groups:

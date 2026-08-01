@@ -440,6 +440,7 @@ final class AppStore: ObservableObject {
     /// and re-subscribe cached chat stores so catch-up does not wait for a
     /// screen to reappear.
     func didBecomeActive() {
+        SessionIndex.shared.reconcileAppBadge()
         if !AppDelegate.hasToken {
             AppDelegate.registerForPush()
         }
@@ -463,7 +464,16 @@ final class AppStore: ObservableObject {
     }
 
     private func registerPushBestEffort() async {
-        _ = try? await Baybo.client.registerPush()
+        do {
+            if let deviceId = try await Baybo.client.registerPush() {
+                NSLog(
+                    "baybo: direct push binding registered — device=%@ env=%@",
+                    deviceId,
+                    Baybo.apnsEnvironmentName)
+            }
+        } catch {
+            NSLog("baybo: direct push registration failed: %@", bayboErrorText(error))
+        }
     }
 
     private func preconnectRelayBestEffort() {

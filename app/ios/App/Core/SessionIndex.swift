@@ -372,6 +372,7 @@ final class SessionIndex: ObservableObject {
     func enterSession(_ sessionId: String) {
         foregroundSessionId = sessionId
         clearUnread(sessionId)
+        reconcileAppBadge()
     }
 
     /// The foreground `ChatScreen` went away (pop / switch). Only clears the
@@ -399,6 +400,12 @@ final class SessionIndex: ObservableObject {
             changed = true
         }
         if changed { save() }
+    }
+
+    /// Reassert the absolute system badge after the NSE may have changed it in
+    /// its separate process without updating `BadgeCenter`'s local memo.
+    func reconcileAppBadge() {
+        publishBadge(force: true)
     }
 
     /// A live `SessionUpdated` title patch reached the connection-global list
@@ -814,9 +821,9 @@ final class SessionIndex: ObservableObject {
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    private func publishBadge() {
+    private func publishBadge(force: Bool = false) {
         guard ownsAppBadge else { return }
-        BadgeCenter.apply(BadgeCenter.total(rows))
+        BadgeCenter.apply(BadgeCenter.total(rows), force: force)
     }
 
     private static func load(from url: URL) -> [SessionRow] {

@@ -80,9 +80,10 @@ impl BillableLlm {
         &self,
         attribution: &Attribution,
         model_id: &str,
+        reasoning_effort: Option<&str>,
         usage: &TokenUsage,
     ) -> MicroUsd {
-        (self.recorder)(attribution, model_id, usage)
+        (self.recorder)(attribution, model_id, reasoning_effort, usage)
     }
 
     /// `pub(crate)` on purpose: the only way to reach a provider from

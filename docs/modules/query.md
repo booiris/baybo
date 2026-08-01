@@ -16,7 +16,7 @@ Fourteen endpoints today:
 8. `cost_summary` — `User` / `Session` / `Turn` / `TimeRange` scope
 9. `replay` — chronological Turn → Step → Span tree
 10. `list_session_summaries` — paginated, filtered per-session aggregates for the admin session browser
-11. `compute_analytics` — cost + session-creation aggregates for the analytics dashboard (`Unsupported` without a `CostStore`)
+11. `compute_analytics` — cost + session-creation aggregates, including model, call-reason, and request reasoning-effort breakdowns, for the analytics dashboard (`Unsupported` without a `CostStore`)
 12. `load_trace_overview` — a session's turn list + message log once, for the trace sidebar
 13. `load_turn_trace` — one turn's full `steps → spans → events` tree (follow-up to `load_trace_overview`)
 14. `trace_counts` — per-session `(turns, steps, spans)` tally via SQL counts (CLI `session show`)

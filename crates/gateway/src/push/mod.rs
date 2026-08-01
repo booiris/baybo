@@ -648,10 +648,14 @@ impl PushDispatcher {
         let preview = build_preview().await;
         for t in &targets {
             match self.dispatch_to_target(t, session_id, &preview).await {
-                // A 2xx from C's `/notify` — the encrypted preview is on its way to
-                // APNs. Logged so the push path is observable end to end.
+                // A 2xx from C's `/notify` means C handled the request. C also
+                // returns 200 after APNs prunes a bad/unregistered token, so only
+                // C's own `delivered to APNs` log proves Apple accepted it.
                 Ok(()) => {
-                    tracing::info!(device = %t.device_id, "push: preview posted to remote host")
+                    tracing::info!(
+                        device = %t.device_id,
+                        "push: remote host handled preview request; check its APNs verdict"
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(

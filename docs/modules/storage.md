@@ -238,6 +238,8 @@ Anything that opens a second sqlite file in the workspace must do the same.
 
 Each domain has an independent Store implementation (`SqliteSessionStore`, `SqliteCostStore`, etc.). All share one `SqlitePool` while preserving domain isolation. No giant struct implementing every interface.
 
+`cost_records.reasoning_effort` is nullable: in-process calls copy `ChatRequest::reasoning_effort`, while requests without the setting, external-agent accounting, and legacy rows remain `NULL`. Analytics groups the column directly in SQL; no inference from current session or LLM config is valid because either may have changed since the call.
+
 ### Store solves initialization, not abstraction
 
 At startup: `Store::open(path)` creates a `SqlitePool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.

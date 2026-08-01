@@ -4,7 +4,8 @@
 //! Defaults to the last 30 UTC days when no range is supplied. Caller
 //! supplies `since` / `until` for any other window. Results are
 //! computed via [`baybo_query::QueryApi::compute_analytics`], which
-//! single-passes `cost_records` plus a session list.
+//! runs grouped `cost_records` aggregates plus a session-created-time
+//! projection.
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -66,5 +67,10 @@ async fn get_analytics(
         daily: summary.daily.into_iter().map(Into::into).collect(),
         by_model: summary.by_model.into_iter().map(Into::into).collect(),
         by_reason: summary.by_reason.into_iter().map(Into::into).collect(),
+        by_reasoning_effort: summary
+            .by_reasoning_effort
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     }))
 }

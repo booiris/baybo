@@ -100,14 +100,13 @@ async fn add_entry<P: Prompter>(
         run_subscription_login(prompter, vault, proxy.clone()).await?;
         None
     } else {
-        let api_key = prompter.password("API key (will be encrypted into the vault): ")?;
-        if api_key.is_empty() {
-            return Err(SetupError::Llm("api key must be non-empty".into()));
+        let api_key = prompter.password("API key (optional; non-empty values are encrypted): ")?;
+        if !api_key.is_empty() {
+            vault
+                .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
+                .await
+                .map_err(|e| SetupError::Vault(format!("write api key: {e}")))?;
         }
-        vault
-            .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
-            .await
-            .map_err(|e| SetupError::Vault(format!("write api key: {e}")))?;
         None
     };
 
@@ -306,6 +305,14 @@ fn print_device_code(code: &DeviceCode) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use baybo_config::BayboConfig;
+    use baybo_llm::LlmProviderRegistry;
+    use baybo_security::test_support::MemorySecretStore;
+    use baybo_security::{EncryptionKey, SecretVault};
+
+    use super::{LlmStepOutcome, configure_llm_step};
     use crate::flow::pick_add_or_skip;
     use crate::test_support::MockPrompter;
 
@@ -329,5 +336,37 @@ mod tests {
         let mut prompter = MockPrompter::new().push_select(0);
         let go = pick_add_or_skip(&mut prompter, "L:", "add", "skip", true).unwrap();
         assert!(go);
+    }
+
+    #[tokio::test]
+    async fn blank_api_key_adds_keyless_entry_without_vault_write() {
+        let registry = LlmProviderRegistry::with_default_providers();
+        let providers = registry.provider_names();
+        let llamafile = providers
+            .iter()
+            .position(|provider| *provider == "llamafile")
+            .unwrap();
+        let store = Arc::new(MemorySecretStore::new());
+        let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
+        let vault = Arc::new(SecretVault::new(key, store.clone()));
+        let mut config = BayboConfig::default();
+        let mut prompter = MockPrompter::new()
+            .push_select(llamafile)
+            .push_text("local")
+            .push_text("")
+            .push_password("")
+            .push_select(0)
+            .push_text("local-model");
+
+        let outcome = configure_llm_step(&mut prompter, &vault, &mut config, false)
+            .await
+            .unwrap();
+
+        let LlmStepOutcome::Added(entry) = outcome else {
+            panic!("first-run LLM setup must add an entry");
+        };
+        assert_eq!(entry.name.as_str(), "local");
+        assert_eq!(entry.provider, "llamafile");
+        assert!(store.is_empty());
     }
 }

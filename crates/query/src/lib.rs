@@ -255,6 +255,9 @@ pub struct AnalyticsSummary {
     /// One bucket per [`CallReason`], so spend can be read by purpose
     /// (chat vs compression vs tool vs …). Sorted by token volume, desc.
     pub by_reason: Vec<AnalyticsReasonBucket>,
+    /// One bucket per request reasoning effort. `None` groups requests that
+    /// omitted the setting and legacy records.
+    pub by_reasoning_effort: Vec<AnalyticsReasoningEffortBucket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +287,17 @@ pub struct AnalyticsModelBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsReasonBucket {
     pub reason: CallReason,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    pub cost_usd: MicroUsd,
+    pub call_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsReasoningEffortBucket {
+    pub reasoning_effort: Option<String>,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
@@ -838,9 +852,9 @@ impl QueryApi {
     // ── 11. compute_analytics ──────────────────────────────────
 
     /// Aggregate cost records + session creations for the analytics
-    /// dashboard. Iterates `cost_records` once for token / model
-    /// breakdowns and `SessionStore::list_all` once for session-per-day
-    /// counts. `Unsupported` if no `CostStore` was wired (CLI-style
+    /// dashboard. Uses grouped SQL aggregates for token breakdowns and
+    /// one created-time projection for session-per-day counts.
+    /// `Unsupported` if no `CostStore` was wired (CLI-style
     /// `QueryApi::without_costs` callers).
     pub async fn compute_analytics(&self, range: TimeRange) -> Result<AnalyticsSummary> {
         let costs = self.costs.as_ref().ok_or_else(|| {
@@ -872,7 +886,7 @@ impl QueryApi {
             };
         }
 
-        // All three breakdowns are grouped aggregates in SQL — the raw
+        // All breakdowns are grouped aggregates in SQL — the raw
         // records never cross the store boundary.
         use baybo_store::CostGroupKey;
         let day_buckets = costs
@@ -885,6 +899,10 @@ impl QueryApi {
             .map_err(CostError::from)?;
         let reason_groups = costs
             .query_range_grouped(range.clone(), CostGroupKey::Reason)
+            .await
+            .map_err(CostError::from)?;
+        let reasoning_effort_groups = costs
+            .query_range_grouped(range.clone(), CostGroupKey::ReasoningEffort)
             .await
             .map_err(CostError::from)?;
 
@@ -970,6 +988,23 @@ impl QueryApi {
             (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
         });
 
+        let mut reasoning_effort_buckets: Vec<AnalyticsReasoningEffortBucket> =
+            reasoning_effort_groups
+                .into_iter()
+                .map(|b| AnalyticsReasoningEffortBucket {
+                    reasoning_effort: (!b.key.is_empty()).then_some(b.key),
+                    input_tokens: b.summary.total_input_tokens,
+                    output_tokens: b.summary.total_output_tokens,
+                    cached_input_tokens: b.summary.total_cached_input_tokens,
+                    cache_creation_input_tokens: b.summary.total_cache_creation_input_tokens,
+                    cost_usd: b.summary.total_cost_usd,
+                    call_count: b.summary.record_count,
+                })
+                .collect();
+        reasoning_effort_buckets.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+        });
+
         Ok(AnalyticsSummary {
             total_input_tokens: total_input,
             total_output_tokens: total_output,
@@ -980,6 +1015,7 @@ impl QueryApi {
             daily,
             by_model: model_buckets,
             by_reason: reason_buckets,
+            by_reasoning_effort: reasoning_effort_buckets,
         })
     }
 

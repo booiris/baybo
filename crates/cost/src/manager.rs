@@ -384,6 +384,7 @@ impl CostManager {
         span_id: SpanId,
         reason: CallReason,
         model_id: &str,
+        reasoning_effort: Option<&str>,
         input_tokens: usize,
         output_tokens: usize,
         cached_input_tokens: usize,
@@ -413,6 +414,7 @@ impl CostManager {
             span_id,
             reason,
             model: model_id.to_string(),
+            reasoning_effort: reasoning_effort.map(str::to_string),
             input_tokens,
             output_tokens,
             cached_input_tokens,
@@ -451,6 +453,7 @@ impl CostManager {
             span_id,
             reason,
             model: model_id.to_string(),
+            reasoning_effort: None,
             input_tokens,
             output_tokens,
             cached_input_tokens,
@@ -541,7 +544,10 @@ pub fn cost_hooks(manager: &Arc<CostManager>) -> baybo_llm::CostHooks {
 fn cost_record_closure(manager: &Arc<CostManager>) -> baybo_llm::LlmCostRecorder {
     let cm = Arc::clone(manager);
     Arc::new(
-        move |attr: &baybo_llm::Attribution, model_id: &str, usage: &baybo_llm::TokenUsage| {
+        move |attr: &baybo_llm::Attribution,
+              model_id: &str,
+              reasoning_effort: Option<&str>,
+              usage: &baybo_llm::TokenUsage| {
             cm.record_call(
                 &attr.user_id,
                 attr.session_id.clone(),
@@ -549,6 +555,7 @@ fn cost_record_closure(manager: &Arc<CostManager>) -> baybo_llm::LlmCostRecorder
                 attr.span_id,
                 attr.reason.clone(),
                 model_id,
+                reasoning_effort,
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.cached_input_tokens,
@@ -735,6 +742,7 @@ mod tests {
                 span_id: SpanId::new(),
                 reason: CallReason::Chat,
                 model: "m1".into(),
+                reasoning_effort: None,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
@@ -772,6 +780,7 @@ mod tests {
             SpanId::new(),
             CallReason::Chat,
             "m1",
+            Some("high"),
             input_tokens,
             output_tokens,
             0,
@@ -815,6 +824,7 @@ mod tests {
             SpanId::new(),
             CallReason::Chat,
             "m1",
+            None,
             1_000,
             0,
             0,
@@ -839,6 +849,7 @@ mod tests {
             SpanId::new(),
             CallReason::Chat,
             "m1",
+            None,
             1_000,
             0,
             0,
@@ -860,6 +871,7 @@ mod tests {
             SpanId::new(),
             CallReason::Chat,
             "m1",
+            None,
             1_000_000_000,
             0,
             0,
@@ -883,6 +895,7 @@ mod tests {
             SpanId::new(),
             CallReason::Chat,
             "m1",
+            None,
             1_000,
             0,
             0,
@@ -914,6 +927,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].input_tokens, 1_000);
         assert_eq!(records[0].output_tokens, 2_000);
+        assert_eq!(records[0].reasoning_effort.as_deref(), Some("high"));
         assert_eq!(cm.metrics().recorded(), 1);
     }
 

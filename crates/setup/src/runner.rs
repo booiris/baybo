@@ -13,6 +13,7 @@ use crate::flow::{
     configure_llm_step,
 };
 use crate::prompt::Prompter;
+use crate::tty::PROMPT_DIVIDER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupMode {
@@ -43,8 +44,6 @@ pub async fn run_quick<P: Prompter>(
 ) -> Result<SetupOutcome> {
     let llm_added = run_llm_step(prompter, ctx).await?;
     print_step_separator();
-    let channel_added = run_channel_step(prompter, ctx).await?;
-    print_step_separator();
 
     // Quick mode auto-enables the browser tool with docker mode on. The
     // sidecar logs and falls back to host-headless when docker isn't
@@ -55,17 +54,14 @@ pub async fn run_quick<P: Prompter>(
     eprintln!("Browser tool: enabled (docker mode; falls back to host-headless if unavailable)");
     print_step_separator();
 
-    let external_agents = configure_external_agents_step(prompter, &mut ctx.config).await?;
-    print_step_separator();
-
     commit_config(ctx).await?;
 
     Ok(SetupOutcome {
         mode: SetupMode::Quick,
         llm_added,
-        channel_added,
+        channel_added: None,
         browser_enabled: ctx.config.browser.enable,
-        external_agents,
+        external_agents: ExternalAgentsStepOutcome::default(),
     })
 }
 
@@ -100,7 +96,7 @@ pub async fn run_full<P: Prompter>(
 /// operator can tell where one module's output ends and the next begins.
 fn print_step_separator() {
     eprintln!();
-    eprintln!("──────────────────────────────────────────────");
+    eprintln!("{PROMPT_DIVIDER}");
     eprintln!();
 }
 
@@ -161,4 +157,53 @@ pub fn print_exit_hint(config_path: &Path) {
     println!("  baybo gateway start    # start the daemon (dashboard at the printed URL)");
     println!("  baybo tui              # interactive terminal UI (needs gateway running)");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use baybo_config::LlmEntry;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::bootstrap_workspace_if_needed;
+    use crate::test_support::MockPrompter;
+
+    #[tokio::test]
+    async fn quick_setup_skips_channel_and_external_agent_steps() {
+        let temp = tempdir().unwrap();
+        let mut ctx = bootstrap_workspace_if_needed(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        ctx.config.llm.push(LlmEntry {
+            name: "local".into(),
+            provider: "llamafile".into(),
+            model: "local-model".into(),
+            model_list: Vec::new(),
+            lite_model: Some("local-model".into()),
+            api_key_env: None,
+            base_url: Some("http://localhost:8080".into()),
+            reasoning_effort: None,
+        });
+        ctx.config.default_llm = "local".into();
+        ctx.config.external_agents.claude.enabled = true;
+        ctx.config.external_agents.claude.binary_path = Some("/usr/bin/claude".into());
+        let external_agents_before = ctx.config.external_agents.clone();
+        let channels_before = ctx.config.channels.clone();
+        let mut prompter = MockPrompter::new().push_select(1);
+
+        let outcome = run_quick(&mut prompter, &mut ctx).await.unwrap();
+
+        assert_eq!(outcome.mode, SetupMode::Quick);
+        assert_eq!(outcome.channel_added, None);
+        assert_eq!(
+            outcome.external_agents,
+            ExternalAgentsStepOutcome::default()
+        );
+        assert_eq!(ctx.config.channels, channels_before);
+        assert_eq!(ctx.config.external_agents, external_agents_before);
+        assert!(ctx.config.browser.enable);
+        assert!(ctx.config.browser.docker.enable);
+        assert!(prompter.selects.is_empty());
+        assert!(prompter.multi_selects.is_empty());
+    }
 }

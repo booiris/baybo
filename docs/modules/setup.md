@@ -27,19 +27,19 @@ a wizard, an operator's first run goes:
   three and never runs this wizard,
 - writes a default `baybo.json` pinned to that key,
 - opens sqlite storage and the secret vault,
-- walks an LLM-provider step (Quick + Full both run it), an optional
-  channel-bot step, (Full only) an interactive browser-tool step —
-  Quick instead auto-enables the browser tool with docker mode on,
-  falling back to host-headless when docker is unavailable — and an
-  external-agents step (Quick + Full both run it),
+- walks an LLM-provider step in both modes; Quick then auto-enables the
+  browser tool with docker mode on (falling back to host-headless when
+  docker is unavailable), while Full additionally runs the channel-bot,
+  interactive browser-tool, and external-agents steps,
 - writes the final `baybo.json` once at the end (never partway through),
 - and prints a hint with the next commands (`baybo gateway start` /
   `baybo tui`) and exits — it never starts the gateway itself.
 
 The command is also idempotent: running it on a workspace that
 already exists reuses the key and the existing `baybo.json`, and
-re-prompts only the steps the operator chooses (LLM step's
-`Add another / Skip`, channel step's `Add another / Skip`).
+re-prompts only the steps the operator chooses (the LLM step's
+`Add another / Skip` in either mode, plus the Full-only channel step's
+`Add another / Skip`).
 
 ## Design
 
@@ -158,7 +158,7 @@ Other knobs (viewport, profile_dir, chrome_path, cdp_url) stay at
 defaults — operators wanting custom values edit `baybo.json`
 directly.
 
-### External-agents step (Quick + Full)
+### External-agents step (Full only)
 
 `configure_external_agents_step` probes `claude`, `codex`, and
 `gemini` on `PATH`, then shows the detected ones in a single
@@ -187,36 +187,41 @@ a `?token=` URL, which would leak it into the access log).
 - The LLM step is mandatory on a fresh install (`config.llm` is
   empty) and skippable on re-runs (operator is offered
   `Add another / Skip`).
-- The channel step always offers `Add (another) / Skip` when called
-  with `allow_skip = true` (Quick + Full).
+- The Full-only channel step always offers `Add (another) / Skip`
+  because the runner calls it with `allow_skip = true`.
+- Quick setup does not inspect or mutate channel or external-agent
+  configuration. Its only configuration steps are LLM selection and
+  automatic browser-tool enablement.
 
 There is no `setup_state.json` or partial-progress file: a Ctrl-C
 mid-wizard leaves `baybo.json` unchanged, and the next run just
 prompts again.
 
-### Prompt style — plain line input
+### Prompt style — inline arrow-key menus
 
-Every prompt is ordinary line input: the question (and, for the
-single/multi pickers, a 1-based numbered menu) is printed to stderr, then
-one line is read from stdin and parsed. There is **no** alternate screen,
-raw-mode arrow-key navigation, or full-screen repaint — the wizard never
-takes the terminal over, so each step stays in normal scrollback exactly
-like answering a shell prompt:
+Pickers render inline on the normal terminal screen; there is **no**
+alternate screen or full-screen UI, so the final selection remains in
+normal scrollback:
 
-- `select` prints `1) … 2) …` and reads the chosen number; an
-  out-of-range or non-numeric line re-prints just the input line.
-- `multi_select` prints the menu with each row's `[x]`/`[ ]` pre-checked
-  state and reads a comma/space-separated list of numbers. An empty line
-  keeps the pre-checked default; a lone `0` (or `none`) selects nothing.
+- `select` highlights one row. Up/down moves and wraps at the ends;
+  Enter confirms.
+- `multi_select` uses the same up/down navigation, Space toggles the
+  highlighted row's `[x]`/`[ ]` state, and Enter confirms. The caller's
+  pre-checked state is preserved until the operator toggles it.
+- A divider separates the option rows from the position and key hints.
+- Menus show at most 12 options (fewer on a short terminal) and move a
+  viewport through longer lists, so a provider model catalog cannot fill
+  the entire screen.
 - `text` / `confirm` are `label [default]:` / `question [Y/n]:` reads.
-- `password` is the one prompt that briefly toggles termios
-  `ECHO`/`ICANON` to mask the secret with `*` as it's typed.
+- `password` masks the secret with `*` as it is typed. The LLM API-key
+  prompt accepts an empty value: setup leaves the per-entry vault key
+  untouched, then credential resolution may use an existing vault value,
+  the provider's environment variable, or no key for a keyless provider.
 
-Because nothing depends on a live terminal's escape-sequence handling,
-the pickers are plain functions over an in-memory reader/writer and are
-covered by ordinary unit tests (`crates/setup/src/tty.rs`) — no tmux
-harness. `Ctrl-C` (SIGINT) or `Ctrl-D` (EOF) at any prompt aborts the
-run before the final `baybo.json` write, per the β2 commit rule.
+The picker key decoder and renderer are functions over an in-memory
+reader/writer and are covered by unit tests (`crates/setup/src/tty.rs`).
+`Ctrl-C` or `Ctrl-D` at any prompt aborts the run before the final
+`baybo.json` write, per the β2 commit rule.
 
 ### TTY-only (no scripted mode)
 

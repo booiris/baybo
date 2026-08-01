@@ -349,7 +349,13 @@ async fn set_default_persists_and_rejects_unknown_name() {
 
 // ── get_usage ────────────────────────────────────────────────────────
 
-fn cost_record(model: &str, input: usize, output: usize, cost: MicroUsd) -> CostRecord {
+fn cost_record(
+    model: &str,
+    input: usize,
+    output: usize,
+    cost: MicroUsd,
+    reasoning_effort: Option<&str>,
+) -> CostRecord {
     CostRecord {
         user_id: "u-test".into(),
         session_id: SessionId::from("sess-1"),
@@ -357,6 +363,7 @@ fn cost_record(model: &str, input: usize, output: usize, cost: MicroUsd) -> Cost
         span_id: SpanId::new(),
         reason: CallReason::Chat,
         model: model.into(),
+        reasoning_effort: reasoning_effort.map(str::to_string),
         input_tokens: input,
         output_tokens: output,
         cached_input_tokens: 0,
@@ -380,6 +387,7 @@ async fn get_usage_aggregates_by_model() {
             100,
             50,
             MicroUsd::from_micros(1_500),
+            Some("high"),
         ))
         .await
         .unwrap();
@@ -391,6 +399,7 @@ async fn get_usage_aggregates_by_model() {
             200,
             80,
             MicroUsd::from_micros(3_500),
+            Some("medium"),
         ))
         .await
         .unwrap();
@@ -402,6 +411,7 @@ async fn get_usage_aggregates_by_model() {
             300,
             120,
             MicroUsd::from_micros(7_000),
+            None,
         ))
         .await
         .unwrap();
@@ -466,7 +476,7 @@ async fn get_usage_aggregates_by_model() {
             .body(Body::empty())
             .unwrap(),
     );
-    let (status, body) = read_json(router.oneshot(req).await.unwrap()).await;
+    let (status, body) = read_json(router.clone().oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     let items = body["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2);
@@ -478,6 +488,32 @@ async fn get_usage_aggregates_by_model() {
     let secondary = items.iter().find(|i| i["name"] == "secondary").unwrap();
     assert_eq!(secondary["call_count"], 1);
     assert_eq!(secondary["cost_micro_usd"], 7_000);
+
+    let req = auth(
+        Request::builder()
+            .method("GET")
+            .uri("/v1/analytics")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let (status, body) = read_json(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let efforts = body["by_reasoning_effort"]
+        .as_array()
+        .expect("reasoning effort array");
+    assert_eq!(efforts.len(), 3);
+    let high = efforts
+        .iter()
+        .find(|item| item["reasoning_effort"] == "high")
+        .unwrap();
+    assert_eq!(high["call_count"], 1);
+    assert_eq!(high["input_tokens"], 100);
+    let untracked = efforts
+        .iter()
+        .find(|item| item["reasoning_effort"].is_null())
+        .unwrap();
+    assert_eq!(untracked["call_count"], 1);
+    assert_eq!(untracked["input_tokens"], 300);
 }
 
 #[tokio::test]

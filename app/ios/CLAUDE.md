@@ -88,9 +88,11 @@ error they can act on, no way back but a re-pair.
   § Notify flow and
   [`docs/modules/mobile/companion.md`](../../docs/modules/mobile/companion.md)
   § Push preview).
-- APNs environment is passed from Swift (`ClientConfig.apnsEnv`, per build
-  config) — never `cfg!(debug_assertions)` in Rust, which usually compiles in
-  release even for debug apps.
+- APNs environment comes from the shared `BAYBO_APNS_ENVIRONMENT` build setting:
+  it expands into both the signed `aps-environment` entitlement and the app's
+  `BayboApnsEnvironment` Info key, which Swift passes through
+  `ClientConfig.apnsEnv`. Never infer it from Swift `DEBUG` or Rust
+  `cfg!(debug_assertions)` — optimization and signing environment are independent.
 
 ## Docs
 

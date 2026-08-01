@@ -11,6 +11,17 @@ cargo nextest run --workspace    # ffi host tests
 (cd web && pnpm build)           # tsc --noEmit + vite build
 ```
 
+`Debug` versus `Release` controls optimization, not the APNs service. Local
+device builds and `install.mjs` are development-signed, so both use the default
+`BAYBO_APNS_ENVIRONMENT=development` and register sandbox tokens. A distribution
+archive must set `BAYBO_APNS_ENVIRONMENT=production`; that one build setting
+feeds both the signed `aps-environment` entitlement and the app's runtime
+`BayboApnsEnvironment`, so they cannot disagree:
+
+```bash
+xcodebuild ... archive BAYBO_APNS_ENVIRONMENT=production
+```
+
 The last three lines are the check/test entry points; the four test tiers and how
 they map onto CI live in [testing.md](testing.md).
 

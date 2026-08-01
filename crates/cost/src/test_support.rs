@@ -104,6 +104,7 @@ impl CostStore for MemoryCostStore {
                 CostGroupKey::Day => r.timestamp.date_naive().format("%Y-%m-%d").to_string(),
                 CostGroupKey::Model => r.model.clone(),
                 CostGroupKey::Reason => r.reason.to_token().into_owned(),
+                CostGroupKey::ReasoningEffort => r.reasoning_effort.clone().unwrap_or_default(),
             };
             by_key.entry(k).or_default().push(r);
         }

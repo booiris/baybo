@@ -65,8 +65,8 @@ impl ApnsEnvironment {
 /// Construction-time configuration for [`crate::BayboClient`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ClientConfig {
-    /// Which APNs environment issued this build's tokens (Xcode debug builds →
-    /// `Sandbox`, release/TestFlight → `Production`).
+    /// Which APNs environment issued this build's tokens (development signing →
+    /// `Sandbox`, distribution signing → `Production`).
     pub apns_env: ApnsEnvironment,
     /// Directory for the rotating `baybo.log` (2 MiB × 3 files — the exportable
     /// log bundle). `None` disables file logging (host tests).

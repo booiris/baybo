@@ -4,22 +4,55 @@ import Foundation
 /// keep running between calls, and the in-flight pairing sessions it parks
 /// between `pairBegin`/`pairConfirm` live inside it.
 enum Baybo {
+    static let apnsEnvironmentInfoKey = "BayboApnsEnvironment"
+
+    static func apnsEnvironment(for value: String?) -> ApnsEnvironment {
+        switch value?.lowercased() {
+        case "production":
+            return .production
+        case "development", "sandbox":
+            return .sandbox
+        default:
+            return .sandbox
+        }
+    }
+
+    static let apnsEnvironment: ApnsEnvironment = {
+        let value = Bundle.main.object(
+            forInfoDictionaryKey: apnsEnvironmentInfoKey
+        ) as? String
+        let environment = apnsEnvironment(for: value)
+        switch value?.lowercased() {
+        case "development", "sandbox", "production":
+            break
+        default:
+            NSLog(
+                "baybo: %@ missing or invalid; defaulting APNs environment to sandbox",
+                apnsEnvironmentInfoKey)
+        }
+        return environment
+    }()
+
+    static var apnsEnvironmentName: String {
+        switch apnsEnvironment {
+        case .sandbox:
+            return "sandbox"
+        case .production:
+            return "production"
+        }
+    }
+
     static let client: BayboClient = {
-        // Sandbox tokens come from debug builds, production from release —
-        // decided HERE (the Xcode build config) because the Rust core is often
-        // compiled in release even for a debug app.
-        #if DEBUG
-        let env = ApnsEnvironment.sandbox
-        #else
-        let env = ApnsEnvironment.production
-        #endif
         let logDir = FileManager.default
             .urls(for: .libraryDirectory, in: .userDomainMask)
             .first?
             .appendingPathComponent("Logs", isDirectory: true)
             .path
         return BayboClient(
-            config: ClientConfig(apnsEnv: env, logDir: logDir, blobCacheDir: blobCacheDir()))
+            config: ClientConfig(
+                apnsEnv: apnsEnvironment,
+                logDir: logDir,
+                blobCacheDir: blobCacheDir()))
     }()
 
     /// `Application Support/baybo/blobs` — durable, alongside the session

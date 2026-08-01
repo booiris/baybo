@@ -15,6 +15,9 @@ pub enum CostGroupKey {
     /// `CallReason` wire token (`chat`, `tool:<name>`, …). Rows written
     /// before the reason column existed group under the empty string.
     Reason,
+    /// Request reasoning-effort token. Requests without one and rows written
+    /// before the column existed group under the empty string.
+    ReasoningEffort,
 }
 
 /// One bucket of a grouped cost aggregate: the group key rendered as a
