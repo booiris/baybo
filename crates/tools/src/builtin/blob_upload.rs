@@ -1,14 +1,34 @@
+//! The seam `AttachFile` and `PutBlob` share: staging a local file into
+//! `BlobStore`.
+//!
+//! Everything up to and including the streaming store write is identical
+//! between them — path safety, size and regular-file validation, MIME
+//! resolution, the per-call timeout, and the progress/permission surface
+//! derived from `path`. Only their *delivery* differs, so only their
+//! `execute` bodies do: one returns `ToolOutput::WithAttachments` for the
+//! agent loop to hoist onto the final reply, the other a
+//! `ToolOutput::Json` reference. Keeping the shared half here is what
+//! stops the two from drifting on a check one of them quietly skips.
+
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use baybo_model::BlobRef;
 use baybo_store::{BlobStore, MAX_BLOB_BYTES};
 use futures::StreamExt;
+use serde_json::Value;
 use tokio_util::io::ReaderStream;
 
 use super::paths::require_absolute;
-use crate::ToolError;
+use crate::{ResourceAccess, ToolError};
 
 pub(super) const MAX_LOCAL_BLOB_BYTES: u64 = MAX_BLOB_BYTES as u64;
+pub(super) const MAX_LOCAL_BLOB_MIB: u64 = MAX_LOCAL_BLOB_BYTES / 1024 / 1024;
+
+/// Streams up to 100 MiB into `BlobStore`. On a slow disk the copy alone
+/// can take tens of seconds, so the trait-default 30 s is tight; 60 s
+/// covers the worst case while still bounding a stuck blob backend.
+pub(super) const BLOB_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) struct LocalBlobFile {
     path: PathBuf,
@@ -74,6 +94,50 @@ impl LocalBlobFile {
             .await
             .map_err(|e| ToolError::Execution(format!("blob upload: {e}")))
     }
+}
+
+/// The MIME both tools stage under: an explicit override when the caller
+/// supplied one, otherwise the extension guess.
+///
+/// Validated rather than taken verbatim, because the value outlives the
+/// call twice over — it is persisted on the blob row and copied onto the
+/// `ContentBlock` clients bucket media by. An empty or newline-bearing
+/// override reaches `HeaderValue::from_str` in the gateway's blob
+/// download, which refuses it and serves the bytes with **no**
+/// `Content-Type` at all. Failing here turns that silent, far-away
+/// degradation into an `InvalidParams` the model can act on.
+pub(super) fn resolve_mime_type(requested: Option<String>, path: &Path) -> crate::Result<String> {
+    let Some(requested) = requested else {
+        return Ok(guess_mime(path).to_string());
+    };
+    let mime_type = requested.trim();
+    if mime_type.is_empty() || mime_type.contains(['\r', '\n']) {
+        return Err(ToolError::InvalidParams(
+            "mime_type must be a non-empty single-line value".to_string(),
+        ));
+    }
+    Ok(mime_type.to_string())
+}
+
+/// Progress preview and permission surface for a blob tool, both derived
+/// from the one `path` argument that identifies the call.
+pub(super) fn path_progress_label(params: &Value) -> Option<String> {
+    params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| crate::progress::preview_path(Path::new(path)))
+}
+
+pub(super) fn path_read_access(params: &Value) -> Vec<ResourceAccess> {
+    params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| {
+            vec![ResourceAccess::ReadFile {
+                path: PathBuf::from(path),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 pub(super) fn guess_mime(path: &Path) -> &'static str {

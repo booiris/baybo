@@ -11,14 +11,16 @@ use baybo_store::BlobStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::blob_upload::{LocalBlobFile, MAX_LOCAL_BLOB_BYTES, guess_mime};
+use super::blob_upload::{
+    BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES, MAX_LOCAL_BLOB_MIB,
+    path_progress_label, path_read_access, resolve_mime_type,
+};
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 
 const TOOL_NAME: &str = "AttachFile";
 const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
-const MAX_MIB: u64 = MAX_BYTES / 1024 / 1024;
 
 const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
 
@@ -27,7 +29,7 @@ DELIVERY: the file attaches to your FINAL reply, not to this call; several calls
 PATHS: `path` MUST be absolute. Sensitive paths (SSH keys, .env, /etc/shadow, …) are blocked."#;
 
 static DESCRIPTION: LazyLock<String> =
-    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_MIB.to_string()));
+    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
 
 pub struct AttachFileTool {
     blob_store: Arc<dyn BlobStore>,
@@ -45,7 +47,7 @@ struct Params {
     #[serde(default)]
     filename: Option<String>,
     #[serde(default)]
-    mime: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[async_trait]
@@ -70,7 +72,7 @@ impl Tool for AttachFileTool {
                     "type": "string",
                     "description": "Optional override for the filename shown to the recipient. Defaults to the path's basename."
                 },
-                "mime": {
+                "mime_type": {
                     "type": "string",
                     "description": "Optional MIME type override. Defaults to an extension-based guess; falls back to application/octet-stream."
                 }
@@ -80,30 +82,15 @@ impl Tool for AttachFileTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        // Streams up to 100 MiB into BlobStore. On a slow disk the
-        // copy alone can take tens of seconds, so the trait-default
-        // 30 s is tight; 60 s covers the worst case while still
-        // bounding a stuck blob backend.
-        Duration::from_secs(60)
+        BLOB_TOOL_TIMEOUT
     }
 
     fn progress_label(&self, params: &Value) -> Option<String> {
-        params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|s| crate::progress::preview_path(Path::new(s)))
+        path_progress_label(params)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| {
-                vec![ResourceAccess::ReadFile {
-                    path: PathBuf::from(path),
-                }]
-            })
-            .unwrap_or_default()
+        path_read_access(params)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -119,7 +106,7 @@ impl Tool for AttachFileTool {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string())
         });
-        let mime = p.mime.unwrap_or_else(|| guess_mime(&p.path).to_string());
+        let mime = resolve_mime_type(p.mime_type, &p.path)?;
 
         let duration_ms = probe_media_duration_ms(&p.path, &mime).await;
         let page_count = probe_pdf_page_count(&p.path, &mime, size).await;
@@ -663,7 +650,7 @@ mod tests {
                 json!({
                     "path": p,
                     "filename": "report.bin",
-                    "mime": "application/x-custom"
+                    "mime_type": "application/x-custom"
                 }),
                 &ctx(),
             )
@@ -682,6 +669,34 @@ mod tests {
                 assert_eq!(mime_type, "application/x-custom");
             }
             other => panic!("expected File block, got {other:?}"),
+        }
+    }
+
+    /// The override outlives the call: it is persisted on the blob row and
+    /// copied onto the `ContentBlock` clients bucket media by. Taken
+    /// verbatim, an empty or newline-bearing value reached
+    /// `HeaderValue::from_str` in the gateway's blob download, which
+    /// refuses it and serves the bytes with no `Content-Type` at all —
+    /// a silent failure two crates away from the call that caused it.
+    /// `PutBlob` always rejected these; sharing `resolve_mime_type` is
+    /// what stops the pair from disagreeing on a check one of them skips.
+    #[tokio::test]
+    async fn refuses_an_unusable_mime_type_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("blob.bin");
+        tokio::fs::write(&p, b"raw bytes").await.unwrap();
+        let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
+        let tool = AttachFileTool::new(store);
+
+        for bad in ["", "   ", "text/plain\r\nX-Injected: 1"] {
+            let err = tool
+                .execute(json!({ "path": &p, "mime_type": bad }), &ctx())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidParams(ref m) if m.contains("single-line")),
+                "{bad:?}: {err:?}"
+            );
         }
     }
 

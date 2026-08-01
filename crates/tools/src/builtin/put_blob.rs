@@ -1,7 +1,7 @@
 //! `PutBlob` — stage a local file in the blob store and return its capability
 //! reference without attaching it to a user-facing message.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -11,20 +11,22 @@ use baybo_store::BlobStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::blob_upload::{LocalBlobFile, MAX_LOCAL_BLOB_BYTES, guess_mime};
+use super::blob_upload::{
+    BLOB_TOOL_TIMEOUT, LocalBlobFile, MAX_LOCAL_BLOB_BYTES, MAX_LOCAL_BLOB_MIB,
+    path_progress_label, path_read_access, resolve_mime_type,
+};
 use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 
 const TOOL_NAME: &str = "PutBlob";
 const MAX_BYTES: u64 = MAX_LOCAL_BLOB_BYTES;
-const MAX_MIB: u64 = MAX_BYTES / 1024 / 1024;
 const DESCRIPTION_TEMPLATE: &str = r#"Store a local file in BlobStore and return its capability id for another tool or response protocol to reference. This does NOT send or attach the file to the user; use AttachFile when the file itself should appear in the final reply. Any MIME type, up to {{max_mib}} MiB.
 
 `path` must be absolute. `mime_type` defaults from the extension. `max_bytes` can impose a smaller use-case-specific cap. The returned `blob_id` is a bearer read capability; expose it only through the protocol that requested it. Sensitive paths are blocked."#;
 
 static DESCRIPTION: LazyLock<String> =
-    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_MIB.to_string()));
+    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_LOCAL_BLOB_MIB.to_string()));
 
 struct PutBlobTool {
     blob_store: Arc<dyn BlobStore>,
@@ -79,26 +81,15 @@ impl Tool for PutBlobTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        Duration::from_secs(60)
+        BLOB_TOOL_TIMEOUT
     }
 
     fn progress_label(&self, params: &Value) -> Option<String> {
-        params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| crate::progress::preview_path(Path::new(path)))
+        path_progress_label(params)
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| {
-                vec![ResourceAccess::ReadFile {
-                    path: PathBuf::from(path),
-                }]
-            })
-            .unwrap_or_default()
+        path_read_access(params)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -130,19 +121,6 @@ fn requested_limit(requested: Option<u64>) -> crate::Result<u64> {
         Some(value) => Ok(value),
         None => Ok(MAX_BYTES),
     }
-}
-
-fn resolve_mime_type(requested: Option<String>, path: &Path) -> crate::Result<String> {
-    let Some(requested) = requested else {
-        return Ok(guess_mime(path).to_string());
-    };
-    let mime_type = requested.trim();
-    if mime_type.is_empty() || mime_type.contains(['\r', '\n']) {
-        return Err(ToolError::InvalidParams(
-            "mime_type must be a non-empty single-line value".to_string(),
-        ));
-    }
-    Ok(mime_type.to_string())
 }
 
 pub(super) fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {

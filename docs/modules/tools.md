@@ -59,10 +59,22 @@ archive the fetched raw content), and `permission` is the shared
 stage channel attachments. `PutBlob` is the owner-only reference-producing
 counterpart: it returns `ToolOutput::Json` rather than
 `ToolOutput::WithAttachments`, so a skill can embed the capability id in its own
-protocol without creating a duplicate file card. Both tools share
-`builtin::blob_upload::LocalBlobFile` for absolute/sensitive-path checks,
-regular-file and size validation, MIME inference, and the streaming store write;
-only their delivery semantics differ.
+protocol without creating a duplicate file card. Everything up to and including
+the store write lives once in `builtin::blob_upload`: `LocalBlobFile` for
+absolute/sensitive-path checks, regular-file and size validation and the
+streaming write, plus `resolve_mime_type`, the shared `BLOB_TOOL_TIMEOUT`, and
+the `path`-derived progress label and `ReadFile` access declaration. Only their
+delivery semantics differ, so only their `execute` bodies do — the divergent
+halves (probing duration/pages/dimensions and building a media `ContentBlock`
+versus returning a JSON reference) stay per-tool rather than collapsing into one
+`match` on a mode flag, and the two manifests stay separate because
+`channels: [owner]` is the only enforced gate on minting a bearer `blob_id`.
+`resolve_mime_type` is shared for a concrete reason: it rejects an empty or
+newline-bearing override, which otherwise reaches `HeaderValue::from_str` in the
+gateway's blob download, gets refused there, and serves the bytes with no
+`Content-Type` at all. `AttachFile` skipped that check while `PutBlob` made it
+— exactly the drift a shared seam exists to prevent. Both name the parameter
+`mime_type`.
 Stubs exist so downstream can register them once their backing subsystem is
 ready without having to invent the tool name/schema at that point.
 
