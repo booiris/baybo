@@ -1,18 +1,65 @@
 name: CI
 
-# CI runs only on PRs, never on plain pushes (incl. master) — keeps the
-# private-repo Actions minutes down. Draft PRs still fire opened/synchronize,
-# but the per-job `if` skips them (a skipped job spins up no runner → zero
-# billed minutes); marking a PR "Ready for review" fires ready_for_review and
-# lets CI through.
+# PRs, plus master — and master is here for the CACHE, not for a second opinion.
+#
+# A run may restore caches from its own ref's scope or from the DEFAULT
+# branch's, and nothing else. While CI ran on PRs only, every cache lived under
+# `refs/pull/N/merge`, master's scope stayed permanently empty, and so the first
+# run of every new PR was cold: measured on PR #239, cargo test 19m47s, ts-rs
+# bindings 15m45s, clippy 10m34s — ~48 billed minutes rebuilding the same deps
+# in four separate target dirs. (`[profile.dev.package."*"] opt-level = 2` is
+# what makes a cold dep build that expensive; see the `test` job.)
+#
+# One run per merge to master populates that scope, so every PR afterwards
+# starts warm — and the master run is itself warm from the previous one, so the
+# steady-state cost of this line is a few minutes, not another 48. Only the
+# jobs whose caches PRs actually reuse run on push; the path-filtered and
+# `if: false` ones below stay PR-only.
+#
+# The other half is `cache-save-if` on each rust job: master WRITES, a PR only
+# restores. A PR-scoped cache is unreadable by any other PR, so writing one buys
+# nothing the next PR can use — and the repo-wide budget is 10 GB, which seven
+# PR scopes of these target dirs had already overrun (10.10 GB measured), so
+# those writes were evicting each other and would evict master's copy too.
+#
+# What that costs, stated plainly rather than sold as free: a PR gives up its own
+# incrementality. rust-cache's key hashes every manifest, so a PR that adds a
+# dependency misses master's exact key and lands on the prefix restore — it keeps
+# master's dep artifacts but rebuilds the new subtree. That used to be paid once
+# (push 1 saved a PR-scoped entry, later pushes hit it exactly); now every push
+# re-pays it. Bounded, but this repo's dev branch takes dozens of pushes per PR.
+# The narrower gate, if it ever matters, is to let a PR save only when it touched
+# a manifest. The pnpm cache is not covered by any of this: `actions/setup-node`
+# has no save-if, so a PR whose pnpm-lock.yaml differs from master's still gets a
+# full miss (it passes no restore-keys) and still writes its own ~81 MB entry.
+#
+# The per-job `if` names its event explicitly instead of testing `draft` alone.
+# That is not decoration: comparing mixed types, GitHub casts BOTH null and
+# false to 0, so on a push — where `github.event.pull_request` is null —
+# `draft == false` is already TRUE. Every guard here would have flipped on the
+# day this trigger landed, silently, including the ones that must not.
+#
+# Draft PRs still fire opened/synchronize, but the per-job `if` skips them (a
+# skipped job spins up no runner → zero billed minutes); marking a PR "Ready
+# for review" fires ready_for_review and lets CI through.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master]
 
-# Newer pushes to a PR cancel the in-flight run.
+# Newer pushes to a PR cancel that PR's in-flight run. Keyed by ref, so a master
+# run and a PR run never cancel each other.
+#
+# Master runs are NOT cancelled, because master is the only ref that writes the
+# cache (see `on:`) and rust-cache saves in a post step — a cancelled run leaves
+# nothing behind, and nothing here watches master's checks, so it would fail
+# silently. This repo pushes to master in bursts (`ec778618`→`03ed8ec6` 135s
+# apart, `9a5176d9`→`0d2b6504` 11s), every gap far inside a cold build, so
+# cancelling would have meant only the last push of a burst ever warmed anything.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -34,18 +81,21 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     steps:
       - uses: actions/checkout@v4
       # Channel + components come from rust-toolchain.toml; this action
       # reads it and caches the cargo registry/target.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Master writes the cache, a PR only restores it — see the `on:` note.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fmt --all --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     # The Rust jobs carry no TS toolchain, and `baybo-gateway`'s build script
     # otherwise hard-fails when it cannot compile the embedded dashboard. The
     # `frontend` job below is what gates `app/web` — it installs pnpm and runs
@@ -55,12 +105,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Master writes the cache, a PR only restores it — see the `on:` note.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --all --benches --tests --examples --all-features --locked -- -D warnings
 
   test:
     name: cargo test
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     # Without this the job inherits GitHub's 6-HOUR default, and a single hung
     # test burns all 360 minutes before the runner is reclaimed — which is what
     # `chat_api::chat_search_finds_a_chinese_word_inside_a_han_run` did on PR
@@ -88,6 +141,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Master writes the cache, a PR only restores it — see the `on:` note.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@nextest
       # The grep builtin shells out to ripgrep, so its tests need `rg` on PATH.
       # (The tmux render/smoke tests are `#[ignore]` and run in `render-tests`
@@ -106,7 +162,7 @@ jobs:
   changes:
     name: detect changes
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
     outputs:
       render: ${{ steps.filter.outputs.render }}
       ios: ${{ steps.filter.outputs.ios }}
@@ -166,7 +222,7 @@ jobs:
     name: tmux render tests (non-gating)
     needs: changes
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.render == 'true' }}
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.render == 'true' }}
     continue-on-error: true
     env:
       # See the `test` job: lld links this workspace far faster than GNU bfd.
@@ -174,6 +230,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # This job is PR-only, so the flag makes its cache write-never rather
+        # than master-only: rust-cache puts the JOB ID in the key, so a
+        # `render-tests` entry is unreadable by `test` (and vice versa), and
+        # master never runs this job to populate one. Writing it would spend the
+        # shared 10 GB budget on bytes only later pushes of the SAME PR could
+        # read — and evict a master entry to do it. The job is non-gating and
+        # only fires when crates/tui|term-harness moved, so cold is the cheaper
+        # trade. To make it warm instead, give it and `test` the same
+        # `cache-shared-key` (their env hash already matches) so master's `test`
+        # run populates the entry this job restores.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: sudo apt-get update -qq && sudo apt-get install -y tmux lld
       - run: cargo test -p baybo-tui --test chat_render --locked -- --include-ignored
       - run: cargo test -p baybo-term-harness --lib --locked -- --include-ignored
@@ -181,16 +249,19 @@ jobs:
   ts-bindings:
     name: ts-rs bindings sync
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Master writes the cache, a PR only restores it — see the `on:` note.
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: scripts/check-ts-bindings.sh
 
   frontend:
     name: frontend (typecheck + build + test)
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
