@@ -67,6 +67,41 @@ server `ordinal` as a field beside the id. Reading only the id made the gate
 blind to every user message ever sent — from this device or another — which is
 precisely the rebase-dirty case it exists for. `app/web` never had the hole: it
 keys every row `row-<sid>-m<ordinal>` and keeps `clientMsgId` separately.
+**The gate is posted-time only, so the merge also places.** `syncSince` runs
+when the request goes out, and the thread keeps growing during the round trip —
+a difference asked for at `since` can land on a thread it is no longer a prefix
+of, and the append then files its rows under rows they predate. So
+`mergeSyncPage` puts a row it does not already hold at its ordinal rather than
+at the end. It does that **only when a durable row still sits below the
+insertion point**, which is the proof the row really did land late; with nothing
+ordinal-bearing below, it appends exactly as before. That restraint is the whole
+safety of it, and it took three attempts: a thread's trailing run is
+ordinal-less almost always — the live work block is `uid()`-keyed, a notice is
+`n<seq>` (a sequence number, not an ordinal), and every user row rendered live
+carries no ordinal at all, since the echo brings none. Ordering a durable row
+against those is a guess, and guessing wrong files a turn's own answer above its
+own question: the reply renders over the card that produced it, the tail-only
+`closeTrailingWork` never runs, and the block spins "Working…" while the next
+turn's steps weld into it. A differential test against the pre-placement
+behaviour is the way to check a change here — the two must agree on every
+ambiguous shape and differ only where a durable row proves lateness.
+
+`applySyncPage` re-checks the invariant at apply time as a backstop, and refuses
+a page **only** when it is both stale and carries a row placement cannot file
+(an `n<seq>` notice, or a slash-command echo, which `control_event_item` emits
+with no ordinal). Both conjuncts matter: on the overrun alone it would discard
+pages that merge perfectly — one live reply landing mid-round-trip is enough —
+and each discard costs a round trip plus a REPLACE that resets the paging floor
+and snaps a reader scrolled up in history to the newest edge. It re-runs the
+sync without demoting the cursor; `runSync` re-derives `syncSince` from the
+current thread, so it posts a fresh difference when the live rows already
+advanced the cursor and falls through to a baseline only when the thread is
+genuinely uncovered. That is also what terminates it.
+
+**`app/web` has NOT moved.** Its merge still plain-appends and its `syncSince`
+says "Mirrors iOS"; only the gate is shared. Port this before relying on the
+ordering there.
+
 **This prevents the scramble; it does not repair one.** The welding sync ends by
 advancing the cursor to `next_cursor`, and a difference is only returned when its
 scan did not overrun, so that watermark is the session's newest ordinal — above

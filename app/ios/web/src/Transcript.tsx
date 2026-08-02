@@ -938,17 +938,61 @@ export function sameTurnWorkIndex(rows: Row[], ord: number): number {
 }
 
 /// Merge a DIFFERENCE sync page into the rendered thread: a row already held is
-/// reconciled where it stands, one we don't hold is appended. Plain append is
-/// only correct because the page extends the thread — every row is above the
-/// cursor, and `syncSince` refuses a difference the thread is not a prefix of.
+/// reconciled where it stands, one we don't hold is placed AT ITS ORDINAL.
 /// Rows arrive ascending; each carries its stable id.
+///
+/// Placement, not append, because `syncSince`'s prefix gate is evaluated when
+/// the request is POSTED and the thread keeps growing while the round trip is in
+/// flight. A difference asked for at `since` can therefore land after live
+/// frames have rendered rows above it, and a blind tail append then files those
+/// page rows below rows they predate — the scramble the gate exists to prevent,
+/// re-entered through the back door. Nothing is lost either way; the order is
+/// wrong, it persists into the mirror, and `syncSince` stays quiet over it
+/// afterwards, so it does not self-heal.
+///
+/// A row goes immediately after the last row it is NOT older than — which keeps
+/// ordinal-less live rows (an optimistic send, the in-flight work block) at the
+/// tail where they belong, since a durable row always predates them. Rows with
+/// no orderable key at all — an `n<seq>` notice, whose seq is a sequence number
+/// and not an ordinal (`rowOrdinal` matches only `m`/`w`) — cannot be placed and
+/// still append; `applySyncPage`'s apply-time prefix re-check is what covers
+/// them, by refusing a stale page outright.
 export function mergeSyncPage(
   prev: Row[],
   pageRows: Row[],
   compactionPoints: CompactionPoint[],
 ): Row[] {
   const next = [...prev];
-  const byId = new Map(next.map((r, i) => [r.id, i] as const));
+  let byId = new Map(next.map((r, i) => [r.id, i] as const));
+  /// Where a page row belongs: just past the last rendered row whose ordinal it
+  /// is at or above — but ONLY when a durable row still sits below that point,
+  /// which is the proof that this row really did land late. With nothing
+  /// ordinal-bearing below, it appends, exactly as it always did.
+  ///
+  /// That second condition is the whole safety of this function, and it took
+  /// three tries to get right. A thread's trailing run is ordinal-less almost
+  /// all the time: the in-flight work block is keyed by a `uid()`, a notice by
+  /// an `n<seq>` whose seq is not an ordinal, and — the one that keeps catching
+  /// people, this file included — EVERY user row this client rendered live,
+  /// because the echo carries no ordinal (see the REPLACE-overlay note below).
+  /// Ordering a durable row against any of those is guesswork, and guessing
+  /// wrong is not cosmetic: file a turn's own answer above its own question and
+  /// the reply renders over the card that produced it, `closeTrailingWork` never
+  /// runs, and the block spins "Working…" forever while the next turn's steps
+  /// weld into it. Refusing to guess costs only the rare late row that has
+  /// nothing durable beneath it — which is where a plain append was already the
+  /// behaviour, so nothing regresses.
+  const placeAt = (row: Row): number => {
+    const ord = rowCoverageOrdinal(row);
+    if (ord === null) return next.length;
+    let at = 0;
+    for (let i = 0; i < next.length; i++) {
+      const held = rowCoverageOrdinal(next[i]);
+      if (held !== null && held <= ord) at = i + 1;
+    }
+    const anchoredBelow = next.slice(at).some((r) => rowCoverageOrdinal(r) !== null);
+    return anchoredBelow ? at : next.length;
+  };
   const closeTrailingWork = () => {
     const last = next[next.length - 1];
     if (!last || last.role !== "work" || !last.active) return;
@@ -1038,9 +1082,23 @@ export function mergeSyncPage(
         continue;
       }
     }
-    if (row.role === "assistant") closeTrailingWork();
-    next.push(row);
-    byId.set(row.id, next.length - 1);
+    const at = placeAt(row);
+    if (at === next.length) {
+      // Closing the trailing block is a TAIL act: an answer arriving at the end
+      // of the thread ends the turn still running there. An answer placed back
+      // among older rows ends nothing — the block below it belongs to a later
+      // turn, and freezing it would stop the live card mid-run.
+      if (row.role === "assistant") closeTrailingWork();
+      next.push(row);
+      byId.set(row.id, next.length - 1);
+      continue;
+    }
+    // Every index at or past the splice point shifts, and `byId` is read again
+    // on the next iteration to reconcile in place — so rebuild it rather than
+    // patch it. Placement is the rare branch (a healthy forward page appends),
+    // and the cost is one pass over a thread bounded by the page limit.
+    next.splice(at, 0, row);
+    byId = new Map(next.map((r, i) => [r.id, i] as const));
   }
   return next;
 }
@@ -3089,9 +3147,10 @@ export function Transcript({
 
   // Apply one `sync_page` frame. REPLACE (rebased, or baseline `since === null`)
   // swaps the durable thread wholesale under the REPLACE-overlay rule
-  // (`applySyncReplace`), while a difference merge appends the rows above the
-  // cursor, reconciling an optimistic send against its persisted row by
-  // `platform_msg_id`. Rows arrive ascending; each carries its stable id.
+  // (`applySyncReplace`), while a difference merge files the rows above the
+  // cursor — appending, or placing at its ordinal one that landed late
+  // (`mergeSyncPage`) — and reconciles an optimistic send against its persisted
+  // row by `platform_msg_id`. Rows arrive ascending; each carries a stable id.
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
       setSyncInFlight(false);
@@ -3103,6 +3162,43 @@ export function Transcript({
       const pageRows = frame.rows
         .map(transcriptItemToRow)
         .filter((r): r is Row => r !== null);
+      // The prefix invariant `mergeSyncPage` merges under is checked when the
+      // request is POSTED (`runSync`), and the thread grows during the round
+      // trip — so a difference can land on a thread it is no longer a prefix
+      // of. `mergeSyncPage` PLACES every page row carrying an ordinal, so that
+      // alone is not a reason to refuse a page. This is the backstop for the
+      // rows placement genuinely cannot file: an `n<seq>` notice, whose seq is a
+      // sequence number and not an ordinal.
+      //
+      // BOTH conditions, and the narrowness is the point: keying on the
+      // overrun alone discards pages that merge perfectly — one live reply
+      // landing mid-round-trip is enough to trip it — and each discard costs a
+      // round trip plus a REPLACE that resets `oldestOrdinal`/`hasMoreOlder`
+      // and snaps a reader scrolled up in history to the newest edge.
+      //
+      // Re-running the sync is the whole response: the cursor is NOT demoted to
+      // `null`. `runSync` re-derives `syncSince` from the CURRENT thread, so the
+      // ordinary case posts a fresh difference from the cursor the live rows
+      // already advanced, and only a genuinely uncovered thread falls through to
+      // a baseline. Minting `{cursor: null}` here would force a REPLACE onto a
+      // warm thread — dropping any live row the page had not yet caught, which
+      // a difference could then never return (it selects strictly `>`). The
+      // discarded page's `next_cursor` is not adopted either: it was not applied.
+      //
+      // Reading `messagesRef` can lag a live `setMessages` in the same batch, so
+      // the check fails OPEN — falling through to a merge that places what it
+      // can, which is the behaviour without this guard, not a worse one.
+      const unplaceable = pageRows.some((r) => rowCoverageOrdinal(r) === null);
+      if (
+        !replace &&
+        unplaceable &&
+        frame.since_ordinal !== null &&
+        syncSince(frame.since_ordinal, messagesRef.current) === null
+      ) {
+        log("warn", `stale difference page carries an unplaceable row (since=${frame.since_ordinal}); re-syncing`);
+        runSync();
+        return;
+      }
       // Reseed the redelivery-dedup sets from the page (idempotent Set adds),
       // and release every send the page proves durable — the ONLY thing that
       // ever retires an id from the REPLACE-overlay's kept set, and the same
@@ -3140,7 +3236,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, markReadIfAdvanced, setSyncInFlight],
+    [advanceCursorFromSync, markReadIfAdvanced, setSyncInFlight, runSync],
   );
 
   const handleFrame = (frameJson: string) => {

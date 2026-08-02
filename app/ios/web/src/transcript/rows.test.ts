@@ -1070,6 +1070,145 @@ describe("syncSince / mergeSyncPage — a difference page must EXTEND the thread
   });
 });
 
+describe("mergeSyncPage — a page that lands late is placed, not piled on the end", () => {
+  // `syncSince`'s prefix gate runs when the request is POSTED, and the thread
+  // keeps growing during the round trip. A difference asked for at `since` can
+  // land after live frames rendered rows above it — and a blind tail append then
+  // files the page's rows below rows they predate. Nothing is lost; the order is
+  // wrong, it persists into the mirror, and the gate stays quiet over it after.
+  it("files a late page row at its ordinal, under the rows it predates", () => {
+    // Asked at since=100; while it flew, the turn rendered live through m103.
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "m103", role: "assistant", ordinal: 103, content: "the reply" },
+    ];
+    const page: Row[] = [
+      { id: "pm-x", role: "user", ordinal: 101, content: "asked" },
+      work({ id: "w102", steps: [tool({ callId: "c1" })] }),
+    ];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m100", "pm-x", "w102", "m103"]);
+  });
+
+  // Refuses to guess. Whether another device's durable row belongs above or
+  // below your own unstamped pending bubble is not knowable here, so it appends
+  // — the behaviour before placement existed. Ordering the two is a tie; the
+  // case below is not, which is why the tie loses.
+  it("appends rather than order a durable row against an ordinal-less trailing run", () => {
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "pm-mine", role: "user", content: "just sent", sendState: "sending" },
+      work({ id: "u-live", steps: [tool()], active: true }),
+    ];
+    const page: Row[] = [{ id: "pm-laptop", role: "user", ordinal: 101, content: "from my laptop" }];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual([
+      "m100",
+      "pm-mine",
+      "u-live",
+      "pm-laptop",
+    ]);
+  });
+
+  // The shape three review rounds kept re-breaking: a live thread's user rows
+  // carry NO ordinal (the echo brings none), so a trailing run of
+  // [unstamped send, live block] must not be treated as placeable — file the
+  // turn's answer above its own question and the reply renders over the card
+  // that produced it, and the block never freezes.
+  it("does not file a turn's answer above its own unstamped question", () => {
+    const rendered: Row[] = [
+      { id: "m99", role: "assistant", ordinal: 99, content: "older" },
+      { id: "pm-mine", role: "user", content: "the question", sendState: "sending" },
+      work({ id: "u-live", steps: [tool()], active: true, startedAt: NOW - 5_000 }),
+    ];
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const page: Row[] = [{ id: "m101", role: "assistant", ordinal: 101, content: "the reply" }];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["m99", "pm-mine", "u-live", "m101"]);
+    expect(out[2]).toMatchObject({ active: false });
+  });
+
+  it("does not leapfrog a trailing notice — an `n<seq>` seq is not an ordinal", () => {
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "n7", role: "notice", content: "Stopped." },
+    ];
+    const page: Row[] = [{ id: "m101", role: "assistant", ordinal: 101, content: "later" }];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m100", "n7", "m101"]);
+  });
+
+  // The answer of the turn that block is STILL RUNNING — arriving by sync
+  // precisely because its live frame was missed. It outranks every ordinal on
+  // screen, so it belongs at the end, and appending is what freezes the card.
+  // Placing it above would render the reply over its own block and strand that
+  // block "Working…" forever: `reconcileWork` keeps a folded live block's uid
+  // and `active`, so nothing downstream ever makes it orderable, and the next
+  // turn's steps then weld into it.
+  it("appends its own turn's answer and freezes the live block — placement must not preempt the tail", () => {
+    const rendered: Row[] = [
+      { id: "pm-mine", role: "user", ordinal: 100, content: "asked" },
+      work({ id: "u-live", steps: [tool()], active: true, startedAt: NOW - 5_000 }),
+    ];
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const page: Row[] = [{ id: "m102", role: "assistant", ordinal: 102, content: "the reply" }];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["pm-mine", "u-live", "m102"]);
+    expect(out[1]).toMatchObject({ active: false, elapsedMs: 5_000 });
+  });
+
+  it("does not freeze a live block it was filed above — a durable row below proves a later turn", () => {
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "m103", role: "assistant", ordinal: 103, content: "a later turn's reply" },
+      work({ id: "u-live", steps: [tool()], active: true }),
+    ];
+    const page: Row[] = [{ id: "m101", role: "assistant", ordinal: 101, content: "landed late" }];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["m100", "m101", "m103", "u-live"]);
+    expect(out[3]).toMatchObject({ active: true });
+  });
+
+  it("still plain-appends the ordinary forward page — placement is the rare branch", () => {
+    const rendered: Row[] = [{ id: "m10", role: "assistant", ordinal: 10, content: "a" }];
+    const page: Row[] = [
+      { id: "m11", role: "assistant", ordinal: 11, content: "b" },
+      { id: "m12", role: "assistant", ordinal: 12, content: "c" },
+    ];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m10", "m11", "m12"]);
+  });
+
+  it("reconciles by id AFTER a placement shifted the indices", () => {
+    // The splice invalidates every index at or past it, and the next row is
+    // matched through that same map — a patched-up index would write the
+    // reconciled row over the wrong slot.
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "m103", role: "assistant", ordinal: 103, content: "the reply" },
+    ];
+    const page: Row[] = [
+      { id: "m101", role: "assistant", ordinal: 101, content: "placed" },
+      { id: "m103", role: "assistant", ordinal: 103, content: "the reply", createdAt: "2026-08-02T10:00:00.000Z" },
+    ];
+    const out = mergeSyncPage(rendered, page, []);
+    expect(out.map((r) => r.id)).toEqual(["m100", "m101", "m103"]);
+    expect(out[2]).toMatchObject({ id: "m103", createdAt: "2026-08-02T10:00:00.000Z" });
+  });
+
+  // The documented limit, and why the apply-time prefix re-check exists: an
+  // `n<seq>` notice carries a SEQUENCE number, not an ordinal (`rowOrdinal`
+  // matches only `m`/`w`), so there is nothing to place it by.
+  it("cannot place a notice — it appends, and `applySyncPage` refuses the page instead", () => {
+    const rendered: Row[] = [
+      { id: "m100", role: "assistant", ordinal: 100, content: "older" },
+      { id: "m103", role: "assistant", ordinal: 103, content: "the reply" },
+    ];
+    const page: Row[] = [{ id: "n7", role: "notice", content: "a warning from ordinal 101" }];
+    expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m100", "m103", "n7"]);
+    // Which is exactly the condition the re-check keys on.
+    expect(syncSince(100, rendered)).toBeNull();
+  });
+});
+
 describe("applySyncReplace — the overlay keeps what the page cannot carry", () => {
   // The scar: the gateway echoes an inbound message to its own sender BEFORE
   // handing it to the router that persists it, and that echo frame carries no
