@@ -66,13 +66,20 @@ jobs:
     # `chat_api::chat_search_finds_a_chinese_word_inside_a_han_run` did on PR
     # #234 (3000/3001 tests green, one test `SLOW [>21120.000s]`, job killed at
     # the ceiling and reported `cancelled`, not `failure`). This repo runs CI on
-    # PRs only and its Actions quota is already out — it is why the three iOS
-    # jobs below are `if: false` — so that is a bill worth capping. That same
-    # run compiled the workspace from scratch (`No cache found`) and ran all
-    # 3000 finishing tests in ~10 minutes total, which is the number to raise
-    # this against: 15 is deliberately tight, so if the suite grows past it the
-    # answer is to bump this line, not to assume a hang.
-    timeout-minutes: 15
+    # PRs only, so that is a bill worth capping.
+    #
+    # A hung *test* is no longer what this cap catches: `.config/nextest.toml`
+    # terminates any test still running at 4 x 30s, which fails the run in two
+    # minutes with the offender named. What is left for this line to bound is a
+    # cold-cache build, and that got much more expensive when `[profile.dev
+    # .package."*"] opt-level = 2` landed — deps are compiled once and then
+    # executed by 3000+ tests, which is the trade. On a `No cache found` run
+    # (4-vCPU runner) 468 dep units took >14m43s and had not reached the
+    # workspace crates or the 56 test-binary links, so 15 could never pass cold.
+    # A warm run pays none of that (the suite itself is 3.3s), so 40 is a
+    # runaway backstop, not a target — if a *warm* run approaches it, something
+    # is wrong, so investigate rather than bumping the line again.
+    timeout-minutes: 40
     env:
       BAYBO_SKIP_WEBUI: 1
       # This job links 56 test binaries; lld does that ~8x faster than the
