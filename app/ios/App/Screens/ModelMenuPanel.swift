@@ -92,34 +92,42 @@ struct ModelMenuPanel: View {
                     close()
                 }
             }
-            hairline
-            row(
-                title: Lang.shared.t("chat.effort"),
-                subtitle: effortFor(entry).map { EffortLevel(rawValue: $0)?.label ?? $0 },
-                chevron: true
-            ) {
-                push(.effort(entry: entryName))
+            if !entry.availableEfforts.isEmpty {
+                hairline
+                row(
+                    title: Lang.shared.t("chat.effort"),
+                    subtitle: effortFor(entry).map { EffortLevel.named($0)?.label ?? $0 },
+                    chevron: true
+                ) {
+                    push(.effort(entry: entryName))
+                }
             }
         }
     }
 
-    /// L3: the effort ladder. A pick sets the session's per-session effort AND
-    /// pins it to (entry, its relevant model).
+    /// L3: the thinking ladder. A pick sets the session's per-session effort
+    /// AND pins it to (entry, its relevant model).
+    ///
+    /// The rungs come from the ENTRY, not a local list: each provider speaks
+    /// its own effort vocabulary, and offering a rung its dialect cannot say
+    /// would be a pick that never reaches the wire. The gateway sends the
+    /// rungs it can actually translate for that provider.
     @ViewBuilder
     private func effortRows(entry entryName: String) -> some View {
         backRow(title: Lang.shared.t("chat.effort")) { push(.models(entry: entryName)) }
         hairline
-        let current = entryByName(entryName).map(effortFor) ?? nil
-        ForEach(EffortLevel.allCases, id: \.rawValue) { effort in
+        let entry = entryByName(entryName)
+        let current = entry.map(effortFor) ?? nil
+        ForEach(entry?.availableEfforts ?? [], id: \.self) { level in
             row(
-                title: effort.label,
-                checked: current == effort.rawValue
+                title: EffortLevel.named(level)?.label ?? level,
+                checked: current == level
             ) {
                 Haptics.tap()
-                if let entry = entryByName(entryName) {
+                if let entry {
                     store.selectEffort(
                         entryName: entryName, model: relevantModel(for: entry),
-                        effort: effort.rawValue, catalog: catalog)
+                        effort: level, catalog: catalog)
                 }
                 close()
             }
@@ -242,11 +250,23 @@ struct ModelMenuPanel: View {
     }
 }
 
-/// The gateway's reasoning-effort ladder — the values `baybo.json` accepts
-/// for an entry's `reasoning_effort` (`crates/llm` registry contract). Raw
-/// values go on the wire; labels are localized.
+/// Localized labels for baybo's thinking ladder (`baybo_llm::effort`). Which
+/// rungs a given entry offers comes from the gateway (`availableEfforts`) —
+/// this only names them, so a rung baybo learns later still renders (as its
+/// raw value) instead of vanishing from the panel.
+///
+/// `none` is the pre-ladder spelling of `off`; the gateway canonicalises new
+/// pins, but a session pinned before that still reads back the old string.
 enum EffortLevel: String, CaseIterable {
-    case none, minimal, low, medium, high, xhigh
+    case off, minimal, low, medium, high, xhigh, max
 
     @MainActor var label: String { Lang.shared.t("chat.effort.\(rawValue)") }
+
+    /// `none` is the pre-ladder spelling of `off`. The gateway canonicalises
+    /// new pins, but a session pinned before that still reads back the old
+    /// string — and a case literally named `none` would collide with
+    /// `Optional.none` at every call site, so it stays a lookup instead.
+    static func named(_ raw: String) -> EffortLevel? {
+        EffortLevel(rawValue: raw) ?? (raw == "none" ? .off : nil)
+    }
 }

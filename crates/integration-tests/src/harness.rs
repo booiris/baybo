@@ -646,4 +646,8 @@ impl LlmCompletion for GatedChat {
     fn model_info(&self) -> &baybo_llm::ModelInfo {
         self.inner.model_info()
     }
+
+    fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+        self.inner.effective_effort(requested)
+    }
 }

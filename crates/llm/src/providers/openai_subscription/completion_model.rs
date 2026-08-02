@@ -31,10 +31,10 @@ const RESPONSES_PATH: &str = "/codex/responses";
 pub struct OpenAiSubscriptionCompletionModel {
     model: String,
     base_url: String,
-    /// Reasoning effort the operator picked, clamped to whatever the
-    /// model accepts. `None` = reasoning off. Resolved once at
-    /// construction time so every request body shares the same value.
-    reasoning_effort: Option<&'static str>,
+    /// Reasoning effort the operator picked, verbatim, or this model
+    /// family's default when they picked nothing. `None` = reasoning off.
+    /// Resolved once at construction so every request body shares it.
+    reasoning_effort: Option<String>,
     /// Request transport for `<base_url>/codex/*`. NOT the refresh client —
     /// refresh lives on the coordinator and targets the OAuth issuer.
     http: reqwest::Client,
@@ -146,6 +146,30 @@ impl OpenAiSubscriptionCompletionModel {
         })
     }
 
+    /// The effort this client actually applies to a request. A per-request
+    /// effort (the session's thinking-level pin) overrides the client's
+    /// construction-time entry default; `None` keeps that default. This is
+    /// what makes the chat header's thinking picker per-SESSION rather than
+    /// a global entry edit.
+    ///
+    /// Returns `None` when reasoning is off, in which case the request body
+    /// carries no `reasoning` field at all.
+    fn effective_effort(&self, effort: Option<&str>) -> Option<String> {
+        match effort {
+            Some(requested) => super::reasoning::resolve_effort(&self.model, Some(requested)),
+            None => self.reasoning_effort.clone(),
+        }
+    }
+
+    /// Same resolution as [`Self::effective_effort`], flattened for
+    /// bookkeeping: reasoning-off reads as the canonical `"none"` level
+    /// instead of an absent value, so a cost record can tell "the operator
+    /// turned reasoning off" apart from "no effort was sent at all".
+    pub(crate) fn effective_effort_label(&self, effort: Option<&str>) -> String {
+        self.effective_effort(effort)
+            .unwrap_or_else(|| super::reasoning::NONE.to_string())
+    }
+
     /// Open a streaming connection to `<base_url>/codex/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
     pub async fn stream(
@@ -153,16 +177,9 @@ impl OpenAiSubscriptionCompletionModel {
         request: CompletionRequest,
         effort: Option<&str>,
     ) -> Result<LlmStream, CompletionError> {
-        // A per-request effort (the session's thinking-level pin) overrides
-        // the client's construction-time entry default, clamped to what this
-        // model allows; `None` keeps the entry default. This is what makes the
-        // chat header's thinking picker per-SESSION rather than a global edit.
-        let effective_effort = match effort {
-            Some(requested) => super::reasoning::resolve_effort(&self.model, Some(requested)),
-            None => self.reasoning_effort,
-        };
-        let body =
-            build_responses_body(&self.model, effective_effort, &request).map_err(|msg| {
+        let effective_effort = self.effective_effort(effort);
+        let body = build_responses_body(&self.model, effective_effort.as_deref(), &request)
+            .map_err(|msg| {
                 let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
                 CompletionError::RequestError(err)
             })?;

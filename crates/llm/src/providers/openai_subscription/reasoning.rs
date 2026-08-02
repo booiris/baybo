@@ -7,7 +7,7 @@
 //! `src/agents/openai-reasoning-effort.ts`.
 
 /// Canonical effort levels used in the request body.
-const NONE: &str = "none";
+pub(super) const NONE: &str = "none";
 const MINIMAL: &str = "minimal";
 const LOW: &str = "low";
 const MEDIUM: &str = "medium";
@@ -65,36 +65,38 @@ fn default_effort(model: &str) -> &'static str {
     }
 }
 
-/// Resolve the effort the request body should use. Returns `None`
-/// when reasoning is disabled (operator picked `none` and the model
-/// supports it). Otherwise returns the canonical level.
+/// Resolve the effort the request body should use. Returns `None` when
+/// reasoning is off — the body then omits `reasoning` entirely.
 ///
 /// `requested` is what the operator typed in `LlmEntry.reasoning_effort`
-/// (case-insensitive, defaults applied when `None`); we clamp to the
-/// model's allow-list, falling back to `default_effort` if the
-/// requested value isn't permitted.
-pub(crate) fn resolve_effort(model: &str, requested: Option<&str>) -> Option<&'static str> {
-    let allowed = allowed_efforts(model);
-    let pick = match requested.map(str::to_ascii_lowercase) {
-        Some(level) => match level.as_str() {
-            "none" => {
-                if allowed.contains(&NONE) {
-                    return None;
-                }
-                default_effort(model)
-            }
-            other => match allowed.iter().find(|e| e.eq_ignore_ascii_case(other)) {
-                Some(e) => *e,
-                None => default_effort(model),
-            },
-        },
-        None => default_effort(model),
-    };
-    Some(pick)
+/// or pinned on the session, and it is passed through **verbatim**: a
+/// level outside this model family's advertised set is sent as written
+/// and refused by Codex, rather than being silently rewritten into a
+/// level nobody asked for — which could just as easily raise effort
+/// (`gpt-5-pro` accepts only `high`) as lower it. [`allowed_efforts_for`]
+/// still backs the CLI picker, so the legal set stays discoverable up
+/// front, where a wrong value is cheap to fix.
+///
+/// Only two values are interpreted rather than forwarded: `none` means
+/// off, and an absent request falls back to the model family's default —
+/// omitting the field would disable reasoning outright, which is not what
+/// "the operator didn't specify" should mean.
+pub(crate) fn resolve_effort(model: &str, requested: Option<&str>) -> Option<String> {
+    match requested {
+        Some(level) if level.eq_ignore_ascii_case(NONE) => None,
+        Some(level) => Some(level.to_string()),
+        None => Some(default_effort(model).to_string()),
+    }
 }
 
 /// Convenience for the CLI picker — list the effort levels available
 /// for a given model, in display order.
+///
+/// A display hint, not a gate: nothing validates a request against it, and
+/// it is known to drift from what a given model actually takes. `gpt-5.6-sol`
+/// answers `level 'max' not supported, valid levels: low, medium, high,
+/// xhigh` — narrower than the `gpt-5.2+` row below, which also offers `none`.
+/// The API is the authority; this table just keeps the picker close.
 pub fn allowed_efforts_for(model: &str) -> &'static [&'static str] {
     allowed_efforts(model)
 }
@@ -103,17 +105,52 @@ pub fn allowed_efforts_for(model: &str) -> &'static [&'static str] {
 mod tests {
     use super::*;
 
+    fn resolved(model: &str, requested: Option<&str>) -> Option<String> {
+        resolve_effort(model, requested)
+    }
+
+    /// The operator's level is sent as written. Rewriting it would be
+    /// wrong in both directions: `gpt-5-pro` accepts only `high`, so
+    /// clamping a `low` pick there silently bills the most expensive tier,
+    /// while a level above a family's ceiling would silently drop.
     #[test]
-    fn gpt5_pro_only_accepts_high() {
+    fn a_requested_level_is_never_rewritten() {
+        assert_eq!(resolved("gpt-5-pro", Some("low")).as_deref(), Some("low"));
+        assert_eq!(resolved("gpt-5", Some("xhigh")).as_deref(), Some("xhigh"));
+        assert_eq!(
+            resolved("gpt-5", Some("ultraplus")).as_deref(),
+            Some("ultraplus"),
+            "an unknown level goes to the provider, which is what reports it as invalid"
+        );
+    }
+
+    /// `none` is the one level that means "omit the field", on every model.
+    #[test]
+    fn none_turns_reasoning_off_regardless_of_model() {
+        assert_eq!(resolved("gpt-5.1", Some("none")), None);
+        assert_eq!(resolved("gpt-5", Some("none")), None);
+        assert_eq!(resolved("gpt-5-pro", Some("NONE")), None);
+    }
+
+    /// Absent ≠ off: omitting the field disables reasoning in the Codex
+    /// body, so an unconfigured entry has to send the family default.
+    #[test]
+    fn an_unset_effort_falls_back_to_the_family_default() {
+        assert_eq!(resolved("gpt-5-pro", None).as_deref(), Some("high"));
+        assert_eq!(resolved("gpt-5", None).as_deref(), Some("medium"));
+        assert_eq!(resolved("brand-new-llm", None).as_deref(), Some("medium"));
+    }
+
+    // The allow-lists no longer gate requests — they back the CLI picker,
+    // so the levels it offers still have to be right.
+
+    #[test]
+    fn gpt5_pro_offers_only_high() {
         assert_eq!(allowed_efforts("gpt-5-pro"), &["high"]);
-        assert_eq!(resolve_effort("gpt-5-pro", None), Some("high"));
-        // Even when operator types something else, clamp.
-        assert_eq!(resolve_effort("gpt-5-pro", Some("low")), Some("high"));
-        assert_eq!(resolve_effort("gpt-5-pro", Some("none")), Some("high"));
     }
 
     #[test]
-    fn gpt5_codex_supports_xhigh_but_not_minimal() {
+    fn gpt5_codex_offers_xhigh_but_not_minimal() {
         let efforts = allowed_efforts("gpt-codex");
         assert!(efforts.contains(&"xhigh"));
         assert!(!efforts.contains(&"minimal"));
@@ -121,37 +158,18 @@ mod tests {
     }
 
     #[test]
-    fn gpt5_minimal_is_legal() {
-        let efforts = allowed_efforts("gpt-5");
-        assert!(efforts.contains(&"minimal"));
-        assert_eq!(resolve_effort("gpt-5", Some("minimal")), Some("minimal"));
-    }
-
-    #[test]
-    fn none_is_only_honoured_when_model_supports_it() {
-        // gpt-5.1 supports `none`, so `none` request → reasoning off.
-        assert_eq!(resolve_effort("gpt-5.1", Some("none")), None);
-        // gpt-5 does NOT support `none` — fall back to default.
-        assert_eq!(resolve_effort("gpt-5", Some("none")), Some("medium"));
+    fn gpt5_offers_minimal() {
+        assert!(allowed_efforts("gpt-5").contains(&"minimal"));
     }
 
     #[test]
     fn gpt5_2_unlocks_xhigh() {
-        let efforts = allowed_efforts("gpt-5.2");
-        assert!(efforts.contains(&"xhigh"));
-        let efforts = allowed_efforts("gpt-5.3");
-        assert!(efforts.contains(&"xhigh"));
+        assert!(allowed_efforts("gpt-5.2").contains(&"xhigh"));
+        assert!(allowed_efforts("gpt-5.3").contains(&"xhigh"));
     }
 
     #[test]
     fn unknown_model_falls_through_to_generic() {
-        let efforts = allowed_efforts("brand-new-llm");
-        assert_eq!(efforts, &["low", "medium", "high"]);
-        assert_eq!(resolve_effort("brand-new-llm", None), Some("medium"));
-    }
-
-    #[test]
-    fn invalid_request_falls_back_to_default() {
-        assert_eq!(resolve_effort("gpt-5", Some("ultraplus")), Some("medium"));
+        assert_eq!(allowed_efforts("brand-new-llm"), &["low", "medium", "high"]);
     }
 }

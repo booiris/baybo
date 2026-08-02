@@ -516,6 +516,11 @@ async fn build_model_entry(
         api_key_env: entry.api_key_env.clone(),
         api_key_configured,
         reasoning_effort: entry.reasoning_effort.clone(),
+        available_efforts: baybo_llm::providers::effort_wire_for_provider(&entry.provider)
+            .levels()
+            .iter()
+            .map(|level| level.to_string())
+            .collect(),
         is_default: cfg.default_llm == entry.name,
         effective_context_window,
         effective_supports_vision,

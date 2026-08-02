@@ -334,7 +334,11 @@ impl LlmProviderRegistry {
         let factory = self.factories.get(&config.provider).ok_or_else(|| {
             crate::LlmError::ModelNotFound(format!("unknown LLM provider: {}", config.provider))
         })?;
-        let mut client = factory.create(config)?;
+        // Every provider's client is minted here, so this is the one place
+        // the operator's effort has to be attached for all of them.
+        let mut client = factory
+            .create(config)?
+            .with_entry_effort(config.reasoning_effort.as_deref())?;
         if let Some(override_) = config.supports_vision {
             client.model_info.supports_vision = override_;
         }

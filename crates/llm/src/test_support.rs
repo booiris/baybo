@@ -32,6 +32,14 @@ pub struct StubLlm {
     /// mutations on its private `Session` aren't reachable through
     /// the harness's shadow copy.
     captured_requests: Mutex<Vec<ChatRequest>>,
+    /// What [`LlmCompletion::effective_effort`] reports, standing in for a
+    /// provider's entry default. Defaults to `None` — the stub models a
+    /// client that sends no effort until a test says otherwise. Note the
+    /// stub answers this without consulting the per-request override:
+    /// resolving one against an entry default is the real client's job, and
+    /// a test asserting a recorded level wants to fix the answer, not
+    /// re-derive it.
+    effective_effort: Option<String>,
 }
 
 impl Default for StubLlm {
@@ -49,6 +57,7 @@ impl Default for StubLlm {
             stream_queue: Mutex::new(std::collections::VecDeque::new()),
             text_chunk_size: Mutex::new(None),
             captured_requests: Mutex::new(Vec::new()),
+            effective_effort: None,
         }
     }
 }
@@ -67,6 +76,13 @@ impl StubLlm {
     /// events. `n = 1` produces single-char chunks; `None` disables.
     pub fn with_text_chunk_size(self, n: Option<usize>) -> Self {
         *self.text_chunk_size.lock() = n;
+        self
+    }
+
+    /// Model a client that sends a reasoning effort, resolving every request
+    /// to `level`. Left unset, the stub reports "no effort sent".
+    pub fn with_effective_effort(mut self, level: Option<&str>) -> Self {
+        self.effective_effort = level.map(str::to_string);
         self
     }
 
@@ -154,6 +170,10 @@ impl LlmCompletion for StubLlm {
 
     fn model_info(&self) -> &ModelInfo {
         &self.model_info
+    }
+
+    fn effective_effort(&self, _requested: Option<&str>) -> Option<String> {
+        self.effective_effort.clone()
     }
 }
 

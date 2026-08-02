@@ -104,6 +104,14 @@ impl BillableLlm {
         self.inner.model_info()
     }
 
+    /// The effort the wrapped client will actually apply, given a
+    /// per-request override. `pub(crate)` because its one consumer is
+    /// [`BoundBilledLlm`]'s recorder — the value belongs on the cost row,
+    /// not in caller-visible control flow.
+    pub(crate) fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+        self.inner.effective_effort(requested)
+    }
+
     /// Issue a minimal chat request to verify provider connectivity
     /// and auth. Mirrors the previous `LlmClient::probe()` so the
     /// `baybo llm probe` / `baybo doctor` paths still have a cheap
@@ -195,6 +203,9 @@ mod tests {
         }
         fn model_info(&self) -> &ModelInfo {
             &self.info
+        }
+        fn effective_effort(&self, _requested: Option<&str>) -> Option<String> {
+            None
         }
     }
 

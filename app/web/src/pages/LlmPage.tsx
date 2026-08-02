@@ -703,13 +703,33 @@ function EditLlmModal({
             </div>
           </div>
 
-          {entry.reasoning_effort != null && (
-            <LabeledInput
-              label="Reasoning effort"
-              value={form.reasoningEffort}
-              onChange={(v) => setForm({ ...form, reasoningEffort: v })}
-              placeholder="none / minimal / low / medium / high / xhigh"
-            />
+          {entry.available_efforts.length > 0 && (
+            <div>
+              <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">
+                Thinking effort
+              </label>
+              <SelectBox
+                value={form.reasoningEffort}
+                onChange={(e) => setForm({ ...form, reasoningEffort: e.target.value })}
+                className="w-full h-10 px-3"
+              >
+                <option value="">Provider default</option>
+                {/* Only the rungs this provider's dialect can actually say —
+                    the gateway decides, so a pick can't be inert. */}
+                {entry.available_efforts.map((level) => (
+                  <option key={level} value={level}>
+                    {level}
+                  </option>
+                ))}
+                {/* A level configured by hand (or one baybo hasn't learned)
+                    stays selectable instead of silently resetting to default
+                    the next time this form is saved. */}
+                {form.reasoningEffort !== '' &&
+                  !entry.available_efforts.includes(form.reasoningEffort) && (
+                    <option value={form.reasoningEffort}>{form.reasoningEffort} (custom)</option>
+                  )}
+              </SelectBox>
+            </div>
           )}
 
           {error && (
