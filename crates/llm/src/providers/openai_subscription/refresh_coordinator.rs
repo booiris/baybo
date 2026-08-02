@@ -767,7 +767,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn save_with_retries_recovers_within_budget() {
         let (store, _) = vault_with_failing_store(2); // first 2 fail, 3rd succeeds
         let bundle = sample_bundle(0, 0);
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(store.load().await.unwrap(), Some(bundle));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn save_with_retries_gives_up_after_budget() {
         let (store, _) = vault_with_failing_store(usize::MAX); // never succeeds
         let bundle = sample_bundle(0, 0);
@@ -791,7 +791,7 @@ mod tests {
     /// touching the network, but only after the self-heal step has run.
     /// That lets us assert `persisted` flips back to true without an HTTP
     /// mock.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_flight_refresh_self_heals_dirty_save() {
         let (store, _) = vault_with_failing_store(VAULT_SAVE_RETRY_ATTEMPTS - 1);
         let now = chrono::Utc::now().timestamp();
@@ -863,7 +863,7 @@ mod tests {
     /// Two consecutive dirty-save failures must NOT chain rotations —
     /// chained unsaved bundles all evaporate on process restart, much
     /// worse than waiting for the disk to recover.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing() {
         let (store, _) = vault_with_failing_store(usize::MAX);
         let now = chrono::Utc::now().timestamp();

@@ -123,7 +123,7 @@ fn call(id: usize, name: &str) -> StreamEvent {
     })
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn concurrent_tools_run_in_parallel_capped_at_limit() {
     let tracker = Arc::new(Tracker::default());
     let probe = ProbeTool::arc("read_probe", ToolConcurrency::Concurrent, tracker.clone());
@@ -160,7 +160,7 @@ async fn concurrent_tools_run_in_parallel_capped_at_limit() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn exclusive_tool_runs_alone() {
     let tracker = Arc::new(Tracker::default());
     let read_probe = ProbeTool::arc("read_probe", ToolConcurrency::Concurrent, tracker.clone());
@@ -208,7 +208,7 @@ async fn exclusive_tool_runs_alone() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn independent_tools_bypass_the_pool_cap() {
     // `Independent` (the policy `spawn_subagent` uses) acquires no permit,
     // so the per-response cap does not bound it — every dispatched call
@@ -245,7 +245,7 @@ async fn independent_tools_bypass_the_pool_cap() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn independent_tool_overlaps_an_exclusive_call() {
     // An `Independent` call holds no permit, so it runs alongside an
     // `Exclusive` call instead of waiting behind it — the property that

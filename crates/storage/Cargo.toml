@@ -42,4 +42,8 @@ baybo-trace = { workspace = true }
 baybo-turn = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `test-util` backs `#[tokio::test(start_paused = true)]` in the retry-backoff
+# tests; it is NOT part of tokio's `full`, and a `--workspace` build only
+# supplies it by feature unification, so `cargo test -p baybo-storage` needs it
+# declared here.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

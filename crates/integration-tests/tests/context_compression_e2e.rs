@@ -27,7 +27,7 @@ use baybo_trace::{CompressionTrigger, SpanKind, StepKind, TraceStore};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn compression_call_records_cost_with_matching_span_id() {
     // Pricing: nonzero so `record_call` actually moves the meter
     // and persists. Only one model id now (the harness's stub) —
@@ -212,7 +212,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
 /// The compaction pass reports its phase: turn 2 crosses the tight budget,
 /// so the loop emits `Status(Compacting)` before the summariser call and
 /// `Status(Compacted)` after; turn 1 stays under threshold and is silent.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn compaction_reports_compacting_then_compacted_status() {
     let mut harness = AgentTestHarness::builder()
         .with_model_context_window(200)
@@ -268,7 +268,7 @@ fn status_phases(outputs: &[AgentOutput]) -> Vec<StatusPhase> {
 /// answers anyway — and the user is told, once, that the compaction did not
 /// happen. Dropping the middle of the conversation instead was the old
 /// behaviour, and it cost a real session its history over a provider blip.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_summariser_keeps_the_transcript_and_warns_the_user() {
     let mut harness = AgentTestHarness::builder()
         .with_model_context_window(200)
@@ -399,7 +399,7 @@ async fn a_failed_summariser_keeps_the_transcript_and_warns_the_user() {
 /// A non-retriable failure must not spend the retry. A context-window 400 is
 /// the likeliest way a compaction fails, and asking again buys the same 400 at
 /// full transcript price.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_non_retriable_summariser_failure_is_not_retried() {
     let mut harness = AgentTestHarness::builder()
         .with_model_context_window(200)
@@ -460,7 +460,7 @@ async fn a_non_retriable_summariser_failure_is_not_retried() {
 /// is left exactly as it was, still over budget, so the threshold check at the
 /// top of the next turn runs the compaction again. Truncating on a cancel
 /// would destroy the middle of the conversation over a `/stop`.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stop_aborts_the_compaction_and_the_next_turn_redoes_it() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
