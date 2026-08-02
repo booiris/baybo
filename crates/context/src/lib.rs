@@ -82,8 +82,8 @@ use baybo_skills::{
     render_skill_for_slash,
 };
 use baybo_trace::LlmCallInputs;
-use baybo_workspace::{IdentityKind, IdentitySource};
 use parking_lot::RwLock;
+use prompts::soul::PersonaSources;
 use tracing::{debug, warn};
 
 /// Maximum tokens the rendered detail block of a single previously
@@ -406,21 +406,6 @@ pub struct ContextManagerConfig {
     pub builtin_memory: bool,
 }
 
-/// The two per-agent identity files a session assembles from, resolved to a
-/// path plus the text to create that file with if it is absent.
-struct PersonaSources {
-    soul_path: PathBuf,
-    soul_seed: String,
-    self_image_path: PathBuf,
-    self_image_seed: String,
-    user_notes_path: PathBuf,
-    user_notes_seed: String,
-    /// This agent's `MEMORY.md`, or `None` when file memory is disabled.
-    /// Resolved from the same binding as the identity files, so a session
-    /// can never read one agent's soul with another's memory.
-    memory_index: Option<PathBuf>,
-}
-
 impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
         Self {
@@ -594,15 +579,7 @@ impl ContextManager {
         }
 
         let sources = self.resolve_persona_sources();
-        match crate::prompts::soul::assemble(
-            &self.workspace,
-            IdentitySource::new(&sources.soul_path, &sources.soul_seed),
-            IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
-            IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
-            sources.memory_index.as_deref(),
-        )
-        .await
-        {
+        match crate::prompts::soul::assemble_for(&self.workspace, &sources).await {
             Ok(prompt) => Some(prompt),
             Err(e) => {
                 // Deliberately no fall back to the workspace persona. Serving
@@ -637,24 +614,7 @@ impl ContextManager {
         // Unbound is the built-in, and the built-in is an ordinary persona
         // directory now — so there is one path rule, not two.
         let agent = self.agent.clone().unwrap_or_else(AgentProfileId::builtin);
-        let path = |kind: IdentityKind| agent.identity_file(&self.workspace, kind);
-        // The same table setup and profile creation seed from. A file the
-        // operator deleted must come back as what shipped, not as whatever
-        // this path happened to name — recreating the built-in's `SOUL.md`
-        // from the custom-agent skeleton would rewrite who the assistant is,
-        // permanently and silently.
-        let seed = |kind| baybo_workspace::identity::persona_seed(agent.as_str(), kind).to_string();
-        PersonaSources {
-            soul_path: path(IdentityKind::Soul),
-            soul_seed: seed(IdentityKind::Soul),
-            self_image_path: path(IdentityKind::Identity),
-            self_image_seed: seed(IdentityKind::Identity),
-            user_notes_path: path(IdentityKind::User),
-            user_notes_seed: seed(IdentityKind::User),
-            memory_index: self
-                .builtin_memory
-                .then(|| agent.memory_index_file(&self.workspace)),
-        }
+        PersonaSources::for_agent(&self.workspace, &agent, self.builtin_memory)
     }
 
     /// Refresh the leading system row after a *committed* compaction so a
@@ -2439,6 +2399,7 @@ pub(crate) fn estimate_skill_trailer_tokens(
 mod tests {
     use super::*;
     use baybo_model::{ContentBlock, Role};
+    use baybo_workspace::IdentityKind;
 
     struct SimpleTokenizer;
 
