@@ -4,6 +4,15 @@
 # is fine — they're disabled workspace-wide (`[lib] doctest = false`).
 # https://nexte.st/docs/configuration/
 
+[profile.default]
+# A hung test must FAIL the run, not wedge it. nextest's default is to wait
+# forever: a `channel_ws` deadlock (rare, but reproducible at ~1-in-50 when
+# several suite runs share a loaded box) once left a test process alive for
+# eight hours while the run reported nothing at all.
+# The whole suite finishes in ~3.2s and its slowest single test is ~0.5s, so
+# terminating at 4 x 30s only ever fires on a genuine hang.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 [test-groups]
 # The tmux render/smoke tests (tui `chat_render`, term-harness lib) each spin a
 # full TUI+WS probe in a private tmux server; run concurrently they starve each
@@ -17,3 +26,6 @@ tmux-serial = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'binary_id(=baybo-tui::chat_render) | (package(baybo-term-harness) & kind(lib))'
 test-group = 'tmux-serial'
+# These legitimately sit on real 15s render-capture waits and retry up to 8
+# times, so the workspace-wide terminate-after would cut them off mid-run.
+slow-timeout = { period = "60s", terminate-after = 10 }
