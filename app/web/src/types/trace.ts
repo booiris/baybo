@@ -170,6 +170,9 @@ export interface LlmCallResult {
   output_content?: string;
   thinking?: string | null;
   tool_calls?: LlmToolCallRecord[];
+  /** The WHOLE prompt, cache included — the two cache fields below are a
+   *  billing-tier breakdown of this number, never addends. Adding them back
+   *  double-counts every cache hit. */
   input_tokens?: number;
   output_tokens?: number;
   cached_input_tokens?: number;

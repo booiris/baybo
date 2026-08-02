@@ -173,26 +173,20 @@ export function sumLlmTokens(spans: Span[]): { input: number; output: number } {
   let output = 0;
   for (const s of spans) {
     if (s.kind.kind === 'llm_call' && s.kind.result) {
-      input +=
-        (s.kind.result.input_tokens ?? 0) +
-        (s.kind.result.cached_input_tokens ?? 0) +
-        (s.kind.result.cache_creation_input_tokens ?? 0);
+      input += s.kind.result.input_tokens ?? 0;
       output += s.kind.result.output_tokens ?? 0;
     }
   }
   return { input, output };
 }
 
-/** Tokens a compaction consumed and produced. Input counts cache reads and cache
- *  writes too: they occupied the context window that was compacted. The step
- *  summary and the overview's CONTEXT chips both read this, so the two figures
- *  cannot drift apart. */
+/** Tokens a compaction consumed and produced. Cache reads and writes are part
+ *  of `input_tokens` already (see [`TurnTokenTotals`]), so the compacted window
+ *  is that field alone. The step summary and the overview's CONTEXT chips both
+ *  read this, so the two figures cannot drift apart. */
 export function compressionTokens(result: LlmCallResult): { input: number; output: number } {
   return {
-    input:
-      (result.input_tokens ?? 0) +
-      (result.cached_input_tokens ?? 0) +
-      (result.cache_creation_input_tokens ?? 0),
+    input: result.input_tokens ?? 0,
     output: result.output_tokens ?? 0,
   };
 }
@@ -360,12 +354,18 @@ export function turnQueuedMs(turn: { created_at?: string | null; started_at?: st
   return Math.max(0, new Date(turn.started_at).getTime() - new Date(turn.created_at).getTime());
 }
 
+/** `input` is the WHOLE prompt: the LLM layer normalises every provider so
+ *  `input_tokens` already contains the prompt-cache buckets (Anthropic reports
+ *  them disjoint and `fold_anthropic_cache_into_total` folds them back in;
+ *  OpenAI/Gemini report them as a subset natively). `cached` / `cacheCreate` are
+ *  therefore a BREAKDOWN of `input`, never addends — adding them back double-
+ *  counts every cache hit. Billing agrees: `compute_cost_usd` bills
+ *  `input - cached - cacheCreate` at the full rate. */
 export interface TurnTokenTotals {
   input: number;
   output: number;
   cached: number;
   cacheCreate: number;
-  inputTotal: number;
 }
 
 export function summaryTokens(summary: TraceTurnSummary): TurnTokenTotals {
@@ -374,8 +374,6 @@ export function summaryTokens(summary: TraceTurnSummary): TurnTokenTotals {
     output: summary.output_tokens,
     cached: summary.cached_input_tokens,
     cacheCreate: summary.cache_creation_input_tokens,
-    inputTotal:
-      summary.input_tokens + summary.cached_input_tokens + summary.cache_creation_input_tokens,
   };
 }
 
@@ -396,7 +394,7 @@ export function traceTokens(trace: TurnTrace): TurnTokenTotals {
       }
     }
   }
-  return { input, output, cached, cacheCreate, inputTotal: input + cached + cacheCreate };
+  return { input, output, cached, cacheCreate };
 }
 
 // Flatten a message's content blocks into a single display string (text

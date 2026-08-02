@@ -69,7 +69,7 @@ export function TurnAnchors({
               {input ?? (trace ? 'no user input recorded' : 'loading…')}
             </div>
             <div className="mt-1 font-mono text-[0.6rem] text-ink-soft">
-              ↑{formatTok(tokens.inputTotal)} ↓{formatTok(tokens.output)} · {formatDuration(dur)}
+              ↑{formatTok(tokens.input)} ↓{formatTok(tokens.output)} · {formatDuration(dur)}
             </div>
           </button>
         );

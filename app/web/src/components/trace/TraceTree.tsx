@@ -386,7 +386,7 @@ function TurnRow({
           {live && <RiLoader4Line className="shrink-0 text-info animate-spin text-xs" />}
         </div>
         <div className="text-[0.7rem] text-ink-soft font-mono">
-          ↑{formatTok(tokens.inputTotal)} ↓{formatTok(tokens.output)}
+          ↑{formatTok(tokens.input)} ↓{formatTok(tokens.output)}
         </div>
       </div>
       <div className="shrink-0 flex items-center gap-2">

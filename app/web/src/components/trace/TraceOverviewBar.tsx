@@ -169,7 +169,7 @@ export function TraceOverviewBar({
     let output = 0;
     for (const j of overview.turns) {
       const t = summaryTokens(j);
-      input += t.inputTotal;
+      input += t.input;
       output += t.output;
     }
     return { input, output };

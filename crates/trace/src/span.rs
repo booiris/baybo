@@ -201,16 +201,20 @@ pub struct LlmCallResult {
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<LlmToolCallRecord>,
+    /// The WHOLE prompt, cache included — `baybo_llm::TokenUsage` normalises
+    /// every provider to that meaning before this is recorded, so the two
+    /// cache fields below are a BREAKDOWN of this number, never addends. A
+    /// consumer that adds them back double-counts every cache hit.
     #[serde(default)]
     pub input_tokens: usize,
     #[serde(default)]
     pub output_tokens: usize,
-    /// Anthropic prompt-cache: input tokens served from the cache.
+    /// Prompt-cache: how much of `input_tokens` was served from the cache.
     /// `#[serde(default)]` keeps already-persisted spans (which lack
     /// the field) decodable.
     #[serde(default)]
     pub cached_input_tokens: usize,
-    /// Anthropic prompt-cache: input tokens written into the cache.
+    /// Prompt-cache: how much of `input_tokens` was written into the cache.
     #[serde(default)]
     pub cache_creation_input_tokens: usize,
 }

@@ -88,15 +88,16 @@ function formatTokens(val: number): string {
   return Math.floor(val).toString();
 }
 
-// All three Anthropic-style input fields count as input sent to the model;
-// they only differ in the cache billing tier. Total input volume = sum of
-// uncached + cache reads + cache writes.
-function totalInput(row: {
+// `input_tokens` is ALREADY the whole prompt — the LLM layer normalises every
+// provider so the prompt-cache buckets are a breakdown of it, not extra volume
+// beside it (Anthropic reports them disjoint and `fold_anthropic_cache_into_total`
+// folds them in; OpenAI/Gemini report them as a subset natively). The cache
+// fields only say which billing tier each slice landed in.
+function uncachedInput(row: {
   input_tokens: number;
   cached_input_tokens: number;
-  cache_creation_input_tokens: number;
 }): number {
-  return row.input_tokens + row.cached_input_tokens + row.cache_creation_input_tokens;
+  return Math.max(0, row.input_tokens - row.cached_input_tokens);
 }
 
 // Wire format is integer micro-USD (USD × 10^6). Divide here at the
@@ -311,11 +312,11 @@ export function AnalyticsPage() {
     () =>
       (data?.daily ?? []).map((d) => ({
         ...d,
-        total_input_tokens: totalInput(d),
+        total_input_tokens: d.input_tokens,
         // "Uncached" = anything not served from prompt cache. Cache *creation*
         // is the first-time write — at this call it is not a cache hit, so it
         // bills at the non-cached tier and is grouped here.
-        uncached_input_tokens: d.input_tokens + d.cache_creation_input_tokens,
+        uncached_input_tokens: uncachedInput(d),
       })),
     [data],
   );
@@ -394,11 +395,7 @@ export function AnalyticsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
             <MetricCard
               title="Total Input Tokens"
-              value={formatTokens(
-                data.total_input_tokens +
-                  data.total_cached_input_tokens +
-                  data.total_cache_creation_input_tokens,
-              )}
+              value={formatTokens(data.total_input_tokens)}
               icon={RiUploadLine}
               subtitle="Prompts & context (incl. cache)"
             />
@@ -542,7 +539,7 @@ export function AnalyticsPage() {
                   {last7Days.map((day) => (
                     <tr key={day.date} className="hover:bg-gray-50">
                       <td className={tdCell}>{day.date}</td>
-                      <td className={`${tdCell} text-right`}>{totalInput(day).toLocaleString()}</td>
+                      <td className={`${tdCell} text-right`}>{day.input_tokens.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>{day.output_tokens.toLocaleString()}</td>
                       <td className={`${tdCell} text-right`}>
                         {day.cached_input_tokens.toLocaleString()}
@@ -590,7 +587,7 @@ export function AnalyticsPage() {
                         <span className="font-bold break-all">{m.model}</span>
                       </td>
                       <td className={`${tdCell} text-right`}>{m.call_count.toLocaleString()}</td>
-                      <td className={`${tdCell} text-right`}>{formatTokens(totalInput(m))}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(m.input_tokens)}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(m.output_tokens)}</td>
                       <td className={`${tdCell} text-right`}>
                         {formatTokens(m.cached_input_tokens)}
@@ -639,7 +636,7 @@ export function AnalyticsPage() {
                         </span>
                       </td>
                       <td className={`${tdCell} text-right`}>{r.call_count.toLocaleString()}</td>
-                      <td className={`${tdCell} text-right`}>{formatTokens(totalInput(r))}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(r.input_tokens)}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(r.output_tokens)}</td>
                       <td className={`${tdCell} text-right`}>
                         {formatTokens(r.cached_input_tokens)}
@@ -686,7 +683,7 @@ export function AnalyticsPage() {
                         <span className="font-bold">{r.reason}</span>
                       </td>
                       <td className={`${tdCell} text-right`}>{r.call_count.toLocaleString()}</td>
-                      <td className={`${tdCell} text-right`}>{formatTokens(totalInput(r))}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(r.input_tokens)}</td>
                       <td className={`${tdCell} text-right`}>{formatTokens(r.output_tokens)}</td>
                       <td className={`${tdCell} text-right`}>
                         {formatTokens(r.cached_input_tokens)}

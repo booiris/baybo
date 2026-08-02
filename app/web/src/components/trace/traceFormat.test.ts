@@ -41,10 +41,10 @@ function step(kind: StepKind): Step {
 }
 
 describe('compressionTokens', () => {
-  it('counts cache reads and writes as compacted context', () => {
-    // A cached token still occupied the window that was compacted, so it must
-    // be part of the "before" figure — counting `input_tokens` alone
-    // under-reports and disagrees with the token totals shown elsewhere.
+  it('does not re-add the cache buckets already inside input_tokens', () => {
+    // `input_tokens` is the whole prompt on every provider — the cache figures
+    // are a billing-tier breakdown of it, not extra context beside it. Adding
+    // them back inflated the compacted window by the entire cache hit.
     expect(
       compressionTokens({
         input_tokens: 12_400,
@@ -52,7 +52,7 @@ describe('compressionTokens', () => {
         cache_creation_input_tokens: 1_240,
         output_tokens: 260,
       }),
-    ).toEqual({ input: 21_080, output: 260 });
+    ).toEqual({ input: 12_400, output: 260 });
   });
 
   it('treats missing token fields as zero', () => {
@@ -71,10 +71,10 @@ describe('stepSummaryText — compression', () => {
   it('leads with why it ran', () => {
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'threshold' }), [llmSpan(result)]),
-    ).toBe('threshold · 21,080 → 260 tokens');
+    ).toBe('threshold · 12,400 → 260 tokens');
     expect(
       stepSummaryText(step({ kind: 'compression', trigger: 'forced' }), [llmSpan(result)]),
-    ).toBe('forced · 21,080 → 260 tokens');
+    ).toBe('forced · 12,400 → 260 tokens');
   });
 
   it('still names a compaction whose summarizer call left no result', () => {
@@ -87,7 +87,7 @@ describe('stepSummaryText — compression', () => {
 
   it('omits the trigger on a legacy row that never recorded one', () => {
     expect(stepSummaryText(step({ kind: 'compression' }), [llmSpan(result)])).toBe(
-      '21,080 → 260 tokens',
+      '12,400 → 260 tokens',
     );
   });
 

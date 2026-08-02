@@ -645,8 +645,8 @@ function TurnSummaryPanel({
   if (!summary) {
     return <div className="flex-1 min-h-0 p-5 text-ink-soft italic text-[0.85rem]">No turn available.</div>;
   }
-  const { input, output, cached, cacheCreate, inputTotal } = trace ? traceTokens(trace) : summaryTokens(summary);
-  const total = inputTotal + output;
+  const { input, output, cached, cacheCreate } = trace ? traceTokens(trace) : summaryTokens(summary);
+  const total = input + output;
   const inputText = trace ? turnInputText(trace, messageLog) : null;
   const outputText = trace ? turnOutputText(trace) : null;
   let llmCount = 0;
@@ -1400,7 +1400,7 @@ export function TraceSessionPage() {
               <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
                 {overview.turns.length === 1 ? 'Tokens' : `Turn #${activeTurnIndex + 1}`}
               </span>
-              <span className="text-ink">↑ {activeTokens.inputTotal.toLocaleString()}</span>
+              <span className="text-ink">↑ {activeTokens.input.toLocaleString()}</span>
               <span className="text-ink">↓ {activeTokens.output.toLocaleString()}</span>
               <span className="text-ink-soft">• {formatDuration(turnDurationMs(activeTurnSummary, activeTurnTrace))}</span>
             </span>
