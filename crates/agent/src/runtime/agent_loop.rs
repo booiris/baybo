@@ -1054,6 +1054,10 @@ impl AgentLoop {
             // compression gate for the same reason the checklist above is: the
             // delta rides this request, so the gate has to see its tokens.
             self.context_manager.reconcile_system_prompt().await;
+            // Same contract for the skill listing, which has its own baseline
+            // row and its own envelope: a render of this session's invocable
+            // set unless the registry actually moved under it.
+            self.context_manager.reconcile_skills().await;
 
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(
