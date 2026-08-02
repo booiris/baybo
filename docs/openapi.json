@@ -6313,6 +6313,7 @@
           "provider",
           "model",
           "api_key_configured",
+          "available_efforts",
           "is_default",
           "effective_context_window",
           "effective_supports_vision",
@@ -6328,6 +6329,13 @@
               "string",
               "null"
             ]
+          },
+          "available_efforts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The thinking levels this entry's provider can actually be told, in\ndisplay order (cheapest first). Empty when baybo sends this provider\nno effort at all, which is a picker's cue to offer none rather than a\nladder whose picks would be inert.\n\nProvider-scoped, not model-scoped: whether a *given* model accepts an\noffered level is its API's answer, and encoding that here would be a\ntable that silently goes stale."
           },
           "base_url": {
             "type": [

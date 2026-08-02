@@ -1,5 +1,6 @@
 pub mod billed;
 pub mod credentials;
+pub mod effort;
 mod error;
 pub mod guard;
 pub mod json_extract;
@@ -1256,6 +1257,21 @@ impl AnyCompletionModel {
         )
     }
 
+    /// The level a provider that resolves its own default would apply to a
+    /// request carrying `requested` — `None` for providers that apply only
+    /// what they are handed.
+    ///
+    /// Codex is the one that answers for itself: it bakes the entry's level
+    /// in at construction and substitutes a model-family default when none
+    /// was configured, so an unconfigured entry there still runs at a real
+    /// level and must bill as one.
+    fn self_resolved_effort(&self, requested: Option<&str>) -> Option<String> {
+        match self {
+            Self::OpenAiSubscription(m) => Some(m.effective_effort_label(requested)),
+            _ => None,
+        }
+    }
+
     /// `effort` is the per-request reasoning-effort override from
     /// [`ChatRequest::reasoning_effort`]. Only the `openai-subscription` arm
     /// consumes it; every other provider ignores it (its effort, if any, is
@@ -1381,6 +1397,13 @@ pub trait LlmCompletion: Send + Sync {
     async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse>;
     async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream>;
     fn model_info(&self) -> &ModelInfo;
+    /// The reasoning effort this client actually applies to a request whose
+    /// [`ChatRequest::reasoning_effort`] override is `requested`: the entry's
+    /// configured level fills in when the caller passes `None`. `None` means
+    /// no effort is sent to this provider. Required rather than defaulted —
+    /// a client that silently answers "not applicable" is how effort stopped
+    /// reaching `cost_records` in the first place.
+    fn effective_effort(&self, requested: Option<&str>) -> Option<String>;
 }
 
 #[async_trait::async_trait]
@@ -1393,6 +1416,9 @@ impl LlmCompletion for LlmClient {
     }
     fn model_info(&self) -> &ModelInfo {
         LlmClient::model_info(self)
+    }
+    fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+        LlmClient::effective_effort(self, requested)
     }
 }
 
@@ -1416,6 +1442,15 @@ pub struct LlmClient {
     /// non-text block degrades to a `[image: …]`-style text stub —
     /// the model never sees the actual payload.
     blob_fetcher: Option<std::sync::Arc<dyn BlobFetcher>>,
+    /// The entry's configured reasoning effort, parsed once. Fills in when a
+    /// request carries no per-session pin, so an operator who set it once
+    /// gets it on every call — including the auxiliary ones (compression,
+    /// titles, tool side-LLMs) that never see a session's pin.
+    ///
+    /// Held here rather than inside each provider client because it is
+    /// operator config, not provider state: the same rung, whichever dialect
+    /// ends up carrying it.
+    entry_effort: Option<crate::effort::EffortPick>,
 }
 
 impl LlmClient {
@@ -1425,7 +1460,26 @@ impl LlmClient {
             model_info,
             model,
             blob_fetcher: None,
+            entry_effort: None,
         }
+    }
+
+    /// Carry the entry's configured reasoning effort. Set once, centrally,
+    /// for every provider — see [`LlmRegistry::build_client`].
+    ///
+    /// Fails when the operator picked a rung this provider's dialect cannot
+    /// express, so a level that would never reach the wire is caught at
+    /// startup with a message naming the alternatives, rather than at the
+    /// first call — or worse, rounded to a neighbour nobody asked for.
+    pub(crate) fn with_entry_effort(mut self, effort: Option<&str>) -> crate::Result<Self> {
+        let pick = effort.map(crate::effort::EffortPick::parse);
+        if let Some(pick) = &pick {
+            self.effort_wire()
+                .wire_level(pick)
+                .map_err(|e| LlmError::Config(format!("{}: {e}", self.model_info.provider)))?;
+        }
+        self.entry_effort = pick;
+        Ok(self)
     }
 
     /// Attach a blob fetcher so the client can materialise multimodal
@@ -1447,9 +1501,12 @@ impl LlmClient {
 
         let rig_request = self.build_completion_request(request).await;
 
+        // Providers that build their own body take the level directly,
+        // already translated into their dialect.
+        let native_effort = self.wire_effort(request.reasoning_effort.as_deref());
         let response = self
             .model
-            .completion(rig_request, request.reasoning_effort.as_deref())
+            .completion(rig_request, native_effort.as_deref())
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -1476,9 +1533,10 @@ impl LlmClient {
 
         let rig_request = self.build_completion_request(request).await;
 
+        let native_effort = self.wire_effort(request.reasoning_effort.as_deref());
         let stream = self
             .model
-            .stream(rig_request, request.reasoning_effort.as_deref())
+            .stream(rig_request, native_effort.as_deref())
             .await
             .map_err(rig_completion_to_error)?;
 
@@ -1629,6 +1687,15 @@ impl LlmClient {
             chat_history.push(msg);
         }
 
+        // The operator's rung, translated into this provider's dialect and
+        // wrapped in the shape it expects. `None` when the provider takes it
+        // by another route or isn't wired for it — in which case nothing is
+        // sent, and the request looks exactly as it did before effort
+        // existed.
+        let additional_params = self
+            .wire_effort(request.reasoning_effort.as_deref())
+            .and_then(|level| self.effort_wire().params(&level));
+
         CompletionRequest {
             model: None,
             preamble,
@@ -1638,7 +1705,7 @@ impl LlmClient {
             temperature: request.temperature.map(|t| t as f64),
             max_tokens: Some(4096),
             tool_choice: None,
-            additional_params: None,
+            additional_params,
             output_schema: None,
         }
     }
@@ -1967,6 +2034,67 @@ impl LlmClient {
     /// Returns the full model metadata.
     pub fn model_info(&self) -> &ModelInfo {
         &self.model_info
+    }
+
+    /// What the operator asked for on this call: the per-request pin wins,
+    /// the entry's configured level fills in. Canonical rungs report their
+    /// ladder name so spend stays comparable across providers that spell the
+    /// same depth differently; `None` means nothing reaches this provider.
+    /// `pub(crate)`: outside this crate the same value is reachable through
+    /// [`LlmCompletion::effective_effort`].
+    pub(crate) fn effective_effort(&self, requested: Option<&str>) -> Option<String> {
+        if !self.effort_wire().carries_effort() {
+            return None;
+        }
+        let pick = self.pick_for(requested);
+        match self
+            .model
+            .self_resolved_effort(pick.as_ref().map(|p| p.label()))
+        {
+            // Reported in the provider's own spelling; fold it back onto the
+            // ladder so cost rows stay comparable across providers.
+            Some(label) => Some(
+                crate::effort::ReasoningEffort::parse(&label)
+                    .map(|l| l.as_str().to_string())
+                    .unwrap_or(label),
+            ),
+            None => pick.map(|p| p.label().to_string()),
+        }
+    }
+
+    /// The effort dialect this client's provider speaks.
+    pub(crate) fn effort_wire(&self) -> crate::effort::EffortWire {
+        crate::providers::effort_wire_for_provider(&self.model_info.provider)
+    }
+
+    /// The pick governing this call — the request's pin, else the entry's.
+    fn pick_for(&self, requested: Option<&str>) -> Option<crate::effort::EffortPick> {
+        requested
+            .map(crate::effort::EffortPick::parse)
+            .or_else(|| self.entry_effort.clone())
+    }
+
+    /// The string this provider should receive for this call, already in its
+    /// own dialect. `None` when nothing is sent — reasoning off, no pick, or
+    /// a provider baybo has no effort wiring for.
+    ///
+    /// A pin the dialect cannot express is dropped with a warning rather than
+    /// failing the call: the entry was validated at startup, so this can only
+    /// be a per-session pick, and losing a turn to a picker that offered a
+    /// bad rung is worse than running at the provider's default.
+    fn wire_effort(&self, requested: Option<&str>) -> Option<String> {
+        let pick = self.pick_for(requested)?;
+        match self.effort_wire().wire_level(&pick) {
+            Ok(level) => level,
+            Err(e) => {
+                tracing::warn!(
+                    provider = %self.model_info.provider,
+                    model = %self.model_info.id,
+                    "{e}; sending no effort for this call"
+                );
+                None
+            }
+        }
     }
 
     /// Issue a minimal chat request to verify provider connectivity and auth.
@@ -3774,5 +3902,170 @@ mod provider_metadata_helpers_tests {
         // some unrelated factory's metadata.
         assert!(default_api_key_env_for_provider("not-a-real-provider").is_none());
         assert!(default_base_url_for_provider("not-a-real-provider").is_none());
+    }
+}
+
+/// The operator's reasoning effort has to survive all the way into the
+/// provider's request body — and stay out of it for providers baybo does not
+/// send it to. Both halves are asserted here because both have failed
+/// silently before: the level was recorded but never sent, and every
+/// provider but one dropped it on the floor.
+#[cfg(test)]
+mod effort_wiring_tests {
+    use super::*;
+    use baybo_model::{ChatMessage, ContentBlock};
+    use serde_json::json;
+
+    fn client_with_effort(provider: &str, model: &str, entry_effort: Option<&str>) -> LlmClient {
+        LlmProviderRegistry::with_default_providers()
+            .build_client(&LlmProviderConfig {
+                provider: provider.into(),
+                api_key: Some("test".into()),
+                base_url: None,
+                model: model.into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: entry_effort.map(str::to_string),
+                vault: None,
+                proxy: None,
+            })
+            .expect("client builds without a network round trip")
+    }
+
+    fn request(pin: Option<&str>) -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage::agent_context(vec![ContentBlock::Text(
+                "hi".into(),
+            )])],
+            temperature: None,
+            tools: vec![],
+            reasoning_effort: pin.map(str::to_string),
+        }
+    }
+
+    async fn body_effort(client: &LlmClient, pin: Option<&str>) -> Option<serde_json::Value> {
+        client
+            .build_completion_request(&request(pin))
+            .await
+            .additional_params
+    }
+
+    #[tokio::test]
+    async fn the_entry_default_reaches_each_dialect_in_its_own_shape() {
+        let openai_compatible = client_with_effort("deepseek", "deepseek-chat", Some("medium"));
+        assert_eq!(
+            body_effort(&openai_compatible, None).await,
+            Some(json!({"reasoning_effort": "medium"}))
+        );
+
+        let anthropic = client_with_effort("anthropic", "claude-sonnet-4-6", Some("high"));
+        assert_eq!(
+            body_effort(&anthropic, None).await,
+            Some(json!({"output_config": {"effort": "high"}}))
+        );
+
+        let gemini = client_with_effort("gemini", "gemini-2.5-flash", Some("low"));
+        assert_eq!(
+            body_effort(&gemini, None).await,
+            Some(json!({"generationConfig": {"thinkingConfig": {"thinkingLevel": "low"}}}))
+        );
+    }
+
+    /// The chat header's per-session pin beats the entry default, and is
+    /// what the ledger records — on every provider, not just the one that
+    /// used to consume a per-request effort.
+    #[tokio::test]
+    async fn a_session_pin_overrides_the_entry_default() {
+        let client = client_with_effort("deepseek", "deepseek-chat", Some("medium"));
+        assert_eq!(
+            body_effort(&client, Some("high")).await,
+            Some(json!({"reasoning_effort": "high"}))
+        );
+        assert_eq!(
+            client.effective_effort(Some("high")).as_deref(),
+            Some("high")
+        );
+    }
+
+    /// A provider baybo does not send effort to must look exactly as it did
+    /// before this existed — nothing in the body, and NULL on the cost row
+    /// rather than a level that never reached the wire.
+    #[tokio::test]
+    async fn an_unwired_provider_neither_sends_nor_records_a_level() {
+        let client = client_with_effort("cohere", "command-r", Some("high"));
+        assert_eq!(body_effort(&client, None).await, None);
+        assert_eq!(body_effort(&client, Some("xhigh")).await, None);
+        assert_eq!(client.effective_effort(Some("xhigh")), None);
+    }
+
+    /// Nothing configured anywhere: the request is byte-for-byte what it
+    /// was before effort was wired, so this cannot regress existing setups.
+    #[tokio::test]
+    async fn no_configured_effort_sends_nothing() {
+        let client = client_with_effort("deepseek", "deepseek-chat", None);
+        assert_eq!(body_effort(&client, None).await, None);
+        assert_eq!(client.effective_effort(None), None);
+    }
+
+    /// A rung the dialect cannot say is refused where the operator can still
+    /// act on it — at startup, naming the alternatives — instead of being
+    /// rounded to a neighbour at request time.
+    #[test]
+    fn a_rung_the_dialect_cannot_express_fails_the_entry() {
+        let registry = LlmProviderRegistry::with_default_providers();
+        let err = registry
+            .build_client(&LlmProviderConfig {
+                provider: "deepseek".into(),
+                api_key: Some("test".into()),
+                base_url: None,
+                model: "deepseek-chat".into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                // No `reasoning_effort` value disables reasoning on the
+                // OpenAI dialect — that is a different mechanism entirely.
+                reasoning_effort: Some("off".into()),
+                vault: None,
+                proxy: None,
+            })
+            .err();
+        // LlmClient is intentionally not Debug; expand expect_err manually.
+        let msg = match err {
+            Some(e) => e.to_string(),
+            None => panic!("`off` has no OpenAI-dialect spelling, so the entry must fail"),
+        };
+        assert!(msg.contains("off"), "names the rejected rung: {msg}");
+        assert!(
+            msg.contains("low, medium, high"),
+            "lists the usable rungs: {msg}"
+        );
+    }
+
+    /// Operators who configured this before the ladder existed have `none`
+    /// on disk; it is Codex's spelling of `off` and keeps working, while the
+    /// cost row records the ladder's own name for that rung.
+    #[test]
+    fn the_ladder_absorbs_the_codex_spelling_of_off() {
+        assert_eq!(
+            crate::effort::ReasoningEffort::parse("none"),
+            Some(crate::effort::ReasoningEffort::Off)
+        );
+        assert_eq!(
+            crate::effort::EffortPick::parse("NONE").label(),
+            crate::effort::ReasoningEffort::Off.as_str()
+        );
+    }
+
+    /// A level baybo has not learned still reaches the provider, so a vendor
+    /// shipping a new rung doesn't have to wait on a baybo release.
+    #[tokio::test]
+    async fn an_off_ladder_level_is_forwarded_untouched() {
+        let client = client_with_effort("deepseek", "deepseek-chat", Some("ultra"));
+        assert_eq!(
+            body_effort(&client, None).await,
+            Some(json!({"reasoning_effort": "ultra"}))
+        );
+        assert_eq!(client.effective_effort(None).as_deref(), Some("ultra"));
     }
 }

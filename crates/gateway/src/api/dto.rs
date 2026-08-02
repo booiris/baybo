@@ -273,6 +273,15 @@ pub struct LlmModelEntry {
     /// var). The literal value never leaves the gateway.
     pub api_key_configured: bool,
     pub reasoning_effort: Option<String>,
+    /// The thinking levels this entry's provider can actually be told, in
+    /// display order (cheapest first). Empty when baybo sends this provider
+    /// no effort at all, which is a picker's cue to offer none rather than a
+    /// ladder whose picks would be inert.
+    ///
+    /// Provider-scoped, not model-scoped: whether a *given* model accepts an
+    /// offered level is its API's answer, and encoding that here would be a
+    /// table that silently goes stale.
+    pub available_efforts: Vec<String>,
     pub is_default: bool,
 
     /// The **default** model's `supports_vision` override. `None` =

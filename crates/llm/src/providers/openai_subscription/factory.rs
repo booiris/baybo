@@ -192,6 +192,54 @@ mod tests {
         );
     }
 
+    /// What the cost ledger records for a call: the entry default fills in
+    /// when the request carries no pin, a pin overrides it, and both are
+    /// clamped to what the model family accepts.
+    #[tokio::test]
+    async fn effective_effort_resolves_entry_default_and_pin() {
+        let with_entry_effort = |level: Option<&str>, model: &str| {
+            let mut c = cfg(Some(vault()));
+            c.reasoning_effort = level.map(str::to_string);
+            c.model = model.to_string();
+            OpenAiSubscriptionProviderFactory
+                .create(&c)
+                .expect("create should succeed")
+        };
+
+        let client = with_entry_effort(Some("high"), "gpt-5");
+        assert_eq!(client.effective_effort(None).as_deref(), Some("high"));
+        assert_eq!(client.effective_effort(Some("low")).as_deref(), Some("low"));
+
+        // Unconfigured entry still runs at the model family's default —
+        // the case that made up ~100% of real traffic and recorded NULL.
+        assert_eq!(
+            with_entry_effort(None, "gpt-5")
+                .effective_effort(None)
+                .as_deref(),
+            Some("medium")
+        );
+
+        // Reasoning explicitly off reads as a level, not as "nothing sent",
+        // so the ledger can tell the two apart — under the ladder's name for
+        // that rung, not Codex's, so cost rows stay comparable across
+        // providers that spell the same depth differently.
+        assert_eq!(
+            with_entry_effort(Some("none"), "gpt-5.6")
+                .effective_effort(None)
+                .as_deref(),
+            Some("off")
+        );
+
+        // The pin reaches the wire as written — no clamping to the family's
+        // advertised set, in either direction.
+        assert_eq!(
+            with_entry_effort(None, "gpt-5-pro")
+                .effective_effort(Some("low"))
+                .as_deref(),
+            Some("low")
+        );
+    }
+
     // base_url validator regressions.
 
     #[test]

@@ -196,10 +196,15 @@ pub struct LlmModelInfo {
     /// of them; the picker lists them under the entry. Empty only when the
     /// gateway sent no list at all.
     pub model_candidates: Vec<String>,
-    /// The entry's reasoning-effort override — one of
-    /// `none`/`minimal`/`low`/`medium`/`high`/`xhigh`, or `None` for the
-    /// provider default. Set via [`crate::BayboClient::llm_set_reasoning_effort`].
+    /// The entry's reasoning-effort override — a rung on the thinking ladder
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), or `None` for
+    /// the provider's own default.
     pub reasoning_effort: Option<String>,
+    /// The rungs THIS entry's provider can be told, cheapest first. The panel
+    /// offers exactly these — an empty list means the provider takes no
+    /// effort from baybo at all, and the Thinking row is hidden rather than
+    /// offering picks that would never reach the wire.
+    pub available_efforts: Vec<String>,
 }
 
 /// The gateway's configured LLM entries plus the current `default-llm` name

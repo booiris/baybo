@@ -111,6 +111,11 @@ final class ModelCatalog: ObservableObject {
             var model: String
             var modelCandidates: [String]
             var reasoningEffort: String?
+            /// Absent in mirrors written before the thinking ladder existed —
+            /// decodes empty, which reads as "no Thinking row" until the next
+            /// live fetch fills it in. A cold-paint concession, not a source
+            /// of truth.
+            var availableEfforts: [String]?
         }
     }
 
@@ -122,7 +127,8 @@ final class ModelCatalog: ObservableObject {
         models = mirror.models.map {
             LlmModelInfo(
                 name: $0.name, provider: $0.provider, model: $0.model,
-                modelCandidates: $0.modelCandidates, reasoningEffort: $0.reasoningEffort)
+                modelCandidates: $0.modelCandidates, reasoningEffort: $0.reasoningEffort,
+                availableEfforts: $0.availableEfforts ?? [])
         }
     }
 
@@ -132,7 +138,8 @@ final class ModelCatalog: ObservableObject {
             models: models.map {
                 Mirror.Entry(
                     name: $0.name, provider: $0.provider, model: $0.model,
-                    modelCandidates: $0.modelCandidates, reasoningEffort: $0.reasoningEffort)
+                    modelCandidates: $0.modelCandidates, reasoningEffort: $0.reasoningEffort,
+                    availableEfforts: $0.availableEfforts)
             })
         guard let data = try? JSONEncoder().encode(mirror) else { return }
         try? data.write(to: mirrorURL, options: .atomic)
@@ -153,10 +160,12 @@ final class ModelCatalog: ObservableObject {
             models = [
                 LlmModelInfo(
                     name: "claude", provider: "anthropic", model: "claude-sonnet-5",
-                    modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil),
+                    modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil,
+                    availableEfforts: ["low", "medium", "high", "xhigh", "max"]),
                 LlmModelInfo(
                     name: "gpt", provider: "openai", model: "gpt-5.5",
-                    modelCandidates: ["gpt-5.5-mini", "o3"], reasoningEffort: "xhigh"),
+                    modelCandidates: ["gpt-5.5-mini", "o3"], reasoningEffort: "xhigh",
+                    availableEfforts: ["low", "medium", "high", "xhigh", "max"]),
             ]
             return true
         }

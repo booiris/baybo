@@ -430,6 +430,11 @@ struct WireLlmModel {
     model_list: Vec<WireLlmModelSpec>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// Thinking levels this entry's provider can actually be told. Empty
+    /// means baybo sends this provider no effort, so the panel hides the
+    /// Thinking row rather than offering inert picks.
+    #[serde(default)]
+    available_efforts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -919,6 +924,7 @@ pub(crate) async fn list_llm_models<C: GatewayJsonClient + Sync>(
                 model: m.model,
                 model_candidates: m.model_list.into_iter().map(|s| s.model).collect(),
                 reasoning_effort: m.reasoning_effort,
+                available_efforts: m.available_efforts,
             })
             .collect(),
     })
@@ -1702,7 +1708,7 @@ mod tests {
         let client = RecordingClient::new(
             r#"{"default_name":"fast","items":[
                 {"name":"fast","provider":"anthropic","model":"claude-haiku-4-5","api_key_configured":true,"is_default":true,"effective_context_window":200000,"effective_supports_vision":true,"effective_pricing":{}},
-                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
+                {"name":"5.5-max","provider":"openai","model":"gpt-5.5","model_list":[{"model":"gpt-5.5"},{"model":"o3","context_window":200000}],"reasoning_effort":"xhigh","available_efforts":["low","medium","high","xhigh","max"],"api_key_configured":false,"is_default":false,"effective_context_window":400000,"effective_supports_vision":false,"effective_pricing":{}}
             ]}"#,
         );
         let catalog = list_llm_models(&client).await.expect("models");
@@ -1722,6 +1728,15 @@ mod tests {
         // Each row's per-model overrides are dropped; only the ids reach the
         // picker, and the entry's default is already among them.
         assert_eq!(catalog.items[1].model_candidates, ["gpt-5.5", "o3"]);
+        // The rungs this provider can be told drive the Thinking sub-level.
+        assert_eq!(
+            catalog.items[1].available_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        // A gateway that sent no list (or a provider baybo tells nothing)
+        // decodes to empty, and the panel hides the row rather than offering
+        // picks that would never reach the wire.
+        assert!(catalog.items[0].available_efforts.is_empty());
     }
 
     /// The pin read rides the session detail with `limit=1` — the smallest page

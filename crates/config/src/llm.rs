@@ -87,24 +87,34 @@ pub struct LlmEntry {
     /// pick its own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Reasoning effort for providers that expose it (currently only
-    /// `openai-subscription` Codex Responses). One of `none`,
-    /// `minimal`, `low`, `medium`, `high`, `xhigh`. The provider
-    /// silently clamps to whatever the chosen model supports.
-    /// `None` lets the provider pick a sensible default.
+    /// How hard the model should think, on baybo's own ladder:
+    /// `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`
+    /// (`none` is accepted as a synonym for `off`). `None` lets the provider
+    /// pick its own default.
+    ///
+    /// The rung is translated into each provider's own vocabulary on the way
+    /// out — see `baybo_llm::effort`. A rung a provider cannot express fails
+    /// at startup with a message naming the ones it can, rather than being
+    /// rounded to a neighbour. Whether a *specific model* accepts an
+    /// expressible rung stays the vendor's call: it is sent and their API
+    /// answers (`gpt-5.6-sol`, for one, refuses `max`).
+    ///
+    /// A value that is not a rung is forwarded verbatim, so a level baybo
+    /// hasn't learned yet is reachable without waiting on a release.
+    ///
+    /// A provider baybo has no effort wiring for ignores this field; see
+    /// `AnyCompletionModel::effort_wire` for which those are.
     ///
     /// Entry-level rather than per-model because it is a preference, not
     /// a fact about a model: a session's own thinking-level pick
     /// (`sessions.last_effort`) overrides it per request.
     ///
-    /// Known limitation: because it is entry-level and baked into each
-    /// client at construction, [`Self::lite_model`]'s client inherits it,
-    /// and the auxiliary call sites pass no per-request effort — so an
-    /// `openai-subscription` entry set to `"high"` runs its risk judges at
-    /// high effort, partly undoing the point of a lite model. There is no
-    /// per-model override; the only remedy is lowering the entry default
-    /// for every session. Affects that provider alone — nothing else reads
-    /// this field.
+    /// Known limitation: [`Self::lite_model`]'s client is built from the
+    /// same entry, and the auxiliary call sites (risk judges, page
+    /// summaries, titles) pass no per-request effort — so an entry set to
+    /// `"high"` runs those at high effort too, partly undoing the point of a
+    /// lite model. There is no per-model override; the only remedy is
+    /// lowering the entry default for every session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }

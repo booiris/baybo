@@ -264,10 +264,12 @@ struct ChatStoreModelTests {
                 items: [
                     LlmModelInfo(
                         name: "claude", provider: "anthropic", model: "claude-sonnet-5",
-                        modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil),
+                        modelCandidates: ["claude-opus-4-8"], reasoningEffort: nil,
+                        availableEfforts: ["low", "medium", "high", "xhigh", "max"]),
                     LlmModelInfo(
                         name: "gpt", provider: "openai", model: "gpt-5.5",
-                        modelCandidates: ["o3"], reasoningEffort: "high"),
+                        modelCandidates: ["o3"], reasoningEffort: "high",
+                        availableEfforts: ["low", "medium", "high", "xhigh", "max"]),
                 ]))
         let catalog = ModelCatalog(client: client, directory: temp.url)
         catalog.refreshIfNeeded()

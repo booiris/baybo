@@ -1686,12 +1686,17 @@ async fn set_session_model(
     // as a 400 rather than silently degrading to the default every turn.
     let effort_pick: Option<String> = match req.reasoning_effort.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(level) if LLM_EFFORT_LEVELS.contains(&level) => Some(level.to_string()),
-        Some(other) => {
-            return Err(GatewayError::BadRequest(format!(
-                "unknown reasoning_effort {other:?}; expected one of {LLM_EFFORT_LEVELS:?}"
-            )));
-        }
+        // Canonicalised on the way in, so `none` and `off` do not persist as
+        // two spellings of one rung.
+        Some(level) => match baybo_llm::effort::ReasoningEffort::parse(level) {
+            Some(rung) => Some(rung.as_str().to_string()),
+            None => {
+                return Err(GatewayError::BadRequest(format!(
+                    "unknown reasoning_effort {level:?}; expected one of {}",
+                    effort_ladder()
+                )));
+            }
+        },
     };
 
     // Persist the pin durably FIRST, via targeted flat-column writes
@@ -1745,9 +1750,16 @@ async fn set_session_model(
     }))
 }
 
-/// The reasoning-effort ladder the per-session pin accepts (mirrors the
-/// `crates/llm` registry contract). A value outside this set is a 400.
-const LLM_EFFORT_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+/// The rungs the per-session pin accepts, for the 400's message. The ladder
+/// itself lives in `baybo_llm::effort` — mirroring it here is how the gateway
+/// ended up two rungs behind it.
+fn effort_ladder() -> String {
+    baybo_llm::effort::ReasoningEffort::ALL
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
 #[derive(Debug, Deserialize, ToSchema)]

@@ -2009,6 +2009,17 @@ export interface components {
              */
             api_key_configured: boolean;
             api_key_env?: string | null;
+            /**
+             * @description The thinking levels this entry's provider can actually be told, in
+             *     display order (cheapest first). Empty when baybo sends this provider
+             *     no effort at all, which is a picker's cue to offer none rather than a
+             *     ladder whose picks would be inert.
+             *
+             *     Provider-scoped, not model-scoped: whether a *given* model accepts an
+             *     offered level is its API's answer, and encoding that here would be a
+             *     table that silently goes stale.
+             */
+            available_efforts: string[];
             base_url?: string | null;
             /**
              * @description The default model's `context_window` override. `None` = factory

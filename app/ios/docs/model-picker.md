@@ -34,7 +34,7 @@ Three levels replace in place, sub-levels headed by a back row:
    `ModelCatalog` has no entries — a first run that has never reached
    `GET /v1/llm/models` could not reach it at all.
 2. **That entry's models** (`model` + `model_list`, ✓ on the effective model) plus, below a hairline, the **Thinking** row — subtitled with the entry's current level and carrying the panel's one trailing `›`.
-3. **The levels** — `none/minimal/low/medium/high/xhigh` (`crates/llm` registry contract).
+3. **The levels** — whatever the entry's `available_efforts` lists, in that order. The rungs come from the SERVER, not a local list: each provider speaks its own effort vocabulary, so offering one its dialect cannot say would be a pick that never reaches the wire. An entry whose provider baybo tells nothing shows **no Thinking row at all** (level 2 hides it). `EffortLevel` only supplies the localized labels — a rung baybo learns later still renders, as its raw value.
 
 ### Accessibility contract
 
@@ -42,7 +42,7 @@ Panel rows set `accessibilityLabel` = title and `accessibilityValue` = subtitle,
 
 ## The catalog
 
-The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits, deleted on logout/rebind) for offline cold-paint.
+The catalog (`GET /v1/llm/models`, FFI `llm_list_models`, narrowed to name/provider/model/**model_list**/reasoning_effort/**available_efforts**) is **global** and cached **per app run** in `ModelCatalog.shared`, plus a **`models.json` mirror** (the `deck.json` idiom, written on fetch + effort edits, deleted on logout/rebind) for offline cold-paint.
 
 Because of the mirror, a cold offline start still paints the pill and the panel. The pill renders only once the catalog has entries, and the pill **NEVER shows a placeholder** — always the best-known model id.
 
@@ -81,8 +81,9 @@ That failure path **defers its notice** (`draftPinFailed`, surfaced after the se
 Root workspace, **NOT** covered by `app/ios` CI:
 
 - `LlmEntry.model_list` / `lite_model` (config). The LLM pool pre-builds a client per listed model; `resolve(name, model)` picks it.
-- Effort is a **PER-REQUEST** override on `ChatRequest.reasoning_effort` that only `openai-subscription` consumes (`AnyCompletionModel::stream(request, effort)`; other providers ignore it — no `additional_params` pollution).
+- Effort is a rung on baybo's own ladder (`baybo_llm::effort`: `off/minimal/low/medium/high/xhigh/max`), translated per provider on the way out — `reasoning_effort` for the OpenAI dialect, `output_config.effort` for Anthropic, `generationConfig.thinkingConfig.thinkingLevel` for Gemini, and Codex's own body for `openai-subscription`. The per-request `ChatRequest.reasoning_effort` is the session pin; the entry's configured level fills in when it is absent. A rung a provider's dialect cannot express fails the ENTRY at startup; the level a call actually ran at is what lands on its `cost_records` row.
+- `GET /v1/llm/models` carries `available_efforts` per entry — the rungs that provider can be told. Empty for providers baybo has no effort wiring for (`baybo_llm::providers::EFFORT_WIRES` is the table; a registered provider missing a row fails a test).
 - `last_model` + `last_effort` are their own flat SQLite columns (`set_last_model` / `set_last_effort`, additive migrations — keep `last_llm`'s golden JSON).
 - `AgentMessage::SetModel{llm, model, effort}` threads the triple through the spawner (`ActorSpawner`'s `initial_effort`) → `AgentLoop.initial_effort` → every turn's `ChatRequest`.
-- `validate_llm_model` + the `LLM_EFFORT_LEVELS` check reject a model outside the entry's `entry_model_ids` / an unknown effort.
+- `validate_llm_model` rejects a model outside the entry's `entry_model_ids`; the pin's effort is parsed against the ladder (`ReasoningEffort::parse`) and **canonicalised** on the way in, so `none` and `off` never persist as two spellings of one rung.
 - `PUT /v1/chat/sessions/{id}/model` carries `{llm, model, reasoning_effort}`; the old global `llm_set_reasoning_effort` FFI was removed (superseded).

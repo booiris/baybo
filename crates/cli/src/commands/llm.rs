@@ -309,7 +309,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             )
         };
         options.push(api_key_label);
-        if working.provider == SUB_PROVIDER_NAME {
+        if !effort_levels_for(&working.provider).is_empty() {
             options.push(format!(
                 "reasoning    = {}",
                 working.reasoning_effort.as_deref().unwrap_or("(default)")
@@ -376,19 +376,20 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                 live[mi].id.clone()
             };
             if new_model != working.model {
-                // Reasoning effort is model-family scoped; clamp on
-                // change so the persisted value is always valid.
-                if working.provider == SUB_PROVIDER_NAME
-                    && let Some(current) = &working.reasoning_effort
+                // The level is NOT reset to fit the new model: which rungs a
+                // given model takes is its API's answer (`gpt-5.6-sol`
+                // refuses `max`, other 5.6 models take it), and a local table
+                // guessing that just silently discarded valid picks. A level
+                // the model won't take now surfaces as that API's error.
+                if let Some(current) = &working.reasoning_effort
+                    && working.provider == SUB_PROVIDER_NAME
+                    && !baybo_llm::providers::openai_subscription::allowed_efforts_for(&new_model)
+                        .iter()
+                        .any(|e| e.eq_ignore_ascii_case(current))
                 {
-                    let allowed =
-                        baybo_llm::providers::openai_subscription::allowed_efforts_for(&new_model);
-                    if !allowed.iter().any(|e| e.eq_ignore_ascii_case(current)) {
-                        eprintln!(
-                            "(reasoning effort {current:?} is not valid for {new_model}; reset to default)"
-                        );
-                        working.reasoning_effort = None;
-                    }
+                    eprintln!(
+                        "(note: {new_model} may not accept reasoning effort {current:?} — keeping it; the provider will say)"
+                    );
                 }
                 working.model = new_model;
                 changed.push("model");
@@ -423,11 +424,10 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             run_subscription_login(vault, ctx.proxy_settings()).await?;
             changed.push("oauth");
         } else if picked.starts_with("reasoning ") {
-            let levels =
-                baybo_llm::providers::openai_subscription::allowed_efforts_for(&working.model);
-            let labels: Vec<&str> = levels.to_vec();
-            let li = select_one("Reasoning effort:", &labels)?;
-            let new_effort = Some(levels[li].to_string());
+            let levels = effort_levels_for(&working.provider);
+            let labels: Vec<&str> = levels.iter().map(|l| l.as_str()).collect();
+            let li = select_one("Thinking effort:", &labels)?;
+            let new_effort = Some(labels[li].to_string());
             if new_effort != working.reasoning_effort {
                 working.reasoning_effort = new_effort;
                 changed.push("reasoning_effort");
@@ -860,4 +860,15 @@ fn print_device_code(code: &DeviceCode) {
         "\nopen this URL on any device, sign in, and enter the code:\n  url:  {}\n  code: {}\n",
         code.verification_url, code.user_code,
     );
+}
+
+/// The thinking rungs `provider` can actually be told, cheapest first.
+/// Empty when baybo sends that provider no effort at all, which is the
+/// picker's cue to hide the row rather than offer inert picks.
+fn effort_levels_for(provider: &str) -> Vec<String> {
+    baybo_llm::providers::effort_wire_for_provider(provider)
+        .levels()
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
 }

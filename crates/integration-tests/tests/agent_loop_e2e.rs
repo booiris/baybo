@@ -4310,6 +4310,10 @@ mod blocking_llm {
         fn model_info(&self) -> &ModelInfo {
             &self.model_info
         }
+
+        fn effective_effort(&self, _requested: Option<&str>) -> Option<String> {
+            None
+        }
     }
 }
 
@@ -4458,6 +4462,10 @@ mod partial_stream_llm {
 
         fn model_info(&self) -> &ModelInfo {
             &self.model_info
+        }
+
+        fn effective_effort(&self, _requested: Option<&str>) -> Option<String> {
+            None
         }
     }
 }

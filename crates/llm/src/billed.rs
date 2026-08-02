@@ -152,10 +152,13 @@ impl BoundBilledLlm {
     /// produced no usage has nothing to bill.
     pub async fn chat(&self, request: &ChatRequest) -> crate::Result<BilledChatResponse> {
         let response = self.llm.chat(request).await?;
+        let effort = self
+            .llm
+            .effective_effort(request.reasoning_effort.as_deref());
         let cost_micros = self.llm.record(
             &self.attribution,
             &self.llm.model_info().id,
-            request.reasoning_effort.as_deref(),
+            effort.as_deref(),
             &response.usage,
         );
         Ok(BilledChatResponse {
@@ -175,11 +178,14 @@ impl BoundBilledLlm {
     /// Every current caller drains it inside the agent loop, which holds.
     pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
         let inner = self.llm.chat_stream(request).await?;
+        let reasoning_effort = self
+            .llm
+            .effective_effort(request.reasoning_effort.as_deref());
         Ok(LlmStream::from_stream(RecordingStream {
             inner,
             llm: Arc::clone(&self.llm),
             attribution: self.attribution.clone(),
-            reasoning_effort: request.reasoning_effort.clone(),
+            reasoning_effort,
             last_usage: TokenUsage::default(),
             recorded: false,
         }))
@@ -193,6 +199,9 @@ struct RecordingStream {
     inner: LlmStream,
     llm: Arc<BillableLlm>,
     attribution: Attribution,
+    /// Resolved at stream construction, not at record time: it describes
+    /// the request that was already sent, and resolving it once keeps the
+    /// drop path free of any work that could differ from the live call.
     reasoning_effort: Option<String>,
     last_usage: TokenUsage,
     recorded: bool,
@@ -300,10 +309,71 @@ mod tests {
         assert_eq!(attr.session_id.as_str(), "system:skill-assessor");
     }
 
+    /// The recorded effort comes from the CLIENT, not the request. A turn
+    /// with no per-session pin still ran at the entry's configured level, so
+    /// billing it as "unspecified" would under-report every call that never
+    /// touched the thinking picker — which is nearly all of them.
+    #[tokio::test]
+    async fn chat_records_client_effort_when_request_carries_no_override() {
+        let probe = Arc::new(RecorderProbe::default());
+        let stub = Arc::new(StubLlm::new().with_effective_effort(Some("high")));
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: usage(1, 2),
+            thinking: None,
+        });
+        let guarded = BillableLlm::new(
+            stub as Arc<dyn LlmCompletion>,
+            billing_with_probe(probe.clone()),
+        );
+        let bound = guarded.bind(Attribution::system("unit-test"));
+
+        bound
+            .chat(&request_with_effort(None))
+            .await
+            .expect("chat ok");
+
+        let calls = probe.calls.lock();
+        assert_eq!(calls[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// The mirror case: a client that sends no effort records none, even
+    /// when the caller passes an override. The chat header offers its
+    /// thinking ladder on every entry, including ones whose provider this
+    /// crate never sends an effort to — and a cost row naming a level that
+    /// never reached the wire is worse than an empty one.
+    #[tokio::test]
+    async fn chat_records_no_effort_when_the_client_sends_none() {
+        let probe = Arc::new(RecorderProbe::default());
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: usage(1, 2),
+            thinking: None,
+        });
+        let guarded = BillableLlm::new(
+            stub as Arc<dyn LlmCompletion>,
+            billing_with_probe(probe.clone()),
+        );
+        let bound = guarded.bind(Attribution::system("unit-test"));
+
+        bound
+            .chat(&request_with_effort(Some("high")))
+            .await
+            .expect("chat ok");
+
+        let calls = probe.calls.lock();
+        assert_eq!(calls[0].reasoning_effort, None);
+    }
+
     #[tokio::test]
     async fn chat_records_response_usage() {
         let probe = Arc::new(RecorderProbe::default());
-        let stub = Arc::new(StubLlm::new());
+        let stub = Arc::new(StubLlm::new().with_effective_effort(Some("high")));
         stub.push_response(LlmResponse {
             content: "ok".into(),
             content_blocks: vec![],
@@ -334,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_records_terminal_usage_once() {
         let probe = Arc::new(RecorderProbe::default());
-        let stub = Arc::new(StubLlm::new());
+        let stub = Arc::new(StubLlm::new().with_effective_effort(Some("xhigh")));
         stub.push_stream(vec![
             StreamEvent::Text("hi".into()),
             StreamEvent::Usage(usage(7, 9)),
@@ -346,7 +416,7 @@ mod tests {
         let bound = guarded.bind(Attribution::system("stream-test"));
 
         let mut stream = bound
-            .chat_stream(&request_with_effort(Some("xhigh")))
+            .chat_stream(&request_with_effort(None))
             .await
             .expect("stream ok");
         while stream.next().await.is_some() {}
