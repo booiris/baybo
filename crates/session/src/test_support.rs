@@ -540,7 +540,7 @@ impl SessionStore for MemorySessionStore {
                 })
             })
             .collect();
-        out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+        out.sort_by_key(|s| std::cmp::Reverse(s.last_activity_at));
         Ok(out)
     }
 

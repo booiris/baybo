@@ -6,9 +6,10 @@
 
 [profile.default]
 # A hung test must FAIL the run, not wedge it. nextest's default is to wait
-# forever: a `channel_ws` deadlock (rare, but reproducible at ~1-in-50 when
-# several suite runs share a loaded box) once left a test process alive for
-# eight hours while the run reported nothing at all.
+# forever: an upstream sqlite lock-order inversion — since fixed, and held
+# fixed by the `rusqlite = "0.40"` floor in the root Cargo.toml — once left a
+# `channel_ws` test process alive for eight hours while the run reported
+# nothing at all.
 # The whole suite finishes in ~3.2s and its slowest single test is ~0.5s, so
 # terminating at 4 x 30s only ever fires on a genuine hang.
 slow-timeout = { period = "30s", terminate-after = 4 }

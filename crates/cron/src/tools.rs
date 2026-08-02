@@ -680,7 +680,7 @@ impl Tool for CronListTool {
             .list_all_jobs()
             .await
             .map_err(|e| ToolError::Execution(format!("{e}")))?;
-        jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        jobs.sort_by_key(|j| j.created_at);
 
         let rows: Vec<Value> = jobs
             .iter()

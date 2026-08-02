@@ -6,7 +6,11 @@
 # workspace (the repo root excludes it and it has no path-deps reaching outside
 # this directory), so the build context is just remote-host/.
 
-FROM rust:1.94.1-bookworm AS builder
+# Keep in step with the repo's rust-toolchain.toml: the build context is only
+# remote-host/, so that file never reaches this image and the tag here is the
+# whole pin. It is also a floor, not just a preference — libsqlite3-sys 0.38
+# (rusqlite 0.40) builds with `cfg_select!`, stable only since 1.95.
+FROM rust:1.97.1-bookworm AS builder
 # rustls' crypto provider (aws-lc-rs) and ring (via jsonwebtoken) compile C +
 # assembly: they need cmake plus a C toolchain and perl (the latter two already
 # ship in the full rust image). No openssl anywhere, so no libssl-dev.

@@ -219,7 +219,7 @@ impl CronStore for InMemoryCronStore {
             .filter(|j| j.is_deleted())
             .cloned()
             .collect();
-        deleted.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+        deleted.sort_by_key(|j| std::cmp::Reverse(j.deleted_at));
         Ok(deleted)
     }
 

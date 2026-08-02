@@ -21,7 +21,7 @@ Because the trait contracts and their row/DTO types live in `baybo-store` (a lea
 
 ### One connection per in-flight operation — a memory-safety rule, not a tuning knob
 
-`SqlitePool` (`sqlite/mod.rs`) is a real pool of `rusqlite::Connection`s (`deadpool-sqlite`, `POOL_SIZE = 8`). Stores never hold a connection; they reach the database only through:
+`SqlitePool` (`sqlite/mod.rs`) is a real pool of `rusqlite::Connection`s (`POOL_SIZE = 8`). Stores never hold a connection; they reach the database only through:
 
 ```rust
 pool.interact("sessions.load_last_user_message", move |conn| { … }).await
@@ -39,6 +39,10 @@ Consequences worth knowing:
 - **No `.await` inside a closure.** A method that must await something non-SQL between statements (`sqlite/blob.rs` does, for path locks and filesystem writes) splits into several `interact` calls. That is behaviour-preserving only where the statements were not already one transaction — check before splitting.
 - **`busy_timeout` is 5s, not 0.** With a single shared connection, intra-process write contention was impossible: everything queued behind one handle. A pool makes concurrent writers real, so without a timeout the agent loop and the trace sink would trade spurious `SQLITE_BUSY`. [`retry`](../../crates/storage/src/retry.rs) is now the *second* line of defence, for cross-process contention (the CLI writing the same file as a running gateway) that outlives the timeout.
 - **Transactions get exclusivity for free.** A `BEGIN IMMEDIATE` block runs inside one closure on one connection, so another task's statements can no longer land inside it — which they could when every task shared the one handle.
+
+The pool itself is ~60 lines in `sqlite/mod.rs`: all eight connections opened in `build`, parked in a `Vec` behind a `parking_lot::Mutex`, and handed out one per `tokio::sync::Semaphore` permit, with the closure and the checkout both living on a `spawn_blocking` thread. Two details are load-bearing. The permit is released *after* the connection is back in the pool, or a woken waiter would find nothing to take. And a closure that panics takes its connection with it rather than returning one that may sit mid-statement — `PoolInner::take` then opens a replacement, which is the only path that opens a connection after `build` and the reason `open_leaves_no_connection_to_be_created_later` asserts it stays unreached in ordinary service.
+
+Owning those lines is also what keeps the `rusqlite` version free to move: a pool crate pinning an older `rusqlite` is what stranded this workspace on SQLite 3.51.1, whose `unixLock` → `unixIsSharingShmNode` → `unixEnterMutex` path takes the process-global `unixBigLock` while holding a file's inode mutex — the exact order sqlite's own comment marks ERROR. One thread closing a database while another opened one deadlocked the pair, across *unrelated* files, and the suite hung roughly one run in fifty. Upstream fixed it in 3.51.3; the workspace `rusqlite = "0.40"` floor (SQLite 3.53.2) is what keeps it fixed.
 
 ### All store traits live in the ports crate
 
