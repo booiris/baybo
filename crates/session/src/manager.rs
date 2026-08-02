@@ -340,7 +340,7 @@ impl SessionManager {
     /// Return every session known to the underlying store, newest-active first.
     pub async fn list(&self) -> Result<Vec<Session>> {
         let mut sessions = self.store.list_all().await?;
-        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active));
         Ok(sessions)
     }
 
@@ -355,7 +355,7 @@ impl SessionManager {
         channel: &baybo_model::ChannelType,
     ) -> Result<Vec<Session>> {
         let mut sessions = self.store.list_by_channel(channel).await?;
-        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active));
         Ok(sessions)
     }
 

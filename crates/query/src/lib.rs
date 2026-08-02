@@ -1028,7 +1028,7 @@ impl QueryApi {
     ) -> Result<ReplayedConversation> {
         // Full turns, oldest-first for replay.
         let mut full_turns = self.turns.list_by_session(session_id, None).await?;
-        full_turns.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        full_turns.sort_by_key(|t| t.created_at);
 
         // The truncation target's owning turn comes from the step row
         // itself — one point lookup instead of scanning every turn's
@@ -1101,7 +1101,7 @@ impl QueryApi {
         // Re-sort oldest-first to match the trace sidebar's turn
         // numbering (`#1, #2, ...` from earliest to latest).
         let mut summaries = self.list_turns(session_id, TurnFilter::default()).await?;
-        summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        summaries.sort_by_key(|t| t.created_at);
 
         let (session_messages, supersede_watermark): (Vec<SessionMessageRow>, Option<i64>) =
             match since_ordinal {

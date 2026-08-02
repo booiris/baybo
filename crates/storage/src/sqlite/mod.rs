@@ -36,7 +36,9 @@ pub use trace::SqliteTraceStore;
 pub use turn::SqliteTurnStore;
 
 use baybo_store::{StorageError, StoreIdentity};
-use deadpool_sqlite::{Config, Runtime};
+use parking_lot::Mutex;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Connections kept open by the pool. Readers never block each other under
 /// WAL; writers serialise on the write lock regardless of how many handles
@@ -422,9 +424,9 @@ const ADD_COLUMNS: &[AddColumn] = &[
 
 /// Pool of sqlite connections.
 ///
-/// Cheap to clone (the inner `deadpool` pool is an `Arc`) and shared by every
-/// store. Callers reach the database only through [`SqlitePool::interact`],
-/// which checks a connection out *exclusively* for the whole closure.
+/// Cheap to clone (the state is one `Arc`) and shared by every store. Callers
+/// reach the database only through [`SqlitePool::interact`], which checks a
+/// connection out *exclusively* for the whole closure.
 ///
 /// That exclusivity is a memory-safety contract, not a throughput knob. A
 /// sqlite connection owns an unsynchronised private heap — its lookaside
@@ -436,11 +438,71 @@ const ADD_COLUMNS: &[AddColumn] = &[
 /// compiler — not a convention — is what keeps them out.
 #[derive(Clone)]
 pub struct SqlitePool {
-    pool: deadpool_sqlite::Pool,
+    inner: Arc<PoolInner>,
     /// What this pool addresses. Carried so stores built on it can report a
     /// [`StoreIdentity`] — two pools over one file are one credential set,
     /// and subsystems that coordinate per credential need to see that.
     identity: StoreIdentity,
+}
+
+/// The connections, and the gate that hands them out one at a time.
+struct PoolInner {
+    /// Where a replacement connection comes from. Kept as the path the caller
+    /// opened rather than the canonicalized one so a replacement resolves
+    /// exactly as the original did.
+    path: std::path::PathBuf,
+    /// Connections parked while nobody holds them. A plain mutex is right here:
+    /// the critical section is a `Vec` push or pop, never a query.
+    idle: Mutex<Vec<rusqlite::Connection>>,
+    /// One permit per connection, so a caller arriving at a fully checked-out
+    /// pool waits here instead of finding `idle` empty. `Arc` because the
+    /// permit outlives this borrow: it rides into the blocking task and is
+    /// released only once the connection is back.
+    permits: Arc<Semaphore>,
+}
+
+impl PoolInner {
+    /// Take the connection this caller's permit entitles it to.
+    ///
+    /// `idle` is empty only when the previous holder's closure panicked and
+    /// unwound with the connection, so opening a replacement — rather than
+    /// failing, or handing back one the panic may have left mid-statement — is
+    /// what keeps "one permit, one connection" true.
+    fn take(&self) -> anyhow::Result<rusqlite::Connection> {
+        match self.idle.lock().pop() {
+            Some(conn) => Ok(conn),
+            None => open_connection(&self.path),
+        }
+    }
+
+    fn give_back(&self, conn: rusqlite::Connection) {
+        self.idle.lock().push(conn);
+    }
+}
+
+/// Open one connection and put it in the state every connection must be in.
+///
+/// `journal_mode` is persisted in the file header and only needs saying once,
+/// but `synchronous`, `busy_timeout` and `journal_size_limit` are per-handle
+/// and would otherwise silently sit at sqlite's defaults. The size limit has to
+/// reach every connection because any of them may be the one that resets the
+/// WAL.
+fn open_connection(path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open sqlite database {}: {e}", path.display()))?;
+    let pragmas = || -> rusqlite::Result<()> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+    };
+    pragmas().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to configure sqlite connection to {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(conn)
 }
 
 impl SqlitePool {
@@ -472,12 +534,7 @@ impl SqlitePool {
         // A zero-length file is a valid empty database, so handing sqlite one
         // we made ourselves costs nothing.
         precreate_private(path)?;
-        let pool = Self::build(
-            Config::new(path),
-            path.display().to_string(),
-            StoreIdentity::File(canonical),
-        )
-        .await?;
+        let pool = Self::build(path.to_path_buf(), StoreIdentity::File(canonical)).await?;
         // `build` ran `init_db`, so the WAL and shared-memory sidecars exist by
         // now — sqlite creates them with the main file's mode, which on a
         // database that predates `precreate_private` is whatever the umask gave
@@ -491,66 +548,37 @@ impl SqlitePool {
         self.identity.clone()
     }
 
-    async fn build(cfg: Config, what: String, identity: StoreIdentity) -> anyhow::Result<Self> {
-        let pool = cfg
-            .builder(Runtime::Tokio1)
-            .map_err(|e| anyhow::anyhow!("failed to configure sqlite pool for {what}: {e}"))?
-            .max_size(POOL_SIZE)
-            // Per-connection state, so it belongs on the hook that fires for
-            // every connection the pool ever creates — including ones opened
-            // lazily under load, or replaced after a recycle. `journal_mode` is
-            // persisted in the file header and only needs saying once, but
-            // `synchronous`, `busy_timeout` and `journal_size_limit` are
-            // per-handle and would otherwise silently revert to sqlite's
-            // defaults on a fresh handle. The limit has to reach every
-            // connection because any of them may be the one that resets the WAL.
-            .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {
-                Box::pin(async move {
-                    conn.interact(|conn| {
-                        conn.busy_timeout(BUSY_TIMEOUT)?;
-                        conn.pragma_update(None, "journal_mode", "WAL")?;
-                        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
-                        conn.pragma_update(None, "synchronous", "NORMAL")
-                    })
-                    .await
-                    .map_err(|e| deadpool_sqlite::HookError::message(e.to_string()))?
-                    .map_err(deadpool_sqlite::HookError::Backend)
-                })
-            }))
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build sqlite pool for {what}: {e}"))?;
-        let pool = Self { pool, identity };
+    /// Open every connection up front, rather than lazily on first contention.
+    ///
+    /// Opening is I/O, and first contention is by definition the moment the
+    /// process can least afford to pay for it — at shutdown, say, when every
+    /// actor flushes at once. It also makes a database that cannot supply
+    /// [`POOL_SIZE`] handles (an fd ceiling, say) fail here, where the error
+    /// still names the file, rather than mid-query much later.
+    async fn build(path: std::path::PathBuf, identity: StoreIdentity) -> anyhow::Result<Self> {
+        let what = path.display().to_string();
+        let connections = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                (0..POOL_SIZE)
+                    .map(|_| open_connection(&path))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to open sqlite pool for {what}: {e}"))??
+        };
+        let pool = Self {
+            inner: Arc::new(PoolInner {
+                path,
+                idle: Mutex::new(connections),
+                permits: Arc::new(Semaphore::new(POOL_SIZE)),
+            }),
+            identity,
+        };
         pool.interact("sqlite.init_db", init_db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
-        pool.warm(&what).await?;
         Ok(pool)
-    }
-
-    /// Open every connection now, rather than letting the pool do it lazily on
-    /// first contention.
-    ///
-    /// `deadpool` opens a connection on a blocking thread, and a *cancelled*
-    /// creation is an unconditional panic inside `deadpool-sync` (unlike a
-    /// cancelled query, which it reports as an error). The tokio runtime cancels
-    /// queued blocking tasks when it shuts down — so a pool still opening
-    /// connections during shutdown panics a worker. Shutdown is exactly when
-    /// that is likely: every actor flushes its state at once, which for a
-    /// half-warm pool is the first real contention it has ever seen.
-    ///
-    /// Holding all the connections at once is what forces distinct ones; getting
-    /// them one at a time would hand back the same connection every time.
-    async fn warm(&self, what: &str) -> anyhow::Result<()> {
-        let mut conns = Vec::with_capacity(POOL_SIZE);
-        for _ in 0..POOL_SIZE {
-            conns.push(
-                self.pool
-                    .get()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to warm sqlite pool for {what}: {e}"))?,
-            );
-        }
-        Ok(())
     }
 
     /// Run `f` against a connection held exclusively for the whole closure.
@@ -563,17 +591,32 @@ impl SqlitePool {
         F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self
-            .pool
-            .get()
+        let permit = self
+            .inner
+            .permits
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: pool checkout: {e}")))?;
-        conn.interact(f)
-            .await
-            // The closure panicked, or a previous one did and poisoned the
-            // connection. Either way it never produced a result.
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Moved in so it is released on the blocking thread, after the
+            // connection is back in `idle` — a permit handed on while the
+            // connection is still out would admit a caller with nothing to
+            // take. Declared first so it also drops last.
+            let _permit = permit;
+            let mut conn = inner
+                .take()
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?;
+            let out =
+                f(&mut conn).map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")));
+            inner.give_back(conn);
+            out
+        })
+        .await
+        // The closure panicked, so it never produced a result. Its connection
+        // went with it rather than returning to the pool possibly mid-statement.
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?
     }
 }
 
@@ -1278,11 +1321,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// The `post_create` hook is the only thing standing between the pool and
+    /// [`open_connection`] is the only thing standing between the pool and
     /// sqlite's defaults, and a PRAGMA that silently fails to apply looks
     /// exactly like one that applied — the query still runs, just with the old
     /// setting. Assert the connection's actual state rather than trusting that
-    /// the hook ran.
+    /// the pragmas ran.
     #[tokio::test]
     async fn every_connection_gets_the_pragmas() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1385,29 +1428,81 @@ mod tests {
     /// An open pool must already hold every connection, leaving none to open
     /// lazily later.
     ///
-    /// The stake is not latency. `deadpool-sync` panics *unconditionally* when a
-    /// connection **creation** is cancelled (a cancelled query, by contrast, it
-    /// reports as an error), and the tokio runtime cancels queued blocking tasks
-    /// as it shuts down. So a pool with connections still to open panics a worker
-    /// on Ctrl-C — and shutdown is precisely when it would be opening them, since
-    /// every actor flushes its state at once and a cold pool meets its first real
-    /// contention there.
-    ///
-    /// Asserting the pool's size is the honest guard: a test that merely tore a
-    /// runtime down and looked for the panic would pass either way, because the
-    /// panic lands in a worker thread and never fails the test.
+    /// The one path that opens a connection after `build` — the replacement
+    /// branch in [`PoolInner::take`] — exists solely to recover from a
+    /// panicking closure, and must stay unreached in ordinary service.
+    /// Asserting the idle count is what pins that down: a pool that filled
+    /// itself on demand would pass every other test in this file.
     #[tokio::test]
     async fn open_leaves_no_connection_to_be_created_later() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pool = SqlitePool::open(dir.path().join("t.db"))
             .await
             .expect("open");
-        let status = pool.pool.status();
         assert_eq!(
-            status.size, POOL_SIZE,
+            pool.inner.idle.lock().len(),
+            POOL_SIZE,
             "every connection must be open before the pool is handed out",
         );
-        assert_eq!(status.available, POOL_SIZE, "and all of them idle");
+        assert_eq!(
+            pool.inner.permits.available_permits(),
+            POOL_SIZE,
+            "and all of them idle"
+        );
+    }
+
+    /// A panicking closure takes its connection down with it — the handle may be
+    /// mid-statement, so it is dropped rather than returned. What must not go
+    /// with it is the *permit*: leak one per panic and the pool silently loses a
+    /// slot each time, until the ninth caller waits on a semaphore that will
+    /// never be posted. The concurrent burst below is the assertion — it can
+    /// only finish if all [`POOL_SIZE`] slots came back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_panicking_closure_costs_the_pool_no_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+
+        // One more than the pool holds, so the last one is served by a
+        // replacement connection rather than an original.
+        for _ in 0..POOL_SIZE + 1 {
+            let err = pool
+                .interact("test.panic", |_| -> anyhow::Result<()> {
+                    panic!("closure blew up")
+                })
+                .await
+                .expect_err("a panicking closure must surface as an error, not a value");
+            assert!(
+                err.to_string().contains("test.panic"),
+                "the error should name the call site, got {err}"
+            );
+        }
+
+        let mut tasks = Vec::new();
+        for w in 0..POOL_SIZE {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = format!("k{w}");
+                pool.interact("test.after_panic", move |conn| {
+                    conn.execute(
+                        "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
+                        rusqlite::params![name],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("the pool still serves every slot after a panic");
+            }));
+        }
+        for t in tasks {
+            t.await.expect("writer panicked");
+        }
+
+        assert!(
+            pool.inner.idle.lock().len() <= POOL_SIZE,
+            "replacements must not grow the pool past its capacity"
+        );
     }
 
     /// The mode is load-bearing rather than hygiene — other crates' threat

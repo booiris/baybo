@@ -2237,7 +2237,13 @@ fn build_unsandboxed_command(
     cmd
 }
 
-fn spawn_unsandboxed_detached(
+/// Spawn a detached child in its own process group.
+///
+/// `pub(crate)` for [`crate::test_support::FakeExecSandbox`], which stands in
+/// for a sandbox backend by running the command directly: routing it through
+/// this function is what makes the fake's detached child behave like a real
+/// one — killable as a whole tree, and carrying a pgid to record.
+pub(crate) fn spawn_unsandboxed_detached(
     program: &str,
     args: &[String],
     cwd: Option<&Path>,

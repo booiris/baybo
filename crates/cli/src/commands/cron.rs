@@ -41,7 +41,7 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
         .list_all_jobs()
         .await
         .map_err(|e| CliError::Manager(format!("list cron jobs: {e}")))?;
-    jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    jobs.sort_by_key(|j| j.created_at);
 
     if jobs.is_empty() {
         return Ok(CommandOutput {

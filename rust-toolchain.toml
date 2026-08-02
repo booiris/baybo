@@ -1,9 +1,10 @@
 # Single source of truth for the workspace toolchain — local builds and
-# CI both read this file. Pinned because a floating `stable` drifted to
-# 1.95 and surfaced clippy lints that 1.94.1 does not flag; pinning keeps
-# the "zero warnings" gate deterministic. Bump deliberately, fixing any
-# newly-surfaced lints in the same change.
+# CI both read this file. Pinned rather than floating on `stable` because
+# every stable ships clippy lints the last one did not flag, and the
+# "zero warnings" gate has to fail in the change that bumps this file
+# rather than in whatever unrelated PR happens to open after rustup moves.
+# Bump deliberately, fixing the newly-surfaced lints in the same change.
 [toolchain]
-channel = "1.94.1"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

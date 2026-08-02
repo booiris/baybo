@@ -20,7 +20,7 @@ use baybo_llm::{BilledChat, BilledChatResponse};
 
 use crate::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, RunningChild, SandboxedOutput,
-    SpawnOpts, TokioRunningChild, Tool, ToolContext, ToolManifest, ToolOutput,
+    SpawnOpts, Tool, ToolContext, ToolManifest, ToolOutput,
 };
 
 /// Binds a [`baybo_llm::BillableLlm`] to a throwaway system
@@ -226,29 +226,28 @@ impl ExecSandbox for FakeExecSandbox {
 
     /// Spawn the command directly (no real sandbox) and hand back a live child,
     /// so tests can exercise `run_detached`'s completion / background handoff
-    /// without bwrap. Mirrors the real backends' detached contract.
+    /// without bwrap.
+    ///
+    /// Delegating to the production spawn is the whole point: a hand-rolled
+    /// `Command` here would omit `process_group(0)`, and then `start_kill()`
+    /// would signal only the direct child. A `sh` that *forks* (dash does; bash
+    /// only execs when the script is a single trailing command) would leave the
+    /// grandchild alive holding both pipe write ends — the test hangs until the
+    /// orphan exits, on the machines where `/bin/sh` is dash and nowhere else.
+    /// It would also report no process group, silently skipping the ledger
+    /// branch in `BackgroundJobManager::detach_command`.
     async fn spawn_command_detached(
         &self,
-        _program: &Path,
+        program: &Path,
         args: &[String],
         opts: SpawnOpts,
     ) -> crate::Result<Box<dyn RunningChild>> {
-        use std::process::Stdio;
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(args);
-        if let Some(dir) = &opts.cwd {
-            cmd.current_dir(dir);
-            cmd.env("PWD", dir);
-        }
-        cmd.envs(opts.extra_env.iter().cloned());
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .map_err(|e| crate::ToolError::Execution(format!("fake detached spawn: {e}")))?;
-        Ok(Box::new(TokioRunningChild(child)))
+        crate::builtin::bash::spawn_unsandboxed_detached(
+            &program.to_string_lossy(),
+            args,
+            opts.cwd.as_deref(),
+            &opts.extra_env,
+        )
     }
 }
 
@@ -310,6 +309,56 @@ mod tests {
         let tool = EchoTool::new("echo");
         let out = tool.execute(json!({"k": "v"}), &ctx()).await.unwrap();
         assert!(matches!(out, ToolOutput::Text(s) if s == "{\"k\":\"v\"}"));
+    }
+
+    /// The fake's detached child has to die as a whole tree, or every test that
+    /// kills one inherits a stall as long as whatever the shell forked.
+    ///
+    /// The script is built so the failure is deterministic on any shell rather
+    /// than a property of which one `/bin/sh` is. `sleep 47 &` forks — no shell
+    /// execs a backgrounded command — and the grandchild inherits both pipe
+    /// write ends, so signalling only the direct child leaves them open until
+    /// the sleep ends. `echo ready` is the barrier: reading it proves the fork
+    /// already happened, without which the kill races the shell and lands
+    /// before there is any grandchild to orphan — passing for the wrong reason.
+    #[tokio::test]
+    async fn detached_fake_child_dies_as_a_whole_process_group() {
+        use tokio::io::AsyncReadExt;
+
+        let sandbox = FakeExecSandbox::new();
+        let mut child = sandbox
+            .spawn_command_detached(
+                Path::new("sh"),
+                &["-c".into(), "sleep 47 & echo ready; wait".into()],
+                SpawnOpts {
+                    cwd: None,
+                    stdin: None,
+                    extra_env: Vec::new(),
+                    timeout: Duration::from_secs(1),
+                },
+            )
+            .await
+            .expect("fake detached spawn");
+        let mut stdout = child.take_stdout().expect("stdout pipe");
+        assert!(
+            child.process_group_id().is_some(),
+            "without a pgid the runtime silently skips the crash-safe reaping ledger"
+        );
+
+        let mut ready = [0u8; 6];
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_exact(&mut ready))
+            .await
+            .expect("the shell must reach its barrier")
+            .expect("read the readiness marker");
+        assert_eq!(&ready, b"ready\n");
+
+        child.start_kill();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut rest))
+            .await
+            .expect("killing the group must close every write end of the pipe")
+            .expect("read stdout to EOF");
+        child.wait().await;
     }
 
     #[tokio::test]

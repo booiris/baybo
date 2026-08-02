@@ -33,7 +33,8 @@ remote-host-dashboard = { workspace = true }
 async-trait = { workspace = true }
 # The admission allow-list table (hot-reloaded by the admission_db poller).
 rusqlite = { workspace = true }
-deadpool-sqlite = { workspace = true }
+# The sqlite pool's idle-connection list (`sqlite.rs`).
+parking_lot = { workspace = true }
 # Generated-key path: random bytes + hex encoding (`generate_remote_api_key`).
 rand = { workspace = true }
 hex = { workspace = true }
@@ -42,8 +43,6 @@ hex = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-# Recording RevokeHook + temp-file RAII in the admission_db inline tests.
-parking_lot = { workspace = true }
 # The revoke → force_reload → kick end-to-end test registers a live connection via
 # the relay's `test-support`-gated helper, then asserts the kick channel resolves.
 remote-host-relay = { workspace = true, features = ["test-support"] }

@@ -750,7 +750,7 @@ fn clip_for_box(text: &str, max_w: usize) -> String {
                 acc_w += cw;
                 start_byte = i;
             }
-            return format!("{label}: …{}", &value[start_byte..].trim_start());
+            return format!("{label}: …{}", value[start_byte..].trim_start());
         }
     }
     // Fallback: right-clip with ellipsis.
