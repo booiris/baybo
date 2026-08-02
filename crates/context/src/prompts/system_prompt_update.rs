@@ -11,10 +11,14 @@
 //! [`crate::ContextManager`]'s post-compaction reseed is what retires the row
 //! itself, and it drops these along with it.
 //!
-//! The delta is expressed in the units [`crate::prompts::soul::AssembledPrompt`]
-//! hands over — a hint block, or one wrapped `<tag path="…">` identity section —
-//! so a moved path or an edited file reports as the one part that carries it
-//! rather than as a whole new prompt.
+//! **A changed section is sent as a line diff, not as its new body.** The
+//! sections are addressed by tag, so the copy the leading row carries can be
+//! recovered from that row and diffed against the live one — a session that
+//! appended one line to `MEMORY.md` then sends that line rather than the whole
+//! index, and a `personas/` directory that moved sends a self-closing tag
+//! carrying the new path. Full text is the fallback, for the cases where a diff
+//! cannot be formed or would not be smaller: a hint (no tag, so no prior copy to
+//! diff against), a section the prompt did not carry before, a rewrite.
 //!
 //! **Updates accumulate, and that is the cheap option.** Each is a complete
 //! delta against the leading row, so only the newest carries information — but
@@ -24,7 +28,7 @@
 //! subsequent call. Appending at the tail is the only edit a cached prefix
 //! tolerates. Superseded blocks are therefore left where they are and the
 //! framing tells the model the last one wins; the size that buys is bounded by
-//! keeping each delta to the parts that actually moved.
+//! keeping each delta to the lines that actually moved.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -34,6 +38,11 @@ use crate::prompts::soul::{PromptPart, SectionTag};
 const OPEN_TAG: &str = "<system_prompt_update>";
 const CLOSE_TAG: &str = "</system_prompt_update>";
 
+/// Lines of unchanged context around each hunk. Two is enough for the model to
+/// locate the hunk in a body it is already holding, and the anchor it actually
+/// relies on is the `@@` line number.
+const DIFF_CONTEXT_LINES: usize = 2;
+
 /// Framing preamble placed before the tagged block.
 ///
 /// Three claims in it are load-bearing rather than decorative.
@@ -42,7 +51,7 @@ const CLOSE_TAG: &str = "</system_prompt_update>";
 /// that moved — so a blanket "treat every path in the system prompt as out of
 /// date" would be false about the majority of them, and would leave a model that
 /// obeyed it with nowhere to write the sections the update does not mention.
-/// Hence the explicit converse: what is not restated below is unchanged.
+/// Hence the explicit converse: what is not named below is unchanged.
 ///
 /// **A superseded path is still writable.** The migration this exists for left
 /// the old `profile/` directory on disk, so an `Edit` against the path an old
@@ -53,23 +62,38 @@ const CLOSE_TAG: &str = "</system_prompt_update>";
 /// **Latest wins.** Updates accumulate until a compaction retires them, and each
 /// restates the whole delta against the original prompt, so without that rule a
 /// sequence of them reads as contradictory.
-const FRAMING_BODY: &str = r#"The system prompt at the top of this conversation was assembled when the conversation started, and some of the files behind it have moved or changed since. Each block below REPLACES the part of that system prompt carrying the same tag. Any part of that system prompt not restated below is unchanged and still current.
+const FRAMING_BODY: &str = r#"The system prompt above was assembled when this conversation started, and some of its sources have changed since. Each block below updates the part of it carrying the same tag; anything not named below is unchanged and still current.
 
-Where a block below names a `path`, that is where the file lives now. If the system prompt above gave a different path for that same block, the old one is dead — and it may well still exist on disk, so writing to it will appear to succeed and nothing will ever read what you wrote.
+A block's `path` is where that file lives now. If the prompt above gave a different path for that tag, the old one is dead — and may still exist on disk, so writing to it will appear to succeed and nothing will ever read it.
 
 If this conversation carries more than one such update, the last one wins."#;
+
+/// Appended to [`FRAMING_BODY`] only when a [`UpdateBlock::Diff`] is actually
+/// present, so an update made only of full bodies is unchanged by this
+/// existing. States the one thing the attribute alone cannot: that an unmarked
+/// block is a whole-part replacement rather than a diff with no markers.
+const DIFF_FRAMING: &str = r#"A block marked `diff` is a unified diff against the copy above — `-` lines are gone, `+` lines are current, the rest is context. An unmarked block is that part's full current text."#;
 
 /// Body used when the sources have come back into agreement with the leading
 /// system row — a source that moved and then moved back. Nothing differs any
 /// more, so there is no block to send; what is needed is a retraction, because
 /// an earlier update in this conversation is still asserting a state that has
 /// since been undone and the model has no other way to learn that.
-const NOTHING_DIFFERS_BODY: &str = r#"Disregard any earlier system-prompt update in this conversation. The files behind the system prompt have changed back: the system prompt at the top of this conversation is accurate again, and every path it names is current."#;
+const NOTHING_DIFFERS_BODY: &str = r#"Disregard any earlier system-prompt update in this conversation: the files behind the system prompt have changed back, so the prompt above is accurate again and every path it names is current."#;
 
 /// Attribute marking a section the model rewrote itself during this
 /// conversation. Named once: the renderer writes it and [`SELF_EDIT_FRAMING`]
 /// explains it, and the two have to agree.
 const SELF_EDITED_ATTR: &str = "edited_by_you_in_this_conversation";
+
+/// Attribute marking a section whose file moved with its contents intact.
+/// Self-describing on purpose — the framing already says what `path` means, so
+/// this case costs an attribute rather than a paragraph.
+const MOVED_ATTR: &str = "content_unchanged";
+
+/// Attribute marking a block whose body is a unified diff rather than a
+/// replacement.
+const DIFF_ATTR: &str = "diff";
 
 /// Appended to [`FRAMING_BODY`] only when the update actually carries a
 /// self-edited pointer, so an update without one is byte-identical to what
@@ -80,12 +104,22 @@ const SELF_EDITED_ATTR: &str = "edited_by_you_in_this_conversation";
 /// telling it otherwise would strand it with no usable copy of a persona it can
 /// still mostly trust. It is pointed at `Read` for the exact bytes rather than
 /// handed them, because it has just written them.
-const SELF_EDIT_FRAMING: &str = r#"One or more blocks below are empty and carry `edited_by_you_in_this_conversation`. Those are not replacements: you rewrote that file yourself earlier in this conversation, so the copy in the system prompt above is out of date exactly where you changed it and still accurate everywhere else. Your own edit is what the file says now. `Read` the path if you need its precise current content."#;
+const SELF_EDIT_FRAMING: &str = r#"An empty block marked `edited_by_you_in_this_conversation` is not a replacement: you rewrote that file yourself earlier in this conversation, so the copy above is out of date exactly where you changed it and accurate everywhere else. Your own edit is what it says now; `Read` the path for the exact bytes."#;
 
 /// One entry of a rendered update.
 pub enum UpdateBlock<'a> {
-    /// The part's current text, replacing the same part above.
+    /// The part's current text, replacing the same part above. The fallback:
+    /// a hint, a section the leading row never carried, or one whose diff came
+    /// out no smaller than the body it describes.
     Full(&'a str),
+    /// A unified diff against the copy the leading row carries.
+    Diff {
+        tag: SectionTag,
+        path: &'a Path,
+        diff: String,
+    },
+    /// The same bytes at a new path.
+    Moved { tag: SectionTag, path: &'a Path },
     /// A section the model rewrote itself: named, not restated.
     SelfEdited { tag: SectionTag, path: &'a Path },
 }
@@ -94,13 +128,23 @@ impl UpdateBlock<'_> {
     fn render(&self) -> String {
         match self {
             UpdateBlock::Full(text) => (*text).to_string(),
-            UpdateBlock::SelfEdited { tag, path } => format!(
-                "<{tag} path=\"{path}\" {SELF_EDITED_ATTR}/>",
+            UpdateBlock::Diff { tag, path, diff } => format!(
+                "<{tag} path=\"{path}\" {DIFF_ATTR}>\n{diff}</{tag}>",
                 tag = tag.as_str(),
                 path = path.display(),
             ),
+            UpdateBlock::Moved { tag, path } => self_closing(*tag, path, MOVED_ATTR),
+            UpdateBlock::SelfEdited { tag, path } => self_closing(*tag, path, SELF_EDITED_ATTR),
         }
     }
+}
+
+fn self_closing(tag: SectionTag, path: &Path, attr: &str) -> String {
+    format!(
+        "<{tag} path=\"{path}\" {attr}/>",
+        tag = tag.as_str(),
+        path = path.display(),
+    )
 }
 
 /// The parts of a freshly assembled prompt that the leading `Role::System` row
@@ -109,7 +153,9 @@ impl UpdateBlock<'_> {
 ///
 /// That is what makes each update supersede every earlier one instead of
 /// building on it, which is the property [`wrap_update`]'s "the last one wins"
-/// rule depends on. `seeded` is therefore the leading row's text alone.
+/// rule depends on. `seeded` is therefore the leading row's text alone, and it
+/// is also where a changed section's *prior* copy is read back from, so the
+/// diff a block carries is likewise measured against that row and nothing else.
 ///
 /// A part counts as already carried when its rendered text appears in `seeded`
 /// verbatim, which is exactly the test that matters: parts are multi-line blocks
@@ -120,7 +166,8 @@ impl UpdateBlock<'_> {
 /// A section whose file is in `self_edited` degrades to a pointer instead of its
 /// body — the model wrote those bytes, so restating them costs the whole file to
 /// tell it what it already did. Sections only: a hint has no file behind it, and
-/// a body absent from `seeded` for any *other* reason is still sent in full.
+/// a body absent from `seeded` for any *other* reason is still described in
+/// full or by diff.
 pub fn build_blocks<'a>(
     current: &'a [PromptPart],
     rendered: &'a [String],
@@ -131,13 +178,77 @@ pub fn build_blocks<'a>(
         .iter()
         .zip(rendered)
         .filter(|(_, text)| !seeded.contains(text.as_str()))
-        .map(|(part, text)| match part {
-            PromptPart::Section { tag, path, .. } if self_edited.contains(path) => {
-                UpdateBlock::SelfEdited { tag: *tag, path }
-            }
-            _ => UpdateBlock::Full(text.as_str()),
-        })
+        .map(|(part, text)| block_for(part, text, seeded, self_edited))
         .collect()
+}
+
+/// Pick the cheapest honest description of one changed part.
+fn block_for<'a>(
+    part: &'a PromptPart,
+    text: &'a str,
+    seeded: &str,
+    self_edited: &HashSet<PathBuf>,
+) -> UpdateBlock<'a> {
+    // A hint carries no tag, so the leading row offers nothing to diff it
+    // against; it is opaque framing text that only a binary upgrade moves.
+    let PromptPart::Section { tag, path, body } = part else {
+        return UpdateBlock::Full(text);
+    };
+    if self_edited.contains(path) {
+        return UpdateBlock::SelfEdited { tag: *tag, path };
+    }
+    let Some(prior) = seeded_section_body(seeded, *tag) else {
+        return UpdateBlock::Full(text);
+    };
+    let body = body.trim_end_matches('\n');
+    if prior == body {
+        return UpdateBlock::Moved { tag: *tag, path };
+    }
+    let diff = unified_diff(prior, body);
+    // A rewrite diffs to roughly both copies; then the new body alone is the
+    // shorter message, and the one with no reassembly for the model to do. The
+    // first diff in an update also summons `DIFF_FRAMING`, so a saving smaller
+    // than that paragraph is not a saving — charging it to every diff block is
+    // conservative when there are several, which is the safe direction.
+    if diff.is_empty() || diff.len() + DIFF_FRAMING.len() >= text.len() {
+        return UpdateBlock::Full(text);
+    }
+    UpdateBlock::Diff {
+        tag: *tag,
+        path,
+        diff,
+    }
+}
+
+/// Terminate both sides before diffing. `from_lines` keeps the line
+/// terminator as part of the line, so an unterminated last line — which is
+/// every body, since `render` trims trailing newlines — compares unequal to the
+/// same text once a line is appended after it. Appending one memory would then
+/// report the line before it as changed too.
+fn unified_diff(prior: &str, current: &str) -> String {
+    similar::TextDiff::from_lines(&format!("{prior}\n"), &format!("{current}\n"))
+        .unified_diff()
+        .context_radius(DIFF_CONTEXT_LINES)
+        .missing_newline_hint(false)
+        .to_string()
+}
+
+/// The body the leading system row carries for `tag`, as
+/// [`PromptPart::render`] wrote it — the baseline a diff is taken against.
+///
+/// `None` when the row has no such section: a `<memory>` block that only
+/// appeared after memory was switched on has no prior copy, and there is
+/// nothing to diff against. Parses rather than pattern-matches on the whole
+/// rendered part because the point is to recover the body when the `path`
+/// attribute is exactly what changed.
+fn seeded_section_body(seeded: &str, tag: SectionTag) -> Option<&str> {
+    let open = format!("<{} path=\"", tag.as_str());
+    let attr_start = seeded.find(&open)? + open.len();
+    let path_end = attr_start + seeded[attr_start..].find('"')?;
+    let body_start = path_end + seeded[path_end..].find(">\n")? + ">\n".len();
+    let close = format!("\n</{}>", tag.as_str());
+    let body_end = body_start + seeded[body_start..].find(&close)?;
+    Some(&seeded[body_start..body_end])
 }
 
 /// Wrap the changed blocks in the `<system_prompt_update>` envelope. An empty
@@ -156,14 +267,26 @@ pub fn wrap_update(blocks: &[UpdateBlock<'_>]) -> String {
         .map(UpdateBlock::render)
         .collect::<Vec<_>>()
         .join("\n\n");
-    let framing = if blocks
-        .iter()
-        .any(|b| matches!(b, UpdateBlock::SelfEdited { .. }))
-    {
-        format!("{FRAMING_BODY}\n\n{SELF_EDIT_FRAMING}")
-    } else {
-        FRAMING_BODY.to_string()
-    };
+    // Each paragraph is paid for only by the update that needs it, so the
+    // common single-section delta carries no explanation of cases it lacks.
+    let mut framing = FRAMING_BODY.to_string();
+    for (present, extra) in [
+        (
+            blocks.iter().any(|b| matches!(b, UpdateBlock::Diff { .. })),
+            DIFF_FRAMING,
+        ),
+        (
+            blocks
+                .iter()
+                .any(|b| matches!(b, UpdateBlock::SelfEdited { .. })),
+            SELF_EDIT_FRAMING,
+        ),
+    ] {
+        if present {
+            framing.push_str("\n\n");
+            framing.push_str(extra);
+        }
+    }
     format!("{framing}\n\n{OPEN_TAG}\n{joined}\n{CLOSE_TAG}")
 }
 
@@ -198,6 +321,23 @@ mod tests {
         parts.iter().map(PromptPart::render).collect()
     }
 
+    /// Whether a rendered update actually carries a diff block. Not a search
+    /// for `DIFF_ATTR` alone: that substring also lives inside the word
+    /// "different", which the framing uses.
+    fn has_diff_block(out: &str) -> bool {
+        out.contains(&format!(" {DIFF_ATTR}>"))
+    }
+
+    /// A body long enough that a one-line edit to it has an obviously cheaper
+    /// description than restating the whole thing.
+    fn index(extra: &[&str]) -> String {
+        let mut lines: Vec<String> = (0..20)
+            .map(|i| format!("- [Memory {i}](m{i}.md) — hook {i}"))
+            .collect();
+        lines.extend(extra.iter().map(|l| (*l).to_string()));
+        lines.join("\n")
+    }
+
     #[test]
     fn a_part_already_in_the_system_row_is_not_reported() {
         let parts = vec![soul("/new", "body")];
@@ -214,6 +354,89 @@ mod tests {
         let out = wrap_update(&blocks(&parts, &rendered, seeded, &HashSet::new()));
         assert!(out.contains("/new/SOUL.md"), "{out}");
         assert!(!out.contains("top hint") && !out.contains("/old/"), "{out}");
+    }
+
+    /// The bytes did not change, so re-sending them would be pure duplication:
+    /// the new path plus a marker is the whole message.
+    #[test]
+    fn a_path_only_move_sends_no_body_at_all() {
+        let parts = vec![soul("/new/SOUL.md", &index(&[]))];
+        let rendered = render_all(&parts);
+        let seeded = format!("<soul path=\"/old/SOUL.md\">\n{}\n</soul>", index(&[]));
+        let out = wrap_update(&blocks(&parts, &rendered, &seeded, &HashSet::new()));
+        assert!(
+            out.contains(&format!("<soul path=\"/new/SOUL.md\" {MOVED_ATTR}/>")),
+            "{out}"
+        );
+        assert!(!out.contains("hook 0"), "the body is unchanged: {out}");
+        assert!(!has_diff_block(&out), "nothing differs to diff: {out}");
+    }
+
+    /// The case the diff exists for: one memory written mid-conversation.
+    #[test]
+    fn an_appended_line_sends_that_line_not_the_whole_body() {
+        let parts = vec![soul("/w/MEMORY.md", &index(&["- [New](n.md) — fresh"]))];
+        let rendered = render_all(&parts);
+        let seeded = format!("<soul path=\"/w/MEMORY.md\">\n{}\n</soul>", index(&[]));
+        let out = wrap_update(&blocks(&parts, &rendered, &seeded, &HashSet::new()));
+
+        assert!(has_diff_block(&out), "{out}");
+        assert!(out.contains("+- [New](n.md) — fresh"), "{out}");
+        assert!(
+            !out.contains("hook 0"),
+            "lines outside the hunk must not ride along: {out}"
+        );
+        // The line before the appended one is untouched context, not a
+        // `-`/`+` pair — the trap when the last line carries no terminator.
+        assert!(
+            !out.contains("-- [Memory 19]"),
+            "an appended line must not restate its predecessor: {out}"
+        );
+    }
+
+    /// A diff is a means, not a goal. When the body was rewritten wholesale the
+    /// diff quotes both copies, and the new body alone is both shorter and
+    /// easier to act on.
+    #[test]
+    fn a_wholesale_rewrite_falls_back_to_the_full_body() {
+        let parts = vec![soul("/w/SOUL.md", "entirely different prose\nsecond line")];
+        let rendered = render_all(&parts);
+        let seeded = "<soul path=\"/w/SOUL.md\">\nnothing alike here\nanother line\n</soul>";
+        let out = wrap_update(&blocks(&parts, &rendered, seeded, &HashSet::new()));
+        assert!(out.contains("entirely different prose"), "{out}");
+        assert!(!has_diff_block(&out), "{out}");
+        assert!(!out.contains("nothing alike here"), "{out}");
+    }
+
+    /// A hint has no tag, so there is no prior copy in the leading row to
+    /// address; it goes in full.
+    #[test]
+    fn a_hint_is_sent_in_full_because_it_has_no_prior_copy_to_diff() {
+        let parts = vec![hint("# Memory\n\nrules")];
+        let rendered = render_all(&parts);
+        let out = wrap_update(&blocks(&parts, &rendered, "stale row", &HashSet::new()));
+        assert!(out.contains("rules"), "{out}");
+        assert!(!has_diff_block(&out), "{out}");
+    }
+
+    /// A section the row never carried has no baseline either — switching
+    /// memory on mid-session must send the index, not a diff against nothing.
+    #[test]
+    fn a_section_the_leading_row_never_carried_is_sent_in_full() {
+        let parts = vec![PromptPart::Section {
+            tag: SectionTag::Memory,
+            path: PathBuf::from("/w/MEMORY.md"),
+            body: index(&[]),
+        }];
+        let rendered = render_all(&parts);
+        let out = wrap_update(&blocks(
+            &parts,
+            &rendered,
+            "<soul path=\"/w/SOUL.md\">\nx\n</soul>",
+            &HashSet::new(),
+        ));
+        assert!(out.contains("hook 0"), "{out}");
+        assert!(!has_diff_block(&out), "{out}");
     }
 
     /// The delta is measured against the leading row ONLY. A part an earlier
@@ -248,7 +471,6 @@ mod tests {
         let rendered = render_all(&parts);
         let out = wrap_update(&blocks(&parts, &rendered, "nothing here", &HashSet::new()));
         assert_eq!(out.matches(OPEN_TAG).count(), 1);
-        assert!(out.contains("REPLACE"));
         assert!(out.contains(&format!("{OPEN_TAG}\na\n\nb\n{CLOSE_TAG}")));
     }
 
@@ -267,11 +489,11 @@ mod tests {
             !out.contains("A VERY LONG BODY"),
             "the body the model wrote must not be echoed back: {out}"
         );
-        assert!(out.contains("edited_by_you_in_this_conversation"), "{out}");
     }
 
+    /// Each explanatory paragraph is carried only by an update that needs it.
     #[test]
-    fn an_update_without_a_self_edit_carries_no_extra_framing() {
+    fn framing_paragraphs_are_paid_for_only_when_their_case_is_present() {
         let parts = vec![soul("/w/SOUL.md", "body")];
         let rendered = render_all(&parts);
         let out = wrap_update(&blocks(&parts, &rendered, "stale row", &HashSet::new()));
@@ -292,5 +514,20 @@ mod tests {
         let out = wrap_update(&blocks(&parts, &rendered, "stale row", &mine));
         assert!(out.contains("rules"), "{out}");
         assert!(!out.contains(SELF_EDITED_ATTR), "{out}");
+    }
+
+    /// The parser has to survive the shapes `render` actually emits, including
+    /// an empty file and a body whose own text mentions the tag.
+    #[test]
+    fn the_baseline_parser_reads_back_what_render_wrote() {
+        for body in ["", "one line", "a\n\nb", "mentions </soul_ish> inline"] {
+            let part = soul("/w/SOUL.md", body);
+            let seeded = format!("hint\n\n{}\n\ntail", part.render());
+            assert_eq!(
+                seeded_section_body(&seeded, SectionTag::Soul),
+                Some(body),
+                "round-trip failed for {body:?}"
+            );
+        }
     }
 }
