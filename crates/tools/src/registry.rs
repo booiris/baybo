@@ -232,9 +232,16 @@ impl ToolRegistry {
         out
     }
 
-    /// Names of every deferred tool this session could load but has not — the
-    /// roster it is shown. Sorted, so the roster message is byte-stable and a
-    /// re-render only differs when the set genuinely differs.
+    /// Names of every deferred tool this session may load — the roster it is
+    /// shown. Sorted, so the message is byte-stable and a re-render differs
+    /// only when the set genuinely differs.
+    ///
+    /// Deliberately ignores what is *already* loaded, even though the scope
+    /// carries it. Filtering loaded tools out would shrink the roster on every
+    /// load, and each shrink is a delta message the model gains nothing from —
+    /// it can see those tools in its own tool list. Holding the set stable
+    /// means a load produces no roster traffic at all, and re-selecting a tool
+    /// whose definition scrolled out of a compacted transcript still works.
     pub fn deferred_tool_names(&self, scope: SessionToolScope<'_>) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let mut push = |name: &String, manifest: Option<&ToolManifest>, tool: &dyn Tool| {
