@@ -338,7 +338,7 @@ mod tests {
                 "…file body…".into(),
                 Some(baybo_model::ToolResultMeta {
                     read_fingerprint: Some(recorded),
-                    approval: None,
+                    ..Default::default()
                 }),
             ),
         ];
@@ -378,7 +378,7 @@ mod tests {
                 "ok".into(),
                 Some(baybo_model::ToolResultMeta {
                     read_fingerprint: Some(fp),
-                    approval: None,
+                    ..Default::default()
                 }),
             )
         };

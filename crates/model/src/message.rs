@@ -125,7 +125,7 @@ pub enum ContentBlock {
 /// needs to persist with the transcript but that must stay off the universal
 /// `content` string (so it never reaches the LLM). A typed extension point —
 /// new per-result metadata adds a field here rather than re-touching every
-/// `ToolResult` match site. Today it carries only a `Read`'s fingerprint.
+/// `ToolResult` match site.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ToolResultMeta {
     /// Fingerprint of the file a `Read` returned. On session hydration the
@@ -134,6 +134,18 @@ pub struct ToolResultMeta {
     /// non-`Read` tool result. See [`FileFingerprint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_fingerprint: Option<FileFingerprint>,
+    /// Fingerprint this call **left on disk**, set only when an `Edit`/`Write`
+    /// actually rewrote the file.
+    ///
+    /// Deliberately not [`Self::read_fingerprint`], which those tools also
+    /// carry: that one is the anchor the call *vouched for*, and a write that
+    /// failed, errored, or was denied still has one — the pre-call value — so a
+    /// reader asking "did this conversation leave these bytes" would answer yes
+    /// for an edit that never landed. `None` here means this call changed
+    /// nothing, which is the question `baybo-context` asks before it tells the
+    /// model a persona file still says what the model wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_fingerprint: Option<FileFingerprint>,
     /// Decision the user's approval gate returned for this call — the durable
     /// record behind the transcript's "approved / always / denied" step label.
     /// `None` for calls that never raised a prompt (covered by prior grants or
@@ -632,6 +644,7 @@ mod tests {
             content: "body".into(),
             meta: Some(ToolResultMeta {
                 read_fingerprint: Some(fp),
+                write_fingerprint: Some(fp),
                 approval: Some(ApprovalDecision::ApproveAlways),
             }),
         };

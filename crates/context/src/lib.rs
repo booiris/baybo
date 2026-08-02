@@ -66,6 +66,7 @@ pub(crate) fn recent_slice_bounds(max_tokens: usize) -> (usize, usize, usize) {
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -716,7 +717,7 @@ impl ContextManager {
             .iter()
             .map(crate::prompts::soul::PromptPart::render)
             .collect();
-        let self_edited = self.self_edited_source_paths();
+        let self_edited = self.verified_self_edited_paths().await;
         let unseen = crate::prompts::system_prompt_update::build_blocks(
             resolved.parts(),
             &rendered,
@@ -761,36 +762,78 @@ impl ContextManager {
             .unwrap_or_default()
     }
 
-    /// Absolute paths this conversation's own tool calls rewrote — the
-    /// `file_path` of every `Edit`/`Write` `ToolUse` in the transcript.
+    /// Absolute paths this conversation rewrote **and that still hold exactly
+    /// what it left there**.
     ///
     /// A section whose file is in here does not need its body restated: the
-    /// model produced those bytes itself, a few messages back. Read straight off
-    /// the transcript rather than from the read-before-write tracker, which is a
-    /// different question (has this file been *seen*) and would have to be
-    /// threaded through `ContextManagerConfig` to be asked here.
+    /// model produced those bytes itself, a few messages back. That is only
+    /// true while nothing has written since, which is why the answer is not the
+    /// set of paths the transcript names. A persona file is writable by more
+    /// than this conversation — the shared `personas/USER.md` by every agent,
+    /// an `IDENTITY.md` by the agents admin API, any of them by the dream pass
+    /// — and keying on the path alone told the model "your own edit is what it
+    /// says now" about someone else's bytes. Worse, the pointer that claim
+    /// rides on renders from tag and path, so the update came out byte-identical
+    /// to the standing one and the dedupe dropped it: the model was not
+    /// misinformed, it was told nothing at all.
+    ///
+    /// So each path is verified against the fingerprint the writing call left
+    /// on its `ToolResult`
+    /// ([`baybo_model::ToolResultMeta::write_fingerprint`], stamped only when
+    /// the call really wrote, and persisted — so this survives a rehydration
+    /// with the transcript rather than living in a field). Newest write per
+    /// path wins; a live `stat` that no longer matches drops the path and the
+    /// section is described honestly instead.
     ///
     /// Matching is on the path string the model was handed. `wrap_section`
     /// absolutises it and [`crate::prompts::soul::PromptPart`] keeps that form,
     /// and the model copies the path out of its own system prompt, so an exact
     /// match is the common case; anything else (a symlink, a `..` spelling)
-    /// simply misses and the body is sent in full, which is the safe direction.
-    fn self_edited_source_paths(&self) -> std::collections::HashSet<PathBuf> {
-        self.messages
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .filter_map(|block| match block {
-                ContentBlock::ToolUse { name, input, .. }
-                    if baybo_tools::FILE_WRITING_TOOLS.contains(&name.as_str()) =>
-                {
-                    input
-                        .get(baybo_tools::TOOL_FILE_PATH_ARG)?
-                        .as_str()
-                        .map(PathBuf::from)
+    /// simply misses and the body is sent in full, which is the safe direction —
+    /// as is every other miss here.
+    async fn verified_self_edited_paths(&self) -> std::collections::HashSet<PathBuf> {
+        let mut wrote: HashMap<PathBuf, FileFingerprint> = HashMap::new();
+        let mut pending: HashMap<&str, PathBuf> = HashMap::new();
+        for block in self.messages.iter().flat_map(|m| m.content.iter()) {
+            match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if baybo_tools::FILE_WRITING_TOOLS.contains(&name.as_str()) => {
+                    if let Some(path) = input
+                        .get(baybo_tools::TOOL_FILE_PATH_ARG)
+                        .and_then(|v| v.as_str())
+                    {
+                        pending.insert(id.as_str(), PathBuf::from(path));
+                    }
                 }
-                _ => None,
-            })
-            .collect()
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    meta: Some(meta),
+                    ..
+                } => {
+                    // Walked in transcript order, so a later write to the same
+                    // path overwrites an earlier one and the newest is what
+                    // gets verified.
+                    if let Some(path) = pending.remove(tool_use_id.as_str())
+                        && let Some(fingerprint) = meta.write_fingerprint
+                    {
+                        wrote.insert(path, fingerprint);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut still_ours = std::collections::HashSet::with_capacity(wrote.len());
+        for (path, fingerprint) in wrote {
+            let live = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|meta| FileFingerprint::from_metadata(&meta));
+            if live == Some(fingerprint) {
+                still_ours.insert(path);
+            }
+        }
+        still_ours
     }
 
     /// Text of the newest system-prompt update already in the transcript, if
@@ -3457,6 +3500,53 @@ mod tests {
         );
     }
 
+    /// The model's `Edit` as the transcript really records it: the `ToolUse`
+    /// **and** the paired `ToolResult` the agent loop stamps with what the
+    /// write left on disk. The write happens here so the fingerprint is read
+    /// back off the very bytes the call produced, exactly as
+    /// `record_write_from_disk` does inside the tool.
+    fn model_edit(id: &str, path: &std::path::Path, body: &str) -> [ChatMessage; 2] {
+        std::fs::write(path, body).expect("write");
+        let meta = std::fs::metadata(path).expect("stat");
+        model_edit_stamped(id, path, body, Some(FileFingerprint::from_metadata(&meta)))
+    }
+
+    /// [`model_edit`] with the stamp forced — `None` is the shape a refused or
+    /// errored `Edit` leaves, which wrote nothing.
+    fn model_edit_stamped(
+        id: &str,
+        path: &std::path::Path,
+        body: &str,
+        write_fingerprint: Option<FileFingerprint>,
+    ) -> [ChatMessage; 2] {
+        [
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "Edit".into(),
+                input: serde_json::json!({
+                    "file_path": path.display().to_string(),
+                    "old_string": "x",
+                    "new_string": body,
+                }),
+                signature: None,
+            }]),
+            ChatMessage::tool_result_with_meta(
+                id.into(),
+                "replaced 1 occurrence(s)".into(),
+                Some(baybo_model::ToolResultMeta {
+                    write_fingerprint,
+                    ..Default::default()
+                }),
+            ),
+        ]
+    }
+
+    async fn append_all(ctx: &mut ContextManager, msgs: [ChatMessage; 2]) {
+        for m in &msgs {
+            ctx.append(m).await;
+        }
+    }
+
     /// When the model rewrites its own persona file, echoing the whole body
     /// back tells it what it just wrote. The update names the file instead —
     /// and a second edit to the same file adds no further row, because the
@@ -3472,22 +3562,11 @@ mod tests {
             baybo_workspace::paths::BUILTIN_PERSONA_DIR,
             IdentityKind::Soul,
         );
-        // The model's own Edit, as the transcript records it.
-        let edit_call = |body: &str| {
-            ChatMessage::assistant(vec![ContentBlock::ToolUse {
-                id: "call-1".into(),
-                name: "Edit".into(),
-                input: serde_json::json!({
-                    "file_path": soul.display().to_string(),
-                    "old_string": "x",
-                    "new_string": body,
-                }),
-                signature: None,
-            }])
-        };
-
-        ctx.append(&edit_call("SOUL_WRITTEN_BY_THE_MODEL")).await;
-        std::fs::write(&soul, "SOUL_WRITTEN_BY_THE_MODEL").expect("edit soul");
+        append_all(
+            &mut ctx,
+            model_edit("call-1", &soul, "SOUL_WRITTEN_BY_THE_MODEL"),
+        )
+        .await;
         ctx.reconcile_system_prompt().await;
 
         let update = ctx
@@ -3505,11 +3584,128 @@ mod tests {
             "the body the model just wrote must not be echoed back: {update}"
         );
 
-        // A second edit to the same file says nothing new.
+        // A second edit by the model says nothing new: same pointer, and the
+        // dedupe catches it.
         let rows = ctx.messages().len();
-        std::fs::write(&soul, "SOUL_EDITED_AGAIN").expect("edit soul again");
+        append_all(&mut ctx, model_edit("call-2", &soul, "SOUL_EDITED_AGAIN")).await;
         ctx.reconcile_system_prompt().await;
-        assert_eq!(ctx.messages().len(), rows, "{:?}", ctx.messages());
+        assert_eq!(
+            ctx.messages().len(),
+            rows + 2,
+            "only the edit's own two rows: {:?}",
+            ctx.messages()
+        );
+    }
+
+    /// The headline regression. Agent A edits its own persona file, then agent
+    /// B — another conversation, the agents admin API, the dream pass — writes
+    /// the same file. A must be told what B wrote.
+    ///
+    /// Keying the elision on the path alone made this silent twice over: the
+    /// pointer claimed A's edit still stood, and because it renders from tag and
+    /// path it came out byte-identical to the standing update, so the dedupe
+    /// dropped the row and A was told nothing at all.
+    #[tokio::test]
+    async fn another_writers_change_after_a_self_edit_reaches_this_conversation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "NAME: nobody");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        append_all(&mut ctx, model_edit("call-1", &soul, "NAME: Alice")).await;
+        ctx.reconcile_system_prompt().await;
+        let rows = ctx.messages().len();
+
+        // Agent B. No ToolUse, no result — this conversation never ran it.
+        std::fs::write(&soul, "NAME: Bob and then some").expect("B writes");
+        ctx.reconcile_system_prompt().await;
+
+        assert_eq!(
+            ctx.messages().len(),
+            rows + 1,
+            "B's write must append an update: {:?}",
+            ctx.messages()
+        );
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(update.contains("NAME: Bob and then some"), "{update}");
+        assert!(
+            !update.contains(crate::prompts::system_prompt_update::SELF_EDITED_ATTR),
+            "A did not write these bytes: {update}"
+        );
+    }
+
+    /// The same file the multi-agent design hands to everyone. `personas/USER.md`
+    /// is shared, so this is the production path rather than a contrived one.
+    #[tokio::test]
+    async fn another_agents_write_to_the_shared_user_profile_reaches_this_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let shared = workspace.shared_user_file();
+        std::fs::create_dir_all(shared.parent().expect("parent")).expect("mkdir");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        append_all(&mut ctx, model_edit("call-1", &shared, "LIKES: tea")).await;
+        ctx.reconcile_system_prompt().await;
+        let rows = ctx.messages().len();
+
+        std::fs::write(&shared, "LIKES: coffee, actually").expect("another agent writes");
+        ctx.reconcile_system_prompt().await;
+
+        assert_eq!(ctx.messages().len(), rows + 1, "{:?}", ctx.messages());
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(update.contains("LIKES: coffee, actually"), "{update}");
+    }
+
+    /// A `ToolUse` is recorded before the tool runs, so a refused or errored
+    /// `Edit` sits in the transcript looking exactly like one that landed. It
+    /// must not be able to claim authorship of bytes it never wrote, nor
+    /// suppress the real writer's change.
+    #[tokio::test]
+    async fn an_edit_that_never_landed_claims_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "NAME: nobody");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        // The call errored: transcript rows, no stamp, no bytes.
+        append_all(
+            &mut ctx,
+            model_edit_stamped("call-1", &soul, "NAME: Alice", None),
+        )
+        .await;
+        std::fs::write(&soul, "NAME: Bob and then some").expect("the real writer");
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(update.contains("NAME: Bob and then some"), "{update}");
+        assert!(
+            !update.contains(crate::prompts::system_prompt_update::SELF_EDITED_ATTR),
+            "the edit never landed: {update}"
+        );
     }
 
     /// The elision is scoped to files THIS conversation wrote. A change made

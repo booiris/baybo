@@ -151,19 +151,40 @@ honest, in ascending order of cost:
    Each explanatory paragraph is likewise carried only by an update that needs it,
    so the common single-section delta explains neither diffs nor self-edits.
 
-   **A file the model rewrote itself is named, not restated.** `Edit`/`Write`
-   calls in the transcript name the paths this conversation changed
-   (`self_edited_source_paths`, keyed off `baybo_tools::FILE_WRITING_TOOLS`), and
-   a section whose file is among them degrades to
+   **A file the model rewrote itself is named, not restated — while it still
+   says what the model wrote.** A section degrades to
    `<tag path="…" edited_by_you_in_this_conversation/>` plus one extra framing
    paragraph. Echoing an 11 KB `personas/USER.md` back at the model to tell it
-   what it just wrote is the one case where the body is pure duplication. The
-   scoping matters in both directions: a hint has no file behind it and is never
-   elided, a change made by anyone else still arrives in full, and a path that
-   fails to match (a symlink, a `..` spelling) falls back to the full body. And
+   what it just wrote is the one case where the body is pure duplication. And
    because the pointer is a pure function of tag and path, a second edit to the
    same file produces an identical update that the dedupe drops — repeated
    self-edits cost one row, not one per edit.
+
+   That last property is exactly why the claim has to be **verified rather than
+   assumed**, and `verified_self_edited_paths` is where it is. Keying on "this
+   conversation's `Edit`/`Write` named this path" is not the same question: a
+   persona file is writable by more than one writer — the shared
+   `personas/USER.md` by every agent, an `IDENTITY.md` by the agents admin API,
+   any of them by the dream pass — so once another writer landed, the pointer
+   asserted "your own edit is what it says now" about someone else's bytes.
+   Being content-free made it worse than wrong: the update came out
+   byte-identical to the standing one, the dedupe dropped the row, and the
+   conversation was told **nothing at all** while its `messages[0]` still held
+   the pre-edit body. A `ToolUse` is also recorded *before* its tool runs, so a
+   refused or errored `Edit` that wrote zero bytes claimed authorship too.
+
+   So each candidate path is checked against
+   `ToolResultMeta::write_fingerprint` — the `{mtime, size}` the writing call
+   left, stamped by the agent loop **only when the call actually wrote**
+   (`tool_wrote_successfully`; the sibling `read_fingerprint` is stamped for
+   failed and denied writes as well, carrying the pre-call anchor, which is what
+   made it the wrong input). It rides the persisted `ToolResult`, so the check
+   survives rehydration with the transcript instead of living in a field. Newest
+   write per path wins; a live `stat` that no longer matches drops the path and
+   the section is diffed honestly instead. Every miss falls the safe way — an
+   unstamped call, a path that fails to match (a symlink, a `..` spelling), a
+   hint with no file behind it — toward saying more, never toward claiming
+   authorship.
 
    The reconciler is otherwise append-only, which leaves one gap it has to close
    explicitly: a source that moves and then moves **back** leaves the standing

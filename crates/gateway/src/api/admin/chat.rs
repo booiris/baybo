@@ -4363,8 +4363,8 @@ mod tests {
                     "c1".to_owned(),
                     "ok output".to_owned(),
                     Some(baybo_model::ToolResultMeta {
-                        read_fingerprint: None,
                         approval: Some(baybo_tools::ApprovalDecision::ApproveAlways),
+                        ..Default::default()
                     }),
                 ),
             ),
@@ -4408,8 +4408,8 @@ mod tests {
                     "c1".to_owned(),
                     "Error: skill 'x' requires env-var approval".to_owned(),
                     Some(baybo_model::ToolResultMeta {
-                        read_fingerprint: None,
                         approval: Some(ApprovalDecision::Deny),
+                        ..Default::default()
                     }),
                 ),
             ),
