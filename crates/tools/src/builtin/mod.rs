@@ -46,6 +46,7 @@ pub mod read;
 mod rg;
 pub mod secret;
 pub mod todo;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod write;
 
@@ -128,9 +129,11 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
         attach_file::tool(blob_store.clone()),
         put_blob::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
-        trusted(secret::SecretAddTool, vec![]),
-        trusted(secret::SecretListTool, vec![]),
-        trusted(secret::SecretCheckTool, vec![]),
+        // Secrets are managed in bursts — add a credential, list what exists —
+        // and then not touched for weeks.
+        deferred(secret::SecretAddTool, vec![]),
+        deferred(secret::SecretListTool, vec![]),
+        deferred(secret::SecretCheckTool, vec![]),
         trusted(JobListTool, vec![]),
         trusted(JobStopTool, vec![]),
     ];
@@ -145,6 +148,17 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
     tools
 }
 
+/// [`trusted`], but kept out of a session's tool list until it asks. See
+/// [`ToolManifest::deferred`].
+pub(crate) fn deferred<T: Tool + 'static>(
+    tool: T,
+    capabilities: Vec<ToolCapability>,
+) -> (Arc<dyn Tool>, ToolManifest) {
+    let (tool, mut manifest) = trusted(tool, capabilities);
+    manifest.deferred = true;
+    (tool, manifest)
+}
+
 pub(crate) fn trusted<T: Tool + 'static>(
     tool: T,
     capabilities: Vec<ToolCapability>,
@@ -156,6 +170,7 @@ pub(crate) fn trusted<T: Tool + 'static>(
         parameters_schema: tool.parameters_schema(),
         capabilities,
         channels: Vec::new(),
+        deferred: false,
     };
     (Arc::new(tool), manifest)
 }

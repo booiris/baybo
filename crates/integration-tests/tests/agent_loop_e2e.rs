@@ -1056,6 +1056,7 @@ mod overlap_tool {
                 parameters_schema: json!({"type": "object", "additionalProperties": true}),
                 capabilities: vec![],
                 channels: Vec::new(),
+                deferred: false,
             }
         }
     }
@@ -2610,11 +2611,18 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     );
     assert!(framed.contains("你好"), "carries the instruction: {framed}");
 
-    // The operator panel recovers the original instruction, not the
-    // framing boilerplate.
-    assert_eq!(
-        baybo_context::prompts::cron::original_cron_prompt(framed),
-        "你好"
+    // The instruction follows the label rather than being swallowed by the
+    // framing. Only `starts_with`, because this is the *wire* form: reminders
+    // are stored as standalone `Role::User` rows and `merge_for_llm` coalesces
+    // them onto the end of this one, so anything appended after the fire (the
+    // checklist, the loadable-tool roster) legitimately shows up here.
+    //
+    // The operator panel's contract — `original_cron_prompt` recovering
+    // exactly the configured instruction — is about the *stored* row, and is
+    // covered where that function lives (`prompts::cron`).
+    assert!(
+        baybo_context::prompts::cron::original_cron_prompt(framed).starts_with("你好"),
+        "the instruction must follow the label: {framed}"
     );
 
     harness.shutdown().await;
@@ -2678,6 +2686,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
         parameters_schema: json!({"type": "object"}),
         capabilities: vec![],
         channels: Vec::new(),
+        deferred: false,
     };
     let mut harness = AgentTestHarness::builder()
         .session(session)
@@ -3342,6 +3351,7 @@ mod interjecting_tool {
                 parameters_schema: json!({"type": "object", "additionalProperties": true}),
                 capabilities: vec![],
                 channels: Vec::new(),
+                deferred: false,
             }
         }
     }

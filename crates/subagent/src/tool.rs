@@ -620,6 +620,7 @@ pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
         channels: Vec::new(),
+        deferred: false,
     };
     (Arc::new(tool), manifest)
 }

@@ -50,22 +50,41 @@ fn parse_tz(name: &str) -> Result<Tz, ToolError> {
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
 /// agent-internal scheduler state, not on the host filesystem or network.
 pub fn agent_tools(scheduler: Arc<CronScheduler>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-    let tools: Vec<Arc<dyn Tool>> = vec![
+    let scheduling: Vec<Arc<dyn Tool>> = vec![
         Arc::new(CronCreateTool::new(Arc::clone(&scheduler))),
         Arc::new(CronUpdateTool::new(Arc::clone(&scheduler))),
         Arc::new(CronDeleteTool::new(Arc::clone(&scheduler))),
         Arc::new(CronPauseTool::new(Arc::clone(&scheduler))),
         Arc::new(CronResumeTool::new(Arc::clone(&scheduler))),
         Arc::new(CronListTool::new(scheduler)),
-        // Holds no scheduler state: its only effect is to flip the fire's
-        // `NotifySilence` handle, and it is visible only inside a recurring fire.
-        Arc::new(CronReportNothingTool),
     ];
 
-    tools.into_iter().map(with_manifest).collect()
+    scheduling
+        .into_iter()
+        .map(|tool| with_manifest(tool, true))
+        .chain(std::iter::once(with_manifest(
+            // Holds no scheduler state: its only effect is to flip the fire's
+            // `NotifySilence` handle, and it is visible only inside a recurring
+            // fire.
+            //
+            // Deliberately NOT deferred. A fire whose entire answer is "nothing
+            // happened" would have to spend a turn loading a tool before it
+            // could say so, which is the opposite of what this tool is for —
+            // and its `CronFire` trigger scope already keeps it out of every
+            // other session's list, so leaving it resident costs an ordinary
+            // conversation nothing.
+            Arc::new(CronReportNothingTool),
+            false,
+        )))
+        .collect()
 }
 
-fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
+/// Name of the silence tool. Named once because the deferral rule above keys
+/// on it, and a rename that missed a site would quietly defer the one tool
+/// that must not be.
+pub const REPORT_NOTHING_TOOL_NAME: &str = "report_nothing";
+
+fn with_manifest(tool: Arc<dyn Tool>, deferred: bool) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
@@ -73,6 +92,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
         channels: Vec::new(),
+        deferred,
     };
     (tool, manifest)
 }
@@ -93,7 +113,7 @@ struct CronReportNothingTool;
 #[async_trait]
 impl Tool for CronReportNothingTool {
     fn name(&self) -> &str {
-        "report_nothing"
+        REPORT_NOTHING_TOOL_NAME
     }
 
     fn description(&self) -> String {

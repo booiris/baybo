@@ -950,6 +950,7 @@ fn tool_pair(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::Http],
         channels: Vec::new(),
+        deferred: false,
     };
     (tool, manifest)
 }

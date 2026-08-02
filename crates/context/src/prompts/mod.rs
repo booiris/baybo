@@ -7,6 +7,7 @@ pub mod background_notification;
 pub mod cancelled_turn;
 pub mod compression;
 pub mod cron;
+pub mod deferred_tools;
 pub mod interjection;
 pub mod recalled_memory;
 pub mod soul;

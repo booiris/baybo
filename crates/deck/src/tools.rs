@@ -60,6 +60,10 @@ pub fn agent_tools(manager: Arc<DeckManager>) -> Vec<(Arc<dyn Tool>, ToolManifes
                 parameters_schema: tool.parameters_schema(),
                 capabilities,
                 channels: vec![baybo_model::ChannelType::owner()],
+                // The deck is a standing surface the owner curates; most turns
+                // never touch a card, and the `/deck` skill loads these on its
+                // first move.
+                deferred: true,
             };
             (tool, manifest)
         })

@@ -133,6 +133,7 @@ pub(crate) fn build_manifest(
     parameters_schema: Value,
     trust_level: baybo_model::TrustLevel,
     capabilities: Vec<crate::ToolCapability>,
+    deferred: bool,
 ) -> crate::ToolManifest {
     crate::ToolManifest {
         name: namespaced_name.to_string(),
@@ -141,5 +142,6 @@ pub(crate) fn build_manifest(
         parameters_schema,
         capabilities,
         channels: Vec::new(),
+        deferred,
     }
 }

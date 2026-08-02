@@ -98,6 +98,10 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
         trust_level,
         capabilities,
         oauth,
+        // An operator adding a server wants its tools. Deferral is a
+        // token-budget call the embedded profiles make for what they ship;
+        // a user entry opts in by hand in `.mcp.json`.
+        deferred: false,
     };
     entry
         .validate()

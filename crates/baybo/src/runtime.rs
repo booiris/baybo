@@ -609,6 +609,14 @@ pub async fn build_managers(
     // need an `Arc<ToolRegistry>` for sharing across tasks.
     let tool_registry = Arc::new(tool_registry);
 
+    // The opener for deferred tools. Registered against the frozen `Arc`
+    // because it reads the live registry: a deferred sidecar's tools appear
+    // when it connects, which is after this point.
+    {
+        let (tool, manifest) = baybo_tools::builtin::tool_search::make(Arc::clone(&tool_registry));
+        tool_registry.register_dynamic("tool-search", tool, manifest);
+    }
+
     // Sandbox FS scope is the workspace `work/` directory — the
     // ephemeral scratch root for tool-generated files. `ensure_layout`
     // creates this before `build_managers` runs. Canonicalize so

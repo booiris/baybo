@@ -58,6 +58,9 @@ pub struct EmbeddedMcpProfile {
     /// child reads via `process.env.*` (chromium binary path,
     /// no-sandbox flag, …).
     pub extra_env: HashMap<String, String>,
+    /// Keep this server's tools out of a session's list until it loads them.
+    /// See [`McpServerEntry::deferred`].
+    pub deferred: bool,
 }
 
 /// Materialise each profile into an [`EmbeddedMcpServer`] entry the
@@ -77,6 +80,7 @@ pub fn embedded_servers(profiles: &[EmbeddedMcpProfile]) -> Vec<EmbeddedMcpServe
                 trust_level: TrustLevelConfig::Trusted,
                 capabilities: p.capabilities.clone(),
                 oauth: None,
+                deferred: p.deferred,
             };
             EmbeddedMcpServer::new(entry, p.extra_env.clone())
         })
@@ -102,6 +106,7 @@ mod tests {
             args: vec!["/path/to/bundle.mjs".into()],
             capabilities: vec![ToolCapability::Http],
             extra_env: env,
+            deferred: false,
         };
         let entries = embedded_servers(std::slice::from_ref(&p));
         assert_eq!(entries.len(), 1);

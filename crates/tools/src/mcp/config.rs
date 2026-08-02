@@ -83,6 +83,16 @@ pub struct McpServerEntry {
     pub capabilities: Vec<ToolCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
+    /// Keep this server's tools out of a session's list until it loads them
+    /// with `ToolSearch`.
+    ///
+    /// An MCP server can contribute dozens of tools, and every one of them is
+    /// serialised into every request whether or not it is ever called.
+    /// Deferring trades one round trip in the sessions that use the server for
+    /// nothing at all in the sessions that do not. The names still appear in
+    /// the roster, so nothing becomes undiscoverable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 impl McpServerEntry {
@@ -340,6 +350,7 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            deferred: false,
         };
         let err = entry.validate().unwrap_err();
         let msg = format!("{err}");
@@ -359,6 +370,7 @@ mod tests {
             trust_level: TrustLevelConfig::Untrusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            deferred: false,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
@@ -387,6 +399,7 @@ mod tests {
             trust_level: TrustLevelConfig::Installed,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            deferred: false,
         };
         let err = entry.validate().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig(_)));
@@ -412,6 +425,7 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::Http],
             oauth: None,
+            deferred: false,
         });
         file.write(dir.path()).await.unwrap();
         let loaded = McpFile::load(dir.path()).await.unwrap();

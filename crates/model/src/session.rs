@@ -8,6 +8,7 @@ use crate::agent_profile::{AgentFramework, AgentProfileId};
 use crate::approval::ApprovedResource;
 use crate::ids::{SessionId, TurnId};
 use crate::llm_entry_name::LlmEntryName;
+use crate::loaded_tools::LoadedTools;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -323,6 +324,13 @@ pub struct SessionState {
     /// grants. See `baybo_model::approval` for matching semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
+
+    /// Deferred tools this session has pulled in with `ToolSearch`. Persisted
+    /// so a conversation that loaded the browser still has it after a restart:
+    /// re-hiding them would drop a capability the model had been using, and
+    /// cost a full prefix miss to take it away.
+    #[serde(default, skip_serializing_if = "LoadedTools::is_empty")]
+    pub loaded_tools: LoadedTools,
 
     /// Durable state for the complete background-notification pipeline:
     /// collecting terminal turn results, waiting on grouped barriers, and

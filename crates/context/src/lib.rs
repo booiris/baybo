@@ -366,6 +366,11 @@ pub struct ContextManager {
     /// site that writes the row from a live assembly records the version it
     /// wrote, which is what keeps the per-call check to a handful of `stat`s.
     system_prompt_version: Option<SystemPromptVersion>,
+    /// The loadable-tool roster this session has been shown, or `None` before
+    /// it has been shown one. In-memory only: a restart re-advertises, which
+    /// costs one roster message and is strictly safer than a hydrated session
+    /// believing it already told the model about a tool it never mentioned.
+    advertised_deferred_tools: Option<Vec<String>>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -435,6 +440,7 @@ impl ContextManager {
             task_reminder_raw: 0,
             notification_cue: None,
             system_prompt_version: None,
+            advertised_deferred_tools: None,
         }
     }
 
@@ -884,6 +890,45 @@ impl ContextManager {
             )]))
             .await;
         }
+    }
+
+    /// Tell the session which tools it could load, and — on later calls — what
+    /// has changed since it was last told.
+    ///
+    /// Append-only in both cases. The roster could equally be re-rendered in
+    /// place, and that would be wrong for the reason `messages_for_llm`
+    /// records for superseded `SystemPromptUpdate` rows: rewriting a row
+    /// mid-transcript invalidates the provider's cached prefix from that
+    /// position, every call, forever after. A delta costs a few tokens once.
+    ///
+    /// `loadable` must be sorted; the caller gets it that way from
+    /// `ToolRegistry::deferred_tool_names`.
+    pub async fn reconcile_deferred_tools(&mut self, loadable: &[String]) {
+        let previous = match &self.advertised_deferred_tools {
+            // First pass in this session: the whole set is the message.
+            None => {
+                if let Some(roster) = crate::prompts::deferred_tools::render_roster(loadable) {
+                    self.append(&ChatMessage::agent_context(vec![ContentBlock::Text(
+                        roster,
+                    )]))
+                    .await;
+                }
+                self.advertised_deferred_tools = Some(loadable.to_vec());
+                return;
+            }
+            Some(previous) => previous,
+        };
+        let (arrived, withdrawn) = crate::prompts::deferred_tools::diff(previous, loadable);
+        if let Some(delta) = crate::prompts::deferred_tools::render_delta(&arrived, &withdrawn) {
+            debug!(
+                arrived = arrived.len(),
+                withdrawn = withdrawn.len(),
+                "announcing a change to the loadable tool set"
+            );
+            self.append(&ChatMessage::agent_context(vec![ContentBlock::Text(delta)]))
+                .await;
+        }
+        self.advertised_deferred_tools = Some(loadable.to_vec());
     }
 
     /// Skills the agent may invoke here: the registry's summaries filtered to

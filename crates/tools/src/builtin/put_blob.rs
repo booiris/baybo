@@ -132,6 +132,7 @@ pub(super) fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManife
         parameters_schema: put_blob.parameters_schema(),
         capabilities: vec![ToolCapability::ReadFile],
         channels: vec![ChannelType::owner()],
+        deferred: false,
     };
     (Arc::new(put_blob), manifest)
 }

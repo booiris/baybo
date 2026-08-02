@@ -9,6 +9,7 @@ mod folder;
 mod governance;
 mod ids;
 mod llm_entry_name;
+mod loaded_tools;
 mod message;
 mod model_tier;
 mod money;
@@ -38,6 +39,7 @@ pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, ParallelGroup, SessionId, SpanId, StepId, TaskId, TurnId};
 pub use llm_entry_name::LlmEntryName;
+pub use loaded_tools::LoadedTools;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
     TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
