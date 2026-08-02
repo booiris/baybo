@@ -18,29 +18,46 @@ import {
   markStepAwaitingApproval,
   resolveStepApproval,
   foldAdjacentWork,
+  segmentWorkSteps,
   type TranscriptRow,
   type WorkStep,
 } from './ChatPage';
 
 // Pins the "Working" affordance UX: a live turn shows a compact spinner and
-// only expands into the steps panel once it has actually produced a step,
+// only expands into the steps panel once it has actually produced MACHINERY,
 // and a finished turn never renders a "Worked 0s" artifact.
 
 describe('workBlockDisplay — spinner first, expand on the first step', () => {
   it('live turn with no steps yet is a compact spinner: boxed but panel shut', () => {
-    expect(workBlockDisplay(true, false, false)).toEqual({ boxed: true, panelOpen: false });
+    expect(workBlockDisplay(true, false, false)).toEqual({
+      boxed: true,
+      panelOpen: false,
+      toggleable: false,
+    });
   });
 
   it('live turn expands the panel the moment a step lands', () => {
-    expect(workBlockDisplay(true, true, false)).toEqual({ boxed: true, panelOpen: true });
+    expect(workBlockDisplay(true, true, false)).toEqual({
+      boxed: true,
+      panelOpen: true,
+      toggleable: false,
+    });
   });
 
   it('finished, collapsed block is neither boxed nor open (the dim summary line)', () => {
-    expect(workBlockDisplay(false, true, false)).toEqual({ boxed: false, panelOpen: false });
+    expect(workBlockDisplay(false, true, false)).toEqual({
+      boxed: false,
+      panelOpen: false,
+      toggleable: true,
+    });
   });
 
   it('finished block the user re-expanded is boxed with its panel open', () => {
-    expect(workBlockDisplay(false, true, true)).toEqual({ boxed: true, panelOpen: true });
+    expect(workBlockDisplay(false, true, true)).toEqual({
+      boxed: true,
+      panelOpen: true,
+      toggleable: true,
+    });
   });
 
   it('a live turn is never collapsed shut even mid-expand-toggle', () => {
@@ -51,8 +68,78 @@ describe('workBlockDisplay — spinner first, expand on the first step', () => {
 
   it('a settling block (interjection-paused) stays boxed with its panel open', () => {
     // workActive=false (reads "Worked"), not user-expanded, but settling keeps
-    // it open until the turn ends.
-    expect(workBlockDisplay(false, true, false, true)).toEqual({ boxed: true, panelOpen: true });
+    // it open until the turn ends — and stays non-toggleable meanwhile.
+    expect(workBlockDisplay(false, true, false, true)).toEqual({
+      boxed: true,
+      panelOpen: true,
+      toggleable: false,
+    });
+  });
+
+  it('a block with only speech offers no chevron — nothing is hidden behind it', () => {
+    // Prose is never folded, so a prose-only block has nothing to reveal. An
+    // arrow here would open onto an empty panel, breaking the standing "the
+    // arrow is always meaningful" contract.
+    expect(workBlockDisplay(false, false, false)).toEqual({
+      boxed: false,
+      panelOpen: false,
+      toggleable: false,
+    });
+  });
+});
+
+describe('segmentWorkSteps — speech stays, machinery folds', () => {
+  const step = (kind: WorkStep['kind'], text: string): WorkStep => ({
+    key: `${kind}:${text}`,
+    kind,
+    text,
+    ...(kind === 'tool' ? { toolCallId: text, toolLabel: text, toolStatus: 'ok' as const } : {}),
+  });
+  const shape = (steps: WorkStep[]) =>
+    segmentWorkSteps(steps).map((s) => `${s.kind}:${s.steps.length}`);
+
+  it('a turn with no narration is one machinery run — the common shape, unchanged', () => {
+    expect(shape([step('reasoning', 'r'), step('tool', 'c1'), step('tool', 'c2')])).toEqual([
+      'machinery:3',
+    ]);
+  });
+
+  it('splits at every prose step, preserving chronological order', () => {
+    expect(
+      shape([
+        step('reasoning', 'r1'),
+        step('prose', 'first'),
+        step('tool', 'c1'),
+        step('prose', 'second'),
+        step('tool', 'c2'),
+      ]),
+    ).toEqual(['machinery:1', 'speech:1', 'machinery:1', 'speech:1', 'machinery:1']);
+  });
+
+  it('coalesces adjacent prose into ONE speech run', () => {
+    expect(shape([step('prose', 'a'), step('prose', 'b'), step('tool', 'c1')])).toEqual([
+      'speech:2',
+      'machinery:1',
+    ]);
+  });
+
+  it('handles a block that leads with speech — the [Text, ToolUse] iteration shape', () => {
+    expect(shape([step('prose', 'a'), step('tool', 'c1')])).toEqual(['speech:1', 'machinery:1']);
+  });
+
+  it('handles a prose-only block (reachable via a mid-turn subscribe_state REPLACE)', () => {
+    expect(shape([step('prose', 'a')])).toEqual(['speech:1']);
+  });
+
+  it('is empty for an empty block', () => {
+    expect(shape([])).toEqual([]);
+  });
+
+  it('groups notices with the machinery they interrupt, not with speech', () => {
+    expect(shape([step('prose', 'a'), step('notice', 'n'), step('tool', 'c1')])).toEqual([
+      'speech:1',
+      'machinery:2',
+    ]);
   });
 });
 
@@ -592,6 +679,89 @@ describe('foldAdjacentWork — a turn cut by a page boundary is still one turn',
     const [row] = foldAdjacentWork([first(), first()]);
     expect(row).toMatchObject({ key: wkey(3), workStartedAt: TURN_START, workEndedAt: FIRST_END });
     expect(row.steps).toHaveLength(1);
+  });
+
+  // Prose used to key on its TEXT alone, so a model that said the same short
+  // thing twice in one turn ("我看下测试。") lost the second copy to the merge.
+  // That was invisible while narration was hidden inside the collapse and is a
+  // deleted paragraph now that it renders — so the key anchors on the tool call
+  // the paragraph precedes (a row's Text and its ToolUse are ONE persisted row,
+  // hence inseparable by a page tear and identical on every leg).
+  describe('repeated narration survives the merge', () => {
+    const SAME = '我看下测试。';
+    const p = (k: string, text: string): WorkStep => ({ key: k, kind: 'prose', text });
+    const tl = (k: string, id: string): WorkStep => ({
+      key: k,
+      kind: 'tool',
+      toolCallId: id,
+      tool: 'bash',
+      toolStatus: 'ok',
+    });
+    const withSteps = (row: TranscriptRow, steps: WorkStep[]): TranscriptRow => ({ ...row, steps });
+    const texts = (row: TranscriptRow) => (row.steps ?? []).map((s) => s.text ?? s.toolCallId);
+
+    it('keeps BOTH copies when a page tear puts one in each half', () => {
+      const a = withSteps(first(), [p('a0', SAME), tl('a1', 'c1')]);
+      const b = withSteps(second(), [p('b0', SAME), tl('b1', 'c2')]);
+      expect(texts(foldAdjacentWork([a, b])[0])).toEqual([SAME, 'c1', SAME, 'c2']);
+    });
+
+    it('keeps both when the live half only saw the first and the server sent both', () => {
+      const live: TranscriptRow = {
+        key: 'work-999-0',
+        role: 'system',
+        text: '',
+        kind: 'work',
+        workActive: true,
+        workStartedAt: 999,
+        steps: [p('l0', SAME), tl('l1', 'c1')],
+      };
+      const recon = withSteps(second(), [p('r0', SAME), tl('r1', 'c1'), p('r2', SAME), tl('r3', 'c2')]);
+      expect(texts(foldAdjacentWork([live, recon])[0])).toEqual([SAME, 'c1', SAME, 'c2']);
+    });
+
+    it('does NOT double a paragraph the live half holds UNANCHORED (its tool call is still in flight)', () => {
+      const live: TranscriptRow = {
+        key: 'work-999-0',
+        role: 'system',
+        text: '',
+        kind: 'work',
+        workActive: true,
+        workStartedAt: 999,
+        steps: [tl('l0', 'c1'), p('l1', SAME)],
+      };
+      const recon = withSteps(second(), [tl('r0', 'c1'), p('r1', SAME), tl('r2', 'c2')]);
+      expect(texts(foldAdjacentWork([live, recon])[0])).toEqual(['c1', SAME, 'c2']);
+    });
+
+    // Found by an adversarial probe against the first version of this key: a's
+    // single copy satisfied BOTH the anchored and the unanchored occurrence in
+    // the server's list, so the tail paragraph vanished.
+    it("keeps the tail paragraph when the live copy already matched an earlier one", () => {
+      const live: TranscriptRow = {
+        key: 'work-999-0',
+        role: 'system',
+        text: '',
+        kind: 'work',
+        workActive: true,
+        workStartedAt: 999,
+        steps: [tl('l0', 'c1'), p('l1', SAME)],
+      };
+      const recon = withSteps(second(), [tl('r0', 'c1'), p('r1', SAME), tl('r2', 'c2'), p('r3', SAME)]);
+      expect(texts(foldAdjacentWork([live, recon])[0])).toEqual(['c1', SAME, 'c2', SAME]);
+    });
+
+    it('keeps a repeat the newer half reached only after adding its own steps', () => {
+      const a = withSteps(first(), [p('a0', '甲'), tl('a1', 'c1')]);
+      const b = withSteps(second(), [p('b0', '甲'), tl('b1', 'c2'), p('b2', '甲')]);
+      expect(texts(foldAdjacentWork([a, b])[0])).toEqual(['甲', 'c1', '甲', 'c2', '甲']);
+    });
+
+    it('still collapses a genuinely redelivered span (no doubling)', () => {
+      const span = [p('0', '甲'), tl('1', 'c1'), p('2', '乙'), tl('3', 'c2')];
+      const [row] = foldAdjacentWork([withSteps(first(), span), withSteps(first(), span)]);
+      expect(texts(row)).toEqual(['甲', 'c1', '乙', 'c2']);
+    });
   });
 
   it('does NOT fuse a completed turn with the following one (two turns, two cards)', () => {

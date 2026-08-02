@@ -47,7 +47,7 @@ const REMARK_PLUGINS = [
 // `white-space: pre-wrap` raw text). Unlike the plugins above it installs no
 // micromark extension — it is a transformer over the parsed mdast — so its
 // position in the array carries no constraint. Deliberately NOT extended to the
-// answer: `prose` steps are the answer's own bytes (see `WorkStepView`).
+// answer: `prose` steps are the answer's own bytes (see `segmentWorkSteps`).
 const REMARK_PLUGINS_BREAKS = [...REMARK_PLUGINS, remarkBreaks];
 // `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
 // `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed

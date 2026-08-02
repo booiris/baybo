@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, render } from '@testing-library/react';
 
-import { WorkStepView, type WorkStep } from './ChatPage';
+import { WorkSpeechRun, WorkStepView, type WorkStep } from './ChatPage';
 
 // Which steps inside a work block are MARKDOWN and which are verbatim is a
 // contract, not a styling detail: the model writes its reasoning in the same
@@ -75,20 +75,41 @@ describe('WorkStepView verbatim steps', () => {
 
   // The trace is written as short newline-separated lines. CommonMark folds a
   // single newline into a space, which ran the whole trace together the moment
-  // it started being parsed; `breaks` is what buys the shape back. Folded prose
-  // is answer text and deliberately stays on the paragraph rule.
-  it('keeps the trace line-broken, while folded prose stays folded', () => {
+  // it started being parsed; `breaks` is what buys the shape back.
+  it('keeps the trace line-broken', () => {
     const trace = render(<WorkStepView step={step({ text: '看配置\n看日志\n看指标' })} />);
     expect(trace.container.querySelectorAll('br')).toHaveLength(2);
-    const prose = render(<WorkStepView step={step({ kind: 'prose', text: '第一行\n第二行' })} />);
-    expect(prose.container.querySelector('br')).toBeNull();
+  });
+});
+
+// Mid-turn narration left the step renderer when the collapse stopped being
+// allowed to hide it (see `segmentWorkSteps`), but the typography contract
+// moved with it: it is ANSWER text, so it gets the answer's markdown rules —
+// notably NOT `breaks`, unlike the reasoning trace above.
+describe('WorkSpeechRun — the model\'s own mid-turn words', () => {
+  const prose = (text: string): WorkStep => ({ key: `p:${text}`, kind: 'prose', text });
+
+  it('renders narration as markdown', () => {
+    const { container } = render(<WorkSpeechRun steps={[prose('**结论：**可以上线')]} />);
+    expect(container.querySelector('strong')?.textContent).toBe('结论：');
   });
 
-  it('still renders folded mid-turn prose as markdown', () => {
+  it('stays on the paragraph rule — a lone newline does not become a <br>', () => {
+    const { container } = render(<WorkSpeechRun steps={[prose('第一行\n第二行')]} />);
+    expect(container.querySelector('br')).toBeNull();
+  });
+
+  it('renders each paragraph of a coalesced run', () => {
+    const { container } = render(<WorkSpeechRun steps={[prose('先看这里'), prose('再看那里')]} />);
+    expect(container.textContent).toContain('先看这里');
+    expect(container.textContent).toContain('再看那里');
+  });
+
+  it('survives a step with no text', () => {
     const { container } = render(
-      <WorkStepView step={step({ kind: 'prose', text: '**结论：**可以上线' })} />,
+      <WorkSpeechRun steps={[{ key: 'p0', kind: 'prose' }]} />,
     );
-    expect(container.querySelector('strong')?.textContent).toBe('结论：');
+    expect(container.textContent).toBe('');
   });
 });
 

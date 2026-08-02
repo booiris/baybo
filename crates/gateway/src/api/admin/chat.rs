@@ -46,7 +46,7 @@ use baybo_channels::wire::{
     AttachmentKind, FolderChange, FolderView, SessionPatch, SlashCommandSpec, WireAttachment,
     WireWorkStep, WireWorkStepKind,
 };
-use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
+use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent};
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
     ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
@@ -593,9 +593,24 @@ pub struct ChatWorkStep {
     /// predates the field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// When this step happened — the `created_at` of the row it came from, or
+    /// the instant the live buffer recorded it. Lets a client time the
+    /// stretches BETWEEN the model's mid-turn remarks rather than only the
+    /// turn as a whole. `None` for a row reconstructed by a gateway that
+    /// predates this, and for the synthetic steps that have no source row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
 }
 
 impl ChatWorkStep {
+    /// Stamp this step with when it happened. Chained at construction so each
+    /// call site names its own source of truth.
+    #[must_use]
+    fn stamped(mut self, at: DateTime<Utc>) -> Self {
+        self.at = Some(at);
+        self
+    }
+
     fn reasoning(text: String) -> Self {
         Self {
             kind: WorkStepKind::Reasoning,
@@ -606,6 +621,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            at: None,
         }
     }
 
@@ -619,6 +635,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            at: None,
         }
     }
 
@@ -632,6 +649,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            at: None,
         }
     }
 
@@ -645,6 +663,7 @@ impl ChatWorkStep {
             tool_status: None,
             tool_summary: None,
             approval: None,
+            at: None,
         }
     }
 }
@@ -655,7 +674,8 @@ impl ChatWorkStep {
 /// `tool_status` / `tool_summary` (both `None` while a tool is still running).
 impl From<WireWorkStep> for ChatWorkStep {
     fn from(step: WireWorkStep) -> Self {
-        match step.kind {
+        let at = step.at;
+        let mut out = match step.kind {
             WireWorkStepKind::Reasoning => Self::reasoning(step.text),
             WireWorkStepKind::Prose => Self::prose(step.text),
             WireWorkStepKind::Status => Self::status(step.text),
@@ -668,8 +688,11 @@ impl From<WireWorkStep> for ChatWorkStep {
                 tool_status: step.status,
                 tool_summary: step.summary,
                 approval: step.approval.map(|d| d.as_str().to_owned()),
+                at: None,
             },
-        }
+        };
+        out.at = at;
+        out
     }
 }
 
@@ -2922,7 +2945,7 @@ fn is_stop_control_event(ev: &ControlEvent) -> bool {
 /// loading mid-turn shows the reasoning / tool steps that streamed before it
 /// joined. Consecutive reasoning / answer deltas were already coalesced by the
 /// channel buffer, so each arrives as a single entry.
-fn in_flight_work_steps(events: Vec<SessionEvent>) -> Vec<ChatWorkStep> {
+fn in_flight_work_steps(events: Vec<StampedEvent>) -> Vec<ChatWorkStep> {
     crate::channel::work_steps::in_flight_wire_steps(events)
         .into_iter()
         .map(ChatWorkStep::from)
@@ -3033,7 +3056,8 @@ fn reconstruct_transcript_with_attachments(
                         work.ordinal = Some(ev.after_ordinal);
                     }
                     work.last = Some(ev.created_at);
-                    work.steps.push(ChatWorkStep::status(ev.text));
+                    work.steps
+                        .push(ChatWorkStep::status(ev.text).stamped(ev.created_at));
                     continue;
                 }
                 // A control event interrupting an open work block bounds it:
@@ -3111,21 +3135,22 @@ fn reconstruct_transcript_with_attachments(
                         ContentBlock::Thinking { content, .. } => {
                             let text = thinking_text(content);
                             if !text.is_empty() {
-                                work.steps.push(ChatWorkStep::reasoning(text));
+                                work.steps
+                                    .push(ChatWorkStep::reasoning(text).stamped(created_at));
                             }
                         }
                         ContentBlock::Text(t) if !t.trim().is_empty() => {
-                            work.steps.push(ChatWorkStep::prose(t.clone()));
+                            work.steps
+                                .push(ChatWorkStep::prose(t.clone()).stamped(created_at));
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
-                            work.steps.push(ChatWorkStep::tool(
-                                id.clone(),
-                                name.clone(),
-                                tool_label(input),
-                            ));
+                            work.steps.push(
+                                ChatWorkStep::tool(id.clone(), name.clone(), tool_label(input))
+                                    .stamped(created_at),
+                            );
                         }
                         _ => {}
                     }
@@ -3164,7 +3189,8 @@ fn reconstruct_transcript_with_attachments(
                                 work.started = Some(turn_started.unwrap_or(created_at));
                                 work.ordinal = Some(ordinal);
                             }
-                            work.steps.push(ChatWorkStep::reasoning(text));
+                            work.steps
+                                .push(ChatWorkStep::reasoning(text).stamped(created_at));
                         }
                     }
                 }

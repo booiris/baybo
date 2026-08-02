@@ -82,9 +82,10 @@ type ApiAttachment = components['schemas']['ChatAttachment'];
 /** One progress entry inside a turn's work block. `reasoning`, `status`
  *  and `prose` carry `text`; `tool` carries the tool-call fields and is
  *  keyed by `toolCallId` so the completion frame resolves the step its
- *  start created. `prose` is mid-turn answer text the model emitted
- *  before its final reply — folded in here rather than left as its own
- *  bubble. */
+ *  start created. `prose` is mid-turn answer text the model emitted before
+ *  its final reply — carried as a step so it keeps the turn's wire and
+ *  storage order, but rendered OUTSIDE the collapse at answer typography
+ *  (`segmentWorkSteps`), never hidden behind `Worked …`. */
 export interface WorkStep {
   key: string;
   kind: 'reasoning' | 'tool' | 'status' | 'prose' | 'notice';
@@ -105,6 +106,11 @@ export interface WorkStep {
   /** The decision the user gave. Persisted with the tool result, so a reload
    *  still shows what was judged. */
   approval?: 'approve' | 'approve_always' | 'deny';
+  /** Epoch ms for when this step happened. Server-supplied where the step has
+   *  a source row or a buffered event; stamped locally when a live frame mints
+   *  the step, since the frames themselves carry no time. Drives the per-run
+   *  `Worked Xs` labels — see `segmentWorkSteps`. */
+  at?: number;
 }
 
 export interface TranscriptRow {
@@ -664,6 +670,22 @@ export function ChatPage() {
     if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
     delete streamPacersRef.current[sid];
   }, []);
+
+  /** Rebase the pacer onto text something ELSE already painted — the
+   *  `subscribe_state` bundle's recovered answer tail. `rendered === length`
+   *  is the whole point: the text is on screen already, so the next delta must
+   *  EXTEND it rather than re-reveal it from zero (which would replace the
+   *  bubble with the delta's first characters). Empty text just tears the
+   *  pacer down, so a fresh answer starts from nothing. */
+  const seedPacer = useCallback(
+    (sid: string, text: string) => {
+      // Tear the old one down first — `cancelPacer` owns the rAF bookkeeping.
+      cancelPacer(sid);
+      if (text.length === 0) return;
+      streamPacersRef.current[sid] = { target: text, rendered: text.length, rafId: null };
+    },
+    [cancelPacer],
+  );
 
   // Reveal the pacer's fully-buffered answer text at once and stop the
   // rAF loop. A progress frame (reasoning / tool / status) is interrupting
@@ -1236,6 +1258,22 @@ export function ChatPage() {
             (endedTurnStartsRef.current.get(sid) ?? []).includes(startedAtMs);
           if (frame.turn.active && startedAtMs !== null && !turnEnded) {
             activeTurnStartRef.current.set(sid, startedAtMs);
+          }
+          // `applySubscribeState` hoists the bundle's trailing prose step into
+          // the streaming reply. The PACER has to be told, or it keeps its own
+          // idea of what is on screen: the next `answer_delta` would find no
+          // pacer (or a stale one), start from `target: ''`, and `pacerTick`'s
+          // `writeStreamingAnswer` would REPLACE the recovered answer with the
+          // delta's first two characters — the reply the user is reading blanks
+          // and re-types itself. Seed it as already-rendered so the next delta
+          // extends the text instead of re-revealing it.
+          if (!turnEnded && frame.turn.active) {
+            const answer = bundleAnswer(frame.work_steps ?? []);
+            // `unknown` leaves the pacer alone — the reply it is tracking stays
+            // on screen, so tearing it down would strand the very text the next
+            // delta is meant to extend.
+            if (answer.kind === 'recovered') seedPacer(sid, answer.text);
+            else if (answer.kind === 'superseded') cancelPacer(sid);
           }
           setViews((prev) => ({
             ...prev,
@@ -3898,10 +3936,12 @@ function parseEpochMs(iso: string | null | undefined): number | null {
  *  absent — and fold any trailing streaming answer bubble into it as a
  *  `prose` step first. Returns the next rows plus the block's index.
  *
- *  The fold is what makes "mid-turn prose lives in the work block" work:
- *  a progress frame interrupting the answer stream means the text
+ *  A progress frame interrupting the answer stream means the text
  *  streamed so far was intermediate, not the final reply, so it moves
- *  inside the block ahead of the step the caller is about to push. The
+ *  inside the block ahead of the step the caller is about to push. What
+ *  the reader sees does not change: `segmentWorkSteps` paints that step as
+ *  a speech run at the same typography, in the place the bubble occupied,
+ *  so the reclassification is bookkeeping rather than a visible demotion. The
  *  final answer never reaches here — it's capped by `Frame::Message`,
  *  which finalizes its bubble through `finalizeMessage` instead. Callers
  *  own the returned `rows` (they slice before writing), so `prev` is
@@ -3916,7 +3956,15 @@ function ensureWork(
   const last = rows[rows.length - 1];
   if (last && last.kind !== 'work' && last.role === 'assistant' && last.streaming) {
     if (last.text.trim().length > 0) {
-      proseStep = { key: `prose-${last.key}`, kind: 'prose', text: last.text };
+      // Stamped when the model started SPEAKING (the bubble's birth), not when
+      // this fold ran: the step marks the boundary of the stretch of work that
+      // preceded it, and the fold only happens once the next frame arrives.
+      proseStep = {
+        key: `prose-${last.key}`,
+        kind: 'prose',
+        text: last.text,
+        at: parseEpochMs(last.createdAt) ?? Date.now(),
+      };
     }
     rows = rows.slice(0, -1);
   }
@@ -3966,7 +4014,10 @@ function pushWorkStep(
   const { rows, idx } = ensureWork(prev, turnActive);
   const block = rows[idx];
   const next = rows.slice();
-  next[idx] = { ...block, steps: [...(block.steps ?? []), step] };
+  next[idx] = {
+    ...block,
+    steps: [...(block.steps ?? []), step.at === undefined ? { ...step, at: Date.now() } : step],
+  };
   return next;
 }
 
@@ -3990,7 +4041,7 @@ function appendReasoningStep(
   } else {
     next[idx] = {
       ...block,
-      steps: [...steps, { key: `reason-${steps.length}-${Date.now()}`, kind: 'reasoning', text }],
+      steps: [...steps, { key: `reason-${steps.length}-${Date.now()}`, kind: 'reasoning', text, at: Date.now() }],
     };
   }
   return next;
@@ -4014,7 +4065,7 @@ export function pushToolStartedStep(
     ...block,
     steps: [
       ...steps,
-      { key: `tool-${callId}`, kind: 'tool', toolCallId: callId, tool, toolLabel: label, toolStatus: 'running' },
+      { key: `tool-${callId}`, kind: 'tool', toolCallId: callId, tool, toolLabel: label, toolStatus: 'running', at: Date.now() },
     ],
   };
   return next;
@@ -4137,7 +4188,7 @@ function pushStatusStep(
   const next = rows.slice();
   next[idx] = {
     ...block,
-    steps: [...steps, { key: `status-${steps.length}-${Date.now()}`, kind: 'status', text }],
+    steps: [...steps, { key: `status-${steps.length}-${Date.now()}`, kind: 'status', text, at: Date.now() }],
   };
   return next;
 }
@@ -4180,10 +4231,16 @@ export function foldNoticeIntoActiveWork(
   // With the bubble gone, that delta opens a fresh bubble instead.
   const folded: WorkStep[] = [...steps];
   if (overBubble && tail.text.trim().length > 0) {
-    folded.push({ key: `prose-${tail.key}`, kind: 'prose', text: tail.text });
+    folded.push({
+      key: `prose-${tail.key}`,
+      kind: 'prose',
+      text: tail.text,
+      at: parseEpochMs(tail.createdAt) ?? Date.now(),
+    });
   }
   folded.push({
     key: `notice-${folded.length}-${Date.now()}`,
+    at: Date.now(),
     kind: 'notice',
     noticeLevel: level,
     text,
@@ -4517,6 +4574,9 @@ export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem):
         // Persisted on the tool result (`ToolResultMeta::approval`), so a
         // reloaded thread still shows what the user judged.
         approval: approvalFromWire(s.approval ?? undefined),
+        // The source row's `created_at`. Times each stretch of work between
+        // the model's remarks; absent on rows a pre-`at` gateway reconstructed.
+        at: parseEpochMs(s.at) ?? undefined,
       })),
     };
   }
@@ -4596,20 +4656,87 @@ function workStepKey(s: WorkStep): string {
   return ['tool!', s.toolLabel ?? '', s.toolStatus ?? '', s.toolSummary ?? ''].join('\u0000');
 }
 
+/** Anchor for a prose step no tool call follows yet — the tail of an in-flight
+ *  block, whose successor simply hasn't landed. Mirrors iOS. */
+const UNANCHORED_PROSE = '$';
+
+/** Index of the last tool step, or -1. Prose past it is UNANCHORED. */
+function lastToolIndex(steps: WorkStep[]): number {
+  let at = -1;
+  steps.forEach((s, i) => {
+    if (s.kind === 'tool') at = i;
+  });
+  return at;
+}
+
+/** Per-list step identities. Prose keys by the TOOL CALL IT PRECEDES, not by
+ *  its text alone: two identical paragraphs in one turn ("Let me check.") share
+ *  a text key, and `mergeWorkSteps` would then drop the second — invisible while
+ *  prose stayed hidden inside the collapse, a silently deleted paragraph now
+ *  that it renders. The successor is the right anchor because a row's `Text` and
+ *  its `ToolUse` blocks are ONE persisted row (the agent loop appends them
+ *  together), so no page tear can separate them and the live leg, the
+ *  reconstruction and both halves of `joinWorkHalves` always agree on which call
+ *  a paragraph precedes. Mirrors iOS `workStepKeys`. */
+function workStepKeys(steps: WorkStep[]): string[] {
+  const keys = steps.map(workStepKey);
+  let anchor = UNANCHORED_PROSE;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].kind === 'tool') anchor = keys[i];
+    else if (steps[i].kind === 'prose') keys[i] = `prose:${anchor}:${steps[i].text ?? ''}`;
+  }
+  return keys;
+}
+
 /** Concatenate two blocks' steps WITHOUT duplicating shared ones — so the
  *  disjoint halves of a page-torn turn append cleanly, while two overlapping
  *  representations of one span (a live block beside its reconstruction, or a
  *  redelivered row) collapse to a single copy instead of doubling every step. */
 function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
-  const seen = new Set(a.map(workStepKey));
+  const ka = workStepKeys(a);
+  const kb = workStepKeys(b);
+  const aLastTool = lastToolIndex(a);
+  const bLastTool = lastToolIndex(b);
+  // Non-prose identity is a plain set, exactly as before.
+  const seenOther = new Set(ka.filter((_, i) => a[i].kind !== 'prose'));
+  // Prose matches by CONSUMING one of a's copies, so one paragraph can never
+  // satisfy two of b's steps — a set would let a's single copy swallow both the
+  // anchored and the unanchored occurrence and silently delete a paragraph.
+  const freeProse: number[] = [];
+  a.forEach((s, i) => {
+    if (s.kind === 'prose') freeProse.push(i);
+  });
+  const takeProse = (pred: (i: number) => boolean): boolean => {
+    const at = freeProse.findIndex(pred);
+    if (at === -1) return false;
+    freeProse.splice(at, 1);
+    return true;
+  };
+
   const out = [...a];
-  for (const s of b) {
-    const k = workStepKey(s);
-    if (!seen.has(k)) {
-      seen.add(k);
+  b.forEach((s, i) => {
+    if (s.kind !== 'prose') {
+      if (seenOther.has(kb[i])) return;
+      seenOther.add(kb[i]);
       out.push(s);
+      return;
     }
-  }
+    const same = (j: number) => a[j].text === s.text;
+    // Same paragraph, same anchor: the ordinary case.
+    if (takeProse((j) => same(j) && ka[j] === kb[i])) return;
+    // One side may hold a paragraph UNANCHORED — folded before its tool call
+    // landed — while the other already anchored it. Same paragraph, two keys.
+    if (i > bLastTool) {
+      // b's tail is unanchored. It is a's paragraph only if b has contributed
+      // nothing new yet, i.e. b is still a prefix of a's timeline; once b has
+      // moved past a, a repeat of the same text is a LATER paragraph and
+      // matching it would delete one.
+      if (out.length === a.length && takeProse(same)) return;
+    } else if (takeProse((j) => same(j) && j > aLastTool)) {
+      return;
+    }
+    out.push(s);
+  });
   return out;
 }
 
@@ -4877,6 +5004,36 @@ export function applySyncMerge(
  *    own partial fold when the starts match (`applyTurnState`), else
  *    carried over from the previous thread;
  *  * a trailing streaming answer bubble (the pacer keeps writing it). */
+/** Strip the in-flight ANSWER from a sync page's trailing work block.
+ *
+ *  The REST plane folds the live channel's in-flight buffer into the trailing
+ *  block (`build_history_page` → `reconstruct_transcript`), and an
+ *  `AgentEvent::AnswerDelta` becomes a `prose` step there — so while a turn is
+ *  streaming, that block's LAST step is the answer the reply bubble is already
+ *  painting. The `subscribe_state` bundle carries the same text and both
+ *  clients hoist it out of the block (`recoveredAnswerTail`); the REST plane
+ *  needs the same hoist or the paragraph renders twice, once as a speech run
+ *  and once as the bubble — and, because the collapse no longer hides prose, it
+ *  stays visible after the turn ends and is persisted into the iOS mirror.
+ *
+ *  Safe because a PERSISTED prose step is never a block's last: an intermediate
+ *  row's `Text` and its `ToolUse` are the same row, so reconstruction always
+ *  emits a tool step after the narration (the same invariant `workStepKeys`
+ *  anchors on). Only the in-flight tail can be trailing prose. The block is
+ *  found by scanning back over trailing notice rows, matching `ensureWork`. */
+function dropInFlightAnswerStep(page: TranscriptRow[]): TranscriptRow[] {
+  let i = page.length - 1;
+  while (i >= 0 && page[i].notice !== undefined) i--;
+  const row = i >= 0 ? page[i] : undefined;
+  if (row === undefined || row.kind !== 'work') return page;
+  const steps = row.steps ?? [];
+  if (steps.length === 0 || steps[steps.length - 1].kind !== 'prose') return page;
+  const kept = steps.slice(0, -1);
+  // A block that held nothing but the in-flight answer was never work at all.
+  const next = kept.length > 0 ? [{ ...row, steps: kept }] : [];
+  return [...page.slice(0, i), ...next, ...page.slice(i + 1)];
+}
+
 export function applySyncReplace(
   prev: TranscriptRow[],
   page: TranscriptRow[],
@@ -4893,7 +5050,7 @@ export function applySyncReplace(
       unconfirmedSendIds.has(r.clientMsgId) &&
       !pageSendIds.has(r.clientMsgId),
   );
-  let rows = [...page, ...keptSends];
+  let rows = [...(turn?.active === true ? dropInFlightAnswerStep(page) : page), ...keptSends];
   if (turn?.active && turn.startedAt !== null) {
     let inherited: WorkStep[] | undefined;
     for (let i = prev.length - 1; i >= 0; i--) {
@@ -4917,8 +5074,12 @@ export function applySyncReplace(
       rows = [...rows.slice(0, -1), { ...tail, steps: inherited }];
     }
   }
-  const last = prev[prev.length - 1];
-  if (last?.streaming === true && last.role === 'assistant') rows = [...rows, last];
+  // Re-overlay the live reply the page cannot know about. `dropEmptyOpenWork`
+  // first, because stripping the page's in-flight answer step can leave the
+  // turn's block with nothing in it — and an empty "Working" card must not
+  // hover above a reply that is already streaming.
+  const liveReply = trailingStreamingAnswer(prev);
+  if (liveReply !== undefined) rows = [...dropEmptyOpenWork(rows), liveReply];
   return rows;
 }
 
@@ -4953,14 +5114,43 @@ function workStepFromWire(step: WireWorkStep, i: number): WorkStep {
               : 'running',
       toolSummary: step.summary,
       approval: approvalFromWire(step.approval),
+      at: parseEpochMs(step.at) ?? undefined,
     };
   }
-  return { key: `snap-${i}-${step.kind}`, kind: step.kind, text: step.text };
+  return {
+    key: `snap-${i}-${step.kind}`,
+    kind: step.kind,
+    text: step.text,
+    at: parseEpochMs(step.at) ?? undefined,
+  };
 }
 
 /** REPLACE the steps of the transcript's open work block wholesale (the
  *  `subscribe_state` work-steps half — the shape the retired on-subscribe
  *  WorkSnapshot apply had). No-op when no block is open. */
+/** Drop an open work block the bundle left with no steps, looking PAST a
+ *  trailing streaming reply. `writeStreamingAnswer` already does this when the
+ *  block is the tail — "the streaming bubble is itself the activity signal, so
+ *  an empty card must not hover above it" — but it cannot see past a bubble
+ *  that is already on screen, which is exactly the shape a mid-turn reconnect
+ *  produces when the bundle is nothing but the answer in flight. */
+function dropEmptyOpenWork(prev: TranscriptRow[]): TranscriptRow[] {
+  let i = prev.length - 1;
+  if (i >= 0 && prev[i].streaming === true && prev[i].role === 'assistant') i--;
+  const row = i >= 0 ? prev[i] : undefined;
+  if (row === undefined || row.kind !== 'work' || row.workActive !== true) return prev;
+  if ((row.steps?.length ?? 0) > 0) return prev;
+  return [...prev.slice(0, i), ...prev.slice(i + 1)];
+}
+
+/** The reply currently streaming at the tail, if any. */
+function trailingStreamingAnswer(prev: TranscriptRow[]): TranscriptRow | undefined {
+  const i = prev.length - 1;
+  if (i < 0) return undefined;
+  const last = prev[i];
+  return last.streaming === true && last.role === 'assistant' ? last : undefined;
+}
+
 function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): TranscriptRow[] {
   for (let i = prev.length - 1; i >= 0; i--) {
     const row = prev[i];
@@ -4980,6 +5170,34 @@ function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): Transcr
  *  already holds a turn-end signal for the SAME turn, matched by
  *  `started_at` — never by ordinal arithmetic, since the coverage
  *  watermark advances mid-turn). */
+/** What a `subscribe_state` bundle says about the reply on screen.
+ *   • `recovered`  — its TRAILING prose step is the answer streaming right now;
+ *     paint it into the bubble and rebase the pacer onto it.
+ *   • `superseded` — the bundle carries answer text, but not as its tail: the
+ *     turn moved on, so whatever bubble is on screen is stale and the text
+ *     already lives in the block as a `prose` step.
+ *   • `unknown`    — the bundle carries NO answer text at all, so it is no
+ *     evidence about the bubble either way. LEAVE IT ALONE. Reachable without a
+ *     race: `AgentEvent::Message` / `TurnState` clears the channel's in-flight
+ *     buffer while `active_turn_started_at` keeps reporting the turn active
+ *     through post-answer finalization, and the buffer also stops recording at
+ *     `MAX_INFLIGHT_ENTRIES`. Treating that as "stale" deletes a reply the user
+ *     is reading.
+ *
+ *  The single source of this judgement: `applySubscribeState` routes the text
+ *  with it and the frame handler rebases the pacer with it. If the two ever
+ *  disagreed, the pacer would paint over the reply the hoist just recovered. */
+export type BundleAnswer =
+  | { kind: 'recovered'; text: string }
+  | { kind: 'superseded' }
+  | { kind: 'unknown' };
+
+export function bundleAnswer(steps: WireWorkStep[]): BundleAnswer {
+  const tail = steps.length > 0 ? steps[steps.length - 1] : undefined;
+  if (tail !== undefined && tail.kind === 'prose') return { kind: 'recovered', text: tail.text ?? '' };
+  return steps.some((s) => s.kind === 'prose') ? { kind: 'superseded' } : { kind: 'unknown' };
+}
+
 export function applySubscribeState(
   view: SessionView,
   frame: Extract<Frame, { kind: 'subscribe_state' }>,
@@ -5001,15 +5219,52 @@ export function applySubscribeState(
     const awaitingByCall = new Map(
       cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.call_id]),
     );
-    let transcript = applyTurnState(view.transcript, true, startedAt);
-    transcript = replaceOpenWorkSteps(
-      transcript,
-      (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
-        step.kind === 'tool' && step.toolCallId && awaitingByCall.has(step.toolCallId)
-          ? { ...step, awaitingApproval: awaitingByCall.get(step.toolCallId) }
-          : step,
-      ),
+    const bundle = (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
+      step.kind === 'tool' &&
+      step.toolCallId !== undefined &&
+      awaitingByCall.has(step.toolCallId)
+        ? { ...step, awaitingApproval: awaitingByCall.get(step.toolCallId) }
+        : step,
     );
+    // The bundle's TRAILING prose step is the answer streaming RIGHT NOW, which
+    // this client renders as the live reply below the block — not as a work
+    // step. iOS has always routed it there (`applySubscribeState`); web dropped
+    // it into the block, so one reconnect rendered the in-progress answer as a
+    // caret-less work step here and as a growing reply there. Split it off and
+    // drive the stream in the same update, so the reply grows in place rather
+    // than blanking for a frame. The caller seeds the rAF pacer with the same
+    // text (`recoveredAnswerTail`) — the pacer owns what is on screen, and left
+    // stale it would overwrite this on the very next delta.
+    const answer = bundleAnswer(frame.work_steps ?? []);
+    const workSteps = answer.kind === 'recovered' ? bundle.slice(0, -1) : bundle;
+    // Take any reply already on screen OFF the tail first. The order matters:
+    // `applyTurnState` appends a fresh block at the TAIL when the turn has none
+    // on screen, and a turn that narrated straight into a bubble has none. Left
+    // in place, the block would land BELOW the bubble, `writeStreamingAnswer`
+    // would then fork a SECOND bubble under it, and the paragraph the user was
+    // reading would show twice with two carets blinking.
+    const liveReply = trailingStreamingAnswer(view.transcript);
+    let transcript = liveReply !== undefined ? view.transcript.slice(0, -1) : view.transcript;
+    transcript = applyTurnState(transcript, true, startedAt);
+    // An EMPTY bundle is not a statement that the turn has done nothing — see
+    // `bundleAnswer`. Replacing with it would wipe the steps this client
+    // rendered live, so leave the block alone and let the empty-block drop
+    // below tidy up a stale affordance (mirrors iOS's `workSteps.length === 0`
+    // early-out).
+    if (workSteps.length > 0) transcript = replaceOpenWorkSteps(transcript, workSteps);
+    if (answer.kind === 'recovered') {
+      transcript = dropEmptyOpenWork(transcript);
+      // Reuse the row when there was one, so React keeps the node and the reply
+      // grows in place instead of remounting (blank for a frame).
+      transcript =
+        liveReply !== undefined
+          ? [...transcript, { ...liveReply, text: answer.text }]
+          : writeStreamingAnswer(transcript, answer.text);
+    } else if (answer.kind === 'unknown' && liveReply !== undefined) {
+      transcript = [...dropEmptyOpenWork(transcript), liveReply];
+    }
+    // `superseded`: the bundle holds the paragraph as a `prose` step of its own,
+    // so the bubble really is stale and stays dropped.
     next = {
       ...next,
       transcript,
@@ -5371,7 +5626,7 @@ const REMARK_PLUGINS = [
 // `whitespace-pre-wrap` raw text). Unlike the plugins above it installs no
 // micromark extension — it is a transformer over the parsed mdast — so its
 // position in the array carries no constraint. Deliberately NOT extended to the
-// answer: `prose` steps are the answer's own bytes (see `WorkStepView`).
+// answer: `prose` steps are the answer's own bytes (see `segmentWorkSteps`).
 const REMARK_PLUGINS_BREAKS = [...REMARK_PLUGINS, remarkBreaks];
 // `rehype-katex` renders the math nodes to KaTeX markup in the hast. It leaves
 // `trust` off (so `\href`/`\includegraphics` stay disabled) and, on a malformed
@@ -5704,10 +5959,10 @@ function ReasoningStepView({ text }: { text: string }) {
   );
 }
 
-// One rendered step inside a work block — mirrors the old inline
-// reasoning / tool / status visuals, plus `prose` for folded mid-turn
-// answer text. Reused by both the live (active) panel and the expanded
-// collapsed view.
+// One rendered MACHINERY step inside a work block — the reasoning / tool /
+// status / notice visuals. Reused by the live panel and the expanded collapsed
+// view. `prose` never reaches here: `segmentWorkSteps` routes the model's own
+// words to `WorkSpeechRun`, outside the collapse.
 export function WorkStepView({ step }: { step: WorkStep }) {
   if (step.kind === 'reasoning') {
     return <ReasoningStepView text={step.text ?? ''} />;
@@ -5717,17 +5972,6 @@ export function WorkStepView({ step }: { step: WorkStep }) {
       <div className="flex items-center gap-2 font-mono text-xs text-ink-soft">
         <span className="select-none shrink-0">⟳</span>
         <span className="break-words [overflow-wrap:anywhere]">{step.text}</span>
-      </div>
-    );
-  }
-  if (step.kind === 'prose') {
-    // Intermediate reply text the model emitted between tool calls (the final
-    // answer streams in its own bubble, not here). Render it with the answer
-    // bubble's prose styling — not the dim mono of the reasoning/tool steps —
-    // so it reads as reply text when the block is expanded.
-    return (
-      <div className="chat-prose text-ink break-words">
-        <MarkdownBody text={step.text ?? ''} />
       </div>
     );
   }
@@ -5797,24 +6041,108 @@ export function WorkStepView({ step }: { step: WorkStep }) {
   );
 }
 
-/** The WorkBlock's two display flags, derived from turn/step/expand state.
+/** A run of consecutive steps of one nature. A turn reads as alternating runs:
+ *  what the agent SAID (speech) and what it DID (machinery). A machinery run
+ *  also carries the span it covers, so it can label itself. */
+export type WorkSegment = {
+  kind: 'speech' | 'machinery';
+  steps: WorkStep[];
+  /** Epoch ms. `undefined` when the boundary step carries no timestamp — a row
+   *  a gateway predating `ChatWorkStep.at` reconstructed. */
+  startedAt?: number;
+  endedAt?: number;
+};
+
+/** Split a block's steps into maximal alternating runs of speech (`prose` — the
+ *  model's own words mid-turn) and machinery (reasoning / tool / status /
+ *  notice).
+ *
+ *  This is the whole redesign, and it is a pure projection: the step list on the
+ *  wire is unchanged, only what the collapse is allowed to hide changes. Speech
+ *  renders at answer typography in document flow and is never folded, so the
+ *  moment a tool call interrupts the model mid-sentence the text does not move,
+ *  shrink, or slide into a scroller — the fold becomes invisible instead of
+ *  merely gentler. `Worked 2m 47s ›` then means what a reader expects it to
+ *  mean: the machinery is hidden, the words are not.
+ *
+ *  Order-preserving, so the live view and a cold reload — which both derive from
+ *  the same ordered `steps[]` — agree by construction. Mirrors iOS
+ *  `segmentWorkSteps`. */
+export function segmentWorkSteps(
+  steps: WorkStep[],
+  workStartedAt?: number,
+  workEndedAt?: number,
+): WorkSegment[] {
+  const out: WorkSegment[] = [];
+  for (const s of steps) {
+    const kind = s.kind === 'prose' ? 'speech' : 'machinery';
+    const tail = out.length > 0 ? out[out.length - 1] : undefined;
+    if (tail !== undefined && tail.kind === kind) tail.steps.push(s);
+    else out.push({ kind, steps: [s] });
+  }
+  // Each machinery run is bounded by the remarks around it: it starts when the
+  // model last spoke (or when the turn did) and ends when it speaks next (or
+  // when the turn did). The runs therefore TILE the turn — the ladder's
+  // durations add up to the whole — and each reads as "how long it worked
+  // before saying this", which is what the header claims.
+  const proseAt = (seg: WorkSegment | undefined, which: 'first' | 'last'): number | undefined => {
+    if (seg === undefined || seg.kind !== 'speech') return undefined;
+    const step = which === 'first' ? seg.steps[0] : seg.steps[seg.steps.length - 1];
+    return step.at;
+  };
+  return out.map((seg, i) =>
+    seg.kind !== 'machinery'
+      ? seg
+      : {
+          ...seg,
+          startedAt: proseAt(out[i - 1], 'last') ?? (i === 0 ? workStartedAt : undefined),
+          endedAt:
+            proseAt(out[i + 1], 'first') ?? (i === out.length - 1 ? workEndedAt : undefined),
+        },
+  );
+}
+
+/** A machinery run's collapsed header. The duration it actually covers when
+ *  both bounds are known, else its step count — a turn reconstructed by a
+ *  gateway predating `ChatWorkStep.at` has no per-run timing, and inventing one
+ *  from the block's total would be a lie the reader can't detect. Mirrors iOS
+ *  `workRunLabel`. */
+export function workRunLabel(seg: WorkSegment, cancelled: boolean): string {
+  const { startedAt, endedAt } = seg;
+  if (startedAt === undefined || endedAt === undefined || endedAt < startedAt) {
+    const n = seg.steps.length;
+    return cancelled ? `Cancelled · ${n} step${n === 1 ? '' : 's'}` : `${n} step${n === 1 ? '' : 's'}`;
+  }
+  return formatWorkedLabel(endedAt - startedAt, cancelled);
+}
+
+/** The WorkBlock's display flags, derived from turn/machinery/expand state.
  *  Pure + exported so the "spinner first, expand on the first step" contract
  *  is unit-testable without rendering:
- *   • `boxed`     — draw the bordered card (live turn, or a re-expanded
+ *   • `boxed`      — draw the bordered card (live turn, or a re-expanded
  *     finished block).
- *   • `panelOpen` — reveal the steps panel (only once a live turn has a step,
- *     or the user expanded a finished block). */
+ *   • `panelOpen`  — reveal the machinery panels (only once a live turn has
+ *     machinery, or the user expanded a finished block).
+ *   • `toggleable` — offer the chevron at all. Speech is never hidden, so a
+ *     block whose only steps are prose has nothing behind the arrow; showing
+ *     one would break the standing "the arrow is always meaningful" contract
+ *     (which `closeActiveWork` upholds at the other end by dropping a stepless
+ *     block outright).
+ *
+ *  `hasMachinery`, not `hasSteps`: a prose-only block is not a reason to grow a
+ *  panel that would open onto nothing. */
 export function workBlockDisplay(
   active: boolean,
-  hasSteps: boolean,
+  hasMachinery: boolean,
   expanded: boolean,
   settling = false,
-): { boxed: boolean; panelOpen: boolean } {
+): { boxed: boolean; panelOpen: boolean; toggleable: boolean } {
   return {
     // `settling` (an interjection-paused block, still mid-turn) reads like an
     // expanded finished block: bordered card with its steps panel open.
     boxed: active || expanded || settling,
-    panelOpen: (active && hasSteps) || expanded || (settling && hasSteps),
+    panelOpen: (active && hasMachinery) || expanded || (settling && hasMachinery),
+    toggleable: !active && !settling && hasMachinery,
   };
 }
 
@@ -5855,143 +6183,186 @@ export function formatWorkedLabel(elapsedMs: number, cancelled = false): string 
 // line (click to re-expand) that sits above the final answer bubble. A turn
 // that produced no steps is dropped on close (see `closeActiveWork`), so a
 // collapsed block always has work to show and the arrow is always meaningful.
-function WorkBlock({ row }: { row: TranscriptRow }) {
-  const active = !!row.workActive;
-  const steps = row.steps ?? [];
-  // `expanded` is the user's explicit toggle for the *finished* block and
-  // defaults closed. Two derived flags drive the look — deriving them rather
-  // than flipping state in an effect keeps every transition a single render
-  // (the body animates 0fr↔1fr cleanly, no flash):
-  //  • `boxed`     — show the bordered card. True while the turn is live (so
-  //    it reads as one element with the initial WorkingIndicator) or when the
-  //    user re-expanded a finished block.
-  //  • `panelOpen` — reveal the steps panel. Held shut until the turn has
-  //    actually produced a step, so a live-but-stepless turn is just the
-  //    compact spinner and the panel grows in when the first step lands.
+/** One run of machinery steps — the reasoning / tool / status traffic between
+ *  two of the model's remarks — with its own `Worked Xs ›` header and its own
+ *  expansion.
+ *
+ *  Per-run rather than per-turn on both counts. The header answers the question
+ *  the ladder exists to answer ("how long did it work before saying this"),
+ *  which a single turn-level total cannot. The expansion is per-run because
+ *  opening one run of a long turn should not insert every other run's hundreds
+ *  of lines. And the tail-pin belongs here too: only the run being appended to
+ *  may follow its tail, so a pin bound to the block would silently stop
+ *  tracking the newest tool line as soon as speech split the turn. */
+function WorkMachineryRun({
+  seg,
+  live,
+  settling,
+  cancelled,
+}: {
+  seg: WorkSegment;
+  /** This run is the one the turn is currently producing into. */
+  live: boolean;
+  settling: boolean;
+  cancelled: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
-  const hasSteps = steps.length > 0;
-  // A block closed mid-turn by an interjection: keep it open ("Worked Xs",
-  // steps shown) until the turn ends and `closeActiveWork` clears the flag.
-  const settling = !!row.workSettling;
-  const { boxed, panelOpen } = workBlockDisplay(active, hasSteps, expanded, settling);
-  // The spinner-first state hugs its content instead of stretching the full
-  // card width; the panel/steps states take the full width so work has room.
-  const compact = boxed && !panelOpen;
+  const { boxed, panelOpen, toggleable } = workBlockDisplay(
+    live,
+    seg.steps.length > 0,
+    expanded,
+    settling,
+  );
 
-  // Pin the steps panel to its tail while the turn is producing so a long
-  // tool loop reveals the newest reasoning/tool line at the bottom instead
-  // of stranding the user at the top — but ONLY while the user is parked at
-  // (or near) the bottom. Once they scroll up to read an earlier line we stop
-  // yanking them back down, and re-engage when they scroll back to the end.
-  // Layout-effect-scoped so the catch-up happens pre-paint, no visible flash.
-  const stepsContainerRef = useRef<HTMLDivElement | null>(null);
-  const stepsPinnedRef = useRef(true);
-  const handleStepsScroll = useCallback(() => {
-    const el = stepsContainerRef.current;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const pinnedRef = useRef(true);
+  const handleScroll = useCallback(() => {
+    const el = containerRef.current;
     if (!el) return;
     const slackPx = 48;
-    stepsPinnedRef.current =
-      el.scrollHeight - el.scrollTop - el.clientHeight <= slackPx;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= slackPx;
   }, []);
   useLayoutEffect(() => {
-    if (!active || !stepsPinnedRef.current) return;
-    const el = stepsContainerRef.current;
+    if (!live || !pinnedRef.current) return;
+    const el = containerRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [active, steps]);
+  }, [live, seg.steps]);
 
-  if (!active && steps.length === 0) return null;
-
-  const elapsedMs =
-    row.workEndedAt && row.workStartedAt ? Math.max(0, row.workEndedAt - row.workStartedAt) : 0;
-  // Never surface a "0s" duration; a cancelled (`/stop`) turn reads
-  // "Cancelled · Worked Xs" instead of a plain completion summary.
-  const cancelled = !!row.workCancelled;
-  const workedLabel = formatWorkedLabel(elapsedMs, cancelled);
-
-  // One persistent element tree across active / collapsed / expanded so
-  // the transitions actually animate (a branch swap would just hard-cut).
-  // The chrome (border + bg + shadow) fades via `transition-all`; the
-  // steps panel grows/shrinks via the grid-rows 0fr↔1fr trick — the
-  // dependable way to animate to/from content height. Border *width*
-  // stays 2px in every state (only its color fades) so nothing reflows.
+  // The spinner-first state hugs its content; once the panel is open the run
+  // takes the full width so work has room.
+  const compact = boxed && !panelOpen;
   return (
-    <div className="group flex flex-col items-start w-full">
-      <div
-        className={`${
-          compact ? 'w-fit max-w-4xl' : 'w-full max-w-4xl'
-        } rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
-          boxed
-            ? 'border-black bg-white shadow-brutal-sm'
-            : // Collapsed: pull left by the 2px transparent border so the
-              // `Worked Xs ›` line sits flush with the answer bubble's edge.
-              'border-transparent bg-transparent shadow-none -ml-0.5'
-        }`}
+    <div
+      className={`${
+        compact ? 'w-fit max-w-4xl' : 'w-full max-w-4xl'
+      } rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
+        boxed
+          ? 'border-black bg-white shadow-brutal-sm'
+          : // Collapsed: pull left by the 2px transparent border so the
+            // `Worked Xs ›` line sits flush with the answer bubble's edge.
+            'border-transparent bg-transparent shadow-none -ml-0.5'
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => {
+          if (toggleable) setExpanded((e) => !e);
+        }}
+        className={`w-full flex items-center gap-2 py-2 font-mono text-xs text-left border-b-2 transition-all duration-300 ease-out ${
+          boxed ? 'px-3' : 'px-0'
+        } ${
+          panelOpen ? 'border-black bg-canvas' : 'border-transparent bg-transparent'
+        } ${toggleable ? 'cursor-pointer' : 'cursor-default'}`}
       >
-        <button
-          type="button"
-          onClick={() => {
-            // Live and settling blocks are non-toggleable: a live turn owns its
-            // expansion, and a settling block stays open until the turn ends.
-            if (!active && !settling) setExpanded((e) => !e);
-          }}
-          className={`w-full flex items-center gap-2 py-2 font-mono text-xs text-left border-b-2 transition-all duration-300 ease-out ${
-            // Drop the horizontal padding when collapsed so the summary
-            // aligns to the bubble's left edge, not its (indented) text.
-            boxed ? 'px-3' : 'px-0'
-          } ${
-            // The header divider + tint only read once the steps panel is
-            // open; the compact spinner card and the collapsed summary keep
-            // a seamless, divider-less header.
-            panelOpen ? 'border-black bg-canvas' : 'border-transparent bg-transparent'
-          } ${active || settling ? 'cursor-default' : 'cursor-pointer'}`}
-        >
-          {active ? (
-            <>
-              <RiLoader4Line className="text-sm text-brand animate-spin shrink-0" />
-              <span className="font-bold uppercase tracking-wider text-ink">Working</span>
-              {row.workStartedAt ? (
-                <span className="text-ink-soft tabular-nums">
-                  <LiveElapsed startedAt={row.workStartedAt} />
-                </span>
-              ) : null}
-            </>
-          ) : (
-            <>
-              <span className={cancelled ? 'text-err' : 'text-ink-soft'}>{workedLabel}</span>
+        {live ? (
+          <>
+            <RiLoader4Line className="text-sm text-brand animate-spin shrink-0" />
+            <span className="font-bold uppercase tracking-wider text-ink">Working</span>
+            {seg.startedAt !== undefined ? (
+              <span className="text-ink-soft tabular-nums">
+                <LiveElapsed startedAt={seg.startedAt} />
+              </span>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <span className={cancelled ? 'text-err' : 'text-ink-soft'}>
+              {workRunLabel(seg, cancelled)}
+            </span>
+            {toggleable ? (
               <RiArrowRightSLine
                 className={`text-sm text-ink-soft shrink-0 transition-transform duration-300 ease-out ${
                   panelOpen ? 'rotate-90' : ''
                 }`}
               />
-            </>
-          )}
-        </button>
+            ) : null}
+          </>
+        )}
+      </button>
+      <div
+        className={`grid transition-[grid-template-rows] duration-300 ease-out ${
+          panelOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+        }`}
+      >
         <div
-          className={`grid transition-[grid-template-rows] duration-300 ease-out ${
-            panelOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+          ref={containerRef}
+          onScroll={handleScroll}
+          className={`min-h-0 ${
+            panelOpen ? 'max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto' : 'overflow-hidden'
           }`}
         >
-          <div
-            ref={stepsContainerRef}
-            onScroll={handleStepsScroll}
-            className={`min-h-0 ${
-              panelOpen
-                ? 'max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
-                : 'overflow-hidden'
-            }`}
-          >
-            <div className="flex flex-col gap-1.5 px-3 py-2">
-              {steps.map((s) => (
-                <WorkStepView key={s.key} step={s} />
-              ))}
-            </div>
+          <div className="flex flex-col gap-1.5 px-3 py-2">
+            {seg.steps.map((s) => (
+              <WorkStepView key={s.key} step={s} />
+            ))}
           </div>
         </div>
       </div>
-      {!active && !panelOpen ? (
-        <div aria-hidden className="w-full border-t border-black/20" />
-      ) : null}
+    </div>
+  );
+}
+
+/** A run of the model's own mid-turn words. Answer typography, in document
+ *  flow, outside every card and every scroller — and deliberately at the same
+ *  horizontal inset in each of the block's states, so nothing shifts sideways
+ *  when the turn ends and the card chrome fades out. */
+export function WorkSpeechRun({ steps }: { steps: WorkStep[] }) {
+  return (
+    <div className="w-full max-w-4xl flex flex-col gap-2 py-1.5">
+      {steps.map((s) => (
+        <div key={s.key} className="work-said chat-prose text-ink break-words">
+          <MarkdownBody text={s.text ?? ''} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** A turn's progress, as a LADDER: one `Worked Xs ›` run per stretch of work,
+ *  each timing itself from the model's previous remark to its next, with the
+ *  remarks themselves rendered between them at answer typography and never
+ *  folded. A turn that says nothing mid-way is a single run — the common shape,
+ *  and the one this looked like before the ladder existed.
+ *
+ *  A block that produced no steps (a direct answer) is dropped on close (see
+ *  `closeActiveWork`), so every run on screen has work to show. */
+export function WorkBlock({ row }: { row: TranscriptRow }) {
+  const active = !!row.workActive;
+  const steps = row.steps ?? [];
+  const settling = !!row.workSettling;
+  const cancelled = !!row.workCancelled;
+  const segments = segmentWorkSteps(steps, row.workStartedAt, row.workEndedAt);
+  const lastMachineryIndex = segments.reduce(
+    (at, seg, i) => (seg.kind === 'machinery' ? i : at),
+    -1,
+  );
+
+  if (!active && steps.length === 0) return null;
+  // A live turn with no step yet still needs its "Working" affordance, and it
+  // has no run to hang it on — synthesize the empty one.
+  const runs: WorkSegment[] =
+    segments.length === 0 ? [{ kind: 'machinery', steps: [], startedAt: row.workStartedAt }] : segments;
+
+  return (
+    <div className="group flex flex-col items-start w-full">
+      {runs.map((seg, i) =>
+        seg.kind === 'speech' ? (
+          <WorkSpeechRun key={`s${i}`} steps={seg.steps} />
+        ) : (
+          <WorkMachineryRun
+            key={`m${i}`}
+            seg={seg}
+            // Only the turn's LAST run is still being produced into; the ones
+            // above it are finished and collapse like any other.
+            live={active && (i === lastMachineryIndex || segments.length === 0)}
+            settling={settling && i === lastMachineryIndex}
+            // The stop landed on whatever run was running.
+            cancelled={cancelled && i === lastMachineryIndex}
+          />
+        ),
+      )}
+      {!active ? <div aria-hidden className="w-full border-t border-black/20" /> : null}
     </div>
   );
 }

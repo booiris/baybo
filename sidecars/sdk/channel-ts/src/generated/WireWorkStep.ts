@@ -42,4 +42,12 @@ summary?: string,
  * within the buffered turn; `None` when it never prompted (or is
  * still running / still waiting on the prompt).
  */
-approval?: string, };
+approval?: string, 
+/**
+ * When this step happened, so a client can time the stretches BETWEEN the
+ * model's mid-turn remarks rather than only the turn as a whole. Stamped
+ * as the buffer records the event; the REST reconstruction stamps its own
+ * steps from the source row's `created_at`, so the two planes agree on a
+ * turn's shape after a reload. `None` from a gateway that predates this.
+ */
+at?: string, };

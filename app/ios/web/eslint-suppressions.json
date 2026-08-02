@@ -6,7 +6,7 @@
   },
   "src/Transcript.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 15
+      "count": 14
     },
     "@typescript-eslint/strict-boolean-expressions": {
       "count": 51

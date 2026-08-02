@@ -71,6 +71,15 @@ import {
 // WorkStep. A `tool` step keeps its `call_id` so a later live `ToolCompleted`
 // still pairs by id; `status` defaults to "running" until the call finished
 // within the buffered turn.
+/// The server's RFC3339 step stamp as epoch ms. `undefined` for a gateway that
+/// predates `at`, and for anything unparseable — a NaN here would poison every
+/// duration derived from it.
+function parseStepAt(at: string | null | undefined): number | undefined {
+  if (at === null || at === undefined || at === "") return undefined;
+  const ms = Date.parse(at);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
 export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
   if (s.kind === "tool") {
     return {
@@ -80,9 +89,10 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
       status: s.status ?? "running",
       summary: s.summary || undefined,
       approval: s.approval || undefined,
+      at: parseStepAt(s.at),
     };
   }
-  return { kind: s.kind, text: s.text ?? "" };
+  return { kind: s.kind, text: s.text ?? "", at: parseStepAt(s.at) };
 }
 
 /// Map a REST `ChatWorkStep` (the `work` transcript row's step — snake_case
@@ -101,9 +111,10 @@ export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number
       status: s.tool_status ?? "",
       summary: s.tool_summary || undefined,
       approval: s.approval || undefined,
+      at: parseStepAt(s.at),
     };
   }
-  return { kind: s.kind, text: s.text ?? "" };
+  return { kind: s.kind, text: s.text ?? "", at: parseStepAt(s.at) };
 }
 
 /// Translate one full-fidelity transcript row (`ChatTranscriptItem`, carried
@@ -533,21 +544,142 @@ export function workStepKey(s: WorkStep): string {
   return ["tool!", s.label, s.status, s.summary ?? ""].join("\u0000");
 }
 
+/// Anchor for a prose step no tool call follows yet — the tail of an in-flight
+/// block, whose successor simply hasn't landed. Mirrors the web chat.
+const UNANCHORED_PROSE = "$";
+
+/// Index of the last tool step, or -1. Prose past it is UNANCHORED.
+function lastToolIndex(steps: WorkStep[]): number {
+  let at = -1;
+  steps.forEach((s, i) => {
+    if (s.kind === "tool") at = i;
+  });
+  return at;
+}
+
+/// Per-list step identities. Prose keys by the TOOL CALL IT PRECEDES, not by its
+/// text alone: two identical paragraphs in one turn ("我看下测试。") share a text
+/// key, and `mergeWorkSteps` would then drop the second — invisible while prose
+/// stayed hidden inside the collapse, a silently deleted paragraph now that it
+/// renders. The successor is the right anchor because a row's Text and its
+/// ToolUse blocks are ONE persisted row (the agent loop appends them together),
+/// so no page tear can separate them and the live leg, the reconstruction and
+/// both halves of `joinWorkHalves` always agree on which call a paragraph
+/// precedes. Mirrors the web chat's `workStepKeys`.
+export function workStepKeys(steps: WorkStep[]): string[] {
+  const keys = steps.map(workStepKey);
+  let anchor = UNANCHORED_PROSE;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (s.kind === "tool") anchor = keys[i];
+    else if (s.kind === "prose") keys[i] = `prose:${anchor}:${s.text}`;
+  }
+  return keys;
+}
+
 /// Concatenate two work blocks' steps WITHOUT duplicating shared ones — so
 /// folding a torn turn's disjoint halves appends cleanly, while folding two
 /// overlapping representations of one turn (live + reconstructed) collapses to
 /// a single copy instead of doubling every step.
 export function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
-  const seen = new Set(a.map(workStepKey));
+  const ka = workStepKeys(a);
+  const kb = workStepKeys(b);
+  const aLastTool = lastToolIndex(a);
+  const bLastTool = lastToolIndex(b);
+  // Non-prose identity is a plain set, exactly as before.
+  const seenOther = new Set(ka.filter((_, i) => a[i].kind !== "prose"));
+  // Prose matches by CONSUMING one of a's copies, so one paragraph can never
+  // satisfy two of b's steps — a set would let a's single copy swallow both the
+  // anchored and the unanchored occurrence and silently delete a paragraph.
+  const freeProse: number[] = [];
+  a.forEach((s, i) => {
+    if (s.kind === "prose") freeProse.push(i);
+  });
+  const takeProse = (pred: (i: number) => boolean): boolean => {
+    const at = freeProse.findIndex(pred);
+    if (at === -1) return false;
+    freeProse.splice(at, 1);
+    return true;
+  };
+
   const out = [...a];
-  for (const s of b) {
-    const k = workStepKey(s);
-    if (!seen.has(k)) {
-      seen.add(k);
+  b.forEach((s, i) => {
+    if (s.kind !== "prose") {
+      if (seenOther.has(kb[i])) return;
+      seenOther.add(kb[i]);
       out.push(s);
+      return;
     }
-  }
+    const same = (j: number) => (a[j] as { text?: string }).text === s.text;
+    // Same paragraph, same anchor: the ordinary case.
+    if (takeProse((j) => same(j) && ka[j] === kb[i])) return;
+    // One side may hold a paragraph UNANCHORED — folded before its tool call
+    // landed — while the other already anchored it. Same paragraph, two keys.
+    if (i > bLastTool) {
+      // b's tail is unanchored. It is a's paragraph only if b has contributed
+      // nothing new yet, i.e. b is still a prefix of a's timeline; once b has
+      // moved past a, a repeat of the same text is a LATER paragraph and
+      // matching it would delete one.
+      if (out.length === a.length && takeProse(same)) return;
+    } else if (takeProse((j) => same(j) && j > aLastTool)) {
+      return;
+    }
+    out.push(s);
+  });
   return out;
+}
+
+/// What a `subscribe_state` bundle says about the reply on screen.
+///  • `recovered`  — its TRAILING prose step is the answer streaming right now.
+///  • `superseded` — the bundle carries answer text, but not as its tail: the
+///    turn moved on, so a reply still on screen is stale and its text already
+///    lives in the block as a `prose` step.
+///  • `unknown`    — the bundle carries NO answer text at all, so it says
+///    nothing about the reply either way. LEAVE IT ALONE. Reachable without a
+///    race: `AgentEvent::Message` / `TurnState` clears the channel's in-flight
+///    buffer while `active_turn_started_at` keeps reporting the turn active
+///    through post-answer finalization, and the buffer also stops recording at
+///    `MAX_INFLIGHT_ENTRIES`. Treating that as "stale" deletes a reply the user
+///    is reading. Mirrors the web chat's `bundleAnswer`.
+export type BundleAnswer =
+  | { kind: "recovered"; text: string }
+  | { kind: "superseded" }
+  | { kind: "unknown" };
+
+export function bundleAnswer(steps: WorkStep[]): BundleAnswer {
+  const tail = steps.length > 0 ? steps[steps.length - 1] : undefined;
+  if (tail !== undefined && tail.kind === "prose") return { kind: "recovered", text: tail.text };
+  return steps.some((s) => s.kind === "prose") ? { kind: "superseded" } : { kind: "unknown" };
+}
+
+/// Strip the in-flight ANSWER from a sync page's trailing work block.
+///
+/// The REST plane folds the live channel's in-flight buffer into the trailing
+/// block (`build_history_page` → `reconstruct_transcript`), and an
+/// `AgentEvent::AnswerDelta` becomes a `prose` step there — so while a turn is
+/// streaming, that block's LAST step is the answer `streamingText` is already
+/// painting below it. `applySubscribeState` hoists the same text out of the
+/// bundle for exactly this reason; the REST plane needs the same hoist or the
+/// paragraph renders twice, once as a speech run and once as the live reply —
+/// and, because the collapse no longer hides prose, it stays visible after the
+/// turn ends and is persisted into the mirror.
+///
+/// Safe because a PERSISTED prose step is never a block's last: an intermediate
+/// row's Text and its ToolUse are the same row, so reconstruction always emits a
+/// tool step after the narration (the same invariant `workStepKeys` anchors on).
+/// Only the in-flight tail can be trailing prose. Mirrors the web chat's
+/// `dropInFlightAnswerStep`.
+export function dropInFlightAnswerStep(rows: Row[]): Row[] {
+  let i = rows.length - 1;
+  while (i >= 0 && rows[i].role === "notice") i--;
+  const row = i >= 0 ? rows[i] : undefined;
+  if (row === undefined || row.role !== "work") return rows;
+  const last = row.steps.length > 0 ? row.steps[row.steps.length - 1] : undefined;
+  if (last === undefined || last.kind !== "prose") return rows;
+  const kept = row.steps.slice(0, -1);
+  // A block that held nothing but the in-flight answer was never work at all.
+  const next: Row[] = kept.length > 0 ? [{ ...row, steps: kept }] : [];
+  return [...rows.slice(0, i), ...next, ...rows.slice(i + 1)];
 }
 
 /// Freeze EVERY work row still marked `active` into its "Worked Xs" — walk the
@@ -614,7 +746,10 @@ export function openWorkIn(rows: Row[], mutate: (row: WorkRow) => WorkRow): Row[
 export function foldMidTurnNoticeIn(rows: Row[], level: string, text: string): Row[] {
   const last = rows[rows.length - 1];
   if (last && last.role === "work" && last.active) {
-    return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
+    return [
+      ...rows.slice(0, -1),
+      { ...last, steps: [...last.steps, { kind: "notice", level, text, at: Date.now() }] },
+    ];
   }
   return [...rows, { id: uid(), role: "notice", content: text }];
 }
@@ -2169,6 +2304,11 @@ export function Transcript({
   // rAF per frame burst — every push crosses the bridge as its own JS task, so
   // without this each delta would re-render (and re-parse markdown) alone.
   const streamText = useRef("");
+  /// When the reply currently streaming BEGAN. A prose step marks the boundary
+  /// of the stretch of work before it, so it must be stamped with when the
+  /// model started speaking — not when the fold ran, which is a whole frame
+  /// later, once the next work frame arrived.
+  const streamStartedAt = useRef<number | undefined>(undefined);
   const streamRaf = useRef<number | undefined>(undefined);
   // Bumped by native on each successful (re)connect (setConnEpoch). Drives the
   // attachment auto-retry and replaces the old per-dial connGen guard.
@@ -2531,6 +2671,7 @@ export function Transcript({
   // ---- streaming answer (rAF-coalesced) ------------------------------------
 
   const appendStreaming = useCallback((text: string) => {
+    if (streamText.current.length === 0) streamStartedAt.current = Date.now();
     streamText.current += text;
     if (streamRaf.current === undefined) {
       streamRaf.current = requestAnimationFrame(() => {
@@ -2545,6 +2686,8 @@ export function Transcript({
   // with this, so the reply line grows in place (batched with the block replace)
   // instead of blanking for a frame.
   const setStreamingText = useCallback((text: string) => {
+    if (text.length === 0) streamStartedAt.current = undefined;
+    else if (streamText.current.length === 0) streamStartedAt.current = Date.now();
     streamText.current = text;
     if (streamRaf.current !== undefined) {
       cancelAnimationFrame(streamRaf.current);
@@ -2570,7 +2713,9 @@ export function Transcript({
 
   const pushWorkStep = useCallback(
     (step: WorkStep) => {
-      withOpenWork((w) => ({ ...w, steps: [...w.steps, step] }));
+      // Live frames carry no time of their own, so arrival IS the step's time.
+      const stamped = step.at === undefined ? { ...step, at: Date.now() } : step;
+      withOpenWork((w) => ({ ...w, steps: [...w.steps, stamped] }));
     },
     [withOpenWork],
   );
@@ -2620,12 +2765,16 @@ export function Transcript({
 
   // Answer text followed by more work was intermediate: settle it into the
   // block as a prose step so reasoning and answer interleave cleanly (the web
-  // chat's flush-and-fold on any non-delta work frame).
+  // chat's flush-and-fold on any non-delta work frame). Purely a
+  // reclassification — `segmentWorkSteps` paints the resulting step at the
+  // same reading weight, in the same place the streaming reply occupied, so
+  // the reader sees nothing move.
   const foldStreamingIntoProse = useCallback(() => {
     const text = streamText.current;
     if (!text) return;
+    const at = streamStartedAt.current;
     clearStreaming();
-    pushWorkStep({ kind: "prose", text });
+    pushWorkStep({ kind: "prose", text, at });
   }, [clearStreaming, pushWorkStep]);
 
   // Close the tail work block: freeze the elapsed label, or drop the block
@@ -2693,13 +2842,15 @@ export function Transcript({
           ? { ...s, awaitingApproval: awaitingByCall.get(s.callId) }
           : s,
       );
-      const tail = steps[steps.length - 1];
-      const tailProse = tail?.kind === "prose";
-      const workSteps = tailProse ? steps.slice(0, -1) : steps;
+      const answer = bundleAnswer(steps);
+      const workSteps = answer.kind === "recovered" ? steps.slice(0, -1) : steps;
       // Drive the live reply to the recovered answer tail (or clear it) in one
       // shot, batched with the block replace below — so the reply grows in place
-      // rather than blanking for a frame.
-      setStreamingText(tailProse ? tail.text : "");
+      // rather than blanking for a frame. `unknown` leaves it ALONE: a bundle
+      // with no answer text in it is no evidence that the reply on screen is
+      // stale, and clearing there deletes a paragraph mid-read.
+      if (answer.kind === "recovered") setStreamingText(answer.text);
+      else if (answer.kind === "superseded") setStreamingText("");
       setMessages((rows) => {
         const last = rows[rows.length - 1];
         const openBlock = last && last.role === "work" ? last : undefined;
@@ -2881,7 +3032,10 @@ export function Transcript({
         // A page can hold BOTH halves of a turn it is wide enough to span, or
         // one half beside a turn it cut — fold before anything else reads them,
         // but never across this frame's compaction boundaries.
-        const folded = foldAdjacentWork(pageRows, frame.compaction_points ?? []);
+        const folded = foldAdjacentWork(
+          turnActiveRef.current ? dropInFlightAnswerStep(pageRows) : pageRows,
+          frame.compaction_points ?? [],
+        );
         const pageIds = new Set(folded.map((r) => r.id));
         setMessages((prev) => {
           // Keep the in-flight turn's open work block and any optimistic user
@@ -3021,7 +3175,7 @@ export function Transcript({
           if (last && last.kind === "reasoning") {
             steps[steps.length - 1] = { ...last, text: last.text + frame.text };
           } else {
-            steps.push({ kind: "reasoning", text: frame.text });
+            steps.push({ kind: "reasoning", text: frame.text, at: Date.now() });
           }
           return { ...w, steps };
         });

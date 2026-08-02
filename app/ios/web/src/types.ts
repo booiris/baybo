@@ -59,6 +59,10 @@ export type WireWorkStepFrame = {
   /// The decision the call's approval prompt returned, once it completed within
   /// the buffered turn — the durable twin of the live `tool_completed.approval`.
   approval?: string;
+  /// RFC3339 instant the channel's in-flight buffer recorded this step, so a
+  /// client joining mid-turn can time the stretches between the model's
+  /// remarks. Absent from a gateway that predates it.
+  at?: string;
 };
 
 /// One reconstructed step inside a REST `work` transcript row — the gateway's
@@ -81,6 +85,10 @@ export type RestWorkStep = {
   /// (`ToolResultMeta::approval`), so a reload still labels the step the user
   /// judged. Absent when the call never prompted.
   approval?: string;
+  /// The source row's `created_at` (RFC3339). Times each stretch of work
+  /// between the model's remarks; absent on rows a gateway predating it
+  /// reconstructed.
+  at?: string;
 };
 
 /// One full-fidelity transcript row — the gateway's `ChatTranscriptItem` DTO,
@@ -285,19 +293,28 @@ export type ChatMsg = {
 };
 
 /// One entry in a turn's work block — the agent's process (thinking, tool
-/// calls, provisional prose the agent superseded, transient progress notices),
+/// calls, the words it said along the way, transient progress notices),
 /// mirroring the web chat's WorkStep.
+/// Epoch ms for when a step happened — the source row's `created_at`, the
+/// instant the live buffer recorded it, or a local stamp when a live frame
+/// minted the step (the frames carry no time of their own). Drives each work
+/// run's own "处理了 Xs" label; absent on rows a gateway predating
+/// `ChatWorkStep.at` reconstructed, which degrades to a step count.
+type Timed = { at?: number };
+
 export type WorkStep =
-  | { kind: "reasoning"; text: string }
+  | ({ kind: "reasoning"; text: string } & Timed)
   // Answer text that streamed mid-turn but was followed by more work — the
-  // agent "went back to thinking", so the text so far was intermediate.
-  | { kind: "prose"; text: string }
-  | { kind: "status"; text: string }
+  // agent "went back to thinking", so the text so far was intermediate. Held
+  // as a step to keep the turn's order, but never hidden by the "Worked Xs"
+  // collapse: `segmentWorkSteps` lifts it out at answer typography.
+  | ({ kind: "prose"; text: string } & Timed)
+  | ({ kind: "status"; text: string } & Timed)
   // An out-of-band agent notice (skill warning, degraded-mode banner) that
   // landed WHILE the turn's work block was open — folded in as a step (styled by
   // `level`) instead of severing the block into two cards. A notice with no open
   // block still renders as its own centered `role:"notice"` row.
-  | { kind: "notice"; level: string; text: string }
+  | ({ kind: "notice"; level: string; text: string } & Timed)
   | {
       kind: "tool";
       callId: string;
@@ -311,7 +328,7 @@ export type WorkStep =
       /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
       /// Survives reload (persisted on the tool result).
       approval?: string;
-    };
+    } & Timed;
 
 /// A turn's collapsible work block, kept as its own transcript row (the web
 /// chat's model: the final answer renders BELOW the block, never inside it).
