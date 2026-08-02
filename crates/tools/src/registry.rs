@@ -129,6 +129,27 @@ impl ToolRegistry {
             .push(name);
     }
 
+    /// Register a builtin that could not be built before the registry was
+    /// frozen — one that needs a handle to the registry itself.
+    ///
+    /// Deliberately not [`Self::register_dynamic`]: that seam belongs to
+    /// external providers, and its `source` is what
+    /// [`Self::unregister_for_source`] sweeps. Filing a first-party builtin
+    /// under an invented source name would put it in reach of a sweep that has
+    /// no business knowing about it, and list it beside real MCP servers.
+    ///
+    /// The entry therefore carries no source and cannot be unregistered.
+    pub fn register_late_builtin(&self, tool: Arc<dyn Tool>, manifest: ToolManifest) {
+        let name = tool.name().to_string();
+        debug_assert_eq!(
+            name, manifest.name,
+            "tool name does not match manifest name"
+        );
+        let mut state = self.dynamic.write();
+        state.tools.insert(name.clone(), tool);
+        state.manifests.insert(name, manifest);
+    }
+
     /// Drop every dynamic tool previously registered under `source`.
     /// Returns the names that were removed.
     pub fn unregister_for_source(&self, source: &str) -> Vec<String> {
@@ -405,6 +426,56 @@ mod tests {
         }
     }
 
+    /// A deferred tool is absent from a session's list until that session
+    /// loads it, and present after — while the unfiltered listing carries it
+    /// either way. Registered here rather than leaning on whatever
+    /// `default_tools` happens to defer: which families are deferred is a
+    /// product decision, and a test that encodes it fails on every retune.
+    #[test]
+    fn a_deferred_tool_appears_only_once_loaded() {
+        let mut registry = default_registry();
+        let tool = crate::test_support::EchoTool::new("Deferred");
+        let mut manifest = tool.manifest();
+        manifest.deferred = true;
+        registry.register(Arc::new(tool), manifest);
+
+        let names = |loaded: &LoadedTools| {
+            registry
+                .tool_definitions_for_session(SessionToolScope {
+                    channel: &baybo_model::ChannelType::owner(),
+                    trigger: &baybo_model::TriggerSource::User,
+                    loaded,
+                })
+                .into_iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+        };
+
+        let unloaded = LoadedTools::default();
+        assert!(!names(&unloaded).contains(&"Deferred".to_string()));
+        assert_eq!(
+            registry.deferred_tool_names(SessionToolScope {
+                channel: &baybo_model::ChannelType::owner(),
+                trigger: &baybo_model::TriggerSource::User,
+                loaded: &unloaded,
+            }),
+            vec!["Deferred".to_string()],
+            "an unloaded deferred tool is what the roster advertises"
+        );
+
+        let loaded: LoadedTools = ["Deferred"].into_iter().collect();
+        assert!(names(&loaded).contains(&"Deferred".to_string()));
+
+        // Never hidden from the unfiltered listing — that one answers "what
+        // does this deployment have", not "what can this session call".
+        assert!(
+            registry
+                .tool_definitions()
+                .iter()
+                .any(|d| d.name == "Deferred")
+        );
+    }
+
     #[test]
     fn unknown_tool_fails_safe_to_exclusive() {
         let registry = default_registry();
@@ -445,19 +516,9 @@ mod tests {
         // exactly the two restricted entries.
         assert!(telegram.contains(&"AttachFile".to_string()));
         assert_eq!(owner.len(), telegram.len() + 2);
-        // The unfiltered listing carries everything, including the tools a
-        // session only sees after loading them — so it is larger than any
-        // session's list by exactly the deferred set.
-        let deferred = registry.deferred_tool_names(SessionToolScope {
-            channel: &baybo_model::ChannelType::owner(),
-            trigger: &baybo_model::TriggerSource::User,
-            loaded: &LoadedTools::default(),
-        });
-        assert!(!deferred.is_empty(), "the fixture should defer something");
-        assert_eq!(
-            registry.tool_definitions().len(),
-            owner.len() + deferred.len()
-        );
+        // The unfiltered listing carries everything, this fixture defers
+        // nothing, so the two agree.
+        assert_eq!(registry.tool_definitions().len(), owner.len());
     }
 
     #[test]

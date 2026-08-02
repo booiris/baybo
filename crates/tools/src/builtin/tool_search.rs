@@ -9,7 +9,7 @@
 //! It is an ordinary always-present builtin, for the obvious reason: a tool
 //! that had to be loaded before it could load anything would load nothing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -43,12 +43,22 @@ Two query forms:
 The definitions come back as this call's result, and the tools are callable from your NEXT message onward — not inside the one that loaded them. They stay for the rest of the conversation, so loading the same tool twice is wasted effort."#;
 
 pub struct ToolSearchTool {
-    registry: Arc<ToolRegistry>,
+    /// Weak, not strong: this tool lives *inside* the registry it reads, so a
+    /// strong handle would be a cycle and the registry could never drop.
+    registry: Weak<ToolRegistry>,
 }
 
 impl ToolSearchTool {
-    pub fn new(registry: Arc<ToolRegistry>) -> Self {
+    pub fn new(registry: Weak<ToolRegistry>) -> Self {
         Self { registry }
+    }
+
+    /// The registry, or an error if it is gone. Only reachable during process
+    /// teardown, where a tool call has nothing left to answer with.
+    fn registry(&self) -> crate::Result<Arc<ToolRegistry>> {
+        self.registry
+            .upgrade()
+            .ok_or_else(|| ToolError::Execution("the tool registry is shutting down".into()))
     }
 }
 
@@ -165,7 +175,8 @@ impl Tool for ToolSearchTool {
         // The roster ignores what is already loaded, so re-selecting a tool
         // returns its definition again rather than reporting it unknown — the
         // model may have compacted the earlier result away.
-        let roster = self.registry.deferred_tool_names(scope);
+        let registry = self.registry()?;
+        let roster = registry.deferred_tool_names(scope);
         let (hits, misses) = resolve(query, &roster);
 
         if hits.is_empty() {
@@ -183,7 +194,7 @@ impl Tool for ToolSearchTool {
 
         let mut defs = Vec::with_capacity(hits.len());
         for name in &hits {
-            if let Some(def) = self.registry.loadable_definition(name, scope) {
+            if let Some(def) = registry.loadable_definition(name, scope) {
                 handle.load(name);
                 defs.push(json!({
                     "name": def.name,
@@ -202,7 +213,7 @@ impl Tool for ToolSearchTool {
 }
 
 /// The tool plus its manifest, for the runtime's registration list.
-pub fn make(registry: Arc<ToolRegistry>) -> (Arc<dyn Tool>, ToolManifest) {
+pub fn make(registry: Weak<ToolRegistry>) -> (Arc<dyn Tool>, ToolManifest) {
     let tool = ToolSearchTool::new(registry);
     let manifest = ToolManifest {
         name: tool.name().to_string(),

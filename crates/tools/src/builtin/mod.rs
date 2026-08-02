@@ -96,6 +96,12 @@ pub struct DefaultToolsConfig {
     pub builtin_memory: bool,
 }
 
+/// Nothing here is [`ToolManifest::deferred`], and that is load-bearing rather
+/// than incidental: the argv boot path (`baybo/src/main.rs`) builds a registry
+/// from this list alone and never registers `ToolSearch`, so a deferred tool
+/// here would be one no session on that path could ever load. Deferral is
+/// declared by the families the full runtime registers, which registers the
+/// loader alongside them.
 pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let DefaultToolsConfig {
         blob_store,
@@ -129,11 +135,9 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
         attach_file::tool(blob_store.clone()),
         put_blob::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
-        // Secrets are managed in bursts — add a credential, list what exists —
-        // and then not touched for weeks.
-        deferred(secret::SecretAddTool, vec![]),
-        deferred(secret::SecretListTool, vec![]),
-        deferred(secret::SecretCheckTool, vec![]),
+        trusted(secret::SecretAddTool, vec![]),
+        trusted(secret::SecretListTool, vec![]),
+        trusted(secret::SecretCheckTool, vec![]),
         trusted(JobListTool, vec![]),
         trusted(JobStopTool, vec![]),
     ];
@@ -146,17 +150,6 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
     tools
-}
-
-/// [`trusted`], but kept out of a session's tool list until it asks. See
-/// [`ToolManifest::deferred`].
-pub(crate) fn deferred<T: Tool + 'static>(
-    tool: T,
-    capabilities: Vec<ToolCapability>,
-) -> (Arc<dyn Tool>, ToolManifest) {
-    let (tool, mut manifest) = trusted(tool, capabilities);
-    manifest.deferred = true;
-    (tool, manifest)
 }
 
 pub(crate) fn trusted<T: Tool + 'static>(
