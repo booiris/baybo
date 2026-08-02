@@ -43,6 +43,14 @@ final class BlobProgressForwarder: BlobProgress, @unchecked Sendable {
 protocol TranscriptSurface: AnyObject {
     func userSent(msgId: String, text: String, attachments: [AttachmentRef])
     func sendFailed(_ msgId: String)
+    /// The return leg of `userSent`: this outbox no longer owes that send. The
+    /// webview keeps the ids it was handed so its REPLACE-overlay knows which
+    /// bubbles no page can carry yet (`applySyncReplace`), and it cannot infer
+    /// the release on its own — the proof native acts on is often a per-key
+    /// point lookup that never touches a frame, and even the sync-page proof is
+    /// unreachable for an ordinary send, whose ordinal the turn's reply has
+    /// already carried the cursor past.
+    func sendConfirmed(_ msgId: String)
     func rebuildIfShowing(_ sessionId: String)
 }
 
@@ -1047,10 +1055,13 @@ final class ChatStore: ObservableObject {
             #endif
             // A draft has nothing to pull yet — but the webview already flipped
             // its in-flight guard, so we MUST reply. An empty baseline
-            // `sync_page` clears it (an empty REPLACE keeps the optimistic
-            // bubble intact); otherwise the guard would stay set forever and
-            // the connEpoch sync after the first send would be a no-op until
-            // reload.
+            // `sync_page` clears it; otherwise the guard would stay set forever
+            // and the connEpoch sync after the first send would be a no-op
+            // until reload. The empty REPLACE keeps the optimistic bubble
+            // because `applySyncReplace` overlays every send this outbox still
+            // owes — NOT because the bubble still shows send chrome. The
+            // gateway's echo lands before its write, so by the time a real page
+            // answers, that chrome is already gone.
             retractResyncNotice()
             pushSynthesizedFrame([
                 "kind": "sync_page",
@@ -1228,7 +1239,7 @@ final class ChatStore: ObservableObject {
         let rows = (frame["rows"] as? [[String: Any]]) ?? []
         for row in rows {
             if let pmid = row["platform_msg_id"] as? String, !pmid.isEmpty {
-                outbox.confirmDurable(platformMsgId: pmid)
+                releaseDurable(platformMsgId: pmid)
             }
         }
         if (frame["rebased"] as? Bool) == true {
@@ -1236,6 +1247,17 @@ final class ChatStore: ObservableObject {
                 resolveUnknownEntry(platformMsgId: entry.platformMsgId)
             }
         }
+    }
+
+    /// Release a send the gateway has provably written: drop the outbox entry
+    /// AND tell the webview, which overlays a bubble across every REPLACE until
+    /// it hears this. The two must move together — this is the ONLY place that
+    /// retires a send, precisely so a future release path cannot take the outbox
+    /// half and forget the transcript half, stranding a bubble that a narrow
+    /// page then welds below the newest answer.
+    private func releaseDurable(platformMsgId: String) {
+        outbox.confirmDurable(platformMsgId: platformMsgId)
+        bridge?.sendConfirmed(platformMsgId)
     }
 
     /// After a rebased sync hid the floor: probe the key's durability directly.
@@ -1247,7 +1269,7 @@ final class ChatStore: ObservableObject {
                 let lookup = try await client.chatLookupMessage(
                     sessionId: sessionId, platformMsgId: platformMsgId)
                 if lookup.found {
-                    outbox.confirmDurable(platformMsgId: platformMsgId)
+                    releaseDurable(platformMsgId: platformMsgId)
                 } else {
                     outbox.resumeSending(platformMsgId: platformMsgId)
                     startOutboxTimerIfNeeded()

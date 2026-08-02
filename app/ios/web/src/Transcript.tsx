@@ -1045,6 +1045,82 @@ export function mergeSyncPage(
   return next;
 }
 
+/// Apply a REPLACE page (a baseline, or a rebase) over the rendered thread: the
+/// server's rows ARE the thread, re-overlaid with the two things no page can
+/// carry — the in-flight turn's open work block, and any optimistic user send
+/// with no durable row yet. `page` arrives already folded.
+///
+/// The kept-send predicate is membership in `unconfirmedSends` — the ids this
+/// client minted and no page has yet answered for. NOT send chrome, and NOT a
+/// missing ordinal; both were tried and both are wrong.
+///
+/// `sendState` is wrong because the gateway echoes an inbound message to its own
+/// sender BEFORE handing it to the router that persists it (`channel/route.rs`,
+/// `sub.echo_inbound` ahead of `incoming_tx.send`), and that echo frame carries
+/// `ordinal: None` (`channel/adapter.rs`) — so `markSent` clears the spinner
+/// while the row is still unpersisted. Gating on chrome dropped exactly the row
+/// this rule exists to protect: a first send whose own `connEpoch` sync raced
+/// its persistence lost its bubble, the cursor then leapfrogged it on the
+/// answer's ordinal (a difference selects strictly `>`, so it could never come
+/// back), and the outbox's next mount-edge replay re-appended it BELOW the
+/// answer.
+///
+/// `ordinal === undefined` is wrong for the opposite reason: it is not a
+/// property of unconfirmed sends but the STEADY STATE of every user row this
+/// client rendered live. The echo never carries an ordinal, so the only stamp is
+/// a difference redelivering the durable twin — which the cursor has usually
+/// already outrun. Keying on it makes every such row immortal, and the first
+/// REPLACE whose window is narrower than the thread tears months of settled
+/// questions out of place and welds them below the newest answer.
+///
+/// A bounded set is the only honest answer, and it is what app/web's
+/// `applySyncReplace` has always used (`unconfirmedSendIds`). Ids leave it on
+/// the one signal that actually proves durability — a sync page carrying the
+/// `platform_msg_id` — which is the same proof native's `reconcileOutboxAfterSync`
+/// releases its own outbox entry on, off the very same frame.
+///
+/// Carry only the SINGLE newest active in-flight block across the rebuild; any
+/// earlier still-active block is a stale fork — drop it so it can't re-appear
+/// beside the reconstructed thread.
+///
+/// The page's reconstructed trailing `w<ordinal>` block and the live in-flight
+/// block are the SAME turn — while the server says so (`sameContinuingTurn`: an
+/// in-flight turn's trailing block is always cut off by the window's edge).
+/// Fuse them into ONE block — keep it active, adopt the server id +
+/// server-anchored timing, union the steps — instead of rendering both
+/// (duplicate/overlapping cards) or dropping either (losing steps or the
+/// correct duration). A COMPLETE tail block is a finished turn that merely left
+/// no answer bubble; the live block belongs to the next one and keeps its card.
+export function applySyncReplace(
+  prev: Row[],
+  page: Row[],
+  unconfirmedSends: ReadonlySet<string>,
+): Row[] {
+  const pageIds = new Set(page.map((r) => r.id));
+  const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
+  const keptSends = prev.filter(
+    (r) => r.role === "user" && unconfirmedSends.has(r.id) && !pageIds.has(r.id),
+  );
+  let rows = page;
+  let carried = openWork;
+  if (openWork.length > 0) {
+    const tail = rows[rows.length - 1];
+    if (tail && tail.role === "work" && sameContinuingTurn(tail)) {
+      rows = [
+        ...rows.slice(0, -1),
+        {
+          ...tail,
+          steps: mergeWorkSteps(tail.steps, openWork[0].steps),
+          active: true,
+          startedAt: tail.startedAt ?? openWork[0].startedAt,
+        },
+      ];
+      carried = [];
+    }
+  }
+  return [...rows, ...keptSends, ...carried];
+}
+
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
 /// live at persist stays live ("working"), because exiting and re-entering
 /// mid-turn — or before the agent's final reply — must NOT collapse it to
@@ -2319,6 +2395,13 @@ export function Transcript({
   const sentIds = useRef<Set<string>>(
     new Set((restored?.messages ?? []).filter((m) => m.role === "user").map((m) => m.id)),
   );
+  // The sends this client minted that no sync page has answered for yet — the
+  // REPLACE-overlay's kept set (`applySyncReplace`). Starts EMPTY even when the
+  // mirror restores optimistic-looking rows: the outbox is the authority on what
+  // is still owed, and native re-seeds it through `userSent` on every mount edge.
+  // A restored row absent from that replay is durable, and a REPLACE should drop
+  // it in favour of the page's own copy.
+  const unconfirmedSends = useRef<Set<string>>(new Set());
   // Durable ordinals already rendered. This catches the network-race where an
   // old leg delivers a final Message just before a sync redelivery carries the
   // same row again.
@@ -3005,9 +3088,8 @@ export function Transcript({
   }, []);
 
   // Apply one `sync_page` frame. REPLACE (rebased, or baseline `since === null`)
-  // swaps the durable thread wholesale — keeping the in-flight turn's open work
-  // block and any optimistic user rows the page can't carry yet (the
-  // REPLACE-overlay rule) — while a difference merge appends the rows above the
+  // swaps the durable thread wholesale under the REPLACE-overlay rule
+  // (`applySyncReplace`), while a difference merge appends the rows above the
   // cursor, reconciling an optimistic send against its persisted row by
   // `platform_msg_id`. Rows arrive ascending; each carries its stable id.
   const applySyncPage = useCallback(
@@ -3021,11 +3103,19 @@ export function Transcript({
       const pageRows = frame.rows
         .map(transcriptItemToRow)
         .filter((r): r is Row => r !== null);
-      // Reseed the redelivery-dedup sets from the page (idempotent Set adds).
+      // Reseed the redelivery-dedup sets from the page (idempotent Set adds),
+      // and release every send the page proves durable — the ONLY thing that
+      // ever retires an id from the REPLACE-overlay's kept set, and the same
+      // proof native takes off this frame to release its outbox entry
+      // (`reconcileOutboxAfterSync`). Both branches: a difference confirms a
+      // send just as well as a baseline does.
       for (const item of frame.rows) {
         if (item.kind === "message") {
           if (typeof item.ordinal === "number") renderedOrdinals.current.add(item.ordinal);
-          if (item.platform_msg_id) sentIds.current.add(item.platform_msg_id);
+          if (item.platform_msg_id) {
+            sentIds.current.add(item.platform_msg_id);
+            unconfirmedSends.current.delete(item.platform_msg_id);
+          }
         }
       }
       if (replace) {
@@ -3036,46 +3126,7 @@ export function Transcript({
           turnActiveRef.current ? dropInFlightAnswerStep(pageRows) : pageRows,
           frame.compaction_points ?? [],
         );
-        const pageIds = new Set(folded.map((r) => r.id));
-        setMessages((prev) => {
-          // Keep the in-flight turn's open work block and any optimistic user
-          // sends still awaiting their durable row (echoed-but-unpersisted, or
-          // below a rebase floor) — the page can't carry either.
-          // Carry only the SINGLE newest active in-flight block across the
-          // rebuild; any earlier still-active block is a stale fork — drop it so
-          // it can't re-appear beside the reconstructed thread.
-          const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
-          const keptSends = prev.filter(
-            (r) => r.role === "user" && r.sendState !== undefined && !pageIds.has(r.id),
-          );
-          // The page's reconstructed trailing `w<ordinal>` block and the live
-          // in-flight block are the SAME turn — while the server says so
-          // (`sameContinuingTurn`: an in-flight turn's trailing block is always
-          // cut off by the window's edge). Fuse them into ONE block — keep it
-          // active, adopt the server id + server-anchored timing, union the steps
-          // — instead of rendering both (duplicate/overlapping cards) or dropping
-          // either (losing steps or the correct duration). A COMPLETE tail block
-          // is a finished turn that merely left no answer bubble; the live block
-          // belongs to the next one and keeps its own card.
-          let rows = folded;
-          let carried = openWork;
-          if (openWork.length > 0) {
-            const tail = rows[rows.length - 1];
-            if (tail && tail.role === "work" && sameContinuingTurn(tail)) {
-              rows = [
-                ...rows.slice(0, -1),
-                {
-                  ...tail,
-                  steps: mergeWorkSteps(tail.steps, openWork[0].steps),
-                  active: true,
-                  startedAt: tail.startedAt ?? openWork[0].startedAt,
-                },
-              ];
-              carried = [];
-            }
-          }
-          return [...rows, ...keptSends, ...carried];
-        });
+        setMessages((prev) => applySyncReplace(prev, folded, unconfirmedSends.current));
         oldestOrdinal.current = frame.oldest_ordinal;
         setHasMoreOlder(frame.has_more_older);
         // The rebuilt thread IS the newest page — pre-sync scroll position is
@@ -3370,7 +3421,16 @@ export function Transcript({
   // append: `awaitingReply` below would raise the composer's stop button on a
   // send that failed days ago and is merely awaiting its red dot. A live send
   // mints a fresh uuid and can never take this exit.
+  //
+  // Registering the id sits ABOVE that exit on purpose. The re-seed's whole
+  // point is that this call is the outbox telling us what it still owes, and
+  // that claim is exactly as true when the row is already on screen — a restored
+  // mirror rendering the bubble is not proof the gateway ever wrote it. The exit
+  // suppresses the duplicate APPEND, not the bookkeeping; leave the add below it
+  // and a restored unconfirmed send never enters the kept set, so the next
+  // REPLACE deletes the very bubble this path exists to preserve.
   const handleUserSent = (payload: UserSentPayload) => {
+    unconfirmedSends.current.add(payload.msgId);
     if (holdsUserSend(messagesRef.current, payload.msgId)) return;
     sentIds.current.add(payload.msgId);
     followRef.current = true;
@@ -3561,6 +3621,12 @@ export function Transcript({
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
         sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
+        // Bookkeeping only — no re-render. The bubble already looks settled;
+        // what changes is that a REPLACE may now drop it in favour of the page's
+        // own copy.
+        sendConfirmed: (msgId) => {
+          unconfirmedSends.current.delete(msgId);
+        },
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
         jumpToMessage: (rowId) => handlersRef.current.jumpToMessage(rowId),

@@ -189,6 +189,12 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("sendFailed", jsonLiteral(msgId))
     }
 
+    /// The outbox released that send — it is durable, so the transcript may stop
+    /// overlaying its optimistic bubble across a REPLACE.
+    func sendConfirmed(_ msgId: String) {
+        call("sendConfirmed", jsonLiteral(msgId))
+    }
+
     func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
         let payload: [String: Any] = [
             "id": id,

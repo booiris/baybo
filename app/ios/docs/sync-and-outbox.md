@@ -76,8 +76,51 @@ on a healthy thread (a sync's `next_cursor` covers every row it delivered, a
 live final reply advances the cursor with itself, and paged rows are older than
 everything) and it is self-terminating (a REPLACE leaves the thread a prefix of
 its own watermark). Ordinal-less rows — an optimistic send, a live work block —
-are not durable coverage and never trip it; a send gains its ordinal when the
-echo (`markSent`) or its durable twin (`mergeSyncPage`) confirms it.
+are not durable coverage and never trip it; a send gains its ordinal from its
+durable twin (`mergeSyncPage`, or a REPLACE page carrying it) — **never from the
+echo**, which the gateway fans out before the router persists the message and
+which therefore carries `ordinal: None` by design (`channel/adapter.rs`).
+`markSent` stamps whatever the echo brought, so for our own send it clears the
+send chrome and nothing else.
+
+That distinction is load-bearing, and reading it the other way cost a shipped
+bug. The REPLACE-overlay (`applySyncReplace`) keeps an optimistic send iff its
+id is in **`unconfirmedSends`** — the set `handleUserSent` mints into and only a
+sync page carrying the `platform_msg_id` retires from, the same proof native's
+`reconcileOutboxAfterSync` releases its own outbox entry on, off the same frame.
+
+Two cheaper-looking predicates are both wrong, in opposite directions, and the
+tests in `rows.test.ts` pin each:
+
+- **Send chrome** (`sendState !== undefined`) deletes the row the moment the echo
+  lands. A first send whose own `connEpoch` sync raced its persistence vanished,
+  could never be re-fetched (the cursor leapfrogged it on the answer's ordinal,
+  and a difference selects strictly `>`), and came back only as the outbox's
+  mount-edge replay — appended below the answer.
+- **A missing ordinal** (`ordinal === undefined`) looks like the fix for that,
+  and is worse. It is not a property of unconfirmed sends: since the echo never
+  stamps an ordinal and the cursor outruns the durable twin, it is the *steady
+  state* of every user row this client rendered live. Keying on it makes those
+  rows immortal, so the first REPLACE whose window is narrower than the thread
+  tears every settled question out of place and welds it below the newest answer
+  — the `syncSince` scramble class, re-entered through the front door.
+
+The lesson generalises: **on this side of the bridge nothing about a rendered row
+proves durability.** Only the outbox knows, so it has to say so.
+
+That makes `userSent` a two-way seam. Native mints an id into the web's set on
+every mount edge (`replayUnconfirmedSends`), and `sendConfirmed` is the return
+leg, fired from `ChatStore.releaseDurable` — the single place an entry is
+retired, kept single so a future release path cannot take the outbox half and
+forget the transcript half. The web cannot derive the release: native's dominant
+proof is a per-key point lookup (`chatLookupMessage`, on every reconnect and
+after every rebase) that touches no frame at all, and even the sync-page proof
+is unreachable for an ordinary send, whose ordinal the turn's own reply has
+already carried the cursor past. Without the return leg the set degenerates from
+"sends still owed" into "sends made since mount", and the first REPLACE with a
+narrower window welds them below the newest answer — the same corruption, one
+door along. `applySyncPage` also retires on a page carrying the
+`platform_msg_id`, which is belt to the bridge call's braces.
 
 ### Only the server says two work blocks are one turn
 
