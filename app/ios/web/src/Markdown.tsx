@@ -7,12 +7,17 @@ import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/parseOnly";
 import rehypeKatex from "rehype-katex";
 import { openUrl } from "./bridge";
+import { HtmlPreview, InvalidHtmlPreview } from "./HtmlPreview";
+import { htmlPreviewBlobId } from "./htmlPreviewProtocol";
 import { normalizeMath } from "./mathDelimiters";
 
 // GFM (tables, strikethrough, autolinks) + math. `remark-math` tokenizes the
 // `$...$` / `$$...$$` spans into math nodes; the `\(...\)` / `\[...\]` form is
 // rewritten to dollars in `normalizeMath` before parse. The source is never raw
-// HTML (react-markdown default), so no sanitizer is needed.
+// HTML (react-markdown default), so no sanitizer is needed. `baybo-html` is the
+// sole explicit escape hatch: its code body is a validated blob id, and the
+// bytes render in a separate opaque-origin/CSP iframe rather than entering this
+// DOM.
 //
 // The two `cjk-friendly` extensions relax CommonMark's flanking rule, which
 // otherwise refuses `**标题：**内容` — punctuation INSIDE the closing `**`, a CJK
@@ -127,6 +132,12 @@ function TableBlock({ children }: { children?: ReactNode }) {
 }
 
 const COMPONENTS: Components = {
+  code({ className, children }) {
+    const blobId = htmlPreviewBlobId(className, String(children));
+    if (blobId === "") return <InvalidHtmlPreview />;
+    if (blobId !== null) return <HtmlPreview blobId={blobId} />;
+    return <code className={className}>{children}</code>;
+  },
   // Every link hands off to native (system browser); an in-webview navigation
   // would replace the transcript page.
   a({ href, children }) {

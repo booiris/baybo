@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
+import { I18nextProvider } from "react-i18next";
 
 // bridge.ts reads `window.webkit` at module scope; MarkdownBody imports it for
 // `openUrl`. jsdom has no bridge, but only link clicks touch it, so a stub keeps
 // the import graph happy.
-vi.mock("./bridge", () => ({ openUrl: vi.fn() }));
+vi.mock("./bridge", () => ({
+  openUrl: vi.fn(),
+  postHtmlPreviewMaximized: vi.fn(),
+}));
 
 // Delegates to the real normalizer everywhere except one sentinel, so the math
 // suite below still exercises the shipped code. The sentinel is how the
@@ -24,6 +28,7 @@ vi.mock("./mathDelimiters", async (importOriginal) => {
 });
 
 import { MarkdownBody } from "./Markdown";
+import i18n from "./i18n";
 
 // The math pipeline (normalize -> remark-math -> rehype-katex -> KaTeX) is wired
 // end to end here — a pure-function test can't prove the plugins are actually
@@ -100,6 +105,25 @@ describe("MarkdownBody math", () => {
     expect(container.querySelector("table")).not.toBeNull();
     expect(container.querySelectorAll("tbody td")).toHaveLength(2);
     expect(container.querySelector(".katex")).not.toBeNull();
+  });
+});
+
+describe("MarkdownBody HTML preview", () => {
+  it("renders only baybo-html fences as blob-backed iframes", () => {
+    const blobId = `sha256:${"a".repeat(64)}.${"b".repeat(32)}`;
+    const preview = render(
+      <I18nextProvider i18n={i18n}>
+        <MarkdownBody text={`\`\`\`baybo-html\n${blobId}\n\`\`\``} />
+      </I18nextProvider>,
+    );
+    expect(preview.container.querySelector("iframe")).toHaveAttribute(
+      "src",
+      `baybo-transcript://localhost/html-preview/${blobId}?reload=0`,
+    );
+
+    const source = render(<MarkdownBody text={"```html\n<button>source</button>\n```"} />);
+    expect(source.container.querySelector("iframe")).toBeNull();
+    expect(source.container.querySelector("code")?.textContent).toContain("<button>source</button>");
   });
 });
 

@@ -52,6 +52,10 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// the webview can fade in rather than pop its content in as the chat
     /// screen slides on. Re-armed on every fresh page load (`ready`).
     @Published private(set) var contentVisible = false
+    /// An agent-authored HTML iframe is expanded over the transcript. Native
+    /// hides its header/composer while true; the close control lives in the
+    /// trusted parent document, never inside the untrusted iframe.
+    @Published private(set) var htmlPreviewMaximized = false
 
     init(store: ChatStore) {
         self.store = store
@@ -64,6 +68,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
         if store === newStore {
             newStore.attachBridge(self)
         } else {
+            collapseHtmlPreview()
             // A DIFFERENT store for the same conversation (the LRU evicted this
             // session's store and re-opening minted a fresh one) keeps the very
             // same React tree — `<Transcript>` is keyed on `sessionId`, so `init`
@@ -129,12 +134,14 @@ final class TranscriptBridge: NSObject, ObservableObject {
         // Buffered calls target a document about to be destroyed — and one of
         // them may be an `init` carrying the mirror we just threw away.
         pending.removeAll()
+        htmlPreviewMaximized = false
         webView.load(URLRequest(url: url))
     }
 
     func detachCurrent(_ leaving: ChatStore) {
         // SwiftUI can run the next screen's `onAppear` before this `onDisappear`.
         guard store === leaving else { return }
+        collapseHtmlPreview()
         call("flushPersist", "")
         store?.detachBridge(self)
     }
@@ -289,6 +296,11 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("requestOutlineHere", "")
     }
 
+    private func collapseHtmlPreview() {
+        htmlPreviewMaximized = false
+        call("collapseHtmlPreview", "")
+    }
+
     #if DEBUG
         /// `-baybo-demo-jump`: 4s in, shove the document off the newest edge from
         /// inside the page — the REAL window scroll → showJump → `jumpVisible`
@@ -395,7 +407,12 @@ extension TranscriptBridge: WKScriptMessageHandler {
         // actor rather than re-dispatch so bridge messages keep their order
         // relative to each other and to frame pushes.
         MainActor.assumeIsolated {
-            guard let body = message.body as? [String: Any],
+            // WKWebView exposes a script handler in every subframe. Agent HTML
+            // runs in a sandboxed iframe and must never drive native actions
+            // directly; only the trusted transcript main frame owns this seam.
+            guard message.frameInfo.isMainFrame,
+                message.name == Self.messageHandlerName,
+                let body = message.body as? [String: Any],
                 let type = body["type"] as? String
             else { return }
             self.handle(type: type, body: body)
@@ -420,6 +437,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // tail — where an optimistic send always sits.
             store?.replayUnconfirmedSends(to: self)
             discardPersist = false
+            htmlPreviewMaximized = false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
             contentVisible = true
@@ -564,6 +582,8 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // The transcript's turn is/ isn't in flight — drives the composer's
             // send↔stop button on the store this webview currently targets.
             store?.setAgentRunning((body["running"] as? Bool) ?? false)
+        case "htmlPreviewMaximized":
+            htmlPreviewMaximized = (body["maximized"] as? Bool) ?? false
         case "openUrl":
             // Markdown links leave the app for the system browser — navigating
             // the transcript webview itself would replace the thread.

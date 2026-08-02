@@ -19,6 +19,7 @@
 //! | `Grep`       | implemented   |
 //! | `WebFetch`   | implemented   |
 //! | `AttachFile` | implemented   |
+//! | `PutBlob`    | implemented   |
 //! | everything else listed in `todo.rs` | stubbed  |
 
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::{Tool, ToolCapability, ToolManifest};
 pub mod attach_file;
 pub mod background_jobs;
 pub mod bash;
+mod blob_upload;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
@@ -39,6 +41,7 @@ pub(crate) mod managed_repo;
 pub mod memory_delete;
 pub mod now;
 pub(crate) mod paths;
+mod put_blob;
 pub mod read;
 mod rg;
 pub mod secret;
@@ -123,6 +126,7 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
             vec![ToolCapability::Http],
         ),
         attach_file::tool(blob_store.clone()),
+        put_blob::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
         trusted(secret::SecretAddTool, vec![]),
         trusted(secret::SecretListTool, vec![]),

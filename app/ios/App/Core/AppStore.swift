@@ -730,7 +730,7 @@ final class AppStore: ObservableObject {
                 // Already applied; a failure to REFETCH leaves the optimistic row
                 // standing (it is right about the status) and the next appear
                 // reconciles the trigger.
-                try? await loadCronJobs()
+                _ = try? await loadCronJobs()
             } catch {
                 cronJobs = rollback
                 cronJobNotice = Lang.shared.t(

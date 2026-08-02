@@ -8,35 +8,55 @@ import WebKit
 /// bridge never comes up. A scheme handler answers with real HTTP semantics
 /// (correct MIME + permissive CORS), which module loading accepts.
 ///
-/// The DECK webview additionally enables a `/blob/<id>` route
-/// (`blobRouteEnabled`) so a card iframe can display a blob it produced/was
-/// handed via `deck.blobUrl` — the spike (docs/modules/deck.md §Blobs) proved
-/// a sandboxed opaque-origin srcdoc iframe's `<img>` subresource reaches this
-/// handler and the `img-src baybo-transcript:` CSP admits it.
+/// Each host opts into at most one dynamic route in addition to the bundle:
+/// Deck serves `/blob/<id>` imagery, while the transcript serves agent-authored
+/// `/html-preview/<id>` documents under a strict response CSP.
 @MainActor
 final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
     static let scheme = "baybo-transcript"
     static let indexURL = URL(string: "\(scheme)://localhost/index.html")
 
-    /// Only the deck webview serves blobs; the transcript webview leaves the
-    /// route off so it can't be reached from a context that never needs it.
-    private let blobRouteEnabled: Bool
+    enum DynamicRoute: Equatable {
+        case deckBlob
+        case htmlPreview
+    }
+
+    private static let deckBlobPathPrefix = "/blob/"
+    private static let htmlPreviewPathPrefix = "/html-preview/"
+    private static let deckBlobServeCap = 8 * 1024 * 1024
+    private static let htmlPreviewServeCap = 16 * 1024 * 1024
+    private static let htmlPreviewCSP =
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
+    private static let htmlPreviewPermissionsPolicy =
+        "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), web-share=(), xr-spatial-tracking=()"
+    private static let htmlPreviewFailureDocument =
+        #"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0}body{display:grid;place-items:center;padding:24px;box-sizing:border-box;color:#6b6b6b;background:#fff;font:14px ui-monospace,SFMono-Regular,monospace;text-align:center}</style><body>HTML preview unavailable. Use the reload button to try again.</body>"#
+
+    private let dynamicRoute: DynamicRoute
 
     /// Live scheme tasks, by identity. An async blob serve MUST confirm its
     /// task is still live before touching it: WebKit tears a task down when the
-    /// card is resized/removed mid-load, and messaging a stopped task crashes.
+    /// dynamic resource is removed or reloaded mid-load, and messaging a
+    /// stopped task crashes.
     /// Only touched on the main actor (WebKit drives start/stop there; the
     /// async serve is `@MainActor` too), so the set needs no extra locking.
     private var liveTasks: Set<ObjectIdentifier> = []
 
-    /// Cap on a single blob served for display. Card imagery is small; a card
-    /// that points `deck.blobUrl` at something huge fails to render rather than
-    /// pulling it all into memory.
-    private static let blobServeCap = 8 * 1024 * 1024
-
-    init(blobRouteEnabled: Bool = false) {
-        self.blobRouteEnabled = blobRouteEnabled
+    init(dynamicRoute: DynamicRoute) {
+        self.dynamicRoute = dynamicRoute
         super.init()
+    }
+
+    static func permitsNavigation(to url: URL, isMainFrame: Bool) -> Bool {
+        guard url.scheme?.lowercased() == scheme,
+            url.host?.lowercased() == "localhost"
+        else {
+            return false
+        }
+        if isMainFrame {
+            return url.path.isEmpty || url.path == "/" || url.path == "/index.html"
+        }
+        return url.path.hasPrefix(htmlPreviewPathPrefix)
     }
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
@@ -44,9 +64,12 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
             urlSchemeTask.didFailWithError(URLError(.badURL))
             return
         }
-        // Blob route (deck only), matched AHEAD of the bundle-file fallthrough.
-        if blobRouteEnabled, url.path.hasPrefix("/blob/") {
-            startBlob(url: url, task: urlSchemeTask)
+        if dynamicRoute == .deckBlob, url.path.hasPrefix(Self.deckBlobPathPrefix) {
+            startDeckBlob(url: url, task: urlSchemeTask)
+            return
+        }
+        if dynamicRoute == .htmlPreview, url.path.hasPrefix(Self.htmlPreviewPathPrefix) {
+            startHtmlPreview(url: url, task: urlSchemeTask)
             return
         }
         guard let root = Bundle.main.url(forResource: "transcript", withExtension: nil) else {
@@ -90,55 +113,116 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
         liveTasks.remove(ObjectIdentifier(urlSchemeTask))
     }
 
-    // MARK: - Blob route (deck)
+    // MARK: - Dynamic blob routes
 
-    private func startBlob(url: URL, task: WKURLSchemeTask) {
-        let blobId = String(url.path.dropFirst("/blob/".count))
+    private enum BlobResponse {
+        case deck(contentType: String)
+        case htmlPreview
+    }
+
+    private func startDeckBlob(url: URL, task: WKURLSchemeTask) {
+        let blobId = String(url.path.dropFirst(Self.deckBlobPathPrefix.count))
         let contentType =
             URLComponents(url: url, resolvingAgainstBaseURL: false)?
             .queryItems?.first(where: { $0.name == "ct" })?.value
             ?? "application/octet-stream"
+        startBlob(
+            url: url, task: task, blobId: blobId,
+            maxBytes: UInt64(Self.deckBlobServeCap),
+            response: .deck(contentType: contentType))
+    }
+
+    private func startHtmlPreview(url: URL, task: WKURLSchemeTask) {
+        let blobId = String(url.path.dropFirst(Self.htmlPreviewPathPrefix.count))
+        startBlob(
+            url: url, task: task, blobId: blobId,
+            maxBytes: UInt64(Self.htmlPreviewServeCap), response: .htmlPreview)
+    }
+
+    private func startBlob(
+        url: URL, task: WKURLSchemeTask, blobId: String, maxBytes: UInt64,
+        response: BlobResponse
+    ) {
         let id = ObjectIdentifier(task)
         liveTasks.insert(id)
-        Task { await serveBlob(url: url, task: task, id: id, blobId: blobId, contentType: contentType) }
+        Task {
+            await serveBlob(
+                url: url, task: task, id: id, blobId: blobId, maxBytes: maxBytes,
+                response: response)
+        }
     }
 
     private func serveBlob(
-        url: URL, task: WKURLSchemeTask, id: ObjectIdentifier, blobId: String, contentType: String
+        url: URL, task: WKURLSchemeTask, id: ObjectIdentifier, blobId: String,
+        maxBytes: UInt64, response: BlobResponse
     ) async {
         // The core owns the serve: id-shape validation, cache-first read (no
-        // binding — a cached image renders offline/unbound), leg-bound download
-        // on a miss, and the display cap (an over-cap cached blob is refused by
-        // its stat, never read). We only adapt the outcome to WebKit.
+        // binding — a cached display blob renders offline/unbound), leg-bound
+        // download on a miss, and the display cap (an over-cap cached blob is
+        // refused by its stat, never read). We only adapt the outcome to WebKit.
         let outcome = await Baybo.client.blobBytesForDisplay(
-            blobId: blobId, maxBytes: UInt64(Self.blobServeCap))
+            blobId: blobId, maxBytes: maxBytes)
         // Back on the main actor after the await: confirm-and-consume the task
         // in one step. `nil` means `stop` already fired — do not touch it.
         guard liveTasks.remove(id) != nil else { return }
         switch outcome {
         case .bytes(let data):
-            let headers = [
-                "Content-Type": contentType,
-                "Access-Control-Allow-Origin": "*",
-                "Content-Length": String(data.count),
-            ]
-            guard
-                let response = HTTPURLResponse(
-                    url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
-            else {
-                task.didFailWithError(URLError(.badServerResponse))
-                return
-            }
-            task.didReceive(response)
-            task.didReceive(data)
-            task.didFinish()
+            finish(task: task, url: url, status: 200, data: data, response: response)
         case .overCap:
-            task.didFailWithError(URLError(.dataLengthExceedsMaximum))
+            fail(
+                task: task, url: url, status: 413, error: .dataLengthExceedsMaximum,
+                response: response)
         case .badId:
-            task.didFailWithError(URLError(.badURL))
+            fail(task: task, url: url, status: 400, error: .badURL, response: response)
         case .notFound:
-            task.didFailWithError(URLError(.resourceUnavailable))
+            fail(
+                task: task, url: url, status: 503, error: .resourceUnavailable,
+                response: response)
         }
+    }
+
+    private func fail(
+        task: WKURLSchemeTask, url: URL, status: Int, error: URLError.Code,
+        response: BlobResponse
+    ) {
+        switch response {
+        case .deck:
+            task.didFailWithError(URLError(error))
+        case .htmlPreview:
+            finish(
+                task: task, url: url, status: status,
+                data: Data(Self.htmlPreviewFailureDocument.utf8), response: response)
+        }
+    }
+
+    private func finish(
+        task: WKURLSchemeTask, url: URL, status: Int, data: Data, response: BlobResponse
+    ) {
+        var headers = [
+            "Access-Control-Allow-Origin": "*",
+            "Content-Length": String(data.count),
+        ]
+        switch response {
+        case .deck(let contentType):
+            headers["Content-Type"] = contentType
+        case .htmlPreview:
+            headers["Content-Type"] = "text/html; charset=utf-8"
+            headers["Content-Security-Policy"] = Self.htmlPreviewCSP
+            headers["Permissions-Policy"] = Self.htmlPreviewPermissionsPolicy
+            headers["Referrer-Policy"] = "no-referrer"
+            headers["Cache-Control"] = "no-store"
+            headers["X-Content-Type-Options"] = "nosniff"
+        }
+        guard
+            let httpResponse = HTTPURLResponse(
+                url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)
+        else {
+            task.didFailWithError(URLError(.badServerResponse))
+            return
+        }
+        task.didReceive(httpResponse)
+        task.didReceive(data)
+        task.didFinish()
     }
 
     private static func mimeType(for ext: String) -> String {

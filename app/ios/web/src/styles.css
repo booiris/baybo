@@ -454,6 +454,138 @@ button {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* `baybo-html` fenced blocks carry a blob id rather than source. The custom
+   code renderer replaces the <code> with this iframe surface; neutralize the
+   ordinary code-block shell that still wraps it. */
+.md pre:has(> .html-preview) {
+  width: 100%;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.html-preview {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 420px;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-paper);
+  font-family: var(--font-mono);
+  white-space: normal;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.html-preview-toolbar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  min-height: 42px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.45rem 0 0.75rem;
+  border-bottom: 1px solid var(--color-line);
+  background: rgba(255, 255, 255, 0.96);
+}
+.html-preview-label {
+  overflow: hidden;
+  color: var(--color-ink-soft);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.html-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+.html-preview-action {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-ink);
+  font-size: 1.15rem;
+  line-height: 1;
+}
+.html-preview-action:active {
+  opacity: 0.55;
+  transform: scale(0.96);
+}
+.html-preview-frame {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  border: 0;
+  background: var(--color-paper);
+  opacity: 0;
+}
+.html-preview-frame.is-loaded { opacity: 1; }
+.html-preview-loading {
+  position: absolute;
+  inset: 42px 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  color: var(--color-ink-soft);
+  font-size: 0.75rem;
+}
+.html-preview-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 1.5px solid var(--color-line-strong);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: send-spin 0.7s linear infinite;
+}
+.html-preview-invalid {
+  height: auto;
+  min-height: 72px;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  color: var(--color-err);
+  font-size: 0.75rem;
+  text-align: center;
+}
+html.html-preview-maximized,
+html.html-preview-maximized body {
+  overflow: hidden;
+}
+html.html-preview-maximized .md { overflow: visible; }
+.html-preview.is-maximized {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+}
+.html-preview.is-maximized .html-preview-toolbar {
+  min-height: calc(env(safe-area-inset-top) + 50px);
+  padding-top: env(safe-area-inset-top);
+  padding-right: 0.7rem;
+  padding-left: 1rem;
+}
+.html-preview.is-maximized .html-preview-loading {
+  top: calc(env(safe-area-inset-top) + 50px);
+}
 .md a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
 .md blockquote {
   border-left: 2px solid var(--color-line-strong);
