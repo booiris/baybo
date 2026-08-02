@@ -3414,6 +3414,49 @@ mod tests {
         assert!(wire_text.contains("SOUL_V3") && wire_text.contains("SOUL_V2"));
     }
 
+    /// The shape a long-lived session actually hits: one line appended to a
+    /// file that rides the prompt in full. The update carries that line, not
+    /// the file — which is the whole reason the delta is a diff.
+    #[tokio::test]
+    async fn a_one_line_edit_to_a_long_file_sends_one_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = |extra: &str| {
+            let mut lines: Vec<String> = (0..40).map(|i| format!("- SOUL_LINE_{i}")).collect();
+            lines.push(extra.to_string());
+            lines.join("\n")
+        };
+        let workspace = workspace_with_soul(dir.path(), &body("- SOUL_LINE_LAST"));
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        std::fs::write(
+            &soul,
+            format!("{}\n- SOUL_LINE_APPENDED", body("- SOUL_LINE_LAST")),
+        )
+        .expect("append a line");
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(update.contains("+- SOUL_LINE_APPENDED"), "{update}");
+        assert!(
+            !update.contains("SOUL_LINE_0"),
+            "lines outside the hunk must not ride along: {update}"
+        );
+        assert!(
+            !update.contains("-- SOUL_LINE_LAST"),
+            "the line before the append is context, not a rewrite: {update}"
+        );
+    }
+
     /// When the model rewrites its own persona file, echoing the whole body
     /// back tells it what it just wrote. The update names the file instead —
     /// and a second edit to the same file adds no further row, because the

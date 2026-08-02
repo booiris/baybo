@@ -56,7 +56,8 @@ ContextManager (struct)
 └── prompts/          — all model-facing framing text + pure builders
     ├── soul.rs            — assemble (TOP/TAIL hints + identity) → AssembledPrompt
     ├── system_prompt_update.rs — build_blocks / wrap_update
-    │                            (<system_prompt_update> drift delta)
+    │                            (<system_prompt_update> drift delta,
+    │                             per-section unified diff)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
     ├── background_notification.rs — build_completion_reply +
     │                              build_notification_content
@@ -136,6 +137,19 @@ honest, in ascending order of cost:
    version that moved without changing any bytes the prompt carries (a re-save, a
    `touch`) appends nothing, and neither does a delta the newest update already
    states verbatim.
+
+   **A changed section is sent as a line diff, not as its new body.** Sections
+   are addressed by tag, so `seeded_section_body` recovers the copy `messages[0]`
+   carries and `similar` diffs it against the live one: a session that appended
+   one line to `MEMORY.md` sends `<memory path="…" diff>` with that line and two
+   lines of context, not the whole index. Two cheaper cases fall out of the same
+   comparison — bytes identical, path moved, is `<tag path="…" content_unchanged/>`
+   with no body at all, and a hunk-free diff never happens. Full text stays the
+   fallback for everything a diff cannot beat: a hint (no tag, so no prior copy to
+   address), a section `messages[0]` never carried, and a wholesale rewrite, whose
+   diff quotes both copies and is measured against the body before it is chosen.
+   Each explanatory paragraph is likewise carried only by an update that needs it,
+   so the common single-section delta explains neither diffs nor self-edits.
 
    **A file the model rewrote itself is named, not restated.** `Edit`/`Write`
    calls in the transcript name the paths this conversation changed
