@@ -100,6 +100,7 @@ img {
    "Worked Xs" toggle, buttons — stays inert. */
 .bubble,
 .msg,
+.work-said,
 .work-steps {
   -webkit-user-select: text;
   user-select: text;
@@ -745,6 +746,14 @@ html.html-preview-maximized .md { overflow: visible; }
    a wide work step wraps instead of overflowing the viewport and scrolling the
    whole document sideways. `<pre>` is exempt — it keeps its own bounded
    overflow-x scroll and soft-wraps past the cap (see `.md pre code`). */
+/* A turn is a LADDER of runs: one collapsible "处理了 Xs ›" per stretch of work,
+   with the model's remarks between them at reading weight. */
+.work-ladder {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
 .work { width: 100%; font-family: var(--font-mono); overflow-wrap: anywhere; }
 .work.active {
   display: flex;
@@ -839,7 +848,24 @@ html.html-preview-maximized .md { overflow: visible; }
   white-space: nowrap;
 }
 .step.tool.awaiting .step-approval { border-color: var(--color-ink); color: var(--color-ink); }
-.step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
+/* Mid-turn narration. Deliberately the SAME reading band as `.msg.assistant`
+   (1rem Inter / 1.6) rather than a subordinate step size: this text streams in
+   as a normal reply and is only reclassified as "mid-turn" retroactively, when
+   the next tool call proves it wasn't the final answer. Matching the source
+   exactly is what makes `foldStreamingIntoProse` a visual no-op — it used to
+   shrink 1rem→0.85rem and slide into the step feed while the user was reading
+   it. Never hidden by the "Worked Xs" collapse; see `segmentWorkSteps`. */
+.work-said {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--color-ink);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
 .step.status { white-space: pre-wrap; }
 /* Mid-turn notice folded into the block: a severity ramp on the monochrome
    system (info dim grey → warn full ink → error the established red), no new

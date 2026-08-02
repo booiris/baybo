@@ -272,11 +272,57 @@ are bubble-less full-width `react-markdown` + `remark-gfm` prose, rendered live 
 streaming (rAF-coalesced; the web app only applies markdown on finalize).
 
 `reasoning` / `tool_started` / `tool_completed` / transient-notice frames fold into a
-per-turn collapsible work block ("思考中" card → "思考了 Xs ›"); answer text interrupted by
+per-turn collapsible work block ("处理中" card → "处理了 Xs ›"); answer text interrupted by
 more work settles into the block as a prose step.
 
+**The collapse hides the machinery, not the words.** `segmentWorkSteps` (`WorkBlock.tsx`)
+splits the step list into maximal alternating runs of *speech* (`prose`) and *machinery*
+(reasoning / tool / status / notice); only machinery answers to the "处理了 Xs ›" toggle,
+and the chevron is rendered — and the button enabled — only when there is machinery to
+hide. Speech renders in every state at `.work-said`, which is deliberately the same
+reading band as `.msg.assistant` (1rem Inter / 1.6). That equality is the point:
+mid-turn text arrives as an ordinary streaming reply and is reclassified as intermediate
+only retroactively, so `foldStreamingIntoProse` used to shrink the paragraph the user was
+mid-way through reading from 1rem to 0.85rem and slide it into the step feed, then hide it
+altogether at turn end. Matching the destination to the source makes the fold a visual
+no-op. Ordering derives from `steps[]`, which the live leg, the `subscribe_state` bundle
+and the REST reconstruction all agree on, so a cold reload paints the same shape as the
+live view. The web chat implements the same rule under the same function name
+(`app/web/src/pages/ChatPage.tsx`), with the same case table in both test suites — there
+is no gate enforcing that, so change the two together.
+
+The zh label is 「处理中」/「处理了 Xs」, deliberately NOT 「思考」. It used to say "thinking",
+which was already loose and became wrong once the collapse stopped covering narration: what is
+left behind the toggle is reasoning, tool calls and status lines, so a tool-heavy turn was being
+labelled as time spent thinking. 处理 is the neutral verb that covers both halves and mirrors the
+en copy's Working/Worked. Don't "fix" it back.
+
+`bundleAnswer` is three-valued about the reply on screen, and the third value is the trap:
+`recovered` (the bundle's trailing prose IS the answer in flight — paint it into `streamingText`),
+`superseded` (it carries answer text but has moved past it — the reply on screen is stale, clear it)
+and `unknown` (**no answer text at all — say nothing, leave it alone**). An empty or machinery-only
+bundle is not evidence of staleness: `AgentEvent::Message` / `TurnState` clears the channel's
+in-flight buffer while `active_turn_started_at` keeps reporting the turn active through post-answer
+finalization, and the buffer stops recording at `MAX_INFLIGHT_ENTRIES` — clearing there deletes a
+paragraph the user is mid-read of. The web chat mirrors this by name.
+
+The REST plane needs the same hoist the `subscribe_state` bundle gets. `build_history_page` folds
+the live channel's in-flight buffer into the trailing work block, and an `AnswerDelta` lands there
+as a `prose` step — so a BASELINE sync taken mid-answer returns a page whose trailing block ends
+with the text `streamingText` is already painting below it. `dropInFlightAnswerStep` strips it in
+`applySyncPage`'s REPLACE branch (gated on `turnActiveRef.current`); without it the paragraph
+renders twice, and because the collapse no longer hides prose the duplicate survives turn end and
+is written into the mirror. Safe because a persisted prose step is never a block's last — an
+intermediate row's Text and its ToolUse are one persisted row.
+
+Prose step identity is load-bearing for this: `mergeWorkSteps` keys a prose step by the
+tool call it PRECEDES, not by its text, because two identical short paragraphs in one turn
+("我看下测试。") would otherwise collapse to one — a silently deleted paragraph now that
+narration renders. See `workStepKeys` in `Transcript.tsx` and the `repeated narration
+survives` cases in `transcript/rows.test.ts`.
+
 A reconstructed row's own judgements are read, not re-derived: a `/stop`ped turn's block
-carries `cancelled` and its closed card says so ("已取消 · 思考了 Xs") instead of reading as
+carries `cancelled` and its closed card says so ("已取消 · 处理了 Xs") instead of reading as
 an ordinary completion — the live block learns it only when the reconstruction reconciles
 in, so either side carrying it cancels the card. A reloaded notice keeps its
 `notice_level` (the same warn/error ramp a folded notice step uses), and a persisted tool

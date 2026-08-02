@@ -15,7 +15,7 @@
 //! [`Frame::SubscribeState`]: baybo_channels::wire::Frame::SubscribeState
 
 use baybo_channels::wire::WireWorkStep;
-use baybo_channels::{AgentEvent, SessionEvent, ToolStatus};
+use baybo_channels::{AgentEvent, SessionEvent, StampedEvent, ToolStatus};
 use std::collections::HashMap;
 
 fn tool_status_str(status: ToolStatus) -> &'static str {
@@ -33,22 +33,26 @@ fn tool_status_str(status: ToolStatus) -> &'static str {
 /// the live client's own tolerance). Empty-text bodies are skipped. The buffer
 /// already coalesces consecutive same-kind text deltas, so a run reads as one
 /// step here.
-pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkStep> {
+pub(crate) fn in_flight_wire_steps(events: Vec<StampedEvent>) -> Vec<WireWorkStep> {
     let mut steps: Vec<WireWorkStep> = Vec::new();
     let mut pending_tools: HashMap<String, usize> = HashMap::new();
-    for ev in events {
-        let SessionEvent::Agent(out) = ev else {
+    for StampedEvent { at, event } in events {
+        let SessionEvent::Agent(out) = event else {
             continue;
         };
+        // Every step carries when it happened, so a client can time the
+        // stretches between the model's remarks and not just the whole turn.
+        // A completion only updates its start's status — the step keeps the
+        // instant the call BEGAN.
         match out.event {
             AgentEvent::Reasoning(text) if !text.trim().is_empty() => {
-                steps.push(WireWorkStep::reasoning(text));
+                steps.push(WireWorkStep::reasoning(text).stamped(at));
             }
             AgentEvent::AnswerDelta(text) if !text.trim().is_empty() => {
-                steps.push(WireWorkStep::prose(text));
+                steps.push(WireWorkStep::prose(text).stamped(at));
             }
             AgentEvent::Progress(text) if !text.trim().is_empty() => {
-                steps.push(WireWorkStep::status(text));
+                steps.push(WireWorkStep::status(text).stamped(at));
             }
             AgentEvent::ToolStarted {
                 call_id,
@@ -56,7 +60,7 @@ pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkSte
                 label,
             } => {
                 pending_tools.insert(call_id.clone(), steps.len());
-                steps.push(WireWorkStep::tool(Some(call_id), Some(tool), label));
+                steps.push(WireWorkStep::tool(Some(call_id), Some(tool), label).stamped(at));
             }
             AgentEvent::ToolCompleted {
                 call_id,
@@ -85,13 +89,16 @@ mod tests {
     use baybo_channels::wire::WireWorkStepKind;
     use baybo_model::{ChannelType, SessionId};
 
-    fn ev(event: AgentEvent) -> SessionEvent {
-        SessionEvent::Agent(AgentOutput {
-            session_id: SessionId::from("s"),
-            user_id: "u".into(),
-            channel: ChannelType::owner(),
-            event,
-        })
+    fn ev(event: AgentEvent) -> StampedEvent {
+        StampedEvent {
+            at: chrono::Utc::now(),
+            event: SessionEvent::Agent(AgentOutput {
+                session_id: SessionId::from("s"),
+                user_id: "u".into(),
+                channel: ChannelType::owner(),
+                event,
+            }),
+        }
     }
 
     #[test]

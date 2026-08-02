@@ -46,6 +46,16 @@ pub struct ApprovalSurface {
 
 /// Live protocol surface. One per [`ChannelType`]. Created eagerly at
 /// gateway boot from `ChannelsConfig`; never dropped while the gateway
+/// A buffered in-flight event with the wall-clock instant the channel recorded
+/// it. The stamp is what lets a client that joins mid-turn time the stretches
+/// BETWEEN the model's remarks — the buffer is the only record of when a
+/// not-yet-persisted step happened.
+#[derive(Debug, Clone)]
+pub struct StampedEvent {
+    pub at: DateTime<Utc>,
+    pub event: SessionEvent,
+}
+
 /// is up.
 pub struct Channel {
     channel_type: ChannelType,
@@ -70,7 +80,7 @@ pub struct Channel {
     /// dropped when the turn ends (history then serves a reload). Consecutive
     /// answer/reasoning deltas coalesce in place so memory tracks the turn's
     /// text size, not its frame count.
-    in_flight: DashMap<SessionId, Vec<SessionEvent>>,
+    in_flight: DashMap<SessionId, Vec<StampedEvent>>,
 }
 
 /// Cap on distinct buffered entries per session (tool steps etc.; coalesced
@@ -127,7 +137,14 @@ impl Channel {
                 let mut buf = self.in_flight.entry(session_id.clone()).or_default();
                 // Coalesce a run of same-kind text deltas into the trailing
                 // entry so the buffer is bounded by text size, not delta count.
-                if let Some(SessionEvent::Agent(last)) = buf.last_mut() {
+                // The run KEEPS its first stamp: a client times the stretch of
+                // work before the model spoke, so what matters is when it
+                // started speaking, not when it stopped.
+                if let Some(StampedEvent {
+                    event: SessionEvent::Agent(last),
+                    ..
+                }) = buf.last_mut()
+                {
                     match (&mut last.event, &out.event) {
                         (AgentEvent::AnswerDelta(acc), AgentEvent::AnswerDelta(more))
                         | (AgentEvent::Reasoning(acc), AgentEvent::Reasoning(more)) => {
@@ -138,7 +155,10 @@ impl Channel {
                     }
                 }
                 if buf.len() < MAX_INFLIGHT_ENTRIES {
-                    buf.push(event.clone());
+                    buf.push(StampedEvent {
+                        at: Utc::now(),
+                        event: event.clone(),
+                    });
                 }
             }
             _ => {}
@@ -154,7 +174,7 @@ impl Channel {
     /// chat-history endpoint folds these into the reconstructed transcript so a
     /// tab that loads mid-turn shows the reasoning / tool steps streamed before
     /// it joined — content the live stream hasn't persisted yet.
-    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<SessionEvent> {
+    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<StampedEvent> {
         self.in_flight
             .get(session_id)
             .map(|b| b.clone())
@@ -757,7 +777,8 @@ mod tests {
         let got = channel.in_flight_events(&SessionId::from(sid));
         // Coalesced reasoning ("weighing it") + the tool step = 2 entries.
         assert_eq!(got.len(), 2, "got {got:?}");
-        let (SessionEvent::Agent(a), SessionEvent::Agent(b)) = (&got[0], &got[1]) else {
+        let (SessionEvent::Agent(a), SessionEvent::Agent(b)) = (&got[0].event, &got[1].event)
+        else {
             panic!("unexpected snapshot shape: {got:?}");
         };
         assert!(
@@ -783,7 +804,7 @@ mod tests {
 
         let got = channel.in_flight_events(&SessionId::from(sid));
         assert_eq!(got.len(), 1, "progress is buffered like reasoning: {got:?}");
-        let SessionEvent::Agent(a) = &got[0] else {
+        let SessionEvent::Agent(a) = &got[0].event else {
             panic!("unexpected snapshot shape: {got:?}");
         };
         assert!(matches!(&a.event, AgentEvent::Progress(p) if p == "still working"));

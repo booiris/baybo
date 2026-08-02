@@ -31,6 +31,7 @@ export const en = {
       stopped: "Stopped",
       working: "Working",
       worked: "Worked",
+      stepsN: "{{n}} steps",
       approvalWaiting: "waiting for approval",
       approvalApproved: "approved",
       approvalApprovedAlways: "always approved",

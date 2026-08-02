@@ -5693,6 +5693,14 @@
             ],
             "description": "Decision the call's approval prompt returned (`\"approve\"` /\n`\"approve_always\"` / `\"deny\"`), read from the persisted\n`ToolResultMeta`; `None` when the call never prompted (or the row\npredates the field)."
           },
+          "at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When this step happened — the `created_at` of the row it came from, or\nthe instant the live buffer recorded it. Lets a client time the\nstretches BETWEEN the model's mid-turn remarks rather than only the\nturn as a whole. `None` for a row reconstructed by a gateway that\npredates this, and for the synthetic steps that have no source row."
+          },
           "call_id": {
             "type": [
               "string",

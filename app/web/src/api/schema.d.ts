@@ -1689,6 +1689,15 @@ export interface components {
              */
             approval?: string | null;
             /**
+             * Format: date-time
+             * @description When this step happened — the `created_at` of the row it came from, or
+             *     the instant the live buffer recorded it. Lets a client time the
+             *     stretches BETWEEN the model's mid-turn remarks rather than only the
+             *     turn as a whole. `None` for a row reconstructed by a gateway that
+             *     predates this, and for the synthetic steps that have no source row.
+             */
+            at?: string | null;
+            /**
              * @description The call's id, set when `kind == Tool` — the SAME id the live
              *     `ToolStarted` / `ToolCompleted` frames carry.
              *

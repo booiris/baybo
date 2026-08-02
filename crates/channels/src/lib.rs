@@ -15,7 +15,7 @@ pub mod registration;
 /// `baybo_channels::wire::*` consumers are unchanged.
 pub use wire;
 
-pub use channel::{ApprovalSurface, Channel, DispatchObserver, SubscribedView};
+pub use channel::{ApprovalSurface, Channel, DispatchObserver, StampedEvent, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
 pub use error::{ChannelError, ConnectionNotFoundError};
 pub use kind::ChannelKind;

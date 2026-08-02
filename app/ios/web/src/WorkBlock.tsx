@@ -110,17 +110,16 @@ function ReasoningStepView({ text }: { text: string }) {
   );
 }
 
+/// One MACHINERY step — the reasoning / tool / status / notice traffic the
+/// "Worked Xs" summary folds away. `prose` never reaches here: `segmentWorkSteps`
+/// routes the model's own words to their own run, outside the collapse.
 function WorkStepView({ step }: { step: WorkStep }) {
   const { t } = useTranslation();
   switch (step.kind) {
     case "reasoning":
       return <ReasoningStepView text={step.text} />;
     case "prose":
-      return (
-        <div className="step prose">
-          <MarkdownBody text={step.text} />
-        </div>
-      );
+      return null;
     case "status":
       return <div className="step status">{step.text}</div>;
     case "notice":
@@ -157,36 +156,118 @@ function WorkStepView({ step }: { step: WorkStep }) {
   }
 }
 
-/// One turn's work block: while the turn runs, a soft card with a spinner
-/// header and the live step feed; once closed, a dim "Worked Xs ›" summary the
-/// user can tap open, followed by a hairline divider (the web chat's shape,
-/// restyled to the mobile line-minimal system).
-export const WorkBlockView = memo(function WorkBlockView({
-  row,
+/// A run of consecutive steps of one nature. A turn reads as alternating runs:
+/// what the agent SAID (speech) and what it DID (machinery).
+export type WorkSegment =
+  | { kind: "speech"; steps: Extract<WorkStep, { kind: "prose" }>[] }
+  | { kind: "machinery"; steps: WorkStep[]; startedAt?: number; endedAt?: number };
+
+/// Split a block's steps into maximal alternating runs of speech (`prose` — the
+/// model's own words mid-turn) and machinery (reasoning / tool / status /
+/// notice).
+///
+/// This is the whole redesign, and it is a pure projection: the step list is
+/// unchanged, only what the collapse is allowed to hide changes. Speech renders
+/// at ANSWER typography (1rem Inter, `.msg.assistant`'s reading band) in
+/// document flow, so when a tool call interrupts the model mid-sentence and
+/// `foldStreamingIntoProse` moves the text into the block, it lands looking
+/// exactly like it did a frame earlier — no jump, no 1rem→0.85rem shrink. The
+/// fold stops being felt instead of merely being softened, and "Worked Xs ›"
+/// comes to mean what a reader expects: the machinery is hidden, the words
+/// are not.
+///
+/// Order-preserving, so the live view and a cold reload — both derived from the
+/// same ordered `steps[]` — agree by construction. Mirrors the web chat's
+/// `segmentWorkSteps`.
+export function segmentWorkSteps(
+  steps: WorkStep[],
+  workStartedAt?: number,
+  workEndedAt?: number,
+): WorkSegment[] {
+  const out: WorkSegment[] = [];
+  for (const s of steps) {
+    const tail = out.length > 0 ? out[out.length - 1] : undefined;
+    if (s.kind === "prose") {
+      if (tail !== undefined && tail.kind === "speech") tail.steps.push(s);
+      else out.push({ kind: "speech", steps: [s] });
+    } else if (tail !== undefined && tail.kind === "machinery") tail.steps.push(s);
+    else out.push({ kind: "machinery", steps: [s] });
+  }
+  // Each machinery run is bounded by the remarks around it: it starts when the
+  // model last spoke (or when the turn did) and ends when it speaks next (or
+  // when the turn did). The runs therefore TILE the turn — the ladder's
+  // durations add up to the whole — and each reads as "how long it worked
+  // before saying this", which is what its header claims.
+  const proseAt = (seg: WorkSegment | undefined, which: "first" | "last"): number | undefined => {
+    if (seg === undefined || seg.kind !== "speech") return undefined;
+    const step = which === "first" ? seg.steps[0] : seg.steps[seg.steps.length - 1];
+    return step.at;
+  };
+  return out.map((seg, i) =>
+    seg.kind !== "machinery"
+      ? seg
+      : {
+          ...seg,
+          startedAt: proseAt(out[i - 1], "last") ?? (i === 0 ? workStartedAt : undefined),
+          endedAt: proseAt(out[i + 1], "first") ?? (i === out.length - 1 ? workEndedAt : undefined),
+        },
+  );
+}
+
+/// A machinery run's collapsed label: the duration it actually covers when both
+/// bounds are known, else its step count — a turn reconstructed by a gateway
+/// predating `ChatWorkStep.at` has no per-run timing, and inventing one from
+/// the block's total would be a lie the reader cannot detect. Mirrors the web
+/// chat's `workRunLabel`.
+export function workRunLabel(t: TFunction, seg: WorkSegment, cancelled = false): string {
+  const startedAt = seg.kind === "machinery" ? seg.startedAt : undefined;
+  const endedAt = seg.kind === "machinery" ? seg.endedAt : undefined;
+  if (startedAt === undefined || endedAt === undefined || endedAt < startedAt) {
+    const n = seg.steps.length;
+    const steps = t("chat.stepsN", { n });
+    return cancelled ? t("chat.cancelledFor", { dur: steps }) : steps;
+  }
+  return workedLabel(t, endedAt - startedAt, cancelled);
+}
+
+/// One turn's work block: while the turn runs, a spinner header over the live
+/// feed; once closed, a dim "Worked Xs ›" summary the user can tap open,
+/// followed by a hairline divider (the web chat's shape, restyled to the mobile
+/// line-minimal system).
+///
+/// Mid-turn narration is NOT part of what the summary hides — it renders in
+/// every state, at reading weight, in its true chronological position between
+/// the machinery runs it interrupted.
+/// One run of machinery — the work between two of the model's remarks — with
+/// its OWN header and its OWN expansion. Per-run on both counts: the header
+/// answers "how long did it work before saying this", which a turn-level total
+/// cannot; and opening one run of a long turn must not insert every other run's
+/// lines under the reader's thumb.
+function WorkRunView({
+  seg,
+  live,
+  cancelled,
   onToggle,
 }: {
-  row: WorkRow;
-  /// Fired with the NEW expanded state on a user tap, so the transcript can
-  /// disengage follow-to-bottom when a block opens — otherwise the pin chases
-  /// the newest edge and the inserted steps shove the summary UP instead of
-  /// opening downward from it.
+  seg: Extract<WorkSegment, { kind: "machinery" }>;
+  live: boolean;
+  cancelled: boolean;
   onToggle?: (expanded: boolean) => void;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-
-  if (row.active) {
+  if (live) {
     return (
       <div className="work active">
         <div className="work-head">
           <span className="work-spin">✻</span>
           <span>{t("chat.working")}</span>
-          <LiveElapsed startedAt={row.startedAt} />
+          <LiveElapsed startedAt={seg.startedAt} />
         </div>
-        {row.steps.length > 0 && (
+        {seg.steps.length > 0 && (
           <div className="work-steps">
-            {row.steps.map((s, i) => (
-              <WorkStepView key={i} step={s} />
+            {seg.steps.map((s, j) => (
+              <WorkStepView key={j} step={s} />
             ))}
           </div>
         )}
@@ -204,17 +285,61 @@ export const WorkBlockView = memo(function WorkBlockView({
           onToggle?.(next);
         }}
       >
-        <span>{workedLabel(t, row.elapsedMs, row.cancelled)}</span>
+        <span>{workRunLabel(t, seg, cancelled)}</span>
         <span className={`work-chevron${expanded ? " open" : ""}`}>›</span>
       </button>
       {expanded && (
         <div className="work-steps">
-          {row.steps.map((s, i) => (
-            <WorkStepView key={i} step={s} />
+          {seg.steps.map((s, j) => (
+            <WorkStepView key={j} step={s} />
           ))}
         </div>
       )}
-      <div className="work-divider" />
+    </div>
+  );
+}
+
+export const WorkBlockView = memo(function WorkBlockView({
+  row,
+  onToggle,
+}: {
+  row: WorkRow;
+  /// Fired with the NEW expanded state on a user tap, so the transcript can
+  /// disengage follow-to-bottom when a run opens — otherwise the pin chases
+  /// the newest edge and the inserted steps shove the summary UP instead of
+  /// opening downward from it.
+  onToggle?: (expanded: boolean) => void;
+}) {
+  const segments = segmentWorkSteps(row.steps, row.startedAt, row.elapsedMs !== undefined && row.startedAt !== undefined ? row.startedAt + row.elapsedMs : undefined);
+  const lastMachinery = segments.reduce((at, seg, i) => (seg.kind === "machinery" ? i : at), -1);
+  // A live turn with no step yet still needs its "处理中" affordance and has no
+  // run to hang it on — synthesize the empty one.
+  const runs: WorkSegment[] =
+    segments.length === 0 && row.active
+      ? [{ kind: "machinery", steps: [], startedAt: row.startedAt }]
+      : segments;
+  return (
+    <div className="work-ladder">
+      {runs.map((seg, i) =>
+        seg.kind === "speech" ? (
+          <div className="work-said" key={`s${i}`}>
+            {seg.steps.map((s, j) => (
+              <MarkdownBody key={j} text={s.text} />
+            ))}
+          </div>
+        ) : (
+          <WorkRunView
+            key={`m${i}`}
+            seg={seg}
+            // Only the turn's LAST run is still being produced into; the ones
+            // above it are finished and collapse like any other.
+            live={row.active && (i === lastMachinery || segments.length === 0)}
+            cancelled={row.cancelled === true && i === lastMachinery}
+            onToggle={onToggle}
+          />
+        ),
+      )}
+      {!row.active && <div className="work-divider" />}
     </div>
   );
 });

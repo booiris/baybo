@@ -2,7 +2,9 @@ import type { TFunction } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearAwaitingApproval,
+  bundleAnswer,
   compactionDividerIds,
+  dropInFlightAnswerStep,
   flattenGloss,
   foldAdjacentWork,
   foldMidTurnNoticeIn,
@@ -398,6 +400,104 @@ describe("mergeWorkSteps", () => {
     const live: WorkStep[] = [tool({ callId: "call_a", label: "Bash(ls)", status: "running" })];
     const recon: WorkStep[] = [tool({ callId: "call_a", label: "Bash(ls)", status: "ok", summary: "out" })];
     expect(mergeWorkSteps(recon, live)).toEqual(recon);
+  });
+
+  // Narration used to key on its TEXT alone, so a model that said the same short
+  // thing twice in one turn lost the second copy to the merge. Invisible while
+  // prose was hidden inside the collapse; a silently DELETED paragraph now that
+  // `segmentWorkSteps` renders it. The key anchors on the tool call a paragraph
+  // precedes — a row's Text and its ToolUse are ONE persisted row, so no page
+  // tear can separate them and every leg agrees on the anchor.
+  describe("repeated narration survives", () => {
+    const SAME = "我看下测试。";
+    const say = (text: string): WorkStep => ({ kind: "prose", text });
+    const shape = (steps: WorkStep[]) =>
+      steps.map((s) => (s.kind === "tool" ? `[${s.callId}]` : s.kind === "prose" ? s.text : `<${s.text}>`));
+
+    it("keeps BOTH copies when a page tear puts one in each half", () => {
+      const a: WorkStep[] = [say(SAME), tool({ callId: "c1" })];
+      const b: WorkStep[] = [say(SAME), tool({ callId: "c2" })];
+      expect(shape(mergeWorkSteps(a, b))).toEqual([SAME, "[c1]", SAME, "[c2]"]);
+    });
+
+    it("keeps both when the live half saw only the first and the server sent both", () => {
+      const live: WorkStep[] = [say(SAME), tool({ callId: "c1" })];
+      const recon: WorkStep[] = [say(SAME), tool({ callId: "c1" }), say(SAME), tool({ callId: "c2" })];
+      expect(shape(mergeWorkSteps(live, recon))).toEqual([SAME, "[c1]", SAME, "[c2]"]);
+    });
+
+    it("does NOT double a paragraph one side holds UNANCHORED (its tool call is still in flight)", () => {
+      const live: WorkStep[] = [tool({ callId: "c1" }), say(SAME)];
+      const recon: WorkStep[] = [tool({ callId: "c1" }), say(SAME), tool({ callId: "c2" })];
+      expect(shape(mergeWorkSteps(live, recon))).toEqual(["[c1]", SAME, "[c2]"]);
+      // …and in the other direction, whichever side the merge is given first.
+      expect(shape(mergeWorkSteps(recon, live))).toEqual(["[c1]", SAME, "[c2]"]);
+    });
+
+    // Found by an adversarial probe against the first version of this key: a's
+    // single copy satisfied BOTH the anchored and the unanchored occurrence in
+    // b, so the tail paragraph vanished. One a-copy may now be consumed once.
+    it("keeps the tail paragraph when a's only copy already matched an earlier one", () => {
+      const live: WorkStep[] = [tool({ callId: "c1" }), say(SAME)];
+      const recon: WorkStep[] = [tool({ callId: "c1" }), say(SAME), tool({ callId: "c2" }), say(SAME)];
+      expect(shape(mergeWorkSteps(live, recon))).toEqual(["[c1]", SAME, "[c2]", SAME]);
+    });
+
+    // …and the mirror trap: once b has contributed a step of its own, its
+    // unanchored tail is a LATER paragraph, not a's — matching it would delete
+    // one. (A page-torn turn whose halves each repeat the same sentence.)
+    it("keeps a repeat that b reached only after adding its own steps", () => {
+      const first: WorkStep[] = [say("甲"), tool({ callId: "c1" })];
+      const second: WorkStep[] = [say("甲"), tool({ callId: "c2" }), say("甲")];
+      expect(shape(mergeWorkSteps(first, second))).toEqual(["甲", "[c1]", "甲", "[c2]", "甲"]);
+    });
+
+    it("still collapses a genuinely redelivered span", () => {
+      const span: WorkStep[] = [say("甲"), tool({ callId: "c1" }), say("乙"), tool({ callId: "c2" })];
+      expect(shape(mergeWorkSteps(span, [...span]))).toEqual(["甲", "[c1]", "乙", "[c2]"]);
+    });
+
+    it("keeps two DIFFERENT paragraphs apart", () => {
+      const a: WorkStep[] = [say("甲"), tool({ callId: "c1" })];
+      const b: WorkStep[] = [say("乙"), tool({ callId: "c2" })];
+      expect(shape(mergeWorkSteps(a, b))).toEqual(["甲", "[c1]", "乙", "[c2]"]);
+    });
+  });
+});
+
+// The REST plane folds the live channel's in-flight buffer into the trailing
+// work block, and an `AnswerDelta` lands there as a `prose` step — so a BASELINE
+// sync taken mid-answer returns a page whose trailing block ends with the very
+// text `streamingText` is painting below it. Hidden inside the collapse until
+// `segmentWorkSteps` started rendering narration; a visible duplicate after.
+describe("dropInFlightAnswerStep — the page's trailing prose is the live reply", () => {
+  const work = (steps: WorkStep[]): WorkRow => ({ id: "w4", role: "work", steps, active: false });
+  const said = (text: string): WorkStep => ({ kind: "prose", text });
+
+  it("strips the in-flight answer, keeping the machinery", () => {
+    const out = dropInFlightAnswerStep([work([tool({ callId: "c1" }), said("答案前半段")])]);
+    expect((out[0] as WorkRow).steps.map((s) => s.kind)).toEqual(["tool"]);
+  });
+
+  it("drops a block that held nothing but the answer (tool-free turn)", () => {
+    expect(dropInFlightAnswerStep([work([said("你好，我是")])])).toEqual([]);
+  });
+
+  it("keeps genuine narration — a persisted prose step is never a block's last", () => {
+    const out = dropInFlightAnswerStep([work([said("我先看看配置"), tool({ callId: "c1" })])]);
+    expect((out[0] as WorkRow).steps.map((s) => s.kind)).toEqual(["prose", "tool"]);
+  });
+
+  it("finds the block behind a trailing notice row", () => {
+    const notice = { id: "n1", role: "notice", level: "info", content: "x" } as unknown as Row;
+    const out = dropInFlightAnswerStep([work([tool({ callId: "c1" }), said("答案")]), notice]);
+    expect((out[0] as WorkRow).steps.map((s) => s.kind)).toEqual(["tool"]);
+    expect(out).toHaveLength(2);
+  });
+
+  it("is a no-op when the page does not end in a work block", () => {
+    const rows = [work([tool({ callId: "c1" })])];
+    expect(dropInFlightAnswerStep(rows)).toBe(rows);
   });
 });
 
@@ -1194,5 +1294,31 @@ describe("flattenGloss — markdown onto one line", () => {
     const started = Date.now();
     expect(flattenGloss(huge).length).toBeGreaterThan(0);
     expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});
+
+// The bundle's judgement about the reply on screen is three-valued, and the
+// third value is the one that matters: a bundle carrying NO answer text says
+// nothing about the reply, so clearing there deletes a paragraph mid-read.
+// Mirrors `bundleAnswer` in app/web/src/pages/ChatPage.tsx.
+describe("bundleAnswer", () => {
+  it("recovers the trailing prose as the answer in flight", () => {
+    expect(bundleAnswer([tool({ callId: "c1" }), { kind: "prose", text: "答案" }])).toEqual({
+      kind: "recovered",
+      text: "答案",
+    });
+  });
+
+  it("calls a reply superseded when the bundle holds the text but moved past it", () => {
+    expect(bundleAnswer([{ kind: "prose", text: "叙述" }, tool({ callId: "c1" })])).toEqual({
+      kind: "superseded",
+    });
+  });
+
+  it("says nothing when the bundle carries no answer text at all", () => {
+    expect(bundleAnswer([])).toEqual({ kind: "unknown" });
+    expect(bundleAnswer([{ kind: "reasoning", text: "r" }, tool({ callId: "c1" })])).toEqual({
+      kind: "unknown",
+    });
   });
 });

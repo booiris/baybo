@@ -133,6 +133,10 @@ export interface WireWorkStep {
    *  approval prompt returned, once it completed within the buffered turn.
    *  Absent when the call never prompted. */
   approval?: string;
+  /** RFC3339 instant the channel's in-flight buffer recorded this step. Lets a
+   *  client that joins mid-turn time the stretches between the model's remarks
+   *  and not just the turn as a whole. Absent from a gateway predating it. */
+  at?: string;
 }
 
 /** One pending tool-approval prompt in the `subscribe_state` bundle —
