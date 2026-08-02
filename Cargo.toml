@@ -253,10 +253,28 @@ panic = "abort"
 # Each test target re-links the whole upper dep graph; full DWARF dominates
 # link time. `line-tables-only` keeps usable backtraces, `unpacked` skips
 # bundling `.dwo`s back into the executable after link.
+#
+# `incremental = false` was measured, not assumed: with sccache serving the
+# rlib units, turning incremental on made the base-crate rebuild WORSE here
+# (~88s vs ~58s over three runs) because 40+ link-producing units each carry
+# GB-scale incremental state, and the resulting I/O outweighs the saved
+# codegen. It only won for edits confined to one mid-tier crate. Re-measure
+# before flipping it; don't flip it on the strength of the general advice.
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
+
+# Dependencies only — cargo's `"*"` never matches workspace members, so every
+# baybo-* crate keeps opt-level 0 and its fast debug build. Deps are compiled
+# once and then executed by 2992 tests, and at -O0 the suite spent its time
+# inside them: bundled sqlite3 (this also flips libsqlite3-sys's cc build to
+# -O2 via OPT_LEVEL), regex NFA construction, the tiktoken BPE table, and the
+# crypto/hash chain. Worth ~4s of a 10.4s run for a one-time dep rebuild.
+# `debug-assertions`/`overflow-checks` are deliberately left at the profile
+# default so nothing the tests rely on is switched off.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.test]
 debug = "line-tables-only"

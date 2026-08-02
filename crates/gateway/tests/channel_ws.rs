@@ -1002,9 +1002,9 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         },
         platform_msg_id: String::new(),
     };
-    // 1.5s throttle window: wait it out so the second pulse isn't
-    // coalesced into the first.
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    // No throttle wait needed: `SessionPulse` keys `last_sent` on
+    // `(SessionId, ActivityKind)`, so this User pulse sits in a different
+    // bucket from the Assistant one above and cannot be coalesced into it.
     http_channel
         .as_subscribed()
         .expect("http channel is Subscribed")

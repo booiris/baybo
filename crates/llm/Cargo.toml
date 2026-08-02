@@ -53,3 +53,7 @@ baybo-security = { workspace = true, features = ["test-support"] }
 flate2 = { workspace = true }
 tempfile = { workspace = true }
 baybo-storage = { workspace = true, features = ["test-support"] }
+# `test-util` backs `#[tokio::test(start_paused = true)]` in the vault-save
+# retry tests; it is NOT part of tokio's `full`, and a `--workspace` build only
+# supplies it by feature unification, so `cargo test -p baybo-llm` needs it here.
+tokio = { workspace = true, features = ["test-util"] }

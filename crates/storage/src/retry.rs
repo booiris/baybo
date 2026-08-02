@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_busy_up_to_max_attempts_then_propagates() {
         let calls = Mutex::new(0u32);
         let result: Result<(), _> = retry_on_busy("test.always_busy", || async {
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), MAX_ATTEMPTS);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_busy_then_succeeds() {
         let calls = Mutex::new(0u32);
         let got = retry_on_busy("test.flaky", || async {
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn works_with_non_storage_error_types() {
         // Verify the generic bound — SecurityError's BUSY string
         // (from SecretVault's wrapper) is matched the same way.

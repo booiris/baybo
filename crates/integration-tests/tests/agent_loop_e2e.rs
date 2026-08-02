@@ -73,7 +73,7 @@ impl RunningChild for LongRunningChild {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn clean_conversation_streams_text_then_final_message() {
     let mut harness = AgentTestHarness::builder().build();
     harness
@@ -125,7 +125,7 @@ async fn clean_conversation_streams_text_then_final_message() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_user_turn_emits_terminal_state_and_error_notice() {
     // A user turn whose LLM call fails terminally (non-retriable) must still
     // close the turn for watchers: a `TurnState { active: false }` AND an
@@ -189,7 +189,7 @@ async fn next_turn_state(rx: &mut tokio::sync::mpsc::Receiver<AgentOutput>) -> (
 /// deterministically — unlike the instant stub turn in
 /// `clean_conversation_streams_text_then_final_message`, which finishes
 /// before the projector can recompute its start edge.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn turn_state_projector_brackets_a_slow_turn() {
     use baybo_model::{ContentBlock, TriggerKind};
     use baybo_turn::TurnInput;
@@ -262,7 +262,7 @@ async fn turn_state_projector_brackets_a_slow_turn() {
     token.cancel();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn secret_in_user_input_is_minted_before_actor_runs() {
     let mut harness = AgentTestHarness::builder().build();
     harness
@@ -312,7 +312,7 @@ async fn secret_in_user_input_is_minted_before_actor_runs() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tool_call_round_trip_invokes_recording_tool() {
     let tool = Arc::new(RecordingTool::new("echo_tool"));
     tool.set_response(ToolOutput::Text("tool says hi".into()));
@@ -368,7 +368,7 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
     use baybo_store::{SessionStore, TraceStore, TurnStore};
     use baybo_trace::{SpanKind, ToolCallOutput};
@@ -513,7 +513,7 @@ fn final_message(outs: &[AgentOutput]) -> &baybo_channels::OutgoingMessage {
 /// `AttachFile`-style media rides out on the turn's terminal assistant
 /// message, not as a live out-of-band push — that is what makes it survive
 /// a reload (the same blocks land in the persisted `session_messages` row).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tool_attachments_are_hoisted_onto_the_final_message() {
     let tool = attaching_tool("attach_file", file_block('a', "tok", "report.pdf"));
     let manifest = tool.manifest();
@@ -556,7 +556,7 @@ async fn tool_attachments_are_hoisted_onto_the_final_message() {
 
 /// Media from several tool calls across several iterations accumulates, and
 /// the accumulator is not carried into a later turn.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn attachments_accumulate_across_iterations_and_reset_per_turn() {
     let first = attaching_tool("attach_a", file_block('a', "tok-1", "a.pdf"));
     let second = attaching_tool("attach_b", file_block('b', "tok-2", "b.pdf"));
@@ -610,7 +610,7 @@ async fn attachments_accumulate_across_iterations_and_reset_per_turn() {
 /// vision path picks them up without breaking provider tool_use/tool_result
 /// adjacency. Regression guard: PR #79 collapsed this variant into the
 /// text-only arm and vision models silently stopped seeing screenshots.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn multimodal_tool_images_are_injected_as_a_followup_user_row() {
     use baybo_store::SessionStore;
 
@@ -684,7 +684,7 @@ async fn multimodal_tool_images_are_injected_as_a_followup_user_row() {
 /// only because of the `_ => false` catch-all. Nothing else pins that, and
 /// "simplifying" the guard to look at text blocks alone would silently swallow
 /// every media-only delivery while the rest of the suite stayed green.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_media_only_reply_is_not_suppressed_as_blank() {
     let tool = attaching_tool("attach_file", file_block('d', "tok", "chart.png"));
     let manifest = tool.manifest();
@@ -725,7 +725,7 @@ async fn a_media_only_reply_is_not_suppressed_as_blank() {
 /// The two blobs carry DIFFERENT `blob_id`s — every `put` mints a fresh read
 /// token — and share a digest, so a dedup keyed on the id would let both
 /// through. That is the whole point of keying on the digest.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_same_blob_staged_twice_lands_on_the_reply_once() {
     let first = attaching_tool("attach_a", file_block('c', "tok-1", "report.pdf"));
     let second = attaching_tool("attach_b", file_block('c', "tok-2", "report.pdf"));
@@ -765,7 +765,7 @@ async fn the_same_blob_staged_twice_lands_on_the_reply_once() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn tool_call_emits_started_and_completed_progress() {
     let tool = Arc::new(RecordingTool::new("echo_tool"));
     tool.set_response(ToolOutput::Text("line one\nline two\nline three".into()));
@@ -810,7 +810,7 @@ async fn tool_call_emits_started_and_completed_progress() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reasoning_chunks_stream_as_reasoning_events() {
     let mut harness = AgentTestHarness::builder().build();
 
@@ -843,7 +843,7 @@ async fn reasoning_chunks_stream_as_reasoning_events() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
     // DeepSeek thinking mode streams reasoning only as deltas (never a
     // complete thinking block) alongside its tool call. That reasoning must
@@ -907,7 +907,7 @@ async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn injection_marker_in_user_input_logs_warn() {
     // Capture tracing on this thread BEFORE building the harness so the
     // actor's spawn picks up the thread-local default subscriber.
@@ -938,7 +938,7 @@ async fn injection_marker_in_user_input_logs_warn() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn budget_gate_blocks_retry_after_partial_stream_billing() {
     // Regression: the budget gate must fire on *every* `chat_stream`
     // invocation, not just the first attempt — otherwise streaming-
@@ -1004,60 +1004,69 @@ async fn budget_gate_blocks_retry_after_partial_stream_billing() {
     harness.shutdown().await;
 }
 
-/// `Tool` that sleeps for `delay` before returning, recording its
-/// start instant so callers can assert overlap. Used by the parallel
-/// tool-execution test below — the agent loop's tool-dispatch path
-/// must fire every emitted tool_call concurrently rather than
-/// sequentially, so two 200ms tools should finish in ~200ms, not
-/// ~400ms.
-mod sleep_tool {
+/// `Tool` that bumps a shared in-flight counter on entry and drops it on
+/// exit, so the test below observes the overlap the dispatch loop actually
+/// produced instead of inferring it from wall-clock start instants. The
+/// agent loop's tool-dispatch path must fire every emitted tool_call
+/// concurrently rather than sequentially; a serial dispatcher never gets
+/// the counter above 1, which is a hard failure rather than a timing race.
+mod overlap_tool {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use baybo_model::TrustLevel;
     use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
-    use parking_lot::Mutex;
     use serde_json::{Value, json};
 
-    pub struct SleepingTool {
-        name: String,
-        delay: Duration,
-        observed_start: Arc<Mutex<Option<Instant>>>,
+    #[derive(Default)]
+    pub struct Tracker {
+        inflight: AtomicUsize,
+        /// High-water mark of concurrently-executing probes.
+        max_inflight: AtomicUsize,
     }
 
-    impl SleepingTool {
-        pub fn new(name: impl Into<String>, delay: Duration) -> Self {
+    impl Tracker {
+        pub fn max_inflight(&self) -> usize {
+            self.max_inflight.load(Ordering::SeqCst)
+        }
+    }
+
+    pub struct OverlapTool {
+        name: String,
+        hold: Duration,
+        tracker: Arc<Tracker>,
+    }
+
+    impl OverlapTool {
+        pub fn new(name: impl Into<String>, hold: Duration, tracker: Arc<Tracker>) -> Self {
             Self {
                 name: name.into(),
-                delay,
-                observed_start: Arc::new(Mutex::new(None)),
+                hold,
+                tracker,
             }
         }
 
         pub fn manifest(&self) -> ToolManifest {
             ToolManifest {
                 name: self.name.clone(),
-                description: "Sleeping tool — used to exercise parallel dispatch.".into(),
+                description: "Overlap probe — used to exercise parallel dispatch.".into(),
                 trust_level: TrustLevel::Trusted,
                 parameters_schema: json!({"type": "object", "additionalProperties": true}),
                 capabilities: vec![],
                 channels: Vec::new(),
             }
         }
-
-        pub fn observed_start(&self) -> Option<Instant> {
-            *self.observed_start.lock()
-        }
     }
 
     #[async_trait]
-    impl Tool for SleepingTool {
+    impl Tool for OverlapTool {
         fn name(&self) -> &str {
             &self.name
         }
         fn description(&self) -> String {
-            "Sleeping tool — used to exercise parallel dispatch.".to_string()
+            "Overlap probe — used to exercise parallel dispatch.".to_string()
         }
         fn parameters_schema(&self) -> Value {
             json!({"type": "object", "additionalProperties": true})
@@ -1074,20 +1083,23 @@ mod sleep_tool {
             _params: Value,
             _ctx: &ToolContext,
         ) -> baybo_tools::Result<ToolOutput> {
-            *self.observed_start.lock() = Some(Instant::now());
-            tokio::time::sleep(self.delay).await;
+            let now = self.tracker.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.tracker.max_inflight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.hold).await;
+            self.tracker.inflight.fetch_sub(1, Ordering::SeqCst);
             Ok(ToolOutput::Text(format!("{} done", self.name)))
         }
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn multiple_tool_calls_run_concurrently() {
-    use sleep_tool::SleepingTool;
+    use overlap_tool::{OverlapTool, Tracker};
 
-    const SLEEP: Duration = Duration::from_millis(200);
-    let tool_a = Arc::new(SleepingTool::new("sleep_a", SLEEP));
-    let tool_b = Arc::new(SleepingTool::new("sleep_b", SLEEP));
+    const HOLD: Duration = Duration::from_millis(200);
+    let tracker = Arc::new(Tracker::default());
+    let tool_a = Arc::new(OverlapTool::new("sleep_a", HOLD, Arc::clone(&tracker)));
+    let tool_b = Arc::new(OverlapTool::new("sleep_b", HOLD, Arc::clone(&tracker)));
     let manifest_a = tool_a.manifest();
     let manifest_b = tool_b.manifest();
 
@@ -1119,28 +1131,21 @@ async fn multiple_tool_calls_run_concurrently() {
         .push_stream(vec![StreamEvent::Text("ok".into())]);
 
     harness.send_text("run both").await.unwrap();
-    // The harness's `drain_outputs` has a tail-quiet-period wait so
-    // wall-clock elapsed conflates dispatch latency with drain padding.
-    // We assert overlap via the tools' observed start instants instead
-    // — those are unaffected by the drain quiet period.
     let _ = harness.drain_outputs(Duration::from_millis(800)).await;
 
-    let start_a = tool_a
-        .observed_start()
-        .expect("sleep_a observed a start instant");
-    let start_b = tool_b
-        .observed_start()
-        .expect("sleep_b observed a start instant");
-    let gap = start_a.max(start_b) - start_a.min(start_b);
-    assert!(
-        gap < SLEEP,
-        "tool starts must overlap (gap={gap:?} >= SLEEP={SLEEP:?}) — the dispatch loop is running them serially"
+    // Both probes must have been inside `execute` at the same moment. A
+    // serial dispatcher runs them back to back and never lifts the
+    // high-water mark above 1, no matter how fast the clock moves.
+    assert_eq!(
+        tracker.max_inflight(),
+        2,
+        "both tool calls must overlap — the dispatch loop is running them serially"
     );
 
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn background_subagent_finished_runs_autonomous_notification_turn() {
     // The new background-delivery contract: a finished background
     // subagent is buffered, then — once nothing higher-priority is
@@ -1314,7 +1319,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_kills_background_command_without_persisting_notification() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
@@ -1423,7 +1428,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn background_notification_suppresses_empty_reply() {
     // The notification turn always runs, but a blank/whitespace model
     // reply is suppressed (never pushed to the channel) — the model's
@@ -1494,7 +1499,7 @@ async fn background_notification_suppresses_empty_reply() {
 /// a measured production DB). The prompt row is persisted now, so the
 /// window/log lockstep holds by construction and every span stays a
 /// `Persisted` reference through and after the notification turn.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn background_notification_keeps_later_spans_persisted() {
     use baybo_trace::{LlmCallInputs, SpanKind, TraceStore};
 
@@ -1578,7 +1583,7 @@ async fn background_notification_keeps_later_spans_persisted() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn background_notification_failure_keeps_active_delivery_for_retry() {
     // If the autonomous notification turn fails (provider error, cost
     // rejection, cancellation), the delivered result must NOT be lost. The
@@ -1801,7 +1806,7 @@ async fn failed_background_notification_retries_and_delivers() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn open_ledger_defers_fresh_batches_past_inbound_messages() {
     // While the delivery ledger is open, the post-message drain must not
     // fire — neither a retry of the open ledger nor a drain of a freshly
@@ -2089,7 +2094,7 @@ async fn retry_reanchors_prompt_after_compaction_supersedes_it() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn actor_stop_preserves_last_active() {
     // The ActorStop final state write (the ledger heal) must NOT move
     // `last_active` in either direction. The chat list orders by it, and:
@@ -2250,7 +2255,7 @@ async fn failing_background_notification_caps_retries_and_degrades_to_passive() 
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn subagent_finished_dedupes_on_handle_id() {
     // Duplicate deliveries of the same `handle_id` that land in one batch
     // (before the notification turn drains the buffer) collapse to a
@@ -2338,7 +2343,7 @@ fn user_input(harness: &AgentTestHarness, text: &str) -> AgentMessage {
     }))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rapid_user_inputs_coalesce_into_one_turn() {
     // A burst of plain user messages that pile up before the actor takes
     // them runs as ONE turn (one LLM call, one reply) with their content
@@ -2381,7 +2386,7 @@ async fn rapid_user_inputs_coalesce_into_one_turn() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn coalesced_first_turn_seeds_system_prompt_before_user_rows() {
     // Regression (P1): when a fresh session's FIRST turn is a coalesced burst,
     // the leading rows must not be appended ahead of the system prompt. If they
@@ -2437,7 +2442,7 @@ async fn coalesced_first_turn_seeds_system_prompt_before_user_rows() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slash_command_is_a_coalescing_boundary() {
     // A slash message splits a burst: "a" / "/x" / "b" run as three
     // separate turns, so the slash never merges with its neighbours and
@@ -2485,7 +2490,7 @@ async fn slash_command_is_a_coalescing_boundary() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn user_turn_empty_reply_surfaces_fallback_notice() {
     // A user turn whose reply is blank must NOT be sent as an empty
     // assistant bubble — the user is waiting, so a fallback Notice is
@@ -2529,7 +2534,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
 /// the real actor path (`AgentMessage::CronTrigger` →
 /// `AgentActor::dispatch_cron_prompt` → `AgentLoop::append_cron_fire`)
 /// and asserts on the content the `StubLlm` actually received.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     // A fire runs in a Cron-rooted session; the dispatch uses
     // `TurnInput::Cron`, which `TurnLifecycle` only admits under a
@@ -2623,7 +2628,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 /// transcript survive — suppression hides, it never deletes. Drives the real
 /// actor path (`AgentMessage::CronTrigger` → `dispatch_cron_prompt`), with the
 /// model scripted to call the tool.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recurring_fire_that_reports_nothing_notifies_no_one() {
     use baybo_store::TurnStore;
     use baybo_turn::{Turn, TurnInputKind, TurnOutput};
@@ -2767,7 +2772,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
 /// call: the framed result lands in the transcript as an assistant row, it goes
 /// out to the channel, the delivery ledger is resolved (so no boot re-drive
 /// replays it), and **no inference runs** — the fire already did the thinking.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
     use baybo_model::{ChatMessage, CronExecution, ExecutionOutcome, PendingCronResult};
     use baybo_store::{CronStore, ExecutionCompletion};
@@ -2927,7 +2932,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
 /// re-drive replay a delivery that already landed. The transcript row's
 /// source-event key makes the insert atomic and idempotent, so neither the row
 /// nor the live channel message is emitted twice.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn replayed_cron_result_does_not_duplicate_the_notification() {
     use baybo_model::{ChatMessage, CronExecution, ExecutionOutcome, PendingCronResult};
     use baybo_store::{CronStore, ExecutionCompletion};
@@ -3084,7 +3089,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
 /// a `CronNotification` turn's `Completed { reply_ordinal }` edge to the user's
 /// phone. A notice does none of those, so a failed scheduled task would show up
 /// as an unbadged, unpushed conversation the user has to notice by themselves.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation() {
     use baybo_model::MessageSource;
 
@@ -3166,7 +3171,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
 /// The append returns `Option<i64>` and logs-and-swallows a store error, so
 /// treating `None` as success would silently mark the reminder delivered and
 /// then lose it. This pins that it doesn't.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() {
     use baybo_model::{CronExecution, ExecutionOutcome, PendingCronResult};
     use baybo_store::{CronStore, ExecutionCompletion};
@@ -3252,7 +3257,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
 /// A fire that failed still notifies. Silence is the one outcome a scheduled
 /// task must never have — a reminder that evaporates because the provider
 /// errored is this feature's worst failure mode, so the conversation says so.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_one_shot_cron_fire_still_notifies_the_conversation() {
     use baybo_model::{ExecutionOutcome, PendingCronResult};
 
@@ -3367,7 +3372,7 @@ mod interjecting_tool {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mid_turn_message_is_injected_at_next_tool_boundary() {
     // A message that arrives WHILE the loop is running (here: enqueued by a
     // tool during iter 1) is drained at the next tool boundary and injected —
@@ -3485,7 +3490,7 @@ async fn mid_turn_message_is_injected_at_next_tool_boundary() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slash_boundary_is_not_bypassed_by_mid_turn_drain() {
     // Regression: a burst [A, /x, B] where A performs a tool call. The slash
     // command is a hard boundary, so B (queued behind it) must NOT be drained
@@ -3567,7 +3572,7 @@ async fn slash_boundary_is_not_bypassed_by_mid_turn_drain() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn drained_interjection_survives_a_failed_turn() {
     // Durability: once an interjection is drained it is popped from the mailbox
     // AND persisted (at the iteration boundary, before the next LLM call), so
@@ -3643,7 +3648,7 @@ async fn await_session_end(memory: &RecordingMemory, expected: usize) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn memory_hooks_fire_on_user_chat_turn() {
     // The loop drives `recall` inline at turn start (with the user input) and
     // `on_turn_complete` (detached) at turn end (with input + final output) for a
@@ -3694,7 +3699,7 @@ async fn memory_hooks_fire_on_user_chat_turn() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recalled_memory_is_injected_as_framed_block() {
     // A memory the backend returns from `recall` reaches the LLM as a framed
     // `<recalled_memory>` block — never a `Role::System` row (hard constraint #3).
@@ -3737,7 +3742,7 @@ async fn recalled_memory_is_injected_as_framed_block() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recall_dedup_skips_memory_already_in_transcript() {
     // Belt-and-braces dedup at the agent loop: when the backend returns
     // the same memory string on a later turn (mem0 / openviking do this
@@ -3792,7 +3797,7 @@ async fn recall_dedup_skips_memory_already_in_transcript() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn memory_hooks_skip_subagent_notification_turn() {
     // `SubagentNotification` is an ineligible turn kind — the gate
     // (`memory_recall_query` → `None`) means neither `recall` nor
@@ -3842,7 +3847,7 @@ async fn memory_hooks_skip_subagent_notification_turn() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
     // ActorStop is the session-end signal: a `Memory` impl gets one
     // `on_session_end` call with the FULL durable transcript when the
@@ -3886,7 +3891,7 @@ async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
 /// surfaces it to the channel as a `TaskList` snapshot — across three turns:
 /// `TaskCreate`, then `TaskUpdate` editing a task in place, then
 /// `TaskUpdate(status: "deleted")` removing one.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn task_tools_persist_and_emit_checklist_to_the_channel() {
     // The harness auto-registers the Task* tools against an inspectable store.
     let mut harness = AgentTestHarness::builder().build();
@@ -4006,7 +4011,7 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
 /// covers the integration the `BackgroundNotificationGroup` predicate unit
 /// tests don't: the agent loop's grouped-member counting → turn-end seal →
 /// cohort fill → single drained notification.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn grouped_subagents_deliver_one_merged_notification() {
     // Stand-in `spawn_subagent` tool: returns the background-dispatch ack so
     // the agent loop's grouped-member counter fires (it keys on the tool name
@@ -4143,7 +4148,7 @@ async fn grouped_subagents_deliver_one_merged_notification() {
 /// `turn_id`, so each turn forms its own cohort and fires its own notification.
 /// (Before the fix, the second turn's `expected += 1` landed on the first,
 /// still-sealed cohort, holding the first member hostage and merging the two.)
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
     let spawn = Arc::new(RecordingTool::new(SPAWN_SUBAGENT_TOOL_NAME));
     spawn.set_response(ToolOutput::Text(format!(
@@ -4329,7 +4334,7 @@ mod blocking_llm {
 /// What only the fix delivers is the actor returning to its mailbox — without
 /// it the actor stays parked in the dead call and never processes `ActorStop`,
 /// so `shutdown` would hang forever.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stop_aborts_an_in_flight_llm_call() {
     use baybo_turn::CancelReason;
     use blocking_llm::BlockingLlm;
@@ -4474,7 +4479,7 @@ mod partial_stream_llm {
 /// already produced (reasoning + answer text), so reconstructing the
 /// transcript on reload still shows the cancelled turn's work — not a blank.
 /// Regression for the in-flight-cancel path dropping the stream wholesale.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stop_persists_partial_work_so_it_survives_reload() {
     use baybo_model::Role;
     use baybo_turn::CancelReason;

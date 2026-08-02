@@ -17,7 +17,7 @@ use baybo_llm::{ModelPricing, StreamEvent, TokenUsage};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn main_call_feeds_sample_into_token_calibration() {
     // The harness builds its tokenizer via
     // `TiktokenTokenizer::for_model(stub.model_info().id)` so the
@@ -82,7 +82,7 @@ async fn main_call_feeds_sample_into_token_calibration() {
 /// the budget would see only the local BPE estimate, which for tiny
 /// stub messages is ~10 tokens — orders of magnitude away from the
 /// provider's reported number.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn budget_picks_up_provider_actual_after_first_main_call() {
     let pricing: HashMap<String, ModelPricing> = HashMap::new();
     let mut harness = AgentTestHarness::builder().with_pricing(pricing).build();
