@@ -24,6 +24,12 @@ The user invoked `/deck` — the text after the command is their request.
 Build the card they asked for. If the request is empty, ask what the
 card should show before writing anything.
 
+**First, load the deck tools**: `ToolSearch` with
+`select:DeckCardList,DeckCardGet,DeckCardCreate,DeckCardUpdate`. They are
+not in your tool list until you do, and they arrive with your next
+message — so ask for them in the same turn you start reading the request,
+and they are in hand by the time there is a bundle to install.
+
 A deck card is a self-contained bundle of exactly four plain files. You
 write them in a scratch directory with your normal file tools, then
 install with `DeckCardCreate(path)`. Install runs a **dry-run gate**:
