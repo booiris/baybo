@@ -103,10 +103,14 @@ subagent's profile prompt before persona resolution runs, so the exclusion is
 structural rather than a flag.
 
 Lifecycle is the existing one: resolved at session seed and re-resolved at
-each post-compaction reseed. A memory written mid-session is therefore on
-disk immediately but reaches the *prompt* at the next reseed or new session —
-the same delay an identity edit has, and the `Edit` tool says so in its
-output.
+each post-compaction reseed — plus the per-call freshness reconcile
+(`reconcile_system_prompt`, see [context.md](context.md#the-system-prompts-lifecycle)),
+which notices that `MEMORY.md` has moved and appends the new index at the tail.
+So a memory written mid-session is in front of the model on the next LLM call,
+and folds back into the system row itself at the next reseed (which also drops
+the updates it makes obsolete). The index is the part most likely to change
+twice in one session and also the largest, so it is the main reason each update
+carries only the parts that moved rather than the whole prompt.
 
 ## Writing, and the audited tier
 
@@ -525,6 +529,34 @@ leaving only an index line in context. Those files stay lean; memory carries
 the detail.
 
 The pass only ever **reads** transcripts.
+
+#### The pass has two inputs, and it can delete
+
+Both are corrections to an earlier version that could restructure the
+identity files but never actually shrink them.
+
+**It is shown the budget.** The router prices the agent's assembled prompt
+per file (`AssembledPrompt::budget`) and splices the figures into the fire
+beside the digest. Without them "keep them lean" is an adjective with nothing
+behind it, and an observed pass trimmed until the diff felt substantial and
+stopped — well short of the target, because it had no target. The count is an
+estimate: the encoding is chosen at the fire, not by the model the fire runs
+on, which is the right trade for a number whose only job is to steer how hard
+the pass trims.
+
+**It may delete, not only demote.** The prune step covers the four files that
+ride the prompt, not just the memory tree, and names the criterion: a line
+recording what the human asked *once*, carrying no reusable instruction, is
+cut rather than filed. This is the load-bearing half. Demoting moves a token
+into an index line; only deleting returns one — so a pass whose sole shrink
+verb was "demote into memory" conserved the cost it was sent to reduce, and
+the growth showed up in the index instead.
+
+The rebalance step names all four files. An earlier version named only
+`SOUL.md` and the agent's own `USER.md`, which left the **shared** profile —
+routinely the largest, and the one every agent pays for — under a step whose
+only verb was "update when you have learned something durable": append
+semantics, with no way to shrink.
 
 ## Config
 

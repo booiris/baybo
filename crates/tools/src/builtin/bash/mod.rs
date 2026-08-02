@@ -101,12 +101,7 @@ fn command_head(command: &str) -> String {
 /// consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
-Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution. Do NOT use it for tasks with a dedicated tool:
-- File-content viewers (`cat`, `head`, `tail`, `less`, `more`, `tac`) and file-driven text processors (`sed`, `awk`) are REJECTED at this layer when invoked as the leading command — use `Read` for content (`offset`/`limit` cover head/tail), `Edit` for in-place changes (safer than `sed -i`). Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` is blocked.
-- To write files use `Write` (not echo/cat with redirection)
-- To search file names use `Glob` (not find/ls)
-- To search file contents use `Grep` (not grep/rg)
-- To download a file to disk (`.txt`, `.json`, `.csv`, archives, binaries, scripts, …) use Bash with `curl`/`wget` — WebFetch only returns rendered text into the conversation and never writes to disk.
+Reserve Bash for system commands, git, build/test, and anything that genuinely needs a shell. Reading, writing, and searching files have dedicated tools — `Read`, `Write`, `Edit`, `Glob`, `Grep` — and a leading `cat`/`head`/`tail`/`less`/`sed`/`awk` against a file is rejected here with the redirect spelled out. Downloading a file to disk IS Bash's job (`curl`/`wget`): WebFetch only returns rendered text into the conversation and never writes to disk.
 
 {{isolation}}
 
@@ -114,7 +109,7 @@ Reserve Bash for system commands, git operations, build/test, and terminal tasks
 
 DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
 
-PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
+PATHS: Every directory or file argument, and `cwd` itself, MUST be absolute; relative values are rejected. Quote paths containing spaces.
 
 {{work_dir_scope}}
 
@@ -127,10 +122,10 @@ ENVIRONMENT:
 - Platform: {{platform}}"#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Baybo state dir under `~/.baybo`/`$BAYBO_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell has read+write access to the workspace and `$HOME`, with the FHS roots (`/usr`, `/bin`, `/etc`, …) readable; nothing outside that union exists. The usual credential directories under `$HOME` (ssh, aws, gnupg, gh, gcloud, docker, kube, and Baybo's own state dir) are masked and read as empty, and `/dev` is minimal. Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `personas/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Inside the workspace, Bash may only name {{work_dir}} (read+write) and `skills/` (read+execute, never write). Every other path under the workspace root is rejected up front, `cwd` included — reach those through `Read`/`Edit`/`Write` instead. Paths outside the workspace are unaffected by this rule.
 
 SCRATCH: Put disposable/intermediate files (probe scripts, one-off downloads, temp build output) under {{work_tmp_dir}} — it is swept automatically after {{work_tmp_ttl_days}} days. Deliverables the user should keep belong elsewhere under {{work_dir}}."#;
 
@@ -146,11 +141,11 @@ const FREE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run 
 /// `{{approval}}` for `permission = manual`: human approval for every
 /// Bash command.
 #[cfg(not(feature = "bench-bash"))]
-const MANUAL_APPROVAL: &str = r#"APPROVAL: Every Bash command requires human approval before it runs. When an OS sandbox runner is available, approved commands run in the sandbox. If Baybo detected an outer container/sandbox, the inner sandbox is skipped silently; if no backend is available on a non-container host, Baybo sends a notice and runs without it. If a sandboxed run fails, Baybo asks again before retrying the same command without the sandbox. File-content viewer commands that Bash rejects up front (`cat foo`, `sed -i …`, etc.) are refused before any approval prompt."#;
+const MANUAL_APPROVAL: &str = r#"APPROVAL: Every Bash command needs human approval before it runs, and approved commands run sandboxed where a runner exists. A sandboxed run that fails is asked about again before any unsandboxed retry. Commands Bash rejects outright are refused without ever reaching the prompt."#;
 
 /// `{{approval}}` for `permission = auto`.
 #[cfg(not(feature = "bench-bash"))]
-const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run in the OS sandbox without prompting by default when an OS sandbox runner is available. If Baybo detected an outer container/sandbox, the inner sandbox is skipped silently; if no backend is available on a non-container host, Baybo sends a notice and runs without it. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs under the active execution route unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure is re-judged: when automatic sandbox escape is safe, it is re-run outside the sandbox automatically; otherwise you are asked before the unsandboxed retry. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
+const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run sandboxed without prompting. A destructive one (file deletion, a history-rewriting `git` op) is risk-judged first, and you are asked only when the judge flags it. Sandbox failures and escapes are handled for you; a run that ended up unsandboxed says so in a `sandbox_escalation` field."#;
 
 /// `{{approval}}` for `permission = free`.
 #[cfg(not(feature = "bench-bash"))]
@@ -2359,6 +2354,11 @@ mod tests {
     use crate::{ApprovalHandle, ApprovedResource};
     use baybo_model::{ChannelType, User};
     use parking_lot::Mutex;
+
+    /// A phrase only the sandboxed `{{isolation}}` section carries, so a test
+    /// can tell "the OS sandbox is on" from `free`'s "no credential-vault
+    /// masking" without matching both.
+    const SANDBOXED_MARKER: &str = "are masked and read as empty";
     use std::sync::Arc;
 
     fn cfg(path: &str) -> std::ffi::OsString {
@@ -3183,7 +3183,7 @@ mod tests {
         );
         // OS-sandbox claims dropped...
         assert!(
-            !d.contains("masked with empty tmpfs"),
+            !d.contains(SANDBOXED_MARKER),
             "free drops the OS-sandbox masking claim"
         );
         assert!(
@@ -3212,10 +3212,7 @@ mod tests {
         );
         // Auto shares the sandbox surface with Sandboxed but advertises the
         // judge in its APPROVAL section.
-        assert!(
-            d.contains("masked with empty tmpfs"),
-            "auto is still sandboxed"
-        );
+        assert!(d.contains(SANDBOXED_MARKER), "auto is still sandboxed");
         assert!(
             d.contains("risk-judged") && d.contains("sandbox_escalation"),
             "auto description must describe the on-failure judge"
@@ -3228,14 +3225,14 @@ mod tests {
         let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
             .with_permission_handle(Arc::clone(&handle));
         // Sandboxed: masked surface, OS sandbox on.
-        assert!(tool.description().contains("masked with empty tmpfs"));
+        assert!(tool.description().contains(SANDBOXED_MARKER));
         assert!(!tool.skip_os_sandbox());
 
         // Hot-swap to free via the shared handle: the SAME tool now skips the OS
         // sandbox but keeps uv + the work-dir scope — no rebuild.
         handle.set(BashPermissionMode::Free);
         assert!(tool.skip_os_sandbox());
-        assert!(!tool.description().contains("masked with empty tmpfs"));
+        assert!(!tool.description().contains(SANDBOXED_MARKER));
         assert!(tool.description().contains("OS sandbox is OFF"));
         assert!(tool.description().contains("uv run python"));
 
@@ -3283,7 +3280,7 @@ mod tests {
                 !d.contains("/some/ws/work"),
                 "bench drops the work-dir jail"
             );
-            assert!(!d.contains("masked with empty tmpfs"));
+            assert!(!d.contains(SANDBOXED_MARKER));
             assert!(d.contains("own interpreters"), "bench uses native python");
             assert!(
                 !d.contains("SCRATCH:"),

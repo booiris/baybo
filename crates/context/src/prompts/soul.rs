@@ -6,9 +6,10 @@
 //! lifecycle (seed + reseed-after-compaction); this module is the pure
 //! assembly seam.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use baybo_workspace::{IdentitySource, WorkspacePaths, absolutise};
+use baybo_model::AgentProfileId;
+use baybo_workspace::{IdentityKind, IdentitySource, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
@@ -34,6 +35,212 @@ When a subagent or command runs in the background — you spawned it with `backg
 /// model reads tag-handling guidance immediately before it encounters the
 /// first message that may carry one.
 const TAIL_HINT: &str = r#"Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear."#;
+
+/// Separator between the parts of an assembled prompt. Load-bearing beyond
+/// formatting: [`crate::prompts::system_prompt_update`] tests a stored prompt
+/// for a part by substring, so a part has to appear in the joined text exactly
+/// as [`AssembledPrompt::parts`] hands it over.
+const PART_SEPARATOR: &str = "\n\n";
+
+/// The `<tag path="…">` sections a prompt can carry. Owns the five tag names,
+/// which the assembly writes and the freshness reconciler reasons about — one
+/// source rather than a literal per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionTag {
+    Soul,
+    Identity,
+    SharedUserProfile,
+    UserNotes,
+    Memory,
+}
+
+impl SectionTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SectionTag::Soul => "soul",
+            SectionTag::Identity => "identity",
+            SectionTag::SharedUserProfile => "shared_user_profile",
+            SectionTag::UserNotes => "user_notes",
+            SectionTag::Memory => "memory",
+        }
+    }
+}
+
+/// One element of an assembled prompt: a block of framing text, or an identity
+/// file wrapped with the path it was read from.
+///
+/// The split exists because the reconciler treats the two differently. A hint
+/// is opaque text that only a binary upgrade changes. A section names a file the
+/// model can be shown to have edited itself, which is the one case where
+/// restating its body is telling the model something it already knows.
+pub enum PromptPart {
+    Hint(String),
+    Section {
+        tag: SectionTag,
+        /// Absolute, as the rendered `path="…"` attribute carries it — so a
+        /// comparison against a tool call's `file_path` is a comparison of the
+        /// same string the model was handed.
+        path: PathBuf,
+        body: String,
+    },
+}
+
+impl PromptPart {
+    /// The part as it appears in the prompt.
+    pub fn render(&self) -> String {
+        match self {
+            PromptPart::Hint(text) => text.clone(),
+            PromptPart::Section { tag, path, body } => format!(
+                "<{tag} path=\"{path}\">\n{body}\n</{tag}>",
+                tag = tag.as_str(),
+                path = path.display(),
+                body = body.trim_end_matches('\n'),
+            ),
+        }
+    }
+
+    /// The file this part was read from, for a section; `None` for a hint.
+    pub fn source_path(&self) -> Option<&Path> {
+        match self {
+            PromptPart::Hint(_) => None,
+            PromptPart::Section { path, .. } => Some(path),
+        }
+    }
+}
+
+/// A system prompt as its ordered parts — the hint blocks and the wrapped
+/// identity sections — rather than one opaque string.
+///
+/// The parts are what the freshness reconciler works in: it compares a live
+/// assembly against the prompt a session's leading `Role::System` row already
+/// carries, and reports the parts that differ. Joining is the last step, so
+/// nothing has to re-split a prompt to find its seams.
+pub struct AssembledPrompt {
+    parts: Vec<PromptPart>,
+}
+
+impl AssembledPrompt {
+    /// A prompt with no seams: a subagent's profile, which comes from the
+    /// in-process registry rather than from anything the workspace assembles.
+    /// It changes as one block or not at all, so it is one part.
+    pub fn opaque(text: String) -> Self {
+        Self {
+            parts: vec![PromptPart::Hint(text)],
+        }
+    }
+
+    /// The prompt as the leading `Role::System` row carries it.
+    pub fn text(&self) -> String {
+        self.parts
+            .iter()
+            .map(PromptPart::render)
+            .collect::<Vec<_>>()
+            .join(PART_SEPARATOR)
+    }
+
+    /// The parts, in the order they appear in [`Self::text`].
+    pub fn parts(&self) -> &[PromptPart] {
+        &self.parts
+    }
+
+    /// What this prompt costs, per identity file, on every request the session
+    /// makes. The dream pass is handed these numbers because the instruction it
+    /// runs on ("keep them lean") is otherwise an adjective with nothing behind
+    /// it — a pass with no sense of the budget trims until the diff feels big
+    /// enough and stops, which is what it did.
+    pub fn budget(&self, tokenizer: &dyn crate::tokenizer::Tokenizer) -> PromptBudget {
+        let mut budget = PromptBudget::default();
+        for part in &self.parts {
+            let cost = tokenizer.count_text(&part.render());
+            budget.total += cost;
+            if let PromptPart::Section { tag, .. } = part {
+                let slot = match tag {
+                    SectionTag::Soul => &mut budget.soul,
+                    SectionTag::Identity => &mut budget.identity,
+                    SectionTag::SharedUserProfile => &mut budget.shared_user_profile,
+                    SectionTag::UserNotes => &mut budget.user_notes,
+                    SectionTag::Memory => &mut budget.memory_index,
+                };
+                *slot += cost;
+            }
+        }
+        budget
+    }
+}
+
+/// Per-section token cost of an assembled prompt.
+///
+/// Every field but [`Self::memory_index`] is a file that rides the prompt in
+/// full and is therefore paid on every call; the memory index is the one that
+/// buys deferred reads, so it is reported beside them as the cheaper place to
+/// put detail.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PromptBudget {
+    pub soul: usize,
+    pub identity: usize,
+    pub user_notes: usize,
+    pub shared_user_profile: usize,
+    pub memory_index: usize,
+    /// The whole prompt, hints included.
+    pub total: usize,
+}
+
+/// Which identity files an agent's prompt is assembled from, and what to seed
+/// each with when it does not exist yet.
+///
+/// Keyed on the agent alone. The profile row is not consulted — not even for
+/// its existence: the files are named by the id the session carries, so
+/// deleting a profile leaves every bound conversation with the persona it has
+/// been talking to.
+pub struct PersonaSources {
+    pub soul_path: PathBuf,
+    pub soul_seed: String,
+    pub self_image_path: PathBuf,
+    pub self_image_seed: String,
+    pub user_notes_path: PathBuf,
+    pub user_notes_seed: String,
+    /// This agent's `MEMORY.md`, or `None` when file memory is disabled.
+    /// Resolved from the same binding as the identity files, so a session can
+    /// never read one agent's soul with another's memory.
+    pub memory_index: Option<PathBuf>,
+}
+
+impl PersonaSources {
+    pub fn for_agent(paths: &WorkspacePaths, agent: &AgentProfileId, builtin_memory: bool) -> Self {
+        let path = |kind: IdentityKind| agent.identity_file(paths, kind);
+        // The same table setup and profile creation seed from. A file the
+        // operator deleted must come back as what shipped, not as whatever
+        // this path happened to name — recreating the built-in's `SOUL.md`
+        // from the custom-agent skeleton would rewrite who the assistant is,
+        // permanently and silently.
+        let seed = |kind| baybo_workspace::identity::persona_seed(agent.as_str(), kind).to_string();
+        Self {
+            soul_path: path(IdentityKind::Soul),
+            soul_seed: seed(IdentityKind::Soul),
+            self_image_path: path(IdentityKind::Identity),
+            self_image_seed: seed(IdentityKind::Identity),
+            user_notes_path: path(IdentityKind::User),
+            user_notes_seed: seed(IdentityKind::User),
+            memory_index: builtin_memory.then(|| agent.memory_index_file(paths)),
+        }
+    }
+}
+
+/// [`assemble`] against a resolved [`PersonaSources`], for callers that hold an
+/// agent id rather than four paths.
+pub async fn assemble_for(
+    paths: &WorkspacePaths,
+    sources: &PersonaSources,
+) -> anyhow::Result<AssembledPrompt> {
+    assemble(
+        paths,
+        IdentitySource::new(&sources.soul_path, &sources.soul_seed),
+        IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
+        IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
+        sources.memory_index.as_deref(),
+    )
+    .await
+}
 
 /// Size past which a memory index is worth complaining about. Not a cap —
 /// see [`memory_parts`] for why truncating would be worse — just the point
@@ -94,27 +301,27 @@ pub async fn assemble(
     self_image: IdentitySource<'_>,
     user_notes: IdentitySource<'_>,
     memory_index: Option<&Path>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AssembledPrompt> {
     let identity =
         baybo_workspace::identity::load_identity_files(paths.root(), soul, self_image, user_notes)
             .await?;
     let mut parts = vec![
-        TOP_HINT.to_string(),
-        wrap_section("soul", soul.path, &identity.soul),
-        wrap_section("identity", self_image.path, &identity.identity),
-        wrap_section(
-            "shared_user_profile",
+        PromptPart::Hint(TOP_HINT.to_string()),
+        section(SectionTag::Soul, soul.path, &identity.soul),
+        section(SectionTag::Identity, self_image.path, &identity.identity),
+        section(
+            SectionTag::SharedUserProfile,
             &paths.shared_user_file(),
             &identity.shared_user,
         ),
-        wrap_section("user_notes", user_notes.path, &identity.user),
+        section(SectionTag::UserNotes, user_notes.path, &identity.user),
     ];
     if let Some(index_path) = memory_index {
         parts.extend(memory_parts(index_path).await);
     }
-    parts.push(BACKGROUND_TASKS_HINT.to_string());
-    parts.push(TAIL_HINT.to_string());
-    Ok(parts.join("\n\n"))
+    parts.push(PromptPart::Hint(BACKGROUND_TASKS_HINT.to_string()));
+    parts.push(PromptPart::Hint(TAIL_HINT.to_string()));
+    Ok(AssembledPrompt { parts })
 }
 
 /// The `<memory>` index section plus the rules for using it, or nothing at
@@ -124,7 +331,7 @@ pub async fn assemble(
 /// unreadable should still get a coherent system prompt, so this failure
 /// warns and degrades to "no memory this session" instead of failing the
 /// assembly and dropping the session to [`FALLBACK_SYSTEM_PROMPT`].
-async fn memory_parts(index_path: &Path) -> Vec<String> {
+async fn memory_parts(index_path: &Path) -> Vec<PromptPart> {
     let index = match baybo_workspace::load_memory_index(index_path).await {
         Ok(index) => index,
         Err(e) => {
@@ -153,22 +360,21 @@ async fn memory_parts(index_path: &Path) -> Vec<String> {
         .map(absolutise)
         .unwrap_or_else(|| absolutise(index_path));
     vec![
-        wrap_section("memory", index_path, &index),
-        MEMORY_HINT.replace("{{memory_dir}}", &dir.display().to_string()),
+        section(SectionTag::Memory, index_path, &index),
+        PromptPart::Hint(MEMORY_HINT.replace("{{memory_dir}}", &dir.display().to_string())),
     ]
 }
 
-/// Wrap an identity-file body in an XML tag carrying the absolute on-disk
+/// An identity-file body wrapped in an XML tag carrying the absolute on-disk
 /// path. Explicit boundaries keep arbitrary user-authored markdown inside one
 /// file from bleeding into a sibling section, and surfacing the path lets the
 /// agent re-read or update the source file without re-deriving its location.
-fn wrap_section(tag: &str, path: &Path, body: &str) -> String {
-    let abs = absolutise(path);
-    format!(
-        "<{tag} path=\"{path}\">\n{body}\n</{tag}>",
-        path = abs.display(),
-        body = body.trim_end_matches('\n'),
-    )
+fn section(tag: SectionTag, path: &Path, body: &str) -> PromptPart {
+    PromptPart::Section {
+        tag,
+        path: absolutise(path),
+        body: body.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +401,8 @@ mod tests {
             None,
         )
         .await
-        .expect("assemble");
+        .expect("assemble")
+        .text();
 
         assert!(prompt.starts_with("You are an intelligent AI assistant."));
         let soul = prompt.find("<soul ").expect("soul tag");
@@ -244,7 +451,8 @@ mod tests {
             Some(&index),
         )
         .await
-        .expect("assemble");
+        .expect("assemble")
+        .text();
 
         assert!(prompt.contains("- [Cat](cat.md) — Mochi"));
         // Operating rules come after the declarative content.
@@ -280,7 +488,8 @@ mod tests {
             None,
         )
         .await
-        .expect("assemble");
+        .expect("assemble")
+        .text();
 
         assert!(!prompt.contains("<memory "));
         assert!(!prompt.contains("# Memory\n"));

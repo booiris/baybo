@@ -136,18 +136,18 @@ pub fn host_timezone() -> String {
 /// change from fire to fire lives here.
 const DREAM_JOB_PROMPT: &str = r#"Tend your memory.
 
-Work through the conversations listed above — read the transcripts that look like they carry something worth keeping — and then:
+This pass has two inputs, not one: the conversations listed above, and the four files that ride your prompt. Read the transcripts that look like they carry something worth keeping — then open all four files and read them whole. A line no recent conversation touched still costs you on every single call, so it is this pass's business too.
 
 1. **Record** what is worth carrying forward: durable facts about your human, corrections they gave you, the state of ongoing work, pointers to things outside this system. Skip anything that only mattered inside its own conversation.
-2. **Consolidate**: merge memories that say the same thing, tighten wording that has gone vague, fix links between related memories.
-3. **Prune**: delete memories that turned out wrong, or that a newer one supersedes (`MemoryDelete`).
-4. **Rebalance against your identity files.** They ride *every* prompt in full; memory files cost nothing until read. So promote what every conversation needs — a real shift in how you work into your `SOUL.md`, what you have worked out about your human into your own `USER.md` — and demote the long tail out of those files into memory, leaving only its index line in context. Keep them lean; let memory carry the detail.
-5. **Update the shared profile** when you have learned something durable about your human that the *other* agents should know too — a name, a timezone, a standing constraint. That file is shared: everyone reads it, everyone may write it, so keep it to the stable facts and leave your own working notes in your own `USER.md`.
+2. **Consolidate**: merge memories that say the same thing, tighten wording that has gone vague, fix links between related memories. Two files saying one thing are also two index lines, and the index rides every prompt.
+3. **Prune, and prune the files too.** Delete memories that turned out wrong, or that a newer one supersedes (`MemoryDelete`). Then turn the same knife on the four files: a line recording what your human asked *once*, carrying no instruction you could reuse, is not a memory — cut it outright. Demoting only moves a token; deleting is the only thing that gives one back.
+4. **Rebalance everything that rides the prompt** — your `SOUL.md`, your `IDENTITY.md`, your own `USER.md`, and the shared profile. All four are sent in full on every call; memory files cost nothing until read. Promote what *every* conversation needs; demote the long tail into memory, where an index line stands in for it. The budget above says what each file is costing you right now — treat a file that is large without earning it as the finding, not as the background.
+5. **The shared profile is the strictest of the four.** Every agent reads it and every agent may write it, so it holds only what is true for all of them: a name, a timezone, a standing constraint. Your own working notes belong in your own `USER.md`, and task detail belongs in memory. If it has grown past that, cut it back — it is the one file whose weight every agent pays.
 6. **Rewrite the index** (`MEMORY.md`) so it names exactly the files that exist, one line each.
 
 Your memory and your own identity files are yours alone — every other agent keeps its own, and writing into theirs is refused. The shared profile is the one thing you hold in common.
 
-If nothing in this window was worth remembering, say so with `report_nothing` rather than inventing something to record."#;
+Say what you cut and what you moved, with the numbers. If there was nothing new worth remembering *and* the files were already lean, use `report_nothing` rather than inventing work to report."#;
 
 /// Manages cron job lifecycle and runs a background tick loop
 /// that fires due jobs on schedule.
