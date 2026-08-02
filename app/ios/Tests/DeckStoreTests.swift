@@ -393,6 +393,9 @@ struct DeckStoreTests {
         ])
         #expect(store.state.cards.first?.size == "large")
         await store.layoutTask?.value
+        // The rollback also kicks a refresh; await it too, or the assertions
+        // race a task that rewrites `state.cards` right after them.
+        await store.refreshTask?.value
         #expect(store.state.cards.map(\.cardId) == ["b", "a"], "rolled back to baseline order")
         #expect(store.state.cards.first?.size == "small")
         DeckStore.removeMirror()

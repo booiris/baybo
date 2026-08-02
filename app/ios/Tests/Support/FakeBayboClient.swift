@@ -401,9 +401,44 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func deckSetLayout(entries: [DeckLayoutEntryInput]) async throws {
         let failure = lock.withLock { () -> Error? in
             deckLayoutPuts.append(entries)
+            // An ACKed layout is what the NEXT fetch has to hand back. Only
+            // recording the PUT leaves `deckView` at the pre-PUT order, so
+            // `DeckStore`'s post-rollback `requestRefresh()` reads back a state
+            // the server no longer holds and undoes the rollback it is meant to
+            // confirm — a race the test can only win by finishing first.
+            if deckLayoutError == nil { deckView = Self.applyingLayout(entries, to: deckView) }
             return deckLayoutError
         }
         if let failure { throw failure }
+    }
+
+    private static func applyingLayout(_ entries: [DeckLayoutEntryInput], to view: DeckView)
+        -> DeckView
+    {
+        var byId: [String: DeckLayoutEntryInput] = [:]
+        for entry in entries { byId[entry.cardId] = entry }
+        let cards =
+            view.cards
+            .map { card -> DeckCardInfo in
+                guard let entry = byId[card.cardId] else { return card }
+                return DeckCardInfo(
+                    cardId: card.cardId,
+                    title: card.title,
+                    position: entry.position,
+                    size: entry.size,
+                    sizes: card.sizes,
+                    maximize: card.maximize,
+                    enabled: card.enabled,
+                    quarantined: card.quarantined,
+                    deletedAtMs: card.deletedAtMs,
+                    specHash: card.specHash,
+                    lastSeq: card.lastSeq,
+                    createdAtMs: card.createdAtMs,
+                    retryableOps: card.retryableOps
+                )
+            }
+            .sorted { $0.position < $1.position }
+        return DeckView(cards: cards, snapshots: view.snapshots)
     }
 
     func deckSetEnabled(cardId: String, enabled: Bool) async throws {

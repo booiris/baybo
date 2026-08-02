@@ -56,6 +56,18 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.draft == false }}
+    # Without this the job inherits GitHub's 6-HOUR default, and a single hung
+    # test burns all 360 minutes before the runner is reclaimed — which is what
+    # `chat_api::chat_search_finds_a_chinese_word_inside_a_han_run` did on PR
+    # #234 (3000/3001 tests green, one test `SLOW [>21120.000s]`, job killed at
+    # the ceiling and reported `cancelled`, not `failure`). This repo runs CI on
+    # PRs only and its Actions quota is already out — it is why the three iOS
+    # jobs below are `if: false` — so that is a bill worth capping. That same
+    # run compiled the workspace from scratch (`No cache found`) and ran all
+    # 3000 finishing tests in ~10 minutes total, which is the number to raise
+    # this against: 15 is deliberately tight, so if the suite grows past it the
+    # answer is to bump this line, not to assume a hang.
+    timeout-minutes: 15
     env:
       BAYBO_SKIP_WEBUI: 1
     steps:

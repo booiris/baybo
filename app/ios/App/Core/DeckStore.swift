@@ -193,8 +193,12 @@ final class DeckStore: ObservableObject {
     /// Server-acked baseline for layout rollback (restore the BASELINE on
     /// failure, never the negation).
     private var layoutBaseline: [Card]?
-    private var refreshTask: Task<Void, Never>?
-    /// In-flight mutation tasks, held so tests can await completion.
+    /// In-flight tasks, held so tests can await completion. `refreshTask` is
+    /// here for a second reason: the failure paths below spawn it from inside
+    /// their own task, so awaiting only the mutation can return with a refresh
+    /// still in flight — one that outlives the test case and rewrites the
+    /// shared mirror the next case just removed.
+    private(set) var refreshTask: Task<Void, Never>?
     private(set) var layoutTask: Task<Void, Never>?
     private(set) var actionTask: Task<Void, Never>?
 
