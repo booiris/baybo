@@ -64,70 +64,23 @@ or perform a focused sub-task. Use when the work is decomposable: the
 parent agent stays focused on the conversation while the subagent
 runs to completion and returns a single final message.
 
-# How subagents see the world
+The subagent does NOT see your transcript. It starts empty, with the
+system prompt its `subagent_type` profile fixes and the self-contained
+`prompt` you authored — see that parameter for how to write one. The
+call blocks until its final message, which is all you get back;
+intermediate tool output is not surfaced.
 
-The subagent does NOT see your transcript. It starts with an empty
-context, a system prompt fixed by its `subagent_type` profile, and the
-self-contained `prompt` you authored. Everything it needs to know must
-be inside that prompt.
+Pick the most specific `subagent_type` from the catalogue below, and
+fall back to `general-purpose` only when none fits; an unknown one is a
+hard error, not a soft fallback. Each spawn is a fresh LLM cost stream,
+so use them sparingly — but when sub-tasks are independent, emit their
+`spawn_subagent` blocks IN ONE message so they run concurrently rather
+than serialising. A subagent may spawn its own, under a hard depth cap;
+one or two specialists per parent is the shape that pays.
 
-This call BLOCKS until the subagent's final assistant message arrives.
-The parent then sees the final message text as this tool's result.
-Intermediate tool output and streaming deltas inside the subagent are
-not surfaced.
-
-# Picking a subagent_type
-
-`subagent_type` is a free string but must match one of the registered
-profiles. Each profile has its own description ("when to use / when
-NOT to use") shown below in the live registry section. Pick the most
-specific match; fall back to `general-purpose` only when none fits.
-
-If you emit an unknown type the call returns a hard error listing the
-catalogue — there's no soft fallback.
-
-# Writing the prompt
-
-Brief the subagent like a teammate who just sat down: it hasn't seen
-this conversation and doesn't know what you've tried.
-
-- State the goal in one or two sentences, then the relevant facts.
-- Include exact paths and line numbers (`crate/foo.rs:123`) — the
-  subagent should not have to grep for what you already located.
-- If the task involves a fix, write what specifically to change. Do
-  NOT push the synthesis onto the subagent (avoid phrases like
-  "based on your findings, decide what to do"); that nullifies the
-  point of dispatching one in the first place.
-- If you need short output, say so ("under 200 words").
-- Include the relevant span ids or turn ids when the subagent should
-  hop across traces.
-
-# Cost and parallelism
-
-Each spawn starts a fresh LLM cost stream. Use sparingly. If you have
-multiple independent sub-tasks, emit multiple `spawn_subagent`
-tool_use blocks IN ONE message — the runtime executes parallel tool
-calls concurrently. Sequential spawns serialise needlessly.
-
-# Background mode
-
-`background: true` returns immediately with a handle and lets the
-parent continue talking. The subagent's result is delivered as an
-out-of-band notification (a system reminder) prepended to your next
-user turn. Works for any backend — especially handy for long external
-(claude/codex/gemini) runs you don't want to block on.
-
-# Trust but verify
-
-A subagent's final message reports what it INTENDED to do, not
-necessarily what landed. When it claims to have made a change, verify
-with `Read` / `Bash(git diff)` before acting on the report.
-
-# Recursion
-
-Subagents may themselves call `spawn_subagent`, but the runtime
-enforces a hard depth cap. Use the parent's perspective: most useful
-work is "parent dispatches one or two specialists", not deep trees.
+Its final message reports what it INTENDED to do, not necessarily what
+landed — verify a claimed change with `Read` or `git diff` before
+acting on it.
 "#;
 
 /// Backstop for the parent's wait on a `spawn_subagent` call. Subagent
@@ -449,7 +402,7 @@ impl SpawnSubagentTool {
             // Description is multi-line in literal blocks; indent
             // continuation lines so the bullet stays readable.
             let mut first = true;
-            for line in s.description.lines() {
+            for line in catalogue_blurb(&s.description).lines() {
                 if first {
                     first = false;
                 } else {
@@ -462,6 +415,46 @@ impl SpawnSubagentTool {
         out
     }
 }
+
+/// Longest profile blurb the catalogue will carry. The catalogue rides every
+/// call of every session and grows a bullet per file in `agents/`, so without
+/// a ceiling a single verbose profile taxes the whole deployment forever. The
+/// blurb only has to answer "when do I pick this one?"; the profile's full
+/// contract is its own system prompt, which the child reads and the parent
+/// never needs.
+const MAX_CATALOGUE_BLURB_CHARS: usize = 240;
+
+/// Ellipsis appended to a blurb cut at [`MAX_CATALOGUE_BLURB_CHARS`], so a
+/// truncated line reads as truncated rather than as a sentence that trails off.
+const BLURB_ELLIPSIS: &str = "…";
+
+/// One profile's catalogue line, bounded. Cuts on a char boundary (profile
+/// descriptions are author-written and routinely non-ASCII) and prefers the
+/// last word break in the final quarter, so the cut lands between words when
+/// one is near enough to matter.
+fn catalogue_blurb(description: &str) -> std::borrow::Cow<'_, str> {
+    if description.chars().count() <= MAX_CATALOGUE_BLURB_CHARS {
+        return std::borrow::Cow::Borrowed(description);
+    }
+    let hard = description
+        .char_indices()
+        .nth(MAX_CATALOGUE_BLURB_CHARS)
+        .map_or(description.len(), |(i, _)| i);
+    let head = &description[..hard];
+    let keep = head
+        .rfind(char::is_whitespace)
+        .filter(|i| *i * 4 >= hard * 3)
+        .unwrap_or(hard);
+    std::borrow::Cow::Owned(format!("{}{BLURB_ELLIPSIS}", head[..keep].trim_end()))
+}
+
+/// How to brief a subagent.
+///
+/// Lives on the parameter rather than in [`STATIC_DESCRIPTION`] because it is
+/// only actionable once the model has decided to spawn one — as prose in the
+/// always-on description it was ~170 tokens charged on every call of every
+/// session, including the overwhelming majority that never dispatch anything.
+const PROMPT_FIELD_DESCRIPTION: &str = r#"Self-contained brief the subagent sees as its first user message. It has NOT seen this conversation, so brief it like a teammate who just sat down: goal in a sentence or two, then the facts. Include exact paths and line numbers (`crate/foo.rs:123`) rather than making it re-find what you already located, and the span or turn ids if it has to hop across traces. If the task is a fix, say what to change — pushing the synthesis back onto it ("based on your findings, decide what to do") gives away the point of dispatching one. Ask for short output if you want it."#;
 
 fn parameters_schema() -> Value {
     json!({
@@ -478,7 +471,7 @@ fn parameters_schema() -> Value {
             },
             "prompt": {
                 "type": "string",
-                "description": "Self-contained brief the subagent sees as its first user message. The subagent does NOT see the parent transcript — include every fact, path, and line number it needs."
+                "description": PROMPT_FIELD_DESCRIPTION
             },
             "model_tier": {
                 "type": "string",
@@ -1123,6 +1116,41 @@ mod tests {
             .await
             .expect_err("unknown parent must surface as execution error");
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[test]
+    fn a_short_blurb_is_passed_through_untouched() {
+        let short = "Use for X. Do NOT use for Y.";
+        assert_eq!(catalogue_blurb(short), short);
+        assert!(matches!(
+            catalogue_blurb(short),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_long_blurb_is_cut_on_a_word_and_marked() {
+        let long = "word ".repeat(200);
+        let cut = catalogue_blurb(&long);
+        assert!(
+            cut.chars().count() <= MAX_CATALOGUE_BLURB_CHARS + 1,
+            "{cut}"
+        );
+        assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
+        assert!(cut.starts_with("word word"), "{cut}");
+    }
+
+    /// Profile descriptions are author-written prose and routinely non-ASCII,
+    /// so the cut has to be a char boundary or rendering the catalogue panics.
+    #[test]
+    fn a_long_multibyte_blurb_does_not_split_a_char() {
+        let long = "用于分析仓库结构".repeat(60);
+        let cut = catalogue_blurb(&long);
+        assert!(
+            cut.chars().count() <= MAX_CATALOGUE_BLURB_CHARS + 1,
+            "{cut}"
+        );
+        assert!(cut.ends_with(BLURB_ELLIPSIS), "{cut}");
     }
 
     #[test]
