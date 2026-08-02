@@ -37,9 +37,11 @@ ContextManager (struct)
 │                       the transcript-recovery pointer, the identity files
 │                       (soul assembly), and the
 │                       tool-spills dir (oversize tool output)
-├── system_prompt     — resolved system prompt for the initial seed (workspace
-│                       soul or a subagent profile override); reseed-after-
-│                       compaction re-reads the workspace instead
+├── system_prompt_version — Option<SystemPromptVersion>; the paths + `stat` of
+│                       the files behind `messages[0]`, as of the last time
+│                       `reconcile_system_prompt` agreed the two matched.
+│                       `None` = unknown (cold start, or a compaction just
+│                       rewrote the transcript) ⇒ look properly
 ├── compressor.rs     — impl ContextManager block: the compaction flow
 │   ├── pre-flight gate    — NoOp if the conversation is short by BOTH
 │   │                        measures (≤ keep_recent msgs AND under
@@ -49,9 +51,12 @@ ContextManager (struct)
 │   │                        answer carries no summary
 │   ├── assemble_summary   — [system + summary + verbatim recent slice],
 │   │                        or summary-only when the slice would not shrink
-│   └── reseed_system_row  — re-read workspace soul on every apply
+│   └── reseed_system_row  — re-read workspace soul on every apply, BEFORE
+│                            persist_compaction so the refresh is durable
 └── prompts/          — all model-facing framing text + pure builders
-    ├── soul.rs            — assemble_from_workspace (TOP/TAIL hints + identity)
+    ├── soul.rs            — assemble (TOP/TAIL hints + identity) → AssembledPrompt
+    ├── system_prompt_update.rs — build_blocks / wrap_update
+    │                            (<system_prompt_update> drift delta)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
     ├── background_notification.rs — build_completion_reply +
     │                              build_notification_content
@@ -68,7 +73,7 @@ ContextManager (struct)
 `prompts/` is the single home for every piece of text the runtime injects into
 the LLM transcript. The pure builders are unit-testable on their own; both
 `ContextManager` (`resolve_system_prompt` via `ensure_seeded`,
-`cap_tool_output`, `reseed_system_row`) and the agent-loop seam
+`cap_tool_output`, `reseed_system_row`, `reconcile_system_prompt`) and the agent-loop seam
 (`append_cron_fire`, `append_background_completion_reply_once`,
 `append_background_notification_prompt_once`) call into them. The
 injection *detection* for tool output stays in `baybo-security`, and the
@@ -99,6 +104,98 @@ self.compress_if_needed(session, span_recorder, turn_id, &cancel_token, delta_tx
 `Failed` is the one outcome the **user** is told about: the agent loop emits a `Warn` notice (once per turn — the gate re-fires on every remaining iteration) and `/compact` answers with a warning instead of a confirmation. The `reason` has already passed the leak boundary inside `CompressionRunner`, so it is safe to show.
 
 `force_compress` is the same call without the budget gate, for caller-initiated passes (e.g. a user-typed `/compact` slash command). The pre-flight NoOp and non-shrinking applies still surface as `StrategyDeclined` / `NoSavings`; only the threshold check is bypassed, so a too-small conversation is still left alone rather than rewritten as a one-line summary.
+
+### The system prompt's lifecycle
+
+`messages[0]` is written once, at `ensure_seeded`, and **persisted**. A session
+outlives the deploy that seeded it, so the row is a snapshot of whatever the
+persona files and the binary's framing text said that day. Three seams keep it
+honest, in ascending order of cost:
+
+1. **`reconcile_system_prompt` — before every main LLM call.** Compares a
+   `SystemPromptVersion` (the resolved source paths plus a `stat` of each) with
+   the version recorded when the row was written. Equal ⇒ return; that is the
+   hot path, and it reads no file. Different ⇒ re-assemble, diff the assembly's
+   parts against what `messages[0]` says, and append the parts it does not — as
+   a `MessageSource::SystemPromptUpdate` row (hidden from chat surfaces, framed
+   `<system_prompt_update>`).
+
+   The delta is **appended, never written over `messages[0]`**: that row heads
+   the prompt-cache prefix, and rewriting it mid-session discards the provider's
+   cached copy of the entire transcript to correct a few lines. A moved
+   `personas/` directory costs one `<soul …>` block at the tail instead.
+
+   Each update is a **complete delta against the leading row**, not against the
+   update before it, so the newest fully restates every older one and the framing
+   tells the model the last one wins. Superseded updates are deliberately **not**
+   filtered out of the request: dropping a row from the middle of the transcript
+   rewrites the request at that position and invalidates the cached prefix after
+   it — the same cost as rewriting `messages[0]`, paid repeatedly. Appending at
+   the tail is the only edit a cached prefix tolerates. What bounds the size
+   instead is keeping each delta to the parts that moved, plus two filters: a
+   version that moved without changing any bytes the prompt carries (a re-save, a
+   `touch`) appends nothing, and neither does a delta the newest update already
+   states verbatim.
+
+   **A file the model rewrote itself is named, not restated.** `Edit`/`Write`
+   calls in the transcript name the paths this conversation changed
+   (`self_edited_source_paths`, keyed off `baybo_tools::FILE_WRITING_TOOLS`), and
+   a section whose file is among them degrades to
+   `<tag path="…" edited_by_you_in_this_conversation/>` plus one extra framing
+   paragraph. Echoing an 11 KB `personas/USER.md` back at the model to tell it
+   what it just wrote is the one case where the body is pure duplication. The
+   scoping matters in both directions: a hint has no file behind it and is never
+   elided, a change made by anyone else still arrives in full, and a path that
+   fails to match (a symlink, a `..` spelling) falls back to the full body. And
+   because the pointer is a pure function of tag and path, a second edit to the
+   same file produces an identical update that the dedupe drops — repeated
+   self-edits cost one row, not one per edit.
+
+   The reconciler is otherwise append-only, which leaves one gap it has to close
+   explicitly: a source that moves and then moves **back** leaves the standing
+   update asserting something no longer true, and an empty delta cannot be
+   silence. `wrap_update(&[])` renders a retraction instead, and only when an
+   update is actually standing.
+
+2. **`reseed_system_row` — after a committed compaction.** Replaces `messages[0]`
+   with a fresh assembly. Runs **after** the savings gate (so a grown soul cannot
+   veto a real compaction) and **before** `persist_compaction` (so the refreshed
+   row is what the store keeps). That ordering is the whole of the durability:
+   with the reseed after the persist, the store held the pre-reseed prompt
+   forever and a reaped-then-rehydrated actor read it straight back — the
+   compaction retired the stale prompt only for as long as the actor happened to
+   live. Once the reseed lands, the reconciler goes quiet on its own: the
+   assembly it compares against is exactly what `messages[0]` now holds.
+
+   The compaction also **drops every `SystemPromptUpdate` row**, in `summarize`'s
+   partition — before the tail walk, not after the assembly. The reseed rewrites
+   `messages[0]` from the same assembly those updates were derived from, so
+   keeping one would leave a block telling the model that a now-current prompt is
+   out of date; and since the walk runs backward from the tail, which is exactly
+   where updates are appended, filtering late would let each one consume the
+   verbatim slice's token budget on its way to being discarded.
+
+   The summariser *request* still carries them: it is built from `self.messages`
+   whole, because `LlmCallInputs::Persisted` can only name the entire active set
+   and trimming to a strict prefix would force an `Inline` marker that re-embeds
+   the transcript into every compaction span. Accepted residue, not an oversight.
+
+3. **`ensure_seeded` — fresh session.** Resolves and appends, then records the
+   version it wrote — but **only when the resolve succeeded**. A seed that fell
+   back to `FALLBACK_SYSTEM_PROMPT` records nothing, because stamping a version
+   on the one-liner would claim it is the assembly of those files and mute the
+   reconciler for the life of the session: a transient `EIO` while seeding would
+   cost that conversation its whole persona, permanently and silently. Left
+   `None`, the next call re-resolves and appends what the seed could not read.
+   Idempotent; the leading-`System` check short-circuits ahead of the resolve, so
+   only a fresh session pays.
+
+`system_prompt_version` is set to `None` on hydration (`restore_messages`) and
+on a compaction apply — in both cases the rows came from somewhere this actor
+cannot vouch for, and `None` means "look properly". A subagent session's version
+is its profile name: the registry is in-memory and immutable for the process, so
+nothing can move under it mid-session, and a profile edited across a deploy is
+caught by the hydration `None` like any other.
 
 ## Design Decisions
 

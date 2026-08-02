@@ -30,7 +30,7 @@ use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
 /// Named once: `name()`, rejection messages, and the `Tool:` trailer of
 /// every audit commit have to agree.
-const WRITE_TOOL_NAME: &str = "Write";
+pub(crate) const WRITE_TOOL_NAME: &str = "Write";
 
 pub struct WriteTool {
     roots: ManagedRoots,

@@ -10,6 +10,7 @@ pub mod cron;
 pub mod interjection;
 pub mod recalled_memory;
 pub mod soul;
+pub mod system_prompt_update;
 pub mod tasks;
 pub mod title;
 pub mod tool_output;

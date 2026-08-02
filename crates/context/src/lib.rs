@@ -72,7 +72,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse};
-use baybo_model::{AgentProfileId, ChatMessage, ContentBlock, Role, SessionId};
+use baybo_model::{
+    AgentProfileId, ChatMessage, ContentBlock, FileFingerprint, MessageSource, Role, SessionId,
+};
 use baybo_session::{SessionManager, SessionMessageAppendOutcome};
 use baybo_skills::render::{render_skill_block, render_skill_reminder};
 use baybo_skills::{
@@ -109,6 +111,23 @@ const TRUNCATION_MARKER: &str = "\n…[truncated]";
 struct TokenBaseline {
     actual_tokens: usize,
     message_count_at_call: usize,
+}
+
+/// Identity of the sources a system prompt was assembled from — cheap enough
+/// to re-derive before every LLM call, so a prompt that has gone stale is
+/// noticed within one call rather than at the next compaction.
+///
+/// A persona prompt is built out of files, so its version is their paths plus a
+/// `stat` of each: a release that moves `personas/` changes the paths, and an
+/// edited `SOUL.md` or a freshly written memory moves a fingerprint. That is
+/// five `stat`s against the two SQLite round-trips the same call already makes
+/// for its trace marker. A subagent's prompt comes from the in-process
+/// registry, which no file can move under it, so the profile name is the whole
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SystemPromptVersion {
+    Subagent(String),
+    Persona(Vec<(PathBuf, Option<FileFingerprint>)>),
 }
 
 /// Result of a [`ContextManager::maybe_compress`] /
@@ -338,6 +357,15 @@ pub struct ContextManager {
     /// (`build_call_input_marker`) apply the same condition, so replay matches
     /// what the model saw.
     notification_cue: Option<ChatMessage>,
+    /// Version of the sources behind the leading `Role::System` row, as of the
+    /// last time [`Self::reconcile_system_prompt`] agreed the two matched.
+    ///
+    /// `None` means "unknown, go and look": set on cold start (the row came
+    /// from the store, written by a process that may have been a different
+    /// build entirely) and whenever a compaction rewrites the transcript. Every
+    /// site that writes the row from a live assembly records the version it
+    /// wrote, which is what keeps the per-call check to a handful of `stat`s.
+    system_prompt_version: Option<SystemPromptVersion>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -421,6 +449,7 @@ impl ContextManager {
             task_reminder: None,
             task_reminder_raw: 0,
             notification_cue: None,
+            system_prompt_version: None,
         }
     }
 
@@ -447,11 +476,21 @@ impl ContextManager {
         // actually holds a row that needs framing — the common case. The scan is
         // O(n) with no allocation; each framing pass would otherwise clone every
         // row before `merge_for_llm` clones again.
+        //
+        // Note what is deliberately NOT done here: superseded
+        // `SystemPromptUpdate` rows are not filtered out. Each one is a complete
+        // delta against the leading system row, so on the face of it only the
+        // newest carries information — but dropping an older one rewrites the
+        // request at whatever mid-transcript position it sits at, which
+        // invalidates the provider's cached prefix from there on. That is the
+        // exact cost appending-instead-of-rewriting exists to avoid, and it
+        // would be paid on every call after every drop. Superseded rows are
+        // cheaper carried than removed; the compaction that reseeds the system
+        // row drops them for free.
         let needs_framing = self.messages.iter().any(|m| {
             matches!(
                 m.source(),
-                baybo_model::MessageSource::UserInterjection
-                    | baybo_model::MessageSource::RecalledMemory
+                MessageSource::UserInterjection | MessageSource::RecalledMemory
             )
         });
         // The task reminder is appended at the tail (after framing, before
@@ -483,9 +522,14 @@ impl ContextManager {
     /// and across a crash-replay (no attempt counter to desync).
     fn active_notification_cue(&self) -> Option<&ChatMessage> {
         let cue = self.notification_cue.as_ref()?;
+        // Look past a system-prompt update: it is machinery appended between
+        // the salvage row and this request, not conversational progress, and
+        // letting it count as the tail would drop the retry cue from the one
+        // turn that exists to carry it.
         let tail_is_assistant = self
             .messages
-            .last()
+            .iter()
+            .rfind(|m| m.source() != MessageSource::SystemPromptUpdate)
             .is_some_and(|m| m.role == baybo_model::Role::Assistant);
         tail_is_assistant.then_some(cue)
     }
@@ -530,6 +574,7 @@ impl ContextManager {
     pub async fn resolve_system_prompt(&self) -> String {
         self.try_resolve_system_prompt()
             .await
+            .map(|prompt| prompt.text())
             .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string())
     }
 
@@ -539,13 +584,13 @@ impl ContextManager {
     /// on a resolution failure (profile not found, or workspace I/O error) so
     /// the caller decides whether to fall back (seed) or keep the prior row
     /// (reseed).
-    async fn try_resolve_system_prompt(&self) -> Option<String> {
+    async fn try_resolve_system_prompt(&self) -> Option<crate::prompts::soul::AssembledPrompt> {
         if let Some((registry, profile_name)) = &self.subagent_profile {
             let resolved = registry.get(profile_name).map(|p| p.system_prompt);
             if resolved.is_none() {
                 tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
             }
-            return resolved;
+            return resolved.map(crate::prompts::soul::AssembledPrompt::opaque);
         }
 
         let sources = self.resolve_persona_sources();
@@ -621,15 +666,15 @@ impl ContextManager {
     /// the session's source via [`Self::replace_first_message`] (which
     /// re-totals the budget); on a resolution failure the prior row is kept.
     async fn reseed_system_row(&mut self) {
-        let first_is_system_text = self.messages.first().is_some_and(|m| {
-            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
-        });
-        if !first_is_system_text {
+        if !self.leads_with_system_text() {
             return;
         }
         match self.try_resolve_system_prompt().await {
             Some(prompt) => {
-                self.replace_first_message(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
+                self.replace_first_message(ChatMessage::system(vec![ContentBlock::Text(
+                    prompt.text(),
+                )]));
+                self.system_prompt_version = Some(self.current_system_prompt_version().await);
             }
             None => {
                 tracing::warn!(
@@ -637,6 +682,200 @@ impl ContextManager {
                 );
             }
         }
+    }
+
+    /// Whether the transcript leads with a text-carrying `Role::System` row —
+    /// the shape both the reseed and the freshness reconciler need before they
+    /// can say anything about the prompt the model is working from.
+    fn leads_with_system_text(&self) -> bool {
+        self.messages.first().is_some_and(|m| {
+            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
+        })
+    }
+
+    /// Reconcile the prompt the model has been shown against what the sources
+    /// say right now, appending the difference when the two have parted ways.
+    ///
+    /// The agent loop calls this before every main LLM call, which is what
+    /// bounds staleness at one call. The version check carries that frequency:
+    /// it is a `stat` per source file, and only a version that actually moved
+    /// pays for a re-assembly.
+    ///
+    /// The difference is **appended**, never written over `messages[0]`. That
+    /// row is the head of the prompt-cache prefix; rewriting it mid-session
+    /// would throw away the provider's cached copy of the whole transcript to
+    /// fix a few lines. The row itself is retired by the post-compaction reseed
+    /// ([`Self::reseed_system_row`]), at which point this check goes quiet on
+    /// its own — the assembly it compares against is then exactly what
+    /// `messages[0]` holds.
+    ///
+    /// **Each update is a complete delta against the leading row**, never
+    /// against the update before it. A session that edits its `SOUL.md` twice,
+    /// or writes two memories, therefore ends up with a newer update that fully
+    /// restates the older one, and the framing tells the model the last one
+    /// wins. The superseded ones are left in the request on purpose — see
+    /// [`Self::messages_for_llm`] for why removing a row from the middle of a
+    /// transcript costs more than carrying it. What keeps the accumulation
+    /// small is that a delta names only the parts that moved, plus two filters:
+    /// a version change that alters no bytes the prompt actually carries (a
+    /// `touch`, a re-save) appends nothing, and neither does a delta the newest
+    /// update already states verbatim.
+    ///
+    /// Append-only would leave one hole, so it is closed here: a source that
+    /// moves and moves **back** makes the standing update false, and an empty
+    /// delta cannot be silence. `wrap_update` renders a retraction for it, and
+    /// only when there is an update to retract.
+    ///
+    /// No-op until the transcript leads with a system row: before
+    /// [`Self::ensure_seeded`] runs there is no prompt to be stale, and
+    /// reporting an entire prompt as a "change" would be nonsense.
+    pub async fn reconcile_system_prompt(&mut self) {
+        if !self.leads_with_system_text() {
+            return;
+        }
+        let version = self.current_system_prompt_version().await;
+        if self.system_prompt_version.as_ref() == Some(&version) {
+            return;
+        }
+        let Some(resolved) = self.try_resolve_system_prompt().await else {
+            // The same judgement `reseed_system_row` makes: a resolution
+            // failure degrades to the one-line fallback, and announcing *that*
+            // to the model as its new prompt would replace a stale persona
+            // with no persona at all. Leave what the conversation has.
+            tracing::warn!("failed to resolve the system prompt; leaving the conversation's copy");
+            return;
+        };
+        // Re-derive rather than reusing the version read above: assembly runs
+        // through the auto-seeding `load_identity_files`, so a file that was
+        // missing a moment ago now exists with a fingerprint of its own.
+        self.system_prompt_version = Some(self.current_system_prompt_version().await);
+
+        let seeded = self.leading_system_text();
+        let rendered: Vec<String> = resolved
+            .parts()
+            .iter()
+            .map(crate::prompts::soul::PromptPart::render)
+            .collect();
+        let self_edited = self.self_edited_source_paths();
+        let unseen = crate::prompts::system_prompt_update::build_blocks(
+            resolved.parts(),
+            &rendered,
+            &seeded,
+            &self_edited,
+        );
+        let told = self.newest_prompt_update_text();
+        // Nothing differs and nothing was ever claimed to: the common case, and
+        // the only one that gets here without something to say. When an update
+        // *has* been appended, an empty delta is not silence — it means a source
+        // moved and moved back, and the update still standing has to be
+        // retracted, which `wrap_update` renders for an empty `unseen`.
+        if unseen.is_empty() && told.is_none() {
+            return;
+        }
+        let update = crate::prompts::system_prompt_update::wrap_update(&unseen);
+        // Each update is a complete delta against the leading row, so an
+        // identical one has already said everything this one would.
+        if told.as_deref() == Some(update.as_str()) {
+            return;
+        }
+        tracing::info!(
+            session_id = %self.session_id,
+            parts = unseen.len(),
+            "system prompt sources moved since the leading row was written; appending the delta"
+        );
+        self.append(&ChatMessage::system_prompt_update(vec![
+            ContentBlock::Text(update),
+        ]))
+        .await;
+    }
+
+    /// Text of the leading `Role::System` row — the prompt the conversation was
+    /// seeded with, and the sole baseline every update is measured against.
+    /// Empty when the transcript does not lead with one, which the callers gate
+    /// on via [`Self::leads_with_system_text`] before they get here.
+    fn leading_system_text(&self) -> String {
+        self.messages
+            .first()
+            .filter(|m| m.role == Role::System)
+            .map(|m| block_text(&m.content))
+            .unwrap_or_default()
+    }
+
+    /// Absolute paths this conversation's own tool calls rewrote — the
+    /// `file_path` of every `Edit`/`Write` `ToolUse` in the transcript.
+    ///
+    /// A section whose file is in here does not need its body restated: the
+    /// model produced those bytes itself, a few messages back. Read straight off
+    /// the transcript rather than from the read-before-write tracker, which is a
+    /// different question (has this file been *seen*) and would have to be
+    /// threaded through `ContextManagerConfig` to be asked here.
+    ///
+    /// Matching is on the path string the model was handed. `wrap_section`
+    /// absolutises it and [`crate::prompts::soul::PromptPart`] keeps that form,
+    /// and the model copies the path out of its own system prompt, so an exact
+    /// match is the common case; anything else (a symlink, a `..` spelling)
+    /// simply misses and the body is sent in full, which is the safe direction.
+    fn self_edited_source_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { name, input, .. }
+                    if baybo_tools::FILE_WRITING_TOOLS.contains(&name.as_str()) =>
+                {
+                    input
+                        .get(baybo_tools::TOOL_FILE_PATH_ARG)?
+                        .as_str()
+                        .map(PathBuf::from)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Text of the newest system-prompt update already in the transcript, if
+    /// any. Read back rather than remembered in a field so the comparison
+    /// survives a process bounce: after hydration the rows are all this actor
+    /// knows about what the last one said.
+    fn newest_prompt_update_text(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+    }
+
+    /// `stat` the sources this session's prompt is assembled from. Cheap by
+    /// construction — no file is read — so it can gate the expensive path
+    /// before every LLM call. A path that does not exist contributes `None`,
+    /// which is a stable value rather than an error: identity files auto-seed
+    /// on the first assembly, and a workspace that never gets one compares
+    /// equal to itself instead of forcing a re-assembly per call.
+    async fn current_system_prompt_version(&self) -> SystemPromptVersion {
+        if let Some((_, profile_name)) = &self.subagent_profile {
+            return SystemPromptVersion::Subagent(profile_name.clone());
+        }
+        let sources = self.resolve_persona_sources();
+        let mut paths = vec![
+            sources.soul_path,
+            sources.self_image_path,
+            self.workspace.shared_user_file(),
+            sources.user_notes_path,
+        ];
+        // `None` when built-in memory is switched off, in which case the prompt
+        // carries no `<memory>` section either — so the index is not part of
+        // this session's version any more than it is part of its prompt.
+        if let Some(memory_index) = sources.memory_index {
+            paths.push(memory_index);
+        }
+        let mut fingerprints = Vec::with_capacity(paths.len());
+        for path in paths {
+            let fingerprint = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|meta| FileFingerprint::from_metadata(&meta));
+            fingerprints.push((path, fingerprint));
+        }
+        SystemPromptVersion::Persona(fingerprints)
     }
 
     /// Seed the leading `Role::System` row — and a skill reminder when any
@@ -659,10 +898,26 @@ impl ContextManager {
         {
             return;
         }
-        let prompt = self.resolve_system_prompt().await;
+        let resolved = self.try_resolve_system_prompt().await;
         let skills = self.invocable_skill_summaries();
+        let prompt = resolved
+            .as_ref()
+            .map(|p| p.text())
+            .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string());
         self.append(&ChatMessage::system(vec![ContentBlock::Text(prompt)]))
             .await;
+        // Record the version ONLY for a row that really is the assembly of
+        // those sources. Stamping it on the fallback would claim the one-liner
+        // matches a healthy `SOUL.md` and mute the reconciler for the life of
+        // the session — a transient EIO at seed time would cost the session its
+        // whole persona, permanently and silently. Left `None`, the next call
+        // re-resolves and appends what the seed could not read.
+        //
+        // Read after the resolve, not before: assembly auto-seeds a missing
+        // identity file, so the fingerprints only settle once it has run.
+        if resolved.is_some() {
+            self.system_prompt_version = Some(self.current_system_prompt_version().await);
+        }
         if !skills.is_empty() {
             self.append(&ChatMessage::agent_context(vec![ContentBlock::Text(
                 render_skill_reminder(&skills),
@@ -818,13 +1073,12 @@ impl ContextManager {
     ///
     /// Used by [`Self::reseed_system_row`] to refresh the soul system prompt
     /// after a committed compaction when the identity files changed on disk.
-    /// The refresh is in-memory only: `persist_compaction` already wrote the
-    /// pre-reseed row, and on a cold start `ensure_system_prompt` short-circuits
-    /// on the restored leading `System` row without re-reading disk — so a
-    /// reaped-then-rehydrated actor carries the persisted prompt until the next
-    /// compaction reseeds again. Correct for the live actor's lifetime and
-    /// self-healing across compactions; a source edit just isn't durable until
-    /// then.
+    /// It runs *before* `persist_compaction`, so the refreshed row is the one
+    /// the store keeps and a reaped-then-rehydrated actor reads it back. The
+    /// ordering is the whole of the durability: on a cold start
+    /// [`Self::ensure_seeded`] short-circuits on the restored leading `System`
+    /// row without re-reading disk, so whatever the compaction wrote is what
+    /// the session lives with until the next one.
     ///
     /// No-op if the transcript is empty.
     fn replace_first_message(&mut self, msg: ChatMessage) {
@@ -858,6 +1112,10 @@ impl ContextManager {
         self.per_message_tokens = per_message_tokens;
         self.called_skills = self.called_skills_in(&messages);
         self.messages = messages;
+        // These rows were written by another process — very possibly another
+        // build, which is the whole reason a session's prompt goes stale. What
+        // this actor knows about the version behind them is nothing.
+        self.system_prompt_version = None;
         self.invalidate_baseline();
         self.budget.update(self.count_tokens());
         // The latch described a transcript that has been replaced wholesale;
@@ -1277,6 +1535,12 @@ impl ContextManager {
 
         self.messages = new_messages;
         self.per_message_tokens = new_per_message;
+        // The transcript this version described is gone — including whatever
+        // system-prompt updates the summary folded away. `reseed_system_row`
+        // below records the version it writes; if it can't resolve, `None` is
+        // what makes the next reconcile look again rather than trust a row the
+        // reseed never got to refresh.
+        self.system_prompt_version = None;
         // Rebuild called_skills from the freshly-applied slice: a summary
         // that folds away every `Skill` ToolUse and `/command` row leaves it
         // empty (the trailer carries plain text), and a kept verbatim tail
@@ -1301,12 +1565,18 @@ impl ContextManager {
             "proactive context compression"
         );
 
-        self.persist_compaction().await;
         // Refresh the system row from the workspace soul now that the shrink
-        // decision is committed + persisted — kept out of the savings gate
-        // above so a grown soul can't veto a real compaction, and after
-        // `persist_compaction` so it stays an in-memory-only refresh.
+        // decision is committed — kept out of the savings gate above so a grown
+        // soul can't veto a real compaction, and ahead of `persist_compaction`
+        // so the refreshed row is the one that lands in the store. Writing it
+        // afterwards left the durable `messages[0]` a generation behind
+        // forever: a reaped-then-rehydrated actor read back the *pre*-reseed
+        // prompt, so the compaction that was supposed to retire a stale prompt
+        // only retired it for as long as the actor happened to live.
+        // `replace_first_message` re-totals the budget, so the numbers logged
+        // above still describe the shrink that was decided on.
         self.reseed_system_row().await;
+        self.persist_compaction().await;
         Ok(CompressionOutcome::Compressed)
     }
 
@@ -1546,6 +1816,19 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
 /// boundary into a single text block (joined with `\n\n`). Non-text
 /// blocks (images, tool_use, tool_result, thinking) are appended as-is so
 /// signatures, IDs, and modality data are preserved verbatim.
+/// A message's text blocks, newline-joined. Non-text blocks are skipped —
+/// callers use this to compare prose against prose.
+fn block_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Wire-only pass: collapse each maximal run of consecutive
 /// [`baybo_model::MessageSource::UserInterjection`] rows into a single
 /// `Role::User` message whose text is wrapped in the `<user_interjection>`
@@ -3023,6 +3306,432 @@ mod tests {
         .resolve_system_prompt()
         .await;
         assert_eq!(bound, unbound);
+    }
+
+    /// The whole point of the reconciler, in the shape the migration created:
+    /// a session seeded before `personas/` existed carries a system row naming
+    /// `profile/`, and nothing on the seed path ever looks at disk again.
+    #[tokio::test]
+    async fn a_stale_system_row_gets_the_moved_paths_appended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "CURRENT_SOUL_BODY");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+
+        // A row from the old world: the pre-migration path, and no trace of
+        // the sections that shipped since.
+        ctx.append(&make_msg(
+            Role::System,
+            "<soul path=\"/old/profile/SOUL.md\">CURRENT_SOUL_BODY</soul>",
+        ))
+        .await;
+        ctx.append(&make_msg(Role::User, "hello")).await;
+
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .find(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .expect("a stale row must produce an update");
+        assert_eq!(update.role, Role::User, "never a second system row");
+        let text = block_text(&update.content);
+        let soul_path = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        assert!(
+            text.contains(&soul_path.display().to_string()),
+            "the update must carry where the file lives now: {text}"
+        );
+        assert!(
+            !text.contains("/old/profile/"),
+            "the update states the new world, not the old: {text}"
+        );
+    }
+
+    /// A prompt that still matches its sources must say nothing at all —
+    /// otherwise every turn of every healthy session pays for a notice.
+    #[tokio::test]
+    async fn reconcile_is_silent_when_the_row_still_matches_its_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_BODY");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+        let before = ctx.messages().len();
+
+        ctx.reconcile_system_prompt().await;
+        ctx.reconcile_system_prompt().await;
+
+        assert_eq!(ctx.messages().len(), before, "{:?}", ctx.messages());
+    }
+
+    /// An edit that moves the mtime without changing what the prompt carries
+    /// (a re-save, a `touch`, a formatter) invalidates the cheap version check
+    /// and must still append nothing — the version is a *filter*, not the
+    /// answer.
+    #[tokio::test]
+    async fn a_rewrite_that_changes_no_prompt_bytes_appends_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_BODY");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+        let before = ctx.messages().len();
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        // Move the mtime explicitly rather than relying on a rewrite landing in
+        // a different filesystem tick — the point of the test is that a moved
+        // version alone appends nothing.
+        std::fs::write(&soul, "SOUL_BODY").expect("rewrite soul");
+        std::fs::File::options()
+            .write(true)
+            .open(&soul)
+            .expect("open soul")
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+                ),
+            )
+            .expect("move mtime");
+
+        ctx.reconcile_system_prompt().await;
+        assert_eq!(ctx.messages().len(), before, "{:?}", ctx.messages());
+
+        // …and the reconciler is genuinely live on this fixture: change what
+        // the prompt carries and it speaks up. Without this the assertion
+        // above would hold for a reconciler that never did anything.
+        std::fs::write(&soul, "SOUL_BODY_CHANGED").expect("edit soul");
+        ctx.reconcile_system_prompt().await;
+        assert_eq!(ctx.messages().len(), before + 1, "{:?}", ctx.messages());
+    }
+
+    /// Two edits in one conversation produce two updates, and the newer is a
+    /// COMPLETE delta against the leading row rather than an increment on the
+    /// older. That is what lets the framing's "the last one wins" be true, and
+    /// it is why superseded rows are left on the wire — removing one from the
+    /// middle of a request is what would cost the prompt cache.
+    #[tokio::test]
+    async fn each_update_is_a_complete_delta_so_the_newest_stands_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+        ctx.append(&make_msg(Role::User, "hello")).await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        for body in ["SOUL_V2", "SOUL_V3"] {
+            std::fs::write(&soul, body).expect("write soul");
+            ctx.reconcile_system_prompt().await;
+        }
+
+        let updates: Vec<String> = ctx
+            .messages()
+            .iter()
+            .filter(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .collect();
+        assert_eq!(updates.len(), 2, "one per edit: {updates:?}");
+        assert!(updates[0].contains("SOUL_V2"), "{}", updates[0]);
+        assert!(
+            updates[1].contains("SOUL_V3") && !updates[1].contains("SOUL_V2"),
+            "the newest states the current world outright: {}",
+            updates[1]
+        );
+
+        // Both ride: dropping the older would rewrite the request mid-
+        // transcript and invalidate the cached prefix after it.
+        let wire_text: String = ctx
+            .messages_for_llm()
+            .iter()
+            .map(|m| block_text(&m.content))
+            .collect();
+        assert!(wire_text.contains("SOUL_V3") && wire_text.contains("SOUL_V2"));
+    }
+
+    /// When the model rewrites its own persona file, echoing the whole body
+    /// back tells it what it just wrote. The update names the file instead —
+    /// and a second edit to the same file adds no further row, because the
+    /// pointer is identical and the dedupe catches it.
+    #[tokio::test]
+    async fn a_file_the_model_edited_itself_is_named_not_restated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        // The model's own Edit, as the transcript records it.
+        let edit_call = |body: &str| {
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "Edit".into(),
+                input: serde_json::json!({
+                    "file_path": soul.display().to_string(),
+                    "old_string": "x",
+                    "new_string": body,
+                }),
+                signature: None,
+            }])
+        };
+
+        ctx.append(&edit_call("SOUL_WRITTEN_BY_THE_MODEL")).await;
+        std::fs::write(&soul, "SOUL_WRITTEN_BY_THE_MODEL").expect("edit soul");
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(
+            update.contains(&soul.display().to_string()),
+            "the file must still be named: {update}"
+        );
+        assert!(
+            !update.contains("SOUL_WRITTEN_BY_THE_MODEL"),
+            "the body the model just wrote must not be echoed back: {update}"
+        );
+
+        // A second edit to the same file says nothing new.
+        let rows = ctx.messages().len();
+        std::fs::write(&soul, "SOUL_EDITED_AGAIN").expect("edit soul again");
+        ctx.reconcile_system_prompt().await;
+        assert_eq!(ctx.messages().len(), rows, "{:?}", ctx.messages());
+    }
+
+    /// The elision is scoped to files THIS conversation wrote. A change made
+    /// anywhere else still arrives in full — the model has never seen it.
+    #[tokio::test]
+    async fn a_change_the_model_did_not_make_still_arrives_in_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        std::fs::write(&soul, "CHANGED_BY_SOMEONE_ELSE").expect("edit soul");
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .rfind(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("an update");
+        assert!(update.contains("CHANGED_BY_SOMEONE_ELSE"), "{update}");
+    }
+
+    /// A source that moves and moves back leaves the standing update asserting
+    /// something no longer true, so an empty delta is not silence — nothing
+    /// else can tell the model to disregard it.
+    #[tokio::test]
+    async fn a_reverted_source_retracts_the_update_that_announced_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        std::fs::write(&soul, "SOUL_V2").expect("edit soul");
+        ctx.reconcile_system_prompt().await;
+        std::fs::write(&soul, "SOUL_V1").expect("revert soul");
+        ctx.reconcile_system_prompt().await;
+
+        let updates: Vec<String> = ctx
+            .messages()
+            .iter()
+            .filter(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .collect();
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert!(
+            updates[1].contains("Disregard any earlier system-prompt update"),
+            "the revert must be retracted, not left standing: {}",
+            updates[1]
+        );
+
+        // And it settles: a further pass with nothing to say is silent.
+        let before = ctx.messages().len();
+        ctx.reconcile_system_prompt().await;
+        assert_eq!(ctx.messages().len(), before);
+    }
+
+    /// A seed that fell back (the persona was unreadable) must NOT record a
+    /// version: doing so claims the one-line fallback is the assembly of those
+    /// files, and mutes the reconciler for the life of the session.
+    #[tokio::test]
+    async fn a_seed_that_fell_back_still_recovers_on_the_next_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        let soul = workspace.persona_identity_file(
+            baybo_workspace::paths::BUILTIN_PERSONA_DIR,
+            IdentityKind::Soul,
+        );
+        // A directory where the soul file goes: assembly fails, the seed falls
+        // back to the one-liner.
+        std::fs::create_dir_all(&soul).expect("soul as a dir");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+        ctx.ensure_seeded().await;
+        assert_eq!(
+            block_text(&ctx.messages()[0].content),
+            crate::prompts::soul::FALLBACK_SYSTEM_PROMPT
+        );
+
+        // The workspace heals; the very next call must notice.
+        std::fs::remove_dir(&soul).expect("clear the dir");
+        std::fs::write(&soul, "RECOVERED_SOUL").expect("write soul");
+        ctx.reconcile_system_prompt().await;
+
+        let update = ctx
+            .messages()
+            .iter()
+            .find(|m| m.source() == MessageSource::SystemPromptUpdate)
+            .map(|m| block_text(&m.content))
+            .expect("the session must not be stuck on the fallback");
+        assert!(update.contains("RECOVERED_SOUL"), "{update}");
+    }
+
+    /// A compaction reseeds `messages[0]` from the same assembly the updates
+    /// were derived from, so keeping one in the verbatim tail would leave a
+    /// block telling the model a now-current prompt is out of date.
+    #[tokio::test]
+    async fn compaction_drops_the_updates_its_reseed_makes_obsolete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_V1");
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: Some(AgentProfileId::builtin()),
+            builtin_memory: false,
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "small seed")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
+        ctx.reconcile_system_prompt().await;
+        assert!(
+            ctx.messages()
+                .iter()
+                .any(|m| m.source() == MessageSource::SystemPromptUpdate),
+            "the stale seed must have produced one to drop"
+        );
+
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .expect("compress");
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        assert!(
+            !ctx.messages()
+                .iter()
+                .any(|m| m.source() == MessageSource::SystemPromptUpdate),
+            "{:?}",
+            ctx.messages()
+        );
+        assert!(block_text(&ctx.messages()[0].content).contains("SOUL_V1"));
+
+        // And the reconciler has nothing left to say: the reseed recorded the
+        // version it wrote, so the next call short-circuits at the version gate
+        // instead of appending a fresh delta against the row it just refreshed.
+        let settled = ctx.messages().len();
+        ctx.reconcile_system_prompt().await;
+        ctx.reconcile_system_prompt().await;
+        assert_eq!(ctx.messages().len(), settled, "{:?}", ctx.messages());
+    }
+
+    /// Nothing to reconcile before the prompt exists. Reporting a whole
+    /// freshly-assembled prompt as a "change" would be nonsense, and the seed
+    /// is about to write it anyway.
+    #[tokio::test]
+    async fn reconcile_is_a_no_op_before_the_prompt_is_seeded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "SOUL_BODY");
+        let mut ctx = bound_ctx(&workspace, AgentProfileId::builtin());
+
+        ctx.reconcile_system_prompt().await;
+
+        assert!(ctx.messages().is_empty(), "{:?}", ctx.messages());
+    }
+
+    /// The reseed has to reach the store. Written after the compaction was
+    /// persisted, it only ever refreshed the live actor's copy — so a reaped
+    /// and rehydrated session read back the prompt the compaction was supposed
+    /// to have retired.
+    #[tokio::test]
+    async fn the_post_compaction_reseed_is_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace_with_soul(dir.path(), "DISTINCTIVE_SOUL");
+        let sessions = test_sessions();
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            agent: Some(AgentProfileId::builtin()),
+            builtin_memory: false,
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            channel: baybo_model::ChannelType::owner(),
+            session_id: test_session_id(),
+            sessions: Arc::clone(&sessions),
+            subagent_profile: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "small seed")).await;
+        for i in 0..12 {
+            ctx.append(&make_msg(Role::User, &bulky(&format!("m{i}"))))
+                .await;
+        }
+
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .expect("compress");
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+
+        let persisted = sessions
+            .load_active_session_messages(&test_session_id())
+            .await
+            .expect("load persisted");
+        assert_eq!(persisted[0].role, Role::System);
+        assert!(
+            block_text(&persisted[0].content).contains("DISTINCTIVE_SOUL"),
+            "the store must hold the reseeded prompt, not the pre-reseed one: {:?}",
+            persisted[0]
+        );
     }
 
     #[tokio::test]

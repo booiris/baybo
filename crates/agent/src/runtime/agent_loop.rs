@@ -1038,6 +1038,13 @@ impl AgentLoop {
                 task_reminder_dirty = false;
             }
 
+            // Re-check the system prompt against the files it was assembled
+            // from and append the delta if they have moved on — a `stat` per
+            // source file unless something actually changed. Before the
+            // compression gate for the same reason the checklist above is: the
+            // delta rides this request, so the gate has to see its tokens.
+            self.context_manager.reconcile_system_prompt().await;
+
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(
                 session,
@@ -1498,17 +1505,23 @@ impl AgentLoop {
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls. The
             // meta rides the persisted row but is never sent to the LLM: a
-            // `Read` stamps the fingerprint it recorded (so the
-            // read-before-write tracker can be rebuilt on hydration; `get`
+            // tool that anchored the read-before-write tracker stamps the
+            // fingerprint it left there (so hydration can rebuild it; `get`
             // returns `None` for a failed/virtual read), and any call that
             // raised an approval prompt stamps the decision (so reloads can
             // label the work step). Both `None` collapses to a plain
             // `tool_result`.
-            let read_fingerprint = (tool_call.name == baybo_tools::READ_TOOL_NAME)
+            //
+            // `Edit`/`Write` and not just `Read`: both re-anchor the tracker to
+            // what they wrote, and stamping only `Read` meant hydration restored
+            // the *pre-edit* fingerprint — so the first write after a restart
+            // was rejected as stale against the model's own edit.
+            let read_fingerprint = baybo_tools::READ_TRACKER_ANCHORING_TOOLS
+                .contains(&tool_call.name.as_str())
                 .then(|| {
                     tool_call
                         .arguments
-                        .get("file_path")
+                        .get(baybo_tools::TOOL_FILE_PATH_ARG)
                         .and_then(|v| v.as_str())
                         .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
                 })

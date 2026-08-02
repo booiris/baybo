@@ -23,7 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use baybo_llm::{ChatRequest, LlmResponse};
-use baybo_model::{ChatMessage, ContentBlock};
+use baybo_model::{ChatMessage, ContentBlock, MessageSource};
 use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
@@ -272,6 +272,19 @@ impl ContextManager {
     /// `Cancelled` for a `/stop`, `Failed` for an errored or unusable call.
     async fn summarize(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
+        // Drop the system-prompt updates before anything is assembled from
+        // them. `reseed_system_row` is about to rewrite `messages[0]` from the
+        // same assembly they were derived from, so carrying one forward would
+        // leave a block telling the model that a now-current prompt is out of
+        // date. Filtering here rather than after the assembly also stops them
+        // consuming the verbatim tail's token budget on their way to being
+        // discarded — the walk runs backward from the tail, which is exactly
+        // where they are appended, so each one would otherwise push a real
+        // turn out of the kept slice.
+        let non_system: Vec<ChatMessage> = non_system
+            .into_iter()
+            .filter(|m| m.source() != MessageSource::SystemPromptUpdate)
+            .collect();
 
         let instruction =
             ChatMessage::agent_context(vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())]);

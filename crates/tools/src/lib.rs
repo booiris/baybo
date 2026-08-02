@@ -31,6 +31,37 @@ pub use approval::{
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::read::READ_TOOL_NAME;
+
+/// The parameter every file tool names its target with. Shared because callers
+/// outside this crate read it back off a recorded `ToolUse` — the agent loop to
+/// stamp a fingerprint, `baybo-context` to spot a persona file the model
+/// rewrote itself.
+pub const TOOL_FILE_PATH_ARG: &str = "file_path";
+
+/// Tools that REWRITE the file at [`TOOL_FILE_PATH_ARG`]. A subset of
+/// [`READ_TRACKER_ANCHORING_TOOLS`], which also counts `Read` — the two answer
+/// different questions ("who changed this file" vs "who vouched for its
+/// contents"), so they are listed apart rather than derived from each other.
+pub const FILE_WRITING_TOOLS: &[&str] = &[
+    builtin::edit::EDIT_TOOL_NAME,
+    builtin::write::WRITE_TOOL_NAME,
+];
+
+/// Tools whose `ToolResult` must carry the file fingerprint they left in the
+/// read-before-write tracker, so hydration can put it back.
+///
+/// These are exactly the tools that anchor [`ReadTracker`] for a `file_path`:
+/// `Read` records what it saw, and `Edit`/`Write` re-anchor to what they just
+/// wrote (so a chained edit does not demand an intervening re-read). Named once
+/// because the producer (`AgentLoop`, stamping `ToolResultMeta`) and the
+/// consumer ([`ReadTracker::rebuild_from_messages`]) have to agree: a tool the
+/// producer stamps but the consumer ignores is a fingerprint silently dropped on
+/// every restart, and the reverse is a lookup that never hits.
+pub const READ_TRACKER_ANCHORING_TOOLS: &[&str] = &[
+    builtin::read::READ_TOOL_NAME,
+    builtin::edit::EDIT_TOOL_NAME,
+    builtin::write::WRITE_TOOL_NAME,
+];
 pub use builtin::read::{paginate_end_line, paginate_numbered};
 pub use error::ToolError;
 pub use read_tracker::ReadTracker;

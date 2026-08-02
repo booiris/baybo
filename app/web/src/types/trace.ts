@@ -80,14 +80,16 @@ export type Role = 'system' | 'user' | 'assistant' | 'tool';
 // 'cron' = a cron fire's framed prompt; 'cron_notification' = a one-shot fire's
 // result, appended to the conversation that scheduled it (an assistant bubble,
 // no inference behind it); 'recalled_memory' = memories recalled from long-term
-// storage, injected (framed) to inform the turn; 'agent' = everything else the
-// agent injects/produces.
+// storage, injected (framed) to inform the turn; 'system_prompt_update' = the
+// parts of the system prompt that changed on disk after the leading system row
+// was written; 'agent' = everything else the agent injects/produces.
 export type MessageSource =
   | 'user'
   | 'user_interjection'
   | 'cron'
   | 'cron_notification'
   | 'recalled_memory'
+  | 'system_prompt_update'
   | 'agent';
 
 export interface BlobRef {
