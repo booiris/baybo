@@ -103,10 +103,14 @@ subagent's profile prompt before persona resolution runs, so the exclusion is
 structural rather than a flag.
 
 Lifecycle is the existing one: resolved at session seed and re-resolved at
-each post-compaction reseed. A memory written mid-session is therefore on
-disk immediately but reaches the *prompt* at the next reseed or new session —
-the same delay an identity edit has, and the `Edit` tool says so in its
-output.
+each post-compaction reseed — plus the per-call freshness reconcile
+(`reconcile_system_prompt`, see [context.md](context.md#the-system-prompts-lifecycle)),
+which notices that `MEMORY.md` has moved and appends the new index at the tail.
+So a memory written mid-session is in front of the model on the next LLM call,
+and folds back into the system row itself at the next reseed (which also drops
+the updates it makes obsolete). The index is the part most likely to change
+twice in one session and also the largest, so it is the main reason each update
+carries only the parts that moved rather than the whole prompt.
 
 ## Writing, and the audited tier
 

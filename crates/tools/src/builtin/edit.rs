@@ -53,7 +53,20 @@ use serde_json::{Value, json};
 
 /// Named once: `name()`, rejection messages, and the `Tool:` trailer of
 /// every audit commit have to agree.
-const EDIT_TOOL_NAME: &str = "Edit";
+pub(crate) const EDIT_TOOL_NAME: &str = "Edit";
+
+/// Trailer on a persona-file edit, telling the model when the prompt it is
+/// running on will reflect what it just wrote.
+///
+/// This used to say "on the next compaction or new session", which was true
+/// until `baybo_context::ContextManager::reconcile_system_prompt` started
+/// re-checking the identity files before every LLM call: the edit now reaches
+/// the model as an appended delta on the very next request, and only folds back
+/// into the leading system row at the next compaction. The model reads this line
+/// immediately after editing its own soul, so a stale claim here is not a
+/// comment — it is the model being told the opposite of what happens.
+const PERSONA_EDIT_PICKUP_NOTE: &str =
+    "\nnote: your system prompt picks this change up on the next request";
 
 use super::managed_repo::{
     ChangeKind, ManagedRoots, ManagedTarget, append_audit_line, commit_change, reject_if_oversized,
@@ -226,9 +239,7 @@ impl Tool for EditTool {
             )
             .await;
             append_audit_line(&mut text, outcome);
-            text.push_str(
-                "\nnote: the in-memory system prompt picks up this change on the next compaction or new session",
-            );
+            text.push_str(PERSONA_EDIT_PICKUP_NOTE);
         }
 
         Ok(ToolOutput::Text(text))

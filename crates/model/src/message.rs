@@ -249,6 +249,16 @@ pub enum MessageSource {
     /// every later turn (the failure mode that retired the prior memory
     /// pipeline).
     RecalledMemory,
+    /// A notice that the sources behind the leading `Role::System` row have
+    /// moved on since it was written, carrying the parts that now differ. The
+    /// system row is durable and a session outlives the deploy that seeded it,
+    /// so a persona-path migration or an edited `SOUL.md` would otherwise leave
+    /// the model working from paths that no longer exist until the next
+    /// compaction reseeds. Rides as a framed `Role::User` row — never
+    /// `Role::System`, which providers accept only in the leading slot — and is
+    /// tracked distinctly so the reconciler can find what it has already said
+    /// by provenance instead of sniffing its envelope tag out of the content.
+    SystemPromptUpdate,
     /// Any other agent-originated row: skill reminders, a spawned/subagent task
     /// prompt, the subagent-finished notification, summary instructions, the
     /// system prompt, assistant output, tool results. Hidden from chat surfaces.
@@ -265,6 +275,7 @@ impl MessageSource {
             MessageSource::Cron => "cron",
             MessageSource::CronNotification => "cron_notification",
             MessageSource::RecalledMemory => "recalled_memory",
+            MessageSource::SystemPromptUpdate => "system_prompt_update",
             MessageSource::Agent => "agent",
         }
     }
@@ -280,6 +291,7 @@ impl std::str::FromStr for MessageSource {
             "cron" => Ok(MessageSource::Cron),
             "cron_notification" => Ok(MessageSource::CronNotification),
             "recalled_memory" => Ok(MessageSource::RecalledMemory),
+            "system_prompt_update" => Ok(MessageSource::SystemPromptUpdate),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
         }
@@ -381,6 +393,25 @@ impl ChatMessage {
             content,
             platform_msg_id: String::new(),
             source: MessageSource::CronNotification,
+        }
+    }
+
+    /// A notice that the leading `Role::System` row no longer matches the
+    /// sources it was assembled from, carrying the parts that differ — the
+    /// **only** constructor that marks a row [`MessageSource::SystemPromptUpdate`].
+    ///
+    /// `Role::User` rather than `Role::System` for the same reason
+    /// [`Self::recalled_memory`] is: a second system row is rejected outside the
+    /// leading slot by providers that validate placement. The reconciler
+    /// (`baybo_context::ContextManager::reconcile_system_prompt`) reads back the
+    /// rows it has already appended to decide what is genuinely new, so the
+    /// content must stay exactly what was sent — no wire-only re-framing.
+    pub fn system_prompt_update(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::SystemPromptUpdate,
         }
     }
 
@@ -686,6 +717,7 @@ mod tests {
                 | MessageSource::Cron
                 | MessageSource::CronNotification
                 | MessageSource::RecalledMemory
+                | MessageSource::SystemPromptUpdate
                 | MessageSource::Agent => {}
             }
         }
@@ -695,6 +727,7 @@ mod tests {
             MessageSource::Cron,
             MessageSource::CronNotification,
             MessageSource::RecalledMemory,
+            MessageSource::SystemPromptUpdate,
             MessageSource::Agent,
         ]
     }

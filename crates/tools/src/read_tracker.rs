@@ -17,11 +17,15 @@
 //! lives on the long-lived agent loop, so a `Read` in one turn satisfies an
 //! `Edit` in a later turn. Across an actor eviction or process restart it is
 //! rebuilt from the persisted transcript by [`ReadTracker::rebuild_from_messages`]:
-//! each `Read` result row carries the [`FileFingerprint`] it observed in its
-//! [`ToolResultMeta`] (persisted with the transcript but never sent to the LLM),
-//! so the prior reads are recovered on hydration. If a fingerprint is ever lost
-//! (a `Read` row compacted away, a stale rebuild) the contract just fails
-//! closed — the model is forced to re-read, never allowed a blind write.
+//! every anchoring tool's result row ([`crate::READ_TRACKER_ANCHORING_TOOLS`] —
+//! `Read` for what it saw, `Edit`/`Write` for what they wrote) carries the
+//! [`FileFingerprint`] it left here in its [`ToolResultMeta`] (persisted with the
+//! transcript but never sent to the LLM), so the anchors are recovered on
+//! hydration. `Edit`/`Write` matter as much as `Read` there: restoring only the
+//! read that preceded an edit puts back the *pre-write* fingerprint, which reads
+//! as the file having changed behind the model's back. If a fingerprint is ever
+//! lost (a row compacted away, a stale rebuild) the contract just fails closed —
+//! the model is forced to re-read, never allowed a blind write.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -164,11 +168,14 @@ impl ReadTracker {
             .copied()
     }
 
-    /// Repopulate the tracker from a restored transcript: pair each `Read`
+    /// Repopulate the tracker from a restored transcript: pair each anchoring
     /// `ToolUse` (for its `file_path`) with its `ToolResult` (for the fingerprint
     /// its [`ToolResultMeta`](baybo_model::ToolResultMeta) carried) and record
-    /// it as committed. Later reads of the same file overwrite earlier ones,
-    /// since messages are walked in order.
+    /// it as committed. Later entries for the same file overwrite earlier ones,
+    /// since messages are walked in order — so an `Edit` that followed a `Read`
+    /// restores the post-write anchor, not the pre-write one. Getting that
+    /// backwards told the model its own edit had changed the file behind its
+    /// back, and cost a redundant re-read on the first turn after every restart.
     /// Called once after the agent loop restores its context from the store, so
     /// a `Read` that happened before an eviction/restart still satisfies a
     /// later `Edit`. `pub` because the caller is in `baybo-agent`.
@@ -179,7 +186,7 @@ impl ReadTracker {
                 if let ContentBlock::ToolUse {
                     id, name, input, ..
                 } = block
-                    && name == crate::READ_TOOL_NAME
+                    && crate::READ_TRACKER_ANCHORING_TOOLS.contains(&name.as_str())
                     && let Some(path) = input.get("file_path").and_then(|v| v.as_str())
                 {
                     read_paths.insert(id.as_str(), path);
@@ -339,6 +346,56 @@ mod tests {
         let t = ReadTracker::default();
         t.rebuild_from_messages(&messages);
         assert_eq!(t.check(&p, recorded), ReadCheck::Current);
+    }
+
+    /// An `Edit` re-anchors the tracker to what it wrote, so hydration has to
+    /// restore *that*, not the `Read` that preceded it. Restoring the earlier
+    /// one reports the model's own edit as a change behind its back, and the
+    /// next write on that file is rejected until it re-reads.
+    #[test]
+    fn rebuild_restores_the_post_edit_anchor_not_the_pre_edit_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.txt");
+        std::fs::write(&p, "before").unwrap();
+        let read_fp = FileFingerprint::from_metadata(&std::fs::metadata(&p).unwrap());
+
+        // The edit lands, moving the file's fingerprint.
+        std::fs::write(&p, "after — a longer body").unwrap();
+        let after_edit = FileFingerprint::from_metadata(&std::fs::metadata(&p).unwrap());
+        assert_ne!(read_fp, after_edit);
+
+        let call = |id: &str, tool: &str| {
+            ChatMessage::assistant(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: tool.into(),
+                input: json!({ "file_path": p.to_str().unwrap() }),
+                signature: None,
+            }])
+        };
+        let result = |id: &str, fp: FileFingerprint| {
+            ChatMessage::tool_result_with_meta(
+                id.into(),
+                "ok".into(),
+                Some(baybo_model::ToolResultMeta {
+                    read_fingerprint: Some(fp),
+                    approval: None,
+                }),
+            )
+        };
+        let messages = vec![
+            call("call-1", crate::READ_TOOL_NAME),
+            result("call-1", read_fp),
+            call("call-2", crate::builtin::edit::EDIT_TOOL_NAME),
+            result("call-2", after_edit),
+        ];
+
+        let t = ReadTracker::default();
+        t.rebuild_from_messages(&messages);
+        assert_eq!(
+            t.check(&p, after_edit),
+            ReadCheck::Current,
+            "the post-edit anchor must win over the read that preceded it"
+        );
     }
 
     #[test]
