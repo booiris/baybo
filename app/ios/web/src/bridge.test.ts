@@ -56,6 +56,7 @@ function recorder(): { log: string[]; events: TranscriptEvents } {
       connEpoch: (epoch) => log.push(`epoch:${epoch}`),
       userSent: (payload) => log.push(`userSent:${payload.msgId}`),
       sendFailed: (msgId) => log.push(`sendFailed:${msgId}`),
+      sendConfirmed: (msgId) => log.push(`sendConfirmed:${msgId}`),
       bottomInset: (px) => log.push(`inset:${px}`),
       jumpToLatest: () => log.push("jump"),
       syncRequested: () => log.push("sync"),
@@ -269,6 +270,7 @@ describe("the pre-subscribe buffer", () => {
     window.baybo.setConnEpoch(2);
     window.baybo.userSent({ msgId: "pm-1", text: "hi", attachments: [] });
     window.baybo.sendFailed("pm-1");
+    window.baybo.sendConfirmed("pm-1");
     window.baybo.setBottomInset(120);
     window.baybo.jumpToLatest();
     window.baybo.requestSync();
@@ -283,6 +285,7 @@ describe("the pre-subscribe buffer", () => {
       "epoch:2",
       "userSent:pm-1",
       "sendFailed:pm-1",
+      "sendConfirmed:pm-1",
       "inset:120",
       "jump",
       "sync",

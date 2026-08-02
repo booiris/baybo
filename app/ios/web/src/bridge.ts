@@ -76,6 +76,7 @@ type BayboGlobal = {
   setConnEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
   sendFailed(msgId: string): void;
+  sendConfirmed(msgId: string): void;
   blobResult(payload: BlobResultPayload): void;
   fileState(payload: FileStatePayload): void;
   audioState(payload: AudioStatePayload): void;
@@ -534,6 +535,10 @@ export type TranscriptEvents = {
   /// Native's send Task errored — mark that optimistic bubble failed (red
   /// retry dot). Keyed by the msgId native minted in `userSent`.
   sendFailed(msgId: string): void;
+  /// The outbox released that send: the gateway has provably written it, so the
+  /// transcript may stop overlaying its optimistic bubble across a REPLACE. The
+  /// return leg of `userSent` — nothing on this side can infer it.
+  sendConfirmed(msgId: string): void;
   /// Native chrome covering the webview's bottom edge (composer + ridden
   /// keyboard), in CSS px. Streams per layout tick through keyboard
   /// animations.
@@ -555,6 +560,7 @@ type Buffered =
   | { kind: "epoch"; epoch: number }
   | { kind: "userSent"; payload: UserSentPayload }
   | { kind: "sendFailed"; msgId: string }
+  | { kind: "sendConfirmed"; msgId: string }
   | { kind: "bottomInset"; px: number }
   | { kind: "jumpToLatest" }
   | { kind: "syncRequested" }
@@ -600,6 +606,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else if (item.kind === "epoch") e.connEpoch(item.epoch);
   else if (item.kind === "userSent") e.userSent(item.payload);
   else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
+  else if (item.kind === "sendConfirmed") e.sendConfirmed(item.msgId);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
   else if (item.kind === "syncRequested") e.syncRequested();
   // Every kind needs its own branch ABOVE the terminal else: that else is a
@@ -655,6 +662,9 @@ window.baybo = {
   },
   sendFailed(msgId) {
     dispatch({ kind: "sendFailed", msgId });
+  },
+  sendConfirmed(msgId) {
+    dispatch({ kind: "sendConfirmed", msgId });
   },
   blobResult(payload) {
     settleBlob(payload);

@@ -1,6 +1,7 @@
 import type { TFunction } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applySyncReplace,
   clearAwaitingApproval,
   bundleAnswer,
   compactionDividerIds,
@@ -1066,6 +1067,114 @@ describe("syncSince / mergeSyncPage — a difference page must EXTEND the thread
   // next open. That mirror needs the resync hatch, not another sync.
   it("cannot re-order one whose cursor that same sync already advanced past the tail", () => {
     expect(syncOnce(scrambled(), 30).map((r) => r.id)).toEqual(["m10", "m20", "w30", "m18"]);
+  });
+});
+
+describe("applySyncReplace — the overlay keeps what the page cannot carry", () => {
+  // The scar: the gateway echoes an inbound message to its own sender BEFORE
+  // handing it to the router that persists it, and that echo frame carries no
+  // ordinal — so `markSent` cleared the spinner on a row the gateway had not
+  // written yet. The overlay gated on `sendState`, so a first send whose own
+  // `connEpoch` sync raced its persistence had its bubble DELETED. The answer's
+  // ordinal then leapfrogged the cursor (a difference selects strictly `>`), so
+  // no later sync could bring it back, and the outbox's next mount-edge replay
+  // re-appended it BELOW the answer.
+  const owed = (...ids: string[]) => new Set(ids);
+  const echoed = (): Row[] => [{ id: "pm-1", role: "user", content: "hi", sendState: undefined }];
+
+  it("keeps an echoed-but-unpersisted send — the echo clears the spinner, not the row", () => {
+    expect(applySyncReplace(echoed(), [], owed("pm-1")).map((r) => r.id)).toEqual(["pm-1"]);
+  });
+
+  it("keeps one still spinning, and one that failed — the red dot is its only retry affordance", () => {
+    const prev: Row[] = [
+      { id: "pm-1", role: "user", content: "a", sendState: "sending" },
+      { id: "pm-2", role: "user", content: "b", sendState: "failed" },
+    ];
+    expect(applySyncReplace(prev, [], owed("pm-1", "pm-2")).map((r) => r.id)).toEqual(["pm-1", "pm-2"]);
+  });
+
+  it("DROPS it once the page carries the durable twin — which renders in its place, in order", () => {
+    const page: Row[] = [
+      { id: "m10", role: "assistant", content: "earlier" },
+      { id: "pm-1", role: "user", ordinal: 11, content: "hi" },
+    ];
+    // The page carrying the id is also what retires it from the owed set, so in
+    // the live path this predicate is belt AND braces.
+    expect(applySyncReplace(echoed(), page, owed("pm-1")).map((r) => r.id)).toEqual(["m10", "pm-1"]);
+  });
+
+  // The regression the FIRST attempt at this fix shipped past its own tests:
+  // keying on `ordinal === undefined` looks equivalent, because the echo never
+  // stamps one and the cursor outruns the durable twin — so EVERY user row this
+  // client rendered live stays ordinal-less for good. A restored thread meeting
+  // any REPLACE narrower than itself then had months of settled questions torn
+  // out of place and welded below the newest answer.
+  it("DROPS settled sends outside a narrow page — the outbox stopped owing them", () => {
+    const prev: Row[] = [
+      { id: "pm-old", role: "user", content: "asked in March" },
+      { id: "m621", role: "assistant", ordinal: 621, content: "answered" },
+      { id: "pm-mid", role: "user", content: "asked in April" },
+      { id: "m987", role: "assistant", ordinal: 987, content: "answered" },
+    ];
+    const page: Row[] = [{ id: "m987", role: "assistant", ordinal: 987, content: "answered" }];
+    expect(applySyncReplace(prev, page, owed()).map((r) => r.id)).toEqual(["m987"]);
+  });
+
+  it("keeps a still-owed send even beside settled ones a narrow page drops", () => {
+    const prev: Row[] = [
+      { id: "pm-old", role: "user", content: "asked in March" },
+      { id: "m987", role: "assistant", ordinal: 987, content: "answered" },
+      { id: "pm-live", role: "user", content: "just now", sendState: "sending" },
+    ];
+    const page: Row[] = [{ id: "m987", role: "assistant", ordinal: 987, content: "answered" }];
+    expect(applySyncReplace(prev, page, owed("pm-live")).map((r) => r.id)).toEqual(["m987", "pm-live"]);
+  });
+
+  it("DROPS another client's live-echoed message — this device's outbox never owed it", () => {
+    const prev: Row[] = [{ id: "pm-laptop", role: "user", content: "sent from my laptop" }];
+    expect(applySyncReplace(prev, [{ id: "m10", role: "assistant", content: "a" }], owed())).toEqual([
+      { id: "m10", role: "assistant", content: "a" },
+    ]);
+  });
+
+  it("carries the single newest open block, dropping an older stale fork", () => {
+    const prev: Row[] = [
+      work({ id: "u-old", steps: [tool({ callId: "c1" })], active: true }),
+      work({ id: "u-new", steps: [tool({ callId: "c2" })], active: true }),
+    ];
+    const out = applySyncReplace(prev, [{ id: "m10", role: "assistant", content: "a" }], owed());
+    expect(out.map((r) => r.id)).toEqual(["m10", "u-new"]);
+  });
+
+  it("fuses the page's cut-off trailing block with the live one — one turn, one card", () => {
+    const prev: Row[] = [work({ id: "u-live", steps: [tool({ callId: "c2" })], active: true })];
+    const page: Row[] = [work({ id: "w20", steps: [tool({ callId: "c1" })], turnComplete: false, startedAt: 20_000 })];
+    const out = applySyncReplace(prev, page, owed());
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: "w20", active: true, startedAt: 20_000 });
+    expect((out[0] as WorkRow).steps.map((s) => (s.kind === "tool" ? s.callId : s.kind))).toEqual(["c1", "c2"]);
+  });
+
+  // The whole reported bug, end to end: send → echo → the REPLACE that raced
+  // persistence → work → answer → the outbox's mount-edge replay.
+  it("never lands the first send below the answer", () => {
+    const markSent = (rows: Row[], id: string, ordinal: number | null): Row[] =>
+      rows.map((r) => (r.role === "user" && r.id === id ? { ...r, sendState: undefined, ordinal: ordinal ?? r.ordinal } : r));
+
+    const owing = new Set<string>(["pm-1"]); // `handleUserSent` minted it
+    let rows: Row[] = [{ id: "pm-1", role: "user", content: "hi", sendState: "sending" }];
+    rows = markSent(rows, "pm-1", null); // the echo: no ordinal, `channel/adapter.rs`
+    rows = applySyncReplace(rows, [], owing); // the baseline whose page predates the write
+    expect(rows.map((r) => r.id)).toEqual(["pm-1"]); // (A) it survives
+
+    rows = [...rows, work({ id: "u-live", steps: [tool()], active: true })]; // (B)
+    rows = [...rows, { id: "m12", role: "assistant", ordinal: 12, content: "there" }];
+
+    // (C) the mount edge replays every send the outbox still owns; the guard
+    // that makes it idempotent is the row being there to find.
+    expect(holdsUserSend(rows, "pm-1")).toBe(true);
+    expect(rows.map((r) => r.id)).toEqual(["pm-1", "u-live", "m12"]);
   });
 });
 
