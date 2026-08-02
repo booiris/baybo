@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
-use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -69,12 +68,22 @@ pub const UNIVERSAL_SKILLS: &[&str] = &[crate::builtin::BAYBO_CLI_SKILL_NAME];
 /// layers, and `reload()` needs to rewrite state without demanding a
 /// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
-    skills: DashMap<String, SkillDefinition>,
+    /// One lock over the whole set rather than a sharded map, because the
+    /// operation that matters is **replacing all of it at once**. `reload`
+    /// rebuilds from disk, and a reader that catches it partway through does
+    /// not see a stale skill — it sees a registry that is missing skills, or
+    /// empty. That is not a blip worth trading for shard concurrency: the
+    /// listing a session seeds from is persisted and never refreshed until a
+    /// compaction, so a session that seeded inside the window advertised a
+    /// truncated set for its whole life. The traffic here is a handful of
+    /// reads per turn against a few dozen entries, which is exactly the shape
+    /// CLAUDE.md says not to reach for `DashMap` for.
+    skills: RwLock<HashMap<String, SkillDefinition>>,
     /// Per-agent private overlays, keyed by profile id. An agent sees
     /// `shared ∪ its own map`, its own entry winning a name collision — for
     /// that agent only. The built-in profile has no entry here: its skills
     /// *are* the shared set.
-    agent_skills: DashMap<AgentProfileId, HashMap<String, SkillDefinition>>,
+    agent_skills: RwLock<HashMap<AgentProfileId, HashMap<String, SkillDefinition>>>,
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
@@ -88,12 +97,16 @@ pub struct SkillRegistry {
     builtins: RwLock<Vec<SkillDefinition>>,
     /// Held for the whole of `reload` and for the whole of an overlay load.
     ///
-    /// `reload` snapshots the dir lists, clears the maps, then rescans. An
-    /// overlay load that lands inside that window records itself in
-    /// `agent_dirs` *after* the snapshot and inserts its skills *before* the
-    /// clear — so the clear removes them, the stale snapshot never restores
-    /// them, and `agent_dir_loaded` now answers "already loaded" forever. The
+    /// `reload` snapshots the dir lists, rescans them, then swaps the result
+    /// in. An overlay load that lands inside that window records itself in
+    /// `agent_dirs` *after* the snapshot and writes its skills *before* the
+    /// swap — so the swap drops them, the stale snapshot never restores them,
+    /// and `agent_dir_loaded` now answers "already loaded" forever. The
     /// agent's private skills would be gone until the next reload.
+    ///
+    /// It orders rebuilds against each other, and nothing else: readers take
+    /// the maps' own locks, which is why the swap has to be atomic on its own
+    /// terms rather than relying on this.
     rebuild: Mutex<()>,
 }
 
@@ -103,11 +116,90 @@ impl Default for SkillRegistry {
     }
 }
 
+/// Read every `<dir>/<name>/SKILL.md` into `out`, returning how many parsed.
+///
+/// Free rather than a method, and writing into a caller-owned map rather than
+/// into the registry, so the disk work is done before any registry lock is
+/// taken — that is what lets `reload` swap a finished set in atomically.
+/// A missing or unreadable `dir` is empty, and one unparseable skill is
+/// skipped rather than failing the scan.
+fn scan_dir_into(dir: &Path, out: &mut HashMap<String, SkillDefinition>) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            debug!(
+                path = %dir.display(),
+                error = %err,
+                "skill directory not available; skipping"
+            );
+            return 0;
+        }
+    };
+
+    let mut loaded = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("SKILL.md").is_file() {
+            continue;
+        }
+        match load_skill_from_dir(&path) {
+            Ok(skill) => {
+                debug!(name = %skill.name, "registering skill");
+                out.insert(skill.name.clone(), skill);
+                loaded += 1;
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to load skill");
+            }
+        }
+    }
+    loaded
+}
+
+/// [`scan_dir_into`] for one agent's private overlay — same on-disk shape,
+/// separate only so the log lines carry the agent.
+fn scan_agent_dir_into(
+    agent: &AgentProfileId,
+    dir: &Path,
+    out: &mut HashMap<String, SkillDefinition>,
+) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            debug!(
+                path = %dir.display(),
+                agent_id = %agent,
+                error = %err,
+                "agent skill directory not available; skipping"
+            );
+            return 0;
+        }
+    };
+
+    let mut loaded = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("SKILL.md").is_file() {
+            continue;
+        }
+        match load_skill_from_dir(&path) {
+            Ok(skill) => {
+                out.insert(skill.name.clone(), skill);
+                loaded += 1;
+            }
+            Err(e) => {
+                warn!(path = %path.display(), agent_id = %agent, error = %e, "failed to load agent skill");
+            }
+        }
+    }
+    loaded
+}
+
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: DashMap::new(),
-            agent_skills: DashMap::new(),
+            skills: RwLock::new(HashMap::new()),
+            agent_skills: RwLock::new(HashMap::new()),
             load_dirs: RwLock::new(Vec::new()),
             agent_dirs: RwLock::new(Vec::new()),
             builtins: RwLock::new(Vec::new()),
@@ -119,7 +211,7 @@ impl SkillRegistry {
     /// same name.
     pub fn register(&self, skill: SkillDefinition) {
         debug!(name = %skill.name, "registering skill");
-        self.skills.insert(skill.name.clone(), skill);
+        self.skills.write().insert(skill.name.clone(), skill);
     }
 
     /// Register every skill compiled into the binary (`crates/skills/src/
@@ -157,41 +249,11 @@ impl SkillRegistry {
                 dirs.push(dir.to_path_buf());
             }
         }
-        self.scan_dir(dir)
-    }
-
-    fn scan_dir(&self, dir: &Path) -> usize {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(err) => {
-                debug!(
-                    path = %dir.display(),
-                    error = %err,
-                    "skill directory not available; skipping"
-                );
-                return 0;
-            }
-        };
-
-        let mut loaded = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if !path.join("SKILL.md").is_file() {
-                continue;
-            }
-            match load_skill_from_dir(&path) {
-                Ok(skill) => {
-                    self.register(skill);
-                    loaded += 1;
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "failed to load skill");
-                }
-            }
-        }
+        // Scanned before the lock is taken, then merged in one step, so a
+        // reader never sees a half-loaded directory.
+        let mut scanned = HashMap::new();
+        let loaded = scan_dir_into(dir, &mut scanned);
+        self.skills.write().extend(scanned);
         loaded
     }
 
@@ -205,24 +267,41 @@ impl SkillRegistry {
     /// Other programmatically registered skills (not via `load_dir` or
     /// `register_builtins`) are cleared — for those, reload is
     /// "authoritative disk state wins."
+    ///
+    /// **Built whole, then swapped in.** Every directory read happens before
+    /// either lock is taken, so a concurrent reader sees the complete old set
+    /// or the complete new one and never the rebuild in progress. Clearing
+    /// first and repopulating over the scans left readers looking at an empty
+    /// registry for as long as the disk took — and the skill listing a session
+    /// seeds from is persisted, so that window could be recorded permanently.
     pub fn reload(&self) -> usize {
         let _rebuild = self.rebuild.lock();
         let dirs: Vec<PathBuf> = self.load_dirs.read().clone();
-        // Snapshot both lists before mutating: the scans below take the same
+        // Snapshot both lists before scanning: the scans below take the same
         // locks these reads hold.
         let agent_dirs: Vec<(AgentProfileId, PathBuf)> = self.agent_dirs.read().clone();
-        self.skills.clear();
-        self.agent_skills.clear();
-        for skill in self.builtins.read().iter() {
-            self.register(skill.clone());
-        }
+
+        let mut shared: HashMap<String, SkillDefinition> = self
+            .builtins
+            .read()
+            .iter()
+            .map(|s| (s.name.clone(), s.clone()))
+            .collect();
         for dir in &dirs {
-            self.scan_dir(dir);
+            scan_dir_into(dir, &mut shared);
         }
+        let mut overlays: HashMap<AgentProfileId, HashMap<String, SkillDefinition>> =
+            HashMap::new();
         for (agent, dir) in &agent_dirs {
-            self.scan_agent_dir(agent, dir);
+            let mut loaded = HashMap::new();
+            scan_agent_dir_into(agent, dir, &mut loaded);
+            overlays.insert(agent.clone(), loaded);
         }
-        self.skills.len()
+
+        let count = shared.len();
+        *self.skills.write() = shared;
+        *self.agent_skills.write() = overlays;
+        count
     }
 
     /// Load `agent`'s private overlay if this process has not already, and
@@ -272,46 +351,15 @@ impl SkillRegistry {
                 dirs.push((agent.clone(), dir.to_path_buf()));
             }
         }
-        self.scan_agent_dir(agent, dir)
+        let mut loaded = HashMap::new();
+        let count = scan_agent_dir_into(agent, dir, &mut loaded);
+        self.agent_skills.write().insert(agent.clone(), loaded);
+        count
     }
 
     /// Whether this agent's overlay has already been scanned in this process.
     fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
         self.agent_dirs.read().iter().any(|(a, _)| a == agent)
-    }
-
-    fn scan_agent_dir(&self, agent: &AgentProfileId, dir: &Path) -> usize {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(err) => {
-                debug!(
-                    path = %dir.display(),
-                    agent_id = %agent,
-                    error = %err,
-                    "agent skill directory not available; skipping"
-                );
-                return 0;
-            }
-        };
-
-        let mut loaded = HashMap::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                continue;
-            }
-            match load_skill_from_dir(&path) {
-                Ok(skill) => {
-                    loaded.insert(skill.name.clone(), skill);
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), agent_id = %agent, error = %e, "failed to load agent skill");
-                }
-            }
-        }
-        let count = loaded.len();
-        self.agent_skills.insert(agent.clone(), loaded);
-        count
     }
 
     /// Whether this scope sees the whole shared set.
@@ -338,8 +386,11 @@ impl SkillRegistry {
         name: &str,
     ) -> Option<SkillDefinition> {
         if let Some(agent) = agent
-            && let Some(overlay) = self.agent_skills.get(agent)
-            && let Some(skill) = overlay.get(name)
+            && let Some(skill) = self
+                .agent_skills
+                .read()
+                .get(agent)
+                .and_then(|overlay| overlay.get(name))
         {
             return Some(skill.clone());
         }
@@ -360,11 +411,14 @@ impl SkillRegistry {
         }
         let mut merged: HashMap<String, SkillSummary> = self
             .skills
+            .read()
             .iter()
-            .filter(|e| UNIVERSAL_SKILLS.contains(&e.key().as_str()))
-            .map(|e| (e.key().clone(), SkillSummary::from(e.value())))
+            .filter(|(name, _)| UNIVERSAL_SKILLS.contains(&name.as_str()))
+            .map(|(name, skill)| (name.clone(), SkillSummary::from(skill)))
             .collect();
-        if let Some(overlay) = agent.and_then(|a| self.agent_skills.get(a)) {
+        if let Some(agent) = agent
+            && let Some(overlay) = self.agent_skills.read().get(agent)
+        {
             for (name, skill) in overlay.iter() {
                 merged.insert(name.clone(), SkillSummary::from(skill));
             }
@@ -376,23 +430,23 @@ impl SkillRegistry {
 
     /// Look up a skill by name, returning a cloned definition.
     pub fn get(&self, name: &str) -> Option<SkillDefinition> {
-        self.skills.get(name).map(|e| e.value().clone())
+        self.skills.read().get(name).cloned()
     }
 
     /// List all registered skill names.
     pub fn list(&self) -> Vec<String> {
-        self.skills.iter().map(|e| e.key().clone()).collect()
+        self.skills.read().keys().cloned().collect()
     }
 
     /// True iff no skills are registered. Used by hot paths to skip
     /// projection allocations when there's nothing to list.
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty()
+        self.skills.read().is_empty()
     }
 
     /// Return every registered skill, sorted by name for stable operator output.
     pub fn all_sorted(&self) -> Vec<SkillDefinition> {
-        let mut out: Vec<SkillDefinition> = self.skills.iter().map(|e| e.value().clone()).collect();
+        let mut out: Vec<SkillDefinition> = self.skills.read().values().cloned().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -403,8 +457,9 @@ impl SkillRegistry {
     pub fn all_summaries_sorted(&self) -> Vec<SkillSummary> {
         let mut out: Vec<SkillSummary> = self
             .skills
-            .iter()
-            .map(|e| SkillSummary::from(e.value()))
+            .read()
+            .values()
+            .map(SkillSummary::from)
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -416,9 +471,9 @@ impl SkillRegistry {
         let needle = query.trim().to_ascii_lowercase();
         let mut hits: Vec<SkillDefinition> = self
             .skills
-            .iter()
-            .filter(|e| {
-                let s = e.value();
+            .read()
+            .values()
+            .filter(|s| {
                 if needle.is_empty() {
                     return true;
                 }
@@ -434,7 +489,7 @@ impl SkillRegistry {
                 }
                 false
             })
-            .map(|e| e.value().clone())
+            .cloned()
             .collect();
         hits.sort_by(|a, b| a.name.cmp(&b.name));
         hits
@@ -449,18 +504,15 @@ impl SkillRegistry {
     /// informational note since the registry has no authoritative list
     /// of "known" models to reject against.
     pub fn validate_all(&self) -> Vec<SkillValidation> {
-        let mut results: Vec<SkillValidation> = self
-            .skills
-            .iter()
-            .map(|e| validate_one(e.value()))
-            .collect();
+        let mut results: Vec<SkillValidation> =
+            self.skills.read().values().map(validate_one).collect();
         results.sort_by(|a, b| a.name.cmp(&b.name));
         results
     }
 
     /// Validate a single skill by name.
     pub fn validate(&self, name: &str) -> Option<SkillValidation> {
-        self.skills.get(name).map(|e| validate_one(e.value()))
+        self.skills.read().get(name).map(validate_one)
     }
 }
 
@@ -971,5 +1023,62 @@ mod tests {
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/nonexistent"));
         assert_eq!(reg.ensure_agent_overlay(&agent, &paths), 0);
         assert!(reg.summaries_for(Some(&agent)).is_empty());
+    }
+
+    fn write_skill_dir(root: &Path, i: usize) {
+        let dir = root.join(format!("skill{i:03}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: skill{i:03}\ndescription: does thing {i}\nversion: 1.0.0\n---\n\n{}\n",
+                "body ".repeat(400)
+            ),
+        )
+        .expect("write skill");
+    }
+
+    /// A reader must never observe the registry mid-rebuild.
+    ///
+    /// `reload` used to `clear()` and then repopulate over real directory
+    /// reads, holding a lock that only excluded other rebuilds — so any
+    /// concurrent reader saw an empty or half-filled set for as long as the
+    /// scan took. That is not a transient blip: the skill listing a session
+    /// seeds from is **persisted** and never refreshed until a compaction, so
+    /// a session unlucky enough to seed inside the window recorded a truncated
+    /// set for its whole life.
+    #[test]
+    fn a_reader_never_sees_a_registry_mid_reload() {
+        const SKILLS: usize = 40;
+        const RELOADS: usize = 12;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..SKILLS {
+            write_skill_dir(dir.path(), i);
+        }
+        let reg = std::sync::Arc::new(SkillRegistry::new());
+        assert_eq!(reg.load_dir(dir.path()), SKILLS);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (reg, stop) = (std::sync::Arc::clone(&reg), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut fewest = usize::MAX;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    fewest = fewest.min(reg.all_summaries_sorted().len());
+                }
+                fewest
+            })
+        };
+        for _ in 0..RELOADS {
+            assert_eq!(reg.reload(), SKILLS);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let fewest = reader.join().expect("reader thread");
+
+        assert_eq!(
+            fewest, SKILLS,
+            "a concurrent reader saw {fewest} of {SKILLS} skills mid-reload"
+        );
     }
 }
