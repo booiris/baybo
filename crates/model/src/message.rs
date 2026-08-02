@@ -271,9 +271,31 @@ pub enum MessageSource {
     /// tracked distinctly so the reconciler can find what it has already said
     /// by provenance instead of sniffing its envelope tag out of the content.
     SystemPromptUpdate,
-    /// Any other agent-originated row: skill reminders, a spawned/subagent task
-    /// prompt, the subagent-finished notification, summary instructions, the
-    /// system prompt, assistant output, tool results. Hidden from chat surfaces.
+    /// The full listing of skills this session may invoke, as
+    /// `baybo_skills::render::render_skill_reminder` writes it. Seeded once and
+    /// re-broadcast by the post-compaction skill trailer, so it is the standing
+    /// baseline a [`MessageSource::SkillsUpdate`] measures the live registry
+    /// against.
+    ///
+    /// Tracked distinctly because provenance is the only thing that separates
+    /// it from its neighbours: the post-compaction skill *detail* payload rides
+    /// the same `<system-reminder>` envelope one row away, as does a slash
+    /// expansion's body, and a workspace-authored skill could otherwise forge
+    /// the header and poison the baseline.
+    SkillListing,
+    /// A notice that the skill registry has moved since the standing
+    /// [`MessageSource::SkillListing`] was written, carrying the difference.
+    /// The registry is mutated at runtime — `SkillInstall`/`SkillUninstall`
+    /// reload it, as does the operator dashboard — so a long conversation would
+    /// otherwise keep advertising skills that no longer exist, and never learn
+    /// of ones that do, until the next compaction. Rides as a framed
+    /// `Role::User` row for the same reason [`MessageSource::SystemPromptUpdate`]
+    /// does.
+    SkillsUpdate,
+    /// Any other agent-originated row: the skill detail payload, a
+    /// spawned/subagent task prompt, the subagent-finished notification, summary
+    /// instructions, the system prompt, assistant output, tool results. Hidden
+    /// from chat surfaces.
     Agent,
 }
 
@@ -288,6 +310,8 @@ impl MessageSource {
             MessageSource::CronNotification => "cron_notification",
             MessageSource::RecalledMemory => "recalled_memory",
             MessageSource::SystemPromptUpdate => "system_prompt_update",
+            MessageSource::SkillListing => "skill_listing",
+            MessageSource::SkillsUpdate => "skills_update",
             MessageSource::Agent => "agent",
         }
     }
@@ -304,6 +328,8 @@ impl std::str::FromStr for MessageSource {
             "cron_notification" => Ok(MessageSource::CronNotification),
             "recalled_memory" => Ok(MessageSource::RecalledMemory),
             "system_prompt_update" => Ok(MessageSource::SystemPromptUpdate),
+            "skill_listing" => Ok(MessageSource::SkillListing),
+            "skills_update" => Ok(MessageSource::SkillsUpdate),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
         }
@@ -424,6 +450,35 @@ impl ChatMessage {
             content,
             platform_msg_id: String::new(),
             source: MessageSource::SystemPromptUpdate,
+        }
+    }
+
+    /// The standing listing of skills this session may invoke — the **only**
+    /// constructor that marks a row [`MessageSource::SkillListing`], so the
+    /// drift delta can find its baseline by provenance rather than by matching
+    /// an envelope its neighbours also use.
+    ///
+    /// `Role::User` because providers reject a `Role::System` row outside the
+    /// leading slot; `merge_for_llm` folds it into the first real user message.
+    pub fn skill_listing(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::SkillListing,
+        }
+    }
+
+    /// A notice that the skill registry has moved since the standing listing
+    /// was written — the **only** constructor that marks a row
+    /// [`MessageSource::SkillsUpdate`]. Same role and same read-back contract
+    /// as [`Self::system_prompt_update`].
+    pub fn skills_update(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::SkillsUpdate,
         }
     }
 
@@ -731,6 +786,8 @@ mod tests {
                 | MessageSource::CronNotification
                 | MessageSource::RecalledMemory
                 | MessageSource::SystemPromptUpdate
+                | MessageSource::SkillListing
+                | MessageSource::SkillsUpdate
                 | MessageSource::Agent => {}
             }
         }
@@ -741,6 +798,8 @@ mod tests {
             MessageSource::CronNotification,
             MessageSource::RecalledMemory,
             MessageSource::SystemPromptUpdate,
+            MessageSource::SkillListing,
+            MessageSource::SkillsUpdate,
             MessageSource::Agent,
         ]
     }
@@ -756,46 +815,50 @@ mod tests {
         );
     }
 
-    /// The hand-maintained TS mirror `app/web/src/types/trace.ts` is **not** covered
-    /// by `scripts/check-ts-bindings.sh` (that gate only spans the ts-rs
-    /// surfaces), so it has silently drifted before. This guards it directly: the
-    /// `MessageSource` union there must list exactly the serialized form of every
-    /// Rust variant — catching both a new Rust variant the mirror forgot and a
-    /// stale member the mirror kept.
+    /// The hand-maintained TS mirrors are **not** covered by
+    /// `scripts/check-ts-bindings.sh` (that gate only spans the ts-rs
+    /// surfaces), so they have silently drifted before. This guards them
+    /// directly: each `MessageSource` union must list exactly the serialized
+    /// form of every Rust variant — catching both a new Rust variant a mirror
+    /// forgot and a stale member it kept.
+    ///
+    /// **Both** mirrors, because covering only the dashboard is what let the
+    /// bench viewer's copy fall two variants behind unnoticed.
     #[test]
     fn message_source_matches_ts_mirror() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../app/web/src/types/trace.ts"
-        );
-        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-
-        // Slice the `export type MessageSource = ...;` declaration (robust to the
-        // union spanning multiple lines) and pull its single-quoted members.
-        let start = src
-            .find("export type MessageSource")
-            .unwrap_or_else(|| panic!("`export type MessageSource` not found in {path}"));
-        let decl = &src[start..];
-        let end = decl
-            .find(';')
-            .unwrap_or_else(|| panic!("MessageSource union not `;`-terminated in {path}"));
-        let ts_members: BTreeSet<String> = decl[..end]
-            .split('\'')
-            .skip(1)
-            .step_by(2)
-            .map(str::to_string)
-            .collect();
-
         let rust_members: BTreeSet<String> = all_message_sources()
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
+        for rel in [
+            "/../../app/web/src/types/trace.ts",
+            "/../../bench/bench-web/web/src/types/trace.ts",
+        ] {
+            let path = format!("{}{rel}", env!("CARGO_MANIFEST_DIR"));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
-        assert_eq!(
-            rust_members, ts_members,
-            "MessageSource drift between baybo_model and app/web/src/types/trace.ts — \
-             keep the TS union in sync with the Rust enum"
-        );
+            // Slice the `export type MessageSource = ...;` declaration (robust to
+            // the union spanning multiple lines) and pull its quoted members.
+            let start = src
+                .find("export type MessageSource")
+                .unwrap_or_else(|| panic!("`export type MessageSource` not found in {path}"));
+            let decl = &src[start..];
+            let end = decl
+                .find(';')
+                .unwrap_or_else(|| panic!("MessageSource union not `;`-terminated in {path}"));
+            let ts_members: BTreeSet<String> = decl[..end]
+                .split('\'')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect();
+
+            assert_eq!(
+                rust_members, ts_members,
+                "MessageSource drift between baybo_model and {path} — \
+                 keep the TS union in sync with the Rust enum"
+            );
+        }
     }
 
     #[test]

@@ -82,7 +82,9 @@ export type Role = 'system' | 'user' | 'assistant' | 'tool';
 // no inference behind it); 'recalled_memory' = memories recalled from long-term
 // storage, injected (framed) to inform the turn; 'system_prompt_update' = the
 // parts of the system prompt that changed on disk after the leading system row
-// was written; 'agent' = everything else the agent injects/produces.
+// was written; 'skill_listing' = the standing listing of invocable skills;
+// 'skills_update' = how that listing has changed since it was written;
+// 'agent' = everything else the agent injects/produces.
 export type MessageSource =
   | 'user'
   | 'user_interjection'
@@ -90,6 +92,8 @@ export type MessageSource =
   | 'cron_notification'
   | 'recalled_memory'
   | 'system_prompt_update'
+  | 'skill_listing'
+  | 'skills_update'
   | 'agent';
 
 export interface BlobRef {

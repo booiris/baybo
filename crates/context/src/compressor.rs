@@ -281,9 +281,27 @@ impl ContextManager {
         // discarded — the walk runs backward from the tail, which is exactly
         // where they are appended, so each one would otherwise push a real
         // turn out of the kept slice.
+        //
+        // The skill rows go the same way, and the listing's case is stronger
+        // than hygiene. `insert_skill_trailer` unconditionally inserts a fresh
+        // listing just after the system block — a low index — while an older
+        // one can survive inside the kept verbatim tail at a higher index, so
+        // `seeded_skill_listing`'s `rfind` would pick the stale copy. Diffing a
+        // stale baseline against the live set is the one shape that can HIDE a
+        // removal: a skill dropped between the two never appears as a `-` line
+        // and never appears in the live set either, so the model goes on
+        // believing in it. Filtering leaves exactly one listing row, which is by
+        // construction the newest the model was shown.
         let non_system: Vec<ChatMessage> = non_system
             .into_iter()
-            .filter(|m| m.source() != MessageSource::SystemPromptUpdate)
+            .filter(|m| {
+                !matches!(
+                    m.source(),
+                    MessageSource::SystemPromptUpdate
+                        | MessageSource::SkillListing
+                        | MessageSource::SkillsUpdate
+                )
+            })
             .collect();
 
         let instruction =

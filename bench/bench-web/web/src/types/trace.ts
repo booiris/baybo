@@ -75,7 +75,11 @@ export type MessageSource =
   | 'user'
   | 'user_interjection'
   | 'cron'
+  | 'cron_notification'
   | 'recalled_memory'
+  | 'system_prompt_update'
+  | 'skill_listing'
+  | 'skills_update'
   | 'agent';
 
 export interface BlobRef {

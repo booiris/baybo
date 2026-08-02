@@ -55,9 +55,12 @@ ContextManager (struct)
 │                            persist_compaction so the refresh is durable
 └── prompts/          — all model-facing framing text + pure builders
     ├── soul.rs            — assemble (TOP/TAIL hints + identity) → AssembledPrompt
+    ├── line_diff.rs       — unified_diff (shared by both drift deltas)
     ├── system_prompt_update.rs — build_blocks / wrap_update
     │                            (<system_prompt_update> drift delta,
     │                             per-section unified diff)
+    ├── skills_update.rs   — wrap_update (<skills_update> drift delta
+    │                        against the standing skill listing)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
     ├── background_notification.rs — build_completion_reply +
     │                              build_notification_content
@@ -231,6 +234,55 @@ cannot vouch for, and `None` means "look properly". A subagent session's version
 is its profile name: the registry is in-memory and immutable for the process, so
 nothing can move under it mid-session, and a profile edited across a deploy is
 caught by the hydration `None` like any other.
+
+### The skill listing's lifecycle
+
+The same shape, one row down. `ensure_seeded` writes the invocable set as a
+`<system-reminder>` row (`MessageSource::SkillListing`) and it is **persisted**;
+`insert_skill_trailer` re-broadcasts a fresh one after each compaction. Nothing
+else refreshed it, so between compactions a conversation named skills that no
+longer existed and was blind to ones that did. **The model opens that gap
+itself** — `SkillInstall`/`SkillUninstall` call `SkillRegistry::reload()`, so a
+conversation that installs a skill could not see it, and every other live
+conversation desynced at the same moment.
+
+`reconcile_skills` runs beside `reconcile_system_prompt` before every main LLM
+call and appends the difference as a `<skills_update>` row. Same contract as its
+sibling: appended and never written over the listing row (which sits inside the
+prompt-cache prefix — `merge_for_llm` folds it into the first user message), a
+**complete delta against the listing row** so the newest supersedes the rest,
+the identical-update dedupe, and a retraction when the registry moves and moves
+back.
+
+Three things differ, each for a reason:
+
+- **The listing is its own version.** There is no registry counter, and one
+  would be the wrong shape: the registry is process-wide while the listing is
+  per-session (`invocable_skill_summaries` filters by the bound agent's overlay,
+  `agent_invocable`, trust and channel), so a shared counter would fire for
+  sessions nothing changed for and could not fire for one whose overlay moved
+  alone. Rendering and comparing the listing costs about a microsecond against
+  the `stat`s the sibling check already pays.
+- **A separate envelope, because the payload is not trusted.**
+  `system_prompt_update` states outright that it does not escape its body —
+  every byte comes from the workspace's own identity files. A skill is
+  third-party content an operator or the model installed, so
+  `render_skill_listing` neutralises the envelopes its `description` rides in
+  (and folds it to one line, which is what makes a line diff mean "these skills
+  changed"). Folding the two would have extended the trusted-payload claim to
+  bytes that do not deserve it.
+- **Always a diff, at any size.** A full listing communicates a removal only by
+  absence, and a model that reads an omission as an abbreviation keeps planning
+  around a skill that is gone. A `-` line says it outright, and the framing
+  names the consequence.
+
+The compaction filter drops `SkillListing` and `SkillsUpdate` rows alongside
+`SystemPromptUpdate`, and for the listing that is **correctness, not hygiene**:
+`insert_skill_trailer` inserts the fresh listing just after the system block (a
+low index) while an older one can survive in the kept verbatim tail (a higher
+index), so `seeded_skill_listing`'s `rfind` would pick the stale copy. Diffing a
+stale baseline against the live set is the one shape that can *hide* a removal —
+a skill dropped between the two appears in neither the diff nor the live set.
 
 ## Design Decisions
 
