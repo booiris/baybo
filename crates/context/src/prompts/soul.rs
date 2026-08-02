@@ -8,7 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use baybo_workspace::{IdentitySource, WorkspacePaths, absolutise};
+use baybo_model::AgentProfileId;
+use baybo_workspace::{IdentityKind, IdentitySource, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
@@ -141,6 +142,104 @@ impl AssembledPrompt {
     pub fn parts(&self) -> &[PromptPart] {
         &self.parts
     }
+
+    /// What this prompt costs, per identity file, on every request the session
+    /// makes. The dream pass is handed these numbers because the instruction it
+    /// runs on ("keep them lean") is otherwise an adjective with nothing behind
+    /// it — a pass with no sense of the budget trims until the diff feels big
+    /// enough and stops, which is what it did.
+    pub fn budget(&self, tokenizer: &dyn crate::tokenizer::Tokenizer) -> PromptBudget {
+        let mut budget = PromptBudget::default();
+        for part in &self.parts {
+            let cost = tokenizer.count_text(&part.render());
+            budget.total += cost;
+            if let PromptPart::Section { tag, .. } = part {
+                let slot = match tag {
+                    SectionTag::Soul => &mut budget.soul,
+                    SectionTag::Identity => &mut budget.identity,
+                    SectionTag::SharedUserProfile => &mut budget.shared_user_profile,
+                    SectionTag::UserNotes => &mut budget.user_notes,
+                    SectionTag::Memory => &mut budget.memory_index,
+                };
+                *slot += cost;
+            }
+        }
+        budget
+    }
+}
+
+/// Per-section token cost of an assembled prompt.
+///
+/// Every field but [`Self::memory_index`] is a file that rides the prompt in
+/// full and is therefore paid on every call; the memory index is the one that
+/// buys deferred reads, so it is reported beside them as the cheaper place to
+/// put detail.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PromptBudget {
+    pub soul: usize,
+    pub identity: usize,
+    pub user_notes: usize,
+    pub shared_user_profile: usize,
+    pub memory_index: usize,
+    /// The whole prompt, hints included.
+    pub total: usize,
+}
+
+/// Which identity files an agent's prompt is assembled from, and what to seed
+/// each with when it does not exist yet.
+///
+/// Keyed on the agent alone. The profile row is not consulted — not even for
+/// its existence: the files are named by the id the session carries, so
+/// deleting a profile leaves every bound conversation with the persona it has
+/// been talking to.
+pub struct PersonaSources {
+    pub soul_path: PathBuf,
+    pub soul_seed: String,
+    pub self_image_path: PathBuf,
+    pub self_image_seed: String,
+    pub user_notes_path: PathBuf,
+    pub user_notes_seed: String,
+    /// This agent's `MEMORY.md`, or `None` when file memory is disabled.
+    /// Resolved from the same binding as the identity files, so a session can
+    /// never read one agent's soul with another's memory.
+    pub memory_index: Option<PathBuf>,
+}
+
+impl PersonaSources {
+    pub fn for_agent(paths: &WorkspacePaths, agent: &AgentProfileId, builtin_memory: bool) -> Self {
+        let path = |kind: IdentityKind| agent.identity_file(paths, kind);
+        // The same table setup and profile creation seed from. A file the
+        // operator deleted must come back as what shipped, not as whatever
+        // this path happened to name — recreating the built-in's `SOUL.md`
+        // from the custom-agent skeleton would rewrite who the assistant is,
+        // permanently and silently.
+        let seed = |kind| baybo_workspace::identity::persona_seed(agent.as_str(), kind).to_string();
+        Self {
+            soul_path: path(IdentityKind::Soul),
+            soul_seed: seed(IdentityKind::Soul),
+            self_image_path: path(IdentityKind::Identity),
+            self_image_seed: seed(IdentityKind::Identity),
+            user_notes_path: path(IdentityKind::User),
+            user_notes_seed: seed(IdentityKind::User),
+            memory_index: builtin_memory.then(|| agent.memory_index_file(paths)),
+        }
+    }
+}
+
+/// [`assemble`] against a resolved [`PersonaSources`], for callers that hold an
+/// agent id rather than four paths.
+pub async fn assemble_for(
+    paths: &WorkspacePaths,
+    sources: &PersonaSources,
+) -> anyhow::Result<AssembledPrompt> {
+    assemble(
+        paths,
+        IdentitySource::new(&sources.soul_path, &sources.soul_seed),
+        IdentitySource::new(&sources.self_image_path, &sources.self_image_seed),
+        IdentitySource::new(&sources.user_notes_path, &sources.user_notes_seed),
+        sources.memory_index.as_deref(),
+    )
+    .await
 }
 
 /// Size past which a memory index is worth complaining about. Not a cap —

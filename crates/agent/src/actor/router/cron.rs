@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use baybo_context::prompts::cron::{DreamDigestGroup, DreamDigestSession, frame_dream_digest};
+use baybo_context::prompts::soul::{PersonaSources, PromptBudget, assemble_for};
+use baybo_context::tokenizer::TiktokenTokenizer;
 use baybo_cron::{CronTriggerEvent, ExecutionCompletion};
 use baybo_model::{
     AgentBinding, AgentFramework, AgentProfileId, BuiltinCronJob, CronExecution, ExecutionOutcome,
@@ -406,6 +408,7 @@ impl Router {
                 agent_label: agent.as_str().to_string(),
                 sessions: work.sessions,
                 held_back: work.held_back,
+                budget: self.dream_prompt_budget(&agent).await,
             };
             let Some(digest) = frame_dream_digest(&digest) else {
                 continue;
@@ -447,6 +450,28 @@ impl Router {
                     error = %e,
                     "failed to advance the dream cursor; this conversation will be offered again"
                 );
+            }
+        }
+    }
+
+    /// What `agent`'s system prompt costs per call, for the pass to trim
+    /// against. `None` when the assembly fails — the pass still has work to do
+    /// without it, so a bad read degrades the instruction rather than the fire.
+    ///
+    /// Built-in memory is taken as on: the dream job is only ever seeded when
+    /// it is (`ensure_dream_job`), so a fire reaching here has a memory tree.
+    ///
+    /// The count is an estimate — the encoding is picked here, not by the model
+    /// the fire will actually run on. That is the right trade: this number
+    /// steers how hard the pass trims, and being 5% out never changes that
+    /// answer, while threading the fire's model down here would.
+    async fn dream_prompt_budget(&self, agent: &AgentProfileId) -> Option<PromptBudget> {
+        let sources = PersonaSources::for_agent(&self.workspace, agent, true);
+        match assemble_for(&self.workspace, &sources).await {
+            Ok(prompt) => Some(prompt.budget(&TiktokenTokenizer::for_model(""))),
+            Err(e) => {
+                warn!(agent_id = %agent, error = %e, "dream: cannot price the identity files; firing without a budget");
+                None
             }
         }
     }
