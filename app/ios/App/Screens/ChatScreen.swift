@@ -27,6 +27,15 @@ struct ChatScreen: View {
     /// dismissal where a guessed delay is not, so the ring blooms on a clear
     /// screen instead of behind the sliding sheet.
     @State private var pendingJump: String?
+    /// How the native chrome crosses with an expanding / collapsing HTML
+    /// preview. It is composited ABOVE the webview, so a hard cut shows: on the
+    /// way IN it vanished a beat before the box had grown over the thread
+    /// (three raw frames of headerless, composerless conversation), and on the
+    /// way OUT it reappeared ON TOP of a still-full-screen agent page — the back
+    /// button and the composer pill drawn over someone's article. Matches
+    /// `--html-preview-morph-ms` in the transcript's styles.css; nothing breaks
+    /// if the two drift, it just stops crossing cleanly.
+    private static let chromeFade = Animation.easeInOut(duration: 0.26)
 
     init(host: TranscriptHost, store: ChatStore) {
         _store = ObservedObject(wrappedValue: store)
@@ -75,16 +84,33 @@ struct ChatScreen: View {
             .opacity(bridge.htmlPreviewMaximized ? 0 : 1)
             .allowsHitTesting(!bridge.htmlPreviewMaximized)
             .accessibilityHidden(bridge.htmlPreviewMaximized)
+            .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
         }
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
-        .background(PopGestureEnabler().frame(width: 0, height: 0))
+        // While a full-screen HTML preview covers the conversation it borrows
+        // that edge: swiping out of the preview must leave the PREVIEW, not the
+        // chat behind it. Native decides the release and the page draws the
+        // travel, since the box lives in the webview.
+        .background(
+            PopGestureEnabler(
+                edgeOverride: EdgeSwipeOverride(
+                    active: bridge.htmlPreviewMaximized,
+                    begin: { bridge.htmlPreviewDragBegin() },
+                    move: { bridge.htmlPreviewDragMove($0) },
+                    end: { bridge.htmlPreviewDragEnd(dismiss: $0) }
+                )
+            )
+            .frame(width: 0, height: 0)
+        )
         // Everything the dock's own chain has to get right — the panel floating
-        // above its top edge, the collapse that must not clip — lives in
-        // `ComposerDock`, which is store-free so `ComposerDockTests` can render
-        // it. Only the CONTENT is assembled here.
+        // above its top edge, the collapse that must neither clip nor resize —
+        // lives in `ComposerDock`, which is store-free so `ComposerDockTests`
+        // can render it. Only the CONTENT is assembled here.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposerDock(collapsed: bridge.htmlPreviewMaximized, jumpVisible: bridge.jumpVisible) {
+            ComposerDock(
+                collapsed: bridge.htmlPreviewMaximized, jumpVisible: bridge.jumpVisible
+            ) {
                 VStack(spacing: 12) {
                     if bridge.jumpVisible {
                         Button {
@@ -122,6 +148,8 @@ struct ChatScreen: View {
                     }
                 }
             }
+            .animation(Self.chromeFade, value: bridge.htmlPreviewMaximized)
+
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
@@ -179,6 +207,7 @@ struct ChatScreen: View {
                 store.startDemoAttachmentsIfRequested()
                 store.startDemoImagesIfRequested()
                 store.startDemoApprovalIfRequested()
+                store.startDemoHtmlIfRequested()
                 store.startDemoSwitchIfRequested()
                 store.startDemoIndexIfRequested()
                 bridge.startDemoJumpIfRequested()

@@ -233,6 +233,20 @@ without touching `app/ios` at all.
   `chatResolveApproval` on). Screenshot at ~4s for the card + both steps'
   "waiting for approval", then tap Approve/Deny for the verdict labels.
 
+- **`-baybo-demo-html`** (DEBUG, with `-baybo-open-chat`) pushes one agent turn
+  whose answer carries a `baybo-html` marker, so the inline preview card, its
+  fullscreen expansion and the left-edge swipe out of it are drivable with no
+  gateway. The bytes behind the marker are served by `TranscriptSchemeHandler`
+  under the SAME flag (a demo session has no leg, so a real blob read could only
+  ever answer `notFound` and the reader would get the failure document);
+  `app/ios/UITests/HtmlPreviewUITests.swift` drives the swipe. That test is the
+  only tier that can see the gesture at all — the web half's tests stop at the
+  bridge, and the native half only exists against a live
+  UINavigationController — and it asserts BOTH failures separately: the chat
+  header still existing (the pop did not fire) and the header being HITTABLE
+  again (the preview really left, rather than the swipe doing nothing behind an
+  `allowsHitTesting(false)` chrome layer).
+
 - **`-baybo-demo-models`** (DEBUG, with `-baybo-open-chat`) seeds a canned model
   catalog into `ModelCatalog` — gpt-5.5 deliberately via TWO provider entries,
   efforts both set and unset — so the header's model pill + the three-level menu

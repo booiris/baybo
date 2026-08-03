@@ -32,6 +32,44 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
     private static let htmlPreviewFailureDocument =
         #"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0}body{display:grid;place-items:center;padding:24px;box-sizing:border-box;color:#6b6b6b;background:#fff;font:14px ui-monospace,SFMono-Regular,monospace;text-align:center}</style><body>HTML preview unavailable. Use the reload button to try again.</body>"#
 
+    #if DEBUG
+        /// The page `-baybo-demo-html` (see `DemoFrames`) points its marker at.
+        /// A demo session has no leg, so a real blob read could only ever answer
+        /// `notFound` and the reader would get the failure document. Gated on
+        /// BOTH the exact id and the launch argument, so nothing reaches it
+        /// without having asked. The bytes obey the same response CSP as any
+        /// agent-authored page — inline style, no network, no images.
+        static let demoHtmlBlobId = "sha256:" + String(repeating: "de", count: 32) + ".d0"
+        private static let demoHtmlArg = "-baybo-demo-html"
+        private static let demoHtmlDocument = #"""
+            <!doctype html><html lang="en"><head><meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>
+              body{margin:0;padding:18px;font:14px/1.5 -apple-system,system-ui,sans-serif;color:#1c1c1e;background:#fff}
+              h1{margin:0 0 2px;font-size:17px}p.sub{margin:0 0 18px;color:#8a8a8e;font-size:12px}
+              .bars{display:flex;align-items:flex-end;gap:10px;height:150px}
+              .bar{flex:1;background:linear-gradient(180deg,#4c6ef5,#7048e8);border-radius:6px 6px 0 0;position:relative}
+              .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:11px;color:#8a8a8e}
+              .row{display:flex;gap:12px;margin-top:32px}
+              .kpi{flex:1;border:1px solid #e5e5ea;border-radius:10px;padding:10px 12px}
+              .kpi b{display:block;font-size:20px}.kpi em{font-style:normal;font-size:11px;color:#8a8a8e}
+            </style></head><body>
+            <h1>Quarterly sales</h1><p class="sub">2026 · thousands</p>
+            <div class="bars">
+              <div class="bar" style="height:45%"><span>Q1</span></div>
+              <div class="bar" style="height:70%"><span>Q2</span></div>
+              <div class="bar" style="height:58%"><span>Q3</span></div>
+              <div class="bar" style="height:92%"><span>Q4</span></div>
+            </div>
+            <div class="row">
+              <div class="kpi"><b>412</b><em>full year</em></div>
+              <div class="kpi"><b>+18%</b><em>year over year</em></div>
+              <div class="kpi"><b>103</b><em>quarter mean</em></div>
+            </div>
+            </body></html>
+            """#
+    #endif
+
     private let dynamicRoute: DynamicRoute
 
     /// Live scheme tasks, by identity. An async blob serve MUST confirm its
@@ -134,6 +172,16 @@ final class TranscriptSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private func startHtmlPreview(url: URL, task: WKURLSchemeTask) {
         let blobId = String(url.path.dropFirst(Self.htmlPreviewPathPrefix.count))
+        #if DEBUG
+            if blobId == Self.demoHtmlBlobId,
+                ProcessInfo.processInfo.arguments.contains(Self.demoHtmlArg)
+            {
+                finish(
+                    task: task, url: url, status: 200,
+                    data: Data(Self.demoHtmlDocument.utf8), response: .htmlPreview)
+                return
+            }
+        #endif
         startBlob(
             url: url, task: task, blobId: blobId,
             maxBytes: UInt64(Self.htmlPreviewServeCap), response: .htmlPreview)

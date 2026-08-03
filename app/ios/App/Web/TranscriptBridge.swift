@@ -307,6 +307,41 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("collapseHtmlPreview", "")
     }
 
+    /// The left-edge swipe over a full-screen preview, streamed to the page that
+    /// draws it. The pop is held off for the duration (`EdgeSwipeOverride`), so
+    /// this is the ONLY thing the gesture can mean while one is up.
+    ///
+    /// Guarded on the maximized flag rather than fired blind: the flag drops the
+    /// instant the web side commits to a dismissal, and a `move` that lands
+    /// after that would re-address a box already on its way out.
+    func htmlPreviewDragBegin() {
+        guard htmlPreviewMaximized else { return }
+        call("htmlPreviewDragBegin", "")
+    }
+
+    func htmlPreviewDragMove(_ points: CGFloat) {
+        guard htmlPreviewMaximized else { return }
+        call("htmlPreviewDragMove", String(Int(points.rounded())))
+    }
+
+    /// Native judged the release, so native retires the flag — the web echo
+    /// that follows is confirmation, not the trigger.
+    ///
+    /// This is the screen's escape hatch, and it must not depend on the web
+    /// process. While the flag is up there is no back button, no composer and
+    /// no interactive pop, so every way out of the conversation runs through a
+    /// page rendering ARBITRARY agent-authored script. One `while(true)` in
+    /// there and a swipe whose dismissal only the page can conclude would leave
+    /// nothing but a force-quit. (A jetsammed web process heals itself — the
+    /// reload's `ready` clears the flag — but a wedged one never does.)
+    /// Behaviour-neutral on the happy path: the page posts `false` at the very
+    /// start of its exit animation anyway, i.e. this same instant.
+    func htmlPreviewDragEnd(dismiss: Bool) {
+        guard htmlPreviewMaximized else { return }
+        call("htmlPreviewDragEnd", dismiss ? "true" : "false")
+        if dismiss { htmlPreviewMaximized = false }
+    }
+
     #if DEBUG
         /// `-baybo-demo-jump`: 4s in, shove the document off the newest edge from
         /// inside the page — the REAL window scroll → showJump → `jumpVisible`

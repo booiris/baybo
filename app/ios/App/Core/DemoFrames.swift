@@ -16,12 +16,13 @@
         private static let demoIndexArg = "-baybo-demo-index"
         static let demoApprovalArg = "-baybo-demo-approval"
         static let demoSwitchArg = "-baybo-demo-switch"
+        static let demoHtmlArg = "-baybo-demo-html"
 
         /// Flags that push a canned TURN — rows that look durable but are backed
         /// by no gateway — into a session that is only ever a local draft.
         private static let cannedTurnArgs = [
             demoFramesArg, demoAttachmentsArg, demoImagesArg, demoIndexArg, demoApprovalArg,
-            demoSwitchArg,
+            demoSwitchArg, demoHtmlArg,
         ]
 
         /// True while such a fixture is driving. `ChatStore.requestSync` reads it:
@@ -715,6 +716,37 @@
                 ])
             }
             return true
+        }
+
+        /// `-baybo-demo-html` (DEBUG, with `-baybo-open-chat`): one agent turn
+        /// whose answer carries a `baybo-html` marker, so the inline preview
+        /// card, its fullscreen expansion and the left-edge swipe that leaves
+        /// that fullscreen (rather than the conversation) are all drivable with
+        /// no gateway. The bytes behind the marker are served by
+        /// `TranscriptSchemeHandler` under the same flag — a demo session has no
+        /// leg, so a real blob read could only ever answer `notFound`.
+        func startDemoHtmlIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoHtmlArg) else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                pushDemoUserSent(msgId: "demo-html-u1", text: "Make me a small sales dashboard")
+                pushDemo(["kind": "turn_state", "active": true])
+                try? await Task.sleep(for: .milliseconds(500))
+                let answer = #"""
+                    Here it is — tap the expand control for the full screen.
+
+                    ```baybo-html
+                    \#(TranscriptSchemeHandler.demoHtmlBlobId)
+                    ```
+
+                    Want it broken down by month as well?
+                    """#
+                pushDemo([
+                    "kind": "message", "role": "assistant", "content": answer,
+                    "platform_msg_id": "demo-html-1", "ordinal": 1,
+                ])
+                pushDemo(["kind": "turn_state", "active": false])
+            }
         }
 
         func startDemoSwitchIfRequested() {

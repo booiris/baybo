@@ -19,11 +19,18 @@ import SwiftUI
 /// the pixels. A stand-in view reproducing the chain would have been worse than
 /// no test — it would stay green the next time the real screen diverged.
 ///
-/// THE INVARIANT: this chain must never clip. Everything the dock shows that
-/// matters — the attach panel above its top edge, `composerVeil`'s solid tail
-/// down over the home indicator, the pill's ambient shadow — is drawn OUTSIDE
-/// these bounds by design. The collapse is `opacity` + a zero `frame`, which
-/// hides the overflow without cutting it.
+/// THE INVARIANT: this chain must never clip, and the collapse must not RESIZE
+/// it either. Everything the dock shows that matters — the attach panel above
+/// its top edge, `composerVeil`'s solid tail down over the home indicator, the
+/// pill's ambient shadow — is drawn OUTSIDE these bounds by design, so a clip
+/// deletes it. And the dock's own geometry is what native reports to the web
+/// side as the transcript's bottom obstruction (`ComposerView`'s
+/// `onGeometryChange` → `setComposerTop`), so collapsing the height MOVES that
+/// edge: the thread reflowed when a preview took the screen and reflowed back
+/// when it left. Nobody saw the first one — but the preview's edge-swipe
+/// dismissal uncovers the thread WHILE it travels, and the second played in
+/// full view. `opacity` alone hides it, without cutting anything and without
+/// telling the transcript its floor moved.
 struct ComposerDock<Content: View, Panel: View>: View {
     /// An expanded HTML preview owns the screen: the dock goes invisible, deaf
     /// and weightless, but stays MOUNTED — the composer's unsent text is its own
@@ -53,8 +60,8 @@ struct ComposerDock<Content: View, Panel: View>: View {
             .opacity(collapsed ? 0 : 1)
             .allowsHitTesting(!collapsed)
             .accessibilityHidden(collapsed)
-            // NO `.clipped()` — see THE INVARIANT above. `opacity` is what hides
-            // what the zero-height frame overflows.
-            .frame(height: collapsed ? 0 : nil)
+            // NO `.clipped()` and NO collapsing `.frame(height:)` — see THE
+            // INVARIANT above. Invisible, deaf and weightless, but the same
+            // size, so the floor it reports to the transcript never moves.
     }
 }
