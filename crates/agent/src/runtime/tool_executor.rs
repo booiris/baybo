@@ -25,6 +25,25 @@ use uuid::Uuid;
 use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
+/// The read-only paths a session's sandbox re-binds over the `$BAYBO_HOME`
+/// mask: the **calling agent's own** skill directory, and nothing else.
+///
+/// Not optional — `SkillInstall` writes there, so without the bind an agent
+/// can install a skill whose bundled `scripts/` it is then unable to run. And
+/// deliberately only its own: binding a second agent's directory would hand
+/// this session read access to skills its scope does not admit, which is the
+/// isolation the scoped registry exists to provide.
+///
+/// A named function rather than an inline `vec![]` so the rule is assertable —
+/// binding the wrong agent's directory is a silent privacy regression that
+/// nothing downstream would fail on.
+fn sandbox_readable_paths(
+    paths: &baybo_workspace::WorkspacePaths,
+    agent: &baybo_model::AgentProfileId,
+) -> Vec<PathBuf> {
+    vec![agent.skills_dir(paths)]
+}
+
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 
@@ -665,6 +684,7 @@ impl ToolExecutor {
                             home.clone().unwrap_or_else(|| self.workspace_root.clone());
                         let denied =
                             default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
+                        let skill_roots = sandbox_readable_paths(&self.workspace_paths, agent_id);
                         Arc::new(
                             SandboxAdapter::new(
                                 Arc::clone(runner),
@@ -672,7 +692,7 @@ impl ToolExecutor {
                                 NetworkPolicy::All,
                             )
                             .with_permissive_filesystem(extra_root, denied)
-                            .with_readable_paths(vec![self.workspace_paths.skills_dir()]),
+                            .with_readable_paths(skill_roots),
                         ) as Arc<dyn ExecSandbox>
                     })
                 } else {
@@ -927,6 +947,37 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    /// The sandbox binds the caller's own skill directory and no other
+    /// agent's. Nothing downstream fails if the wrong one is bound — the
+    /// session simply gains read access to skills its scope does not admit —
+    /// so this is the only place that catches it.
+    #[test]
+    fn the_sandbox_binds_only_the_calling_agents_skill_dir() {
+        let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/ws"));
+        let mine = baybo_model::AgentProfileId::parse("01JMINE").expect("valid id");
+        let theirs = baybo_model::AgentProfileId::parse("01JTHEIRS").expect("valid id");
+
+        assert_eq!(
+            super::sandbox_readable_paths(&paths, &mine),
+            vec![paths.persona_skills_dir("01JMINE")],
+        );
+        assert!(
+            !super::sandbox_readable_paths(&paths, &mine)
+                .contains(&paths.persona_skills_dir("01JTHEIRS")),
+            "another agent's directory must never be bound",
+        );
+        // The built-in is not a special case: it has a directory like anyone
+        // else, and gets that one rather than a workspace-wide tree.
+        assert_eq!(
+            super::sandbox_readable_paths(&paths, &baybo_model::AgentProfileId::builtin()),
+            vec![paths.persona_skills_dir(baybo_workspace::paths::BUILTIN_PERSONA_DIR)],
+        );
+        assert_ne!(
+            super::sandbox_readable_paths(&paths, &theirs),
+            super::sandbox_readable_paths(&paths, &mine),
+        );
+    }
+
     use super::*;
     use baybo_tools::ToolEventSink;
     use baybo_trace::SPAN_EVENT_TEXT_MAX_BYTES;

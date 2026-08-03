@@ -11,7 +11,6 @@
 //! ```text
 //! <root>/
 //!   config/            # standalone git repo: baybo.json, .mcp.json
-//!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
 //!   personas/          # standalone git repo: USER.md (shared) + <agent>/{SOUL,IDENTITY,USER}.md + skills/ + memory/
 //!   .key/              # not version-controlled: encryption.key
@@ -20,9 +19,10 @@
 //!   logs/              # not version-controlled: baybo.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
-//! `config/`, `skills/`, `agents/` and `personas/` each get their own `.git`
-//! repo on first `ensure_layout`; the workspace root itself is not
-//! git-tracked.
+//! `config/`, `agents/` and `personas/` each get their own `.git` repo on
+//! first `ensure_layout`; the workspace root itself is not git-tracked. One
+//! repo spans the whole declarative agent surface — every agent's identity,
+//! memory, and skills.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -42,7 +42,9 @@ pub const CONFIG_DIR: &str = "config";
 /// crate's job.
 pub const BUILTIN_PERSONA_DIR: &str = "baybo";
 
-/// Standalone git repo at `<root>/skills/`: workspace-local skill definitions.
+/// One agent's skills, at `<root>/personas/<id>/skills/`, one directory per
+/// skill. Every agent has its own and no agent shares one; the built-in is
+/// not an exception, at `personas/baybo/skills/`.
 pub const SKILLS_DIR: &str = "skills";
 
 /// Standalone git repo at `<root>/agents/`: workspace-local subagent
@@ -53,20 +55,18 @@ pub const AGENTS_DIR: &str = "agents";
 
 /// Standalone git repo at `<root>/personas/`: one directory per agent —
 /// the built-in included, at `personas/baybo/` — each carrying that agent's
-/// `SOUL.md`, `IDENTITY.md`, `USER.md` and its private `skills/` overlay.
+/// `SOUL.md`, `IDENTITY.md`, `USER.md`, its own `skills/`, and its `memory/`.
 ///
-/// The one file directly inside it, [`SHARED_USER_FILE`], belongs to no
-/// agent: it is the human's profile, which every agent reads.
+/// The one entry directly inside it that belongs to no agent is
+/// [`SHARED_USER_FILE`], the human's profile that every agent reads. It is
+/// not a persona directory and is never addressed as one — see
+/// [`classify_persona_path`].
 pub const PERSONAS_DIR: &str = "personas";
 
 /// The shared human profile at `<root>/personas/USER.md`. Read by every
 /// agent alongside its own `USER.md` notes, and owned by none of them —
 /// which is why it sits beside the agent directories rather than inside one.
 pub const SHARED_USER_FILE: &str = "USER.md";
-
-/// Per-agent private skill overlay, at `<root>/personas/<id>/skills/`.
-/// Same one-directory-per-skill shape as the shared `skills/` tree.
-pub const PERSONA_SKILLS_DIR: &str = "skills";
 
 /// One agent's long-term memory, at `<root>/personas/<id>/memory/` — one
 /// markdown file per remembered fact, indexed by [`MEMORY_INDEX_FILE`].
@@ -360,8 +360,8 @@ pub enum PersonaPath<'a> {
     Identity { agent_id: &'a str },
     /// A file under `personas/<agent_id>/memory/`.
     Memory { agent_id: &'a str },
-    /// Anything else: a skills overlay, a directory, a stray file, or a
-    /// path this crate cannot read as UTF-8.
+    /// Anything else: an agent's skills directory, a bare directory, a stray
+    /// file, or a path this crate cannot read as UTF-8.
     Other,
 }
 
@@ -477,10 +477,6 @@ impl WorkspacePaths {
         self.root.join(CONFIG_DIR)
     }
 
-    pub fn skills_dir(&self) -> PathBuf {
-        self.root.join(SKILLS_DIR)
-    }
-
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join(AGENTS_DIR)
     }
@@ -518,7 +514,7 @@ impl WorkspacePaths {
     /// One agent's private skill overlay:
     /// `<root>/personas/<agent_id>/skills/`.
     pub fn persona_skills_dir(&self, agent_id: &str) -> PathBuf {
-        self.persona_dir(agent_id).join(PERSONA_SKILLS_DIR)
+        self.persona_dir(agent_id).join(SKILLS_DIR)
     }
 
     /// One agent's private memory tree:
@@ -772,8 +768,11 @@ mod tests {
             p.sessions_log_dir(),
             PathBuf::from("/var/baybo/logs/sessions"),
         );
-        assert_eq!(p.skills_dir(), PathBuf::from("/var/baybo/skills"));
         assert_eq!(p.agents_dir(), PathBuf::from("/var/baybo/agents"));
+        assert_eq!(
+            p.persona_skills_dir("agt_1"),
+            PathBuf::from("/var/baybo/personas/agt_1/skills"),
+        );
         assert_eq!(
             p.persona_memory_dir("agt_1"),
             PathBuf::from("/var/baybo/personas/agt_1/memory"),

@@ -3,7 +3,7 @@ use baybo_skills_assessor::{AssessError, AssessedSkill, RiskLevel, SkillAssessor
 use serde_json::{Value, json};
 
 use crate::cli::SkillsCmd;
-use crate::context::CommandContext;
+use crate::context::{CommandContext, OPERATOR_SKILL_SCOPE};
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
@@ -17,7 +17,12 @@ pub async fn handle(ctx: &CommandContext, cmd: SkillsCmd) -> Result<CommandOutpu
 }
 
 fn list(ctx: &CommandContext) -> Result<CommandOutput> {
-    let mut names = ctx.skills.list();
+    let mut names: Vec<String> = ctx
+        .skills
+        .summaries_for(OPERATOR_SKILL_SCOPE)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
     names.sort();
 
     let human = if names.is_empty() {
@@ -39,7 +44,7 @@ fn list(ctx: &CommandContext) -> Result<CommandOutput> {
 fn info(ctx: &CommandContext, name: &str) -> Result<CommandOutput> {
     let skill = ctx
         .skills
-        .get(name)
+        .get_scoped(OPERATOR_SKILL_SCOPE, name)
         .ok_or_else(|| CliError::UnknownCommand(format!("skill: {name}")))?;
     let value = serde_json::to_value(skill)?;
     let human = serde_json::to_string_pretty(&value)?;
@@ -50,7 +55,7 @@ fn info(ctx: &CommandContext, name: &str) -> Result<CommandOutput> {
 }
 
 fn search(ctx: &CommandContext, query: &str) -> Result<CommandOutput> {
-    let hits = ctx.skills.search(query);
+    let hits = ctx.skills.search(OPERATOR_SKILL_SCOPE, query);
 
     let rows: Vec<Value> = hits
         .iter()
@@ -107,11 +112,11 @@ async fn check(ctx: &CommandContext, name: Option<&str>) -> Result<CommandOutput
         Some(n) => {
             let v = ctx
                 .skills
-                .validate(n)
+                .validate(OPERATOR_SKILL_SCOPE, n)
                 .ok_or_else(|| CliError::UnknownCommand(format!("skill: {n}")))?;
             vec![v]
         }
-        None => ctx.skills.validate_all(),
+        None => ctx.skills.validate_all(OPERATOR_SKILL_SCOPE),
     };
 
     // Run the risk check for each report, reusing the skill definition
@@ -119,7 +124,7 @@ async fn check(ctx: &CommandContext, name: Option<&str>) -> Result<CommandOutput
     // so one failure doesn't tank the whole report.
     let mut risk_summaries: Vec<RiskSummary> = Vec::with_capacity(reports.len());
     for r in &reports {
-        let summary = match ctx.skills.get(&r.name) {
+        let summary = match ctx.skills.get_scoped(OPERATOR_SKILL_SCOPE, &r.name) {
             Some(skill) => assess_one(ctx.skill_assessor.as_deref(), &skill).await,
             None => RiskSummary::Error(format!("skill '{}' is no longer registered", r.name)),
         };

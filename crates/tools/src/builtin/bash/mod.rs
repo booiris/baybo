@@ -242,12 +242,6 @@ pub struct BashTool {
     /// Absolute work directory (`<workspace>/work`). Sole writable area
     /// for Bash invocations.
     work_dir: PathBuf,
-    /// Absolute skills directory (`<workspace>/skills`). Bound read-only
-    /// into the sandbox so an installed skill's bundled script can be
-    /// executed in place; accepted as a command-argument path even
-    /// though it sits outside `work/`. Not a valid `cwd` (writes there
-    /// fail) — only a readable/executable source tree.
-    skills_dir: PathBuf,
     /// Pre-rendered `export UV_*=…; ` chain prepended to every command so
     /// any `uv` invocation caches inside the workspace rather than
     /// `~/.cache/uv` / `~/.local/share/uv`. Non-uv processes inherit and
@@ -269,7 +263,6 @@ impl BashTool {
         let paths = WorkspacePaths::new(absolutise(workspace_paths.root()));
         let workspace_root = paths.root().to_path_buf();
         let work_dir = paths.work_dir();
-        let skills_dir = paths.skills_dir();
         Self {
             #[cfg(not(feature = "bench-bash"))]
             descriptions: build_descriptions(&work_dir, std::env::consts::OS),
@@ -277,10 +270,18 @@ impl BashTool {
             bench_description: render_bench_description(std::env::consts::OS),
             workspace_root,
             work_dir,
-            skills_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
             permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
         }
+    }
+
+    /// The calling agent's skill directory — the one tree a command may name
+    /// paths inside besides `work/`. It is bound read-only into the sandbox,
+    /// and running an installed skill's bundled script in place is the point.
+    /// Per call rather than per process because the agent decides it, and
+    /// another agent's tree is neither bound nor exempt.
+    fn skill_root(&self, ctx: &ToolContext) -> PathBuf {
+        absolutise(&ctx.agent_id.skills_dir(&ctx.workspace_paths))
     }
 
     /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
@@ -678,7 +679,7 @@ impl Tool for BashTool {
                 &command,
                 &self.workspace_root,
                 &self.work_dir,
-                &self.skills_dir,
+                &self.skill_root(ctx),
             )?;
         }
         // The bench profile has no work-dir jail, so a command with no explicit
@@ -1322,10 +1323,10 @@ fn spawn_copy_to_file(
 /// Reject an absolute path that lives inside the workspace root but
 /// outside the work directory. Bash invocations are scoped to the
 /// `work/` subtree so the agent can't accidentally clobber the
-/// gateway's own `config/`, `state/`, `personas/`, `logs/`, `skills/`,
-/// or `.key/` subdirectories from a shell call. Paths that are not
-/// absolute, or that fall entirely outside the workspace root (FHS
-/// roots, `$HOME`, `/tmp`, …) are left to the OS sandbox.
+/// gateway's own `config/`, `state/`, `personas/`, `logs/`, or `.key/`
+/// subdirectories from a shell call. Paths that are not absolute, or
+/// that fall entirely outside the workspace root (FHS roots, `$HOME`,
+/// `/tmp`, …) are left to the OS sandbox.
 fn require_within_work_dir(
     path: &Path,
     workspace_root: &Path,
@@ -1338,11 +1339,11 @@ fn require_within_work_dir(
     if path.starts_with(workspace_root) && !path.starts_with(work_dir) {
         return Err(ToolError::InvalidParams(format!(
             "Bash {label} `{}` is inside the workspace but outside the work \
-             directory. Only `{}` is writable for shell operations (and \
-             `skills/` is bound read-only so installed skill scripts can run \
-             in place) — move the action under `{}/` or use Read/Edit/Write \
-             for the read-only workspace subtrees (personas/, config/, state/, \
-             logs/, .key/).",
+             directory. Only `{}` is writable for shell operations (your own \
+             skill directory is bound read-only so installed skill scripts can \
+             run in place) — move the action under `{}/` or use \
+             Read/Edit/Write for the read-only workspace subtrees (personas/, \
+             config/, state/, logs/, .key/).",
             path.display(),
             work_dir.display(),
             work_dir.display(),
@@ -1360,15 +1361,16 @@ fn require_within_work_dir(
 /// past the rest of the heuristic stack and the goal here is to catch
 /// the obvious cases, not to be a full shell parser.
 ///
-/// `skills_dir` is exempt: it is bound read-only into the sandbox (see
-/// `args.rs`), so naming an installed skill's script there is exactly
-/// how a skill is meant to run. Writes still fail at the RO bind, so
-/// there's nothing to guard against by rejecting the path token.
+/// `skill_root` is exempt: the calling agent's skill directory is bound
+/// read-only into the sandbox (see `args.rs`), so naming an installed
+/// skill's script there is exactly how a skill is meant to run. Writes
+/// still fail at the RO bind, so there's nothing to guard against by
+/// rejecting the path token.
 fn require_command_paths_within_work_dir(
     command: &str,
     workspace_root: &Path,
     work_dir: &Path,
-    skills_dir: &Path,
+    skill_root: &Path,
 ) -> crate::Result<()> {
     for sub in split_into_subcommands(command) {
         for tok in sub {
@@ -1377,7 +1379,7 @@ fn require_command_paths_within_work_dir(
             };
             for word in words {
                 let p = Path::new(&word);
-                if p.is_absolute() && p.starts_with(skills_dir) {
+                if p.is_absolute() && p.starts_with(skill_root) {
                     continue;
                 }
                 require_within_work_dir(p, workspace_root, work_dir, "command argument")?;
@@ -4447,29 +4449,70 @@ mod tests {
             .expect("paths under work_dir and outside workspace must be accepted");
     }
 
+    /// Running an installed skill's bundled script in place
+    /// (`python <its own skills dir>/.../x.py`) must pass the work-dir guard
+    /// even though the skill tree is outside `work/` — the sandbox binds it
+    /// read-only. Regression test for the rejection that forced skills to be
+    /// copied into `work/` first. The path comes from the ctx's own agent
+    /// rather than a literal, so relocating the tree cannot quietly turn this
+    /// into a test of some other directory.
     #[tokio::test]
-    async fn accepts_command_argument_under_skills_dir() {
-        // Running an installed skill's bundled script in place
-        // (`python <workspace>/skills/.../x.py`) must pass the work-dir
-        // guard even though `skills/` is outside `work/` — the sandbox
-        // binds it read-only. Regression test for the rejection that
-        // forced skills to be copied into `work/` first.
+    async fn accepts_command_argument_under_the_callers_own_skill_dir() {
+        for agent in ["baybo", "01JCUSTOM"] {
+            let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                timed_out: false,
+            });
+            let agent = baybo_model::AgentProfileId::parse(agent).expect("valid id");
+            let script = WorkspacePaths::new("/tmp")
+                .persona_skills_dir(agent.as_str())
+                .join("mmemos-memo/scripts/mmemos.py");
+            let mut ctx = ctx_with(Some(sandbox));
+            ctx.agent_id = agent;
+            ctx.workspace_paths = WorkspacePaths::new("/tmp");
+            BashTool::for_test()
+                .execute(
+                    json!({
+                        "command": format!("python {} auth-status", script.display()),
+                        "cwd": "/tmp/work"
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("the caller's own skill dir must be accepted");
+        }
+    }
+
+    /// …but only its *own*. Another agent's directory is not bound into this
+    /// session's sandbox, so naming a path there is the ordinary
+    /// outside-`work/` rejection rather than a silently broken exec.
+    #[tokio::test]
+    async fn rejects_command_argument_under_another_agents_skill_dir() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
             timed_out: false,
         });
-        BashTool::for_test()
+        let script = WorkspacePaths::new("/tmp")
+            .persona_skills_dir("01JSOMEONEELSE")
+            .join("theirs/scripts/run.py");
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.agent_id = baybo_model::AgentProfileId::parse("01JCUSTOM").expect("valid id");
+        ctx.workspace_paths = WorkspacePaths::new("/tmp");
+        let err = BashTool::for_test()
             .execute(
                 json!({
-                    "command": "python /tmp/skills/mmemos-memo/scripts/mmemos.py auth-status",
+                    "command": format!("python {} --check", script.display()),
                     "cwd": "/tmp/work"
                 }),
-                &ctx_with(Some(sandbox)),
+                &ctx,
             )
             .await
-            .expect("command arguments under skills/ must be accepted");
+            .expect_err("another agent's skill dir is not exempt");
+        assert!(matches!(err, ToolError::InvalidParams(_)), "got {err:?}");
     }
 
     #[test]
@@ -4498,7 +4541,7 @@ mod tests {
     fn require_command_paths_within_work_dir_walks_subcommands() {
         let ws = Path::new("/tmp");
         let work = Path::new("/tmp/work");
-        let skills = Path::new("/tmp/skills");
+        let skills = WorkspacePaths::new("/tmp").persona_skills_dir("01JCUSTOM");
 
         // Clean command — no offending paths.
         assert!(
@@ -4506,7 +4549,7 @@ mod tests {
                 "ls /tmp/work && cat /etc/hosts",
                 ws,
                 work,
-                skills
+                &skills
             )
             .is_ok()
         );
@@ -4514,7 +4557,7 @@ mod tests {
         // Quoted path inside the workspace but outside work — caught
         // after `shell_words::split` unquotes the token.
         let err =
-            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, skills)
+            require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work, &skills)
                 .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/profile/foo")));
 
@@ -4523,20 +4566,21 @@ mod tests {
             "git status | tee /tmp/logs/out",
             ws,
             work,
-            skills,
+            &skills,
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/logs/out")));
 
-        // A path under `skills/` is exempt — running an installed
-        // skill's bundled script in place is the intended use, and the
-        // RO sandbox bind makes the path safe to name.
+        // A path under the exempt skill dir is allowed — running an
+        // installed skill's bundled script in place is the intended use, and
+        // the RO sandbox bind makes the path safe to name.
+        let script = skills.join("mmemos-memo/scripts/mmemos.py");
         assert!(
             require_command_paths_within_work_dir(
-                "python /tmp/skills/mmemos-memo/scripts/mmemos.py auth-status",
+                &format!("python {} auth-status", script.display()),
                 ws,
                 work,
-                skills
+                &skills
             )
             .is_ok()
         );

@@ -156,9 +156,10 @@ impl Tool for SkillTool {
             )));
         }
 
-        // Scoped lookup: this agent's overlay first, then the shared set. A
-        // name that exists only in another agent's overlay is simply not
-        // found — the miss must not reveal that it exists elsewhere.
+        // Scoped lookup: this agent's own directory first, then the builtins
+        // its scope admits. A name that exists only in another agent's
+        // directory is simply not found — the miss must not reveal that it
+        // exists elsewhere.
         let skill = self
             .registry
             .get_scoped(Some(&ctx.agent_id), &p.skill)
@@ -478,13 +479,23 @@ fn path_to_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// The skill directory this session installs into and removes from: its
+/// agent's own, at `personas/<id>/skills/`.
+///
+/// Derived per call rather than wired once at startup, because that is what
+/// makes **"install what you can see"** hold — the destination has to follow
+/// the caller, and a process-wide root cannot. It lands on exactly the
+/// directory [`SkillRegistry::get_scoped`] reads first for this scope, so an
+/// install is visible to the agent that asked for it and to nobody else.
+fn scope_skills_dir(ctx: &ToolContext) -> PathBuf {
+    ctx.agent_id.skills_dir(&ctx.workspace_paths)
+}
+
 pub fn build_install_tool(
-    workspace_skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
 ) -> (Arc<dyn Tool>, ToolManifest) {
     let tool: Arc<dyn Tool> = Arc::new(SkillInstallTool {
-        workspace_skills_dir,
         registry,
         risk_check,
     });
@@ -500,7 +511,6 @@ pub fn build_install_tool(
 }
 
 struct SkillInstallTool {
-    workspace_skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
     risk_check: Arc<dyn SkillRiskCheck>,
 }
@@ -517,13 +527,14 @@ impl Tool for SkillInstallTool {
     }
 
     fn description(&self) -> String {
-        "Install a skill from an on-disk directory into the workspace's \
-         skills folder. The directory must contain a valid SKILL.md; the \
-         skill is run through the risk assessor (Dangerous verdicts \
-         abort the install) and the registry is hot-reloaded so the new \
-         skill is available on the next turn. Refuses to overwrite an \
-         existing installation; the operator must remove the old copy \
-         first."
+        "Install a skill from an on-disk directory into this session's own \
+         skills folder. Every agent has one of its own, so the skill lands in \
+         exactly the set this session can see: it shows up in the next turn's \
+         listing and in no other agent's. The source directory must contain a \
+         valid SKILL.md; the skill is run through the risk assessor \
+         (Dangerous verdicts abort the install) and the registry is \
+         hot-reloaded. Refuses to overwrite an existing installation; the old \
+         copy must be removed first."
             .to_string()
     }
 
@@ -573,14 +584,18 @@ impl Tool for SkillInstallTool {
             )));
         }
 
-        // Reject before parsing if the source resolves into the
-        // workspace skills directory — operator pointed at an
-        // already-installed skill by mistake.
-        if let Ok(canonical_skills_root) = tokio::fs::canonicalize(&self.workspace_skills_dir).await
-            && source_dir.starts_with(&canonical_skills_root)
+        let dest_root = scope_skills_dir(ctx);
+
+        // Reject before parsing if the source resolves into the destination
+        // tree — caller pointed at a skill it already has installed. Only the
+        // destination: a source under *another* agent's folder is allowed by
+        // design, because refusing it would not withhold the capability (see
+        // docs/modules/skills.md, "Skill installation").
+        if let Ok(canonical_dest_root) = tokio::fs::canonicalize(&dest_root).await
+            && source_dir.starts_with(&canonical_dest_root)
         {
             return Err(ToolError::InvalidParams(format!(
-                "source_dir `{}` is already inside the workspace skills directory",
+                "source_dir `{}` is already inside this session's skills directory",
                 source_dir.display()
             )));
         }
@@ -588,7 +603,7 @@ impl Tool for SkillInstallTool {
         let skill = crate::loader::load_skill_from_dir(&source_dir)
             .map_err(|e| ToolError::InvalidParams(format!("invalid skill source: {e}")))?;
 
-        let dest_dir = self.workspace_skills_dir.join(&skill.name);
+        let dest_dir = dest_root.join(&skill.name);
         if tokio::fs::try_exists(&dest_dir).await.unwrap_or(false) {
             return Err(ToolError::Execution(format!(
                 "skill '{}' already installed at {}; remove it first",
@@ -621,12 +636,13 @@ impl Tool for SkillInstallTool {
             }
         };
 
-        // Stage at depth 2 (`<skills_dir>/.staging/<uuid>/`) rather
-        // than alongside `<skills_dir>/<name>/`. `SkillRegistry::scan_dir`
-        // only inspects depth-1 children for `SKILL.md`, so a leaked
-        // staging tree (process killed between copy and rename) won't
-        // be loaded as a phantom skill on the next reload.
-        let staging_root = self.workspace_skills_dir.join(".staging");
+        // Stage at depth 2 (`<dest_root>/.staging/<uuid>/`) rather than
+        // alongside `<dest_root>/<name>/`. Both of the registry's scanners
+        // inspect only depth-1 children for `SKILL.md`, so a leaked staging
+        // tree (process killed between copy and rename) won't be loaded as a
+        // phantom skill on the next reload. Staging inside the destination
+        // is also what keeps the rename same-filesystem, hence atomic.
+        let staging_root = dest_root.join(".staging");
         tokio::fs::create_dir_all(&staging_root)
             .await
             .map_err(|e| ToolError::Execution(format!("ensure staging dir: {e}")))?;
@@ -644,13 +660,21 @@ impl Tool for SkillInstallTool {
             )));
         }
 
-        let reloaded = self.registry.reload();
+        // An overlay the agent did not have before this install is absent from
+        // `agent_dirs`, and `reload` replays exactly that list — so without
+        // registering the freshly created directory first, the reload below
+        // would drop the skill again and the install would be invisible for
+        // the life of the process. A no-op for the built-in and for an
+        // overlay already scanned.
+        self.registry
+            .ensure_agent_skills(&ctx.agent_id, &ctx.workspace_paths);
+        self.registry.reload();
 
         let mut out = json!({
             "name": skill.name,
             "version": skill.version,
             "installed_at": path_to_string(&dest_dir),
-            "registry_loaded": reloaded,
+            "skills_in_scope": self.registry.summaries_for(Some(&ctx.agent_id)).len(),
             "linked_files": skill.linked_files.to_json(),
         });
         if let Some(w) = warning {
@@ -660,14 +684,8 @@ impl Tool for SkillInstallTool {
     }
 }
 
-pub fn build_uninstall_tool(
-    workspace_skills_dir: PathBuf,
-    registry: Arc<SkillRegistry>,
-) -> (Arc<dyn Tool>, ToolManifest) {
-    let tool: Arc<dyn Tool> = Arc::new(SkillUninstallTool {
-        workspace_skills_dir,
-        registry,
-    });
+pub fn build_uninstall_tool(registry: Arc<SkillRegistry>) -> (Arc<dyn Tool>, ToolManifest) {
+    let tool: Arc<dyn Tool> = Arc::new(SkillUninstallTool { registry });
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
@@ -680,7 +698,6 @@ pub fn build_uninstall_tool(
 }
 
 struct SkillUninstallTool {
-    workspace_skills_dir: PathBuf,
     registry: Arc<SkillRegistry>,
 }
 
@@ -696,11 +713,13 @@ impl Tool for SkillUninstallTool {
     }
 
     fn description(&self) -> String {
-        "Remove an installed skill from the workspace's skills folder. \
-         Refuses skills that aren't on disk under the workspace skills \
-         dir (so registry-only or third-party-mounted skills aren't \
-         accidentally deleted). The registry is hot-reloaded so the \
-         skill disappears from the next turn's listing."
+        "Remove an installed skill from this session's own skills folder. \
+         Only skills this session can see are addressable by name, and of \
+         those only the ones living under its own folder are removable — a \
+         skill reached from anywhere else (one compiled into the binary, \
+         another agent's folder, a registry-only or third-party-mounted \
+         skill) is refused rather than deleted. The registry is hot-reloaded so the skill disappears \
+         from the next turn's listing."
             .to_string()
     }
 
@@ -724,13 +743,16 @@ impl Tool for SkillUninstallTool {
             .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: UninstallParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
+        // Scoped lookup, same rule as the `Skill` tool: a name this session
+        // cannot see is an ordinary miss, never a refusal that would reveal
+        // another agent's inventory.
         let skill = self
             .registry
-            .get(&p.name)
+            .get_scoped(Some(&ctx.agent_id), &p.name)
             .ok_or_else(|| ToolError::NotFound(format!("skill '{}'", p.name)))?;
 
         let source_path = skill.source_path.as_deref().ok_or_else(|| {
@@ -747,25 +769,29 @@ impl Tool for SkillUninstallTool {
         let real_source = tokio::fs::canonicalize(source_path).await.map_err(|e| {
             ToolError::Execution(format!("canonicalize {}: {e}", source_path.display()))
         })?;
-        let real_root = tokio::fs::canonicalize(&self.workspace_skills_dir)
-            .await
-            .map_err(|e| ToolError::Execution(format!("canonicalize skills dir: {e}")))?;
-        if !real_source.starts_with(&real_root) {
+        // Containment is against the caller's OWN tree, not "some skills
+        // tree": seeing a skill and owning it are different things. A custom
+        // agent reaches a `UNIVERSAL_SKILLS` entry among the builtins and
+        // must still not be able to remove it — and a session whose own
+        // directory does not exist yet owns nothing at all, which is why a
+        // root that fails to canonicalize refuses rather than errors.
+        let scope_root = scope_skills_dir(ctx);
+        let contained = match tokio::fs::canonicalize(&scope_root).await {
+            // Equality, not just the prefix: a skill that somehow registered
+            // with `source_path` = the root itself must not take the whole
+            // tree with it.
+            Ok(real_root) => real_source.starts_with(&real_root) && real_source != real_root,
+            Err(_) => false,
+        };
+        if !contained {
             return Err(ToolError::Denied {
                 tool: self.name().to_string(),
                 reason: format!(
-                    "skill '{}' lives outside the workspace skills directory; refusing to delete {}",
+                    "skill '{}' lives outside this session's skills directory ({}); refusing to delete {}",
                     p.name,
+                    scope_root.display(),
                     real_source.display()
                 ),
-            });
-        }
-        // Refuse to recurse into the skills root itself if a skill
-        // somehow registered with `source_path = <skills_dir>`.
-        if real_source == real_root {
-            return Err(ToolError::Denied {
-                tool: self.name().to_string(),
-                reason: "skill source_path equals the skills root; refusing to delete".into(),
             });
         }
 
@@ -773,12 +799,12 @@ impl Tool for SkillUninstallTool {
             .await
             .map_err(|e| ToolError::Execution(format!("remove {}: {e}", real_source.display())))?;
 
-        let reloaded = self.registry.reload();
+        self.registry.reload();
 
         Ok(ToolOutput::Json(json!({
             "name": skill.name,
             "removed_from": path_to_string(&real_source),
-            "registry_loaded": reloaded,
+            "skills_in_scope": self.registry.summaries_for(Some(&ctx.agent_id)).len(),
         })))
     }
 }
@@ -1252,13 +1278,46 @@ mod tests {
         .unwrap();
     }
 
+    /// A skill directory under `root`, ready for a scan to find.
+    fn write_installed_skill(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        write_minimal_skill(&dir, name);
+        dir
+    }
+
+    fn workspace_paths(root: &Path) -> baybo_workspace::WorkspacePaths {
+        baybo_workspace::WorkspacePaths::new(root.to_path_buf())
+    }
+
+    fn builtin() -> baybo_model::AgentProfileId {
+        baybo_model::AgentProfileId::builtin()
+    }
+
+    /// The directory a default (built-in / unbound) session installs into.
+    fn builtin_skills_dir(root: &Path) -> PathBuf {
+        builtin().skills_dir(&workspace_paths(root))
+    }
+
+    /// A tool context anchored at a real workspace root and running as
+    /// `agent` — which is what decides the tree install/uninstall address.
+    fn ctx_at(root: &Path, agent: &baybo_model::AgentProfileId) -> ToolContext {
+        ToolContext {
+            workspace_paths: workspace_paths(root),
+            agent_id: agent.clone(),
+            ..mk_ctx()
+        }
+    }
+
+    fn custom_agent() -> baybo_model::AgentProfileId {
+        baybo_model::AgentProfileId::parse("01JCUSTOM").expect("valid id")
+    }
+
     fn install_tool(
-        skills_dir: &Path,
         registry: Arc<SkillRegistry>,
         risk: Arc<dyn SkillRiskCheck>,
     ) -> SkillInstallTool {
         SkillInstallTool {
-            workspace_skills_dir: skills_dir.to_path_buf(),
             registry,
             risk_check: risk,
         }
@@ -1267,21 +1326,21 @@ mod tests {
     #[tokio::test]
     async fn install_copies_files_and_reloads() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
         let source = tempdir().unwrap();
         write_minimal_skill(source.path(), "axolotl");
         fs::create_dir(source.path().join("references")).unwrap();
         fs::write(source.path().join("references/a.md"), "ref").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
-        registry.load_dir(&skills_dir);
-        let tool = install_tool(&skills_dir, Arc::clone(&registry), Arc::new(AlwaysPass));
+        registry.ensure_agent_skills(&builtin(), &workspace_paths(workspace.path()));
+        let tool = install_tool(Arc::clone(&registry), Arc::new(AlwaysPass));
 
         let out = tool
             .execute(
                 json!({"source_dir": source.path().to_str().unwrap()}),
-                &mk_ctx(),
+                &ctx_at(workspace.path(), &builtin()),
             )
             .await
             .unwrap();
@@ -1290,29 +1349,38 @@ mod tests {
             other => panic!("expected json, got {other:?}"),
         };
         assert_eq!(v["name"], "axolotl");
+        assert_eq!(v["skills_in_scope"], 1);
         assert!(skills_dir.join("axolotl/SKILL.md").exists());
         assert!(skills_dir.join("axolotl/references/a.md").exists());
-        assert!(registry.get("axolotl").is_some());
+        // Reachable from the default scope by either spelling — an unbound
+        // session resolves to the same directory the built-in reads.
+        assert!(registry.get_scoped(Some(&builtin()), "axolotl").is_some());
+        assert!(registry.get_scoped(None, "axolotl").is_some());
+        // Invisible to anyone else.
+        assert!(
+            registry
+                .get_scoped(Some(&custom_agent()), "axolotl")
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn install_refuses_overwrite() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
-        fs::create_dir(skills_dir.join("axolotl")).unwrap();
-        fs::write(skills_dir.join("axolotl/SKILL.md"), "x").unwrap();
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_installed_skill(&skills_dir, "axolotl");
 
         let source = tempdir().unwrap();
         write_minimal_skill(source.path(), "axolotl");
 
         let registry = Arc::new(SkillRegistry::new());
-        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+        let tool = install_tool(registry, Arc::new(AlwaysPass));
 
         let err = tool
             .execute(
                 json!({"source_dir": source.path().to_str().unwrap()}),
-                &mk_ctx(),
+                &ctx_at(workspace.path(), &builtin()),
             )
             .await
             .unwrap_err();
@@ -1334,23 +1402,19 @@ mod tests {
             }
         }
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
         let source = tempdir().unwrap();
         write_minimal_skill(source.path(), "demo");
 
         let registry = Arc::new(SkillRegistry::new());
-        registry.load_dir(&skills_dir);
-        let tool = install_tool(
-            &skills_dir,
-            Arc::clone(&registry),
-            Arc::new(AlwaysSuspicious),
-        );
+        registry.ensure_agent_skills(&builtin(), &workspace_paths(workspace.path()));
+        let tool = install_tool(Arc::clone(&registry), Arc::new(AlwaysSuspicious));
 
         let out = tool
             .execute(
                 json!({"source_dir": source.path().to_str().unwrap()}),
-                &mk_ctx(),
+                &ctx_at(workspace.path(), &builtin()),
             )
             .await
             .unwrap();
@@ -1409,18 +1473,18 @@ mod tests {
         }
 
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
         let source = tempdir().unwrap();
         write_minimal_skill(source.path(), "demo");
 
         let registry = Arc::new(SkillRegistry::new());
-        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysBlock));
+        let tool = install_tool(registry, Arc::new(AlwaysBlock));
 
         let err = tool
             .execute(
                 json!({"source_dir": source.path().to_str().unwrap()}),
-                &mk_ctx(),
+                &ctx_at(workspace.path(), &builtin()),
             )
             .await
             .unwrap_err();
@@ -1431,17 +1495,15 @@ mod tests {
     #[tokio::test]
     async fn install_invalid_source_returns_invalid_params() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
         let source = tempdir().unwrap();
         // No SKILL.md in source.
         let registry = Arc::new(SkillRegistry::new());
-        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+        let tool = install_tool(registry, Arc::new(AlwaysPass));
 
         let err = tool
             .execute(
                 json!({"source_dir": source.path().to_str().unwrap()}),
-                &mk_ctx(),
+                &ctx_at(workspace.path(), &builtin()),
             )
             .await
             .unwrap_err();
@@ -1456,63 +1518,161 @@ mod tests {
         // pick it up (only depth-1 children of skills_dir get
         // scanned for SKILL.md).
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
         let staging = skills_dir.join(".staging").join("abc-123");
         fs::create_dir_all(&staging).unwrap();
         write_minimal_skill(&staging, "phantom");
 
         let registry = Arc::new(SkillRegistry::new());
-        let loaded = registry.load_dir(&skills_dir);
+        let loaded = registry.ensure_agent_skills(&builtin(), &workspace_paths(workspace.path()));
         assert_eq!(loaded, 0, "leaked staging tree must not register");
-        assert!(registry.get("phantom").is_none());
+        assert!(registry.get_scoped(Some(&builtin()), "phantom").is_none());
     }
 
+    /// "Already inside" is measured against the tree the *caller* installs
+    /// into, so it catches the mistake for every scope — the default one and
+    /// a custom agent's alike.
     #[tokio::test]
-    async fn install_rejects_source_inside_skills_dir() {
+    async fn install_rejects_source_inside_the_callers_own_skills_dir() {
+        for agent in [builtin(), custom_agent()] {
+            let workspace = tempdir().unwrap();
+            let ctx = ctx_at(workspace.path(), &agent);
+            // Through the production seam, so the test cannot drift from the
+            // rule it is checking.
+            let root = scope_skills_dir(&ctx);
+            fs::create_dir_all(&root).unwrap();
+            let source = write_installed_skill(&root, "foo");
+
+            let registry = Arc::new(SkillRegistry::new());
+            let tool = install_tool(registry, Arc::new(AlwaysPass));
+
+            let err = tool
+                .execute(json!({"source_dir": source.to_str().unwrap()}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidParams(_)),
+                "{agent}: {err:?}"
+            );
+        }
+    }
+
+    /// A custom agent installs into its own folder and nowhere else: the
+    /// skill is in that agent's scope and invisible to every other session,
+    /// the default one included.
+    #[tokio::test]
+    async fn install_lands_in_the_calling_agents_own_folder() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
-        let source = skills_dir.join("foo");
-        fs::create_dir(&source).unwrap();
-        write_minimal_skill(&source, "foo");
+        let paths = workspace_paths(workspace.path());
+        let agent = custom_agent();
+        let default_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&default_dir).unwrap();
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "private-recipe");
 
         let registry = Arc::new(SkillRegistry::new());
-        let tool = install_tool(&skills_dir, registry, Arc::new(AlwaysPass));
+        registry.ensure_agent_skills(&builtin(), &paths);
+        let tool = install_tool(Arc::clone(&registry), Arc::new(AlwaysPass));
 
-        let err = tool
-            .execute(json!({"source_dir": source.to_str().unwrap()}), &mk_ctx())
+        let out = tool
+            .execute(
+                json!({"source_dir": source.path().to_str().unwrap()}),
+                &ctx_at(workspace.path(), &agent),
+            )
             .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidParams(_)));
+            .unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+
+        let own = agent.skills_dir(&paths);
+        assert_eq!(
+            v["installed_at"],
+            path_to_string(&own.join("private-recipe"))
+        );
+        assert!(own.join("private-recipe/SKILL.md").is_file());
+        assert!(
+            !default_dir.join("private-recipe").exists(),
+            "an agent's install must not touch another scope's directory"
+        );
+
+        // The installing agent sees it…
+        assert!(
+            registry
+                .get_scoped(Some(&agent), "private-recipe")
+                .is_some()
+        );
+        assert_eq!(v["skills_in_scope"], 1);
+        // …and nobody else does, the default scope included.
+        assert!(registry.get_scoped(None, "private-recipe").is_none());
+        assert!(
+            registry
+                .get_scoped(Some(&builtin()), "private-recipe")
+                .is_none()
+        );
+        assert!(registry.get_scoped(None, "private-recipe").is_none());
+        assert!(registry.summaries_for(None).is_empty());
     }
 
-    fn uninstall_tool(skills_dir: &Path, registry: Arc<SkillRegistry>) -> SkillUninstallTool {
-        SkillUninstallTool {
-            workspace_skills_dir: skills_dir.to_path_buf(),
-            registry,
-        }
+    /// The reload trap the scoped install has to clear: an agent whose
+    /// folder did not exist yet is absent from the registry's replay list,
+    /// and `reload` replays exactly that list. Registering the freshly
+    /// created folder is what keeps the skill alive past the next reload —
+    /// without it the install succeeds and then silently evaporates.
+    #[tokio::test]
+    async fn install_into_a_brand_new_folder_survives_a_later_reload() {
+        let workspace = tempdir().unwrap();
+        let paths = workspace_paths(workspace.path());
+        let agent = custom_agent();
+        let overlay = paths.persona_skills_dir(agent.as_str());
+        assert!(!overlay.exists(), "the folder must be absent to start");
+
+        let source = tempdir().unwrap();
+        write_minimal_skill(source.path(), "late-bloomer");
+
+        let registry = Arc::new(SkillRegistry::new());
+        let tool = install_tool(Arc::clone(&registry), Arc::new(AlwaysPass));
+        tool.execute(
+            json!({"source_dir": source.path().to_str().unwrap()}),
+            &ctx_at(workspace.path(), &agent),
+        )
+        .await
+        .unwrap();
+
+        assert!(registry.get_scoped(Some(&agent), "late-bloomer").is_some());
+        registry.reload();
+        assert!(
+            registry.get_scoped(Some(&agent), "late-bloomer").is_some(),
+            "the freshly created folder was never registered, so reload dropped it"
+        );
+    }
+
+    fn uninstall_tool(registry: Arc<SkillRegistry>) -> SkillUninstallTool {
+        SkillUninstallTool { registry }
     }
 
     #[tokio::test]
     async fn uninstall_removes_dir_and_reloads_registry() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
-        let skill_dir = skills_dir.join("demo");
-        fs::create_dir(&skill_dir).unwrap();
-        write_minimal_skill(&skill_dir, "demo");
+        let skills_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&skills_dir).unwrap();
+        let skill_dir = write_installed_skill(&skills_dir, "demo");
         fs::create_dir(skill_dir.join("references")).unwrap();
         fs::write(skill_dir.join("references/a.md"), "x").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
-        let loaded = registry.load_dir(&skills_dir);
+        let loaded = registry.ensure_agent_skills(&builtin(), &workspace_paths(workspace.path()));
         assert_eq!(loaded, 1);
-        assert!(registry.get("demo").is_some());
+        assert!(registry.get_scoped(Some(&builtin()), "demo").is_some());
 
-        let tool = uninstall_tool(&skills_dir, Arc::clone(&registry));
+        let tool = uninstall_tool(Arc::clone(&registry));
         let out = tool
-            .execute(json!({"name": "demo"}), &mk_ctx())
+            .execute(
+                json!({"name": "demo"}),
+                &ctx_at(workspace.path(), &builtin()),
+            )
             .await
             .unwrap();
         let v = match out {
@@ -1520,21 +1680,22 @@ mod tests {
             other => panic!("expected json, got {other:?}"),
         };
         assert_eq!(v["name"], "demo");
-        assert_eq!(v["registry_loaded"], 0);
+        assert_eq!(v["skills_in_scope"], 0);
         assert!(!skill_dir.exists());
-        assert!(registry.get("demo").is_none());
+        assert!(registry.get_scoped(Some(&builtin()), "demo").is_none());
     }
 
     #[tokio::test]
     async fn uninstall_unknown_skill_returns_not_found() {
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
         let registry = Arc::new(SkillRegistry::new());
-        let tool = uninstall_tool(&skills_dir, registry);
+        let tool = uninstall_tool(registry);
 
         let err = tool
-            .execute(json!({"name": "ghost"}), &mk_ctx())
+            .execute(
+                json!({"name": "ghost"}),
+                &ctx_at(workspace.path(), &builtin()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
@@ -1542,25 +1703,26 @@ mod tests {
 
     #[tokio::test]
     async fn uninstall_refuses_skill_outside_workspace() {
-        // Skill loaded from a directory outside the workspace skills
-        // root must not be deletable through this tool — the LLM is
-        // not allowed to roam the host filesystem.
+        // A skill registered from outside every agent's directory — a
+        // third-party mount — must not be deletable through this tool: the
+        // LLM is not allowed to roam the host filesystem.
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
 
         let other = tempdir().unwrap();
-        let outside = other.path().join("rogue");
-        fs::create_dir(&outside).unwrap();
-        write_minimal_skill(&outside, "rogue");
+        let outside = write_installed_skill(other.path(), "rogue");
 
+        // Registered directly, as a third-party mount would be: on disk, but
+        // outside every agent's directory.
         let registry = Arc::new(SkillRegistry::new());
-        registry.load_dir(other.path());
-        assert!(registry.get("rogue").is_some());
+        registry.register(mk_skill(&outside, "rogue"));
+        assert!(registry.get_scoped(Some(&builtin()), "rogue").is_some());
 
-        let tool = uninstall_tool(&skills_dir, registry);
+        let tool = uninstall_tool(registry);
         let err = tool
-            .execute(json!({"name": "rogue"}), &mk_ctx())
+            .execute(
+                json!({"name": "rogue"}),
+                &ctx_at(workspace.path(), &builtin()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied { .. }));
@@ -1572,19 +1734,125 @@ mod tests {
         // A registered skill with no source_path (e.g. directly
         // injected for tests) has nothing on disk to delete.
         let workspace = tempdir().unwrap();
-        let skills_dir = workspace.path().join("skills");
-        fs::create_dir(&skills_dir).unwrap();
 
         let mut def = mk_skill(workspace.path(), "inline");
         def.source_path = None;
         let registry = Arc::new(SkillRegistry::new());
         registry.register(def);
 
-        let tool = uninstall_tool(&skills_dir, registry);
+        let tool = uninstall_tool(registry);
         let err = tool
-            .execute(json!({"name": "inline"}), &mk_ctx())
+            .execute(
+                json!({"name": "inline"}),
+                &ctx_at(workspace.path(), &builtin()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    /// The defect this scoping exists to close: a custom agent could name a
+    /// skill it cannot see and delete it out from under the session that
+    /// owns it. The lookup is scoped now, so the name simply misses — and the
+    /// miss is an ordinary "not found", never a refusal that would confirm
+    /// the skill is there.
+    #[tokio::test]
+    async fn a_custom_agent_cannot_uninstall_the_default_scopes_skill() {
+        let workspace = tempdir().unwrap();
+        let paths = workspace_paths(workspace.path());
+        let default_dir = builtin_skills_dir(workspace.path());
+        fs::create_dir_all(&default_dir).unwrap();
+        let theirs = write_installed_skill(&default_dir, "everyones");
+
+        let registry = Arc::new(SkillRegistry::new());
+        assert_eq!(registry.ensure_agent_skills(&builtin(), &paths), 1);
+
+        let tool = uninstall_tool(Arc::clone(&registry));
+        let err = tool
+            .execute(
+                json!({"name": "everyones"}),
+                &ctx_at(workspace.path(), &custom_agent()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)), "got {err:?}");
+        assert!(theirs.exists());
+        assert!(registry.get_scoped(Some(&builtin()), "everyones").is_some());
+    }
+
+    /// Seeing a skill and owning it are different things. A custom agent
+    /// reaches a `UNIVERSAL_SKILLS` entry through the compiled-in builtins —
+    /// so the lookup succeeds — and must still not be able to remove it. A
+    /// compiled-in skill has no directory to delete, which is what the
+    /// refusal says.
+    #[tokio::test]
+    async fn a_custom_agent_cannot_uninstall_the_universal_skill_it_can_see() {
+        let workspace = tempdir().unwrap();
+        let paths = workspace_paths(workspace.path());
+        let agent = custom_agent();
+        fs::create_dir_all(agent.skills_dir(&paths)).unwrap();
+        let universal = crate::registry::UNIVERSAL_SKILLS[0];
+
+        let registry = Arc::new(SkillRegistry::new());
+        assert!(registry.register_builtins() > 0);
+        assert!(
+            registry.get_scoped(Some(&agent), universal).is_some(),
+            "precondition: the agent can see it"
+        );
+
+        let tool = uninstall_tool(Arc::clone(&registry));
+        let err = tool
+            .execute(
+                json!({"name": universal}),
+                &ctx_at(workspace.path(), &agent),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "got {err:?}");
+        assert!(
+            registry.get_scoped(Some(&agent), universal).is_some(),
+            "still there"
+        );
+    }
+
+    /// The mirror image: an unbound session is the built-in, whose scope is
+    /// its own directory, so another agent's private skill is not addressable
+    /// from it at all.
+    #[tokio::test]
+    async fn the_builtin_cannot_uninstall_an_agents_private_skill() {
+        let workspace = tempdir().unwrap();
+        let paths = workspace_paths(workspace.path());
+        let agent = custom_agent();
+        let overlay = paths.persona_skills_dir(agent.as_str());
+        fs::create_dir_all(&overlay).unwrap();
+        let private = write_installed_skill(&overlay, "private-recipe");
+
+        let registry = Arc::new(SkillRegistry::new());
+        assert_eq!(registry.ensure_agent_skills(&agent, &paths), 1);
+
+        let tool = uninstall_tool(Arc::clone(&registry));
+        let err = tool
+            .execute(
+                json!({"name": "private-recipe"}),
+                &ctx_at(workspace.path(), &builtin()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)), "got {err:?}");
+        assert!(private.exists());
+
+        // …while its owner removes it normally.
+        tool.execute(
+            json!({"name": "private-recipe"}),
+            &ctx_at(workspace.path(), &agent),
+        )
+        .await
+        .unwrap();
+        assert!(!private.exists());
+        assert!(
+            registry
+                .get_scoped(Some(&agent), "private-recipe")
+                .is_none()
+        );
     }
 }

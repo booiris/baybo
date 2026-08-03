@@ -18,12 +18,12 @@ One directory per skill, a `SKILL.md` entrypoint with YAML frontmatter plus a Ma
 
 ### Load location
 
-At startup the registry first calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans `<workspace.path>/skills/<skill-name>/SKILL.md` and overlays any workspace skill of the same name on top. Built-ins are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an operator can patch shipped behaviour by dropping a same-named directory under the workspace.
+At startup the registry calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans the built-in agent's own directory, `<workspace.path>/personas/baybo/skills/<skill-name>/SKILL.md`. Every other agent's directory is scanned lazily — see [Every agent owns its skills](#every-agent-owns-its-skills). Compiled-in skills are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an agent patches shipped behaviour for itself by having a same-named directory of its own, which shadows the builtin inside that agent's scope only.
 
 The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags). The second is `deck` — the inverse shape: slash-only (`command: deck` + `disable-model-invocation: true`, so the model never auto-selects it; the user types `/deck <request>`) and owner-channel-only (`channels: [owner]`) — carrying the deck card bundle contract, the `ctx`/`deck` SDK surface, and worked examples for authoring a card before `DeckCardCreate`/`DeckCardUpdate`; see [`deck.md`](deck.md#authoring-pipeline). The third is `html-gen`: an agent- and slash-invocable, owner-only skill for authoring a self-contained HTML page, staging it through `PutBlob`, and returning the `baybo-html` blob marker understood by the iOS transcript.
 
 ```
-<workspace>/skills/
+<workspace>/personas/<agent_id>/skills/     # baybo/ for the default scope
 ├── greet/
 │   └── SKILL.md
 └── deploy/
@@ -82,55 +82,84 @@ A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invoc
 
 The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `ContextManager::expand_slash_command` matches the leading `/<cmd>` against the invocable skill set and injects the skill body. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#slash-completion) for the full wiring.
 
-### Per-agent overlays
+### Every agent owns its skills
 
-**A custom agent does not inherit the shared set.** The built-in's skills
-*are* that set (builtins + `<workspace>/skills/`), and an unbound session is
-the built-in; a custom agent starts from nothing but its own overlay at
-`<workspace>/personas/<agent_id>/skills/`, same one-directory-per-skill shape.
-A persona someone curated should not silently acquire every skill the
-workspace happens to hold — granting one is a decision, so it is made by
-putting the skill in that agent's folder.
+**There is no shared skill tree.** Each agent's skills live in its own
+directory at `<workspace>/personas/<agent_id>/skills/`, one directory per
+skill, and no agent reads another's. The built-in is not a special case — its
+skills are at `personas/baybo/skills/`, which is also what an unbound session
+reads, since an unbound session *is* the built-in. A persona someone curated
+should not silently acquire every skill the workspace happens to hold; granting
+one is a decision, made by putting the skill in that agent's folder.
 
-The one exception is `UNIVERSAL_SKILLS`, currently just `baybo-cli`: it tells
-the agent how to introspect the instance it is running inside (the Bash tool
-injects `BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for exactly that), so it is
-runtime infrastructure rather than a capability anyone chose to grant.
-Withholding it would not make a persona narrower, only blinder. `deck` is
-deliberately *not* in the list — an authoring tool is a capability.
+The only skills that are not in some agent's directory are the ones **compiled
+into the binary** (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via
+`include_str!`). They belong to the process, not to any persona, which is what
+makes them safe to share: reaching one is never reaching into another agent's
+folder. The built-in scope sees all of them — the shipped set is what "default
+behaviour" means. A custom agent sees only `UNIVERSAL_SKILLS`, currently just
+`baybo-cli`: it tells the agent how to introspect the instance it is running
+inside (the Bash tool injects `BAYBO_HELP_AGENT` / `BAYBO_CONFIG_PATH` for
+exactly that), so it is runtime infrastructure rather than a capability anyone
+chose to grant — withholding it would not make a persona narrower, only
+blinder. `deck` is deliberately *not* in the list; an authoring tool is a
+capability, which is why a custom agent has no `/deck`.
 
-`SkillRegistry` holds overlays in a second map keyed by profile id, and every
-session-scoped read goes through the scoped pair:
+`SkillRegistry` therefore holds two maps — compiled-in builtins, and a
+per-agent map keyed by profile id — and every session-scoped read goes through
+the scoped pair:
 
-- `get_scoped(agent, name)` — the agent's overlay first, then the shared set.
-- `summaries_for(agent)` — the shared set for the built-in; for a custom
-  agent, its overlay ∪ `UNIVERSAL_SKILLS`, **overlay winning a name
-  collision**; sorted by name so ordering is stable across turns. `ContextManager` routes the per-turn listing, the
-  post-compaction trailer, and slash candidates through it.
-- `ensure_agent_overlay(agent, paths)` — **the only thing that fills that
-  map**, so every reader of an agent's scope calls it first: the actor build
-  (`runtime.rs`, on the cold spawn of a bound session) and `GET /v1/skills`
-  when the query names an agent. It derives `personas/<id>/skills/` from the
-  id, so a call site holding only a session's agent needs nothing else;
-  the built-in and an already-scanned agent are both no-ops. `reload()`
-  replays overlays after builtins and the shared dirs.
+- `get_scoped(agent, name)` — the agent's own directory first, then the
+  builtins its scope admits.
+- `summaries_for(agent)` — the admitted builtins with the agent's own
+  directory layered on top, **the agent's own winning a name collision**;
+  sorted by name so ordering is stable across turns. `ContextManager` routes
+  the per-turn listing, the post-compaction trailer, and slash candidates
+  through it.
+- `all_scoped(agent)` — the same set as full definitions, for the operator
+  surfaces that need more than the four summary fields (`baybo skills info` /
+  `search` / `check`, which pass the default scope).
 
-Loading is lazy rather than part of boot because the set of agents is DB
-state: `ensure_layout` cannot enumerate persona folders to scan, and a scan at
+**Every read names a scope, and there is deliberately no unscoped sibling.**
+An unscoped `get` / `list` / `all_sorted` used to exist and each one was the
+same trap: it could only see the compiled-in map, so it silently missed every
+skill anyone had installed. The one that mattered was the post-compaction
+trailer, which re-broadcasts the body of a skill the session actually called —
+unscoped, it dropped exactly the skills an agent owns, at the moment the
+summary discarded the original. `search` and `validate` / `validate_all` take
+a scope for the same reason.
+- `ensure_agent_skills(agent, paths)` — **the only thing that fills the
+  per-agent map**, so every reader of a scope calls it first: boot (for the
+  built-in, whose id is a constant), the actor build (`runtime.rs`, on the cold
+  spawn of a session) and `GET /v1/skills` when the query names an agent. It
+  derives `personas/<id>/skills/` from the id, so a call site holding only a
+  session's agent needs nothing else; an already-scanned agent is a no-op.
+  `reload()` replays every scan.
+
+`None` as a scope means the built-in, directory included — an unbound session
+has always behaved as the built-in, and now that the built-in owns a directory
+like everyone else, behaving as it has to include reading that directory.
+
+Loading is lazy past the built-in because the set of agents is DB state:
+`ensure_layout` cannot enumerate persona folders to scan, and a scan at
 profile-creation time would miss every agent that already existed. The cost of
-getting this wrong is silent — an unloaded overlay is indistinguishable from an
-empty one, and the agent simply has no skills — so the seam is one function
+getting this wrong is silent — an unloaded directory is indistinguishable from
+an empty one, and the agent simply has no skills — so the seam is one function
 with no separate "is it loaded" question for a caller to forget.
 
-A name that exists only in another agent's overlay — or in a shared set this
+A name that exists only in another agent's directory — or among builtins this
 agent does not inherit — simply misses, so the `Skill` tool answers "unknown
-skill" rather than a refusal that would leak an inventory. One consequence
-worth knowing: a custom agent has no `/deck`, because that builtin is a
-capability like any other. Governance is unchanged: persona folders are
-workspace content, so their skills are `Trusted` and the risk assessor judges
-them by content hash like any other. `SkillInstall` / `SkillUninstall` keep
-targeting the shared folder — overlays are hand-authored. The built-in
-profile has no overlay: its skills *are* the shared set.
+skill" rather than a refusal that would leak an inventory. Governance is
+unchanged: persona folders are workspace content, so their skills are `Trusted`
+and the risk assessor judges them by content hash like any other.
+
+`SkillInstall` / `SkillUninstall` write in the scope the caller reads — see
+[Skill installation](#skill-installation). `SkillInstall` is also the **only**
+writer of a skill directory: `Edit` and `Write` refuse a path under
+`personas/<id>/skills/` outright (`classify_persona_path` gives it
+`PersonaPath::Other`, which the managed-repo tier treats as unwritable), so a
+skill gets in by being installed — and therefore by passing the risk assessor —
+never by being hand-authored in place.
 
 ### Three-tier trust model
 
@@ -157,11 +186,11 @@ to skill count × body size; the projection avoids that. Filtered to
 `agent_invocable && trust_level != Untrusted && allows_channel`, sorted
 by name for stable across-turn ordering. There is deliberately **no**
 "registry is empty, skip the projection" guard: that check could only read
-the shared map, while the question is scoped, so a custom agent whose skills
-live only in its private overlay was advertised nothing at all whenever the
-shared set happened to be empty. `SkillRegistry::is_empty()` existed for
-exactly that guard and was removed with it — `summaries_for` is already
-cheap on an empty registry. The trailer's reminder block advertises this same
+one map, while the question is scoped, so an agent whose skills live only in
+its own directory was advertised nothing at all whenever the map it read
+happened to be empty. `SkillRegistry::is_empty()` existed for exactly that
+guard and was removed with it — `summaries_for` is already cheap on an empty
+registry. The trailer's reminder block advertises this same
 filtered set (and is skipped when it is empty); the per-called-skill
 `<skill>` detail blocks stay keyed on `called_skills` unfiltered, so a
 skill actually invoked in the session keeps its definition across
@@ -255,10 +284,21 @@ The assessor is wired in `crates/baybo/src/runtime.rs` alongside the other share
 
 ### Skill installation
 
-The crate ships two governance-gated lifecycle tools (built by `build_install_tool` / `build_uninstall_tool` in `tools.rs`, wired in `crates/baybo/src/runtime.rs` after the assessor is constructed), both declaring `TrustLevel::Trusted` with the `WriteFile` capability scoped to the workspace skills directory:
+The crate ships two governance-gated lifecycle tools (built by `build_install_tool` / `build_uninstall_tool` in `tools.rs`, wired in `crates/baybo/src/runtime.rs` after the assessor is constructed), both declaring `TrustLevel::Trusted` with the `WriteFile` capability.
 
-- **`SkillInstall`** — validates a source directory (must contain a parseable `SKILL.md`, must live outside the workspace skills dir, must not collide with an existing install), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<workspace>/skills/<name>/` via a temp-dir-and-rename for atomicity, then calls `SkillRegistry::reload()` so the new skill is available next turn.
-- **`SkillUninstall`** — looks up the skill by name and refuses unless its canonicalized `source_path` sits under the workspace skills dir (registry-only or third-party-mounted skills aren't deletable), removes the directory, then calls `SkillRegistry::reload()`.
+**Both act in the caller's own scope, and the invariant is "install what you can see, uninstall only what you can see."** The destination comes from `ctx.agent_id`, not from a root wired at startup: `scope_skills_dir` reads `AgentProfileId::skills_dir`, so every session lands on `personas/<its agent>/skills/` — exactly the directory `get_scoped` reads first for that scope. Wiring one process-wide root is what made the old behaviour incoherent in both directions: an install was invisible to the agent that asked for it and leaked to every session that did not.
+
+- **`SkillInstall`** — validates a source directory (must contain a parseable `SKILL.md`, must live outside the *caller's own* skills dir, must not collide with an existing install there), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<scope>/<name>/` via a staging-and-rename for atomicity (staged at `<scope>/.staging/<uuid>/` — depth 2, so a leak from a crash mid-install is not scanned as a phantom skill), calls `ensure_agent_skills` and then `SkillRegistry::reload()`.
+
+  The `ensure_agent_skills` call is load-bearing, not defensive. `load_agent_dir` returns before recording a directory that does not exist, and `reload()` replays exactly the recorded list — so an agent whose folder was absent when its actor was built is missing from that list, and installing into the folder it just created would be dropped again on the very next reload. Because a miss is never latched, the post-install call re-stats and registers it. Order matters: reloading first would rebuild from a list that still lacks the agent.
+
+  "Must live outside the caller's own skills dir" is deliberately not "outside any skills dir". The check is about the mistake it names — you pointed at the copy you already have — not about where a source may come from.
+
+  **A source under another agent's folder is allowed, on purpose.** An agent may name `personas/<other>/skills/<name>` and copy it into its own — adopting a skill it could otherwise only read. That is a real hole in "no agent reads another's directory" if you read that invariant as a confidentiality boundary, and it is worth being clear that it is not one: the visibility rules decide what a *session's model* is offered and can invoke, not what the host filesystem will hand to a tool that was given a path. Closing this one path would not close the capability — `source_dir` is arbitrary, `Read` is not scoped, and an agent that can read a `SKILL.md` can hand-author the same body under `work/` and install that. What actually governs the copy is the risk assessor, which every install runs regardless of where the bytes came from. Treat a skill body as readable-by-any-agent; put nothing in one that a different persona must not see.
+
+- **`SkillUninstall`** — resolves the name through `get_scoped`, so a name the session cannot see is an ordinary `NotFound` rather than a refusal that would confirm it exists. Deletion is then confined to the caller's own directory, which is a *second*, narrower gate: seeing a skill and owning it are different things, and a custom agent reaching a `UNIVERSAL_SKILLS` entry has nothing on disk to remove. A session whose own directory does not exist yet owns nothing, so a root that fails to canonicalize refuses rather than errors. Removes the directory, then calls `SkillRegistry::reload()`.
+
+Both report `skills_in_scope` — the size of the caller's set after the reload. Any other scope's count would be noise to an agent that just installed into its own folder, and a `0` there would read as failure.
 
 ### Hot reload constraints
 
@@ -267,12 +307,11 @@ The crate ships two governance-gated lifecycle tools (built by `build_install_to
 - Record name/version/source/hash on version replacement
 - On failure, keep the old version rather than emptying the registry
 
-`SkillRegistry` offers `reload()` — re-scans every directory previously
-passed to `load_dir` and rebuilds the skill set from disk. Builtins are
-replayed first (from the definitions captured by `register_builtins`),
-then the dir scans run on top so a same-named workspace skill still
-overrides its builtin — without the replay, the first
-`SkillInstall`-triggered reload silently dropped every builtin.
+`SkillRegistry` offers `reload()` — re-scans every agent directory registered
+so far and rebuilds the set from disk. Compiled-in builtins are replayed from
+the definitions captured by `register_builtins`; without the replay, the first
+`SkillInstall`-triggered reload silently dropped every one of them. An agent's
+own same-named skill still shadows its builtin, inside that agent's scope.
 
 **The rebuilt set is assembled in full and then swapped in**, so a reader
 observes the complete old set or the complete new one. The maps are a
@@ -285,7 +324,7 @@ not a blip: the skill listing a session seeds from is persisted and is not
 refreshed until a compaction, so a session that seeded inside the window
 advertised a truncated set for its whole life. The TUI
 Skills dashboard wires this into its refresh action (`r` key), so an
-operator editing `<workspace>/skills/<name>/SKILL.md` can press refresh
+operator editing `<workspace>/personas/<agent_id>/skills/<name>/SKILL.md` can press refresh
 to pick up the change without restarting Baybo. Individual broken
 `SKILL.md` files are logged and skipped, matching startup behaviour.
 Filesystem watching is not wired yet — reload is on-demand only.
@@ -298,7 +337,7 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 - Depends on `baybo-model`, `baybo-tools`, and `baybo-workspace` (the last for `baybo_workspace::paths::BIN_NAME`), plus `regex`, `walkdir`, and `uuid`
 - Does not call `llm` or execute tools directly
-- The crate's own `SkillInstall` / `SkillUninstall` tools (see “Skill installation” above) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
+- The crate's own `SkillInstall` / `SkillUninstall` tools (see “Skill installation” above) are the supported way to add or remove a skill at runtime, in the caller's own scope; nothing else here mutates the installed set
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
 
 ## Collaboration

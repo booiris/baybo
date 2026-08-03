@@ -17,6 +17,20 @@ use baybo_trace::TraceStore;
 use baybo_turn::TurnLifecycle;
 use baybo_workspace::WorkspacePaths;
 
+/// The skill scope every operator surface reads: the default one, which is
+/// what an unbound session sees. Naming it once beats a bare `None` at each
+/// call site, and it marks the decision — a per-agent view is the agents API's
+/// job (`GET /v1/skills?agent_id=`), not the CLI's.
+///
+/// **Known limitation, for the slash seam specifically.** `SlashHandler`'s
+/// `commands()` and `is_skill_invocation` have no session in hand, so they
+/// resolve `/<cmd>` against this scope — meaning a custom agent's slash-only
+/// skill is not recognised there. Harmless while skills were hand-placed and
+/// rare; now that `SkillInstall` lands them per agent it is reachable. Fixing
+/// it means giving the slash seam the session's agent, which is a larger
+/// change than this one; recorded here rather than left to be rediscovered.
+pub(crate) const OPERATOR_SKILL_SCOPE: Option<&baybo_model::AgentProfileId> = None;
+
 use crate::format::OutputFormat;
 
 /// Where a command was invoked from.

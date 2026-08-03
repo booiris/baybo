@@ -293,17 +293,21 @@ build time so bwrap never sees a `--tmpfs <missing>` line.
 
 `SandboxAdapter::with_readable_paths(paths)` adds **read-only** re-binds
 on top of that policy (filtered to existing paths at build time). The
-agent layer passes `<workspace>/skills` here: the denylist masks all of
-`~/.baybo`, but installed skill scripts must still be executable in
-place, so `skills/` is re-bound RO *after* the masking tmpfs — the same
-last-wins ordering that re-establishes the `work/` dir, except RO. On
-bwrap that's `--ro-bind-try <skills> <skills>` emitted after the
-`--tmpfs` masks; on macOS SBPL it's an `(allow file-read* (subpath …))`
+agent layer passes the calling agent's own skill directory,
+`<workspace>/personas/<id>/skills`, because the denylist masks all of
+`~/.baybo` and installed skill scripts must still be executable in
+place. It is re-bound RO *after* the masking tmpfs — the same last-wins
+ordering that re-establishes the `work/` dir, except RO. The bind is not
+optional: `SkillInstall` writes there, so without it an agent could
+install a skill it could not then run. On bwrap that's
+`--ro-bind-try <dir> <dir>` emitted after the `--tmpfs` masks; on macOS SBPL it's an `(allow file-read* (subpath …))`
 emitted after the `(deny …)` block (no `file-write*` re-allow, so writes
 still `EPERM`); Docker already binds `readable_paths` as `-v …:ro`. The
 companion guard in `BashTool` (`require_command_paths_within_work_dir`)
-mirrors this: a command-argument path under `skills/` is accepted even
-though it sits outside `work/`, while `cwd` stays pinned to `work/`.
+mirrors this, and takes the same root per call: a command-argument path
+under the caller's own skill directory is allowed even though it sits
+outside `work/`, while `cwd` stays pinned to `work/`. Another agent's
+directory is neither bound nor exempted.
 
 Default Bash denylist (built by
 `baybo_sandbox::default_sensitive_denylist`):
@@ -312,10 +316,13 @@ Default Bash denylist (built by
 - `~/.config/gh`, `~/.config/gcloud` — cloud CLI tokens
 - `~/.docker`, `~/.kube` — registry / cluster auth
 - `$BAYBO_HOME` (or `~/.baybo` if unset) — Baybo's own state, secrets,
-  identity files. The whole tree is masked, then `skills/` alone is
-  re-exposed read-only via `with_readable_paths` (above) so skill
-  scripts run in place; `config/`, `state/`, `personas/`, `.key/`, etc.
-  stay hidden.
+  identity files. The whole tree is masked, then the caller's own skill
+  directory alone is re-exposed read-only via `with_readable_paths`
+  (above) so skill scripts run in place; `config/`, `state/`, `.key/`,
+  and the rest of `personas/` — every agent's identity and memory files,
+  including those of the agent whose skills are bound — stay hidden. Note
+  the RO re-bind creates its intermediate directories, so a `personas/`
+  node now exists inside the sandbox; its contents remain masked.
 
 Trade-offs:
 
@@ -330,8 +337,8 @@ Trade-offs:
   there, prefer launching baybo with the workspace inside `$HOME` so
   the home bind covers it, or extend `BWRAP_RO_ROOTS`.
 - Docker ignores the permissive *denylist / extra_root* policy and
-  binds only `workspace_root` (plus `readable_paths` RO, so `skills/`
-  still works) — reaching `$HOME` from inside a container would need an
+  binds only `workspace_root` (plus `readable_paths` RO, so the skill
+  directory still works) — reaching `$HOME` from inside a container would need an
   explicit bind that defeats the container model.
 
 ### Sandbox FS root vs. Baybo state directory

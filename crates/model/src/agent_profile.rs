@@ -48,7 +48,7 @@ pub struct InvalidAgentProfileId {
 /// directory name of the profile's persona folder — so it is **not** an
 /// opaque string: every construction path runs the same grammar,
 /// `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the skill-name grammar), which is
-/// what keeps [`Self::identity_file`] and [`Self::skills_overlay_dir`] inside
+/// what keeps [`Self::identity_file`] and [`Self::skills_dir`] inside
 /// the workspace. There is deliberately no infallible `From<String>`, and
 /// `Deserialize` is not transparent: a guard only on the constructor would
 /// be bypassed by every request body and stored row that parses an id.
@@ -127,17 +127,21 @@ impl AgentProfileId {
         paths.persona_identity_file(&self.0, kind)
     }
 
-    /// This agent's private skill overlay, or `None` for the built-in — whose
-    /// skills are exactly the shared set, so an overlay pointing at
-    /// `<workspace>/skills/` would register the same directory twice.
-    pub fn skills_overlay_dir(&self, paths: &WorkspacePaths) -> Option<PathBuf> {
-        (!self.is_builtin()).then(|| paths.persona_skills_dir(&self.0))
+    /// This agent's skills, at `personas/<id>/skills/`.
+    ///
+    /// Every agent owns its set outright — there is no shared tree to inherit
+    /// from or be shadowed by, and the built-in is not a special case: its
+    /// skills live at `personas/baybo/skills/` like anyone else's. The only
+    /// skills an agent sees that are not in this directory are the ones
+    /// compiled into the binary, which belong to the process rather than to
+    /// any persona.
+    pub fn skills_dir(&self, paths: &WorkspacePaths) -> PathBuf {
+        paths.persona_skills_dir(&self.0)
     }
 
-    /// This agent's memory tree. Unlike the skill overlay there is no
-    /// shared-vs-private question to answer — memory is partitioned per
-    /// agent by construction, with no shared tree for one agent's writes to
-    /// land in — so this needs no special case for the built-in either.
+    /// This agent's memory tree — partitioned per agent by construction,
+    /// with no shared tree for one agent's writes to land in, exactly like
+    /// [`Self::skills_dir`].
     pub fn memory_dir(&self, paths: &WorkspacePaths) -> PathBuf {
         paths.persona_memory_dir(&self.0)
     }
@@ -311,8 +315,12 @@ mod tests {
             builtin.identity_file(&paths, IdentityKind::User),
             paths.shared_user_file()
         );
-        // …but the built-in still has no skill overlay: it *is* the shared set.
-        assert!(builtin.skills_overlay_dir(&paths).is_none());
+        // The built-in is not a special case here either: its skills live in
+        // its own persona directory, like every other agent's.
+        assert_eq!(
+            builtin.skills_dir(&paths),
+            paths.persona_skills_dir(baybo_workspace::paths::BUILTIN_PERSONA_DIR)
+        );
     }
 
     #[test]
@@ -331,8 +339,8 @@ mod tests {
             );
         }
         assert_eq!(
-            custom.skills_overlay_dir(&paths),
-            Some(paths.persona_skills_dir("01JCUSTOM"))
+            custom.skills_dir(&paths),
+            paths.persona_skills_dir("01JCUSTOM")
         );
     }
 

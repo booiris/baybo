@@ -38,11 +38,14 @@
 //! `Edit` it, so a self-edit must not be a per-turn approval prompt with
 //! no audit trail — for *every* agent, not just the built-in.
 //!
-//! Edits under `<workspace>/work/` and `<workspace>/skills/` also skip
-//! the approval gate (matching the `Write` tool's `work/` bypass), but
-//! without the identity-file allowlist, size cap, or audit commit —
-//! those roots are agent scratch / managed skill content, not an
-//! identity store.
+//! Edits under `<workspace>/work/` also skip the approval gate (matching
+//! the `Write` tool's `work/` bypass), but without the identity-file
+//! allowlist, size cap, or audit commit — that root is agent scratch, not
+//! an identity store.
+//!
+//! A skill directory gets no bypass and no write at all: every skill belongs
+//! to some agent, and `SkillInstall` — which runs the risk assessor — is its
+//! only sanctioned writer.
 
 use std::path::{Path, PathBuf};
 

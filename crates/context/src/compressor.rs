@@ -437,6 +437,7 @@ impl ContextManager {
             .sum();
         let trailer = estimate_skill_trailer_tokens(
             self.skill_registry.as_ref(),
+            self.skill_scope(),
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),

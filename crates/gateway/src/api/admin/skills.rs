@@ -31,9 +31,9 @@ pub struct SkillInfo {
 /// Query for [`list_skills`].
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ListSkillsQuery {
-    /// Whose scope to list. Absent = the shared set, which is the built-in
-    /// agent's. A custom agent's id lists its own overlay plus the universal
-    /// skills — it does not inherit the shared set.
+    /// Whose scope to list. Absent = the default scope, which is the
+    /// built-in agent's. Any other id lists that agent's own directory plus
+    /// the universal skills — no agent inherits another's.
     ///
     /// The id need not name an existing profile: this asks what a scope can
     /// invoke, not whether a row exists, so a client can preview what a
@@ -46,7 +46,7 @@ pub struct ListSkillsQuery {
     get,
     path = "/skills",
     tag = "skills",
-    params(("agent_id" = Option<String>, Query, description = "List this agent's scope instead of the shared set")),
+    params(("agent_id" = Option<String>, Query, description = "List this agent's scope instead of the default one")),
     responses(
         (status = 200, description = "Skills this scope can invoke", body = inline(ListResponse<SkillInfo>)),
         (status = 400, description = "Malformed agent id", body = ErrorBody),
@@ -65,7 +65,7 @@ async fn list_skills(
     if let Some(agent) = agent.as_ref() {
         state
             .skill_registry
-            .ensure_agent_overlay(agent, &state.workspace_paths);
+            .ensure_agent_skills(agent, &state.workspace_paths);
     }
     let items = state
         .skill_registry

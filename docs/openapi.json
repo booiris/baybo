@@ -4067,7 +4067,7 @@
           {
             "name": "agent_id",
             "in": "query",
-            "description": "List this agent's scope instead of the shared set",
+            "description": "List this agent's scope instead of the default one",
             "required": false,
             "schema": {
               "type": "string"

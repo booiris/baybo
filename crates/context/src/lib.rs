@@ -1042,12 +1042,12 @@ impl ContextManager {
     /// (if any) admits this session's channel.
     ///
     /// Deliberately no "registry is empty, skip the projection" short-circuit.
-    /// Such a check can only read the **shared** map, while this question is
-    /// scoped — a custom agent's skills live in its private overlay, so a
-    /// workspace with an empty shared set hid every one of them and the agent
-    /// was advertised nothing at all. `SkillRegistry::is_empty` existed for
-    /// that guard and was deleted with it; `summaries_for` is already cheap on
-    /// an empty registry, so it bought nothing and cost correctness.
+    /// Such a check can only read one map, while this question is scoped — an
+    /// agent's skills live in its own directory, so a build with an empty
+    /// compiled-in set hid every one of them and the agent was advertised
+    /// nothing at all. `SkillRegistry::is_empty` existed for that guard and
+    /// was deleted with it; `summaries_for` is already cheap on an empty
+    /// registry, so it bought nothing and cost correctness.
     ///
     /// The seed reminder and the post-compaction trailer advertise
     /// exactly this set; slash candidates are a *different* set
@@ -1065,9 +1065,10 @@ impl ContextManager {
             .collect()
     }
 
-    /// The agent whose private skill overlay this session sees, or `None`
-    /// when it has no overlay of its own (unbound, or bound to the built-in
-    /// whose skills *are* the shared set).
+    /// The agent whose skill directory this session reads, or `None` for the
+    /// default scope — an unbound session, or one bound to the built-in.
+    /// `None` is not "no directory": the registry resolves it to the
+    /// built-in's, which is what an unbound session has always behaved as.
     pub(crate) fn skill_scope(&self) -> Option<&AgentProfileId> {
         self.agent.as_ref().filter(|id| !id.is_builtin())
     }
@@ -1617,6 +1618,7 @@ impl ContextManager {
         insert_skill_trailer(
             &mut new_messages,
             self.skill_registry.as_ref(),
+            self.skill_scope(),
             self.tokenizer.as_ref(),
             &self.called_skills,
             &self.invocable_skill_summaries(),
@@ -2437,13 +2439,18 @@ fn render_skill_block_capped(
 /// callers can skip emitting an empty wrapper.
 fn build_skill_detail_payload(
     registry: &SkillRegistry,
+    agent: Option<&AgentProfileId>,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
 ) -> Option<String> {
     let mut total = 0usize;
     let mut blocks: Vec<String> = Vec::new();
     for name in called_skills {
-        let Some(skill) = registry.get(name) else {
+        // Scoped, like every other read: an unscoped lookup would find only
+        // the compiled-in builtins, so the one thing this payload exists to
+        // re-broadcast — the body of a skill this session actually called —
+        // would silently vanish for a skill the agent owns.
+        let Some(skill) = registry.get_scoped(agent, name) else {
             continue;
         };
         let remaining = TOTAL_SKILL_TOKEN_CAP.saturating_sub(total);
@@ -2490,6 +2497,7 @@ fn build_skill_detail_payload(
 pub(crate) fn insert_skill_trailer(
     messages: &mut Vec<ChatMessage>,
     registry: &SkillRegistry,
+    agent: Option<&AgentProfileId>,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
     // The session's advertisable set (`invocable_skill_summaries`) — NOT
@@ -2514,7 +2522,7 @@ pub(crate) fn insert_skill_trailer(
         insert_at += 1;
         inserted += 1;
     }
-    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+    if let Some(detail) = build_skill_detail_payload(registry, agent, tokenizer, called_skills) {
         messages.insert(
             insert_at,
             ChatMessage::agent_context(vec![ContentBlock::Text(detail)]),
@@ -2534,6 +2542,7 @@ pub(crate) fn insert_skill_trailer(
 /// reminder if no called_skills carry a renderable definition.
 pub(crate) fn estimate_skill_trailer_tokens(
     registry: &SkillRegistry,
+    agent: Option<&AgentProfileId>,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
     advertised: &[SkillSummary],
@@ -2545,7 +2554,7 @@ pub(crate) fn estimate_skill_trailer_tokens(
             reminder,
         )]));
     }
-    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+    if let Some(detail) = build_skill_detail_payload(registry, agent, tokenizer, called_skills) {
         total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
             detail,
         )]));
@@ -4798,15 +4807,24 @@ mod tests {
         ctx
     }
 
-    /// Write a skills tree and load it, the way a workspace does. Removal has
-    /// no API — in production a skill disappears by leaving disk and the
-    /// registry being reloaded — so the drift tests drive that real path
-    /// rather than a fake one.
-    fn skills_on_disk(root: &std::path::Path, names: &[&str]) -> Arc<SkillRegistry> {
-        write_skill_tree(root, names);
+    /// Write the default scope's skill directory and load it, the way a
+    /// workspace does. Removal has no API — in production a skill disappears
+    /// by leaving disk and the registry being reloaded — so the drift tests
+    /// drive that real path rather than a fake one.
+    ///
+    /// Returns the registry and the directory the skills were written to, so
+    /// a caller can rewrite it and reload.
+    fn skills_on_disk(
+        workspace_root: &std::path::Path,
+        names: &[&str],
+    ) -> (Arc<SkillRegistry>, std::path::PathBuf) {
+        let paths = baybo_workspace::WorkspacePaths::new(workspace_root.to_path_buf());
+        let agent = AgentProfileId::builtin();
+        let dir = agent.skills_dir(&paths);
+        write_skill_tree(&dir, names);
         let registry = Arc::new(SkillRegistry::new());
-        registry.load_dir(root);
-        registry
+        registry.ensure_agent_skills(&agent, &paths);
+        (registry, dir)
     }
 
     /// Replace what is on disk, then reload — `SkillInstall`/`SkillUninstall`
@@ -4844,12 +4862,12 @@ mod tests {
     #[tokio::test]
     async fn a_skill_installed_mid_session_reaches_the_model() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha", "beta"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha", "beta"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
         let rows = ctx.message_count();
 
-        reload_with(&registry, dir.path(), &["alpha", "beta", "gamma"]);
+        reload_with(&registry, &skills_dir, &["alpha", "beta", "gamma"]);
         ctx.reconcile_skills().await;
 
         assert_eq!(ctx.message_count(), rows + 1, "{:?}", ctx.messages());
@@ -4866,11 +4884,11 @@ mod tests {
     #[tokio::test]
     async fn an_uninstalled_skill_is_reported_as_gone() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha", "beta"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha", "beta"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
 
-        reload_with(&registry, dir.path(), &["alpha"]);
+        reload_with(&registry, &skills_dir, &["alpha"]);
         ctx.reconcile_skills().await;
 
         let update = newest_skills_update(&ctx).expect("an update");
@@ -4883,7 +4901,7 @@ mod tests {
     #[tokio::test]
     async fn a_listing_that_still_matches_the_registry_says_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha"]);
+        let (registry, _skills_dir) = skills_on_disk(dir.path(), &["alpha"]);
         let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
         let rows = ctx.message_count();
@@ -4900,13 +4918,13 @@ mod tests {
     #[tokio::test]
     async fn each_skills_update_is_a_complete_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
 
-        reload_with(&registry, dir.path(), &["alpha", "beta"]);
+        reload_with(&registry, &skills_dir, &["alpha", "beta"]);
         ctx.reconcile_skills().await;
-        reload_with(&registry, dir.path(), &["alpha", "beta", "gamma"]);
+        reload_with(&registry, &skills_dir, &["alpha", "beta", "gamma"]);
         ctx.reconcile_skills().await;
 
         let updates: Vec<String> = ctx
@@ -4928,13 +4946,13 @@ mod tests {
     #[tokio::test]
     async fn a_registry_that_moves_back_retracts_the_standing_update() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha", "beta"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha", "beta"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
 
-        reload_with(&registry, dir.path(), &["alpha"]);
+        reload_with(&registry, &skills_dir, &["alpha"]);
         ctx.reconcile_skills().await;
-        reload_with(&registry, dir.path(), &["alpha", "beta"]);
+        reload_with(&registry, &skills_dir, &["alpha", "beta"]);
         ctx.reconcile_skills().await;
 
         let update = newest_skills_update(&ctx).expect("a retraction");
@@ -4949,7 +4967,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_seeded_with_no_skills_still_learns_of_the_first_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &[]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &[]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
         assert_eq!(
@@ -4958,7 +4976,7 @@ mod tests {
             "no listing row when nothing is invocable"
         );
 
-        reload_with(&registry, dir.path(), &["alpha"]);
+        reload_with(&registry, &skills_dir, &["alpha"]);
         ctx.reconcile_skills().await;
 
         let update = newest_skills_update(&ctx).expect("an update");
@@ -4990,9 +5008,9 @@ mod tests {
         .expect("write skill");
 
         let registry = Arc::new(SkillRegistry::new());
-        registry.ensure_agent_overlay(&agent, &workspace);
+        registry.ensure_agent_skills(&agent, &workspace);
         assert!(
-            registry.list().is_empty(),
+            registry.summaries_for(None).is_empty(),
             "the shared set is empty — that is the whole point"
         );
 
@@ -5006,6 +5024,46 @@ mod tests {
         assert_eq!(advertised, vec!["private".to_string()], "{advertised:?}");
     }
 
+    /// The payoff of a scoped `SkillInstall`: the agent that asked for the
+    /// skill is told it landed, on its very next iteration, and no other
+    /// session hears about it. Both halves matter — a `+` line that also
+    /// reached unbound sessions would be the leak the scoping exists to
+    /// prevent.
+    #[tokio::test]
+    async fn an_overlay_install_drifts_only_the_agent_that_made_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        let agent = AgentProfileId::parse("01JAGENT").expect("id");
+        let own = agent.skills_dir(&workspace);
+        std::fs::create_dir_all(&own).expect("mkdir");
+
+        let (registry, _default_dir) = skills_on_disk(dir.path(), &["alpha"]);
+        registry.ensure_agent_skills(&agent, &workspace);
+
+        let mut bound = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
+        bound.agent = Some(agent.clone());
+        bound.ensure_seeded().await;
+        let mut unbound = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
+        unbound.ensure_seeded().await;
+
+        // What `SkillInstall` does when the caller is that agent.
+        write_skill_tree(&own, &["private"]);
+        registry.reload();
+
+        bound.reconcile_skills().await;
+        let update = newest_skills_update(&bound).expect("the installer is told");
+        assert!(update.contains("+- private: desc for private"), "{update}");
+
+        unbound.reconcile_skills().await;
+        assert!(
+            newest_skills_update(&unbound).is_none(),
+            "an unbound session must not learn of another agent's skill: {:?}",
+            unbound.messages()
+        );
+    }
+
     /// The compaction filter is correctness, not hygiene. `insert_skill_trailer`
     /// puts the fresh listing just after the system block — a LOW index — while
     /// an older one can survive in the kept verbatim tail at a HIGHER one, and
@@ -5015,7 +5073,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_leaves_exactly_one_listing_row_and_no_updates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha", "beta"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha", "beta"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 2, 6000, 0.5);
         ctx.ensure_seeded().await;
         for i in 0..40 {
@@ -5027,7 +5085,7 @@ mod tests {
             ctx.append(&make_msg(Role::Assistant, &format!("reply {i}")))
                 .await;
         }
-        reload_with(&registry, dir.path(), &["alpha"]);
+        reload_with(&registry, &skills_dir, &["alpha"]);
         ctx.reconcile_skills().await;
         assert!(
             ctx.messages()
@@ -5069,7 +5127,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_listing_row_serves_as_the_baseline() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = skills_on_disk(dir.path(), &["alpha"]);
+        let (registry, skills_dir) = skills_on_disk(dir.path(), &["alpha"]);
         let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 5, 100_000, 0.75);
         ctx.ensure_seeded().await;
 
@@ -5078,7 +5136,7 @@ mod tests {
             "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- ghost: not real\n</system-reminder>".into(),
         )]))
         .await;
-        reload_with(&registry, dir.path(), &["alpha", "beta"]);
+        reload_with(&registry, &skills_dir, &["alpha", "beta"]);
         ctx.reconcile_skills().await;
 
         let update = newest_skills_update(&ctx).expect("an update");
@@ -5235,6 +5293,75 @@ mod tests {
         );
     }
 
+    /// The trailer's detail block re-broadcasts the body of a skill the
+    /// session actually called — and most skills belong to an agent, not to
+    /// the binary. Looking them up unscoped found only the compiled-in set,
+    /// so an agent's own skill lost its definition at exactly the moment the
+    /// summary discarded the original: right after a compaction, mid-use.
+    #[test]
+    fn the_trailer_re_broadcasts_a_skill_from_the_agents_own_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(dir.path().to_path_buf());
+        let agent = AgentProfileId::parse("01JOWNER").expect("id");
+        let own = agent.skills_dir(&paths);
+        std::fs::create_dir_all(own.join("mine")).expect("mkdir");
+        std::fs::write(
+            own.join("mine/SKILL.md"),
+            "---\nname: mine\ndescription: d\nversion: 1.0.0\n---\n\nMINE_BODY\n",
+        )
+        .expect("write skill");
+
+        let registry = Arc::new(SkillRegistry::new());
+        assert_eq!(registry.ensure_agent_skills(&agent, &paths), 1);
+
+        let called = ["mine".to_string()];
+        let advertised = registry.summaries_for(Some(&agent));
+
+        let mut scoped = vec![make_msg(Role::System, "sys")];
+        insert_skill_trailer(
+            &mut scoped,
+            &registry,
+            Some(&agent),
+            &SimpleTokenizer,
+            &called,
+            &advertised,
+        );
+        let joined: String = scoped
+            .iter()
+            .filter_map(|m| match m.content.first() {
+                Some(ContentBlock::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("MINE_BODY"), "body must survive: {joined}");
+
+        // The scope is what makes it work: another agent's trailer cannot
+        // reach it, so the body is absent rather than leaked.
+        let other = AgentProfileId::parse("01JOTHER").expect("id");
+        let mut foreign = vec![make_msg(Role::System, "sys")];
+        insert_skill_trailer(
+            &mut foreign,
+            &registry,
+            Some(&other),
+            &SimpleTokenizer,
+            &called,
+            &advertised,
+        );
+        let foreign_joined: String = foreign
+            .iter()
+            .filter_map(|m| match m.content.first() {
+                Some(ContentBlock::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !foreign_joined.contains("MINE_BODY"),
+            "another agent's trailer must not carry it: {foreign_joined}"
+        );
+    }
+
     /// The trailer's reminder block advertises the caller-supplied
     /// (seed-filtered) set — not the raw registry — and is skipped
     /// entirely when that set is empty; the called-skill detail block
@@ -5243,7 +5370,7 @@ mod tests {
     fn skill_trailer_respects_the_advertised_set() {
         let registry = registry_with(&[("visible", "V_BODY"), ("hidden", "H_BODY")]);
         let advertised: Vec<SkillSummary> = registry
-            .all_summaries_sorted()
+            .summaries_for(None)
             .into_iter()
             .filter(|s| s.name == "visible")
             .collect();
@@ -5252,6 +5379,7 @@ mod tests {
         insert_skill_trailer(
             &mut messages,
             &registry,
+            None,
             &SimpleTokenizer,
             &["hidden".to_string()],
             &advertised,
@@ -5271,7 +5399,7 @@ mod tests {
         assert!(texts[2].contains("H_BODY"), "called skill keeps its detail");
 
         let mut bare = vec![make_msg(Role::System, "sys")];
-        insert_skill_trailer(&mut bare, &registry, &SimpleTokenizer, &[], &[]);
+        insert_skill_trailer(&mut bare, &registry, None, &SimpleTokenizer, &[], &[]);
         assert_eq!(bare.len(), 1, "empty advertised set inserts no reminder");
     }
 
@@ -5714,6 +5842,7 @@ mod tests {
         let registry = registry_with(&[("big", big.as_str()), ("small", "SMALL_BODY")]);
         let payload = build_skill_detail_payload(
             &registry,
+            None,
             &SimpleTokenizer,
             &["big".to_string(), "small".to_string()],
         )
@@ -5743,6 +5872,7 @@ mod tests {
 
         let payload = build_skill_detail_payload(
             &registry,
+            None,
             &SimpleTokenizer,
             &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
@@ -5774,6 +5904,7 @@ mod tests {
 
         let payload = build_skill_detail_payload(
             &registry,
+            None,
             &SimpleTokenizer,
             &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
@@ -5793,7 +5924,7 @@ mod tests {
         // so the trailer-emitting caller skips the message entirely.
         let registry = Arc::new(SkillRegistry::new());
         assert!(
-            build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()])
+            build_skill_detail_payload(&registry, None, &SimpleTokenizer, &["ghost".to_string()])
                 .is_none()
         );
     }

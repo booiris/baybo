@@ -19,7 +19,7 @@ a wizard, an operator's first run goes:
 
 `baybo setup` collapses that down to one interactive command that
 
-- bootstraps the workspace skeleton (`config/`, `personas/`, `skills/`,
+- bootstraps the workspace skeleton (`config/`, `personas/`,
   `agents/`, `.key/`, `state/`, `work/`, `logs/`),
 - mints the master encryption key at `<root>/.key/encryption.key`
   with mode 0600 — **minting only**: loading, rotating and recovering that key
@@ -73,8 +73,9 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
 
 1. Calls `baybo_workspace::ensure_layout`, which creates every
    workspace subdir and runs `git init` inside `config/`,
-   `personas/`, `skills/`, and `agents/` (per-dir repos, no top-level
-   repo).
+   `personas/`, and `agents/` (per-dir repos, no top-level repo).
+   Skill directories live inside `personas/` and are versioned by
+   that repo, so they get no `.git` of their own.
    Then calls `seed_default_identity_files`, which
    re-seeds any missing identity file (e.g. a deleted `SOUL.md`) from
    its default template without clobbering operator edits — load-

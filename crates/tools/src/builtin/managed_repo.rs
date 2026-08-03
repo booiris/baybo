@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
 use baybo_workspace::paths::{
-    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, classify_persona_path,
-    escapes_upward, has_git_component,
+    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
+    classify_persona_path, escapes_upward, has_git_component,
 };
 use baybo_workspace::{WorkspacePaths, absolutise};
 use tokio::process::Command;
@@ -76,7 +76,6 @@ impl ChangeKind {
 pub(crate) struct ManagedRoots {
     personas_dir: PathBuf,
     work_dir: PathBuf,
-    skills_dir: PathBuf,
 }
 
 impl ManagedRoots {
@@ -84,7 +83,6 @@ impl ManagedRoots {
         Self {
             personas_dir: absolutise(&paths.personas_dir()),
             work_dir: absolutise(&paths.work_dir()),
-            skills_dir: absolutise(&paths.skills_dir()),
         }
     }
 
@@ -94,7 +92,12 @@ impl ManagedRoots {
     }
 
     /// Whether a write here skips the approval gate: an identity file, a
-    /// memory file, or anything under `work/` / `skills/`.
+    /// memory file, or anything under `work/`.
+    ///
+    /// A skill directory is deliberately absent. Every skill now belongs to
+    /// some agent, and `SkillInstall` — which runs the risk assessor — is its
+    /// only sanctioned writer; letting `Edit` hand-author a `SKILL.md` in
+    /// place would be a way around that gate, not a convenience.
     ///
     /// Shape only — *some* agent's file. Ownership is checked at execute
     /// time, because this has no call context to check it against.
@@ -102,7 +105,6 @@ impl ManagedRoots {
         self.is_identity_shape(file_path)
             || self.is_memory_shape(file_path)
             || self.is_inside(&self.work_dir, file_path)
-            || self.is_inside(&self.skills_dir, file_path)
     }
 
     /// What `file_path` is, or [`PersonaPath::Other`] when it is not a
@@ -217,9 +219,9 @@ impl ManagedRoots {
             return Err(ToolError::InvalidParams(format!(
                 "writes under {PERSONAS_DIR}/ are restricted to the shared \
                  {SHARED_USER_FILE}, this agent's own {{SOUL,IDENTITY,USER}}.md, \
-                 and its own {PERSONA_MEMORY_DIR}/; anything else there (a \
-                 skills overlay, another agent's files) is not writable \
-                 through a tool at all; got {}",
+                 and its own {PERSONA_MEMORY_DIR}/; anything else there (any \
+                 agent's {SKILLS_DIR}/, another agent's files) is not writable \
+                 through a tool at all — use SkillInstall for a skill; got {}",
                 file_path.display()
             )));
         }
@@ -498,6 +500,42 @@ mod tests {
         // …but the shape still bypasses the gate, because the declaration
         // has no call context; execute is what refuses it.
         assert!(r.bypasses_approval(&theirs));
+    }
+
+    /// No skill directory is writable through the persona tier — not the
+    /// caller's own, not anyone else's. `SkillInstall` runs the risk assessor
+    /// and is the only sanctioned writer; letting `Edit` hand-author a
+    /// `SKILL.md` in place would be a way around that gate. The built-in is
+    /// not an exception: its skills live in a persona directory like every
+    /// other agent's.
+    #[test]
+    fn no_agents_skill_directory_is_writable_through_the_persona_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let r = roots(tmp.path());
+        let paths = WorkspacePaths::new(tmp.path().to_path_buf());
+
+        for owner in ["baybo", "01JSCOUT"] {
+            let skill = paths.persona_skills_dir(owner).join("deploy/SKILL.md");
+            for caller in ["baybo", "01JSCOUT"] {
+                assert!(
+                    r.audit_target(&skill, &agent(caller)).is_err(),
+                    "{caller} writing {owner}'s skill",
+                );
+            }
+            // And it does not skip the approval gate either, which is what
+            // separates it from `work/` and the memory tree.
+            assert!(!r.bypasses_approval(&skill));
+            assert!(!r.write_bypasses_approval(&skill));
+            // A decoy named like an identity file is one level too deep to be
+            // claimed as one.
+            for kind in IdentityKind::all() {
+                let decoy = paths.persona_skills_dir(owner).join(kind.file_name());
+                assert!(
+                    r.audit_target(&decoy, &agent(owner)).is_err(),
+                    "{owner} {kind:?}",
+                );
+            }
+        }
     }
 
     #[test]

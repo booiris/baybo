@@ -5868,7 +5868,7 @@ export interface operations {
     list_skills: {
         parameters: {
             query?: {
-                /** @description List this agent's scope instead of the shared set */
+                /** @description List this agent's scope instead of the default one */
                 agent_id?: string;
             };
             header?: never;

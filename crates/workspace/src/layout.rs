@@ -9,15 +9,27 @@ use std::path::Path;
 use crate::identity;
 use crate::paths::{IdentityKind, WorkspacePaths};
 
-/// Materialise the workspace skeleton: create `config/`,
-/// `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`,
+/// Materialise the workspace skeleton: create `config/`, `agents/`,
+/// `personas/`, `personas/baybo/skills/`, `.key/`, `state/`, `work/`,
 /// `work/tmp/`, `logs/`, and initialise a standalone git repo inside
 /// each of the declarative dirs if it isn't one already. Idempotent —
 /// safe to call on every boot.
+///
+/// `personas/baybo/skills/` is the one persona-internal path created here,
+/// and it is created **empty on purpose**. `SkillRegistry` only records a
+/// directory that exists, and `reload()` replays exactly the recorded list —
+/// while the operator dashboard's refresh calls `reload()` and nothing else.
+/// So a default scope whose directory did not exist yet would silently ignore
+/// a hand-placed skill until the next restart. Every other agent gets the
+/// same guarantee from `ensure_persona_layout` at profile creation; the
+/// built-in has no such hook, because its id is a constant rather than DB
+/// state, so its directory is layout's job.
+///
+/// Also writes `personas/.gitignore` — see [`PERSONAS_GITIGNORE_BODY`].
 pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
     for dir in [
         paths.config_dir(),
-        paths.skills_dir(),
+        paths.persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR),
         paths.agents_dir(),
         paths.personas_dir(),
         paths.key_dir(),
@@ -31,15 +43,35 @@ pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("create workspace dir {}: {e}", dir.display()))?;
     }
 
-    for dir in [
-        paths.config_dir(),
-        paths.skills_dir(),
-        paths.agents_dir(),
-        paths.personas_dir(),
-    ] {
+    for dir in [paths.config_dir(), paths.agents_dir(), paths.personas_dir()] {
         ensure_git_repo(&dir).await?;
     }
+    ensure_personas_gitignore(paths).await?;
     Ok(())
+}
+
+/// Everything under `personas/` that is transient rather than declarative.
+///
+/// `SkillInstall` stages a copy at `<agent>/skills/.staging/<uuid>/` before
+/// the atomic rename, and a crash between the two leaves it there. That used
+/// to land in a skills-only repo nobody hand-curated; it now lands in the one
+/// repo an operator is told to commit their personas from, where a plain
+/// `git add -A` would sweep it in. Same reason `deck` ignores its own
+/// `.staging/`.
+const PERSONAS_GITIGNORE_BODY: &str = "*/skills/.staging/
+";
+
+/// Write `personas/.gitignore` if it is missing. Never overwritten — an
+/// operator who edited it keeps their version, exactly like the identity
+/// files.
+async fn ensure_personas_gitignore(paths: &WorkspacePaths) -> anyhow::Result<()> {
+    let path = paths.personas_dir().join(".gitignore");
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    tokio::fs::write(&path, PERSONAS_GITIGNORE_BODY)
+        .await
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
 }
 
 /// Seed any missing identity markdown file for the **built-in** agent
@@ -165,7 +197,7 @@ mod tests {
 
         for d in [
             paths.config_dir(),
-            paths.skills_dir(),
+            paths.persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR),
             paths.agents_dir(),
             paths.personas_dir(),
             paths.key_dir(),
@@ -178,18 +210,57 @@ mod tests {
         }
         // No workspace-root .gitignore should exist anymore.
         assert!(!dir.join(".gitignore").exists());
-        // Each of config/, personas/, skills/, and agents/ is its own git repo.
+        // Each of config/, personas/, and agents/ is its own git repo.
         assert!(paths.config_dir().join(".git").is_dir());
-        assert!(paths.skills_dir().join(".git").is_dir());
         assert!(paths.agents_dir().join(".git").is_dir());
         assert!(paths.personas_dir().join(".git").is_dir());
+        // Skills are versioned by the personas/ repo they sit in; a nested
+        // .git there would give git two owners for one file.
+        assert!(
+            !paths
+                .persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR)
+                .join(".git")
+                .exists()
+        );
         // .key/ is NOT a git repo — encryption key must never be tracked.
         assert!(!paths.key_dir().join(".git").exists());
 
+        // A leaked `SkillInstall` staging tree must not be sweepable into the
+        // personas repo by a plain `git add -A`.
+        let ignore = paths.personas_dir().join(".gitignore");
+        assert!(ignore.is_file(), "missing {}", ignore.display());
+        let staging = paths
+            .persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR)
+            .join(".staging/abc-123");
+        tokio::fs::create_dir_all(&staging).await.expect("mkdir");
+        tokio::fs::write(staging.join("SKILL.md"), "x")
+            .await
+            .expect("write");
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(paths.personas_dir())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .await
+            .expect("git status");
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !status.contains(".staging"),
+            "staging tree is visible to `git add -A`: {status}"
+        );
+
+        // An operator's own edit to it survives a re-apply.
+        tokio::fs::write(&ignore, "# mine\n").await.expect("edit");
+
         // Idempotent: a re-apply must not re-init or fail.
         ensure_layout(&paths).await.expect("layout reapply");
+        assert_eq!(
+            tokio::fs::read_to_string(&ignore).await.expect("read"),
+            "# mine\n",
+            "operator edit clobbered"
+        );
         assert!(paths.config_dir().join(".git").is_dir());
-        assert!(paths.skills_dir().join(".git").is_dir());
+        assert!(paths.personas_dir().join(".git").is_dir());
     }
 
     #[tokio::test]

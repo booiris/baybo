@@ -103,7 +103,7 @@ boundary.
 
 The Bash tool still applies its normal tool-layer guards. In particular, cwd
 and any absolute command-path argument must remain inside the configured work
-directory (the read-only `skills/` tree excepted) unless the build uses the
+directory (the caller's own read-only skill directory excepted) unless the build uses the
 bench-only `bench-bash` feature.
 
 ## Sandbox Availability
