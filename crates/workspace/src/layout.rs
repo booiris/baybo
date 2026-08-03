@@ -15,9 +15,16 @@ use crate::paths::{IdentityKind, WorkspacePaths};
 /// each of the declarative dirs if it isn't one already. Idempotent —
 /// safe to call on every boot.
 ///
-/// The built-in's skill directory is the one persona-internal path created
-/// here rather than by `ensure_persona_layout`: every other agent is DB
-/// state, but the built-in's id is a constant, so its folder is layout.
+/// `personas/baybo/skills/` is the one persona-internal path created here,
+/// and it is created **empty on purpose**. `SkillRegistry` only records a
+/// directory that exists, and `reload()` replays exactly the recorded list —
+/// while the operator dashboard's refresh calls `reload()` and nothing else.
+/// So a default scope whose directory did not exist yet would silently ignore
+/// a hand-placed skill until the next restart. Every other agent gets the
+/// same guarantee from `ensure_persona_layout` at profile creation; the
+/// built-in has no such hook, because its id is a constant rather than DB
+/// state, so its directory is layout's job.
+///
 /// Also writes `personas/.gitignore` — see [`PERSONAS_GITIGNORE_BODY`].
 pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
     for dir in [

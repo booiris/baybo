@@ -951,6 +951,39 @@ mod tests {
         assert!(reg.get_scoped(Some(&agent), "deck").is_none());
     }
 
+    /// Why `ensure_layout` creates the built-in's skill directory eagerly.
+    ///
+    /// A directory that does not exist is never recorded, and `reload()`
+    /// replays exactly the recorded list. The dashboard's refresh calls
+    /// `reload()` and nothing else — so if the default scope's directory were
+    /// absent at boot, an operator who hand-placed a skill in it would get
+    /// nothing from refresh until the next restart. Materialising it up front
+    /// is what keeps the default scope permanently in the replay list.
+    #[test]
+    fn a_hand_placed_skill_in_an_existing_directory_survives_a_bare_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = baybo_workspace::WorkspacePaths::new(tmp.path().to_path_buf());
+        let builtin = AgentProfileId::builtin();
+        let dir = builtin.skills_dir(&paths);
+
+        // What `ensure_layout` does: the directory exists and is empty.
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = SkillRegistry::new();
+        assert_eq!(reg.ensure_agent_skills(&builtin, &paths), 0);
+        assert!(
+            reg.agent_dir_loaded(&builtin),
+            "an empty directory must still be recorded — that is the point"
+        );
+
+        // Operator drops a skill in and hits refresh, which is reload() alone.
+        write_skill(&dir, "greet", "hand-placed");
+        reg.reload();
+        assert!(
+            reg.get_scoped(Some(&builtin), "greet").is_some(),
+            "refresh must pick up a hand-placed skill without a restart"
+        );
+    }
+
     #[test]
     fn a_missing_agent_directory_is_empty_not_an_error() {
         let reg = SkillRegistry::new();
