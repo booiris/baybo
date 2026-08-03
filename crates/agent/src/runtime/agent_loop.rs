@@ -1055,6 +1055,20 @@ impl AgentLoop {
             // delta rides this request, so the gate has to see its tokens.
             self.context_manager.reconcile_system_prompt().await;
 
+            // Same shape, one layer over: tell the session what it could load,
+            // and announce anything that has appeared or gone since. A sidecar
+            // finishing its boot after the conversation started is the normal
+            // case, so a seed-time roster alone would be wrong.
+            self.context_manager
+                .reconcile_deferred_tools(&self.tool_registry.deferred_tool_names(
+                    baybo_tools::registry::SessionToolScope {
+                        channel: &session.channel,
+                        trigger: &session.trigger,
+                        loaded: &session.state.loaded_tools,
+                    },
+                ))
+                .await;
+
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(
                 session,
@@ -1322,6 +1336,9 @@ impl AgentLoop {
         let approved = std::sync::Arc::new(parking_lot::Mutex::new(
             session.state.approved_resources.clone(),
         ));
+        // Shared for the same reason `approved` is: a tool loaded by one call
+        // in this batch has to be visible to the executor's gate for the next.
+        let loaded_tools = baybo_tools::LoadedToolsHandle::new(session.state.loaded_tools.clone());
 
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
@@ -1371,6 +1388,7 @@ impl AgentLoop {
             let triggering_llm_span = Some(llm_span_id);
             let limiter = Arc::clone(&concurrency_limiter);
             let read_tracker = read_tracker_for_calls.clone();
+            let loaded_for_call = loaded_tools.clone();
             // `Concurrent` → one permit (up to the cap run together);
             // `Exclusive` → every permit, so the call runs alone among
             // pool calls; `Independent` → no permit (self-bounded, e.g.
@@ -1412,6 +1430,7 @@ impl AgentLoop {
                         background_eligible,
                         read_tracker,
                         notify_silence,
+                        Some(loaded_for_call),
                     )
                     .await
             }
@@ -1587,6 +1606,7 @@ impl AgentLoop {
 
         // Flush accumulated approvals back into session state.
         session.state.approved_resources = approved.lock().clone();
+        session.state.loaded_tools = loaded_tools.snapshot();
 
         let task_mutated = response
             .tool_calls
@@ -1691,7 +1711,11 @@ impl AgentLoop {
         // session's calls and prompt caching holds.
         let tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
-            .tool_definitions_for_session(&session.channel, &session.trigger)
+            .tool_definitions_for_session(baybo_tools::registry::SessionToolScope {
+                channel: &session.channel,
+                trigger: &session.trigger,
+                loaded: &session.state.loaded_tools,
+            })
             .into_iter()
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,

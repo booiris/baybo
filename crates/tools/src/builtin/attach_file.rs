@@ -330,6 +330,7 @@ pub fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {
         parameters_schema: attach.parameters_schema(),
         capabilities: vec![ToolCapability::ReadFile],
         channels: Vec::new(),
+        deferred: false,
     };
     (Arc::new(attach), manifest)
 }

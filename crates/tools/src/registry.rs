@@ -4,7 +4,41 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde_json::Value;
 
-use crate::{Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, ToolOutput};
+use crate::{
+    LoadedTools, Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, ToolOutput,
+};
+
+/// The three axes that decide whether one session may see and call a tool.
+///
+/// Grouped rather than passed as three references because the visibility
+/// filter here and the executor's admission check have to apply the *same*
+/// three: a tool omitted from the list but accepted on the way in is not gated
+/// at all, and a hallucinated or skill-body-prompted name would still run.
+#[derive(Clone, Copy)]
+pub struct SessionToolScope<'a> {
+    pub channel: &'a baybo_model::ChannelType,
+    pub trigger: &'a baybo_model::TriggerSource,
+    pub loaded: &'a LoadedTools,
+}
+
+impl SessionToolScope<'_> {
+    /// Whether this session may see and call `tool`. `manifest` is `None` only
+    /// for a registration that somehow carries none, treated as unrestricted.
+    pub fn allows(&self, manifest: Option<&ToolManifest>, tool: &dyn Tool) -> bool {
+        let manifest_ok =
+            manifest.is_none_or(|m| m.allows_channel(self.channel) && m.is_loaded(self.loaded));
+        manifest_ok && tool.trigger_scope().allows_trigger(self.trigger)
+    }
+
+    /// Like [`Self::allows`] but ignoring whether the tool has been loaded —
+    /// "would this session be allowed to load it at all". `ToolSearch` uses
+    /// this so a channel- or trigger-restricted tool cannot be reached by
+    /// naming it, and so the roster never advertises one.
+    pub fn allows_ignoring_load(&self, manifest: Option<&ToolManifest>, tool: &dyn Tool) -> bool {
+        manifest.is_none_or(|m| m.allows_channel(self.channel))
+            && tool.trigger_scope().allows_trigger(self.trigger)
+    }
+}
 
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
@@ -95,6 +129,27 @@ impl ToolRegistry {
             .push(name);
     }
 
+    /// Register a builtin that could not be built before the registry was
+    /// frozen — one that needs a handle to the registry itself.
+    ///
+    /// Deliberately not [`Self::register_dynamic`]: that seam belongs to
+    /// external providers, and its `source` is what
+    /// [`Self::unregister_for_source`] sweeps. Filing a first-party builtin
+    /// under an invented source name would put it in reach of a sweep that has
+    /// no business knowing about it, and list it beside real MCP servers.
+    ///
+    /// The entry therefore carries no source and cannot be unregistered.
+    pub fn register_late_builtin(&self, tool: Arc<dyn Tool>, manifest: ToolManifest) {
+        let name = tool.name().to_string();
+        debug_assert_eq!(
+            name, manifest.name,
+            "tool name does not match manifest name"
+        );
+        let mut state = self.dynamic.write();
+        state.tools.insert(name.clone(), tool);
+        state.manifests.insert(name, manifest);
+    }
+
     /// Drop every dynamic tool previously registered under `source`.
     /// Returns the names that were removed.
     pub fn unregister_for_source(&self, source: &str) -> Vec<String> {
@@ -153,29 +208,17 @@ impl ToolRegistry {
     /// session and the prompt-cache constraint above still holds. A tool with no
     /// manifest is treated as channel-unrestricted (defensive — `register`
     /// always stores one).
-    pub fn tool_definitions_for_session(
-        &self,
-        channel: &baybo_model::ChannelType,
-        trigger: &baybo_model::TriggerSource,
-    ) -> Vec<ToolDefinition> {
+    pub fn tool_definitions_for_session(&self, scope: SessionToolScope<'_>) -> Vec<ToolDefinition> {
         let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
         for (name, tool) in &self.builtin {
-            let channel_ok = self
-                .builtin_manifests
-                .get(name)
-                .is_none_or(|m| m.allows_channel(channel));
-            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
+            if scope.allows(self.builtin_manifests.get(name), tool.as_ref()) {
                 let def = tool_definition_for(tool.as_ref());
                 defs.insert(def.name.clone(), def);
             }
         }
         let dynamic = self.dynamic.read();
         for (name, tool) in &dynamic.tools {
-            let channel_ok = dynamic
-                .manifests
-                .get(name)
-                .is_none_or(|m| m.allows_channel(channel));
-            if channel_ok && tool.trigger_scope().allows_trigger(trigger) {
+            if scope.allows(dynamic.manifests.get(name), tool.as_ref()) {
                 let def = tool_definition_for(tool.as_ref());
                 defs.insert(def.name.clone(), def);
             } else {
@@ -187,6 +230,58 @@ impl ToolRegistry {
         let mut out: Vec<ToolDefinition> = defs.into_values().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Names of every deferred tool this session may load — the roster it is
+    /// shown. Sorted, so the message is byte-stable and a re-render differs
+    /// only when the set genuinely differs.
+    ///
+    /// Deliberately ignores what is *already* loaded, even though the scope
+    /// carries it. Filtering loaded tools out would shrink the roster on every
+    /// load, and each shrink is a delta message the model gains nothing from —
+    /// it can see those tools in its own tool list. Holding the set stable
+    /// means a load produces no roster traffic at all, and re-selecting a tool
+    /// whose definition scrolled out of a compacted transcript still works.
+    pub fn deferred_tool_names(&self, scope: SessionToolScope<'_>) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |name: &String, manifest: Option<&ToolManifest>, tool: &dyn Tool| {
+            if manifest.is_some_and(|m| m.deferred) && scope.allows_ignoring_load(manifest, tool) {
+                names.push(name.clone());
+            }
+        };
+        for (name, tool) in &self.builtin {
+            push(name, self.builtin_manifests.get(name), tool.as_ref());
+        }
+        let dynamic = self.dynamic.read();
+        for (name, tool) in &dynamic.tools {
+            push(name, dynamic.manifests.get(name), tool.as_ref());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The definition of one deferred tool, if this session may load it.
+    /// `None` when the name is unknown or out of scope — `ToolSearch` reports
+    /// both the same way, so naming a channel-restricted tool reveals nothing
+    /// beyond what the roster already omits.
+    pub fn loadable_definition(
+        &self,
+        name: &str,
+        scope: SessionToolScope<'_>,
+    ) -> Option<ToolDefinition> {
+        let dynamic = self.dynamic.read();
+        let (tool, manifest) = match dynamic.tools.get(name) {
+            Some(tool) => (Arc::clone(tool), dynamic.manifests.get(name).cloned()),
+            None => (
+                Arc::clone(self.builtin.get(name)?),
+                self.builtin_manifests.get(name).cloned(),
+            ),
+        };
+        drop(dynamic);
+        let deferred = manifest.as_ref().is_some_and(|m| m.deferred);
+        (deferred && scope.allows_ignoring_load(manifest.as_ref(), tool.as_ref()))
+            .then(|| tool_definition_for(tool.as_ref()))
     }
 
     /// Look up a tool by name. Dynamic registrations shadow builtins.
@@ -250,6 +345,9 @@ fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use super::SessionToolScope;
+    use crate::LoadedTools;
 
     use baybo_storage::test_support::MemoryBlobStore;
 
@@ -335,6 +433,56 @@ mod tests {
         }
     }
 
+    /// A deferred tool is absent from a session's list until that session
+    /// loads it, and present after — while the unfiltered listing carries it
+    /// either way. Registered here rather than leaning on whatever
+    /// `default_tools` happens to defer: which families are deferred is a
+    /// product decision, and a test that encodes it fails on every retune.
+    #[test]
+    fn a_deferred_tool_appears_only_once_loaded() {
+        let mut registry = default_registry();
+        let tool = crate::test_support::EchoTool::new("Deferred");
+        let mut manifest = tool.manifest();
+        manifest.deferred = true;
+        registry.register(Arc::new(tool), manifest);
+
+        let names = |loaded: &LoadedTools| {
+            registry
+                .tool_definitions_for_session(SessionToolScope {
+                    channel: &baybo_model::ChannelType::owner(),
+                    trigger: &baybo_model::TriggerSource::User,
+                    loaded,
+                })
+                .into_iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+        };
+
+        let unloaded = LoadedTools::default();
+        assert!(!names(&unloaded).contains(&"Deferred".to_string()));
+        assert_eq!(
+            registry.deferred_tool_names(SessionToolScope {
+                channel: &baybo_model::ChannelType::owner(),
+                trigger: &baybo_model::TriggerSource::User,
+                loaded: &unloaded,
+            }),
+            vec!["Deferred".to_string()],
+            "an unloaded deferred tool is what the roster advertises"
+        );
+
+        let loaded: LoadedTools = ["Deferred"].into_iter().collect();
+        assert!(names(&loaded).contains(&"Deferred".to_string()));
+
+        // Never hidden from the unfiltered listing — that one answers "what
+        // does this deployment have", not "what can this session call".
+        assert!(
+            registry
+                .tool_definitions()
+                .iter()
+                .any(|d| d.name == "Deferred")
+        );
+    }
+
     #[test]
     fn unknown_tool_fails_safe_to_exclusive() {
         let registry = default_registry();
@@ -356,24 +504,27 @@ mod tests {
         let names =
             |defs: Vec<crate::ToolDefinition>| defs.into_iter().map(|d| d.name).collect::<Vec<_>>();
 
-        let owner = names(registry.tool_definitions_for_session(
-            &baybo_model::ChannelType::owner(),
-            &baybo_model::TriggerSource::User,
-        ));
+        let owner = names(registry.tool_definitions_for_session(SessionToolScope {
+            channel: &baybo_model::ChannelType::owner(),
+            trigger: &baybo_model::TriggerSource::User,
+            loaded: &LoadedTools::default(),
+        }));
         assert!(owner.contains(&"OwnerOnly".to_string()));
         assert!(owner.contains(&"PutBlob".to_string()));
 
-        let telegram = names(registry.tool_definitions_for_session(
-            &baybo_model::ChannelType::telegram(),
-            &baybo_model::TriggerSource::User,
-        ));
+        let telegram = names(registry.tool_definitions_for_session(SessionToolScope {
+            channel: &baybo_model::ChannelType::telegram(),
+            trigger: &baybo_model::TriggerSource::User,
+            loaded: &LoadedTools::default(),
+        }));
         assert!(!telegram.contains(&"OwnerOnly".to_string()));
         assert!(!telegram.contains(&"PutBlob".to_string()));
         // Unrestricted tools are unaffected, and the two lists differ by
         // exactly the two restricted entries.
         assert!(telegram.contains(&"AttachFile".to_string()));
         assert_eq!(owner.len(), telegram.len() + 2);
-        // The unfiltered listing still carries everything.
+        // The unfiltered listing carries everything, this fixture defers
+        // nothing, so the two agree.
         assert_eq!(registry.tool_definitions().len(), owner.len());
     }
 
@@ -414,12 +565,17 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object"}),
             capabilities: vec![],
             channels: Vec::new(),
+            deferred: false,
         };
         registry.register(Arc::new(FireOnly), manifest);
 
         let has = |trigger: &TriggerSource| {
             registry
-                .tool_definitions_for_session(&baybo_model::ChannelType::owner(), trigger)
+                .tool_definitions_for_session(SessionToolScope {
+                    channel: &baybo_model::ChannelType::owner(),
+                    trigger,
+                    loaded: &LoadedTools::default(),
+                })
                 .into_iter()
                 .any(|d| d.name == "report_nothing")
         };

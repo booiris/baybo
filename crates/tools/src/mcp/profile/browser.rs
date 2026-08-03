@@ -178,6 +178,9 @@ pub fn browser_mcp_profile(
         // pre-execute approval gate never fires for browser tool calls.
         capabilities: Vec::new(),
         extra_env,
+        // Two dozen tools, ~4k tokens on every request, wanted by a minority of
+        // conversations — and the ones that want them rarely want all 24.
+        deferred: true,
     })
 }
 

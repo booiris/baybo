@@ -229,14 +229,49 @@ list is rendered and reused for slash-command matching.
 
 `ToolManifest` carries coarse capability ceilings (`ToolCapability`): `ReadFile`, `WriteFile`, `Http`, `ExecCommand`. The manifest answers "what *kind* of thing may this tool do"; the concrete resource per call comes from `Tool::accessed_resources(params)` as [`ResourceAccess`] and is what the approval gate routes on. Trust level is a separate axis enforced before execution.
 
-The manifest also carries `channels: Vec<ChannelType>` (empty = every channel, the norm): a channel-restricted tool is enforced twice — the agent loop assembles the LLM's tool list via `ToolRegistry::tool_definitions_for_channel(&session.channel)` so other sessions never see it (the channel is session-stable, so the list stays byte-identical across calls and the prompt-cache sort guarantee holds), and the executor refuses a call that names it anyway (omission is not a gate against a hallucinated or skill-body-prompted name). The deck tools (`DeckCardList`/`DeckCardGet`/`DeckCardCreate`/`DeckCardUpdate`) are the first restricted tools (`channels: [owner]` — the deck is the owner's surface).
-
 Typical rules:
 
 - `Untrusted` tools may not auto-execute
 - `Installed` tools may not declare `WriteFile` or `ExecCommand` (requires `Trusted`)
 - Concrete paths/hosts/commands are gated by user approval, not by manifest
-- A `channels`-restricted tool is invisible and refused outside its channels
+
+### Which tools a session sees
+
+Three axes decide it, and `ToolRegistry::tool_definitions_for_session` applies all three through one `SessionToolScope { channel, trigger, loaded }`. Grouping them is load-bearing: the executor's admission check has to apply the *same* three, because **omission is not a gate** — a tool left out of the list but accepted on the way in is not gated at all, and a hallucinated or skill-body-prompted name would still execute.
+
+| Axis | Declared on | Fixed for the session? |
+|---|---|---|
+| `ToolManifest::channels` (empty = every channel) | manifest | yes |
+| `Tool::trigger_scope()` | tool impl | yes |
+| `ToolManifest::deferred` | manifest | no — the loaded set only grows |
+
+The first two being session-stable, and the third only ever growing, is what keeps the serialised `tools` array byte-identical across a session's calls. Anthropic's prompt cache keys on the exact request prefix (tools → system → messages), so a list that shuffled or shrank would invalidate every breakpoint past `tools`.
+
+**Channels.** The deck tools are the original restricted set (`channels: [owner]` — the deck is the owner's surface).
+
+**Trigger.** `report_nothing` is `ToolTriggerScope::CronFire`: it can only suppress a recurring fire's own notification, so it appears nowhere else.
+
+### Deferred tools
+
+A **deferred** tool is not in a session's tool list until the session asks for it by name. It is named — and nothing more — in a roster the session is shown; `ToolSearch` turns a name into the full definition, and the tool stays for the rest of the conversation.
+
+The problem it solves: a tool costs tokens on *every* request of *every* session whether or not it is ever called. The 34 deferred here (browser's 24, cron's six, the deck's four) were 6,001 tokens carried by every chat, every cron fire and every subagent; the roster is 279 and `ToolSearch` 262.
+
+**Everything the mechanism adds goes into messages, never the tool array.** That is the design, not an implementation detail:
+
+- **Roster** (`prompts::deferred_tools::render_roster`) — a `<system-reminder>` of bare names. No descriptions: `browser/read_page` already says what it is, and a blurb each would cost most of what deferring saved. The framing carries what a name cannot — how to load, and that calling first fails.
+- **Deltas** — a sidecar that finishes booting after the conversation started is the normal case, so `ContextManager::reconcile_deferred_tools` appends what arrived or went away. Appended, never rewritten, for the reason `messages_for_llm` records for superseded `SystemPromptUpdate` rows. A withdrawal is announced rather than silently applied, so a model reaching for one is told why instead of getting a bare `ToolSearch` miss.
+- **Definitions** — returned as `ToolSearch`'s own tool output, so they land in the transcript where appending is free.
+
+Adding to the tool array instead would invalidate the system prompt and the whole transcript behind it on the turn that loaded. Measured on a live deployment: half of tool-using sessions reach for a browser tool, and 73% of those first do so at call 9 or later — a miss there cost ~64k of full-price re-read to save ~4k, roughly a 16× loss. That measurement is why this mechanism is shaped the way it is.
+
+**State.** `SessionState::loaded_tools` (`LoadedTools`, in `baybo-model` — a session persists it, and `Session` cannot depend on the tool layer). Sorted and deduped on construction so load order never reaches the wire; persisted so a restart does not re-hide a capability the model had been using. `LoadedToolsHandle` mirrors `approved_resources`: shared and mutable, so a load reaches the next tool call in the *same* turn.
+
+**Where the loader lives.** `ToolSearch` is registered by the full runtime *after* the registry is frozen, because it reads the live registry — a deferred sidecar's tools appear when it connects, later still. It holds a `Weak<ToolRegistry>`: a strong handle would be a cycle, since the tool sits inside the registry it reads. It goes in through `register_late_builtin`, not `register_dynamic`, because the latter's `source` is what `unregister_for_source` sweeps and a first-party builtin filed under an invented source name would be in reach of a sweep that has no business knowing about it.
+
+Nothing in `default_tools` is deferred, and that is load-bearing: the argv boot path builds a registry from that list alone and never registers `ToolSearch`, so a deferred tool there would be one no session on that path could load. Deferral is declared by the families the full runtime registers — which registers the loader alongside them.
+
+**What is not deferred, and why.** `Task*` stays resident. Every deferred family has a moment where the model plainly needs it — a page to open, a job to schedule, a card to write — so the round trip is prompted by the work itself. Planning has no such moment: the model chooses to track work, and it quietly choosing not to is invisible. Deferring a capability whose absence cannot be observed trades 737 tokens for a silent regression nothing would report.
 
 ### User-approval gate
 

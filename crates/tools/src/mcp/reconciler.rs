@@ -392,6 +392,7 @@ impl McpReconciler {
                 tool.parameters_schema(),
                 trust_level.clone(),
                 entry.capabilities.clone(),
+                entry.deferred,
             );
             self.registry
                 .register_dynamic(&entry.name, Arc::new(tool), manifest);
@@ -612,6 +613,7 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![],
             oauth: None,
+            deferred: false,
         };
         let embedded = resource_access_for(&entry, true);
         assert!(
@@ -648,6 +650,7 @@ mod tests {
             trust_level: TrustLevelConfig::Trusted,
             capabilities: vec![ToolCapability::ExecCommand],
             oauth: None,
+            deferred: false,
         };
         let access = resource_access_for(&entry, true);
         assert_eq!(

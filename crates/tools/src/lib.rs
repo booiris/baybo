@@ -30,6 +30,7 @@ pub use approval::{
     ResourceAccess,
 };
 pub(crate) use baybo_model::FileFingerprint;
+pub use baybo_model::LoadedTools;
 pub use builtin::read::READ_TOOL_NAME;
 
 /// The parameter every file tool names its target with. Shared because callers
@@ -232,6 +233,31 @@ impl NotifySilence {
     }
 }
 
+/// A session's loaded deferred tools, shared between the agent loop that
+/// persists them, the executor that gates on them, and `ToolSearch`.
+///
+/// Shared and mutable for the same reason `approved_resources` is: a load has
+/// to be visible to the *next* tool call in the same turn, not only to the
+/// next turn.
+#[derive(Clone, Default)]
+pub struct LoadedToolsHandle(Arc<parking_lot::Mutex<LoadedTools>>);
+
+impl LoadedToolsHandle {
+    pub fn new(loaded: LoadedTools) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(loaded)))
+    }
+
+    /// Mark `name` loaded. Returns whether this call was the one that added
+    /// it, so a caller can persist and log exactly once per tool.
+    pub fn load(&self, name: &str) -> bool {
+        self.0.lock().insert(name)
+    }
+
+    pub fn snapshot(&self) -> LoadedTools {
+        self.0.lock().clone()
+    }
+}
+
 /// Context injected into tool execution by the agent layer.
 pub struct ToolContext {
     pub session_id: SessionId,
@@ -353,6 +379,11 @@ pub struct ToolContext {
     /// else, so the tool no-ops on a user reply, a one-shot fire, or any
     /// ordinary turn. See [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
+    /// This session's loaded deferred tools. `ToolSearch` adds to it; the
+    /// executor reads it to admit a deferred call. `None` on paths with no
+    /// session behind them (argv one-shots, older fixtures), where a deferred
+    /// tool is unreachable anyway. See [`LoadedToolsHandle`].
+    pub loaded_tools: Option<LoadedToolsHandle>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -395,6 +426,7 @@ impl ToolContext {
             background_jobs: None,
             background_control: None,
             notify_silence: None,
+            loaded_tools: None,
         }
     }
 }
@@ -920,6 +952,17 @@ pub struct ToolManifest {
     /// gate against a hallucinated or prompted-by-skill-body call.
     #[serde(default)]
     pub channels: Vec<baybo_model::ChannelType>,
+    /// Keep this tool out of a session's list until it asks for it by name
+    /// with `ToolSearch`. `false` — the norm — is always present.
+    ///
+    /// The third scoping axis, beside [`Self::channels`] and
+    /// [`Tool::trigger_scope`], and the only one that is not fixed for a
+    /// session's lifetime: a session opts in mid-conversation and stays opted
+    /// in. It exists because a tool costs tokens on *every* request whether or
+    /// not it is ever called, and most tools are called in a minority of
+    /// conversations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 impl ToolManifest {
@@ -927,6 +970,12 @@ impl ToolManifest {
     /// An empty `channels` list means no restriction.
     pub fn allows_channel(&self, channel: &baybo_model::ChannelType) -> bool {
         self.channels.is_empty() || self.channels.contains(channel)
+    }
+
+    /// Whether a session that has loaded `loaded` may see or call this tool.
+    /// A tool that is not [`Self::deferred`] is always allowed.
+    pub fn is_loaded(&self, loaded: &LoadedTools) -> bool {
+        !self.deferred || loaded.contains(&self.name)
     }
 }
 

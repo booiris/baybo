@@ -39,6 +39,18 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
         channels: Vec::new(),
+        // NOT deferred, unlike the other discretionary families. Every one of
+        // those has a moment where the model plainly needs it — a page to
+        // open, a job to schedule, a card to write — so a round trip to load
+        // is prompted by the task itself. Planning has no such moment: the
+        // model chooses to track work, and the cost of it quietly choosing
+        // not to is invisible. Deferring a capability whose absence cannot be
+        // observed trades 737 tokens for a silent behavioural regression.
+        //
+        // The live checklist the agent loop re-injects only appears once
+        // tasks exist, so it cannot stand in for the schemas the way a
+        // sidecar's own errors can.
+        deferred: false,
     };
     (tool, manifest)
 }

@@ -51,6 +51,7 @@ pub fn build(
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
         channels: Vec::new(),
+        deferred: false,
     };
     (tool, manifest)
 }
@@ -495,6 +496,7 @@ pub fn build_install_tool(
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
         channels: Vec::new(),
+        deferred: false,
     };
     (tool, manifest)
 }
@@ -675,6 +677,7 @@ pub fn build_uninstall_tool(
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
         channels: Vec::new(),
+        deferred: false,
     };
     (tool, manifest)
 }

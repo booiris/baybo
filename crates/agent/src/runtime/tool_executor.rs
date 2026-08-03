@@ -478,6 +478,10 @@ impl ToolExecutor {
         // Handle a cron-fire tool (`report_nothing`) flips to suppress this
         // fire's notification. `None` for every turn that cannot be silenced.
         notify_silence: Option<baybo_tools::NotifySilence>,
+        // This session's loaded deferred tools. Read here to refuse a call to
+        // one it has not loaded, and handed to the tool so `ToolSearch` can add
+        // to it. `None` on paths with no session behind them.
+        loaded_tools: Option<baybo_tools::LoadedToolsHandle>,
     ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
@@ -498,6 +502,23 @@ impl ToolExecutor {
                         "security: tool '{}' is not available on channel '{}'",
                         tool_name,
                         user.channel.as_str()
+                    )),
+                    approval: None,
+                };
+            }
+            // Same reasoning one axis over: a deferred tool is omitted from
+            // this session's list until it loads it, and omission is not a
+            // gate. Unlike the channel refusal this one is recoverable, so it
+            // says how rather than just saying no.
+            let loaded = loaded_tools
+                .as_ref()
+                .map(|h| h.snapshot())
+                .unwrap_or_default();
+            if !manifest.is_loaded(&loaded) {
+                return ExecutedTool {
+                    output: Err(anyhow::anyhow!(
+                        "tool '{tool_name}' is not loaded in this conversation. Call {search}                          with `select:{tool_name}` first; it becomes callable on your next                          message.",
+                        search = baybo_tools::builtin::tool_search::TOOL_SEARCH_TOOL_NAME,
                     )),
                     approval: None,
                 };
@@ -725,6 +746,7 @@ impl ToolExecutor {
                     )) as Arc<dyn BilledChat>
                 });
                 let ctx = ToolContext {
+                    loaded_tools: loaded_tools.clone(),
                     session_id: session_id.clone(),
                     session_trigger: session_trigger.clone(),
                     agent_id: agent_id.clone(),

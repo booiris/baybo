@@ -46,6 +46,7 @@ pub mod read;
 mod rg;
 pub mod secret;
 pub mod todo;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod write;
 
@@ -95,6 +96,12 @@ pub struct DefaultToolsConfig {
     pub builtin_memory: bool,
 }
 
+/// Nothing here is [`ToolManifest::deferred`], and that is load-bearing rather
+/// than incidental: the argv boot path (`baybo/src/main.rs`) builds a registry
+/// from this list alone and never registers `ToolSearch`, so a deferred tool
+/// here would be one no session on that path could ever load. Deferral is
+/// declared by the families the full runtime registers, which registers the
+/// loader alongside them.
 pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let DefaultToolsConfig {
         blob_store,
@@ -156,6 +163,7 @@ pub(crate) fn trusted<T: Tool + 'static>(
         parameters_schema: tool.parameters_schema(),
         capabilities,
         channels: Vec::new(),
+        deferred: false,
     };
     (Arc::new(tool), manifest)
 }

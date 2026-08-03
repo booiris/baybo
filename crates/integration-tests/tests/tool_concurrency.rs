@@ -79,6 +79,7 @@ impl ProbeTool {
             parameters_schema: json!({ "type": "object", "additionalProperties": true }),
             capabilities: vec![],
             channels: Vec::new(),
+            deferred: false,
         }
     }
 }

@@ -67,6 +67,8 @@ Mechanically, suppression is local to the recurring fire (which has no delivery 
 
 The fire still ran and its reply row and transcript survive in the (hidden) session — suppression hides, it never deletes, so a run that goes wrongly silent stays inspectable (`include_cron`).
 
+**`report_nothing` is deliberately not deferred**, unlike the six scheduling tools beside it. A fire whose entire answer is "nothing happened" would otherwise have to spend a turn loading a tool before it could say so, making the silent path cost more than the noisy one; its trigger scope already keeps it out of every non-fire session's list, so leaving it resident costs an ordinary conversation nothing. See [`tools.md`](tools.md) §Deferred tools.
+
 **Visibility scope, not just a runtime no-op.** The tool is omitted from the LLM's tool list outside a recurring fire, via a trigger-scope axis on `ToolRegistry::tool_definitions_for_session` (`Tool::trigger_scope` → `ToolTriggerScope::CronFire`, keyed on `is_cron_conversation()`) that mirrors the manifest's `channels` axis. Both the channel and the trigger are fixed for a session's whole life, so the tool list stays byte-stable within a session and the prompt cache holds. The effect guard is separate: the fire's `NotifySilence` handle (`ToolContext::notify_silence`) is present only on a recurring fire turn, so a call on a user reply in a cron conversation — where the tool is visible for cache-stability but should not act — is a no-op.
 
 ### Jobs the runtime owns

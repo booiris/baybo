@@ -451,6 +451,13 @@ filtered from its LLM tool list and refused by the executor), and a card is
 only ever authored when the owner types `/deck <request>` in chat (web or
 iOS; it's a plain chat message, no client plumbing).
 
+All four are additionally **deferred**: even an owner session does not carry
+them until it asks, because the deck is a standing surface the owner curates
+and most turns never touch a card. The skill body opens by loading them, so
+`/deck` spends no turn discovering they are absent — its `allowed-tools` names
+the `DeckCard*` tools, which would otherwise send it into the executor's
+(recoverable) refusal. See [`tools.md`](tools.md) §Deferred tools.
+
 When the user types `/deck`:
 
 1. **Skill.** The slash expansion injects the builtin `deck` skill: the bundle contract, the `ctx`/`deck` SDK surface, and worked examples deliberately spanning genres (an API-fetch quota card *and* a fetch-free machine-status card via `ctx.exec`) so the skill doesn't anchor generation to one shape.
