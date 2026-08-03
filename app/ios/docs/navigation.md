@@ -61,6 +61,29 @@ The clamp install is `#available(iOS 26, *)`-gated: pre-26 pops don't overshoot,
 and UIKit's finish/completion math reads the same velocity — capping it there
 would only make fast flicks feel laggy.
 
+### Lending the edge out — `EdgeSwipeOverride`
+
+A screen that lets something COVER the conversation has to lend the left edge to
+it: swiping out of a full-screen overlay must leave the overlay, not the chat
+under it. `PopGestureEnabler(edgeOverride:)` takes that reading — `active`, plus
+`begin` / `move(points)` / `end(dismiss)` — and while it is active the host
+
+- refuses the interactive pop AND, on iOS 26, disables
+  `interactiveContentPopGestureRecognizer` with it. Refusing only the edge one
+  would be worse than doing nothing: the content recognizer is ordered BEHIND it
+  by a failure requirement, so an edge recognizer that steps aside simply hands
+  the pop over;
+- arms its own `UIScreenEdgePanGestureRecognizer` on the NAVIGATION
+  controller's view (a recognizer sees every touch in its view's subtree, which
+  is what lets it read a swipe landing on web content — the zero-sized host view
+  takes no touches at all), and
+- judges the release itself: past `dismissFraction` of the width, or a flick
+  over `dismissVelocity`. The renderer is only ever told the verdict.
+
+Its one caller today is `ChatScreen`, for the full-screen HTML preview — which
+lives inside the transcript webview, so native owns the gesture and the page
+owns the travel (see [`transcript.md`](transcript.md)).
+
 ## Liquid Glass (iOS 26+; deployment target is 18.0)
 
 ### Never call `.glassEffect` raw

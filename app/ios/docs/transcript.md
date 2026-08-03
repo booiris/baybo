@@ -385,12 +385,116 @@ APIs. Finally, `TranscriptNavigationPolicy` permits only the transcript index
 in the main frame and `/html-preview/` in a subframe, so page code cannot
 replace its frame with an external URL to escape the no-network CSP.
 
+The card is a framed window: a surface-tinted chrome bar (line-art window glyph
++ label, then stroked reload / expand controls in the transcript's own 20-unit
+1.2-weight glyph hand) over the page. Its height is `--html-preview-h` —
+nothing on this side can measure an opaque-origin page, so the card picks a
+height rather than fitting one, capped as a share of the viewport so a small
+phone still shows the reply around it.
+
 The toolbar reloads and expands the SAME iframe. Fullscreen is CSS-fixed rather
 than reparented (no page reload or JS-state loss), while
 `htmlPreviewMaximized` hides the native header/composer; the trusted parent
 toolbar owns the close button. Detach/session-switch sends
 `collapseHtmlPreview`, so a reopened chat never gets stranded behind an old
-fullscreen preview.
+fullscreen preview — and that path alone is instant, because the page is about
+to be repointed at another session.
+
+#### Expanding and collapsing — the rect morph
+
+**The maximize engine is Deck's**, down to the timing (`--html-preview-morph`
+mirrors `.deck-max-animate`), for the reason Deck's exists: an `<iframe>`
+reloads when its node MOVES in the DOM, so the box never moves. It lifts to
+`position: fixed` at the exact rect the inline card occupied and animates by
+RECT — `left/top/width/height` — so the page inside is laid out at every
+intermediate size rather than drawn scaled. The `<pre>` holds that slot open
+(`--html-preview-h`) so the collapse has somewhere true to land, and the
+collapse re-measures the slot rather than replaying a remembered rect (rows keep
+arriving while a preview is up, so its home may have moved down the thread).
+
+The transition itself is declared in `styles.css` and the geometry is written
+from `HtmlPreview.tsx`, which waits on `transitionend`; its timer is a loose
+upper bound, not a copy of the duration. Three writes are load-bearing:
+
+- `flushSync` puts the fullscreen class on in the SAME synchronous block that
+  pinned the starting rect — a scheduled render would paint the box at full
+  screen first;
+- the chrome bar sheds its status-bar padding one morph EARLY on the way out,
+  since the class that would do it only flips at the far end; and
+- **the morph is scaled to the distance actually left**
+  (`--html-preview-morph-scale`), and a box already home is retired on the spot.
+  Leaving `position: fixed` tears the box's compositing layer down and repaints
+  every glyph in it — unavoidable, but it has to land WITH the motion. A release
+  after a long edge drag has almost no travel left, and running the full
+  duration anyway parked the box for a quarter second and THEN repainted:
+  measured on a real agent page at 60fps as a single 280ms-late flash of the
+  whole card. The scale is a custom property so the bar's own transition
+  inherits it and lands with the box. It has a floor
+  (`MIN_MORPH_SCALE`) from both directions: a transition scaled to nothing never
+  runs, and a tail under ~5 frames stops reading as motion.
+
+#### The morph's end state must BE the final state
+
+Everything above is one rule: when the class flips, nothing may still be
+mid-flight. Two ways it was broken, both found by diffing 60fps frames of a real
+agent page and both fixed:
+
+- **`.is-maximized` differed from the card in more than the rect** — it carried
+  `padding-bottom: env(safe-area-inset-bottom)`, no border and square corners.
+  Parked on the slot's rect the box was still reserving a home indicator, so the
+  page inside grew ~34pt at the bottom the instant the class flipped. All of it
+  now derives from `--html-preview-expansion` (0 = card, 1 = full screen), which
+  `HtmlPreview.tsx` writes EARLY — a dismissal starts at 0, a drag rides
+  `1 - travelled` — so the values travel with the box. **Anything added to
+  `.is-maximized` that is not position/rect has to go through that variable.**
+- **the settle retired the box on the first `transitionend`** — that event fires
+  PER PROPERTY, and the morph moves seven of them. Whichever landed first flipped
+  the class while the rest were a pixel or two short. It now waits on
+  `getAnimations()`, the whole set.
+
+**A fade was tried first and cannot work here.** The card can only be in one
+place, so the moment the fullscreen box drops below full opacity the reader is
+looking at the EMPTY reserved slot behind it. Measured off a 60fps capture:
+~80ms of blank screen at the end of every dismissal, and a blank first frame on
+every expand. Do not reintroduce an opacity-based enter or exit.
+
+Two ways out, both the same morph home:
+
+- the toolbar's close button; and
+- **a left-edge swipe**, which native lends to the preview
+  (`EdgeSwipeOverride`, see [`navigation.md`](navigation.md)): with a preview up,
+  the interactive pop is held off and the drag arrives here as
+  `htmlPreviewDragBegin` / `…Move(px)` / `…End(dismiss)`.
+
+  The finger drives the SAME morph — the box shrinks toward its slot, it does
+  not slide. A translate would be a second, unrelated motion that the release
+  then has to hand over to a shrink, and it drags a full-screen page sideways,
+  which reads as the conversation itself moving. A full screen-width drag
+  arrives all the way home; native commits the dismissal well before that, so
+  the release always has travel left to animate. Rects are written straight to
+  the element — no React state, so a drag costs no re-render — and the chrome
+  bar sheds its status-bar padding along the way rather than in one step at the
+  release (it is the only part of the box whose height a class flip owns).
+
+Two more things keep the uncovered thread still, because the swipe reveals it
+*while it travels*:
+
+- native's chrome stays at FULL HEIGHT behind the preview (opacity 0, inert) —
+  the composer's geometry is what native reports as the thread's bottom
+  obstruction, and collapsing it moved that edge; and
+- `postHtmlPreviewMaximized(false)` fires when the dismissal STARTS, not when it
+  finishes — but the native chrome CROSS-FADES with the morph rather than
+  cutting (`ChatScreen.chromeFade`). It is composited ABOVE the webview, so a
+  hard cut showed at both ends: on the way in it vanished a beat before the box
+  had grown over the thread (three raw frames of headerless conversation), and
+  on the way out the back button and composer pill were drawn ON TOP of a
+  still-full-screen agent page.
+
+And one more, in the stylesheet: the rule that lifts `.md`'s clip (an ancestor's
+`overflow: clip` also clips a `position: fixed` descendant) is scoped with
+`:has` to the ONE message hosting the box. Applied to every `.md` under the
+document class — which is how it started — it relaid every message in the thread
+on the way in and again on the way out.
 
 ### LaTeX math
 

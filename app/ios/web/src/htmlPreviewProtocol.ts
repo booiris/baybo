@@ -1,5 +1,14 @@
 export const HTML_PREVIEW_LANGUAGE = "language-baybo-html";
 export const HTML_PREVIEW_COLLAPSE_EVENT = "baybo:collapse-html-preview";
+/// Native's left-edge swipe while a preview is full screen. The interactive pop
+/// is held off there (PopGesture.swift) and the drag is streamed here instead,
+/// so the swipe leaves the PREVIEW rather than the conversation.
+export const HTML_PREVIEW_DRAG_BEGIN_EVENT = "baybo:html-preview-drag-begin";
+export const HTML_PREVIEW_DRAG_MOVE_EVENT = "baybo:html-preview-drag-move";
+export const HTML_PREVIEW_DRAG_END_EVENT = "baybo:html-preview-drag-end";
+/// Set on <html> while a preview owns the screen — locks the thread's scroll
+/// and lifts the `.md` clip that would otherwise cut a fixed child.
+export const HTML_PREVIEW_MAXIMIZED_CLASS = "html-preview-maximized";
 export const HTML_PREVIEW_URL_PREFIX =
   "baybo-transcript://localhost/html-preview/";
 

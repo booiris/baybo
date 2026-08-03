@@ -4,7 +4,12 @@
 // dev browser (no window.webkit) outbound posts degrade to console.log stubs.
 
 import type { OutlineEntry, PersistedState, WireAttachment } from "./types";
-import { HTML_PREVIEW_COLLAPSE_EVENT } from "./htmlPreviewProtocol";
+import {
+  HTML_PREVIEW_COLLAPSE_EVENT,
+  HTML_PREVIEW_DRAG_BEGIN_EVENT,
+  HTML_PREVIEW_DRAG_END_EVENT,
+  HTML_PREVIEW_DRAG_MOVE_EVENT,
+} from "./htmlPreviewProtocol";
 
 export type InitPayload = {
   language: string;
@@ -100,6 +105,14 @@ type BayboGlobal = {
   requestSync(): void;
   /// Collapse an inline HTML preview before the transcript is detached.
   collapseHtmlPreview(): void;
+  /// A left-edge swipe over a FULL-SCREEN preview. Native holds the interactive
+  /// pop off while one is up (PopGesture.swift) and streams the drag here
+  /// instead, so the swipe leaves the preview rather than the conversation.
+  /// `px` is the distance travelled from the edge; `dismiss` is native's
+  /// verdict on the release (distance or flick), never re-judged here.
+  htmlPreviewDragBegin(): void;
+  htmlPreviewDragMove(px: number): void;
+  htmlPreviewDragEnd(dismiss: boolean): void;
   /// Native invokes this just before it detaches the bridge (back-out) so the
   /// debounced transcript mirror is written up to that instant — otherwise
   /// steps delivered live since the last debounce sit in neither the mirror nor
@@ -705,6 +718,15 @@ window.baybo = {
   },
   collapseHtmlPreview() {
     window.dispatchEvent(new Event(HTML_PREVIEW_COLLAPSE_EVENT));
+  },
+  htmlPreviewDragBegin() {
+    window.dispatchEvent(new Event(HTML_PREVIEW_DRAG_BEGIN_EVENT));
+  },
+  htmlPreviewDragMove(px) {
+    window.dispatchEvent(new CustomEvent(HTML_PREVIEW_DRAG_MOVE_EVENT, { detail: px }));
+  },
+  htmlPreviewDragEnd(dismiss) {
+    window.dispatchEvent(new CustomEvent(HTML_PREVIEW_DRAG_END_EVENT, { detail: dismiss }));
   },
   flushPersist() {
     flushPersist();
