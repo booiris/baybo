@@ -4,7 +4,7 @@
 
 The `workspace` crate is the single source of truth for Baybo's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `personas/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `personas/`, `skills/` — always inside a persona directory — `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
 
 - **Skeleton materialisation** (`layout` module, `io` feature): `ensure_layout`, `seed_default_identity_files` — the two boot-time writes that turn a bare root into a usable workspace.
 - **Identity I/O** (`identity` module, `io` feature, default-on): `IdentityFiles`, `IdentitySource`, `load_identity`, `load_identity_files`, `ensure_persona_layout` — the async readers backing the identity documents, seeding any that is missing.
@@ -22,9 +22,9 @@ The workspace root is the single **project root** for the entire runtime: every 
 ```text
 <workspace_root>/
   config/          # standalone git repo: baybo.json, .mcp.json
-  skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
-  personas/        # standalone git repo: one dir per agent — SOUL.md + IDENTITY.md + skills/
+  personas/        # standalone git repo: one dir per agent — SOUL.md + IDENTITY.md
+                   # + skills/ + memory/, plus the shared USER.md
   .key/            # not version-controlled: encryption.key (mode 0600)
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, tmp/ (disposable scratch, swept), agent scratch
@@ -43,7 +43,7 @@ checkout rather than polluting the real user home.
 | ---------------- | ------------------------------------------ |
 | config           | `<workspace.path>/config/baybo.json`        |
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
-| skills           | `<workspace.path>/skills/`                 |
+| agent skills     | `<workspace.path>/personas/<agent_id>/skills/` |
 | agent identity files | `<workspace.path>/personas/<agent_id>/{SOUL,IDENTITY,USER}.md` |
 | built-in's identity files | `<workspace.path>/personas/baybo/…` — it is an ordinary persona dir |
 | shared user profile | `<workspace.path>/personas/USER.md` (owned by no agent) |
@@ -67,15 +67,15 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing.
-- Runs `git init --quiet` inside `config/`, `skills/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `agents/`, `personas/`, `personas/baybo/skills/`, `.key/`, `state/`, `work/`, `work/tmp/`, `logs/` if missing. The built-in's skill directory is the one persona-internal path created here rather than by `ensure_persona_layout` — every other agent is DB state, but the built-in's id is a constant, so its folder is layout.
+- Runs `git init --quiet` inside `config/`, `agents/`, and `personas/` if the directory isn't already a git repo (`<dir>/.git` check). Skill directories get no repo of their own — they live inside `personas/`, which already is one, and a nested `.git` there would give git two answers to which repo owns a file.
 
 Per-agent subdirectories under `personas/` are created on demand by
 `ensure_persona_layout` (at profile creation, and defensively when a bound
 session's actor is built), not by `ensure_layout` — the set of agents is
 DB-state, not layout.
 
-`config/`, `personas/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `personas/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
+`config/`, `personas/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the three declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits and skills both commit inside `personas/`, which is the repo that spans the whole declarative agent surface — every agent's identity, memory, and skills; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
 ## Config file resolution
 
@@ -155,9 +155,11 @@ number), measuring staleness with the shared
 `baybo_workspace::walk::tree_stats` walker (newest lstat mtime anywhere
 in the tree, symlinks never followed); see [`janitor.md`](janitor.md).
 
-### Why split state/work/logs from personas/skills
+### Why split state/work/logs from personas
 
-The split exists so the user's git workflow stays clean: `config/`, `personas/`, `skills/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (sqlite DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the four declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+The split exists so the user's git workflow stays clean: `config/`, `personas/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (sqlite DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the three declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+
+One consequence of skills living inside `personas/`: `git checkout .` in that repo is a gesture that reaches installed skills as well as identity files. That is the price of one repo spanning the declarative agent surface, and it is paid knowingly — the alternative, a `.git` nested inside another repo, fails silently and much worse (`git add` records a gitlink with no `.gitmodules`, and a fresh clone restores an empty directory).
 
 ## Constraints
 

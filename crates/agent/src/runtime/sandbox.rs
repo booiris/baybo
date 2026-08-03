@@ -96,7 +96,7 @@ impl SandboxAdapter {
     }
 
     /// Expose extra host paths **read-only** inside the sandbox, mounted
-    /// at the same path. Used to surface `<workspace>/skills` so an
+    /// at the same path. Used to surface the skill trees so an
     /// installed skill's bundled script runs in place: under
     /// `Permissive`, the RO bind is layered on top of the denylist's
     /// masking tmpfs (the agent's denylist masks all of `~/.baybo`), so

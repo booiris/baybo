@@ -150,13 +150,17 @@ async fn main() -> anyhow::Result<()> {
         if builtins > 0 {
             info!(count = builtins, "registered built-in skills");
         }
-        let workspace_skills = workspace_paths.skills_dir();
-        let loaded = reg.load_dir(&workspace_skills);
+        // The built-in's own directory, eagerly: every other agent is loaded
+        // lazily at actor build because the set of agents is DB state, but
+        // this one is the default scope and is read by listings that run
+        // before any actor exists.
+        let builtin = baybo_model::AgentProfileId::builtin();
+        let loaded = reg.ensure_agent_skills(&builtin, &workspace_paths);
         if loaded > 0 {
             info!(
                 count = loaded,
-                path = %workspace_skills.display(),
-                "loaded skills from workspace"
+                path = %builtin.skills_dir(&workspace_paths).display(),
+                "loaded skills from the built-in persona"
             );
         }
         reg

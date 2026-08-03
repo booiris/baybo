@@ -12,7 +12,10 @@ use crate::format::CommandOutput;
 const RECENT_FAILURE_WINDOW: Duration = Duration::hours(24);
 
 pub async fn handle(ctx: &CommandContext, live: bool) -> Result<CommandOutput> {
-    let skills_count = ctx.skills.list().len();
+    let skills_count = ctx
+        .skills
+        .summaries_for(crate::context::OPERATOR_SKILL_SCOPE)
+        .len();
     let tools_count = ctx.tools.tool_definitions().len();
     let channels_count = ctx.channels.len();
     let (provider, model) = match ctx.llm.as_ref() {

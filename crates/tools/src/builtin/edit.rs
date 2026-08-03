@@ -38,7 +38,7 @@
 //! `Edit` it, so a self-edit must not be a per-turn approval prompt with
 //! no audit trail — for *every* agent, not just the built-in.
 //!
-//! Edits under `<workspace>/work/` and `<workspace>/skills/` also skip
+//! Edits under `<workspace>/work/` and the shared skill tree also skip
 //! the approval gate (matching the `Write` tool's `work/` bypass), but
 //! without the identity-file allowlist, size cap, or audit commit —
 //! those roots are agent scratch / managed skill content, not an

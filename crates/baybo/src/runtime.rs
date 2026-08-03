@@ -251,13 +251,17 @@ pub async fn build_managers(
         if builtins > 0 {
             info!(count = builtins, "registered built-in skills");
         }
-        let workspace_skills = workspace_paths.skills_dir();
-        let loaded = reg.load_dir(&workspace_skills);
+        // The built-in's own directory, eagerly: every other agent is loaded
+        // lazily at actor build because the set of agents is DB state, but
+        // this one is the default scope and is read by listings that run
+        // before any actor exists.
+        let builtin = baybo_model::AgentProfileId::builtin();
+        let loaded = reg.ensure_agent_skills(&builtin, &workspace_paths);
         if loaded > 0 {
             info!(
                 count = loaded,
-                path = %workspace_skills.display(),
-                "loaded skills from workspace"
+                path = %builtin.skills_dir(&workspace_paths).display(),
+                "loaded skills from the built-in persona"
             );
         }
         reg
@@ -432,7 +436,10 @@ pub async fn build_managers(
     ));
     {
         let registry = Arc::clone(&skill_registry);
-        let lookup = move |name: &str| registry.get(name);
+        // Boot has only scanned the built-in's directory, so this recovers
+        // what the default scope can see. A pending job for a skill in some
+        // other agent's directory is re-assessed on its next invocation.
+        let lookup = move |name: &str| registry.get_scoped(None, name);
         match skill_assessor.recover_pending_jobs(lookup).await {
             Ok(0) => {}
             Ok(n) => info!(count = n, "re-enqueued skill-risk jobs from prior run"),
@@ -540,17 +547,12 @@ pub async fn build_managers(
             baybo_skills::build_skill_tool(Arc::clone(&skill_registry), Arc::clone(&risk_check));
         tool_registry.register(tool, manifest);
 
-        let (install_tool, install_manifest) = baybo_skills::tools::build_install_tool(
-            workspace_paths.skills_dir(),
-            Arc::clone(&skill_registry),
-            risk_check,
-        );
+        let (install_tool, install_manifest) =
+            baybo_skills::tools::build_install_tool(Arc::clone(&skill_registry), risk_check);
         tool_registry.register(install_tool, install_manifest);
 
-        let (uninstall_tool, uninstall_manifest) = baybo_skills::tools::build_uninstall_tool(
-            workspace_paths.skills_dir(),
-            Arc::clone(&skill_registry),
-        );
+        let (uninstall_tool, uninstall_manifest) =
+            baybo_skills::tools::build_uninstall_tool(Arc::clone(&skill_registry));
         tool_registry.register(uninstall_tool, uninstall_manifest);
     }
 
@@ -882,12 +884,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // `initial_model` is the chat pick WITHIN that entry
                 // (`session.state.last_model`); `None` ⇒ entry default.
 
-                // The overlay is loaded lazily, here, because the set of
-                // agents is DB state: boot cannot enumerate the persona
-                // folders to scan, and nothing else populates the map that
+                // Loaded lazily, here, because the set of agents is DB
+                // state: boot can only scan the built-in's folder, not
+                // enumerate the rest, and nothing else populates the map that
                 // `summaries_for` / `get_scoped` read.
                 let agent_id = session.state.agent_id_or_builtin();
-                skill_registry.ensure_agent_overlay(&agent_id, &workspace_paths_arc);
+                skill_registry.ensure_agent_skills(&agent_id, &workspace_paths_arc);
 
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),

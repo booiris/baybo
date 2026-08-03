@@ -9,15 +9,19 @@ use std::path::Path;
 use crate::identity;
 use crate::paths::{IdentityKind, WorkspacePaths};
 
-/// Materialise the workspace skeleton: create `config/`,
-/// `skills/`, `agents/`, `personas/`, `.key/`, `state/`, `work/`,
+/// Materialise the workspace skeleton: create `config/`, `agents/`,
+/// `personas/`, `personas/baybo/skills/`, `.key/`, `state/`, `work/`,
 /// `work/tmp/`, `logs/`, and initialise a standalone git repo inside
 /// each of the declarative dirs if it isn't one already. Idempotent —
 /// safe to call on every boot.
+///
+/// The built-in's skill directory is the one persona-internal path created
+/// here rather than by `ensure_persona_layout`: every other agent is DB
+/// state, but the built-in's id is a constant, so its folder is layout.
 pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
     for dir in [
         paths.config_dir(),
-        paths.skills_dir(),
+        paths.persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR),
         paths.agents_dir(),
         paths.personas_dir(),
         paths.key_dir(),
@@ -31,12 +35,7 @@ pub async fn ensure_layout(paths: &WorkspacePaths) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("create workspace dir {}: {e}", dir.display()))?;
     }
 
-    for dir in [
-        paths.config_dir(),
-        paths.skills_dir(),
-        paths.agents_dir(),
-        paths.personas_dir(),
-    ] {
+    for dir in [paths.config_dir(), paths.agents_dir(), paths.personas_dir()] {
         ensure_git_repo(&dir).await?;
     }
     Ok(())
@@ -165,7 +164,7 @@ mod tests {
 
         for d in [
             paths.config_dir(),
-            paths.skills_dir(),
+            paths.persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR),
             paths.agents_dir(),
             paths.personas_dir(),
             paths.key_dir(),
@@ -178,18 +177,25 @@ mod tests {
         }
         // No workspace-root .gitignore should exist anymore.
         assert!(!dir.join(".gitignore").exists());
-        // Each of config/, personas/, skills/, and agents/ is its own git repo.
+        // Each of config/, personas/, and agents/ is its own git repo.
         assert!(paths.config_dir().join(".git").is_dir());
-        assert!(paths.skills_dir().join(".git").is_dir());
         assert!(paths.agents_dir().join(".git").is_dir());
         assert!(paths.personas_dir().join(".git").is_dir());
+        // Skills are versioned by the personas/ repo they sit in; a nested
+        // .git there would give git two owners for one file.
+        assert!(
+            !paths
+                .persona_skills_dir(crate::paths::BUILTIN_PERSONA_DIR)
+                .join(".git")
+                .exists()
+        );
         // .key/ is NOT a git repo — encryption key must never be tracked.
         assert!(!paths.key_dir().join(".git").exists());
 
         // Idempotent: a re-apply must not re-init or fail.
         ensure_layout(&paths).await.expect("layout reapply");
         assert!(paths.config_dir().join(".git").is_dir());
-        assert!(paths.skills_dir().join(".git").is_dir());
+        assert!(paths.personas_dir().join(".git").is_dir());
     }
 
     #[tokio::test]

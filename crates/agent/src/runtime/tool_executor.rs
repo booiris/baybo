@@ -665,6 +665,12 @@ impl ToolExecutor {
                             home.clone().unwrap_or_else(|| self.workspace_root.clone());
                         let denied =
                             default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
+                        // The calling agent's own skill directory, so an
+                        // installed skill's bundled `scripts/` run in place.
+                        // Not optional: `SkillInstall` writes there, so
+                        // without the bind an agent can install a skill it
+                        // then cannot run. No other agent's tree is bound.
+                        let skill_roots = vec![agent_id.skills_dir(&self.workspace_paths)];
                         Arc::new(
                             SandboxAdapter::new(
                                 Arc::clone(runner),
@@ -672,7 +678,7 @@ impl ToolExecutor {
                                 NetworkPolicy::All,
                             )
                             .with_permissive_filesystem(extra_root, denied)
-                            .with_readable_paths(vec![self.workspace_paths.skills_dir()]),
+                            .with_readable_paths(skill_roots),
                         ) as Arc<dyn ExecSandbox>
                     })
                 } else {

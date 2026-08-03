@@ -130,7 +130,11 @@ impl SlashHandler for CliSlashHandler {
         // User-invocable skills surface as slash commands alongside built-ins.
         // Clap subcommands take precedence on name collisions so operators
         // can't shadow `/config` or `/skills` with a workspace skill.
-        for skill in self.ctx.skills.all_sorted() {
+        for skill in self
+            .ctx
+            .skills
+            .summaries_for(crate::context::OPERATOR_SKILL_SCOPE)
+        {
             let Some(cmd_name) = skill.command.as_deref() else {
                 continue;
             };
@@ -213,7 +217,7 @@ fn is_skill_invocation(raw: &str, skills: &baybo_skills::SkillRegistry) -> bool 
         return false;
     };
     skills
-        .get(first)
+        .get_scoped(crate::context::OPERATOR_SKILL_SCOPE, first)
         .and_then(|s| s.command)
         .is_some_and(|cmd| cmd == first)
 }
