@@ -257,7 +257,18 @@ passed to `load_dir` and rebuilds the skill set from disk. Builtins are
 replayed first (from the definitions captured by `register_builtins`),
 then the dir scans run on top so a same-named workspace skill still
 overrides its builtin — without the replay, the first
-`SkillInstall`-triggered reload silently dropped every builtin. The TUI
+`SkillInstall`-triggered reload silently dropped every builtin.
+
+**The rebuilt set is assembled in full and then swapped in**, so a reader
+observes the complete old set or the complete new one. The maps are a
+`parking_lot::RwLock<HashMap<…>>` rather than a `DashMap` for exactly that
+reason: the operation that matters is replacing all of it at once, and the
+traffic is a handful of reads per turn over a few dozen entries. Reloading
+in place — clear, then repopulate over the directory reads — left concurrent
+readers seeing an empty registry for as long as the disk took, and that is
+not a blip: the skill listing a session seeds from is persisted and is not
+refreshed until a compaction, so a session that seeded inside the window
+advertised a truncated set for its whole life. The TUI
 Skills dashboard wires this into its refresh action (`r` key), so an
 operator editing `<workspace>/skills/<name>/SKILL.md` can press refresh
 to pick up the change without restarting Baybo. Individual broken
@@ -270,7 +281,7 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 ## Constraints
 
-- Depends on `baybo-model`, `baybo-tools`, and `baybo-workspace` (the last for `baybo_workspace::paths::BIN_NAME`), plus `regex`, `dashmap`, `walkdir`, and `uuid`
+- Depends on `baybo-model`, `baybo-tools`, and `baybo-workspace` (the last for `baybo_workspace::paths::BIN_NAME`), plus `regex`, `walkdir`, and `uuid`
 - Does not call `llm` or execute tools directly
 - The crate's own `SkillInstall` / `SkillUninstall` tools (see “Skill installation” above) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
