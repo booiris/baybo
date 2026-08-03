@@ -1041,12 +1041,13 @@ impl ContextManager {
     /// agent-invocable, non-untrusted entries whose `channels:` restriction
     /// (if any) admits this session's channel.
     ///
-    /// Deliberately no `registry.is_empty()` short-circuit. That predicate
-    /// reads the **shared** map alone, while this question is scoped — a custom
-    /// agent's skills live in its private overlay, so a workspace with an empty
-    /// shared set hid every one of them and the agent was advertised nothing at
-    /// all. `summaries_for` is already cheap on an empty registry, so the guard
-    /// bought nothing and cost correctness.
+    /// Deliberately no "registry is empty, skip the projection" short-circuit.
+    /// Such a check can only read the **shared** map, while this question is
+    /// scoped — a custom agent's skills live in its private overlay, so a
+    /// workspace with an empty shared set hid every one of them and the agent
+    /// was advertised nothing at all. `SkillRegistry::is_empty` existed for
+    /// that guard and was deleted with it; `summaries_for` is already cheap on
+    /// an empty registry, so it bought nothing and cost correctness.
     ///
     /// The seed reminder and the post-compaction trailer advertise
     /// exactly this set; slash candidates are a *different* set
@@ -4991,7 +4992,7 @@ mod tests {
         let registry = Arc::new(SkillRegistry::new());
         registry.ensure_agent_overlay(&agent, &workspace);
         assert!(
-            registry.is_empty(),
+            registry.list().is_empty(),
             "the shared set is empty — that is the whole point"
         );
 

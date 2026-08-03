@@ -155,11 +155,13 @@ Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
 / `requirements` per turn would burn allocator pressure proportional
 to skill count × body size; the projection avoids that. Filtered to
 `agent_invocable && trust_level != Untrusted && allows_channel`, sorted
-by name for stable across-turn ordering. Deliberately **not** guarded by
-`SkillRegistry::is_empty()`: that predicate reads the shared map alone,
-while the question is scoped, so a custom agent whose skills live only
-in its private overlay was advertised nothing at all whenever the shared
-set happened to be empty. The trailer's reminder block advertises this same
+by name for stable across-turn ordering. There is deliberately **no**
+"registry is empty, skip the projection" guard: that check could only read
+the shared map, while the question is scoped, so a custom agent whose skills
+live only in its private overlay was advertised nothing at all whenever the
+shared set happened to be empty. `SkillRegistry::is_empty()` existed for
+exactly that guard and was removed with it — `summaries_for` is already
+cheap on an empty registry. The trailer's reminder block advertises this same
 filtered set (and is skipped when it is empty); the per-called-skill
 `<skill>` detail blocks stay keyed on `called_skills` unfiltered, so a
 skill actually invoked in the session keeps its definition across
