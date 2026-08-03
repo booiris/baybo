@@ -103,6 +103,16 @@ fn media_digest(block: &ContentBlock) -> Option<&str> {
     }
 }
 
+/// Whether a file-writing tool's outcome means the file really changed.
+///
+/// `ToolOutput::Error` is the in-band failure a tool returns for a rejected
+/// call — a `Read`-before-write violation, a missing `old_string`, an oversize
+/// body — and rides back as `Ok`, so `is_ok()` alone would count an edit that
+/// wrote nothing. `Err` covers the denied and panicked paths.
+fn tool_wrote_successfully(output: &anyhow::Result<ToolOutput>) -> bool {
+    matches!(output, Ok(o) if !matches!(o, ToolOutput::Error(_)))
+}
+
 /// Fold a tool's attachments into the turn's accumulator, skipping content the
 /// turn already staged. `AttachFile` called twice on one path stages the same
 /// bytes twice; the reply must show the user that file once. A block with no
@@ -1526,12 +1536,33 @@ impl AgentLoop {
                         .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
                 })
                 .flatten();
-            let meta = (read_fingerprint.is_some() || call_approval.is_some()).then_some(
-                baybo_model::ToolResultMeta {
-                    read_fingerprint,
-                    approval: call_approval,
-                },
-            );
+            // What this call LEFT on disk, and only when it really wrote. The
+            // tracker is the source rather than a fresh `stat` because
+            // `Edit`/`Write` re-anchor it from inside the tool, the instant
+            // after their own write — a stat from out here would race any
+            // concurrent writer and could stamp someone else's bytes as ours.
+            // A successful write's anchor lands in `committed`, and
+            // `begin_response` already drained `pending`, so `get` returns the
+            // post-write value and not a read staged earlier in this response.
+            let write_fingerprint = (baybo_tools::FILE_WRITING_TOOLS
+                .contains(&tool_call.name.as_str())
+                && tool_wrote_successfully(&executed.output))
+            .then(|| {
+                tool_call
+                    .arguments
+                    .get(baybo_tools::TOOL_FILE_PATH_ARG)
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+            })
+            .flatten();
+            let meta = (read_fingerprint.is_some()
+                || write_fingerprint.is_some()
+                || call_approval.is_some())
+            .then_some(baybo_model::ToolResultMeta {
+                read_fingerprint,
+                write_fingerprint,
+                approval: call_approval,
+            });
             let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
             self.context_manager.append(&tool_msg).await;
         }

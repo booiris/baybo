@@ -82,9 +82,11 @@ const DIFF_FRAMING: &str = r#"A block marked `diff` is a unified diff against th
 const NOTHING_DIFFERS_BODY: &str = r#"Disregard any earlier system-prompt update in this conversation: the files behind the system prompt have changed back, so the prompt above is accurate again and every path it names is current."#;
 
 /// Attribute marking a section the model rewrote itself during this
-/// conversation. Named once: the renderer writes it and [`SELF_EDIT_FRAMING`]
-/// explains it, and the two have to agree.
-const SELF_EDITED_ATTR: &str = "edited_by_you_in_this_conversation";
+/// conversation, and that still holds those bytes. Named once: the renderer
+/// writes it, [`SELF_EDIT_FRAMING`] explains it, and
+/// `ContextManager::verified_self_edited_paths` decides when it is true — all
+/// three have to agree.
+pub(crate) const SELF_EDITED_ATTR: &str = "edited_by_you_in_this_conversation";
 
 /// Attribute marking a section whose file moved with its contents intact.
 /// Self-describing on purpose — the framing already says what `path` means, so
@@ -220,13 +222,24 @@ fn block_for<'a>(
     }
 }
 
-/// Terminate both sides before diffing. `from_lines` keeps the line
-/// terminator as part of the line, so an unterminated last line — which is
-/// every body, since `render` trims trailing newlines — compares unequal to the
-/// same text once a line is appended after it. Appending one memory would then
-/// report the line before it as changed too.
+/// Terminate each side before diffing, but only when it has content.
+///
+/// `from_lines` keeps the line terminator as part of the line, so an
+/// unterminated last line — which is every body, since `render` trims trailing
+/// newlines — compares unequal to the same text once a line is appended after
+/// it. Appending one memory would then report the line before it as changed
+/// too. Terminating an *empty* side, though, turns nothing into one empty
+/// line: emptying a file rendered a phantom `+`, and filling an empty one
+/// rendered a `-` for a line that never existed.
 fn unified_diff(prior: &str, current: &str) -> String {
-    similar::TextDiff::from_lines(&format!("{prior}\n"), &format!("{current}\n"))
+    let terminate = |s: &str| {
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!("{s}\n")
+        }
+    };
+    similar::TextDiff::from_lines(&terminate(prior), &terminate(current))
         .unified_diff()
         .context_radius(DIFF_CONTEXT_LINES)
         .missing_newline_hint(false)
@@ -514,6 +527,20 @@ mod tests {
         let out = wrap_update(&blocks(&parts, &rendered, "stale row", &mine));
         assert!(out.contains("rules"), "{out}");
         assert!(!out.contains(SELF_EDITED_ATTR), "{out}");
+    }
+
+    /// An empty side is zero lines, not one blank one. Terminating it
+    /// unconditionally made emptying a file report a phantom added blank line,
+    /// and filling an empty one report a blank line removed.
+    #[test]
+    fn an_empty_side_contributes_no_line() {
+        let emptied = unified_diff("- a: one\n- b: two", "");
+        assert!(!emptied.lines().any(|l| l == "+"), "{emptied}");
+        assert!(emptied.contains("-- a: one") && emptied.contains("-- b: two"));
+
+        let filled = unified_diff("", "- a: one");
+        assert!(!filled.lines().any(|l| l == "-"), "{filled}");
+        assert!(filled.contains("+- a: one"), "{filled}");
     }
 
     /// The parser has to survive the shapes `render` actually emits, including
