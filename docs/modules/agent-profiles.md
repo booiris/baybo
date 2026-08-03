@@ -4,7 +4,7 @@
 
 Agent profiles are user-managed personas: a named, avatar-carrying row bundling an execution framework (`baybo` / `claude` / `codex`) and an optional LLM pin. The operator creates and edits them from the web dashboard, and a chat session binds to one at creation.
 
-**The row is half of an agent.** The other half is its persona directory, `<workspace>/personas/<agent_id>/`, holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` overlay only it sees. The split is by kind of content: the row carries what the system queries (a unique name to sort and pick by, a binary avatar, a framework), the directory carries the prose the agent itself rewrites. Neither a prompt nor a skill list is a column. See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding, the resolution rules, and what is still unbuilt.
+**The row is half of an agent.** The other half is its persona directory, `<workspace>/personas/<agent_id>/`, holding the `SOUL.md` and `IDENTITY.md` it reads and the `skills/` directory only it sees. The split is by kind of content: the row carries what the system queries (a unique name to sort and pick by, a binary avatar, a framework), the directory carries the prose the agent itself rewrites. Neither a prompt nor a skill list is a column. See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) for the binding, the resolution rules, and what is still unbuilt.
 
 This is a cross-crate feature subsystem, not a crate. The pieces live where their kind of code already lives:
 
@@ -49,7 +49,7 @@ own `personas/<id>/SOUL.md`, and its name is the `Name:` line in its
 That makes the name **not unique and not sortable in SQL**, which is not a
 loss: no constraint could have held one, since the agent may rename itself to
 anything at any moment. The **id** is the identity — every binding, memory
-partition, skill overlay and API path keys off it — so a duplicate name is a
+partition, skill directory and API path keys off it — so a duplicate name is a
 display ambiguity, never a correctness problem. `list` therefore orders by
 `builtin DESC, id` and the gateway re-sorts by the name it reads from each
 agent's file.
@@ -83,7 +83,7 @@ The gateway still answers an *explicit* attempt with a 400 rather than silently 
 
 A create materialises the persona directory and writes the name **before** inserting the row: the row is what makes an agent visible and what a retry would duplicate, so a filesystem failure must not leave a half-made one in the roster. An orphaned directory is inert — nothing sweeps `personas/`, by design.
 
-Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (`personas/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
+Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (`personas/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
 
 ### The builtin row is locked structurally, not by convention
 
@@ -175,7 +175,7 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 ## Constraints
 
 - Feature subsystem, not a crate: no `baybo-agent-profiles` crate until there is behavior beyond CRUD. Domain types in `model`, port in `store`, impl in `storage`, policy in `gateway` handlers.
-- **The row is not the agent.** `ContextManager` reads the persona from `personas/<id>/`, the skill overlay from `personas/<id>/skills/`, and the memory partition from the id — all keyed by the id the session carries, none of them by the row. So deleting a row strands nothing: the conversation keeps the persona, the skills and the memories it has been talking to, and only the row's own fields (the llm pin, the roster entry) go.
+- **The row is not the agent.** `ContextManager` reads the persona from `personas/<id>/`, the skills from `personas/<id>/skills/`, and the memory partition from the id — all keyed by the id the session carries, none of them by the row. So deleting a row strands nothing: the conversation keeps the persona, the skills and the memories it has been talking to, and only the row's own fields (the llm pin, the roster entry) go.
 - Strictly disjoint from `SubagentProfile` and from the workspace Soul; the only shared vocabulary is `baybo-model` (`ExternalAgentKind`, `LlmEntryName`, the backend tag strings).
 - All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere. Deleting a row does not touch `personas/<id>/`, and nothing in the persona path consults the row — so a bound conversation keeps the agent it has been talking to, the same way it keeps that agent's memories.
 - `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`) **and** a round-trip check — it is rejected unless `display_name(with_display_name(…))` returns it unchanged, so a create response and the next `GET` can never disagree about what the agent is called. Identity-file writes carry a 1 MiB cap enforced by the API and by the `Edit` tool alike. `description` is deliberately bounded only by the admin request-body limit.

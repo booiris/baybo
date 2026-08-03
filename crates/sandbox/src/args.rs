@@ -1357,7 +1357,7 @@ mod tests {
             extra_root: PathBuf::from("/home/u"),
             denied_paths: vec![PathBuf::from("/home/u/.baybo")],
         };
-        spec.readable_paths = vec![PathBuf::from("/home/u/.baybo/skills")];
+        spec.readable_paths = vec![PathBuf::from("/home/u/.baybo/personas/baybo/skills")];
         let argv = build_bwrap_argv(&spec, None);
         let strs = argv_strs(&argv);
 
@@ -1365,8 +1365,8 @@ mod tests {
             .windows(3)
             .position(|w| {
                 w[0] == "--ro-bind-try"
-                    && w[1] == "/home/u/.baybo/skills"
-                    && w[2] == "/home/u/.baybo/skills"
+                    && w[1] == "/home/u/.baybo/personas/baybo/skills"
+                    && w[2] == "/home/u/.baybo/personas/baybo/skills"
             })
             .expect("skills/ must be RO re-bound");
         let tmpfs_idx = strs
@@ -1381,7 +1381,7 @@ mod tests {
         assert!(
             !strs
                 .windows(3)
-                .any(|w| w[0] == "--bind" && w[1] == "/home/u/.baybo/skills"),
+                .any(|w| w[0] == "--bind" && w[1] == "/home/u/.baybo/personas/baybo/skills"),
             "skills/ must be read-only, never RW-bound: {strs:?}"
         );
     }
@@ -1393,14 +1393,14 @@ mod tests {
             extra_root: PathBuf::from("/Users/u"),
             denied_paths: vec![PathBuf::from("/Users/u/.baybo")],
         };
-        spec.readable_paths = vec![PathBuf::from("/Users/u/.baybo/skills")];
+        spec.readable_paths = vec![PathBuf::from("/Users/u/.baybo/personas/baybo/skills")];
         let s = render_sbpl_profile(&spec, None);
 
         let deny_pos = s
             .find(r#"(deny file-read* (subpath "/Users/u/.baybo"))"#)
             .expect("deny for /Users/u/.baybo must be present");
         let read_allow = s
-            .find(r#"(allow file-read* (subpath "/Users/u/.baybo/skills"))"#)
+            .find(r#"(allow file-read* (subpath "/Users/u/.baybo/personas/baybo/skills"))"#)
             .expect("post-deny skills read-allow must be emitted");
         assert!(
             read_allow > deny_pos,
@@ -1408,7 +1408,7 @@ mod tests {
         );
         // Read-only: there must be no write-allow for skills/.
         assert!(
-            !s.contains(r#"(allow file-write* (subpath "/Users/u/.baybo/skills"))"#),
+            !s.contains(r#"(allow file-write* (subpath "/Users/u/.baybo/personas/baybo/skills"))"#),
             "skills/ must stay read-only (no file-write* allow): {s}"
         );
     }

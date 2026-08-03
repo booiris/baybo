@@ -50,7 +50,7 @@ persona already lives:
 ```text
 <root>/personas/<agent_id>/
   SOUL.md  IDENTITY.md  USER.md      # the agent's identity files
-  skills/                            # its private skill overlay
+  skills/                            # the skills only it sees
   memory/
     MEMORY.md                        #   the index — one line per memory
     cat-name.md                      #   one fact per file
@@ -122,7 +122,7 @@ writes are audited instead of approved, in three tiers:
 | Shared profile | `personas/USER.md` | bypassed for `Edit` | yes | 1 MiB | yes |
 | Identity | `personas/<agent_id>/{SOUL,IDENTITY,USER}.md` | bypassed for `Edit` | yes | 1 MiB | yes |
 | Memory | `personas/<agent_id>/memory/**` | bypassed | **no** | 1 MiB | yes |
-| Scratch | `work/`, `skills/` | bypassed | no | no | no |
+| Scratch | `work/` | bypassed | no | no | no |
 
 The per-agent tiers are **owned**: `<agent_id>` is the calling agent, and a
 write into another agent's directory is refused — the same rule the identity

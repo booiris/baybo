@@ -42,13 +42,17 @@ fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
     // can edit `<workspace>/personas/<id>/skills/<name>/SKILL.md` and see the change
     // without restarting Baybo. Other dashboards don't pair with a
     // filesystem source, so they skip this step.
-    let total = ctx.skills.reload();
+    ctx.skills.reload();
     let rows: Vec<Vec<String>> = ctx
         .skills
         .summaries_for(crate::context::OPERATOR_SKILL_SCOPE)
         .into_iter()
         .map(|s| vec![s.name, first_line(&s.description)])
         .collect();
+    // Count the rows, not `reload`'s return: that total spans every loaded
+    // scope, so it double-counts a skill shadowing a builtin and includes
+    // other agents' skills the table deliberately leaves out.
+    let total = rows.len();
     DashboardSnapshot {
         title: "Skills".into(),
         columns: vec!["NAME".into(), "DESCRIPTION".into()],

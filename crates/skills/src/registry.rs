@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use baybo_model::AgentProfileId;
 use parking_lot::{Mutex, RwLock};
@@ -59,6 +60,12 @@ impl SkillSummary {
 /// capability, so a custom agent gets it only by having a copy in its own
 /// directory.
 pub const UNIVERSAL_SKILLS: &[&str] = &[crate::builtin::BAYBO_CLI_SKILL_NAME];
+
+/// The id [`SkillRegistry::owner`] resolves an unbound scope to. Interned
+/// because that resolution happens on every scoped read, including the
+/// per-turn listing — minting a fresh `AgentProfileId` each time allocated a
+/// `String` for a value that never changes.
+static BUILTIN_OWNER: LazyLock<AgentProfileId> = LazyLock::new(AgentProfileId::builtin);
 
 /// Central registry for skill definitions.
 ///
@@ -205,8 +212,13 @@ impl SkillRegistry {
 
     /// Re-scan every agent skill directory registered so far and rebuild the
     /// set from what is on disk. Skills removed from disk drop out, edits take
-    /// effect, and new subdirectories appear. Returns how many skills the
-    /// registry holds afterwards, across every scope.
+    /// effect, and new subdirectories appear.
+    ///
+    /// Returns how many definitions the registry holds afterwards, summed
+    /// **across every loaded scope**. That is a health number, not something
+    /// to show a user: it counts a skill that shadows a builtin twice, and it
+    /// counts agents whose skills the caller cannot see. Anything rendering a
+    /// count wants `summaries_for(scope).len()`.
     ///
     /// Compiled-in builtins are replayed from the definitions captured by
     /// `register_builtins` — without the replay, the first
@@ -232,21 +244,21 @@ impl SkillRegistry {
             .iter()
             .map(|s| (s.name.clone(), s.clone()))
             .collect();
-        let mut overlays: HashMap<AgentProfileId, HashMap<String, SkillDefinition>> =
+        let mut per_agent: HashMap<AgentProfileId, HashMap<String, SkillDefinition>> =
             HashMap::new();
         for (agent, dir) in &agent_dirs {
             let mut loaded = HashMap::new();
             scan_agent_dir_into(agent, dir, &mut loaded);
-            overlays.insert(agent.clone(), loaded);
+            per_agent.insert(agent.clone(), loaded);
         }
 
-        let count = builtins.len() + overlays.values().map(HashMap::len).sum::<usize>();
+        let count = builtins.len() + per_agent.values().map(HashMap::len).sum::<usize>();
         *self.builtin_skills.write() = builtins;
-        *self.agent_skills.write() = overlays;
+        *self.agent_skills.write() = per_agent;
         count
     }
 
-    /// Load `agent`'s private overlay if this process has not already, and
+    /// Load `agent`'s own skills if this process has not already, and
     /// report how many skills the scan registered.
     ///
     /// This is the only way an agent's skills are ever loaded, so every reader
@@ -306,7 +318,7 @@ impl SkillRegistry {
         count
     }
 
-    /// Whether this agent's overlay has already been scanned in this process.
+    /// Whether this agent's directory has already been scanned in this process.
     fn agent_dir_loaded(&self, agent: &AgentProfileId) -> bool {
         self.agent_dirs.read().iter().any(|(a, _)| a == agent)
     }
@@ -328,8 +340,8 @@ impl SkillRegistry {
     /// other agent, behaving as it has to include reading that directory —
     /// otherwise `None` would mean "compiled-in builtins and nothing else",
     /// which is not what any caller passing it intends.
-    fn owner(agent: Option<&AgentProfileId>) -> AgentProfileId {
-        agent.cloned().unwrap_or_else(AgentProfileId::builtin)
+    fn owner(agent: Option<&AgentProfileId>) -> &AgentProfileId {
+        agent.unwrap_or(&BUILTIN_OWNER)
     }
 
     /// Look up a skill in one agent's scope: its own directory first, then
@@ -348,7 +360,7 @@ impl SkillRegistry {
         if let Some(skill) = self
             .agent_skills
             .read()
-            .get(&Self::owner(agent))
+            .get(Self::owner(agent))
             .and_then(|own| own.get(name))
         {
             return Some(skill.clone());
@@ -374,7 +386,7 @@ impl SkillRegistry {
             .filter(|(name, _)| sees_all || UNIVERSAL_SKILLS.contains(&name.as_str()))
             .map(|(name, skill)| (name.clone(), SkillSummary::from(skill)))
             .collect();
-        if let Some(own) = self.agent_skills.read().get(&Self::owner(agent)) {
+        if let Some(own) = self.agent_skills.read().get(Self::owner(agent)) {
             for (name, skill) in own.iter() {
                 merged.insert(name.clone(), SkillSummary::from(skill));
             }
@@ -400,7 +412,7 @@ impl SkillRegistry {
             .filter(|(name, _)| sees_all || UNIVERSAL_SKILLS.contains(&name.as_str()))
             .map(|(name, skill)| (name.clone(), skill.clone()))
             .collect();
-        if let Some(own) = self.agent_skills.read().get(&Self::owner(agent)) {
+        if let Some(own) = self.agent_skills.read().get(Self::owner(agent)) {
             for (name, skill) in own.iter() {
                 merged.insert(name.clone(), skill.clone());
             }
@@ -940,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_agent_overlay_is_empty_not_an_error() {
+    fn a_missing_agent_directory_is_empty_not_an_error() {
         let reg = SkillRegistry::new();
         let agent = AgentProfileId::parse("01JNOWHERE").unwrap();
         let paths = baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/nonexistent"));
@@ -955,7 +967,7 @@ mod tests {
     /// into a brand-new folder would be dropped by the next `reload`, whose
     /// replay list would never contain it.
     #[test]
-    fn an_overlay_that_appears_later_is_picked_up_on_the_next_ensure() {
+    fn a_directory_that_appears_later_is_picked_up_on_the_next_ensure() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(dir.path().to_path_buf());
         let agent = AgentProfileId::parse("01JLATE").unwrap();
@@ -964,8 +976,8 @@ mod tests {
         assert_eq!(reg.ensure_agent_skills(&agent, &paths), 0);
         assert!(!reg.agent_dir_loaded(&agent), "a miss must not be recorded");
 
-        let overlay = paths.persona_skills_dir(agent.as_str());
-        let skill = overlay.join("late");
+        let own = paths.persona_skills_dir(agent.as_str());
+        let skill = own.join("late");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
@@ -979,7 +991,7 @@ mod tests {
         reg.reload();
         assert!(
             reg.get_scoped(Some(&agent), "late").is_some(),
-            "reload replays the now-recorded overlay"
+            "reload replays the now-recorded directory"
         );
     }
 
@@ -987,7 +999,7 @@ mod tests {
     /// agent's folder stages there, and `scan_agent_dir_into` is a separate
     /// function per scope, and the guard has to hold on the one that runs.
     #[test]
-    fn a_leaked_staging_tree_in_an_overlay_is_not_loaded_either() {
+    fn a_leaked_staging_tree_in_an_agent_directory_is_not_loaded_either() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = baybo_workspace::WorkspacePaths::new(dir.path().to_path_buf());
         let agent = AgentProfileId::parse("01JCRASHED").unwrap();

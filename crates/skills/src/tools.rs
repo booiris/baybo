@@ -528,14 +528,13 @@ impl Tool for SkillInstallTool {
 
     fn description(&self) -> String {
         "Install a skill from an on-disk directory into this session's own \
-         skills folder — the agent's private folder when the session is \
-         bound to a custom agent, the shared workspace folder otherwise. \
-         Either way it lands in exactly the set this session can see, so the \
-         skill shows up in the next turn's listing and in no other agent's. \
-         The directory must contain a valid SKILL.md; the skill is run \
-         through the risk assessor (Dangerous verdicts abort the install) \
-         and the registry is hot-reloaded. Refuses to overwrite an existing \
-         installation; the old copy must be removed first."
+         skills folder. Every agent has one of its own, so the skill lands in \
+         exactly the set this session can see: it shows up in the next turn's \
+         listing and in no other agent's. The source directory must contain a \
+         valid SKILL.md; the skill is run through the risk assessor \
+         (Dangerous verdicts abort the install) and the registry is \
+         hot-reloaded. Refuses to overwrite an existing installation; the old \
+         copy must be removed first."
             .to_string()
     }
 
@@ -588,7 +587,10 @@ impl Tool for SkillInstallTool {
         let dest_root = scope_skills_dir(ctx);
 
         // Reject before parsing if the source resolves into the destination
-        // tree — caller pointed at a skill it already has installed.
+        // tree — caller pointed at a skill it already has installed. Only the
+        // destination: a source under *another* agent's folder is allowed by
+        // design, because refusing it would not withhold the capability (see
+        // docs/modules/skills.md, "Skill installation").
         if let Ok(canonical_dest_root) = tokio::fs::canonicalize(&dest_root).await
             && source_dir.starts_with(&canonical_dest_root)
         {
@@ -1701,9 +1703,9 @@ mod tests {
 
     #[tokio::test]
     async fn uninstall_refuses_skill_outside_workspace() {
-        // Skill loaded from a directory outside the workspace skills
-        // root must not be deletable through this tool — the LLM is
-        // not allowed to roam the host filesystem.
+        // A skill registered from outside every agent's directory — a
+        // third-party mount — must not be deletable through this tool: the
+        // LLM is not allowed to roam the host filesystem.
         let workspace = tempdir().unwrap();
 
         let other = tempdir().unwrap();

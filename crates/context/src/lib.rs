@@ -1042,12 +1042,12 @@ impl ContextManager {
     /// (if any) admits this session's channel.
     ///
     /// Deliberately no "registry is empty, skip the projection" short-circuit.
-    /// Such a check can only read the **shared** map, while this question is
-    /// scoped — a custom agent's skills live in its private overlay, so a
-    /// workspace with an empty shared set hid every one of them and the agent
-    /// was advertised nothing at all. `SkillRegistry::is_empty` existed for
-    /// that guard and was deleted with it; `summaries_for` is already cheap on
-    /// an empty registry, so it bought nothing and cost correctness.
+    /// Such a check can only read one map, while this question is scoped — an
+    /// agent's skills live in its own directory, so a build with an empty
+    /// compiled-in set hid every one of them and the agent was advertised
+    /// nothing at all. `SkillRegistry::is_empty` existed for that guard and
+    /// was deleted with it; `summaries_for` is already cheap on an empty
+    /// registry, so it bought nothing and cost correctness.
     ///
     /// The seed reminder and the post-compaction trailer advertise
     /// exactly this set; slash candidates are a *different* set
@@ -1065,9 +1065,10 @@ impl ContextManager {
             .collect()
     }
 
-    /// The agent whose private skill overlay this session sees, or `None`
-    /// when it has no overlay of its own (unbound, or bound to the built-in
-    /// whose skills *are* the shared set).
+    /// The agent whose skill directory this session reads, or `None` for the
+    /// default scope — an unbound session, or one bound to the built-in.
+    /// `None` is not "no directory": the registry resolves it to the
+    /// built-in's, which is what an unbound session has always behaved as.
     pub(crate) fn skill_scope(&self) -> Option<&AgentProfileId> {
         self.agent.as_ref().filter(|id| !id.is_builtin())
     }

@@ -5,12 +5,13 @@
 //! Each built-in lives in `crates/skills/src/builtin/<name>/SKILL.md`
 //! and is embedded via `include_str!`. Parsing reuses
 //! [`crate::loader::parse_skill_md`] so the YAML frontmatter contract
-//! is identical to workspace skills.
+//! is identical to an agent's on-disk skills.
 //!
 //! Built-ins land in [`crate::SkillRegistry`] via
-//! [`crate::SkillRegistry::register_builtins`]; workspace skills loaded
-//! later with the same name override them, so an operator can always
-//! patch shipped behaviour locally.
+//! [`crate::SkillRegistry::register_builtins`]. They belong to the process
+//! rather than to any persona, which is what makes
+//! [`crate::UNIVERSAL_SKILLS`] safe to share; an agent whose own directory
+//! carries the same name shadows one, inside that agent's scope only.
 
 use baybo_model::{ArtifactSource, TrustLevel};
 

@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use baybo_model::AgentProfileId;
 use baybo_workspace::paths::{
-    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, classify_persona_path,
-    escapes_upward, has_git_component,
+    PERSONA_MEMORY_DIR, PERSONAS_DIR, PersonaPath, SHARED_USER_FILE, SKILLS_DIR,
+    classify_persona_path, escapes_upward, has_git_component,
 };
 use baybo_workspace::{WorkspacePaths, absolutise};
 use tokio::process::Command;
@@ -219,9 +219,9 @@ impl ManagedRoots {
             return Err(ToolError::InvalidParams(format!(
                 "writes under {PERSONAS_DIR}/ are restricted to the shared \
                  {SHARED_USER_FILE}, this agent's own {{SOUL,IDENTITY,USER}}.md, \
-                 and its own {PERSONA_MEMORY_DIR}/; anything else there (a \
-                 skills overlay, another agent's files) is not writable \
-                 through a tool at all; got {}",
+                 and its own {PERSONA_MEMORY_DIR}/; anything else there (any \
+                 agent's {SKILLS_DIR}/, another agent's files) is not writable \
+                 through a tool at all — use SkillInstall for a skill; got {}",
                 file_path.display()
             )));
         }

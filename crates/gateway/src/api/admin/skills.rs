@@ -31,9 +31,9 @@ pub struct SkillInfo {
 /// Query for [`list_skills`].
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ListSkillsQuery {
-    /// Whose scope to list. Absent = the shared set, which is the built-in
-    /// agent's. A custom agent's id lists its own overlay plus the universal
-    /// skills — it does not inherit the shared set.
+    /// Whose scope to list. Absent = the default scope, which is the
+    /// built-in agent's. Any other id lists that agent's own directory plus
+    /// the universal skills — no agent inherits another's.
     ///
     /// The id need not name an existing profile: this asks what a scope can
     /// invoke, not whether a row exists, so a client can preview what a
