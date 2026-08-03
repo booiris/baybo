@@ -277,12 +277,23 @@ Three things differ, each for a reason:
   names the consequence.
 
 The compaction filter drops `SkillListing` and `SkillsUpdate` rows alongside
-`SystemPromptUpdate`, and for the listing that is **correctness, not hygiene**:
-`insert_skill_trailer` inserts the fresh listing just after the system block (a
-low index) while an older one can survive in the kept verbatim tail (a higher
-index), so `seeded_skill_listing`'s `rfind` would pick the stale copy. Diffing a
-stale baseline against the live set is the one shape that can *hide* a removal —
-a skill dropped between the two appears in neither the diff nor the live set.
+`SystemPromptUpdate`, and the two arms are not equally load-bearing.
+
+`SkillsUpdate` is the live one, reachable exactly the way its sibling is: those
+rows are appended at the tail, which is where `walk_backward_atomic` starts, so
+one really does survive into the kept slice — verified, not assumed. The trailer
+then re-broadcasts a current listing under it, leaving a block that asserts
+drift against a listing that was just refreshed.
+
+`SkillListing` is structure rather than a live bug. The old listing is
+`non_system[0]`, and any compaction that shrinks at all has `cut >= 1`, so the
+summary already swallows it — that is what `insert_skill_trailer`'s own comment
+means by "the summary discards the historical reminder by construction".
+Filtering makes it a property of the partition instead of a consequence of where
+the cut lands, because if two listing rows ever did coexist,
+`seeded_skill_listing`'s `rfind` would take the stale one — and a stale baseline
+is the single shape that can *hide* a removal, since a skill dropped between the
+two appears in neither the diff nor the live set.
 
 ## Design Decisions
 

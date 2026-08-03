@@ -1039,15 +1039,20 @@ impl ContextManager {
 
     /// Skills the agent may invoke here: the registry's summaries filtered to
     /// agent-invocable, non-untrusted entries whose `channels:` restriction
-    /// (if any) admits this session's channel. Empty when the registry is
-    /// empty. The seed reminder and the post-compaction trailer advertise
+    /// (if any) admits this session's channel.
+    ///
+    /// Deliberately no `registry.is_empty()` short-circuit. That predicate
+    /// reads the **shared** map alone, while this question is scoped — a custom
+    /// agent's skills live in its private overlay, so a workspace with an empty
+    /// shared set hid every one of them and the agent was advertised nothing at
+    /// all. `summaries_for` is already cheap on an empty registry, so the guard
+    /// bought nothing and cost correctness.
+    ///
+    /// The seed reminder and the post-compaction trailer advertise
     /// exactly this set; slash candidates are a *different* set
     /// ([`Self::slash_skill_summaries`]) so a slash-only skill stays
     /// user-invocable without being advertised.
     pub fn invocable_skill_summaries(&self) -> Vec<SkillSummary> {
-        if self.skill_registry.is_empty() {
-            return Vec::new();
-        }
         self.skill_registry
             .summaries_for(self.skill_scope())
             .into_iter()
@@ -1074,9 +1079,6 @@ impl ContextManager {
     /// hidden from the model's listing yet must keep expanding on the
     /// user's explicit command (docs/modules/skills.md).
     fn slash_skill_summaries(&self) -> Vec<SkillSummary> {
-        if self.skill_registry.is_empty() {
-            return Vec::new();
-        }
         self.skill_registry
             .summaries_for(self.skill_scope())
             .into_iter()
@@ -4964,6 +4966,99 @@ mod tests {
             !update.lines().any(|l| l == "-"),
             "no phantom removal: {update}"
         );
+    }
+
+    /// A custom agent's skills live in its private overlay, and the shared set
+    /// can legitimately be empty. Consulting the shared map to decide whether
+    /// to look at all advertised such an agent nothing — no listing row at
+    /// seed, an empty listing forever, and so no drift hint could ever fire
+    /// for it.
+    #[tokio::test]
+    async fn an_agents_overlay_only_skills_are_advertised_to_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        let agent = AgentProfileId::parse("01JAGENT").expect("id");
+        let overlay = workspace.persona_skills_dir(agent.as_str());
+        std::fs::create_dir_all(overlay.join("private")).expect("mkdir");
+        std::fs::write(
+            overlay.join("private/SKILL.md"),
+            "---\nname: private\ndescription: only this agent has it\nversion: 1.0.0\n---\n\nbody\n",
+        )
+        .expect("write skill");
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.ensure_agent_overlay(&agent, &workspace);
+        assert!(
+            registry.is_empty(),
+            "the shared set is empty — that is the whole point"
+        );
+
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+        ctx.agent = Some(agent);
+        let advertised: Vec<String> = ctx
+            .invocable_skill_summaries()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(advertised, vec!["private".to_string()], "{advertised:?}");
+    }
+
+    /// The compaction filter is correctness, not hygiene. `insert_skill_trailer`
+    /// puts the fresh listing just after the system block — a LOW index — while
+    /// an older one can survive in the kept verbatim tail at a HIGHER one, and
+    /// `seeded_skill_listing` takes the last. A stale baseline is the one shape
+    /// that can HIDE a removal: a skill dropped between the two shows up in
+    /// neither the diff nor the live set.
+    #[tokio::test]
+    async fn compaction_leaves_exactly_one_listing_row_and_no_updates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = skills_on_disk(dir.path(), &["alpha", "beta"]);
+        let mut ctx = make_ctx_with_registry(Arc::clone(&registry), 2, 6000, 0.5);
+        ctx.ensure_seeded().await;
+        for i in 0..40 {
+            ctx.append(&make_msg(
+                Role::User,
+                &format!("turn {i} {}", "x".repeat(60)),
+            ))
+            .await;
+            ctx.append(&make_msg(Role::Assistant, &format!("reply {i}")))
+                .await;
+        }
+        reload_with(&registry, dir.path(), &["alpha"]);
+        ctx.reconcile_skills().await;
+        assert!(
+            ctx.messages()
+                .iter()
+                .any(|m| m.source() == MessageSource::SkillsUpdate),
+            "precondition: an update is standing"
+        );
+
+        let outcome = ctx
+            .force_compress("test-model", ok_summary_chat)
+            .await
+            .expect("compress");
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+
+        let listings = ctx
+            .messages()
+            .iter()
+            .filter(|m| m.source() == MessageSource::SkillListing)
+            .count();
+        assert_eq!(listings, 1, "exactly one, and it is the fresh one");
+        assert!(
+            !ctx.messages()
+                .iter()
+                .any(|m| m.source() == MessageSource::SkillsUpdate),
+            "the reseeded listing makes every standing update obsolete"
+        );
+        // …and the surviving listing is the CURRENT set, so a later diff has an
+        // honest baseline.
+        assert_eq!(ctx.seeded_skill_listing(), "- alpha: desc for alpha");
     }
 
     /// The baseline is found by provenance. The post-compaction detail payload
