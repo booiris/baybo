@@ -134,8 +134,16 @@ struct ChatScreen: View {
             .allowsHitTesting(!bridge.htmlPreviewMaximized)
             .accessibilityHidden(bridge.htmlPreviewMaximized)
             // Keep ComposerView mounted: its unsent text is local @State.
+            // Collapsed to nothing while a preview is maximized; the `.opacity`
+            // above is what hides what the zero-height frame overflows. NO
+            // `.clipped()` here — it wraps the whole chain, overlay included,
+            // and `AttachMenuPanel` is drawn ENTIRELY at negative y (it floats
+            // above the dock's top edge). Clipping to the dock's own bounds
+            // erased the panel's paint while leaving it laid out and
+            // hit-testable, so the `+` dimmed the screen and showed nothing —
+            // and every UI smoke, asserting `exists`/`isHittable`/frames rather
+            // than pixels, stayed green through it.
             .frame(height: bridge.htmlPreviewMaximized ? 0 : nil)
-            .clipped()
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
