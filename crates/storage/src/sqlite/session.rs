@@ -94,6 +94,8 @@ pub(super) fn rehydrate_message(
         MessageSource::CronNotification => ChatMessage::cron_notification(content),
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
+        MessageSource::SkillListing => ChatMessage::skill_listing(content),
+        MessageSource::SkillsUpdate => ChatMessage::skills_update(content),
         MessageSource::Agent => match role {
             Role::User => ChatMessage::agent_context(content),
             Role::Assistant => ChatMessage::assistant(content),

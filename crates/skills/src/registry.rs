@@ -438,12 +438,6 @@ impl SkillRegistry {
         self.skills.read().keys().cloned().collect()
     }
 
-    /// True iff no skills are registered. Used by hot paths to skip
-    /// projection allocations when there's nothing to list.
-    pub fn is_empty(&self) -> bool {
-        self.skills.read().is_empty()
-    }
-
     /// Return every registered skill, sorted by name for stable operator output.
     pub fn all_sorted(&self) -> Vec<SkillDefinition> {
         let mut out: Vec<SkillDefinition> = self.skills.read().values().cloned().collect();

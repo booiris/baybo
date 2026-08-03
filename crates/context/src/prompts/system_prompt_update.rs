@@ -33,15 +33,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::prompts::line_diff::{DIFF_ATTR, unified_diff};
 use crate::prompts::soul::{PromptPart, SectionTag};
 
 const OPEN_TAG: &str = "<system_prompt_update>";
 const CLOSE_TAG: &str = "</system_prompt_update>";
-
-/// Lines of unchanged context around each hunk. Two is enough for the model to
-/// locate the hunk in a body it is already holding, and the anchor it actually
-/// relies on is the `@@` line number.
-const DIFF_CONTEXT_LINES: usize = 2;
 
 /// Framing preamble placed before the tagged block.
 ///
@@ -92,10 +88,6 @@ pub(crate) const SELF_EDITED_ATTR: &str = "edited_by_you_in_this_conversation";
 /// Self-describing on purpose — the framing already says what `path` means, so
 /// this case costs an attribute rather than a paragraph.
 const MOVED_ATTR: &str = "content_unchanged";
-
-/// Attribute marking a block whose body is a unified diff rather than a
-/// replacement.
-const DIFF_ATTR: &str = "diff";
 
 /// Appended to [`FRAMING_BODY`] only when the update actually carries a
 /// self-edited pointer, so an update without one is byte-identical to what
@@ -220,30 +212,6 @@ fn block_for<'a>(
         path,
         diff,
     }
-}
-
-/// Terminate each side before diffing, but only when it has content.
-///
-/// `from_lines` keeps the line terminator as part of the line, so an
-/// unterminated last line — which is every body, since `render` trims trailing
-/// newlines — compares unequal to the same text once a line is appended after
-/// it. Appending one memory would then report the line before it as changed
-/// too. Terminating an *empty* side, though, turns nothing into one empty
-/// line: emptying a file rendered a phantom `+`, and filling an empty one
-/// rendered a `-` for a line that never existed.
-fn unified_diff(prior: &str, current: &str) -> String {
-    let terminate = |s: &str| {
-        if s.is_empty() {
-            String::new()
-        } else {
-            format!("{s}\n")
-        }
-    };
-    similar::TextDiff::from_lines(&terminate(prior), &terminate(current))
-        .unified_diff()
-        .context_radius(DIFF_CONTEXT_LINES)
-        .missing_newline_hint(false)
-        .to_string()
 }
 
 /// The body the leading system row carries for `tag`, as
@@ -527,20 +495,6 @@ mod tests {
         let out = wrap_update(&blocks(&parts, &rendered, "stale row", &mine));
         assert!(out.contains("rules"), "{out}");
         assert!(!out.contains(SELF_EDITED_ATTR), "{out}");
-    }
-
-    /// An empty side is zero lines, not one blank one. Terminating it
-    /// unconditionally made emptying a file report a phantom added blank line,
-    /// and filling an empty one report a blank line removed.
-    #[test]
-    fn an_empty_side_contributes_no_line() {
-        let emptied = unified_diff("- a: one\n- b: two", "");
-        assert!(!emptied.lines().any(|l| l == "+"), "{emptied}");
-        assert!(emptied.contains("-- a: one") && emptied.contains("-- b: two"));
-
-        let filled = unified_diff("", "- a: one");
-        assert!(!filled.lines().any(|l| l == "-"), "{filled}");
-        assert!(filled.contains("+- a: one"), "{filled}");
     }
 
     /// The parser has to survive the shapes `render` actually emits, including

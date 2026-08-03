@@ -281,9 +281,33 @@ impl ContextManager {
         // discarded — the walk runs backward from the tail, which is exactly
         // where they are appended, so each one would otherwise push a real
         // turn out of the kept slice.
+        //
+        // `SkillsUpdate` for exactly the same reason, and it is reachable the
+        // same way: those rows are appended at the tail, which is where the
+        // backward walk starts, so one really does survive into the kept slice.
+        // The trailer then re-broadcasts a current listing under it, leaving a
+        // block that asserts drift against a listing that was just refreshed.
+        //
+        // `SkillListing` is the weaker case, kept for structure rather than for
+        // a live bug: the old listing is `non_system[0]`, and any compaction
+        // that shrinks at all has `cut >= 1`, so the summary already swallows it
+        // — which is what the trailer's own comment means by "the summary
+        // discards the historical reminder by construction". Filtering makes
+        // that a property of this partition instead of a consequence of where
+        // the cut happens to land, because if two listing rows ever did coexist
+        // `seeded_skill_listing`'s `rfind` would take the stale one, and a stale
+        // baseline is the single shape that can HIDE a removal: a skill dropped
+        // between the two appears in neither the diff nor the live set.
         let non_system: Vec<ChatMessage> = non_system
             .into_iter()
-            .filter(|m| m.source() != MessageSource::SystemPromptUpdate)
+            .filter(|m| {
+                !matches!(
+                    m.source(),
+                    MessageSource::SystemPromptUpdate
+                        | MessageSource::SkillListing
+                        | MessageSource::SkillsUpdate
+                )
+            })
             .collect();
 
         let instruction =

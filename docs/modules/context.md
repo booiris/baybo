@@ -55,9 +55,12 @@ ContextManager (struct)
 │                            persist_compaction so the refresh is durable
 └── prompts/          — all model-facing framing text + pure builders
     ├── soul.rs            — assemble (TOP/TAIL hints + identity) → AssembledPrompt
+    ├── line_diff.rs       — unified_diff (shared by both drift deltas)
     ├── system_prompt_update.rs — build_blocks / wrap_update
     │                            (<system_prompt_update> drift delta,
     │                             per-section unified diff)
+    ├── skills_update.rs   — wrap_update (<skills_update> drift delta
+    │                        against the standing skill listing)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
     ├── background_notification.rs — build_completion_reply +
     │                              build_notification_content
@@ -231,6 +234,66 @@ cannot vouch for, and `None` means "look properly". A subagent session's version
 is its profile name: the registry is in-memory and immutable for the process, so
 nothing can move under it mid-session, and a profile edited across a deploy is
 caught by the hydration `None` like any other.
+
+### The skill listing's lifecycle
+
+The same shape, one row down. `ensure_seeded` writes the invocable set as a
+`<system-reminder>` row (`MessageSource::SkillListing`) and it is **persisted**;
+`insert_skill_trailer` re-broadcasts a fresh one after each compaction. Nothing
+else refreshed it, so between compactions a conversation named skills that no
+longer existed and was blind to ones that did. **The model opens that gap
+itself** — `SkillInstall`/`SkillUninstall` call `SkillRegistry::reload()`, so a
+conversation that installs a skill could not see it, and every other live
+conversation desynced at the same moment.
+
+`reconcile_skills` runs beside `reconcile_system_prompt` before every main LLM
+call and appends the difference as a `<skills_update>` row. Same contract as its
+sibling: appended and never written over the listing row (which sits inside the
+prompt-cache prefix — `merge_for_llm` folds it into the first user message), a
+**complete delta against the listing row** so the newest supersedes the rest,
+the identical-update dedupe, and a retraction when the registry moves and moves
+back.
+
+Three things differ, each for a reason:
+
+- **The listing is its own version.** There is no registry counter, and one
+  would be the wrong shape: the registry is process-wide while the listing is
+  per-session (`invocable_skill_summaries` filters by the bound agent's overlay,
+  `agent_invocable`, trust and channel), so a shared counter would fire for
+  sessions nothing changed for and could not fire for one whose overlay moved
+  alone. Rendering and comparing the listing costs about a microsecond against
+  the `stat`s the sibling check already pays.
+- **A separate envelope, because the payload is not trusted.**
+  `system_prompt_update` states outright that it does not escape its body —
+  every byte comes from the workspace's own identity files. A skill is
+  third-party content an operator or the model installed, so
+  `render_skill_listing` neutralises the envelopes its `description` rides in
+  (and folds it to one line, which is what makes a line diff mean "these skills
+  changed"). Folding the two would have extended the trusted-payload claim to
+  bytes that do not deserve it.
+- **Always a diff, at any size.** A full listing communicates a removal only by
+  absence, and a model that reads an omission as an abbreviation keeps planning
+  around a skill that is gone. A `-` line says it outright, and the framing
+  names the consequence.
+
+The compaction filter drops `SkillListing` and `SkillsUpdate` rows alongside
+`SystemPromptUpdate`, and the two arms are not equally load-bearing.
+
+`SkillsUpdate` is the live one, reachable exactly the way its sibling is: those
+rows are appended at the tail, which is where `walk_backward_atomic` starts, so
+one really does survive into the kept slice — verified, not assumed. The trailer
+then re-broadcasts a current listing under it, leaving a block that asserts
+drift against a listing that was just refreshed.
+
+`SkillListing` is structure rather than a live bug. The old listing is
+`non_system[0]`, and any compaction that shrinks at all has `cut >= 1`, so the
+summary already swallows it — that is what `insert_skill_trailer`'s own comment
+means by "the summary discards the historical reminder by construction".
+Filtering makes it a property of the partition instead of a consequence of where
+the cut lands, because if two listing rows ever did coexist,
+`seeded_skill_listing`'s `rfind` would take the stale one — and a stale baseline
+is the single shape that can *hide* a removal, since a skill dropped between the
+two appears in neither the diff nor the live set.
 
 ## Design Decisions
 

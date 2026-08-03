@@ -141,8 +141,9 @@ profile has no overlay: its skills *are* the shared set.
 ### Selection pipeline
 
 Skills are no longer auto-injected at user-turn start. Instead the
-agent loop seeds a session-start **system reminder** (an agent-context
-row appended by `ContextManager::ensure_seeded`, re-broadcast after
+agent loop seeds a session-start **system reminder** (a
+`MessageSource::SkillListing` row appended by
+`ContextManager::ensure_seeded`, re-broadcast after
 each compaction via the skill trailer) listing every agent-invocable,
 non-`Untrusted` skill whose `channels:` restriction (if any) admits the
 session's channel (name, description, optional
@@ -154,13 +155,27 @@ Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
 / `requirements` per turn would burn allocator pressure proportional
 to skill count × body size; the projection avoids that. Filtered to
 `agent_invocable && trust_level != Untrusted && allows_channel`, sorted
-by name for stable across-turn ordering. When the registry is empty,
-`SkillRegistry::is_empty()` short-circuits before the projection
-runs at all. The trailer's reminder block advertises this same
+by name for stable across-turn ordering. There is deliberately **no**
+"registry is empty, skip the projection" guard: that check could only read
+the shared map, while the question is scoped, so a custom agent whose skills
+live only in its private overlay was advertised nothing at all whenever the
+shared set happened to be empty. `SkillRegistry::is_empty()` existed for
+exactly that guard and was removed with it — `summaries_for` is already
+cheap on an empty registry. The trailer's reminder block advertises this same
 filtered set (and is skipped when it is empty); the per-called-skill
 `<skill>` detail blocks stay keyed on `called_skills` unfiltered, so a
 skill actually invoked in the session keeps its definition across
 compaction regardless of flags.
+
+That listing is a **snapshot**, and the registry moves under it —
+`SkillInstall`/`SkillUninstall` and the dashboard's refresh all call
+`reload()`, so the model itself opens the gap. `ContextManager::reconcile_skills`
+closes it: before every main LLM call it re-renders this same filtered set and,
+when it differs from the standing `SkillListing` row, appends the difference as
+a `<skills_update>` diff. A `-` line means the skill is uninstalled and calling
+it will fail — never communicated by absence. See
+[`context.md`](./context.md#the-skill-listings-lifecycle) for the baseline,
+escaping and compaction rules.
 
 Slash invocations are expanded before the first LLM call by
 `ContextManager::expand_slash_command`: when the trailing user message
