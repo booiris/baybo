@@ -57,14 +57,20 @@ describe("sanitizeRestoredRows — the four restore heals", () => {
     expect(sanitizeRestoredRows(rows)[0]).toMatchObject({ sendState: "failed" });
   });
 
-  it("STRIPS startedAt — a persisted client clock would count the app-closed hours as 'Worked 7h'", () => {
+  // The anchor is an absolute instant, so the "Worked 7h" hazard is not that it
+  // was persisted — it is a LIVE block reading `now − startedAt` across the
+  // app-closed gap. A CLOSED block runs neither the ticker nor the close path,
+  // and stripping it there cost `segmentWorkSteps` the bounds it times runs
+  // with: every restored turn collapsed to "N steps" with its true duration
+  // sitting unused on the row.
+  it("KEEPS startedAt on a CLOSED block — nothing there can tick it, and the runs need it", () => {
     const rows: Row[] = [work({ id: "w1", steps: [{ kind: "status", text: "reading" }], startedAt: 1, elapsedMs: 5_000 })];
     const [out] = sanitizeRestoredRows(rows) as WorkRow[];
-    expect(out.startedAt).toBeUndefined();
+    expect(out.startedAt).toBe(1);
     expect(out.elapsedMs).toBe(5_000);
   });
 
-  it("keeps a block that was live at persist LIVE (re-entry mid-turn must not collapse it)", () => {
+  it("keeps a block that was live at persist LIVE, and STRIPS its anchor (the 'Worked 7h' case)", () => {
     const rows: Row[] = [work({ id: "w1", steps: [tool()], active: true, startedAt: 1 })];
     expect(sanitizeRestoredRows(rows)[0]).toMatchObject({ active: true, startedAt: undefined });
   });

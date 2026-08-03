@@ -79,46 +79,41 @@ struct ChatScreen: View {
         // The system nav bar is hidden (custom chrome), which also disables the
         // interactive pop — this presence-only host re-enables the edge swipe.
         .background(PopGestureEnabler().frame(width: 0, height: 0))
+        // Everything the dock's own chain has to get right — the panel floating
+        // above its top edge, the collapse that must not clip — lives in
+        // `ComposerDock`, which is store-free so `ComposerDockTests` can render
+        // it. Only the CONTENT is assembled here.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 12) {
-                if bridge.jumpVisible {
-                    Button {
-                        bridge.jumpToLatest()
-                    } label: {
-                        Image(systemName: "arrow.down")
-                            .font(.system(size: 17, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 44, height: 44)
+            ComposerDock(collapsed: bridge.htmlPreviewMaximized, jumpVisible: bridge.jumpVisible) {
+                VStack(spacing: 12) {
+                    if bridge.jumpVisible {
+                        Button {
+                            bridge.jumpToLatest()
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 17, weight: .medium))
+                                .foregroundStyle(Theme.ink)
+                                .frame(width: 44, height: 44)
+                        }
+                        .glassSurface(interactive: true, in: .circle)
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
+                        .transition(.scale(scale: 0.7).combined(with: .opacity))
                     }
-                    .glassSurface(interactive: true, in: .circle)
-                    .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
-                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+                    ComposerView(store: store, attach: attach)
+                        .onGeometryChange(for: CGFloat.self) { proxy in
+                            proxy.frame(in: .global).minY
+                        } action: { minY in
+                            // The composer's own geometry is the one signal that
+                            // tracks BOTH the keyboard it rides and its own
+                            // growth (notice line, staged strip, multiline
+                            // field). The bridge converts to the covered strip
+                            // against the WINDOW bottom. Measured on the
+                            // COMPOSER, not the wrapping stack: the jump button
+                            // popping in must never inflate the web-side inset.
+                            bridge.setComposerTop(minY)
+                        }
                 }
-                ComposerView(store: store, attach: attach)
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.frame(in: .global).minY
-                    } action: { minY in
-                        // The composer's own geometry is the one signal that
-                        // tracks BOTH the keyboard it rides and its own growth
-                        // (notice line, staged strip, multiline field). The
-                        // bridge converts to the covered strip against the
-                        // WINDOW bottom. Measured on the COMPOSER, not the
-                        // wrapping stack: the jump button popping in must
-                        // never inflate the web-side inset.
-                        bridge.setComposerTop(minY)
-                    }
-            }
-            // The space the `+` reports its frame in and the space the panel is
-            // laid out in, in one container — no `.global` round trip between
-            // two of them, so the panel's paint and its hit region are the same
-            // rectangle.
-            .coordinateSpace(.named(AttachMenuPanel.dockSpace))
-            // The panel rides HERE, not in the stack above: this is the only
-            // layer that composites over the dock's own content — the notice
-            // line, the approval card, the staged strip and the jump disc. An
-            // overlay adds nothing to the inset, so the transcript's bottom
-            // inset stays what `ComposerView` alone measures.
-            .overlay(alignment: .topLeading) {
+            } panel: {
                 if attach.isOpen {
                     AttachMenuPanel(
                         anchor: attach.anchor, isPresented: $attach.isOpen
@@ -127,15 +122,6 @@ struct ChatScreen: View {
                     }
                 }
             }
-            // Inside this, so the panel travels with the dock the jump disc
-            // pushes up rather than stepping to the new position on its own.
-            .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
-            .opacity(bridge.htmlPreviewMaximized ? 0 : 1)
-            .allowsHitTesting(!bridge.htmlPreviewMaximized)
-            .accessibilityHidden(bridge.htmlPreviewMaximized)
-            // Keep ComposerView mounted: its unsent text is local @State.
-            .frame(height: bridge.htmlPreviewMaximized ? 0 : nil)
-            .clipped()
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in

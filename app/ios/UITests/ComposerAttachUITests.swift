@@ -42,6 +42,27 @@ final class ComposerAttachUITests: BayboUITestCase {
             app.buttons[Self.plusLabel].isHittable, "the dock must stay out of the panel's scrim")
         attachScreenshot(app, name: "composer-plus-panel")
 
+        // The panel must PAINT, not merely lay out. Everything else in this
+        // file — exists / isHittable / frame intersections — is satisfied just
+        // as well by a panel that renders nothing, and that is exactly what
+        // shipped: 50b4e33f put a `.clipped()` on the dock's modifier chain
+        // AFTER the overlay hosting the panel, and the panel is drawn entirely
+        // at negative y (`AttachMenuPanel.box`), so the clip erased its paint
+        // while leaving it laid out, hit-testable and green across this suite.
+        //
+        // A before/after screenshot DIFF is not the test: the scrim dims that
+        // whole band on open whether or not the panel drew, and a diff passes
+        // on the dimming alone (measured — it does). What only a real panel
+        // produces is STRUCTURE: a glyph and a label over glass. This launch
+        // has no thread behind the panel, so the band is otherwise one flat
+        // colour.
+        let shades = Self.distinctShades(
+            app.screenshot().image, in: photos.frame, window: app.windows.firstMatch.frame)
+        XCTAssertGreaterThan(
+            shades, 8,
+            "the + panel must RENDER where the accessibility tree says it is — "
+                + "the Photos row's band holds \(shades) distinct shades, i.e. it is blank")
+
         // Anywhere over the transcript is the scrim; the panel itself sits just
         // above the dock, far below this.
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)).tap()
@@ -197,6 +218,32 @@ final class ComposerAttachUITests: BayboUITestCase {
         XCTAssertTrue(previewClose.waitForNonExistence(timeout: 5))
 
         XCTAssertTrue(staged.waitForExistence(timeout: 5), "nor is a sheet over it")
+    }
+
+    /// How many distinct pixel values a window-space `rect` holds. The only way
+    /// to tell a painted panel from a clipped-away one: the accessibility tree
+    /// reports the two identically, and a scrim dims the band either way.
+    private static func distinctShades(_ image: UIImage, in rect: CGRect, window: CGRect) -> Int {
+        guard !rect.isEmpty, !window.isEmpty, let full = image.cgImage else { return 0 }
+        let scale = CGFloat(full.width) / window.width
+        let box = CGRect(
+            x: rect.minX * scale, y: rect.minY * scale,
+            width: rect.width * scale, height: rect.height * scale)
+        guard let crop = full.cropping(to: box),
+            let provider = crop.dataProvider, let data = provider.data
+        else { return 0 }
+        let bytes = Data(referencing: data)
+        let stride = max(1, crop.bitsPerPixel / 8)
+        var seen = Set<UInt32>()
+        for offset in Swift.stride(from: 0, to: bytes.count - stride, by: stride) {
+            var pixel: UInt32 = 0
+            for byte in 0..<Swift.min(4, stride) {
+                pixel = (pixel << 8) | UInt32(bytes[bytes.startIndex + offset + byte])
+            }
+            seen.insert(pixel)
+            if seen.count > 64 { return seen.count }
+        }
+        return seen.count
     }
 
     /// A staged tile is one accessibility element with the name as its label
