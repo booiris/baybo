@@ -29,8 +29,11 @@ export const zh: typeof en = {
       copied: "已复制",
       stopped: "已停止",
       working: "处理中",
-      worked: "处理了片刻",
-      stepsN: "{{n}} 步",
+      // NOT "处理了片刻": this is the label whenever the duration is UNKNOWN
+      // (a mirror-restored turn with remarks in it, a gateway that sent no step
+      // stamps), not only when it was genuinely brief — and "片刻" over a
+      // five-minute turn is a claim the reader cannot check.
+      worked: "处理了",
       approvalWaiting: "等待审批",
       approvalApproved: "已批准",
       approvalApprovedAlways: "始终批准",

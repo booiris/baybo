@@ -215,18 +215,20 @@ export function segmentWorkSteps(
 }
 
 /// A machinery run's collapsed label: the duration it actually covers when both
-/// bounds are known, else its step count — a turn reconstructed by a gateway
-/// predating `ChatWorkStep.at` has no per-run timing, and inventing one from
-/// the block's total would be a lie the reader cannot detect. Mirrors the web
-/// chat's `workRunLabel`.
+/// bounds are known, else a bare "Worked" — inventing a number from the block's
+/// total would be a lie the reader cannot detect, and a STEP COUNT in that slot
+/// answers a question nobody asked (it is what the run expands to show).
 ///
-/// `wholeBlockMs` is the one exception, and it is not an invention: when a run
-/// is the block's ONLY segment, its span IS the block's `elapsedMs` by
-/// definition. That matters because `elapsedMs` outlives the anchor — the
-/// mirror restore drops `startedAt` on a block still active at persist
-/// (`sanitizeRestoredRows`), and rows written before it narrowed lost theirs on
-/// disk. Without this the label read "N steps" on every restored turn while the
-/// exact number sat unused on the row.
+/// `wholeBlockMs` is not an invention: when a run is the block's ONLY segment
+/// its span IS the block's `elapsedMs` by definition. That matters because
+/// `elapsedMs` outlives the anchor — the mirror restore drops `startedAt` on a
+/// block still active at persist (`sanitizeRestoredRows`), and rows written
+/// before that narrowed lost theirs on disk — so without it a restored turn
+/// loses a duration it still holds.
+///
+/// Diverges from the web chat's `workRunLabel`, which keeps the count: only this
+/// surface has a mirror that can strip the anchor, so only here is the fallback
+/// common enough to be worth reading well.
 export function workRunLabel(
   t: TFunction,
   seg: WorkSegment,
@@ -235,13 +237,11 @@ export function workRunLabel(
 ): string {
   const startedAt = seg.kind === "machinery" ? seg.startedAt : undefined;
   const endedAt = seg.kind === "machinery" ? seg.endedAt : undefined;
-  if (startedAt === undefined || endedAt === undefined || endedAt < startedAt) {
-    if (wholeBlockMs !== undefined) return workedLabel(t, wholeBlockMs, cancelled);
-    const n = seg.steps.length;
-    const steps = t("chat.stepsN", { n });
-    return cancelled ? t("chat.cancelledFor", { dur: steps }) : steps;
-  }
-  return workedLabel(t, endedAt - startedAt, cancelled);
+  const span =
+    startedAt === undefined || endedAt === undefined || endedAt < startedAt
+      ? wholeBlockMs
+      : endedAt - startedAt;
+  return workedLabel(t, span, cancelled);
 }
 
 /// One turn's work block: while the turn runs, a spinner header over the live

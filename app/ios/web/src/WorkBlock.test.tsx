@@ -206,13 +206,15 @@ describe("WorkBlockView — the ladder", () => {
     expect(headers(container)).toEqual(["Worked 2m 47s›"]);
   });
 
-  // No honest fallback once the turn has remarks in it: the runs are each
-  // SHORTER than the block, so the block's total belongs to none of them.
-  it("keeps the step count for a multi-run turn with no stamps", () => {
+  // No honest duration once the turn has remarks in it: the runs are each
+  // SHORTER than the block, so the block's total belongs to none of them. Say
+  // "Worked" and stop — a step count there answers a question nobody asked, and
+  // it is what the run expands to show anyway.
+  it("falls back to a bare Worked for a multi-run turn with no stamps", () => {
     const { container } = renderWork(
       workRow({ elapsedMs: 60_000, steps: LADDER.map(({ at: _at, ...s }) => s as WorkStep) }),
     );
-    expect(headers(container)).toEqual(["1 steps›", "1 steps›", "1 steps›"]);
+    expect(headers(container)).toEqual(["Worked›", "Worked›", "Worked›"]);
   });
 
   it("opens one run without inserting the others", async () => {
@@ -237,8 +239,9 @@ describe("WorkBlockView — the ladder", () => {
     expect(headers(container)[0]).toBe("Worked 12s›");
   });
 
-  it("falls back to a step count when the boundary carries no timestamp", () => {
-    // A row a gateway predating `ChatWorkStep.at` reconstructed.
+  it("falls back to a bare Worked when the boundary carries no timestamp", () => {
+    // A row a gateway predating `ChatWorkStep.at` reconstructed. The block's
+    // 5s belongs to neither run — both are shorter — so neither claims it.
     const { container } = renderWork(
       workRow({
         active: false,
@@ -246,7 +249,7 @@ describe("WorkBlockView — the ladder", () => {
         steps: [{ kind: "reasoning", text: "r" }, { kind: "prose", text: "说点什么" }, toolStep({})],
       }),
     );
-    expect(headers(container)).toEqual(["1 steps›", "1 steps›"]);
+    expect(headers(container)).toEqual(["Worked›", "Worked›"]);
   });
 
   it("a turn with no narration is a single run — the common shape", () => {
