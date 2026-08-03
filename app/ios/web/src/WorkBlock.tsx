@@ -219,10 +219,24 @@ export function segmentWorkSteps(
 /// predating `ChatWorkStep.at` has no per-run timing, and inventing one from
 /// the block's total would be a lie the reader cannot detect. Mirrors the web
 /// chat's `workRunLabel`.
-export function workRunLabel(t: TFunction, seg: WorkSegment, cancelled = false): string {
+///
+/// `wholeBlockMs` is the one exception, and it is not an invention: when a run
+/// is the block's ONLY segment, its span IS the block's `elapsedMs` by
+/// definition. That matters because `elapsedMs` outlives the anchor — the
+/// mirror restore drops `startedAt` on a block still active at persist
+/// (`sanitizeRestoredRows`), and rows written before it narrowed lost theirs on
+/// disk. Without this the label read "N steps" on every restored turn while the
+/// exact number sat unused on the row.
+export function workRunLabel(
+  t: TFunction,
+  seg: WorkSegment,
+  cancelled = false,
+  wholeBlockMs?: number,
+): string {
   const startedAt = seg.kind === "machinery" ? seg.startedAt : undefined;
   const endedAt = seg.kind === "machinery" ? seg.endedAt : undefined;
   if (startedAt === undefined || endedAt === undefined || endedAt < startedAt) {
+    if (wholeBlockMs !== undefined) return workedLabel(t, wholeBlockMs, cancelled);
     const n = seg.steps.length;
     const steps = t("chat.stepsN", { n });
     return cancelled ? t("chat.cancelledFor", { dur: steps }) : steps;
@@ -247,11 +261,15 @@ function WorkRunView({
   seg,
   live,
   cancelled,
+  wholeBlockMs,
   onToggle,
 }: {
   seg: Extract<WorkSegment, { kind: "machinery" }>;
   live: boolean;
   cancelled: boolean;
+  /// Set only when this run is the block's ONLY segment, so its span is the
+  /// block's own `elapsedMs` — see `workRunLabel`.
+  wholeBlockMs?: number;
   onToggle?: (expanded: boolean) => void;
 }) {
   const { t } = useTranslation();
@@ -285,7 +303,7 @@ function WorkRunView({
           onToggle?.(next);
         }}
       >
-        <span>{workRunLabel(t, seg, cancelled)}</span>
+        <span>{workRunLabel(t, seg, cancelled, wholeBlockMs)}</span>
         <span className={`work-chevron${expanded ? " open" : ""}`}>›</span>
       </button>
       {expanded && (
@@ -335,6 +353,12 @@ export const WorkBlockView = memo(function WorkBlockView({
             // above it are finished and collapse like any other.
             live={row.active && (i === lastMachinery || segments.length === 0)}
             cancelled={row.cancelled === true && i === lastMachinery}
+            // A lone machinery run spans the whole turn, so the block's own
+            // duration is exactly its span — the only number that survives the
+            // mirror dropping `startedAt`. With a remark in the turn the runs
+            // are shorter than the block and there is nothing honest to fall
+            // back to, so those keep the step count.
+            wholeBlockMs={runs.length === 1 ? row.elapsedMs : undefined}
             onToggle={onToggle}
           />
         ),

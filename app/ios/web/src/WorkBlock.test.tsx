@@ -193,6 +193,28 @@ describe("WorkBlockView — the ladder", () => {
     expect(container.querySelectorAll(".work-steps")).toHaveLength(0);
   });
 
+  // The shape a cold start hands this view: `elapsedMs` survives the mirror,
+  // the anchor does not (stripped for a block still active at persist, and
+  // absent outright on rows written before that strip narrowed). A turn with no
+  // mid-turn remark is ONE run spanning the whole block, so `elapsedMs` is
+  // exactly its span — reading "3 steps" there with the real number on the row
+  // is the regression `3730466d` shipped.
+  it("times a lone run from the block when the mirror dropped the anchor", () => {
+    const { container } = renderWork(
+      workRow({ steps: [{ kind: "reasoning", text: "thinking" }, toolStep(), toolStep({ callId: "c2" })], elapsedMs: 167_000 }),
+    );
+    expect(headers(container)).toEqual(["Worked 2m 47s›"]);
+  });
+
+  // No honest fallback once the turn has remarks in it: the runs are each
+  // SHORTER than the block, so the block's total belongs to none of them.
+  it("keeps the step count for a multi-run turn with no stamps", () => {
+    const { container } = renderWork(
+      workRow({ elapsedMs: 60_000, steps: LADDER.map(({ at: _at, ...s }) => s as WorkStep) }),
+    );
+    expect(headers(container)).toEqual(["1 steps›", "1 steps›", "1 steps›"]);
+  });
+
   it("opens one run without inserting the others", async () => {
     const user = userEvent.setup();
     const { container, onToggle } = renderWork(ladderRow());

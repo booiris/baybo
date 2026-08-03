@@ -1183,12 +1183,14 @@ export function applySyncReplace(
 /// live at persist stays live ("working"), because exiting and re-entering
 /// mid-turn — or before the agent's final reply — must NOT collapse it to
 /// "worked". The buffered continuation frames extend that same block, and only
-/// its terminal reply / turn-end closes it. `startedAt` is STRIPPED here: a
-/// persisted client `Date.now()` anchor would make `now − startedAt` count all
-/// the time the app was closed (an absurd "Worked 7h"); the next SubscribeState
-/// / sync re-anchors it to the server's true turn start. A block that persisted
-/// already-closed stays closed. Empty blocks have nothing to show; unknown
-/// future roles are dropped. Also folds back a turn a mirror split in two.
+/// its terminal reply / turn-end closes it. `startedAt` is stripped from a block
+/// restored ACTIVE and only from that one (`keepAnchor`): the anchor is an
+/// absolute instant, and it is the live ticker / the close path — neither of
+/// which a closed block runs — that would turn it into an absurd "Worked 7h".
+/// A block that persisted already-closed stays closed, and keeps its anchor, so
+/// `segmentWorkSteps` can still time its runs. Empty blocks have nothing to
+/// show; unknown future roles are dropped. Also folds back a turn a mirror split
+/// in two.
 export function clearAwaitingApproval(step: WorkStep): WorkStep {
   return step.kind === "tool" && step.awaitingApproval
     ? { ...step, awaitingApproval: undefined }
@@ -1224,6 +1226,23 @@ export function hasUntimedWork(rows: Row[] | undefined): boolean {
       Array.isArray(r.steps) &&
       r.steps.length > 0,
   );
+}
+
+/// A restored block's `startedAt`, kept unless it is still ACTIVE.
+///
+/// The anchor is an absolute epoch instant (the server's `work_started_at`, or
+/// `Date.now()` when the block opened), so persisting it is harmless in itself.
+/// What is not harmless is letting a block that survives the relaunch STILL
+/// RUNNING read it: `LiveElapsed` renders `now − startedAt` (only in the live
+/// branch), and the close paths take `elapsedMs ?? Date.now() − startedAt` —
+/// both would count every app-closed hour, which is the "absurd Worked 7h" the
+/// blanket strip was written against. Neither can fire on a block restored
+/// CLOSED: it already carries `elapsedMs`, nothing recomputes it, and no ticker
+/// renders. Dropping the anchor there bought nothing and cost the per-run
+/// bounds `segmentWorkSteps` needs, so every restored turn's label fell back to
+/// a step count with its true duration sitting unused on the row.
+function keepAnchor(startedAt: number | undefined, active: boolean): number | undefined {
+  return active ? undefined : startedAt;
 }
 
 export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
@@ -1262,16 +1281,16 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
       // dropping it, which reads as "worked for a moment" on a five-minute turn
       // and is UNRECOVERABLE: the fold re-persists as one row, and a cursor
       // already past the block means no sync or history page ever re-delivers
-      // it for `reconcileWork` to re-time. `startedAt` still goes, like every
-      // other restore path — a restored anchor would have a live ticker count
-      // all the app-closed hours.
+      // it for `reconcileWork` to re-time. `startedAt` goes only if the fold is
+      // still ACTIVE — see `keepAnchor`.
       const prev = out[out.length - 1];
       if (prev && prev.role === "work" && prev.turnComplete !== true) {
+        const active = prev.active || r.active;
         out[out.length - 1] = {
           ...prev,
           steps: mergeWorkSteps(prev.steps, r.steps),
-          active: prev.active || r.active,
-          startedAt: undefined,
+          active,
+          startedAt: keepAnchor(prev.startedAt, active),
           elapsedMs: prev.elapsedMs ?? r.elapsedMs,
         };
       } else {
@@ -1288,7 +1307,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
         if (target && target.role === "work") {
           out[at] = { ...target, steps: mergeWorkSteps(target.steps, r.steps), active: target.active || r.active };
         } else {
-          out.push({ ...r, startedAt: undefined });
+          out.push({ ...r, startedAt: keepAnchor(r.startedAt, r.active) });
         }
       }
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
