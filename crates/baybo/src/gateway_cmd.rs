@@ -225,7 +225,6 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
     baybo_workspace::ensure_layout(&workspace_paths).await?;
-    boot::warn_if_skills_are_stranded(&workspace_paths);
     let _workspace_lock = baybo_workspace::acquire_workspace_lock(workspace_paths.root())?;
 
     // Register SIGHUP **before** the long boot work below (manager build,

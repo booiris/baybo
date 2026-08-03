@@ -18,7 +18,7 @@ use baybo_security::{EncryptionKey, LeakDetector};
 use baybo_skills_assessor::AssessmentMode;
 use baybo_workspace::WorkspacePaths;
 use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
-use tracing::{info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Loaders (perform I/O)
@@ -28,33 +28,6 @@ use tracing::{info, warn};
 /// `<default_workspace_root>/config/baybo.json`, else fall back to
 /// `BayboConfig::default()`. An explicit `BAYBO_CONFIG_PATH` that points at a
 /// missing file is a hard error — silent fallback would hide typos.
-/// Name a workspace whose skills are sitting where nothing reads them.
-///
-/// Skills used to live at `<root>/skills/`; they live in a persona directory
-/// now, and there is deliberately no compatibility path — the loader does not
-/// look at the old location and nothing moves it. That is a defensible
-/// decision only if the operator is told: otherwise every installed skill
-/// disappears from every listing at once with no signal at all, which reads
-/// as a bug rather than as a move. One line, no filesystem mutation.
-pub fn warn_if_skills_are_stranded(paths: &WorkspacePaths) {
-    let legacy = paths.root().join("skills");
-    let has_content = std::fs::read_dir(&legacy)
-        .map(|mut entries| entries.any(|e| e.is_ok()))
-        .unwrap_or(false);
-    if !has_content {
-        return;
-    }
-    let destination = paths.persona_skills_dir(baybo_workspace::paths::BUILTIN_PERSONA_DIR);
-    warn!(
-        found_at = %legacy.display(),
-        expected_at = %destination.display(),
-        "skills found at the old workspace-root location; nothing reads that path any more. \
-         Move them with `mv {}/* {}/` — they are not loaded until you do",
-        legacy.display(),
-        destination.display(),
-    );
-}
-
 pub async fn load_config() -> anyhow::Result<BayboConfig> {
     let explicit = std::env::var(ENV_CONFIG_PATH).ok();
     let path = explicit

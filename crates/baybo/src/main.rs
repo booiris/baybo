@@ -92,7 +92,6 @@ async fn main() -> anyhow::Result<()> {
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
     baybo_workspace::ensure_layout(&workspace_paths).await?;
-    boot::warn_if_skills_are_stranded(&workspace_paths);
 
     // One-shot `baybo prompt`: stream a single answer and exit. Sits
     // beside the `tui` early-return because both drive the agent runtime
