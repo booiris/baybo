@@ -52,9 +52,24 @@ struct AttachMenuTests {
     /// `.overlay(alignment:)` kept every assertion here green while the VIEW
     /// discarded `box()` entirely — an overlay pins its child to the named
     /// corner and never resolves those guides — and the panel opened inside the
-    /// dock at x = 0 in all seven dock configurations. What catches that is the
-    /// UI tier asserting the rendered frame (`ComposerAttachUITests`), not this
-    /// one.
+    /// dock at x = 0 in all seven dock configurations.
+    ///
+    /// It goes one level further than that, and the correction is the whole
+    /// point: a `.clipped()` on `ChatScreen`'s dock chain (`50b4e33f`) erased
+    /// the panel's PAINT while leaving its layout, its hit region and its
+    /// accessibility frame all correct — so `box()` was right here, and the UI
+    /// tier's `exists` / `isHittable` / frame-intersection assertions were right
+    /// there, and the user saw a `+` that dimmed the screen and showed nothing.
+    /// Only sampling PIXELS catches that class, which is what
+    /// `ComposerAttachUITests.testPlusPanelOffersPhotosAndFiles` now does.
+    ///
+    /// Nothing at THIS tier can, and not for want of trying: the modifier chain
+    /// that broke exists only inside `ChatScreen.body`, which needs a
+    /// `ChatStore` and a live `TranscriptHost` webview to instantiate. A
+    /// stand-in view reproducing the chain would rot into false coverage the
+    /// first time `ChatScreen` diverged from it. Extracting the dock into its
+    /// own store-free `View` is what would make it renderable here
+    /// (`ImageRenderer`) — a refactor, not a test.
     @Test func theBottomEdgeClearsTheDock() {
         for anchor in [Self.plus, Self.plusUnderStrip, Self.plusUnderApproval] {
             let box = AttachMenuPanel.box(anchor: anchor)
