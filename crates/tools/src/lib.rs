@@ -31,12 +31,19 @@ pub use approval::{
 };
 pub(crate) use baybo_model::FileFingerprint;
 pub use builtin::read::READ_TOOL_NAME;
+pub use builtin::write::WRITE_TOOL_NAME;
 
 /// The parameter every file tool names its target with. Shared because callers
 /// outside this crate read it back off a recorded `ToolUse` — the agent loop to
 /// stamp a fingerprint, `baybo-context` to spot a persona file the model
 /// rewrote itself.
 pub const TOOL_FILE_PATH_ARG: &str = "file_path";
+
+/// The parameter [`WRITE_TOOL_NAME`] carries the whole new file in. Shared for
+/// the same reason as [`TOOL_FILE_PATH_ARG`]: `baybo-context` reads it back off
+/// the recorded `ToolUse` to recover the copy of a persona file the model is
+/// holding, which is a newer baseline than the one its system prompt carries.
+pub const TOOL_CONTENT_ARG: &str = "content";
 
 /// Tools that REWRITE the file at [`TOOL_FILE_PATH_ARG`]. A subset of
 /// [`READ_TRACKER_ANCHORING_TOOLS`], which also counts `Read` — the two answer
