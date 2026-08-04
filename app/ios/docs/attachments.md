@@ -26,6 +26,12 @@ The directory is excluded from backup (a blob runs to 100 MiB and is always re-f
 
 `ready` is still re-asked on every mount rather than remembered, because the directory is a fact about disk.
 
+### Every card is viewport-gated, not just the image
+
+`useNearViewport` (`Transcript.tsx`) is the load-once IntersectionObserver gate the image tile always had, lifted to serve **every** attachment card: `useFileState` and `useAudioState` take it, so `queryFileState` / `queryAudioState` — and therefore `requestVideoPoster`, which waits on `ready` — fire only once the card is within the preload band.
+
+A restored thread mounts every card it holds at once, and each ungated one is a bridge round trip on the app's MAIN thread, landing squarely in the window the transcript is trying to paint its first frame in: a post out and an `evaluateJavaScript` back apiece, plus an `AVAssetImageGenerator` per downloaded video. A long conversation carries dozens; the reader can see two or three. Nothing is lost by waiting — a card can only be downloaded or played by being tapped, which needs it on screen.
+
 ### Per-blob state subscription
 
 Cards subscribe to `fileState` **by blob id** (`onFileState`), so a progress tick re-renders one card and `MessageRow`'s memo survives — and two cards on the same blob (an agent's file the user quotes back) update together.

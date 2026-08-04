@@ -247,6 +247,37 @@ initializer — so a cached conversation paints on the first commit with **zero
 network**. Nothing in the paint path reads `connState`. If a chat opens blank and
 fills in only once the leg connects, the mirror was **missing**, not gated.
 
+### The first commit paints the mirror's TAIL, not all of it
+
+`splitForFirstPaint` (`Transcript.tsx`) holds everything older than
+`FIRST_PAINT_ROWS` back; a nested `requestAnimationFrame` folds it in on the
+frame after the paint, through `prependOlder` — the scroll-up seam, so the
+viewport is anchored, `sentIds`/`renderedOrdinals` are re-seeded, and the
+work-block fold runs. The mirror only grows (every turn and every scroll-up page
+a session ever rendered is in it), and seeding `messages` with all of it made the
+first paint wait on the markdown parse, DOM build and WebKit layout of the WHOLE
+conversation — which is why a long chat opened to a longer white screen than a
+short one, off the same disk. Nothing about the sync loop changes: withholding
+rows only removes ordinals BELOW the ones `syncSince` scans for, so the gate
+answers identically on the split thread (pinned in `rows.test.ts`).
+
+Two ways the withheld head can be lost, both closed:
+
+- the persist effect **must not write while it is withheld** — that persists the
+  truncated thread over the only copy of rows the cursor has long since passed,
+  and `flushPersist` is synchronous on both `pagehide` and native's detach, so a
+  back-out inside that frame reaches it;
+- a **REPLACE drops the reservoir unrendered** (`applySyncPage`) — those rows
+  describe a thread the server has just rebased away, and the page brings its own
+  paging window.
+
+While the head is withheld, `oldestOrdinal`/`hasMoreOlder` describe what is
+RENDERED (the tail's own floor, and "there is more older"); the drain hands the
+mirror's own values back. `loadOlder` drains the reservoir instead of hitting the
+network — the safety net for a frame callback that never ran (rAF is throttled
+while the webview is hidden), which would otherwise re-fetch what is on disk and
+fail outright offline.
+
 So: **a mirror is kept for every session this device has rendered, and no
 capacity sweeper evicts it.** `save()` writes the registry and nothing else.
 

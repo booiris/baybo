@@ -6,6 +6,7 @@ import {
   bundleAnswer,
   compactionDividerIds,
   dropInFlightAnswerStep,
+  FIRST_PAINT_ROWS,
   flattenGloss,
   foldAdjacentWork,
   foldMidTurnNoticeIn,
@@ -17,6 +18,7 @@ import {
   isStopCommand,
   mergeSyncPage,
   mergeWorkSteps,
+  oldestRowOrdinal,
   openWorkIn,
   outlineEntries,
   reconcileWork,
@@ -25,6 +27,7 @@ import {
   rowOrdinal,
   sameTurnWorkIndex,
   sanitizeRestoredRows,
+  splitForFirstPaint,
   syncSince,
   transcriptItemToRow,
   wireStepToWork,
@@ -1573,6 +1576,105 @@ describe("bundleAnswer", () => {
     expect(bundleAnswer([])).toEqual({ kind: "unknown" });
     expect(bundleAnswer([{ kind: "reasoning", text: "r" }, tool({ callId: "c1" })])).toEqual({
       kind: "unknown",
+    });
+  });
+});
+
+describe("splitForFirstPaint — the mirror's older half is deferred past the first commit", () => {
+  const msg = (ordinal: number): Row => ({
+    id: `m${ordinal}`,
+    role: "assistant",
+    content: `row ${ordinal}`,
+  });
+  const many = (count: number, from = 0): Row[] =>
+    Array.from({ length: count }, (_, i) => msg(from + i));
+
+  it("leaves a thread at or under the threshold whole — a short chat's open is untouched", () => {
+    const rows = many(FIRST_PAINT_ROWS);
+    expect(splitForFirstPaint(rows)).toEqual({ head: [], tail: rows });
+  });
+
+  it("paints the NEWEST rows and defers the rest — the reader sees the bottom, not the top", () => {
+    const rows = many(FIRST_PAINT_ROWS + 12);
+    const { head, tail } = splitForFirstPaint(rows);
+    expect(tail).toHaveLength(FIRST_PAINT_ROWS);
+    expect(tail[tail.length - 1]).toBe(rows[rows.length - 1]);
+    expect(head).toHaveLength(12);
+  });
+
+  it("strands nothing — head ++ tail is the input, in order", () => {
+    const rows = many(FIRST_PAINT_ROWS + 7);
+    const { head, tail } = splitForFirstPaint(rows);
+    expect([...head, ...tail]).toEqual(rows);
+  });
+
+  it("oldestRowOrdinal reads the paging floor off the rendered half", () => {
+    const { tail } = splitForFirstPaint(many(FIRST_PAINT_ROWS + 5));
+    expect(oldestRowOrdinal(tail)).toBe(5);
+  });
+
+  it("oldestRowOrdinal is null when nothing in the thread carries an ordinal", () => {
+    expect(oldestRowOrdinal([{ id: "n1", role: "notice", content: "stopped" }])).toBeNull();
+  });
+
+  // The invariant the whole change rests on. `syncSince` is the gate that decides
+  // between a difference and a baseline REPLACE, and it answers by scanning the
+  // RENDERED rows for a durable ordinal above the cursor. Deferring rows can only
+  // remove candidates BELOW the ones it looks for, so its answer has to be the
+  // same either way — otherwise a long chat's open would take a different sync
+  // path from a short one, which is the class of bug that scrambled a thread once
+  // already (see the describe above).
+  describe("the sync gate cannot tell the thread was split", () => {
+    const rows = many(FIRST_PAINT_ROWS + 20);
+    const { tail } = splitForFirstPaint(rows);
+
+    it("agrees on a thread the cursor covers (a difference)", () => {
+      const cursor = FIRST_PAINT_ROWS + 19;
+      expect(syncSince(cursor, tail)).toBe(syncSince(cursor, rows));
+      expect(syncSince(cursor, tail)).toBe(cursor);
+    });
+
+    it("agrees on a thread the cursor does NOT cover (a baseline REPLACE)", () => {
+      expect(syncSince(5, tail)).toBe(syncSince(5, rows));
+      expect(syncSince(5, tail)).toBeNull();
+    });
+  });
+
+  // `drainDeferredHead` re-joins through `prependOlder`, which folds work blocks
+  // at the seam — so the split must not manufacture a fold that the unsplit
+  // mirror never had. It can't: `sanitizeRestoredRows` has already folded this
+  // array, so any adjacent work pair still standing is one it deliberately left
+  // apart, and `sameContinuingTurn` refuses exactly that shape. Pinned on the
+  // real functions at the real boundary, both directions.
+  describe("re-joining the split is a no-op on the work-block fold", () => {
+    // `count` rows with two adjacent work blocks landing either side of the cut.
+    const straddling = (headTurnComplete: boolean): Row[] => {
+      const tailLen = FIRST_PAINT_ROWS;
+      const rows: Row[] = [
+        msg(0),
+        work({ id: "w1", steps: [tool({ callId: "c1" })], turnComplete: headTurnComplete }),
+        work({ id: "w2", steps: [tool({ callId: "c2" })], turnComplete: true }),
+        ...many(tailLen - 1, 10),
+      ];
+      // The cut must fall exactly between w1 and w2.
+      const { head, tail } = splitForFirstPaint(rows);
+      expect(head[head.length - 1].id).toBe("w1");
+      expect(tail[0].id).toBe("w2");
+      return rows;
+    };
+
+    it("keeps two COMPLETE turns apart — the cut cannot weld them into one card", () => {
+      const sanitized = sanitizeRestoredRows(straddling(true));
+      const { head, tail } = splitForFirstPaint(sanitized);
+      expect(foldAdjacentWork([...head, ...tail], [])).toEqual(sanitized);
+      expect(foldAdjacentWork([...head, ...tail], []).filter((r) => r.role === "work")).toHaveLength(2);
+    });
+
+    it("and a CUT-OFF head was already folded by the restore, so the cut can't land between them", () => {
+      const sanitized = sanitizeRestoredRows(straddling(false));
+      expect(sanitized.filter((r) => r.role === "work")).toHaveLength(1);
+      const { head, tail } = splitForFirstPaint(sanitized);
+      expect(foldAdjacentWork([...head, ...tail], [])).toEqual(sanitized);
     });
   });
 });

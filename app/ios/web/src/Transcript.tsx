@@ -12,6 +12,7 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  type RefObject,
   type TouchEvent as ReactTouchEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
@@ -215,11 +216,11 @@ const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
 /// follow/button state again instead of staying pinned by the in-flight flag.
 const GLIDE_SETTLE_CAP_MS = 1200;
 
-/// How far outside the viewport (px, top + bottom) an image attachment begins
-/// loading its blob — a preload band so an image is usually ready by the time it
-/// scrolls in, while a back-history page's off-screen images stay unfetched. See
-/// AttachmentImage.
-const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
+/// How far outside the viewport (px, top + bottom) an attachment card begins
+/// asking native for anything — a preload band so a card is usually settled by
+/// the time it scrolls in, while a back-history page's off-screen ones stay
+/// silent. See `useNearViewport`.
+const LAZY_ATTACHMENT_ROOT_MARGIN = "400px 0px";
 
 /// Cap on an outline entry's `text` / `gloss`. A TRANSPORT cap, not a display
 /// one — native truncates to its own (shorter) width; this only keeps a pasted
@@ -1320,6 +1321,47 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   return out;
 }
 
+/// How many of a restored mirror's rows the FIRST commit paints. Everything
+/// older is held back and folded in on the next frame.
+///
+/// The mirror is the whole cold-open story (see docs/sync-and-outbox.md) and it
+/// only grows: every turn and every scroll-up page a session ever rendered here
+/// is in it. Seeding `messages` with all of it means the first paint waits on
+/// the markdown parse, the DOM build and the WebKit layout of the ENTIRE
+/// conversation, of which the reader can see one screen — which is exactly why a
+/// long chat opens to a longer white screen than a short one, on the same
+/// device, off the same disk.
+///
+/// The number is a screenful with room to spare, not a tuned constant: it only
+/// has to be enough that the deferred head lands (one frame later, through
+/// `prependOlder`, viewport-anchored) before anyone can scroll to where it
+/// isn't.
+export const FIRST_PAINT_ROWS = 40;
+
+/// Split a sanitized mirror into what the first commit renders (`tail`) and the
+/// older rows deferred past it (`head`, oldest-first). Below the threshold the
+/// head is empty and nothing about the open changes.
+///
+/// Splitting anywhere is safe against the work-block fold that `prependOlder`
+/// runs at the seam: `sanitizeRestoredRows` has already folded this array, so
+/// any adjacent work pair still standing is one it deliberately left apart —
+/// a head with `turnComplete === true` and a durable `w<ordinal>` id — and that
+/// is precisely what `sameContinuingTurn` refuses. The rejoin is a no-op.
+export function splitForFirstPaint(rows: Row[]): { head: Row[]; tail: Row[] } {
+  if (rows.length <= FIRST_PAINT_ROWS) return { head: [], tail: rows };
+  return { head: rows.slice(0, -FIRST_PAINT_ROWS), tail: rows.slice(-FIRST_PAINT_ROWS) };
+}
+
+/// The oldest durable ordinal in `rows` — the backward-paging floor for a thread
+/// rendering only part of its mirror. `null` when nothing in it is ordinal-bearing.
+export function oldestRowOrdinal(rows: Row[]): number | null {
+  for (const r of rows) {
+    const ordinal = rowOrdinal(r.id);
+    if (ordinal !== null) return ordinal;
+  }
+  return null;
+}
+
 /// The natural pixel size of every image this thread has decoded, keyed by blob
 /// digest and mirrored to disk with the rows (`PersistedState.imageDims`). A hit
 /// means the image rendered here before — so its blob is on the device and its
@@ -1352,6 +1394,47 @@ export function restoreImageDims(
   return out;
 }
 
+/// Load-once viewport gate for the attachment cards: `false` until the observed
+/// element first comes within `LAZY_ATTACHMENT_ROOT_MARGIN` of the viewport,
+/// then `true` for good — so scrolling back past a card never re-runs whatever
+/// it gates.
+///
+/// EVERY card in a restored thread mounts at once, and each ungated one costs
+/// native work on the app's main thread before the transcript can settle: an
+/// image blob crosses as a large base64 string plus an `atob` decode,
+/// `queryFileState` / `queryAudioState` are a post out and an
+/// `evaluateJavaScript` back apiece, and a downloaded video adds a poster frame
+/// (native spins an AVAssetImageGenerator per tile). A long conversation carries
+/// dozens of cards; the reader can see two or three. So the gate gets the whole
+/// card, not just the image inside it.
+///
+/// Without IntersectionObserver (not expected on WKWebView; a dev-browser
+/// guard) open the gate immediately rather than never loading at all.
+function useNearViewport(ref: RefObject<Element | null>): boolean {
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    if (near) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
+    }
+    const el = ref.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setNear(true);
+          io.disconnect();
+        }
+      },
+      { rootMargin: LAZY_ATTACHMENT_ROOT_MARGIN },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [near, ref]);
+  return near;
+}
+
 /// One image attachment in a bubble: lazily downloads the blob via the bridge
 /// (cached on device) once its row scrolls near the viewport, wraps it in an
 /// object URL, shows a spinner while loading and a tap-to-retry on failure. The
@@ -1359,11 +1442,11 @@ export function restoreImageDims(
 /// images, and fetching every blob on mount floods the bridge — each image
 /// crosses as a large base64 string plus a main-thread `atob` decode
 /// (bridge.ts) — which stalls the whole transcript until they all settle (the
-/// whole page fails to appear while paging history). An IntersectionObserver
-/// defers each fetch to when its row actually approaches the screen, so
-/// off-screen history images cost nothing until scrolled to. The old in-session
-/// previewUrl short-circuit is gone — native previews don't cross the bridge, so
-/// a just-sent image renders by fetching its own bytes back over requestBlob
+/// whole page fails to appear while paging history). `useNearViewport` defers
+/// each fetch to when its row actually approaches the screen, so off-screen
+/// history images cost nothing until scrolled to. The old in-session previewUrl
+/// short-circuit is gone — native previews don't cross the bridge, so a
+/// just-sent image renders by fetching its own bytes back over requestBlob
 /// (device-cached, so fast).
 function AttachmentImage({
   attachment,
@@ -1374,9 +1457,6 @@ function AttachmentImage({
 }) {
   const { t } = useTranslation();
   const imageDims = useContext(ImageDimsContext);
-  // Load-once gate — flips true when the placeholder nears the viewport and
-  // never falls back, so scrolling past a loaded image doesn't refetch it.
-  const [visible, setVisible] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   // True once the fetched image has actually decoded — the frame reserves a box
@@ -1391,31 +1471,7 @@ function AttachmentImage({
   // The reserved placeholder box the observer watches until the row nears the
   // viewport.
   const holderRef = useRef<HTMLDivElement | null>(null);
-
-  // Arm the lazy gate: observe the placeholder and load once it enters the
-  // preload band. Disconnects on the first intersection. Without
-  // IntersectionObserver (not expected on WKWebView; a dev-browser guard) load
-  // eagerly rather than never showing the image.
-  useEffect(() => {
-    if (visible) return;
-    if (typeof IntersectionObserver === "undefined") {
-      setVisible(true);
-      return;
-    }
-    const el = holderRef.current;
-    if (!el) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setVisible(true);
-          io.disconnect();
-        }
-      },
-      { rootMargin: LAZY_IMAGE_ROOT_MARGIN },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [visible]);
+  const visible = useNearViewport(holderRef);
 
   useEffect(() => {
     if (!visible) return;
@@ -1703,20 +1759,29 @@ export function formatTimestampShort(iso: string): string {
 }
 
 /// One file attachment's on-device lifecycle. Native owns the truth (the blob
-/// cache is a directory iOS may purge), so the card asks on every mount rather
-/// than trusting a `ready` it saw before.
-function useFileState(blobId: string): { state: FileState; loaded: number } {
+/// cache is a directory iOS may purge), so the card asks whenever it comes into
+/// view rather than trusting a `ready` it saw before.
+///
+/// `active` is the card's `useNearViewport` gate, and it covers the query as
+/// well as the subscription: this is one bridge round trip PER CARD, and a
+/// restored thread mounts every card it holds at once — on a long conversation
+/// that is a burst of main-thread work landing squarely in the window the
+/// transcript is trying to paint its first frame in. Nothing is lost by waiting:
+/// a card can only be downloaded or played by being tapped, which needs it on
+/// screen, and the gate opens a preload band ahead of that.
+function useFileState(blobId: string, active: boolean): { state: FileState; loaded: number } {
   const [state, setState] = useState<FileState>("idle");
   const [loaded, setLoaded] = useState(0);
 
   useEffect(() => {
+    if (!active) return;
     const unsubscribe = onFileState(blobId, (payload) => {
       setState(payload.state);
       if (payload.state === "loading") setLoaded(payload.loaded ?? 0);
     });
     queryFileState(blobId);
     return unsubscribe;
-  }, [blobId]);
+  }, [blobId, active]);
 
   return { state, loaded };
 }
@@ -1730,7 +1795,8 @@ function useFileState(blobId: string): { state: FileState; loaded: number } {
 /// ring and the size turns into a `1.2 MB / 2.3 MB` counter, which is where the
 /// real progress lives. Tapping it once it's on disk opens the preview.
 function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
-  const { state, loaded } = useFileState(attachment.blob_id);
+  const rootRef = useRef<HTMLButtonElement | null>(null);
+  const { state, loaded } = useFileState(attachment.blob_id, useNearViewport(rootRef));
   const type = typeLabel(attachment);
   // A nameless blob has nothing better to title itself with than its type, so
   // the meta line would only repeat it.
@@ -1759,7 +1825,13 @@ function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
   );
 
   return (
-    <button type="button" className={`attachment-file ${state}`} onClick={onTap} {...share}>
+    <button
+      ref={rootRef}
+      type="button"
+      className={`attachment-file ${state}`}
+      onClick={onTap}
+      {...share}
+    >
       <span className="file-glyph-slot">
         <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           {state === "ready" ? GLYPH_FILE : GLYPH_DOWNLOAD}
@@ -1779,9 +1851,14 @@ function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
 
 /// Mirror of one blob's slice of the native audio engine (there is ONE player
 /// app-wide — see `AudioPlayerCenter`). Subscribed by blob id like `fileState`,
-/// so a 2 Hz position tick re-renders one card; the mount-time query resyncs a
-/// card that appears mid-playback (session switch, thread reload).
-function useAudioState(blobId: string): AudioStatePayload {
+/// so a 2 Hz position tick re-renders one card; the query resyncs a card that
+/// appears mid-playback (session switch, thread reload).
+///
+/// Gated on the same `useNearViewport` flag as `useFileState`, for the same
+/// reason and with the same safety: a track can only be playing because someone
+/// tapped its card, and a card off-screen has nothing to show about it — the
+/// query runs the moment it scrolls back into the band.
+function useAudioState(blobId: string, active: boolean): AudioStatePayload {
   const [audio, setAudio] = useState<AudioStatePayload>({
     blobId,
     state: "stopped",
@@ -1790,10 +1867,11 @@ function useAudioState(blobId: string): AudioStatePayload {
   });
 
   useEffect(() => {
+    if (!active) return;
     const unsubscribe = onAudioState(blobId, setAudio);
     queryAudioState(blobId);
     return unsubscribe;
-  }, [blobId]);
+  }, [blobId, active]);
 
   return audio;
 }
@@ -1892,8 +1970,10 @@ function AudioTrack({
 /// counter), so a history page of audio costs nothing until asked for.
 function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   const { t } = useTranslation();
-  const { state, loaded } = useFileState(attachment.blob_id);
-  const audio = useAudioState(attachment.blob_id);
+  const rootRef = useRef<HTMLButtonElement | null>(null);
+  const near = useNearViewport(rootRef);
+  const { state, loaded } = useFileState(attachment.blob_id, near);
+  const audio = useAudioState(attachment.blob_id, near);
   const type = typeLabel(attachment);
   const name = attachment.filename ?? type;
   const [head, tail] = splitForMiddleEllipsis(name);
@@ -1947,6 +2027,7 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
 
   return (
     <button
+      ref={rootRef}
       type="button"
       className={`attachment-file audio ${state}`}
       onClick={onTap}
@@ -2021,7 +2102,8 @@ function VideoProgressRing({ fraction }: { fraction: number }) {
 /// at the right ratio from the first paint.
 function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
   const { t } = useTranslation();
-  const { state, loaded } = useFileState(attachment.blob_id);
+  const rootRef = useRef<HTMLButtonElement | null>(null);
+  const { state, loaded } = useFileState(attachment.blob_id, useNearViewport(rootRef));
   const imageDims = useContext(ImageDimsContext);
   const digest = blobContentDigest(attachment.blob_id);
   const [dims, setDims] = useState(() => imageDims?.get(digest));
@@ -2099,6 +2181,7 @@ function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
 
   return (
     <button
+      ref={rootRef}
       type="button"
       className={`attachment-video ${state}${poster ? " has-poster" : ""}`}
       style={{ "--video-ar": String(ratio) } as CSSProperties}
@@ -2428,7 +2511,30 @@ export function Transcript({
   initialConnEpoch: number;
 }) {
   const { t } = useTranslation();
-  const [messages, setMessages] = useState<Row[]>(() => sanitizeRestoredRows(restored?.messages));
+  // The mirror, split so the first commit paints only the newest screenfuls
+  // (`splitForFirstPaint`), with the backward-paging state that describes what
+  // is actually RENDERED while the older half is withheld: the floor is the
+  // tail's own oldest ordinal, and there is always more older (the head itself).
+  // `drainDeferredHead` hands the mirror's own values back when it folds it in.
+  //
+  // Built in one `useState` initializer, not inline: a `useRef(expr)` argument
+  // is evaluated on EVERY render, and this walks and slices the whole thread.
+  const [restoredSplit] = useState(() => {
+    const { head, tail } = splitForFirstPaint(sanitizeRestoredRows(restored?.messages));
+    return {
+      head,
+      tail,
+      oldestOrdinal: head.length > 0 ? oldestRowOrdinal(tail) : (restored?.oldestOrdinal ?? null),
+      hasMoreOlder: head.length > 0 || (restored?.hasMoreOlder ?? false),
+    };
+  });
+  // The deferred older rows, oldest-first. Drained ONCE, on the frame after the
+  // first paint, through the same `prependOlder` seam scroll-up paging uses — so
+  // the viewport is anchored and the fold/dedup rules at the seam still run.
+  // Emptied without being rendered if a REPLACE lands first: those rows describe
+  // a thread the server has just rebased away.
+  const deferredHead = useRef<Row[]>(restoredSplit.head);
+  const [messages, setMessages] = useState<Row[]>(restoredSplit.tail);
   // The rendered thread, readable from `runSync` — which must NOT re-create on
   // every row change: its identity gates the mount and safety-tick sync effects,
   // so a `messages` dependency would fire a pull on every bubble. Seeded from
@@ -2538,8 +2644,8 @@ export function Transcript({
   const lastMarkedRead = useRef(-1);
   // Lowest durable ordinal loaded — the scroll-up paging cursor
   // (`before_ordinal`). `null` = unknown / nothing older to page to.
-  const oldestOrdinal = useRef<number | null>(restored?.oldestOrdinal ?? null);
-  const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restored?.hasMoreOlder ?? false);
+  const oldestOrdinal = useRef<number | null>(restoredSplit.oldestOrdinal);
+  const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restoredSplit.hasMoreOlder);
   const [loadingOlder, setLoadingOlder] = useState(false);
   // Compaction boundaries (`{ ordinal, at }[]`), the authoritative set carried
   // on every `sync_page`. Seeds the pre-compaction divider; restored from the
@@ -2648,6 +2754,15 @@ export function Transcript({
   useEffect(() => {
     persistLatest.current = () => {
       if (messages.length === 0 && cursorRef.current.cursor === null) return;
+      // The first commit deliberately renders only the mirror's newest rows
+      // (`splitForFirstPaint`); writing in that window persists the TRUNCATED
+      // thread and loses the rest for good — the file is the only copy of a row
+      // the sync cursor has long since passed. The debounce usually hides this
+      // (the drain lands a frame later and supersedes the pending write), but
+      // `flushPersist` is synchronous and both `pagehide` and native's detach
+      // fire it — so a back-out inside that frame is a real path, not a
+      // theoretical one.
+      if (deferredHead.current.length > 0) return;
       persistState({
         messages,
         lastOrdinal: cursorRef.current.cursor,
@@ -3095,6 +3210,42 @@ export function Transcript({
     setHasMoreOlder(more);
   }, []);
 
+  // Fold the mirror's withheld older rows into the thread (see
+  // `splitForFirstPaint`), restoring the paging state they were held back from.
+  // Idempotent and one-shot: the reservoir is cleared before the prepend, so a
+  // drain racing the frame effect below can't double-render it.
+  //
+  // Goes through `prependOlder` rather than a bare `setMessages` so the head
+  // arrives under exactly the rules a scroll-up page does — viewport anchored by
+  // `prependAnchor`, `sentIds`/`renderedOrdinals` re-seeded, seam folded (a
+  // no-op on an already-sanitized split, see `splitForFirstPaint`).
+  const drainDeferredHead = useCallback(() => {
+    const head = deferredHead.current;
+    if (head.length === 0) return;
+    deferredHead.current = [];
+    prependOlder(head, restored?.oldestOrdinal ?? null, restored?.hasMoreOlder ?? false);
+    // `prependOlder` leaves the floor PUT on a null — its "an empty page changes
+    // nothing" rule. Here null is the mirror's real answer ("no durable floor to
+    // page from"), and the tail's own oldest — seeded only to describe the half
+    // that was rendered — must not outlive the half it described.
+    oldestOrdinal.current = restored?.oldestOrdinal ?? null;
+  }, [prependOlder, restored]);
+
+  // One frame after the first paint. `useEffect` alone runs before the browser
+  // has painted the commit, which would put the whole thread back in the first
+  // frame and undo the split; the nested rAF lands after it.
+  useEffect(() => {
+    if (deferredHead.current.length === 0) return;
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(drainDeferredHead);
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
+    };
+  }, [drainDeferredHead]);
+
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap
   // cursor goes back out on the next reconnect and overflows again. One
@@ -3104,6 +3255,14 @@ export function Transcript({
   // there). `pagingRef` gates re-entry.
   const loadOlder = useCallback(() => {
     if (pagingRef.current || !hasMoreOlder) return;
+    // Rows we already hold beat a round trip — and this is the safety net for a
+    // reservoir the post-paint frame never drained (rAF is throttled while the
+    // webview is hidden), which would otherwise re-fetch what is on disk and
+    // fail outright offline.
+    if (deferredHead.current.length > 0) {
+      drainDeferredHead();
+      return;
+    }
     const before = oldestOrdinal.current;
     if (before === null) return; // no cursor — can't page older
     pagingRef.current = true;
@@ -3122,7 +3281,7 @@ export function Transcript({
       log("warn", `history page failed: ${String(e)}`);
       appendNotice(t("chat.recoverFailed", { error: String(e) }));
     }
-  }, [hasMoreOlder, requestHistory, appendNotice]);
+  }, [hasMoreOlder, requestHistory, appendNotice, drainDeferredHead]);
 
   // The one forward-recovery pull (docs/sync-protocol.md "The one client
   // algorithm"): session open, reconnect, gap nudge and the safety tick all
@@ -3242,6 +3401,11 @@ export function Transcript({
           frame.compaction_points ?? [],
         );
         setMessages((prev) => applySyncReplace(prev, folded, unconfirmedSends.current));
+        // The page IS the thread now, and it brings its own paging window. Rows
+        // still withheld from the first paint describe the thread this REPLACE
+        // just rebased away — prepending them a frame later would weld a stale
+        // head onto it, under a floor that no longer refers to them.
+        deferredHead.current = [];
         oldestOrdinal.current = frame.oldest_ordinal;
         setHasMoreOlder(frame.has_more_older);
         // The rebuilt thread IS the newest page — pre-sync scroll position is
