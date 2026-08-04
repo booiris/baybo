@@ -161,15 +161,16 @@ directly.
 
 ### External-agents step (Full only)
 
-`configure_external_agents_step` probes `claude`, `codex`, and
-`gemini` on `PATH`, then shows the detected ones in a single
-multi-select so the operator enables the set they want in one pass.
-If more than one ends up enabled it prompts for the default. Each
-enabled agent's discovered binary path is recorded under
-`external_agents.<kind>.binary_path`, and the chosen default lands in
-`external_agents.default_external_agent`. When nothing is detected the
-step is a no-op. The resulting `ExternalAgentsStepOutcome { enabled,
-default }` is surfaced on `SetupOutcome`.
+`configure_external_agents_step` probes `claude` and `codex` on
+`PATH`, then shows the detected ones in a single multi-select —
+pre-checked to each kind's current `enabled` state, which on a fresh
+install means every detected kind is checked, since both ship enabled.
+Unchecking one is how the operator withholds an installed backend.
+The multi-select is the whole step — it asks nothing further. Each
+enabled agent's discovered **absolute** binary path is recorded under
+`external_agents.<kind>.binary_path`. When nothing is detected the
+step is a no-op. The resulting `ExternalAgentsStepOutcome { enabled }`
+is surfaced on `SetupOutcome`.
 
 ### Exit hint
 
@@ -302,7 +303,7 @@ pub mod test_support {
 | `baybo-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
 | `baybo-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `baybo-store` and imported via `baybo_store::ChannelBotStore`.) |
 | `baybo-workspace`     | `WorkspacePaths`, `ensure_layout`, `default_workspace_root` |
-| `baybo-agent`         | `external_agent::{claude_cli,codex_cli,gemini_cli}::*Agent::probe_and_build` for PATH detection |
+| `baybo-agent`         | `external_agent::{claude_cli,codex_cli}::*Agent::probe_and_build` for PATH detection |
 | `baybo-model`         | `ChannelType`, `ExternalAgentKind`                                      |
 | `baybo-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
 | `baybo-cli`           | Wrappers: `commands::llm::add`, `commands::channel::add_bot`            |

@@ -278,10 +278,8 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             Err("`memory` commands edit a non-hot-reload backend; run them from a shell")
         }
         Commands::ExternalAgent {
-            cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable | ExternalAgentCmd::Default,
-        } => {
-            Err("`external-agent setup`/`disable`/`default` are interactive; run them from a shell")
-        }
+            cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable,
+        } => Err("`external-agent setup`/`disable` are interactive; run them from a shell"),
 
         // Bounded reads + opt-in mutations: allowed.
         Commands::Config { cmd } => match cmd {

@@ -1,7 +1,7 @@
 /**
  * Projects a session transcript into trace-shaped rows.
  *
- * An external-agent session (claude / codex / gemini) records no step/span
+ * An external-agent session (claude / codex) records no step/span
  * tree — its loop runs out of process and baybo never sees the individual LLM
  * calls. Its `session_messages` log is therefore the only trace it has, and
  * this module reshapes that log into the same vocabulary the tree already

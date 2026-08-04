@@ -998,12 +998,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         graph.workspace.root().to_path_buf(),
     ));
 
-    // External-agent registry: only kinds the operator has explicitly
-    // opted into (`enabled: true` in baybo.json) are probed and
-    // registered. An installed-but-not-enabled binary on PATH is
-    // NOT a trust signal — registration would expose the LLM to a
-    // host-execution channel that bypasses baybo's sandbox + approval
-    // gate.
+    // External-agent registry: every kind is `enabled` by default, so
+    // this probes PATH and registers whichever of claude / codex is
+    // actually installed. Having the CLI on the host is the opt-in.
+    // Note what that grants: these run their own tool loops with
+    // approvals bypassed, so they sidestep baybo's sandbox + approval
+    // gate. `external_agents.<kind>.enabled = false` withholds one.
     let external_agents = Arc::new(baybo_agent::external_agent::build_registry(
         graph.config.external_agents.boot_entries(),
         boot::proxy_settings(&graph.config),

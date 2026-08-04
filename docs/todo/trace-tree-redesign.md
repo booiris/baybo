@@ -104,7 +104,7 @@ span that spawned it (`Lineage.parent_span_id`), recursively.
 
 ### Edge case — external-agent turns
 
-`claude` / `codex` / `gemini` turns record no step/span tree (their internal loop is
+`claude` / `codex` turns record no step/span tree (their internal loop is
 opaque). **Shipped** differently from the sketch above: rather than a leaf whose
 transcript appears in the right panel, such a turn expands into its transcript **in the
 tree itself** — one row per message, a `tool_use` folded together with its `tool_result`

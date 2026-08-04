@@ -173,7 +173,7 @@ export function findStep(trace: TurnTrace | undefined, stepId: string): ReplaySt
 }
 
 /**
- * Whether a turn's trace is an external agent (claude/codex/gemini) whose
+ * Whether a turn's trace is an external agent (claude/codex) whose
  * internal loop is opaque — it records no step/span tree ever, so its
  * transcript is the trace.
  *

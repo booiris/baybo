@@ -302,7 +302,6 @@ fn validate_cross_section(config: &BayboConfig, errors: &mut Vec<ValidationError
     validate_encryption_key_source(&config.security, errors);
     validate_default_llm(config, errors);
     validate_model_tiers(config, errors);
-    validate_default_external_agent(config, errors);
 }
 
 /// Every `agent.model_tiers` target must name a real `llm` entry.
@@ -323,47 +322,6 @@ fn validate_model_tiers(config: &BayboConfig, errors: &mut Vec<ValidationError>)
                     tier.as_str(),
                     name.as_str(),
                     names.join(", "),
-                ),
-            ));
-        }
-    }
-}
-
-fn validate_default_external_agent(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
-    let enabled = config.external_agents.enabled_kinds();
-    match (
-        enabled.len(),
-        &config.external_agents.default_external_agent,
-    ) {
-        // Zero or one enabled: default is optional. Single enabled
-        // kind is implicitly the default.
-        (0 | 1, _) => {}
-        (_, Some(d)) => {
-            if !enabled.contains(d) {
-                let joined = enabled
-                    .iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                errors.push(ValidationError::new(
-                    "external_agents.default_external_agent",
-                    format!(
-                        "{:?} is not among the enabled external agents [{joined}]",
-                        d.as_str(),
-                    ),
-                ));
-            }
-        }
-        (_, None) => {
-            let joined = enabled
-                .iter()
-                .map(|k| k.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            errors.push(ValidationError::new(
-                "external_agents.default_external_agent",
-                format!(
-                    "multiple external agents are enabled ([{joined}]); set `default_external_agent` to one of them",
                 ),
             ));
         }

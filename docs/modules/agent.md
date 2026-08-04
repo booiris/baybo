@@ -26,7 +26,7 @@ agent/src/
 ├── security.rs               # SecurityGateway (cross-cutting interception facade)
 ├── service.rs                # ShutdownSignal, TaskTracker (process-level)
 ├── recovery.rs               # startup + actor-panic recovery
-├── external_agent/           # claude / codex / gemini CLI subagents + version probe
+├── external_agent/           # claude / codex CLI subagents + version probe
 ├── runtime/                  # per-turn execution core
 │   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
 │   ├── tool_executor.rs      # ToolExecutor + approval gate; wires virtual-file providers into ToolContext
@@ -258,7 +258,7 @@ Per-tool `max_timeout()`:
 
 The observer fires from the loop's **`Continue` arm only** — after an iteration has resolved as a tool round, never on the one that produced the final answer — so a turn that just ended never spawns a fresh summary. At that point the context is coherent (tool results appended, no dangling `tool_use`) and still reuses that iteration's warm cached prefix. The summary is drained (emitted) at the *next* `Continue`. One residual remains: the last summary, spawned right before an iteration that turns out to be the final answer, can no longer be drained. To avoid that detached call lingering past the reply billed-and-discarded, the observer is bound to a dedicated `observer_cancel` child token (not the turn token): a drop guard trips it on **every** `run_inner` exit (Final / max-iter / error), and it inherits `/stop`; the observer's LLM call `select!`s on it, so an undrainable (or `/stop`-ed) summary aborts and closes its step as `Cancelled` instead of being `abort()`-ed (which would leak a `Pending` step). A summary that already finished before the turn ended is simply dropped.
 
-**External CLI subagents** (`external_agent/*`, claude/codex/gemini) — opaque subprocesses, so they get real wall-clock guards:
+**External CLI subagents** (`external_agent/*`, claude/codex) — opaque subprocesses, so they get real wall-clock guards:
 
 | Const | Value | Meaning |
 |-------|-------|---------|

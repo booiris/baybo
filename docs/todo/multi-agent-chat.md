@@ -53,7 +53,7 @@ so memory partitions by `(user, agent)` and cost still bills one owner.
   recall/write carries the session's agent id. Agent A never recalls agent B's
   memories.
 - **Frameworks**: `framework = claude | codex` profiles serve top-level chat
-  through the external-agent leg. `gemini` stays subagent-backend-only.
+  through the external-agent leg.
 
 ## The axes, and where each one resolves
 
@@ -482,8 +482,10 @@ translation layer, which is the second reason the soul is a file.
 **Capability gaps — stated, not hidden** (UI copy and docs): baybo tools,
 sandbox, approval gate, and secret injection do **not** apply. The security
 posture equals `spawn_subagent(backend: claude)` — the CLIs run with permissions
-bypassed, so an external-agent chat is a shell on the host. That is why creation
-is gated on the operator's explicit `external_agents.<kind>.enabled = true`.
+bypassed, so an external-agent chat is a shell on the host. Note what does and
+does not gate it: `external_agents.<kind>.enabled` defaults to **true**, so the
+effective gate is "the CLI is installed on this host", not an explicit operator
+opt-in. Do not design this feature as though an opt-in stands behind it.
 No mid-turn interjection (no tool boundaries — mid-run messages queue in the
 mailbox and become the next turn), no progress observer, no compression (context
 is the CLI's problem; the baybo-side transcript is display plus memory input).

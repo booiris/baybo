@@ -1,6 +1,6 @@
 /**
  * Pins the transcript-as-trace projection for an external agent
- * (claude / codex / gemini): `buildTranscriptNodes` + `transcriptPreview`.
+ * (claude / codex): `buildTranscriptNodes` + `transcriptPreview`.
  *
  * Source of truth for the input shape is `ContentBlock` / `ChatMessage` /
  * `SessionMessageRow` in `src/types/trace.ts`, which mirror

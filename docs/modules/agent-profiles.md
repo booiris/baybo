@@ -32,7 +32,7 @@ pub struct AgentProfileRow {
 }
 ```
 
-`AgentFramework` is a flat unit enum in `baybo-model` (`#[serde(rename_all = "snake_case")]` + the house `as_str()` / `parse()` / `const ALL` mirror): `Baybo | Claude | Codex`, `Baybo` the `Default`. Its string forms are a subset of the spawn protocol's backend tags — `BAYBO_BACKEND_TAG` and `ExternalAgentKind::as_str()` (the runtime also has `Gemini`, deliberately not offered as an agent-profile framework) — and it carries `to_backend_kind(self) -> SubagentBackendKind` so future runtime wiring is a lossless mapping, not a string translation.
+`AgentFramework` is a flat unit enum in `baybo-model` (`#[serde(rename_all = "snake_case")]` + the house `as_str()` / `parse()` / `const ALL` mirror): `Baybo | Claude | Codex`, `Baybo` the `Default`. Its string forms are a subset of the spawn protocol's backend tags — `BAYBO_BACKEND_TAG` and `ExternalAgentKind::as_str()` — and it carries `to_backend_kind(self) -> SubagentBackendKind` so future runtime wiring is a lossless mapping, not a string translation.
 
 `NULL` consistently means **inherit the default**:
 
@@ -187,7 +187,7 @@ Session binding, the per-agent persona directory, and the memory partition
 ship in [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md), which is
 authoritative for all three. What is left:
 
-- **External-framework top-level sessions** — `claude`/`codex`/`gemini` currently run only as subagent backends; a profile with an external framework needs the external-agent leg generalized to top-level chat. (`gemini` exists as a runtime backend but isn't offered as an agent-profile framework.)
+- **External-framework top-level sessions** — `claude`/`codex` currently run only as subagent backends; a profile with an external framework needs the external-agent leg generalized to top-level chat.
 - **Markdown export/import** — if git-versioning of personas ever matters; DB stays authoritative.
 - **@-mention / slash selection** — unique names are already reserved for it.
 

@@ -1,12 +1,12 @@
-//! External-agent setup. Probes `claude` + `codex` + `gemini` on
-//! PATH, then shows the detected ones in a single multi-select so the
-//! operator enables the set they want in one pass; if more than one
-//! ends up enabled, prompts for the default. Records each enabled
-//! agent's discovered binary path.
+//! External-agent setup. Probes `claude` + `codex` on PATH, then shows
+//! the detected ones in a single multi-select so the operator confirms
+//! (or withholds) the set in one pass. Records each enabled agent's
+//! discovered **absolute** binary path, so the gateway service — which
+//! may run with a different cwd and a narrower `PATH` — pins the same
+//! binary the operator just probed instead of re-walking `PATH`.
 
 use baybo_agent::external_agent::claude_cli::ClaudeCliAgent;
 use baybo_agent::external_agent::codex_cli::CodexCliAgent;
-use baybo_agent::external_agent::gemini_cli::GeminiCliAgent;
 use baybo_config::BayboConfig;
 use baybo_model::ExternalAgentKind;
 
@@ -16,7 +16,6 @@ use crate::prompt::Prompter;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExternalAgentsStepOutcome {
     pub enabled: Vec<ExternalAgentKind>,
-    pub default: Option<ExternalAgentKind>,
 }
 
 pub async fn configure_external_agents_step<P: Prompter>(
@@ -35,22 +34,19 @@ fn select_and_apply<P: Prompter>(
     detected: Vec<Detected>,
 ) -> Result<ExternalAgentsStepOutcome> {
     if detected.is_empty() {
-        eprintln!("No external agents (`claude`, `codex`, `gemini`) found on PATH; skipping.");
+        eprintln!("No external agents (`claude`, `codex`) found on PATH; skipping.");
         return Ok(ExternalAgentsStepOutcome::default());
     }
 
-    // Pre-check agents already enabled in config; on a fresh install
-    // (nothing enabled yet) pre-check everything detected, since the
-    // operator just confirmed these are installed.
-    let preselected: Vec<bool> = detected
+    // Pre-check each detected agent to its current `enabled` state.
+    // Since every kind ships enabled, a fresh install pre-checks
+    // everything detected on its own — and an operator who previously
+    // unchecked one keeps it unchecked, rather than having setup
+    // silently switch it back on.
+    let initial: Vec<bool> = detected
         .iter()
         .map(|d| is_enabled(config, d.kind))
         .collect();
-    let initial = if preselected.iter().any(|&on| on) {
-        preselected
-    } else {
-        vec![true; detected.len()]
-    };
 
     let labels: Vec<String> = detected
         .iter()
@@ -68,30 +64,7 @@ fn select_and_apply<P: Prompter>(
         }
     }
 
-    outcome.default = pick_default(prompter, config)?;
     Ok(outcome)
-}
-
-/// Resolve `default_external_agent` over everything enabled in config
-/// (which may include an enabled kind we didn't re-detect this run):
-/// `None` when nothing is enabled, the sole entry when exactly one is,
-/// and an explicit pick when more than one competes.
-fn pick_default<P: Prompter>(
-    prompter: &mut P,
-    config: &mut BayboConfig,
-) -> Result<Option<ExternalAgentKind>> {
-    let enabled = config.external_agents.enabled_kinds();
-    let chosen = match enabled.as_slice() {
-        [] => None,
-        [only] => Some(*only),
-        many => {
-            let labels: Vec<&str> = many.iter().map(|k| k.display_name()).collect();
-            let idx = prompter.select("Pick a default external agent:", &labels)?;
-            Some(many[idx])
-        }
-    };
-    config.external_agents.default_external_agent = chosen;
-    Ok(chosen)
 }
 
 struct Detected {
@@ -120,9 +93,6 @@ fn probe(kind: ExternalAgentKind) -> Option<String> {
         ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None, None)
             .ok()
             .map(|a| a.binary_path().display().to_string()),
-        ExternalAgentKind::Gemini => GeminiCliAgent::probe_and_build(None, None)
-            .ok()
-            .map(|a| a.binary_path().display().to_string()),
     }
 }
 
@@ -130,7 +100,6 @@ fn is_enabled(config: &BayboConfig, kind: ExternalAgentKind) -> bool {
     match kind {
         ExternalAgentKind::Claude => config.external_agents.claude.enabled,
         ExternalAgentKind::Codex => config.external_agents.codex.enabled,
-        ExternalAgentKind::Gemini => config.external_agents.gemini.enabled,
     }
 }
 
@@ -143,10 +112,6 @@ fn apply_enable(config: &mut BayboConfig, d: &Detected, on: bool) {
         ExternalAgentKind::Codex => (
             &mut config.external_agents.codex.enabled,
             &mut config.external_agents.codex.binary_path,
-        ),
-        ExternalAgentKind::Gemini => (
-            &mut config.external_agents.gemini.enabled,
-            &mut config.external_agents.gemini.binary_path,
         ),
     };
     *enabled = on;
@@ -189,17 +154,15 @@ mod tests {
             Some("/usr/bin/codex")
         );
         assert_eq!(outcome.enabled, vec![ExternalAgentKind::Codex]);
-        // Single enabled → implicit default, no select prompt consumed.
-        assert_eq!(outcome.default, Some(ExternalAgentKind::Codex));
     }
 
+    /// The multi-select is the whole step — checking every box must not
+    /// draw a second prompt. `MockPrompter` panics on an unscripted
+    /// call, so a stray follow-up question fails this test.
     #[test]
-    fn multiple_enabled_prompts_for_default() {
+    fn checking_every_box_asks_nothing_further() {
         let mut config = BayboConfig::default();
-        // Check both (0,1), then pick default = index 1 (codex).
-        let mut prompter = MockPrompter::new()
-            .push_multi_select(vec![0, 1])
-            .push_select(1);
+        let mut prompter = MockPrompter::new().push_multi_select(vec![0, 1]);
         let outcome = select_and_apply(
             &mut prompter,
             &mut config,
@@ -209,18 +172,16 @@ mod tests {
 
         assert!(config.external_agents.claude.enabled);
         assert!(config.external_agents.codex.enabled);
-        assert_eq!(outcome.default, Some(ExternalAgentKind::Codex));
         assert_eq!(
-            config.external_agents.default_external_agent,
-            Some(ExternalAgentKind::Codex)
+            outcome.enabled,
+            vec![ExternalAgentKind::Claude, ExternalAgentKind::Codex],
         );
     }
 
     #[test]
-    fn deselecting_all_disables_and_clears_default() {
+    fn deselecting_all_disables_every_detected_kind() {
         let mut config = BayboConfig::default();
         config.external_agents.claude.enabled = true;
-        config.external_agents.default_external_agent = Some(ExternalAgentKind::Claude);
 
         // Detected claude is shown pre-checked; uncheck everything.
         let mut prompter = MockPrompter::new().push_multi_select(vec![]);
@@ -233,8 +194,6 @@ mod tests {
 
         assert!(!config.external_agents.claude.enabled);
         assert!(outcome.enabled.is_empty());
-        assert_eq!(outcome.default, None);
-        assert_eq!(config.external_agents.default_external_agent, None);
     }
 
     #[test]

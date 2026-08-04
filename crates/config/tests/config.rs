@@ -1,7 +1,6 @@
 use baybo_config::{
-    BayboConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig,
-    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, LlmModelSpec, PermissionPolicy,
-    ProxyConfig, TelegramChannelConfig,
+    BayboConfig, ConfigError, DiscordChannelConfig, LlmEntry, LlmEntryName, LlmModelSpec,
+    PermissionPolicy, ProxyConfig, TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -544,95 +543,74 @@ fn unset_at_path_rejects_empty() {
 }
 
 #[test]
-fn external_agents_disabled_by_default() {
-    // Default config has no external agents enabled — even if a
-    // claude/codex binary happens to be on PATH at boot, registration
-    // must require an explicit operator opt-in.
+fn external_agents_enabled_by_default() {
+    // Every kind is on out of the box: boot probes PATH and registers
+    // whichever binary is actually installed, so a host with claude /
+    // codex can delegate to them without an opt-in step.
     let c = BayboConfig::default();
-    assert!(c.external_agents.enabled_kinds().is_empty());
+    assert_eq!(
+        c.external_agents.enabled_kinds(),
+        vec![ExternalAgentKind::Claude, ExternalAgentKind::Codex],
+    );
     c.validate().expect("default config validates");
 }
 
 #[test]
-fn external_agents_zero_or_one_enabled_default_optional() {
-    // Zero enabled.
-    let c = BayboConfig::default();
-    c.validate()
-        .expect("no external agents = no default needed");
-
-    // Exactly one enabled, no default set: still fine.
-    let mut c = BayboConfig::default();
-    c.external_agents.claude.enabled = true;
-    c.external_agents.claude.binary_path = Some("/usr/bin/claude".into());
-    c.validate()
-        .expect("single external agent = implicit default");
+fn external_agents_omitted_section_still_enables_every_kind() {
+    // The default lives behind serde, so a config file that never
+    // mentions `external_agents` — or mentions it with the per-kind
+    // tables absent — must still come back enabled. A plain
+    // `#[derive(Default)]` on the per-kind structs would silently
+    // regress this to `false`.
+    for json in [
+        r#"{"llm": []}"#,
+        r#"{"llm": [], "external_agents": {}}"#,
+        r#"{"llm": [], "external_agents": {"claude": {}, "codex": {}}}"#,
+    ] {
+        let c: BayboConfig = serde_json::from_str(json).expect("parses");
+        assert!(
+            c.external_agents.claude.enabled && c.external_agents.codex.enabled,
+            "expected both kinds enabled for {json}",
+        );
+    }
 }
 
 #[test]
-fn external_agents_multiple_enabled_require_default() {
-    let c = BayboConfig {
-        external_agents: ExternalAgentsConfig {
-            claude: ClaudeConfig {
-                enabled: true,
-                binary_path: Some("/usr/bin/claude".into()),
-            },
-            codex: CodexConfig {
-                enabled: true,
-                binary_path: Some("/usr/bin/codex".into()),
-            },
-            gemini: GeminiConfig::default(),
-            default_external_agent: None,
-        },
-        ..BayboConfig::default()
-    };
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "external_agents.default_external_agent"));
+fn external_agents_explicit_disable_is_respected() {
+    let c: BayboConfig =
+        serde_json::from_str(r#"{"llm": [], "external_agents": {"claude": {"enabled": false}}}"#)
+            .expect("parses");
+    assert!(!c.external_agents.claude.enabled);
+    assert_eq!(
+        c.external_agents.enabled_kinds(),
+        vec![ExternalAgentKind::Codex],
+    );
+    c.validate().expect("one kind withheld is a valid config");
 }
 
 #[test]
-fn external_agents_default_among_enabled_is_ok() {
-    let c = BayboConfig {
-        external_agents: ExternalAgentsConfig {
-            claude: ClaudeConfig {
-                enabled: true,
-                binary_path: Some("/usr/bin/claude".into()),
-            },
-            codex: CodexConfig {
-                enabled: true,
-                binary_path: Some("/usr/bin/codex".into()),
-            },
-            gemini: GeminiConfig::default(),
-            default_external_agent: Some(ExternalAgentKind::Claude),
-        },
-        ..BayboConfig::default()
-    };
-    c.validate().expect("default among enabled = OK");
-}
-
-#[test]
-fn external_agents_binary_path_without_enabled_does_not_count() {
-    // An operator who set binary_path but left enabled=false has not
-    // actually opted in. Validation must NOT treat this as "configured"
-    // for the multi-enabled default-required rule, since boot will
-    // skip the kind entirely.
-    let c = BayboConfig {
-        external_agents: ExternalAgentsConfig {
-            claude: ClaudeConfig {
-                enabled: false,
-                binary_path: Some("/usr/bin/claude".into()),
-            },
-            codex: CodexConfig {
-                enabled: false,
-                binary_path: Some("/usr/bin/codex".into()),
-            },
-            gemini: GeminiConfig::default(),
-            default_external_agent: None,
-        },
-        ..BayboConfig::default()
-    };
-    c.validate()
-        .expect("binary_path without enabled = not opted in");
-    assert!(c.external_agents.enabled_kinds().is_empty());
+fn external_agents_ignores_retired_keys_instead_of_bricking() {
+    // A `baybo.json` written by an older build carries keys this one
+    // dropped — a `gemini` table and a `default_external_agent`. Neither
+    // may fail the parse: `load_from_file` is fatal at boot AND runs
+    // before every subcommand, so a strict decode would leave `baybo
+    // config unset` unable to repair what it rejected.
+    let c = BayboConfig::load_from_str(
+        r#"{
+            "llm": [],
+            "external_agents": {
+                "claude": {"enabled": true},
+                "codex": {"enabled": true},
+                "gemini": {"enabled": true, "binary_path": "/usr/bin/gemini"},
+                "default_external_agent": "gemini"
+            }
+        }"#,
+    )
+    .expect("retired keys must be ignored, not fatal");
+    assert_eq!(
+        c.external_agents.enabled_kinds(),
+        vec![ExternalAgentKind::Claude, ExternalAgentKind::Codex],
+    );
 }
 
 #[test]

@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 
 pub mod claude_cli;
 pub mod codex_cli;
-pub mod gemini_cli;
 mod probe;
 
 pub type Result<T> = std::result::Result<T, ExternalAgentError>;
@@ -132,12 +131,14 @@ impl ExternalAgentRegistry {
     }
 }
 
-/// Probe + register every entry marked `enabled = true`. Disabled
-/// kinds are skipped silently; probe failure on an enabled kind logs
-/// `warn!` and continues (operator misconfiguration doesn't block
-/// boot). Adding a new `ExternalAgentKind` only requires extending
-/// the inner match here — boot paths just pass through their per-
-/// kind config (see `baybo_config::ExternalAgentsConfig::boot_entries`).
+/// Probe + register every entry marked `enabled = true` — which is
+/// every kind by default, so in practice this registers whichever of
+/// `claude` / `codex` is actually installed on the host. Disabled
+/// kinds are skipped silently; a missing binary logs `debug!` and a
+/// present-but-broken one logs `warn!`, neither blocking boot.
+/// Adding a new `ExternalAgentKind` only requires extending the inner
+/// match here — boot paths just pass through their per-kind config
+/// (see `baybo_config::ExternalAgentsConfig::boot_entries`).
 ///
 /// Tuple form `(kind, enabled, binary_path)` is the lingua franca
 /// between this crate and `baybo-config` since the two don't depend on
@@ -167,15 +168,25 @@ where
                 codex_cli::CodexCliAgent::probe_and_build(binary_path, proxy.clone())
                     .map(|a| a as Arc<dyn ExternalAgent>)
             }
-            ExternalAgentKind::Gemini => {
-                gemini_cli::GeminiCliAgent::probe_and_build(binary_path, proxy.clone())
-                    .map(|a| a as Arc<dyn ExternalAgent>)
-            }
         };
         match result {
             Ok(agent) => {
                 tracing::info!(kind = kind.as_str(), "external agent registered");
                 registry.register(agent);
+            }
+            // Enabled-by-default means every boot probes every kind, so
+            // a bare "this host doesn't have that CLI" is the ordinary
+            // case on most machines, not a misconfiguration to shout
+            // about. A configured `binary_path` that has gone stale is
+            // the opposite — the operator pointed at something and it
+            // moved — and shares the same error variant, so it keeps
+            // the warning.
+            Err(ExternalAgentError::NotInstalled(reason)) if binary_path.is_none() => {
+                tracing::debug!(
+                    kind = kind.as_str(),
+                    reason = %reason,
+                    "external agent binary not found on PATH; not registered",
+                );
             }
             Err(e) => {
                 tracing::warn!(

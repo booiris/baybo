@@ -4,16 +4,14 @@
 
 An **external agent** is a subagent backend whose work is delegated to a
 subprocess (or other out-of-process driver) instead of running on an
-in-process baybo `AgentActor`. Three are registered today:
+in-process baybo `AgentActor`. Two are registered today:
 
 - **`claude`** drives `claude` (Anthropic Claude Code) — billed
   against the operator's Claude Code Max/Pro subscription.
 - **`codex`** drives `codex` (OpenAI Codex CLI) — billed against the
   operator's ChatGPT subscription.
-- **`gemini`** drives `gemini` (Google Gemini CLI) — billed against
-  the operator's Google account / Gemini API key.
 
-All three let an baybo subagent's task be handled by the external
+Both let an baybo subagent's task be handled by the external
 agent's own autonomous loop without spending baybo's own per-token API
 credit.
 
@@ -41,7 +39,7 @@ different flavor of LLM:
   Baybo backend's model choice travels separately as
   `SubagentSpawnRequest.model_tier`.
 - `baybo_model::ExternalAgentKind` — discriminator enum: `Claude`,
-  `Codex`, `Gemini`. Carried on `SubagentBackendTag::External {
+  `Codex`. Carried on `SubagentBackendTag::External {
   external_kind, workspace_dir, resume_key }`.
 - `baybo_model::SubagentBackendKind` — discriminator-only view of
   `SubagentBackendTag` for runtime decisions that don't care about
@@ -70,7 +68,7 @@ spawn_subagent({
   "prompt": "self-contained brief",   // the child's first user message
 
   // Backend selection:
-  "backend": "claude",       // or "codex" | "gemini" | "baybo" (default)
+  "backend": "claude",       // or "codex" | "baybo" (default)
   "model_tier": "lite",      // baybo backend only; lite|balanced|deep
 
   // Optional:
@@ -164,11 +162,6 @@ the child session's transcript looks like a normal agent loop:
   are codex-prefixed (`codex_shell`, `codex_file_change`) so a reader
   cannot mistake them for baybo-routed tool invocations — these
   bypass baybo's sandbox + approval gate by design.
-- gemini: assistant `message` deltas → accumulated into one
-  `Assistant Text` per run; `tool_use` / `tool_result` events emit a
-  paired `Assistant ToolUse` + `Tool ToolResult` linked by `tool_id`,
-  with tool names `gemini_`-prefixed for the same reason as codex's.
-
 `FinalContent` duplicates the last assistant text, so the consumer
 treats it as a result signal only and does not double-write.
 
@@ -193,7 +186,7 @@ analytics with calls baybo never made. The persisted
 renders it in place of a step tree.
 
 **The wire says so explicitly.** `GET /v1/traces/{session_id}` carries
-`external_agent` (`"claude" | "codex" | "gemini"`, absent otherwise)
+`external_agent` (`"claude" | "codex"`, absent otherwise)
 and `subagent_type`, projected from the durable
 `SessionState.subagent_backend` tag by
 `QueryApi::subagent_backend_of`. Only the discriminator and the
@@ -277,26 +270,46 @@ manually.
 ```jsonc
 "external_agents": {
   "claude": {
-    "enabled": false,        // operator must opt in explicitly
+    "enabled": true,         // the default — see below
     "binary_path": null      // null falls back to PATH lookup
   }
 }
 ```
 
-External agents are **disabled by default** even when their binary
-is installed on `PATH`. A claude/codex binary alone is not the
-trust signal — the operator must set `enabled: true` (via
-`baybo external-agent setup`, `baybo setup`, or by editing
-`baybo.json`) to make the LLM able to invoke that backend.
+External agents are **enabled by default**. Installing `claude` on the
+host is the opt-in: boot probes `PATH` and registers the backend when
+the binary is actually there, so a machine that has Claude Code can
+delegate to it with no configuration step. On a machine without it,
+the enabled flag costs nothing — the probe simply finds nothing and
+the backend goes unregistered.
+
+Set `enabled: false` (via `baybo external-agent disable` or by editing
+`baybo.json`) to withhold a backend that *is* installed. That is the
+knob to reach for given what these agents do: claude runs with
+`--permission-mode bypassPermissions` and codex with
+`--dangerously-bypass-approvals-and-sandbox`, so their internal tool
+calls bypass baybo's sandbox / `sensitive_paths` / approval gate
+entirely (see the security note above).
 
 At boot, when `enabled: true`, `ClaudeCliAgent::probe_and_build`
 resolves the binary, runs `claude --version` (with an ETXTBSY retry
-for editor-just-wrote races), and registers the agent on success.
-Probe failure on an enabled kind logs `warn!` but does NOT block
-boot — any `spawn_subagent(backend: "claude")` call gets a clear
-"not registered" error until the binary is in place. When
-`enabled: false`, boot doesn't probe at all and `binary_path` is
-ignored.
+for editor-just-wrote races), and registers the agent on success. A
+binary that simply isn't installed logs `debug!` — the ordinary case
+on most hosts. A binary that is present but unusable (wrong arch,
+non-zero `--version`), or a configured `binary_path` that has gone
+stale, logs `warn!`. Neither blocks boot; a
+`spawn_subagent(backend: "claude")` call gets an
+`is not registered: no \`claude\` binary was found on this host's PATH
+at startup, or it is disabled in \`external_agents.claude.enabled\``
+error until it's resolved, and `baybo external-agent status` re-probes
+offline to report the concrete reason. When `enabled: false`, boot
+doesn't probe at all and `binary_path` is ignored.
+
+`binary_path` matters because the gateway service can run with a
+different cwd and a narrower `PATH` than the operator's shell.
+`baybo setup` / `baybo external-agent setup` record the **resolved
+absolute path** they probed, so boot pins that exact binary instead of
+re-walking `PATH`.
 
 ## codex — invocation
 
@@ -355,97 +368,15 @@ as equivalent to running `codex exec ...` in a shell on the host.
 ```jsonc
 "external_agents": {
   "codex": {
-    "enabled": false,        // operator must opt in explicitly
+    "enabled": true,         // the default
     "binary_path": null      // null falls back to PATH lookup
   }
 }
 ```
 
-Same opt-in model as claude — `enabled: false` (the default)
-means boot skips this kind entirely.
-
-## gemini — invocation
-
-Same shape as claude/codex, a third wire protocol. Built on
-`gemini --output-format stream-json` (the Google Gemini CLI's
-non-interactive line-delimited-JSON mode).
-
-```
-gemini --output-format stream-json
-       --yolo
-       --skip-trust
-       [--model <name>]
-       [--resume <session_id>]
-       -p "<prompt>"
-```
-
-Event mapping (vs claude's `stream-json` / codex's JSONL):
-- `{"type":"init","session_id":…}` → emit `ResumeKey(session_id)` on a
-  fresh session (gemini calls its session uuid a `session_id`, like
-  claude).
-- `{"type":"message","role":"assistant","content":…,"delta":true}` →
-  assistant text arrives as incremental deltas, so they're
-  **accumulated** (claude/codex send whole turns). Consecutive deltas
-  are grouped into one `Intermediate(Assistant text)` row, flushed when
-  a tool event interrupts or at stream end, so a token-streamed answer
-  doesn't fragment the transcript.
-- `{"type":"message","role":"user",…}` → the prompt echo; skipped (the
-  spawn router already persisted the task).
-- `{"type":"tool_use","tool_name":…,"tool_id":…,"parameters":…}` →
-  `Intermediate(Assistant ToolUse)`, name prefixed `gemini_` so a
-  transcript reader can't confuse it with an baybo-audited tool call.
-- `{"type":"tool_result","tool_id":…,"status":…,"output":…}` →
-  `Intermediate(Tool ToolResult)`, linked by `tool_id`. Output may be
-  absent; the status string stands in.
-- `{"type":"result","status":"success","stats":{…}}` → emit `Usage` +
-  `FinalContent`. The result event carries **no** final answer text —
-  `FinalContent` is the accumulated assistant deltas.
-- `{"type":"result","status":"error","error":{message}}` → terminal
-  error.
-- Unknown event kinds are ignored.
-
-Differences from claude/codex that matter:
-- **Prompt is the `-p <prompt>` flag**, a single argv value (not stdin
-  like claude, not a positional after `--` like codex).
-- **`--skip-trust` is required alongside `--yolo`.** In an untrusted
-  folder gemini silently downgrades `--yolo` to interactive approval —
-  which a non-TTY subprocess can never satisfy, so the run hangs.
-  `--skip-trust` trusts the workspace cwd so YOLO actually takes.
-- **`stats.input_tokens` is the TOTAL prompt; `stats.cached` is a
-  subset** (OpenAI/Gemini convention) — passed through, not folded
-  like claude's disjoint cache buckets.
-- **Resume takes the session uuid directly** (`--resume <session_id>`),
-  same as claude's `--resume`.
-
-Security: `--yolo --skip-trust` is hardcoded for the same reason
-claude's `bypassPermissions` / codex's
-`--dangerously-bypass-approvals-and-sandbox` are — a non-TTY
-subprocess can't show the interactive approval UI. The workspace cwd
-pins gemini's default working area but does not constrain its
-absolute-path reach. Treat `spawn_subagent(backend: "gemini", ...)` as
-equivalent to running `gemini --yolo ...` in a shell on the host.
-
-## gemini — config
-
-```jsonc
-"external_agents": {
-  "gemini": {
-    "enabled": false,        // operator must opt in explicitly
-    "binary_path": null      // null falls back to PATH lookup
-  }
-}
-```
-
-Same opt-in model as claude/codex — `enabled: false` (the default)
-means boot skips this kind entirely.
-
-## Picking a default
-
-When multiple external agents are **enabled**,
-`external_agents.default_external_agent` must be set to one of them.
-Today this is an operator-visible designation — the spawn protocol
-still requires an explicit `backend` value — but a future shorthand
-may resolve it.
+Same model as claude — enabled by default, registered only when the
+`codex` binary is actually on `PATH`, and `enabled: false` makes boot
+skip the kind entirely.
 
 ## CLI commands
 
@@ -459,32 +390,24 @@ may resolve it.
   `external_agents.<kind>.binary_path` on success. Even an empty
   answer records the concrete location PATH resolved to, so the
   gateway service (different cwd, possibly a narrower PATH) pins
-  the same binary instead of re-walking PATH at boot. If the write
-  would leave multiple kinds configured without a default, the
-  wizard also prompts for `default_external_agent`. Requires a
+  the same binary instead of re-walking PATH at boot. Requires a
   gateway restart to take effect (the command prints a restart hint;
   it does not restart the gateway itself).
 - `baybo external-agent disable` — interactive multi-select: check the
   currently-enabled kinds to turn off and set each
-  `external_agents.<kind>.enabled = false`. If a disabled kind was
-  `default_external_agent`, the default is re-resolved (cleared when
-  ≤1 kind remains, else the wizard prompts for a new one). Each
-  recorded `binary_path` is left intact for an easy re-enable. When
-  nothing is enabled it's a no-op success — the feature is already
-  off. Requires a gateway restart to take effect (the command prints
-  a restart hint; it does not restart the gateway itself).
-- `baybo external-agent default` — interactive picker that sets
-  `external_agents.default_external_agent` to one of the
-  currently-enabled kinds. Errors when nothing is enabled. The
-  default is an operator-facing designation (the spawn protocol
-  still requires an explicit `backend`), so it only matters once
-  more than one kind is enabled; nothing in the boot/spawn path
-  reads it yet, so **no gateway restart** is needed.
+  `external_agents.<kind>.enabled = false`. Since every kind ships
+  enabled, this is *the* way to withhold a backend that is installed.
+  Each recorded `binary_path` is left intact for an easy re-enable.
+  When nothing is enabled it's a no-op success — the feature is
+  already off. Requires a gateway restart to take effect (the command
+  prints a restart hint; it does not restart the gateway itself).
 - `baybo setup` (quick and full modes) probes every kind on PATH
   after the other setup steps and shows the detected ones in a single
-  multi-select (already-enabled kinds pre-checked; on a fresh install
-  everything detected is pre-checked). If multiple end up enabled,
-  prompts for `default_external_agent` automatically.
+  multi-select, pre-checked to their current `enabled` state — which
+  on a fresh install means every detected kind is checked. Unchecking
+  one is how the operator withholds an installed backend. Each kind
+  left checked has its **resolved absolute path** recorded to
+  `external_agents.<kind>.binary_path`.
 
 ## Adding a new external agent
 
@@ -494,7 +417,7 @@ may resolve it.
    underlying tool supports continuation; otherwise just emit
    `FinalContent` (and a parent-side `resume_session_id` for that
    agent will return "doesn't support resume").
-3. Add a config struct field in
+3. Add a config struct field (with an `enabled: true` `Default` impl) in
    `crates/config/src/external_agents.rs` and extend `boot_entries()`
    (required — boot only probes config-backed kinds).
 4. Extend the `match kind` in `build_registry`
