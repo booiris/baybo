@@ -77,9 +77,18 @@ A block's `path` is where that file lives now. Any other path the prompt above g
 
 /// Appended to [`FRAMING_BODY`] only when a [`UpdateBlock::Diff`] is actually
 /// present, so an update made only of full bodies is unchanged by this
-/// existing. States the one thing the attribute alone cannot: that an unmarked
-/// block is a whole-part replacement rather than a diff with no markers.
-const DIFF_FRAMING: &str = r#"A block marked `diff` is a unified diff against the copy in the system prompt above — `-` lines are gone, `+` lines are current, the rest is context. An unmarked block is that part's full current text."#;
+/// existing.
+///
+/// Both halves say something the model cannot get anywhere else. Which copy
+/// the diff is against is a fact about this system, not about diffs. And an
+/// *unmarked* block being a whole-part replacement is the one thing the
+/// attribute alone cannot state — without it, a full body reads as a diff that
+/// happens to carry no markers.
+///
+/// What `-` and `+` mean is deliberately absent: unified diff is not a format
+/// a model has to be taught, and glossing it is the one part of this paragraph
+/// that every request would pay for and none would use.
+const DIFF_FRAMING: &str = r#"A block marked `diff` is a unified diff against the copy in the system prompt above. An unmarked block is that part's full current text."#;
 
 /// Attribute marking a diff whose baseline is the copy the model wrote itself
 /// rather than the one the leading row carries. Rides alongside [`DIFF_ATTR`],
@@ -93,11 +102,10 @@ const SINCE_YOUR_WRITE_ATTR: &str = "changed_since_you_wrote_it";
 /// unambiguous the moment the conversation holds two of them — the system
 /// prompt's and the model's own tool call. It also states the fact the block
 /// exists to report: the model's write stood, and then somebody else wrote over
-/// part of it. And it glosses `-`/`+` itself rather than leaning on
-/// [`DIFF_FRAMING`], which is absent whenever this is the only kind of diff in
-/// the update — the misreading it guards against is a `-` line being taken for
-/// literal content of a file that describes the model to itself.
-const SINCE_YOUR_WRITE_FRAMING: &str = r#"A block marked `changed_since_you_wrote_it` is a unified diff — `-` gone, `+` current — against the copy YOU wrote earlier in this conversation, not the older one in the system prompt above. Something else has written to that file since."#;
+/// part of it. It says neither of the things [`DIFF_FRAMING`] says, and does
+/// not need that paragraph present: which copy is the baseline is exactly what
+/// it is here to state, and a block reaching this variant is never unmarked.
+const SINCE_YOUR_WRITE_FRAMING: &str = r#"A block marked `changed_since_you_wrote_it` is a unified diff against the copy YOU wrote earlier in this conversation, not the older one in the system prompt above. Something else has written to that file since."#;
 
 /// Body used when the sources have come back into agreement with the leading
 /// system row — a source that moved and then moved back. Nothing differs any
