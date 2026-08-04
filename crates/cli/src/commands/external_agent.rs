@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use baybo_agent::external_agent::{
     ExternalAgentError, claude_cli::ClaudeCliAgent, codex_cli::CodexCliAgent,
-    gemini_cli::GeminiCliAgent,
 };
 use baybo_config::BayboConfig;
 use baybo_model::ExternalAgentKind;
@@ -25,17 +24,14 @@ pub async fn handle(ctx: &CommandContext, cmd: ExternalAgentCmd) -> Result<Comma
         ExternalAgentCmd::Status => status(ctx),
         ExternalAgentCmd::Setup => setup(ctx).await,
         ExternalAgentCmd::Disable => disable(ctx).await,
-        ExternalAgentCmd::Default => set_default(ctx).await,
     }
 }
 
 fn status(ctx: &CommandContext) -> Result<CommandOutput> {
     let mut human = String::new();
     let mut data: Vec<Value> = Vec::new();
-    let default = ctx.config.external_agents.default_external_agent;
     for kind in ExternalAgentKind::ALL.iter().copied() {
         let row = describe_kind(ctx, kind);
-        let marker = if default == Some(kind) { "*" } else { " " };
         let enabled_label = if row.enabled { "enabled" } else { "DISABLED" };
         let probe_label = match &row.probe {
             ProbeOutcome::Ok { resolved_path } => format!("ok ({resolved_path})"),
@@ -47,7 +43,7 @@ fn status(ctx: &CommandContext) -> Result<CommandOutput> {
             .clone()
             .unwrap_or_else(|| "(PATH lookup)".to_string());
         human.push_str(&format!(
-            "{marker} {kind} :: {enabled_label}  binary_path={path_label}  probe={probe_label}\n",
+            "{kind} :: {enabled_label}  binary_path={path_label}  probe={probe_label}\n",
             kind = kind.as_str(),
         ));
         data.push(json!({
@@ -61,14 +57,12 @@ fn status(ctx: &CommandContext) -> Result<CommandOutput> {
                 ProbeOutcome::NotInstalled => json!({"status": "not_installed"}),
                 ProbeOutcome::Failed(msg) => json!({"status": "failed", "error": msg}),
             },
-            "is_default": default == Some(kind),
         }));
     }
     Ok(CommandOutput {
         human: human.trim_end().to_string(),
         data: Some(json!({
             "external_agents": data,
-            "default_external_agent": default.map(|k| k.as_str()),
         })),
     })
 }
@@ -119,28 +113,6 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             new_config.external_agents.codex.enabled = true;
             new_config.external_agents.codex.binary_path = Some(binary_path.clone());
         }
-        ExternalAgentKind::Gemini => {
-            new_config.external_agents.gemini.enabled = true;
-            new_config.external_agents.gemini.binary_path = Some(binary_path.clone());
-        }
-    }
-
-    // If multiple kinds are enabled after this write and no default
-    // is set, require the operator to pick one.
-    let enabled = new_config.external_agents.enabled_kinds();
-    if enabled.len() > 1
-        && new_config
-            .external_agents
-            .default_external_agent
-            .filter(|d| enabled.contains(d))
-            .is_none()
-    {
-        let default_labels: Vec<&str> = enabled.iter().map(|k| k.display_name()).collect();
-        let default_idx = select_one(
-            "Multiple external agents are now enabled; pick the default:",
-            &default_labels,
-        )?;
-        new_config.external_agents.default_external_agent = Some(enabled[default_idx]);
     }
 
     new_config
@@ -152,9 +124,6 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         "set up external agent {} :: binary_path={binary_path}\n",
         kind.as_str(),
     );
-    if let Some(d) = new_config.external_agents.default_external_agent {
-        human.push_str(&format!("default_external_agent={}\n", d.as_str()));
-    }
     human.push_str(RESTART_HINT);
 
     Ok(CommandOutput {
@@ -162,10 +131,6 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         data: Some(json!({
             "kind": kind.as_str(),
             "binary_path": binary_path,
-            "default_external_agent": new_config
-                .external_agents
-                .default_external_agent
-                .map(|k| k.as_str()),
             "requires_restart": true,
         })),
     })
@@ -201,32 +166,7 @@ async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
         match kind {
             ExternalAgentKind::Claude => new_config.external_agents.claude.enabled = false,
             ExternalAgentKind::Codex => new_config.external_agents.codex.enabled = false,
-            ExternalAgentKind::Gemini => new_config.external_agents.gemini.enabled = false,
         }
-    }
-
-    // Turning off the kind the default pointed at would leave a
-    // dangling `default_external_agent`. Re-resolve: drop it when ≤1
-    // kind remains (a sole survivor is the implicit default), else make
-    // the operator pick among the survivors so validation passes.
-    let remaining = new_config.external_agents.enabled_kinds();
-    if new_config
-        .external_agents
-        .default_external_agent
-        .is_some_and(|d| !remaining.contains(&d))
-    {
-        new_config.external_agents.default_external_agent = match remaining.as_slice() {
-            [] => None,
-            [only] => Some(*only),
-            many => {
-                let default_labels: Vec<&str> = many.iter().map(|k| k.display_name()).collect();
-                let default_idx = select_one(
-                    "Multiple external agents remain enabled; pick the default:",
-                    &default_labels,
-                )?;
-                Some(many[default_idx])
-            }
-        };
     }
 
     new_config
@@ -236,60 +176,13 @@ async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
 
     let disabled: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
     let mut human = format!("disabled external agent(s): {}\n", disabled.join(", "));
-    if let Some(d) = new_config.external_agents.default_external_agent {
-        human.push_str(&format!("default_external_agent={}\n", d.as_str()));
-    }
     human.push_str(RESTART_HINT);
 
     Ok(CommandOutput {
         human,
         data: Some(json!({
             "disabled": disabled,
-            "default_external_agent": new_config
-                .external_agents
-                .default_external_agent
-                .map(|k| k.as_str()),
             "requires_restart": true,
-        })),
-    })
-}
-
-async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
-    require_tty()?;
-    let target = resolve_target_path(ctx)?;
-
-    let enabled = ctx.config.external_agents.enabled_kinds();
-    if enabled.is_empty() {
-        return Err(CliError::Config(
-            "no external agents are enabled; run `baybo external-agent setup` first".into(),
-        ));
-    }
-
-    let labels: Vec<&str> = enabled.iter().map(|k| k.display_name()).collect();
-    let idx = select_one("Set the default external agent to:", &labels)?;
-    let kind = enabled[idx];
-
-    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
-    new_config.external_agents.default_external_agent = Some(kind);
-    new_config
-        .validate()
-        .map_err(|e| CliError::Config(format!("config validation failed: {e}")))?;
-    new_config.write_to_file(&target).await?;
-
-    // No RESTART_HINT: `default_external_agent` is an operator-facing
-    // designation that nothing in the boot/spawn path reads today (it
-    // keys on `enabled` + `binary_path`), so a running gateway needs no
-    // restart to honor the new default.
-    Ok(CommandOutput {
-        human: format!(
-            "default_external_agent = {} (wrote {})",
-            kind.as_str(),
-            target.display(),
-        ),
-        data: Some(json!({
-            "default_external_agent": kind.as_str(),
-            "written_to": target.display().to_string(),
-            "requires_restart": false,
         })),
     })
 }
@@ -315,10 +208,6 @@ fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
         ExternalAgentKind::Codex => (
             ctx.config.external_agents.codex.enabled,
             ctx.config.external_agents.codex.binary_path.clone(),
-        ),
-        ExternalAgentKind::Gemini => (
-            ctx.config.external_agents.gemini.enabled,
-            ctx.config.external_agents.gemini.binary_path.clone(),
         ),
     };
     let probe = match probe(kind, configured_path.as_deref()) {
@@ -348,10 +237,6 @@ fn probe(
         }
         ExternalAgentKind::Codex => {
             let agent = CodexCliAgent::probe_and_build(binary_path, None)?;
-            Ok(agent.binary_path().display().to_string())
-        }
-        ExternalAgentKind::Gemini => {
-            let agent = GeminiCliAgent::probe_and_build(binary_path, None)?;
             Ok(agent.binary_path().display().to_string())
         }
     }

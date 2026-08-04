@@ -47,7 +47,7 @@ The tool is registered by the runtime wiring code (`crates/baybo/src/runtime.rs`
 
 **Tool parameters** (`subagent_type`, `description`, `prompt` required):
 
-- `backend` — `"baybo"` (default, full in-process baybo agent) or `"claude"` / `"codex"` / `"gemini"` (one-shot external CLI backends; see [`../external-agents.md`](../external-agents.md)). Parsed via `SubagentBackend` / `ExternalAgentKind`.
+- `backend` — `"baybo"` (default, full in-process baybo agent) or `"claude"` / `"codex"` (one-shot external CLI backends; see [`../external-agents.md`](../external-agents.md)). Parsed via `SubagentBackend` / `ExternalAgentKind`.
 - `model_tier` — `lite` / `balanced` / `deep` (`fast` is still accepted as the pre-rename spelling of `lite`); precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="baybo"`.
 - `background` — when `true`, returns a dispatch ack immediately and surfaces the child's final result as an out-of-band notification on the parent's next turn.
 - `on_timeout` — `"background"` (default) or `"kill"`: what to do when a foreground spawn is still running after the fixed 2-minute foreground wait (`SUBAGENT_FOREGROUND_WAIT`). `background` detaches it (handle now, notification on terminal); `kill` cancels it. Ignored when `background=true`, and on a turn that is not `background_eligible` (see [`agent.md`](agent.md) → *Background jobs*) — there the spawn blocks until the child is terminal, with no foreground-wait timer at all. Parsed via `OnTimeout`.
@@ -85,4 +85,4 @@ Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) a
 | `session` | `SessionManager` backs the lineage walk that powers the depth cap |
 | `workspace` | `WorkspacePaths::agents_dir()` resolves the `<workspace>/agents/` profile directory (a standalone git repo, created and `git init`-ed by `ensure_layout`) |
 
-External (`claude` / `codex` / `gemini`) subagent backends are documented in [`../external-agents.md`](../external-agents.md).
+External (`claude` / `codex`) subagent backends are documented in [`../external-agents.md`](../external-agents.md).

@@ -181,7 +181,6 @@ export function externalAgentLabel(kind: ExternalAgentKind): string {
 const EXTERNAL_AGENT_LABELS: Partial<Record<string, string>> = {
   claude: 'Claude Code',
   codex: 'Codex',
-  gemini: 'Gemini',
 };
 
 /** The tool name a span calls, when it is a tool call. */

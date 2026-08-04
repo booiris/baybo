@@ -267,7 +267,7 @@ describe('turnLabels', () => {
 //
 // Source of truth: `TraceOverview.external_agent` (see the doc comment on
 // `crates/gateway/src/api/admin/traces.rs`) — a session whose work ran on a
-// claude/codex/gemini binary records NO step/span tree, ever, so its
+// claude/codex binary records NO step/span tree, ever, so its
 // `session_messages` transcript IS its trace and the middle pane renders that
 // instead of a step tree.
 
@@ -314,7 +314,7 @@ describe('isExternalAgentTurn (session-level external_agent marker)', () => {
 
   it('keeps flagging terminal zero-step turns, for every backend', () => {
     expect(isExternalAgentTurn(empty, 'completed', 'codex')).toBe(true);
-    expect(isExternalAgentTurn(empty, 'failed', 'gemini')).toBe(true);
+    expect(isExternalAgentTurn(empty, 'failed', 'codex')).toBe(true);
     expect(isExternalAgentTurn(empty, 'cancelled', 'claude')).toBe(true);
   });
 

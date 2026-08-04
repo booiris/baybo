@@ -101,7 +101,7 @@ struct SpawnParams {
     description: String,
     /// Self-contained brief the child sees as its first user message.
     prompt: String,
-    /// `"baybo"` (default), `"claude"`, `"codex"`, or `"gemini"`.
+    /// `"baybo"` (default), `"claude"`, or `"codex"`.
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -481,12 +481,12 @@ fn parameters_schema() -> Value {
             },
             "backend": {
                 "type": "string",
-                "enum": ["baybo", "claude", "codex", "gemini"],
-                "description": "Backend that runs the subagent. 'baybo' (default) spawns a full in-process baybo agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI; 'gemini' delegates to Google's gemini CLI — these three are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not baybo) to drive."
+                "enum": ["baybo", "claude", "codex"],
+                "description": "Backend that runs the subagent. 'baybo' (default) spawns a full in-process baybo agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess and 'codex' to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not baybo) to drive. Each is available only when its CLI is installed on this host; a call naming a missing one fails with a clear error."
             },
             "background": {
                 "type": "boolean",
-                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex/gemini) runs."
+                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex) runs."
             },
             "on_timeout": {
                 "type": "string",

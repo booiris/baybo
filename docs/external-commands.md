@@ -18,7 +18,7 @@ task containers) provide or skip each one.
 | `uv` | Optional | `baybo-tools` (`bash/mod.rs` prewarm) | Python tool prewarm / the uv shim. Non-fatal if absent (a startup `WARN`). |
 | `bun` | Required **for channel sidecars and deck card services** | `baybo-gateway` (sidecar supervisor) + `baybo-setup` (channel registration flow) + `baybo-deck` (`service.rs`) — all honoring the one `BAYBO_BUN_BIN` override | Runs the bundled JS channel sidecars (Telegram/Discord/…) and every enabled deck card's resident service (one bun child per card, run directly on the host — like the sidecars, inheriting the login `PATH` — spawned at gateway boot and per install dry-run). Only when those channels are configured / any deck card is installed. |
 | `node` | Required **for embedded MCP / tool sidecars** (e.g. the browser sidecar) | `baybo-gateway` (`sidecar/embedded_mcp.rs`) | Runs embedded MCP-server sidecar bundles (`node <bundle.mjs>`); resolved from `PATH`, overridable via `BAYBO_NODE_BIN`. Only when a tool-sidecar domain (e.g. `browser.enable`) is configured. |
-| `claude` / `codex` / `gemini` | Optional | `baybo-agent` external-agent delegation | Only when an external agent is configured. |
+| `claude` / `codex` | Optional | `baybo-agent` external-agent delegation | Probed on `PATH` at boot; registered only when installed. |
 | *(per-skill binaries)* | Per-skill | `baybo-skills` (`registry.rs`) | A skill manifest may declare any required binary; checked at load. |
 
 Build/test-only (not runtime): `cargo`, `pnpm` (web build), `musl-gcc` (bench

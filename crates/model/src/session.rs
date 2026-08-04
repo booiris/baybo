@@ -349,7 +349,20 @@ pub struct SessionState {
     /// External) the agent's `workspace_dir` and `resume_key`.
     /// `None` for non-subagent sessions (top-level user, cron) and
     /// for pre-tag subagent rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Decoded leniently: a tag this build can't parse — a row written
+    /// by a build whose `ExternalAgentKind` had a variant since retired
+    /// (e.g. `gemini`) — degrades to `None`, the same state a pre-tag
+    /// row already has. Strict decoding would fail the whole `Session`,
+    /// which means the row is dropped from listings and `get()` errors:
+    /// a user-facing conversation and its transcript would effectively
+    /// disappear, which CLAUDE.md forbids. Degrading costs only resume
+    /// (an untagged session is refused with "spawn fresh").
+    #[serde(
+        default,
+        deserialize_with = "lenient_subagent_backend",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subagent_backend: Option<crate::SubagentBackendTag>,
 
     /// `subagent_type` (profile name) this subagent session was spawned
@@ -426,6 +439,35 @@ impl SessionState {
         self.agent_id
             .clone()
             .unwrap_or_else(AgentProfileId::builtin)
+    }
+}
+
+/// Decode `subagent_backend` without ever failing the enclosing
+/// `Session`. See the field's docstring for why a stricter decode is
+/// not an option here.
+///
+/// Buffering through `Value` first is what makes the fallback possible:
+/// a failed `from_value` leaves the outer deserializer's position
+/// untouched, so `None` is a safe answer. This is JSON-only, which
+/// matches how sessions are actually persisted (`sessions.data`).
+fn lenient_subagent_backend<'de, D>(de: D) -> Result<Option<crate::SubagentBackendTag>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(de)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match serde_json::from_value::<crate::SubagentBackendTag>(raw) {
+        Ok(tag) => Ok(Some(tag)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "unreadable session subagent_backend tag; treating the session as untagged \
+                 (its transcript is unaffected, but it cannot be resumed as a subagent)",
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -986,5 +1028,60 @@ mod tests {
             !s.contains("last_llm"),
             "unset last_llm must not serialize: {s}"
         );
+    }
+}
+
+#[cfg(test)]
+mod subagent_backend_decode_tests {
+    use super::*;
+
+    /// A session row written by a build whose `ExternalAgentKind` had a
+    /// variant this build has retired must still load. Strict decoding
+    /// would fail the whole `Session`, which makes the storage layer
+    /// drop the row from listings and error on `get()` — a user-facing
+    /// conversation and its transcript vanishing, which CLAUDE.md
+    /// forbids outright.
+    #[test]
+    fn retired_external_kind_degrades_to_untagged_instead_of_failing() {
+        let json = r#"{
+            "subagent_backend": {
+                "kind": "external",
+                "external_kind": "gemini",
+                "workspace_dir": "w1",
+                "resume_key": "rk1"
+            }
+        }"#;
+        let state: SessionState =
+            serde_json::from_str(json).expect("a retired backend kind must not fail the row");
+        assert!(state.subagent_backend.is_none());
+    }
+
+    #[test]
+    fn known_backend_tags_still_round_trip() {
+        for (json, expected) in [
+            (
+                r#"{"subagent_backend":{"kind":"baybo"}}"#,
+                crate::SubagentBackendTag::Baybo,
+            ),
+            (
+                r#"{"subagent_backend":{"kind":"external","external_kind":"codex","workspace_dir":"w"}}"#,
+                crate::SubagentBackendTag::External {
+                    external_kind: crate::ExternalAgentKind::Codex,
+                    workspace_dir: "w".into(),
+                    resume_key: None,
+                },
+            ),
+        ] {
+            let state: SessionState = serde_json::from_str(json).expect("parses");
+            assert_eq!(state.subagent_backend, Some(expected));
+        }
+    }
+
+    #[test]
+    fn absent_and_null_tags_are_both_none() {
+        for json in [r#"{}"#, r#"{"subagent_backend":null}"#] {
+            let state: SessionState = serde_json::from_str(json).expect("parses");
+            assert!(state.subagent_backend.is_none(), "for {json}");
+        }
     }
 }

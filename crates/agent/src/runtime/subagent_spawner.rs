@@ -421,7 +421,12 @@ impl ActorSubagentSpawner {
         let fan_out_root = request.fan_out_root.clone();
         let Some(agent) = self.external_agents.get(kind) else {
             let _ = result_tx.send(SubagentResult::failed(format!(
-                "external agent {:?} is not registered (check `baybo external-agent` config + boot logs)",
+                "external agent {:?} is not registered: no `{}` binary was found on this host's \
+                 PATH at startup, or it is disabled in `external_agents.{}.enabled`. Install it \
+                 (restart baybo if you just did) or use backend='baybo'. \
+                 `baybo external-agent status` re-probes and reports the reason.",
+                kind.as_str(),
+                kind.binary_name(),
                 kind.as_str(),
             )));
             self.release_fan_out_slot(&fan_out_root);

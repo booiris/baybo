@@ -8,61 +8,70 @@ use serde::{Deserialize, Serialize};
 pub struct ExternalAgentsConfig {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
-    pub gemini: GeminiConfig,
-    /// Which kind to treat as the operator's primary when multiple
-    /// external agents are configured. Only meaningful (and only
-    /// validated) when more than one kind has a non-default config;
-    /// today nothing in the spawn protocol reads it — it's an
-    /// operator-visible designation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_external_agent: Option<ExternalAgentKind>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Default for both per-kind `enabled` flags. Boot probes each kind on
+/// `PATH` and registers only the ones actually installed, so leaving
+/// this on costs nothing on a host without the binary — it just means
+/// a machine that *does* have `claude` / `codex` can delegate to them
+/// out of the box.
+const ENABLED_BY_DEFAULT: bool = true;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
-    /// Whether boot should probe + register this agent. Default
-    /// `false` is the trust signal: an installed `claude` on PATH
-    /// does NOT auto-grant the LLM access to a host-execution
-    /// channel — the operator must opt in explicitly (via
-    /// `baybo external-agent setup`, `baybo setup`, or by editing
-    /// `baybo.json`).
+    /// Whether boot should probe + register this agent. Defaults to
+    /// `true`: installing `claude` on the host is the opt-in, and on a
+    /// host without it the flag grants nothing because the PATH probe
+    /// finds nothing to register.
+    ///
+    /// Set `false` (or run `baybo external-agent disable`) to withhold
+    /// a backend that *is* installed — worth knowing that an external
+    /// agent runs its own tool loop with approvals bypassed (`claude
+    /// --permission-mode bypassPermissions`), so it does NOT go through
+    /// baybo's sandbox / `sensitive_paths` / approval gate.
     pub enabled: bool,
     /// Path to the `claude` binary. `None` falls back to `PATH`
-    /// lookup. Only consulted when `enabled = true`.
+    /// lookup. `baybo setup` / `baybo external-agent setup` record the
+    /// resolved absolute path here so the gateway service — which may
+    /// run with a different cwd and a narrower `PATH` — pins the same
+    /// binary the operator probed. Only consulted when `enabled = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: ENABLED_BY_DEFAULT,
+            binary_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodexConfig {
     /// Whether boot should probe + register this agent. See the
     /// `ClaudeConfig::enabled` docstring for rationale.
     pub enabled: bool,
-    /// Path to the `codex` binary. `None` falls back to `PATH`
-    /// lookup. Only consulted when `enabled = true`.
+    /// Path to the `codex` binary. See `ClaudeConfig::binary_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GeminiConfig {
-    /// Whether boot should probe + register this agent. See the
-    /// `ClaudeConfig::enabled` docstring for rationale.
-    pub enabled: bool,
-    /// Path to the `gemini` binary. `None` falls back to `PATH`
-    /// lookup. Only consulted when `enabled = true`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binary_path: Option<String>,
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: ENABLED_BY_DEFAULT,
+            binary_path: None,
+        }
+    }
 }
 
 impl ExternalAgentsConfig {
-    /// Which kinds the operator has explicitly opted into. Boot
-    /// probes / registers only these. Validation also keys on this
-    /// when enforcing `default_external_agent` for the multi-enabled
-    /// case.
+    /// Which kinds are switched on. Boot probes / registers only
+    /// these; `baybo external-agent disable` offers exactly this set.
     pub fn enabled_kinds(&self) -> Vec<ExternalAgentKind> {
         let mut out = Vec::new();
         if self.claude.enabled {
@@ -70,9 +79,6 @@ impl ExternalAgentsConfig {
         }
         if self.codex.enabled {
             out.push(ExternalAgentKind::Codex);
-        }
-        if self.gemini.enabled {
-            out.push(ExternalAgentKind::Gemini);
         }
         out
     }
@@ -93,11 +99,6 @@ impl ExternalAgentsConfig {
                 ExternalAgentKind::Codex,
                 self.codex.enabled,
                 self.codex.binary_path.as_deref(),
-            ),
-            (
-                ExternalAgentKind::Gemini,
-                self.gemini.enabled,
-                self.gemini.binary_path.as_deref(),
             ),
         ]
     }

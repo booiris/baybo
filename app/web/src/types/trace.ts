@@ -376,7 +376,7 @@ export interface TraceTurnSummary {
  * `baybo_model::ExternalAgentKind`). Present only on subagent sessions
  * delegated to an out-of-process agent.
  */
-export type ExternalAgentKind = 'claude' | 'codex' | 'gemini';
+export type ExternalAgentKind = 'claude' | 'codex';
 
 /** Response shape of `GET /v1/traces/{session_id}`. */
 export interface TraceOverview {

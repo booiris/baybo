@@ -139,7 +139,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
-    /// Manage external-agent backends (Claude Code, Codex, Gemini CLI)
+    /// Manage external-agent backends (Claude Code, Codex)
     /// used by `spawn_subagent(backend: ...)`. `setup` is an interactive
     /// wizard that picks a kind, prompts for a binary path (empty
     /// = $PATH lookup), runs an existence + version probe, then
@@ -638,17 +638,10 @@ pub enum ExternalAgentCmd {
     Setup,
     /// Interactive multi-select: check the currently-enabled kinds to
     /// turn off (`external_agents.<kind>.enabled = false`) in
-    /// `baybo.json`. If a disabled kind was `default_external_agent`,
-    /// the default is re-resolved (cleared when ≤1 kind remains, else
-    /// re-prompted). When nothing is enabled it's a no-op success — the
-    /// feature is already off.
+    /// `baybo.json` — the way to withhold a backend that IS installed,
+    /// since every kind is enabled by default. When nothing is enabled
+    /// it's a no-op success — the feature is already off.
     Disable,
-    /// Interactive picker that sets `default_external_agent` to one of
-    /// the currently-enabled kinds and persists it to `baybo.json`. The
-    /// default is an operator-facing designation (the spawn protocol
-    /// still needs an explicit `backend`), so it only matters once more
-    /// than one kind is enabled.
-    Default,
 }
 
 #[derive(Debug, Subcommand)]
