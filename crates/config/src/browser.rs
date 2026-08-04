@@ -105,6 +105,9 @@ impl Default for BrowserConfig {
     }
 }
 
+/// See [`BrowserDockerConfig::memory_limit_mb`].
+const DEFAULT_DOCKER_MEMORY_LIMIT_MB: u32 = 4096;
+
 /// Docker-mode settings for the embedded browser sidecar.
 ///
 /// When [`enable`](Self::enable) is `true` and Docker is available, the
@@ -118,7 +121,7 @@ impl Default for BrowserConfig {
 /// sandbox needs setup the slim image deliberately omits. The wrapper
 /// logs an info line at boot if `sandbox=true` while docker mode is
 /// active.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BrowserDockerConfig {
     /// Master switch for Docker mode. **Default: `false`** (off — preserves
@@ -177,6 +180,61 @@ pub struct BrowserDockerConfig {
     /// alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
+
+    /// Bind-mount `<workspace>/work` read-only inside the container so
+    /// the agent can open artefacts it just wrote via `file://`.
+    /// **Default: `true`.**
+    ///
+    /// Without it the container's filesystem carries only the Chrome
+    /// profile and the font dir, and a `file://` URL naming any host path
+    /// fails with `ERR_FILE_NOT_FOUND` — indistinguishable, from the
+    /// model's side, from the file genuinely not existing.
+    ///
+    /// The mount is read-only: the agent has filesystem tools for
+    /// writing, and read-only also keeps page JS from reaching back into
+    /// the workspace through a `file://` origin. Set `false` to keep the
+    /// container blind to the workspace entirely.
+    pub mount_work_dir: bool,
+
+    /// Hard memory ceiling for the container, in MiB, applied as
+    /// `docker run --memory`/`--memory-swap`. **Default: `4096`**; set to
+    /// `null` for no limit (the pre-cap behaviour).
+    ///
+    /// Chrome never returns a tab's memory on its own, so an uncapped
+    /// container's ceiling is whatever the host has — and the host OOM
+    /// killer picks the victim, possibly the gateway itself.
+    ///
+    /// A cap buys **containment, not recovery**. The cgroup OOM killer
+    /// picks within the container, and Chrome renderers carry
+    /// `oom_score_adj=300`, so a tab dies while the browser process and
+    /// its CDP endpoint survive — the sidecar's watchdog probes liveness,
+    /// sees a healthy browser, and correctly does not replace anything.
+    /// The agent observes one unresponsive page; the host observes
+    /// nothing.
+    ///
+    /// Swap is disabled for the container (`--memory-swap` is set equal
+    /// to `--memory`): swapping a browser trades an honest OOM for
+    /// minutes of thrash indistinguishable from a hang.
+    ///
+    /// Deliberately **not** `skip_serializing_if` — unlike every other
+    /// `Option` here, `None` is not this field's default. `baybo config
+    /// set` rewrites the whole file, so eliding the key would turn an
+    /// operator's explicit "uncapped" back into `4096` the next time the
+    /// config was read.
+    pub memory_limit_mb: Option<u32>,
+}
+
+impl Default for BrowserDockerConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            cdp_url: None,
+            web_vnc_port: None,
+            image_tag: None,
+            mount_work_dir: true,
+            memory_limit_mb: Some(DEFAULT_DOCKER_MEMORY_LIMIT_MB),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +263,16 @@ mod tests {
         assert!(c.docker.cdp_url.is_none());
         assert!(c.docker.web_vnc_port.is_none());
         assert!(c.docker.image_tag.is_none());
+        assert!(
+            c.docker.mount_work_dir,
+            "work dir is mounted by default — without it every file:// URL naming a host path \
+             fails with ERR_FILE_NOT_FOUND and the model cannot tell that from a missing file",
+        );
+        assert_eq!(
+            c.docker.memory_limit_mb,
+            Some(DEFAULT_DOCKER_MEMORY_LIMIT_MB),
+            "container is capped by default; Chrome never gives a tab's memory back",
+        );
     }
 
     #[test]
@@ -227,6 +295,8 @@ mod tests {
                 cdp_url: Some("http://127.0.0.1:9222".into()),
                 web_vnc_port: Some(6080),
                 image_tag: Some("custom/chrome:latest".into()),
+                mount_work_dir: false,
+                memory_limit_mb: Some(2048),
             },
         };
         let json = serde_json::to_string(&c).unwrap();
@@ -277,6 +347,49 @@ mod tests {
         assert!(c.docker.cdp_url.is_none());
         assert!(c.docker.web_vnc_port.is_none());
         assert!(c.docker.image_tag.is_none());
+        assert!(
+            c.docker.mount_work_dir,
+            "a partial docker block must keep the other docker defaults",
+        );
+        assert_eq!(
+            c.docker.memory_limit_mb,
+            Some(DEFAULT_DOCKER_MEMORY_LIMIT_MB),
+        );
+    }
+
+    /// `null` is the documented way to opt out of the memory cap, and it
+    /// has to survive `#[serde(default)]` — which only fires for *absent*
+    /// fields, not explicit nulls.
+    #[test]
+    fn explicit_null_memory_limit_means_uncapped() {
+        let c: BrowserConfig =
+            serde_json::from_str(r#"{"docker": {"memory_limit_mb": null}}"#).unwrap();
+        assert_eq!(c.docker.memory_limit_mb, None);
+    }
+
+    /// `baybo config set` rewrites the whole file, so an explicit
+    /// "uncapped" has to survive a serialise/deserialise cycle. It only
+    /// does because `memory_limit_mb` is exempt from the
+    /// `skip_serializing_if` the other `Option`s carry — for them `None`
+    /// *is* the default, so eliding is lossless; here it would silently
+    /// re-impose the 4096 cap the operator turned off.
+    #[test]
+    fn uncapped_memory_survives_a_config_rewrite() {
+        let original: BrowserConfig =
+            serde_json::from_str(r#"{"docker": {"memory_limit_mb": null}}"#).unwrap();
+        let rewritten: BrowserConfig =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert_eq!(
+            rewritten.docker.memory_limit_mb, None,
+            "round-tripping the config must not turn an uncapped container back into a capped one",
+        );
+    }
+
+    #[test]
+    fn mount_work_dir_can_be_disabled() {
+        let c: BrowserConfig =
+            serde_json::from_str(r#"{"docker": {"mount_work_dir": false}}"#).unwrap();
+        assert!(!c.docker.mount_work_dir);
     }
 
     #[test]

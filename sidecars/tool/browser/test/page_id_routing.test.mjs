@@ -15,6 +15,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,8 +51,12 @@ function startSidecar() {
             BAYBO_BROWSER_DOCKER_CDP_URL: "",
         },
     });
-    child.stderr.on("data", () => {
-        // Sidecar logs to stderr; drain so the pipe doesn't fill up.
+    let stderrBuf = "";
+    child.stderr.on("data", (chunk) => {
+        // Sidecar logs to stderr; drain so the pipe doesn't fill up. The
+        // boot summary is the only place several load-bearing CDDM flags
+        // are observable without a live browser, so keep it.
+        stderrBuf += chunk.toString("utf8");
     });
 
     let stdoutBuf = "";
@@ -93,7 +98,7 @@ function startSidecar() {
         });
     }
 
-    return { child, send, nextResponse };
+    return { child, send, nextResponse, stderr: () => stderrBuf };
 }
 
 test("experimentalPageIdRouting is on; pageId surfaces on the right tools", async (t) => {
@@ -174,5 +179,73 @@ test("experimentalPageIdRouting is on; pageId surfaces on the right tools", asyn
         readPage.inputSchema.required,
         ["pageId"],
         "read_page.pageId is required (evaluate_script handler has no selected-page fallback)",
+    );
+});
+
+// The tab cap is fully dependent on `experimentalStructuredContent`:
+// CDDM's ToolHandler attaches `structuredContent` only when that arg is
+// set, and the flag is off by default when CDDM is driven
+// programmatically (only its own CLI passes it). Without it,
+// `listOpenPages` throws on every call, `makeRoomForOne` swallows that
+// and returns "nothing evicted", and the cap silently becomes a no-op —
+// the exact leak it was added to fix, with every unit test still green
+// because they inject fakes. The boot summary is the cheapest place to
+// observe the real value without launching Chrome.
+test("the CDDM flags the tab cap depends on are actually passed", async (t) => {
+    const { child, send, nextResponse, stderr } = startSidecar();
+    t.after(() => {
+        child.kill("SIGTERM");
+    });
+
+    send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "baybo-browser-test", version: "0.0.1" },
+        },
+    });
+    await nextResponse();
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    // tools/list round-trips after the boot summary is emitted, so its
+    // response is the signal that stderr has the line.
+    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    await nextResponse();
+
+    const log = stderr();
+    assert.match(
+        log,
+        /structured_content=on/,
+        "experimentalStructuredContent must be passed to CDDM or the page budget can never read a page list",
+    );
+    assert.match(log, /page_id_routing=on/);
+    assert.match(log, /max_pages=\d+/, "the effective tab cap is reported at boot");
+});
+
+
+// Pins the upstream behaviour the flag above exists for. CDDM is vendored
+// and its internals are not a contract, so this reads the shipped source
+// rather than driving its classes — a constructor signature change should
+// not fail this test, but silently making `structuredContent`
+// unconditional (or renaming the arg) should, because then our flag has
+// stopped being what makes the tab cap work.
+test("CDDM still gates structuredContent on the arg the sidecar passes", async () => {
+    const handlerSrc = resolve(
+        here,
+        "..",
+        "node_modules",
+        "chrome-devtools-mcp",
+        "build",
+        "src",
+        "ToolHandler.js",
+    );
+    const src = await readFile(handlerSrc, "utf8");
+    assert.match(
+        src,
+        /if\s*\(\s*this\.serverArgs\.experimentalStructuredContent\s*\)/,
+        "CDDM attaches structuredContent only under this guard; if it changed, re-check whether " +
+            "the sidecar still needs experimentalStructuredContent for the page budget to see a page list",
     );
 });

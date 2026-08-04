@@ -1,10 +1,15 @@
-//! Runtime side of the "Bash timeout → background" path: the
-//! [`BackgroundJobSink`] the tool layer hands a still-running command to,
-//! plus the detached escort that streams it to completion and routes a
-//! [`AgentMessage::BackgroundJobFinished`] back to the parent session.
+//! Runtime side of background jobs. Two things live here:
 //!
-//! It reuses the supervisor's in-flight-background registry (shared with
-//! background subagents) for two things: pinning the parent against the
+//! * [`background_eligible`] — the per-turn gate deciding whether work may be
+//!   backgrounded at all. Both the `Bash` and the subagent path read it, so it
+//!   is defined once here rather than in either consumer.
+//! * The "Bash timeout → background" machinery: the [`BackgroundJobSink`] the
+//!   tool layer hands a still-running command to, plus the detached escort
+//!   that streams it to completion and routes a
+//!   [`AgentMessage::BackgroundJobFinished`] back to the parent session.
+//!
+//! The escort reuses the supervisor's in-flight-background registry (shared
+//! with background subagents) for two things: pinning the parent against the
 //! idle reaper while the command runs, and `/stop` suppression — `/stop`
 //! cancels the registered token and drains the entry, so the escort kills
 //! the child and skips delivery (a user-stopped result must not surface).
@@ -13,14 +18,34 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
+use baybo_model::{PendingBackgroundResult, Session, SessionId, SubagentExitStatus};
 use baybo_tools::builtin::bash::{clear_detached_group, record_detached_group};
 use baybo_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
+use baybo_turn::TurnInputKind;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::supervisor::AgentSupervisor;
+
+/// Whether this turn may **create** background work — a `Bash` command that
+/// converts to background on timeout, or a subagent that converts (or is
+/// dispatched) instead of blocking. Computed once per turn by the agent loop
+/// and carried to both consumers as [`baybo_tools::ToolContext::background_eligible`].
+/// Both halves of the gate:
+///
+/// * the **session** must be somewhere a completion notification can land
+///   ([`Session::can_host_background_jobs`]);
+/// * the **turn** must not be a cron fire's own turn. Converting there would
+///   end the fire with a partial report and deliver the real answer as a
+///   separate notification, so a fire blocks until its work is done.
+///
+/// A user reply inside a recurring fire's conversation is an ordinary
+/// `UserChat` turn in a session that *can* host the notification, so it
+/// backgrounds like any other chat.
+pub(crate) fn background_eligible(session: &Session, turn_kind: TurnInputKind) -> bool {
+    session.can_host_background_jobs() && !matches!(turn_kind, TurnInputKind::Cron)
+}
 
 /// In-flight-registry label for a detached command (the registry is shared
 /// with background subagents, which use the subagent profile name here).
@@ -290,4 +315,110 @@ async fn read_file_tail(path: &Path, max_bytes: u64) -> String {
     let mut buf = Vec::new();
     let _ = f.read_to_end(&mut buf).await;
     String::from_utf8_lossy(&buf).into_owned()
+}
+#[cfg(test)]
+mod background_eligible_tests {
+    //! The turn half of the background-job gate. The session half lives on
+    //! `Session::can_host_background_jobs` and is covered next to the
+    //! spawner; what's pinned here is that the two compose so a recurring
+    //! cron job's *fire* blocks while a *reply* in the same conversation
+    //! backgrounds.
+    use super::background_eligible;
+    use baybo_model::{
+        ChannelType, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource, TurnId,
+        User,
+    };
+    use baybo_turn::TurnInputKind;
+    use chrono::Utc;
+
+    fn session_with(trigger: TriggerSource, lineage: Option<Lineage>) -> Session {
+        let now = Utc::now();
+        let id = SessionId::from("sess-bg");
+        Session {
+            id: id.clone(),
+            user: User {
+                id: "user-bg".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            channel: ChannelType::tui(),
+            created_at: now,
+            last_active: now,
+            state: SessionState::default(),
+            root_session_id: id,
+            trigger,
+            lineage,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        }
+    }
+
+    fn cron(conversation: bool) -> Session {
+        session_with(
+            TriggerSource::Cron {
+                cron_job_id: "c-1".into(),
+                origin_session_id: None,
+                conversation,
+                job_title: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn a_user_chat_backgrounds() {
+        let s = session_with(TriggerSource::User, None);
+        assert!(background_eligible(&s, TurnInputKind::UserChat));
+    }
+
+    /// The point of the turn half: a fire that backgrounded its slow work
+    /// would notify with a partial report and deliver the real answer
+    /// separately, so it blocks even though its conversation could host the
+    /// notification.
+    #[test]
+    fn a_recurring_fires_own_turn_blocks() {
+        assert!(!background_eligible(&cron(true), TurnInputKind::Cron));
+    }
+
+    /// …and the same conversation backgrounds once the user takes over. This
+    /// pair is the whole feature.
+    #[test]
+    fn a_reply_inside_a_recurring_fires_conversation_backgrounds() {
+        assert!(background_eligible(&cron(true), TurnInputKind::UserChat));
+    }
+
+    /// A one-shot fire's workspace is invisible and unregistered, so nothing
+    /// can be delivered there — no turn kind unlocks it.
+    #[test]
+    fn a_one_shot_fires_workspace_never_backgrounds() {
+        assert!(!background_eligible(&cron(false), TurnInputKind::Cron));
+        assert!(!background_eligible(&cron(false), TurnInputKind::UserChat));
+    }
+
+    /// A subagent's turn ends with the child, so there is no later turn to
+    /// notify into regardless of what started it.
+    #[test]
+    fn a_subagent_session_never_backgrounds() {
+        let s = session_with(
+            TriggerSource::User,
+            Some(Lineage {
+                parent_session_id: SessionId::from("parent"),
+                parent_turn_id: TurnId::new(),
+                parent_span_id: None,
+                kind: LineageKind::Subagent,
+            }),
+        );
+        assert!(!background_eligible(&s, TurnInputKind::UserChat));
+    }
+
+    /// A background result's own notification turn must stay eligible: the
+    /// agent reacting to one job may dispatch the next.
+    #[test]
+    fn a_notification_turn_still_backgrounds() {
+        let s = session_with(TriggerSource::User, None);
+        assert!(background_eligible(&s, TurnInputKind::SubagentNotification));
+    }
 }

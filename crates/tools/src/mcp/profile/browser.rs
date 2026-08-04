@@ -22,11 +22,43 @@ use std::path::Path;
 
 use super::EmbeddedMcpProfile;
 
+/// Policy inputs for [`browser_mcp_profile`].
+///
+/// Deliberately primitives + `Path`s rather than `baybo_config` types, so
+/// this crate stays free of a config dep; the gateway does the unpacking.
+/// A struct rather than a positional arg list because the call site is
+/// otherwise fifteen bare values in a row, where a transposed pair of
+/// `bool`s type-checks and silently inverts a policy.
+pub struct BrowserProfileParams<'a> {
+    /// Master switch — `false` makes the builder return `None`.
+    pub enable: bool,
+    pub chrome_path: Option<&'a Path>,
+    pub profile_dir: Option<&'a Path>,
+    pub sandbox: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Typically the resolved host `node` binary.
+    pub command: String,
+    /// The materialised `dist/bundle.mjs` path.
+    pub bundle_path: &'a Path,
+    pub extra_font_dirs: &'a [&'a Path],
+    pub docker_enable: bool,
+    pub docker_cdp_url: Option<&'a str>,
+    pub docker_web_vnc_port: Option<u16>,
+    pub docker_image_tag: Option<&'a str>,
+    /// Host directory bind-mounted read-only in the container so `file://`
+    /// URLs for agent-written artefacts resolve. `None` leaves the
+    /// container with no view of the workspace.
+    pub docker_work_dir: Option<&'a Path>,
+    /// Container memory ceiling in MiB. `None` leaves it uncapped.
+    pub docker_memory_limit_mb: Option<u32>,
+}
+
 /// Build the `browser` MCP-server profile from the operator's policy
 /// settings. Returns `None` when `enable=false` so the boot path drops
 /// it uniformly with the rest of the disabled profiles.
 ///
-/// Args:
+/// Fields of [`BrowserProfileParams`]:
 /// - `enable`: master switch — `false` returns `None`.
 /// - `chrome_path`: optional override for the Chrome binary, plumbed
 ///   via the internal `BAYBO_BROWSER_CHROME_PATH` env var. When unset,
@@ -72,6 +104,13 @@ use super::EmbeddedMcpProfile;
 /// - `docker_image_tag`: when set, skip the deterministic-tag computation
 ///   + image build and trust this tag exists. Plumbed as
 ///     `BAYBO_BROWSER_DOCKER_IMAGE_TAG`.
+/// - `docker_work_dir`: host directory bind-mounted read-only inside the
+///   container, plumbed as `BAYBO_BROWSER_DOCKER_WORK_DIR`. Without it a
+///   `file://` URL naming a host path fails with `ERR_FILE_NOT_FOUND`,
+///   which the model reads as "the file isn't there".
+/// - `docker_memory_limit_mb`: container memory ceiling, plumbed as
+///   `BAYBO_BROWSER_DOCKER_MEMORY_LIMIT` in docker's own `<N>m` syntax.
+///   Ignored outside docker mode.
 ///
 /// `capabilities` is intentionally empty: dropping the
 /// `[Http, ExecCommand]` ceiling means `accessed_resources()` returns
@@ -83,22 +122,24 @@ use super::EmbeddedMcpProfile;
 /// Keeping `command` + `bundle_path` as plain inputs (rather than
 /// reaching into `baybo-gateway::SidecarRuntime` from here) is what
 /// lets this module live in `baybo-tools` without a dependency cycle.
-#[allow(clippy::too_many_arguments)]
-pub fn browser_mcp_profile(
-    enable: bool,
-    chrome_path: Option<&Path>,
-    profile_dir: Option<&Path>,
-    sandbox: bool,
-    width: u32,
-    height: u32,
-    command: String,
-    bundle_path: &Path,
-    extra_font_dirs: &[&Path],
-    docker_enable: bool,
-    docker_cdp_url: Option<&str>,
-    docker_web_vnc_port: Option<u16>,
-    docker_image_tag: Option<&str>,
-) -> Option<EmbeddedMcpProfile> {
+pub fn browser_mcp_profile(params: BrowserProfileParams<'_>) -> Option<EmbeddedMcpProfile> {
+    let BrowserProfileParams {
+        enable,
+        chrome_path,
+        profile_dir,
+        sandbox,
+        width,
+        height,
+        command,
+        bundle_path,
+        extra_font_dirs,
+        docker_enable,
+        docker_cdp_url,
+        docker_web_vnc_port,
+        docker_image_tag,
+        docker_work_dir,
+        docker_memory_limit_mb,
+    } = params;
     if !enable {
         return None;
     }
@@ -168,6 +209,25 @@ pub fn browser_mcp_profile(
     if let Some(tag) = docker_image_tag {
         extra_env.insert("BAYBO_BROWSER_DOCKER_IMAGE_TAG".into(), tag.into());
     }
+    // Unlike `cdp_url` — which the wrapper honours whether or not docker
+    // mode is on — these two describe a container that only exists when
+    // `docker_enable` is set. Emitting them regardless would put a
+    // container bind-mount path and a `--memory` value in the env of a
+    // host-headless child, where the first thing to read them would take
+    // a docker-only code path in a mode that has no container.
+    if docker_enable {
+        if let Some(dir) = docker_work_dir {
+            extra_env.insert(
+                "BAYBO_BROWSER_DOCKER_WORK_DIR".into(),
+                dir.display().to_string(),
+            );
+        }
+        // Docker's own size suffix — the wrapper forwards the string to
+        // `--memory` verbatim rather than re-deriving a unit.
+        if let Some(mb) = docker_memory_limit_mb {
+            extra_env.insert("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT".into(), format!("{mb}m"));
+        }
+    }
     Some(EmbeddedMcpProfile {
         server_name: "browser".into(),
         command,
@@ -189,22 +249,33 @@ mod tests {
     /// `sandbox=false` matches the `BrowserConfig` default and exercises
     /// the BAYBO_BROWSER_NO_SANDBOX-on path; the override case is
     /// covered by `sandbox_on_clears_no_sandbox_env` below.
-    fn defaults_call(enable: bool) -> Option<EmbeddedMcpProfile> {
-        browser_mcp_profile(
+    fn params(enable: bool) -> BrowserProfileParams<'static> {
+        BrowserProfileParams {
             enable,
-            None,
-            None,
-            false, // sandbox
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false, // docker_enable
-            None,  // docker_cdp_url
-            None,  // docker_web_vnc_port
-            None,  // docker_image_tag
-        )
+            chrome_path: None,
+            profile_dir: None,
+            sandbox: false,
+            width: 1920,
+            height: 1080,
+            command: "node".into(),
+            bundle_path: Path::new("/x.mjs"),
+            extra_font_dirs: &[],
+            docker_enable: false,
+            docker_cdp_url: None,
+            docker_web_vnc_port: None,
+            docker_image_tag: None,
+            // Deliberately `Some` even though the fixture is docker-off:
+            // these two default to a real value in `baybo.json`, so a
+            // fixture that left them `None` would make
+            // `docker_disabled_omits_all_docker_env` pass no matter what
+            // the builder did.
+            docker_work_dir: Some(Path::new("/ws/work")),
+            docker_memory_limit_mb: Some(4096),
+        }
+    }
+
+    fn defaults_call(enable: bool) -> Option<EmbeddedMcpProfile> {
+        browser_mcp_profile(params(enable))
     }
 
     #[test]
@@ -264,21 +335,10 @@ mod tests {
 
     #[test]
     fn sandbox_on_clears_no_sandbox_env() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            true, // sandbox
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false,
-            None,
-            None,
-            None,
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            sandbox: true,
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert!(
             !p.extra_env.contains_key("BAYBO_BROWSER_NO_SANDBOX"),
@@ -288,21 +348,11 @@ mod tests {
 
     #[test]
     fn chrome_path_lands_in_env() {
-        let p = browser_mcp_profile(
-            true,
-            Some(&PathBuf::from("/opt/google/chrome/chrome")),
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false,
-            None,
-            None,
-            None,
-        )
+        let chrome = PathBuf::from("/opt/google/chrome/chrome");
+        let p = browser_mcp_profile(BrowserProfileParams {
+            chrome_path: Some(&chrome),
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_CHROME_PATH").unwrap(),
@@ -312,21 +362,11 @@ mod tests {
 
     #[test]
     fn profile_dir_lands_in_env() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            Some(&PathBuf::from("/var/baybo/browser-profile")),
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false,
-            None,
-            None,
-            None,
-        )
+        let dir = PathBuf::from("/var/baybo/browser-profile");
+        let p = browser_mcp_profile(BrowserProfileParams {
+            profile_dir: Some(&dir),
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_PROFILE_DIR").unwrap(),
@@ -336,21 +376,11 @@ mod tests {
 
     #[test]
     fn viewport_lands_in_env_as_wxh() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1280,
-            720,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false,
-            None,
-            None,
-            None,
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            width: 1280,
+            height: 720,
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_VIEWPORT").unwrap(),
@@ -381,21 +411,11 @@ mod tests {
     fn font_dirs_join_with_colon() {
         let a = PathBuf::from("/work/.fonts");
         let b = PathBuf::from("/usr/share/extra-fonts");
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[a.as_path(), b.as_path()],
-            false,
-            None,
-            None,
-            None,
-        )
+        let dirs = [a.as_path(), b.as_path()];
+        let p = browser_mcp_profile(BrowserProfileParams {
+            extra_font_dirs: &dirs,
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_EXTRA_FONT_DIRS").unwrap(),
@@ -412,6 +432,8 @@ mod tests {
             "BAYBO_BROWSER_DOCKER_CDP_URL",
             "BAYBO_BROWSER_DOCKER_WEB_VNC_PORT",
             "BAYBO_BROWSER_DOCKER_IMAGE_TAG",
+            "BAYBO_BROWSER_DOCKER_WORK_DIR",
+            "BAYBO_BROWSER_DOCKER_MEMORY_LIMIT",
         ] {
             assert!(
                 !p.extra_env.contains_key(key),
@@ -422,21 +444,10 @@ mod tests {
 
     #[test]
     fn docker_enable_lands_in_env() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            true,
-            None,
-            None,
-            None,
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_DOCKER_ENABLE"),
@@ -447,21 +458,10 @@ mod tests {
 
     #[test]
     fn docker_cdp_url_lands_in_env() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            false,
-            Some("http://10.0.0.5:9222"),
-            None,
-            None,
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_cdp_url: Some("http://10.0.0.5:9222"),
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_DOCKER_CDP_URL").unwrap(),
@@ -471,21 +471,11 @@ mod tests {
 
     #[test]
     fn docker_image_tag_override_lands_in_env() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            true,
-            None,
-            None,
-            Some("my-registry/baybo-browser:pinned"),
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            docker_image_tag: Some("my-registry/baybo-browser:pinned"),
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env.get("BAYBO_BROWSER_DOCKER_IMAGE_TAG").unwrap(),
@@ -496,21 +486,11 @@ mod tests {
 
     #[test]
     fn docker_web_vnc_port_lands_in_env_as_string() {
-        let p = browser_mcp_profile(
-            true,
-            None,
-            None,
-            false,
-            1920,
-            1080,
-            "node".into(),
-            Path::new("/x.mjs"),
-            &[],
-            true,
-            None,
-            Some(6080),
-            None,
-        )
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            docker_web_vnc_port: Some(6080),
+            ..params(true)
+        })
         .expect("profile when enabled");
         assert_eq!(
             p.extra_env
@@ -518,6 +498,54 @@ mod tests {
                 .unwrap(),
             "6080",
             "web_vnc_port serialised to a decimal string for the TS wrapper to parse",
+        );
+    }
+
+    #[test]
+    fn docker_work_dir_lands_in_env() {
+        let work = PathBuf::from("/var/baybo/work");
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            docker_work_dir: Some(&work),
+            ..params(true)
+        })
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env.get("BAYBO_BROWSER_DOCKER_WORK_DIR").unwrap(),
+            "/var/baybo/work",
+        );
+    }
+
+    /// The wrapper forwards this string to `docker run --memory` verbatim,
+    /// so the unit suffix has to be docker's, not a bare integer.
+    #[test]
+    fn docker_memory_limit_serialises_with_docker_suffix() {
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            docker_memory_limit_mb: Some(4096),
+            ..params(true)
+        })
+        .expect("profile when enabled");
+        assert_eq!(
+            p.extra_env
+                .get("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT")
+                .unwrap(),
+            "4096m",
+        );
+    }
+
+    #[test]
+    fn no_memory_limit_omits_env() {
+        let p = browser_mcp_profile(BrowserProfileParams {
+            docker_enable: true,
+            docker_memory_limit_mb: None,
+            ..params(true)
+        })
+        .expect("profile when enabled");
+        assert!(
+            !p.extra_env
+                .contains_key("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT"),
+            "None means uncapped — the wrapper must not receive a --memory value at all",
         );
     }
 }

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import type { LifecycleState, ReplayStep, Span, Step, TraceTurnSummary, TurnInputKind, TurnTrace } from '../../types/trace';
+import type {
+  LifecycleState,
+  ReplayStep,
+  SessionMessageRow,
+  Span,
+  Step,
+  TraceTurnSummary,
+  TurnInputKind,
+  TurnTrace,
+} from '../../types/trace';
 import {
   attention,
   failureCount,
@@ -8,6 +17,7 @@ import {
   isExternalAgentTurn,
   isTurnLive,
   neededTurnIds,
+  partitionTranscript,
   resolveExpanded,
   traceHasPendingSpan,
   turnLabels,
@@ -250,5 +260,176 @@ describe('turnLabels', () => {
   it('is empty-safe and numbers a pure-maintenance session with no turns at all', () => {
     expect(turnLabels([])).toEqual([]);
     expect(turnLabels([mkKindTurn('a', 'compact')]).map((l) => l.long)).toEqual(['Compaction']);
+  });
+});
+
+// ── External agents: the marker, and the transcript-as-trace partition ──
+//
+// Source of truth: `TraceOverview.external_agent` (see the doc comment on
+// `crates/gateway/src/api/admin/traces.rs`) — a session whose work ran on a
+// claude/codex/gemini binary records NO step/span tree, ever, so its
+// `session_messages` transcript IS its trace and the middle pane renders that
+// instead of a step tree.
+
+/** A turn whose window boundary is explicit. `created_at` defaults to the
+ *  start, so the two only diverge where a test means them to. */
+function mkTurnAt(turnId: string, startedAt: string, createdAt: string = startedAt): TraceTurnSummary {
+  return { ...mkTurn(turnId, 'completed'), created_at: createdAt, started_at: startedAt };
+}
+
+function mkRow(ordinal: number, createdAt: string, supersededBy: number | null = null): SessionMessageRow {
+  return {
+    ordinal,
+    superseded_by: supersededBy,
+    created_at: createdAt,
+    message: { role: 'user', source: 'user', content: [{ Text: `row ${ordinal}` }] },
+  };
+}
+
+/** Buckets flattened to `{ turn_id: [ordinal, …] }`; order inside a bucket is
+ *  the order the rows were fed in. */
+function byTurn(map: Map<string, SessionMessageRow[]>): Record<string, number[]> {
+  return Object.fromEntries([...map].map(([id, rows]) => [id, rows.map((r) => r.ordinal)]));
+}
+
+const S0 = '2026-02-01T00:00:00.000Z'; // turn `a` starts
+const S1 = '2026-02-01T00:10:00.000Z'; // turn `b` starts
+const S2 = '2026-02-01T00:20:00.000Z'; // turn `c` starts
+const BEFORE_S0 = '2026-01-31T23:59:59.000Z';
+const MID_A = '2026-02-01T00:05:00.000Z';
+const MID_B = '2026-02-01T00:15:00.000Z';
+const AFTER_S2 = '2026-02-01T09:00:00.000Z';
+
+describe('isExternalAgentTurn (session-level external_agent marker)', () => {
+  const empty = mkTrace('j', []);
+  const withSteps = mkTrace('j', [mkStep('s1', ok, [])]);
+
+  it('flags a LIVE zero-step turn — the whole point of the marker', () => {
+    // The steps are never coming, so gating on a terminal status gates forever:
+    // without this a running claude/codex subagent renders nothing at all.
+    expect(isExternalAgentTurn(empty, 'in_progress', 'claude')).toBe(true);
+    expect(isExternalAgentTurn(empty, 'pending', 'claude')).toBe(true);
+    expect(isExternalAgentTurn(empty, 'stuck', 'claude')).toBe(true);
+  });
+
+  it('keeps flagging terminal zero-step turns, for every backend', () => {
+    expect(isExternalAgentTurn(empty, 'completed', 'codex')).toBe(true);
+    expect(isExternalAgentTurn(empty, 'failed', 'gemini')).toBe(true);
+    expect(isExternalAgentTurn(empty, 'cancelled', 'claude')).toBe(true);
+  });
+
+  it('never mislabels a real step tree — recorded steps win over the marker', () => {
+    expect(isExternalAgentTurn(withSteps, 'in_progress', 'claude')).toBe(false);
+    expect(isExternalAgentTurn(withSteps, 'completed', 'claude')).toBe(false);
+  });
+
+  it('counts an unfetched trace as external WHEN marked', () => {
+    // The page never fetches turn trees for a marked external session — there
+    // is no tree to fetch — so `undefined` is the steady state, not a
+    // not-yet-loaded state. Requiring a fetched trace here would mean the
+    // transcript never rendered at all for the sessions this marker exists for.
+    expect(isExternalAgentTurn(undefined, 'in_progress', 'claude')).toBe(true);
+    expect(isExternalAgentTurn(undefined, 'completed', 'claude')).toBe(true);
+    expect(isExternalAgentTurn(undefined, 'stuck', 'codex')).toBe(true);
+  });
+
+  it('an unfetched trace is never external WITHOUT a marker', () => {
+    // Unmarked, an absent tree says nothing — it may simply not have loaded.
+    expect(isExternalAgentTurn(undefined, 'in_progress', null)).toBe(false);
+    expect(isExternalAgentTurn(undefined, 'completed', null)).toBe(false);
+    expect(isExternalAgentTurn(undefined, 'completed', undefined)).toBe(false);
+  });
+
+  it('leaves the no-marker heuristic exactly as it was', () => {
+    // Sessions written before the backend tag reached the wire: a live internal
+    // turn can momentarily have zero steps and must not be relabelled.
+    expect(isExternalAgentTurn(empty, 'in_progress', null)).toBe(false);
+    expect(isExternalAgentTurn(empty, 'in_progress', undefined)).toBe(false);
+    expect(isExternalAgentTurn(empty, 'completed', null)).toBe(true);
+    expect(isExternalAgentTurn(empty, 'completed', undefined)).toBe(true);
+    // …and omitting the argument is the same as passing undefined.
+    expect(isExternalAgentTurn(empty, 'in_progress')).toBe(false);
+    expect(isExternalAgentTurn(empty, 'completed')).toBe(true);
+  });
+});
+
+describe('partitionTranscript', () => {
+  const turns = [mkTurnAt('a', S0), mkTurnAt('b', S1), mkTurnAt('c', S2)];
+
+  it('buckets each row to the last turn that had started when it was written', () => {
+    const rows = [mkRow(1, S0), mkRow(2, MID_A), mkRow(3, S1), mkRow(4, MID_B), mkRow(5, S2)];
+    expect(byTurn(partitionTranscript(rows, turns))).toEqual({ a: [1, 2], b: [3, 4], c: [5] });
+  });
+
+  it('gives a row written exactly on a boundary to the turn that just opened', () => {
+    expect(byTurn(partitionTranscript([mkRow(1, S1)], turns))).toEqual({ b: [1] });
+  });
+
+  it('folds rows that predate the first turn into it rather than dropping them', () => {
+    // An external run persists its task prompt around the same instant the turn
+    // opens, and the two orderings are not guaranteed.
+    const rows = [mkRow(1, BEFORE_S0), mkRow(2, S0)];
+    expect(byTurn(partitionTranscript(rows, turns))).toEqual({ a: [1, 2] });
+  });
+
+  it("leaves the newest turn's window open-ended so a live run's rows land", () => {
+    const live = [mkTurnAt('a', S0), mkTurnAt('b', S1)];
+    const rows = [mkRow(1, S1), mkRow(2, MID_B), mkRow(3, AFTER_S2)];
+    expect(byTurn(partitionTranscript(rows, live))).toEqual({ b: [1, 2, 3] });
+  });
+
+  it('drops superseded rows entirely — a compaction rewrote them', () => {
+    const rows = [mkRow(1, S0), mkRow(2, MID_A, 42), mkRow(3, S1), mkRow(4, MID_B, 42)];
+    expect(byTurn(partitionTranscript(rows, turns))).toEqual({ a: [1], b: [3] });
+  });
+
+  it('treats a 0 supersede marker as superseded (a marker, not a falsy no-op)', () => {
+    expect(byTurn(partitionTranscript([mkRow(1, S0, 0)], turns))).toEqual({});
+  });
+
+  it('is empty for no turns and for no rows', () => {
+    expect(partitionTranscript([mkRow(1, S0)], []).size).toBe(0);
+    expect(partitionTranscript([], turns).size).toBe(0);
+  });
+
+  it('omits a turn that got no rows instead of mapping it to an empty array', () => {
+    const map = partitionTranscript([mkRow(1, S2)], turns);
+    expect([...map.keys()]).toEqual(['c']);
+    expect(map.has('a')).toBe(false);
+    expect(map.get('b')).toBeUndefined();
+  });
+
+  it('sorts the turns itself, so an out-of-order slice partitions identically', () => {
+    const shuffled = [mkTurnAt('c', S2), mkTurnAt('a', S0), mkTurnAt('b', S1)];
+    const rows = [mkRow(1, MID_A), mkRow(2, MID_B), mkRow(3, AFTER_S2)];
+    expect(byTurn(partitionTranscript(rows, shuffled))).toEqual({ a: [1], b: [2], c: [3] });
+    expect(byTurn(partitionTranscript(rows, shuffled))).toEqual(byTurn(partitionTranscript(rows, turns)));
+  });
+
+  it('keys the window off started_at when it is present', () => {
+    // `b` was created before `a` even opened but did not start until S2, so the
+    // S1 row is `a`'s; keying off created_at would hand it to `b`.
+    const late = mkTurnAt('b', S2, BEFORE_S0);
+    const pinned = [mkTurnAt('a', S0), late];
+    expect(byTurn(partitionTranscript([mkRow(1, S1), mkRow(2, S2)], pinned))).toEqual({ a: [1], b: [2] });
+  });
+
+  it('falls back to created_at for a turn that has no start yet', () => {
+    const nullStart: TraceTurnSummary = { ...mkTurn('b', 'pending'), created_at: S1, started_at: null };
+    const absentStart: TraceTurnSummary = { ...mkTurn('c', 'pending'), created_at: S2, started_at: undefined };
+    const pinned = [mkTurnAt('a', S0), nullStart, absentStart];
+    const rows = [mkRow(1, MID_A), mkRow(2, MID_B), mkRow(3, AFTER_S2)];
+    expect(byTurn(partitionTranscript(rows, pinned))).toEqual({ a: [1], b: [2], c: [3] });
+  });
+
+  it('preserves the input order of the rows inside a bucket', () => {
+    const rows = [mkRow(3, MID_A), mkRow(1, MID_A), mkRow(2, MID_A)];
+    expect(byTurn(partitionTranscript(rows, turns))).toEqual({ a: [3, 1, 2] });
+  });
+
+  it('parks a row with an unparseable timestamp in the newest turn', () => {
+    // The explicit NaN branch: an unplaceable row still shows up somewhere
+    // rather than silently disappearing from the transcript.
+    expect(byTurn(partitionTranscript([mkRow(1, 'not-a-timestamp')], turns))).toEqual({ c: [1] });
   });
 });

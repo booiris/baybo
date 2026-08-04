@@ -42,14 +42,6 @@ const SUBAGENT_OUTPUT_BUFFER: usize = 64;
 /// or kill). Fixed, no per-call knob.
 const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
 
-/// Whether a parent session can host a background job — delegates to the
-/// shared [`baybo_model::Session::supports_background_jobs`] so the router
-/// (subagent conversion) and the agent loop (bash sink injection) gate on
-/// one definition.
-fn parent_supports_background(session: &Session) -> bool {
-    session.supports_background_jobs()
-}
-
 /// Construction bundle for [`ActorSubagentSpawner`] — every field is
 /// required; call sites populate it via struct literal.
 pub struct SubagentSpawnerConfig {
@@ -126,17 +118,7 @@ impl baybo_subagent::SubagentSpawner for ActorSubagentSpawner {
         // so an internal oneshot bridges its terminal — or the immediate
         // background ack — back to this return.
         let (result_tx, result_rx) = oneshot::channel();
-        if let Err(e) = self
-            .handle_subagent_spawn(
-                parent.session_id,
-                parent.turn_id,
-                parent.span_id,
-                parent.cancel_token,
-                request,
-                result_tx,
-            )
-            .await
-        {
+        if let Err(e) = self.handle_subagent_spawn(parent, request, result_tx).await {
             return SubagentResult::failed(format!("subagent spawn dispatch error: {e}"));
         }
         result_rx.await.unwrap_or_else(|_| {
@@ -148,13 +130,12 @@ impl baybo_subagent::SubagentSpawner for ActorSubagentSpawner {
 impl ActorSubagentSpawner {
     async fn handle_subagent_spawn(
         &self,
-        parent_session_id: SessionId,
-        parent_turn_id: TurnId,
-        parent_span_id: SpanId,
-        parent_actor_token: CancellationToken,
+        parent_ctx: SubagentParentContext,
         request: SubagentSpawnRequest,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> anyhow::Result<()> {
+        let parent_session_id = parent_ctx.session_id.clone();
+        let parent_turn_id = parent_ctx.turn_id;
         // `fan_out_root` is `None` only on synthesized test requests
         // (those tests don't gate the limiter, so the release is a
         // no-op). Production spawns always carry a root because the
@@ -190,27 +171,12 @@ impl ActorSubagentSpawner {
 
         match request.backend.clone() {
             SubagentBackend::Baybo => {
-                self.spawn_baybo_subagent(
-                    parent,
-                    parent_turn_id,
-                    parent_span_id,
-                    parent_actor_token,
-                    request,
-                    result_tx,
-                )
-                .await
+                self.spawn_baybo_subagent(parent, parent_ctx, request, result_tx)
+                    .await
             }
             SubagentBackend::External { external_kind } => {
-                self.spawn_external_subagent(
-                    parent,
-                    parent_turn_id,
-                    parent_span_id,
-                    parent_actor_token,
-                    request,
-                    external_kind,
-                    result_tx,
-                )
-                .await
+                self.spawn_external_subagent(parent, parent_ctx, request, external_kind, result_tx)
+                    .await
             }
         }
     }
@@ -221,12 +187,17 @@ impl ActorSubagentSpawner {
     async fn spawn_baybo_subagent(
         &self,
         parent: Session,
-        parent_turn_id: TurnId,
-        parent_span_id: SpanId,
-        parent_actor_token: CancellationToken,
+        parent_ctx: SubagentParentContext,
         request: SubagentSpawnRequest,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> anyhow::Result<()> {
+        let SubagentParentContext {
+            turn_id: parent_turn_id,
+            span_id: parent_span_id,
+            cancel_token: parent_actor_token,
+            background_eligible,
+            ..
+        } = parent_ctx;
         let fan_out_root = request.fan_out_root.clone();
         let child_session = match self
             .resolve_child_session(
@@ -282,19 +253,17 @@ impl ActorSubagentSpawner {
         // escorted result so the parent holds it until the group completes.
         let group = request.group.clone();
 
-        // A foreground subagent from a live user session converts to
-        // background after a fixed foreground wait (unless `on_timeout`
-        // is `Kill`). Cron and nested-subagent parents are out of scope —
-        // their notification turn can't be delivered — so they keep the
-        // block-until-terminal behaviour with no timer.
-        let user_facing = parent_supports_background(&parent);
-        // A non-user parent can't host the notification turn that surfaces a
-        // background result, so an explicit `background=true` / grouped spawn
-        // from one is downgraded to a blocking foreground run (its result is
-        // returned inline) rather than dispatched to a notification that would
-        // be dropped on delivery. `convertible` is already user-only.
-        let background = request.background && user_facing;
-        let convertible = user_facing && !background && matches!(on_timeout, OnTimeout::Background);
+        // A foreground subagent converts to background after a fixed
+        // foreground wait (unless `on_timeout` is `Kill`) — but only when the
+        // dispatching turn may create background work. A cron fire's own turn
+        // and a nested-subagent parent can't surface a notification, so they
+        // keep the block-until-terminal behaviour with no timer.
+        // An ineligible turn also downgrades an explicit `background=true` /
+        // grouped spawn to a blocking foreground run (result returned inline)
+        // rather than dispatching to a notification that would be dropped.
+        let background = request.background && background_eligible;
+        let convertible =
+            background_eligible && !background && matches!(on_timeout, OnTimeout::Background);
 
         // Background subagents — and convertible foreground ones, which
         // may outlive the dispatching turn once they convert — must
@@ -412,7 +381,7 @@ impl ActorSubagentSpawner {
         );
         tokio::spawn(run_foreground_job(
             ForegroundJob {
-                user_facing,
+                background_eligible,
                 on_timeout,
                 child_session_id,
                 subagent_type,
@@ -434,17 +403,21 @@ impl ActorSubagentSpawner {
     /// External backend: route one-shot delegation to a registered
     /// external-agent impl (claude_cli, codex_cli). No `AgentActor` is
     /// built; the agent's event stream is driven to a terminal result.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_external_subagent(
         &self,
         parent: Session,
-        parent_turn_id: TurnId,
-        parent_span_id: SpanId,
-        parent_actor_token: CancellationToken,
+        parent_ctx: SubagentParentContext,
         request: SubagentSpawnRequest,
         kind: ExternalAgentKind,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> anyhow::Result<()> {
+        let SubagentParentContext {
+            turn_id: parent_turn_id,
+            span_id: parent_span_id,
+            cancel_token: parent_actor_token,
+            background_eligible,
+            ..
+        } = parent_ctx;
         let fan_out_root = request.fan_out_root.clone();
         let Some(agent) = self.external_agents.get(kind) else {
             let _ = result_tx.send(SubagentResult::failed(format!(
@@ -492,15 +465,11 @@ impl ActorSubagentSpawner {
         // runs are long; a converted one keeps running past the turn that
         // spawned it). A non-convertible foreground run stays on the parent's
         // per-turn token (cancelled at the foreground-wait mark, or ends with the
-        // turn). Mirrors the Baybo backend's anchoring.
-        let user_facing = parent_supports_background(&parent);
-        // Non-user parents can't deliver a background notification, so an
-        // explicit background / grouped external run from one is downgraded to
-        // a blocking foreground run (result returned inline). Mirrors the Baybo
-        // backend's gate.
-        let background = request.background && user_facing;
-        let convertible =
-            user_facing && !background && matches!(request.on_timeout, OnTimeout::Background);
+        // turn). Mirrors the Baybo backend's anchoring and its eligibility gate.
+        let background = request.background && background_eligible;
+        let convertible = background_eligible
+            && !background
+            && matches!(request.on_timeout, OnTimeout::Background);
         let actor_token = if background || convertible {
             self.actor_parent_token.child_token()
         } else {
@@ -584,7 +553,7 @@ impl ActorSubagentSpawner {
         );
         tokio::spawn(run_foreground_job(
             ForegroundJob {
-                user_facing,
+                background_eligible,
                 on_timeout: request.on_timeout,
                 child_session_id,
                 subagent_type: request.subagent_type.clone(),
@@ -784,10 +753,10 @@ async fn escort_background_terminal(
 
 /// Everything [`run_foreground_job`] needs that isn't the terminal future.
 struct ForegroundJob {
-    /// Whether the parent can host the background-conversion notification
-    /// turn ([`Session::supports_background_jobs`]). A non-user parent blocks
-    /// until terminal with no foreground-wait timer.
-    user_facing: bool,
+    /// Whether the dispatching turn may create background work (see
+    /// [`baybo_tools::ToolContext::background_eligible`]). An ineligible turn
+    /// blocks until terminal with no foreground-wait timer.
+    background_eligible: bool,
     on_timeout: OnTimeout,
     child_session_id: SessionId,
     subagent_type: String,
@@ -812,12 +781,12 @@ struct ForegroundJob {
 /// (only `fut` differs: an Baybo actor terminal vs an external-subprocess run,
 /// both resolving to a [`SubagentResult`]).
 ///
-/// A non-user parent blocks until terminal (no timer). A user-facing parent
-/// waits up to [`SUBAGENT_FOREGROUND_WAIT`]; on overrun it either converts the
-/// still-running turn to background (acking now, escorting its eventual
-/// terminal as a notification turn) or force-cancels it, per `on_timeout`. The
-/// future is pinned and resumed across the `select!` boundary so it is never
-/// polled to completion twice.
+/// A turn that may not create background work blocks until terminal (no
+/// timer). An eligible one waits up to [`SUBAGENT_FOREGROUND_WAIT`]; on
+/// overrun it either converts the still-running turn to background (acking
+/// now, escorting its eventual terminal as a notification turn) or
+/// force-cancels it, per `on_timeout`. The future is pinned and resumed across
+/// the `select!` boundary so it is never polled to completion twice.
 async fn run_foreground_job(
     turn: ForegroundJob,
     fut: impl std::future::Future<Output = SubagentResult>,
@@ -827,7 +796,7 @@ async fn run_foreground_job(
     limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
 ) {
     let ForegroundJob {
-        user_facing,
+        background_eligible,
         on_timeout,
         child_session_id,
         subagent_type,
@@ -839,10 +808,10 @@ async fn run_foreground_job(
     } = turn;
     tokio::pin!(fut);
 
-    if !user_facing {
-        // Cron / nested-subagent parent: conversion + its notification turn
-        // only work for a live, registered user session, so block until
-        // terminal with no foreground-wait timer.
+    if !background_eligible {
+        // A cron fire's own turn, or a nested-subagent parent: conversion and
+        // the notification turn that delivers its result are out of reach, so
+        // block until terminal with no foreground-wait timer.
         let result = fut.await;
         let _ = result_tx.send(result);
         release_reserved_slot(limiter.as_ref(), &fan_out_root);
@@ -1534,26 +1503,36 @@ mod resume_validation_tests {
         baybo_model::SubagentBackendTag::Baybo
     }
 
-    #[test]
-    fn parent_supports_background_only_for_top_level_user_sessions() {
-        // Top-level user session: convertible.
-        assert!(parent_supports_background(&mk_parent("p")));
-
-        // Subagent child: not convertible (its turn ends before a
-        // notification could be delivered).
-        let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
-        assert!(!parent_supports_background(&child));
-
-        // Cron session: one-shot + unregistered, so notification can't
-        // reach it.
-        let mut cron = mk_parent("cr");
-        cron.trigger = TriggerSource::Cron {
-            cron_job_id: "turn-1".into(),
+    fn mk_cron(id: &str, conversation: bool) -> Session {
+        let mut s = mk_parent(id);
+        s.trigger = TriggerSource::Cron {
+            cron_job_id: "job-1".into(),
             origin_session_id: None,
-            conversation: false,
+            conversation,
             job_title: None,
         };
-        assert!(!parent_supports_background(&cron));
+        s
+    }
+
+    #[test]
+    fn a_session_hosts_background_jobs_only_where_a_notification_can_land() {
+        // Top-level user session: the notification turn's home.
+        assert!(mk_parent("p").can_host_background_jobs());
+
+        // Subagent child: its turn ends before a notification could be
+        // delivered.
+        let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
+        assert!(!child.can_host_background_jobs());
+
+        // One-shot cron fire: an invisible, deliberately unregistered
+        // workspace — nothing to notify into.
+        assert!(!mk_cron("cr", false).can_host_background_jobs());
+
+        // Recurring cron fire's own conversation: listed, replyable, and its
+        // actor is registered, so a notification turn reaches the user. The
+        // *fire's* turn is still excluded — by the turn half of the gate in
+        // the agent loop, not here.
+        assert!(mk_cron("cr-conv", true).can_host_background_jobs());
     }
 
     fn claude_tag(resume_key: Option<&str>) -> baybo_model::SubagentBackendTag {
@@ -1734,13 +1713,13 @@ mod foreground_turn_tests {
     }
 
     fn turn(
-        user_facing: bool,
+        background_eligible: bool,
         on_timeout: OnTimeout,
         child_token: CancellationToken,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> ForegroundJob {
         ForegroundJob {
-            user_facing,
+            background_eligible,
             on_timeout,
             child_session_id: SessionId::from("child"),
             subagent_type: "general-purpose".into(),
@@ -1826,10 +1805,11 @@ mod foreground_turn_tests {
         assert!(token.is_cancelled(), "the kill cancelled the run's token");
     }
 
-    // A non-user parent (cron / nested subagent) has no foreground-wait timer:
-    // it blocks until terminal and never converts, even on a long run.
+    // An ineligible turn (a cron fire's own turn, a nested subagent) has no
+    // foreground-wait timer: it blocks until terminal and never converts,
+    // even on a long run.
     #[tokio::test(start_paused = true)]
-    async fn non_user_parent_blocks_without_conversion() {
+    async fn ineligible_turn_blocks_without_conversion() {
         let (tx, mut rx) = oneshot::channel();
         let gate = Arc::new(tokio::sync::Notify::new());
         let gate2 = Arc::clone(&gate);
@@ -1843,7 +1823,10 @@ mod foreground_turn_tests {
         );
         // Well past the foreground wait, still no conversion ack (no timer).
         tokio::time::advance(SUBAGENT_FOREGROUND_WAIT * 3).await;
-        assert!(rx.try_recv().is_err(), "a non-user parent must not convert");
+        assert!(
+            rx.try_recv().is_err(),
+            "an ineligible turn must not convert"
+        );
         // It delivers only when the run actually finishes.
         gate.notify_one();
         let result = rx.await.expect("result after the run finishes");

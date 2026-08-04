@@ -103,29 +103,37 @@ const result = await build({
   plugins: [bayboResolveCddm],
   logLevel: "info",
 });
-// Test-only second output. `dist/bundle.mjs` is an entrypoint, not a library —
-// it has no exports a unit test can reach — and `node --test` can't import the
-// `.ts` sources on the Node 20 floor this package supports. So the watchdog's
-// state machine is emitted once more, unminified and importable, under
-// `dist/test/`. The gateway's build.rs only ever picks up `dist/bundle.mjs`
-// plus the `baybo.auxAssets` paths, so this never ships.
-const testResult = await build({
-  entryPoints: ["src/watchdog.ts"],
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  outfile: "dist/test/watchdog.mjs",
-  minify: false,
-  sourcemap: false,
-  logLevel: "warning",
-});
+// Test-only outputs. `dist/bundle.mjs` is an entrypoint, not a library — it
+// has no exports a unit test can reach — and `node --test` can't import the
+// `.ts` sources on the Node 20 floor this package supports. So each module
+// with unit-testable logic is emitted once more, unminified and importable,
+// under `dist/test/`. The gateway's build.rs only ever picks up
+// `dist/bundle.mjs` plus the `baybo.auxAssets` paths, so these never ship.
+const TEST_MODULES = ["watchdog", "page_budget", "net_hints", "tool_notes"];
+const testResults = await Promise.all(
+  TEST_MODULES.map((name) =>
+    build({
+      entryPoints: [`src/${name}.ts`],
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "node20",
+      outfile: `dist/test/${name}.mjs`,
+      minify: false,
+      sourcemap: false,
+      logLevel: "warning",
+      plugins: [bayboResolveCddm],
+    }),
+  ),
+);
 
+const testWarnings = testResults.reduce((n, r) => n + r.warnings.length, 0);
+const testErrors = testResults.reduce((n, r) => n + r.errors.length, 0);
 const ms = Date.now() - start;
 console.log(
-  `bundled in ${ms}ms (${result.warnings.length + testResult.warnings.length} warnings, ` +
-    `${result.errors.length + testResult.errors.length} errors)`,
+  `bundled in ${ms}ms (${result.warnings.length + testWarnings} warnings, ` +
+    `${result.errors.length + testErrors} errors)`,
 );
-if (result.errors.length > 0 || testResult.errors.length > 0) {
+if (result.errors.length > 0 || testErrors > 0) {
   process.exit(1);
 }

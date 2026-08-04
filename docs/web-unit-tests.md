@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **24 files, 371 tests** — and the conventions that
+The dashboard's vitest suite — **31 files, 541 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -171,8 +171,15 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/cronActions.test.ts` (22) | `CronPage.tsx` — `actOnCronJob`, `fetchCronJobs`, `updateCronJob`, `deleteCronJob`, `cronEditPatch`, `jobToEditForm`, `isoToLocalInput`, `mutationErrorSlot`, … | Cron page API helpers driven against a `FakeGateway` (real `openapi-fetch` client): soft delete, pause/resume, expired-one-shot resume 400, partial-patch reschedule, error slots. |
 | `pages/queueDrain.test.ts` (19) | `ChatPage.tsx` — `classifyQueueFrame`, `canBatchDeferred`, `hasSendableContent` | The interjection-queue drain decision: fire / fire-deferred / restore-deferred / pause-cancelled / pause-error / none across message / turn_state / notice frames, plus the deferred batch threshold. |
 | `types/trace.test.ts` (3) | `types/trace.ts` — `resolveToolCallOutput` | Resolve a tool-call's output from the persisted result row by `tool_use_id`. |
+| `components/trace/traceFormat.test.ts` (10) | `traceFormat.tsx` — duration/token formatting, `stepSummaryText`, `compressionTokens`, kind visuals | Per-kind row text and the compaction `before→after` figures the overview and the step summary must agree on. |
+| `components/trace/traceTreeModel.test.ts` (42) | `traceTreeModel.ts` — `turnLabels`, `turnRollup`, `failureCount`, `neededTurnIds`, `isExternalAgentTurn`, `partitionTranscript` | Tree defaults + failure roll-up; the external-agent rule on both sides of the wire marker (a marked session counts while LIVE and while unfetched — its tree is never coming — an unmarked one still needs a terminal, stepless turn); and the timestamp partition that assigns turn-less transcript rows to turns. |
+| `components/trace/transcriptModel.test.ts` (32) | `transcriptModel.ts` — `buildTranscriptNodes`, `transcriptPreview`, `transcriptSearchText` | An external agent's transcript projected into trace rows: a `ToolUse` folded with the `ToolResult` that answers it rows later, in-flight calls, orphan results, stable `ordinal:block` ids, thinking/redaction, attachments, and a search corpus that keeps a call's arguments after its result lands. |
+| `components/trace/traceForest.test.ts` (23) | `traceForest.ts` — `buildForest`, `sessionHasFailure`, `sessionIsLive`, `liveSessions` | Subagent lineage indexed by attach point (span, falling back to turn), cross-boundary failure roll-up, and **cycle safety** — a mutual-parent lineage must terminate, which the same walk without its `seen` guard does not. |
+| `components/trace/overviewSync.test.ts` (32) | `overviewSync.ts` — `maxOrdinal`, `pollCursor`, `mergeOverviewPage` | The incremental trace-overview poll: cursor selection (including the different-session guard), append vs replace, and the supersede-watermark move that forces a full reload. |
 | `pages/chat/queueStore.test.tsx` (9) · **render** | `queueStore.tsx` — `QueueProvider`, `useSessionQueue`, `useQueueStore` | `renderHook` over the store: FIFO append, synchronous `clearPause`→`popTop` compose, `normalize` pause-collapse, reorder, defer/restore, localStorage round-trip, cross-tab `storage` ingest. |
 | `pages/chat/QueuePanel.test.tsx` (8) · **render** | `QueuePanel.tsx` | `render` + `user-event`: empty-queue renders null, rows in order, send/delete callbacks, inline edit (save on Enter / revert on Esc), cancelled vs error pause banner + "Send remaining". |
+| `pages/chat/ImageLightbox.test.tsx` (10) · **render** | `ImageLightbox.tsx` | The viewer's view state and dismiss rules: fit floor + 8× ceiling (and the buttons disabling at each), toolbar/keyboard zoom, reset, double-click toggle, eased-jump vs 1:1-wheel (`View.animate`), Escape / close / backdrop-vs-image click, the download filename, and body-scroll lock ↔ restore. jsdom measures every box at 0, so the zoom **percentage** can never resolve — assertions read the `transform` the state produces instead. |
+| `pages/chat/AttachmentImage.test.tsx` (3) · **render** | `AttachmentImage.tsx` | The bearer-authorized blob fetch and its object URL reaching the `<img>`, the thumbnail opening `ImageLightbox` on that *same* URL with no second fetch, and the named-chip fallback on a failed fetch. |
 | `pages/chatMarkdown.test.tsx` (14) · **render** | `ChatPage.tsx` — `MarkdownBody` | The math pipeline end to end (normalize → remark-math → rehype-katex → KaTeX): inline vs display, both delimiter styles, money left literal, a malformed formula colored from the palette instead of throwing, list/table structure intact, and the `katex.min.css` import itself. Also that `<ol start>` survives the component overrides — the marker counter reads it off the element, and jsdom computes no counters, so the attribute is the only half of that the suite can see. |
 
 ## Adding a test — the recipe
@@ -183,7 +190,13 @@ says `pass`, not `skipping`, before trusting it.
    Reach for a **render test** (`.test.tsx`, `render`/`renderHook` + `user-event`)
    only when the behaviour is inherently in the wiring/DOM — mirror
    `QueuePanel.test.tsx` / `queueStore.test.tsx` (mount inside `<QueueProvider>`,
-   `installMemoryLocalStorage()` if it persists).
+   `installMemoryLocalStorage()` if it persists). Where jsdom simply lacks a DOM
+   API the component legitimately uses, install the gap from `test/domGaps.ts`
+   (`installPointerCapture()`, `installObjectUrls()`) rather than making the
+   component branch on its environment — and note that those two are installed
+   for the whole file on purpose: Testing Library's `cleanup()` unmounts in a
+   **setup-file** `afterEach`, which runs *after* the suite's own, so restoring
+   them early puts the gap back exactly when React unmounts through it.
 2. **Create `<subject>.test.ts(x)` next to the source.** Open with a comment naming
    the invariant and the upstream source of truth it mirrors.
 3. **Feed explicit inputs and an explicit clock; assert the exact output.** Use

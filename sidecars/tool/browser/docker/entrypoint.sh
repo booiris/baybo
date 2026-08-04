@@ -174,12 +174,24 @@ fi
 # `--enable-logging=stderr` surfaces Chrome's own stderr in `docker logs`
 # (default is to write to a logfile inside the user-data-dir).
 #
-# `--disable-dev-shm-usage` is belt-and-braces: docker.ts passes
-# `--shm-size=2g` so /dev/shm is large enough for Chrome by default, but
-# older docker engines silently ignore that flag and Chrome OOMs on
-# memory-heavy pages with no obvious signal. Setting this flag makes
-# Chrome back its shared-memory regions with /tmp regardless, so the
-# /dev/shm size is no longer a hidden cliff.
+# We deliberately do NOT pass `--disable-dev-shm-usage`. docker.ts passes
+# `--shm-size=2g`, so /dev/shm is already large enough; the flag then just
+# redirects Chrome's shared-memory regions to /tmp, which in this image is
+# the container's overlayfs. That turns every compositor frame into a disk
+# write — measured at ~1.3 MiB/s sustained on an *idle* browser (~100 GiB
+# a day of pure SSD wear) while a 2 GiB tmpfs sat unused.
+#
+# `--disk-cache-size` caps Chrome's HTTP cache. The profile is bind-mounted
+# to the host and outlives every container, and nothing sweeps it; left at
+# Chrome's default (a fraction of free disk) it is the workspace's largest
+# unbounded directory. The size lives in the host wrapper (DISK_CACHE_BYTES
+# in src/server.ts) and arrives as $DISK_CACHE_SIZE; repeating the number
+# here would give the two modes separate, silently diverging ceilings. Only
+# a hand-run container lacks it, and there Chrome's own default is fine.
+CACHE_ARG=""
+if [ -n "${DISK_CACHE_SIZE:-}" ]; then
+    CACHE_ARG="--disk-cache-size=${DISK_CACHE_SIZE}"
+fi
 log "launching chrome (loopback CDP on 9222) + socat relay (0.0.0.0:9223 -> 127.0.0.1:9222)"
 /usr/local/bin/chrome \
     --remote-debugging-port=9222 \
@@ -190,7 +202,7 @@ log "launching chrome (loopback CDP on 9222) + socat relay (0.0.0.0:9223 -> 127.
     --disable-default-apps \
     --no-sandbox \
     --disable-gpu \
-    --disable-dev-shm-usage \
+    ${CACHE_ARG:+"$CACHE_ARG"} \
     --enable-logging=stderr \
     --window-position=0,0 \
     --window-size="${VIEWPORT%x*},${VIEWPORT#*x}" \

@@ -188,13 +188,48 @@ subprocess.
 
 External runs record **no step/span tree** — the agent's internal
 loop is opaque, and faking `LlmCall` spans would pollute cost /
-analytics with calls baybo never made. So the trace detail page
-(`app/web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
-persisted `session_messages` transcript directly when a turn has zero
-steps. Net frontend behaviour: the external subagent appears in the
-Traces list with a `subagent` badge + turn status, and opening it
-shows the full transcript (thinking / tool_use / tool_result) via the
-shared `MessageList` component.
+analytics with calls baybo never made. The persisted
+`session_messages` transcript **is** the trace, so the trace viewer
+renders it in place of a step tree.
+
+**The wire says so explicitly.** `GET /v1/traces/{session_id}` carries
+`external_agent` (`"claude" | "codex" | "gemini"`, absent otherwise)
+and `subagent_type`, projected from the durable
+`SessionState.subagent_backend` tag by
+`QueryApi::subagent_backend_of`. Only the discriminator and the
+profile name reach the body — `workspace_dir` and `resume_key` never
+do.
+
+That marker exists because *"zero steps"* alone is ambiguous: an
+in-process turn that has not flushed its first step yet also has zero
+steps. Inferring "external" from a terminal-and-stepless turn — what
+the viewer used to do — meant a **running** external agent rendered
+nothing at all until it exited, which for an 8-hour idle timeout is
+most of the run. With the marker, `isExternalAgentTurn`
+(`app/web/src/components/trace/traceTreeModel.ts`) treats the turn as
+external the moment its session is known to be, live or not. Sessions
+written before the marker reached the wire keep the old
+terminal-and-stepless heuristic as a fallback.
+
+Net frontend behaviour (`app/web/src/pages/TraceSessionPage.tsx`):
+
+- The external subagent appears in the Traces list with a `subagent`
+  badge + turn status.
+- Opening it renders the transcript in the **middle tree pane**, one
+  row per message, with each `tool_use` folded together with the
+  `tool_result` that answers it — so it reads like the `ToolCall`
+  spans of a normal trace rather than like a chat log. Selecting a row
+  puts its full text / params / result in the detail panel.
+  `buildTranscriptNodes` (`components/trace/transcriptModel.ts`) owns
+  that projection.
+- Rows appear **as the agent writes them**: the spawn router awaits
+  `append_session_message` per `Intermediate` event, and the viewer's
+  incremental overview poll picks each one up. A tool call whose
+  result has not arrived shows as still running.
+- Viewed from the **parent** session, the child's transcript nests
+  inline under the `spawn_subagent` span that started it — see
+  "Trace viewer polling" in [`webui.md`](webui.md) for the `/lineage`
+  endpoint that makes that possible.
 
 ## Cost / token accounting
 

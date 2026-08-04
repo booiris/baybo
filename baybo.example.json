@@ -74,7 +74,9 @@
     "width": 1920,
     "height": 1080,
     "docker": {
-      "enable": false
+      "enable": false,
+      "mount_work_dir": true,
+      "memory_limit_mb": 4096
     }
   },
   "external_agents": {

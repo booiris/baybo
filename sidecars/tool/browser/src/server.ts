@@ -73,18 +73,25 @@ import {
 import type { CreateMcpServerArgs } from "chrome-devtools-mcp";
 
 import {
+  CONTAINER_WORK_DIR,
   type DockerHandle,
   type DockerPhase,
   type DockerSpawnOptions,
+  HOST_GATEWAY_ALIAS,
   checkDockerAvailable,
   describeDeadContainer,
   isPidAlive,
   probeCdpEndpoint,
   spawnContainer,
+  supportsHostGateway,
   sweepStaleContainers,
+  sweepStaleImages,
 } from "./docker.js";
 import { createLogger, errText } from "./log.js";
+import { type BrowserMode, type HintContext, annotateBrowserError } from "./net_hints.js";
+import { MAX_PAGES, type OpenPage, PageBudget, evictionNotice } from "./page_budget.js";
 import { READ_PAGE_TOOL, handleReadPage } from "./read_page.js";
+import { augmentToolDescriptions } from "./tool_notes.js";
 import {
   BrowserActivity,
   BrowserWatchdog,
@@ -311,6 +318,18 @@ async function installChromeInBackground(state: InstallState): Promise<string> {
   return exe;
 }
 
+/**
+ * Ceiling on Chrome's HTTP cache, in bytes.
+ *
+ * Chrome's default is a fraction of free disk, which on a server means
+ * "grows until someone notices". The profile is bind-mounted out of the
+ * container and survives every container replacement and gateway
+ * restart, so it is the one browser artefact nothing else reclaims — no
+ * janitor sweep covers it. 256 MiB keeps repeat navigations warm without
+ * turning the workspace into a cache.
+ */
+const DISK_CACHE_BYTES = 256 * 1024 * 1024;
+
 function buildArgs(executablePath: string | undefined): ServerArgs {
   const userDataDir = resolvedProfileDir();
   mkdirSync(userDataDir, { recursive: true });
@@ -322,7 +341,7 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
   // is false (the default — most container/CI hosts can't satisfy
   // Chrome's user-namespace prerequisites). Append `--no-sandbox` to
   // chromeArg so it reaches Chrome at launch.
-  const chromeArg: string[] = [];
+  const chromeArg: string[] = [`--disk-cache-size=${DISK_CACHE_BYTES}`];
   if (process.env["BAYBO_BROWSER_NO_SANDBOX"] === "1") {
     chromeArg.push("--no-sandbox");
   }
@@ -337,7 +356,13 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     viewport,
     chromeArg: chromeArg.length > 0 ? chromeArg : undefined,
     redactNetworkHeaders: true,
-    categoryNavigationAutomation: true,
+    // `category<Name>` where <Name> is CDDM's own ToolCategory value —
+    // `buildFlag` in its ToolHandler derives the arg key from the
+    // category string, so a name that doesn't match one is read as
+    // `undefined` and silently means "default". `navigation` is the
+    // category; `categoryNavigationAutomation` (its human label) was a
+    // no-op knob.
+    categoryNavigation: true,
     categoryDebugging: true,
     // Drops `emulate` (CPU/network/device emulation) + `resize_page`.
     // Viewport is fixed at sidecar boot via `BAYBO_BROWSER_VIEWPORT`, and
@@ -379,6 +404,17 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     // "<agent-id>"` to `new_page` — CDDM creates a Puppeteer
     // BrowserContext per name, giving each agent its own cookie jar.
     experimentalPageIdRouting: true,
+    // Machine-readable twin of the `## Pages` prose. The page budget
+    // needs the page table, and the prose is formatted for a model — its
+    // shape is not a contract. Off by default when CDDM is driven
+    // programmatically (only its own CLI passes the flag), and
+    // `ToolHandler` attaches `structuredContent` solely when it is set,
+    // so without this the budget can never read a page list at all.
+    //
+    // `stripStructuredContent` removes it again on the way out: it is a
+    // verbatim duplicate of text the model already has, and every
+    // browser result would otherwise carry a second copy.
+    experimentalStructuredContent: true,
   };
 }
 
@@ -799,6 +835,21 @@ function pickFirstExistingDir(raw: string | undefined): string | undefined {
   return undefined;
 }
 
+/**
+ * A single directory path, or undefined when unset or absent. Unlike
+ * {@link pickFirstExistingDir} this does not treat `:` as a separator —
+ * the value is one path, and a colon in it is a bind-mount error the
+ * spawner rejects with a clear message.
+ */
+function existingDir(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    return statSync(raw).isDirectory() ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface DockerSpawnOutcome {
   args: ServerArgs;
   handle: DockerHandle;
@@ -850,18 +901,28 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
     log(`profile dir prep failed: ${(e as Error).message}`);
   }
 
+  const workDir = existingDir(envValue("BAYBO_BROWSER_DOCKER_WORK_DIR"));
   const opts: DockerSpawnOptions = {
     dockerDir: dockerDirPath(),
     imageTag: operatorImageTag,
     profileDir,
     fontDir: pickFirstExistingDir(envValue("BAYBO_BROWSER_EXTRA_FONT_DIRS")),
+    workDir,
     webVncPort: parseVncPort(envValue("BAYBO_BROWSER_DOCKER_WEB_VNC_PORT"), "WEB_VNC_PORT"),
+    memoryLimit: envValue("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT"),
+    hostGatewayAlias: supportsHostGateway(check.serverVersion),
+    diskCacheBytes: DISK_CACHE_BYTES,
     viewport: parseViewport(envValue("BAYBO_BROWSER_VIEWPORT")) ?? { width: 1920, height: 1080 },
     onPhase: (p) => {
       state.phase = p;
     },
   };
   const handle = await spawnContainer(opts);
+  // After the spawn, so a freshly built image is already pinned by a
+  // running container and the sweep can never race it away.
+  void sweepStaleImages(handle.imageTag).catch((e: unknown) => {
+    logDebug(`image sweep failed: ${errText(e)}`);
+  });
 
   // CDDM ignores `headless` in connect-mode; set false anyway so the
   // boot summary reads correctly and the operator's mental model
@@ -888,6 +949,8 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
  * read as a failed probe.
  */
 const CDDM_LIST_PAGES_TOOL = "list_pages";
+const CDDM_NEW_PAGE_TOOL = "new_page";
+const CDDM_CLOSE_PAGE_TOOL = "close_page";
 
 /** Ceiling on the end-to-end call each `recover()` uses to prove itself. */
 const RECOVERY_CALL_TIMEOUT_MS = 30_000;
@@ -905,6 +968,58 @@ function firstText(content: unknown): string {
     if (trimmed.length > 0) return trimmed;
   }
   return "";
+}
+
+/**
+ * Every page-listing CDDM response carries the page table twice: once as
+ * prose under `## Pages`, once as `structuredContent.pages`. Read the
+ * structured copy — the prose is formatted for the model and its shape is
+ * not a contract.
+ */
+function structuredPages(result: unknown): OpenPage[] | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const sc = (result as { structuredContent?: unknown }).structuredContent;
+  if (typeof sc !== "object" || sc === null) return undefined;
+  const pages = (sc as { pages?: unknown }).pages;
+  if (!Array.isArray(pages)) return undefined;
+  const out: OpenPage[] = [];
+  for (const p of pages) {
+    if (typeof p !== "object" || p === null) continue;
+    const { id, url, selected } = p as { id?: unknown; url?: unknown; selected?: unknown };
+    if (typeof id !== "number") continue;
+    out.push({ id, url: typeof url === "string" ? url : "", selected: selected === true });
+  }
+  return out;
+}
+
+async function listOpenPages(client: Client): Promise<OpenPage[]> {
+  const res = await client.callTool({ name: CDDM_LIST_PAGES_TOOL, arguments: {} });
+  if (res.isError === true) throw new Error(firstText(res.content));
+  const pages = structuredPages(res);
+  if (pages === undefined) {
+    throw new Error(`${CDDM_LIST_PAGES_TOOL} returned no structured page list`);
+  }
+  return pages;
+}
+
+/** The page CDDM has selected, which after `new_page` is the one it just opened. */
+function selectedPageId(result: unknown): number | undefined {
+  return structuredPages(result)?.find((p) => p.selected === true)?.id;
+}
+
+/**
+ * Drop the machine-readable page/network/console mirror before the result
+ * leaves the proxy. We ask CDDM for it (`experimentalStructuredContent`)
+ * because the page budget needs a parseable page list, but it duplicates
+ * text the model already has in prose — shipping both would put a second
+ * copy of every snapshot and network log into the agent's context.
+ */
+function stripStructuredContent<T extends object>(result: T): T {
+  if (!("structuredContent" in result)) return result;
+  const { structuredContent: _dropped, ...rest } = result as T & {
+    structuredContent?: unknown;
+  };
+  return rest as T;
 }
 
 async function assertBrowserAnswers(client: Client, signal?: AbortSignal): Promise<void> {
@@ -1091,7 +1206,7 @@ async function main(): Promise<void> {
   let dockerHandle: DockerHandle | null = null;
   let dockerOpts: DockerSpawnOptions | null = null;
   let args: ServerArgs;
-  let mode: "cdp_url" | "docker" | "host";
+  let mode: BrowserMode;
 
   if (dockerCdpUrl !== undefined) {
     log(`docker.cdp_url set; connecting to existing CDP at ${dockerCdpUrl}`);
@@ -1162,23 +1277,6 @@ async function main(): Promise<void> {
   // built after the client it probes through.
   let watchdog: BrowserWatchdog | null = null;
 
-  proxy.setRequestHandler(ListToolsRequestSchema, async () => {
-    // The gateway's reconciler probes with exactly this request, and would
-    // otherwise get a healthy answer from the in-process registry no matter
-    // what state the watchdog is in — so a watchdog that stopped ticking is
-    // invisible, while the phase it left behind tells the agent to keep
-    // retrying. Failing here converts that into the one failure the reconciler
-    // already handles: disconnect, then respawn onto a clean boot.
-    if (watchdog?.isStalled() === true) {
-      throw new Error(
-        "browser watchdog has stopped ticking; the sidecar cannot vouch for the browser. " +
-          "Respawning is the recovery — see the baybo-browser-mcp lines in the gateway log.",
-      );
-    }
-    const cddmTools = await cddmClient.listTools();
-    const visible = cddmTools.tools.filter((t) => !BLOCKED_TOOLS.has(t.name));
-    return { tools: [...visible, READ_PAGE_TOOL] };
-  });
   // Every call that reaches CDDM is recorded, so the watchdog can stand down
   // while the agent is actively browsing: real traffic proves the browser
   // answers better than any probe, and CDDM serialises tool calls behind one
@@ -1194,17 +1292,79 @@ async function main(): Promise<void> {
       // CDDM never throws out of a tool handler — a dead browser comes back
       // as `isError` with the message in a text block — so the flag, not the
       // absence of a throw, is what says the browser actually answered.
-      ok = (result as { isError?: unknown }).isError !== true;
+      ok = (result as { isError?: unknown } | undefined)?.isError !== true;
       return result;
     } finally {
       activity.end(ok);
     }
   };
 
+  // Where the browser actually lives. Chrome's `net::ERR_*` codes are
+  // reported against the container's namespaces, not the gateway's, and
+  // nothing in the error text says so — see net_hints.ts.
+  const hintCtx: HintContext = {
+    mode,
+    workMountSource: dockerOpts?.workDir,
+    profileMountSource: mode === "docker" ? dockerOpts?.profileDir : undefined,
+    fontMountSource: mode === "docker" ? dockerOpts?.fontDir : undefined,
+    hostGatewayHint:
+      mode === "docker" && dockerOpts?.hostGatewayAlias === true ? HOST_GATEWAY_ALIAS : undefined,
+  };
+
+  // Eviction rides `throughCddm` like any other traffic: it is real work
+  // on the same serialised mutex, so a probe fired during it would queue
+  // behind three round-trips and then time out against a healthy browser.
+  // `BrowserActivity` counts in-flight calls, so the nesting under the
+  // `new_page` that triggered it is harmless.
+  const pageBudget = new PageBudget({
+    maxPages: MAX_PAGES,
+    listPages: () => throughCddm(() => listOpenPages(cddmClient)),
+    closePage: async (id) => {
+      const res = await throughCddm(() =>
+        cddmClient.callTool({ name: CDDM_CLOSE_PAGE_TOOL, arguments: { pageId: id } }),
+      );
+      if (res.isError === true) throw new Error(firstText(res.content));
+      // CDDM's close_page swallows its own "the last open page cannot be
+      // closed" into a response line without setting `error`, so a refusal
+      // arrives looking exactly like a success. The refreshed page list it
+      // returns is the honest signal.
+      const remaining = structuredPages(res);
+      if (remaining?.some((p) => p.id === id) === true) {
+        throw new Error(firstText(res.content) || `page ${id} is still open after close_page`);
+      }
+    },
+  });
+
+  proxy.setRequestHandler(ListToolsRequestSchema, async () => {
+    // The gateway's reconciler probes with exactly this request, and would
+    // otherwise get a healthy answer from the in-process registry no matter
+    // what state the watchdog is in — so a watchdog that stopped ticking is
+    // invisible, while the phase it left behind tells the agent to keep
+    // retrying. Failing here converts that into the one failure the reconciler
+    // already handles: disconnect, then respawn onto a clean boot.
+    if (watchdog?.isStalled() === true) {
+      throw new Error(
+        "browser watchdog has stopped ticking; the sidecar cannot vouch for the browser. " +
+          "Respawning is the recovery — see the baybo-browser-mcp lines in the gateway log.",
+      );
+    }
+    const cddmTools = await cddmClient.listTools();
+    const visible = cddmTools.tools.filter((t) => !BLOCKED_TOOLS.has(t.name));
+    return {
+      tools: [...augmentToolDescriptions(visible, hintCtx, pageBudget.maxPages), READ_PAGE_TOOL],
+    };
+  });
+  // Tail of the serialised `new_page` chain — see the gate below.
+  let newPageGate: Promise<unknown> = Promise.resolve();
+
   proxy.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const rawArgs = (req.params.arguments ?? {}) as { pageId?: unknown };
+    const pageIdRaw = rawArgs.pageId;
+    if (typeof pageIdRaw === "number") {
+      pageBudget.noteUse(pageIdRaw);
+    }
+
     if (req.params.name === READ_PAGE_TOOL.name) {
-      const raw = req.params.arguments ?? {};
-      const pageIdRaw = (raw as { pageId?: unknown }).pageId;
       if (typeof pageIdRaw !== "number") {
         return proxyToolError(
           "read_page requires a numeric `pageId`. CDDM's evaluate_script " +
@@ -1212,7 +1372,8 @@ async function main(): Promise<void> {
             "to find the page id and pass it in.",
         );
       }
-      return await throughCddm(() => handleReadPage(cddmClient, { pageId: pageIdRaw }));
+      const res = await throughCddm(() => handleReadPage(cddmClient, { pageId: pageIdRaw }));
+      return stripStructuredContent(annotateBrowserError(res, hintCtx));
     }
     if (BLOCKED_TOOLS.has(req.params.name)) {
       return proxyToolError(
@@ -1220,12 +1381,64 @@ async function main(): Promise<void> {
           `It was hidden from tools/list — do not invoke it.`,
       );
     }
-    return await throughCddm(() =>
-      cddmClient.callTool({
-        name: req.params.name,
-        arguments: req.params.arguments,
-      }),
-    );
+
+    const forward = async (): Promise<CallToolResult> => {
+      const result = await throughCddm(() =>
+        cddmClient.callTool({
+          name: req.params.name,
+          arguments: req.params.arguments,
+        }),
+      );
+      if (req.params.name === CDDM_CLOSE_PAGE_TOOL && typeof pageIdRaw === "number") {
+        pageBudget.noteClosed(pageIdRaw);
+      }
+      if (req.params.name === CDDM_NEW_PAGE_TOOL) {
+        // `newPage` selects the tab it just created, so the entry flagged
+        // `selected` in the refreshed list is exactly that tab. Taking the
+        // highest id instead would mis-attribute whenever the navigation
+        // caused the site to open a popup, which CDDM snapshots too.
+        const opened = selectedPageId(result);
+        if (opened !== undefined) pageBudget.noteUse(opened);
+      }
+      return stripStructuredContent(annotateBrowserError(result, hintCtx)) as CallToolResult;
+    };
+
+    if (req.params.name !== CDDM_NEW_PAGE_TOOL) return await forward();
+
+    // Reclaim before opening, not after: the cap has to bound the peak,
+    // and post-hoc trimming would let the count spike by one every time.
+    //
+    // Serialised because this is a check-then-act across two awaits, and
+    // the MCP SDK dispatches request handlers concurrently while the
+    // gateway shares one connection across every agent. Without the gate,
+    // N concurrent `new_page` calls each read the same pre-eviction count,
+    // each pick the *same* LRU victim, and N-1 of them get "No page found"
+    // for a tab they never owned — while the cap is overshot by N-1.
+    const gated: Promise<CallToolResult> = newPageGate
+      .catch(() => undefined)
+      .then(async () => {
+        const notice = evictionNotice(await pageBudget.makeRoomForOne(), pageBudget.maxPages);
+        if (notice === undefined) return await forward();
+        try {
+          const answered = await forward();
+          return {
+            ...answered,
+            content: [...(Array.isArray(answered.content) ? answered.content : []), {
+              type: "text" as const,
+              text: notice,
+            }],
+          };
+        } catch (e) {
+          // Tabs are already gone. Losing the notice here would surface
+          // later as an inexplicable "No page found" on an id the agent
+          // still holds, so it rides the failure out.
+          throw new Error(`${errText(e)}\n\n${notice}`);
+        }
+      });
+    // The chain must advance even when this call fails, or one rejection
+    // would wedge every later `new_page` behind it.
+    newPageGate = gated.catch(() => undefined);
+    return await gated;
   });
 
   const realTransport = new StdioServerTransport();
@@ -1245,6 +1458,12 @@ async function main(): Promise<void> {
       `viewport=${viewportStr} headless=${args.headless} ` +
       `sandbox=${chromeArgList.includes("--no-sandbox") ? "off" : "on"} ` +
       `telemetry=off page_id_routing=${args.experimentalPageIdRouting === true ? "on" : "off"} ` +
+      // Load-bearing, not cosmetic: without the flag CDDM emits no
+      // `structuredContent`, the page budget can never read a page list,
+      // and the tab cap silently degrades to a no-op. Reported so the
+      // regression is visible at boot rather than only as a leak.
+      `structured_content=${args.experimentalStructuredContent === true ? "on" : "off"} ` +
+      `max_pages=${pageBudget.maxPages} ` +
       `install_state=${state.phase} extra_tools=read_page ` +
       `disabled_categories=emulation,performance,extensions disabled_tools=${[...BLOCKED_TOOLS].join(",")}`,
   );

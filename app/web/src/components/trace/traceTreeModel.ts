@@ -4,7 +4,16 @@
  * step trees must be fetched, and span/step lookups. No React, no rendering —
  * so it stays unit-testable and the `TraceTree` component reads as layout.
  */
-import type { LifecycleState, ReplayStep, Span, TraceTurnSummary, TurnStatusKind, TurnTrace } from '../../types/trace';
+import type {
+  ExternalAgentKind,
+  LifecycleState,
+  ReplayStep,
+  SessionMessageRow,
+  Span,
+  TraceTurnSummary,
+  TurnStatusKind,
+  TurnTrace,
+} from '../../types/trace';
 import { isChatTurn } from '../../types/trace';
 
 /**
@@ -164,12 +173,72 @@ export function findStep(trace: TurnTrace | undefined, stepId: string): ReplaySt
 }
 
 /**
- * A turn with a fetched-but-empty step tree, once it is no longer live, is an
- * external agent (claude/codex) whose loop is opaque — render its transcript
- * instead of a step tree. The `!isTurnLive` gate is essential: a pending /
- * in_progress internal turn can momentarily have zero recorded steps, and must
- * NOT be mislabeled an external agent (it self-corrects as steps land).
+ * Whether a turn's trace is an external agent (claude/codex/gemini) whose
+ * internal loop is opaque — it records no step/span tree ever, so its
+ * transcript is the trace.
+ *
+ * `externalAgent` is the session-level wire marker (`TraceOverview.external_agent`).
+ * When present it is authoritative and the turn qualifies **while it is still
+ * running** — that is the whole point: a live external run would otherwise
+ * show nothing at all until it terminated, because its steps are never coming.
+ *
+ * Without the marker (sessions written before the backend tag reached the
+ * wire) we keep the old heuristic, `!isTurnLive` gate included: a pending /
+ * in_progress *internal* turn can momentarily have zero recorded steps and must
+ * NOT be mislabeled an external agent — it self-corrects as steps land.
  */
-export function isExternalAgentTurn(trace: TurnTrace | undefined, status: TurnStatusKind): boolean {
+export function isExternalAgentTurn(
+  trace: TurnTrace | undefined,
+  status: TurnStatusKind,
+  externalAgent?: ExternalAgentKind | null,
+): boolean {
+  // With the marker there is nothing to wait for — an external session's step
+  // tree is never coming, and its turns are not even fetched, so an unfetched
+  // trace must qualify too. Only an actual tree with steps in it disqualifies.
+  if (externalAgent != null) return !trace || trace.steps.length === 0;
   return !!trace && trace.steps.length === 0 && !isTurnLive(status);
+}
+
+/**
+ * Partition a session transcript across its turns.
+ *
+ * `session_messages` rows carry no `turn_id` — only an ordinal and a
+ * timestamp — so a row belongs to the last turn that had started when it was
+ * written. Rows predating the first turn (an external run persists its task
+ * prompt around the same instant the turn opens, and the two orderings are not
+ * guaranteed) fold into that first turn rather than vanishing, and the newest
+ * turn's window stays open-ended so a live run's rows land as they arrive.
+ *
+ * Superseded rows are dropped: a compaction rewrote them, and replaying the
+ * pre-compaction text as though it were still the transcript would show the
+ * reader history the agent no longer has.
+ *
+ * Returns a map keyed by `turn_id`; turns with no rows are absent.
+ */
+export function partitionTranscript(
+  messages: SessionMessageRow[],
+  turns: TraceTurnSummary[],
+): Map<string, SessionMessageRow[]> {
+  const out = new Map<string, SessionMessageRow[]>();
+  if (turns.length === 0) return out;
+  // Ascending by start; the overview already sorts turns oldest-first, but a
+  // local sort keeps this correct if a caller passes an unordered slice.
+  const bounds = turns
+    .map((t) => ({ id: t.turn_id, at: Date.parse(t.started_at ?? t.created_at) }))
+    .sort((a, b) => a.at - b.at);
+
+  for (const row of messages) {
+    if (row.superseded_by != null) continue;
+    const at = Date.parse(row.created_at);
+    let idx = 0;
+    for (let i = 0; i < bounds.length; i++) {
+      if (Number.isNaN(at) || bounds[i].at <= at) idx = i;
+      else break;
+    }
+    const key = bounds[idx].id;
+    const bucket = out.get(key);
+    if (bucket) bucket.push(row);
+    else out.set(key, [row]);
+  }
+  return out;
 }

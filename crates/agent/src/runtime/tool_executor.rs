@@ -341,12 +341,13 @@ pub struct ToolExecutor {
     /// every [`ToolContext`] this executor builds; `ReadTool` consults it before
     /// the filesystem. `None` ⇒ no virtual reads wired.
     virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
-    /// Runtime hook for backgrounding a slow command. Forwarded into a
-    /// [`ToolContext`] **only when the call is `background_eligible`** (a
-    /// user-facing session) — see [`Self::execute`]. `None` ⇒ no manager
-    /// wired (argv-mode boots, tests), so commands keep kill-on-timeout.
+    /// Runtime hook for backgrounding a slow command, forwarded into every
+    /// [`ToolContext`] this executor builds. Whether a given call may use it
+    /// is the per-turn [`ToolContext::background_eligible`] gate, not the
+    /// presence of this handle. `None` ⇒ no manager wired (argv-mode boots,
+    /// tests), so commands keep kill-on-timeout regardless.
     background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
-    /// Control surface for the `JobList` / `JobStop` tools. Gated like
+    /// Control surface for the `JobList` / `JobStop` tools. Wired like
     /// [`Self::background_jobs`] (same runtime component implements both).
     background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
 }
@@ -488,8 +489,8 @@ impl ToolExecutor {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.lite_llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
-        // Whether this session may background work (user-facing session).
-        // Gates whether the [`BackgroundJobSink`] reaches the tool's ctx.
+        // Whether this turn may create background work — forwarded verbatim
+        // to `ToolContext::background_eligible`, which documents the rule.
         background_eligible: bool,
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
@@ -771,19 +772,9 @@ impl ToolExecutor {
                     // interactive agent loop, so `Edit`/`Write` enforce the
                     // contract here (unlike the background-summary pass).
                     read_tracker: Some(read_tracker),
-                    // Gate: the background-turn sink reaches a tool only for
-                    // user-facing sessions, so a command can convert to
-                    // background on timeout only there.
-                    background_jobs: if background_eligible {
-                        self.background_jobs.clone()
-                    } else {
-                        None
-                    },
-                    background_control: if background_eligible {
-                        self.background_control.clone()
-                    } else {
-                        None
-                    },
+                    background_eligible,
+                    background_jobs: self.background_jobs.clone(),
+                    background_control: self.background_control.clone(),
                     notify_silence,
                 };
 

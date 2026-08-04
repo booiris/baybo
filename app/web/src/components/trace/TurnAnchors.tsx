@@ -5,8 +5,15 @@
  * Clicking one selects the turn and scrolls the tree to it (`data-turn-id`).
  */
 import type { SessionMessageRow, TraceOverview, TurnTrace } from '../../types/trace';
-import { formatDuration, formatTok, summaryTokens, turnDurationMs, turnInputText } from './traceFormat';
-import { turnLabels, turnRollup } from './traceTreeModel';
+import {
+  formatDuration,
+  formatTok,
+  transcriptInputText,
+  turnDurationMs,
+  turnInputText,
+  turnTokens,
+} from './traceFormat';
+import { partitionTranscript, turnLabels, turnRollup } from './traceTreeModel';
 import { scrollToAnchor } from './scrollToAnchor';
 
 export function TurnAnchors({
@@ -28,6 +35,7 @@ export function TurnAnchors({
   };
 
   const labels = turnLabels(overview.turns);
+  const transcripts = partitionTranscript(messageLog, overview.turns);
 
   if (overview.turns.length <= 1) return null;
 
@@ -40,9 +48,16 @@ export function TurnAnchors({
         const trace = turnTraces.get(j.turn_id);
         const rollup = turnRollup(j, trace);
         const active = j.turn_id === activeTurnId;
-        const tokens = summaryTokens(j);
+        const tokens = turnTokens(j, trace);
         const dur = turnDurationMs(j, trace);
-        const input = trace ? turnInputText(trace, messageLog) : null;
+        // A stepless turn (external agent) has no LLM span to read the prompt
+        // off, so fall back to its own slice of the transcript — otherwise the
+        // whole anchor column of an external session reads "no user input
+        // recorded" over transcripts that open with exactly that prompt.
+        const input =
+          trace && trace.steps.length > 0
+            ? turnInputText(trace, messageLog)
+            : transcriptInputText(transcripts.get(j.turn_id) ?? []);
 
         return (
           <button

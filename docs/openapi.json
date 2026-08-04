@@ -4405,6 +4405,45 @@
         }
       }
     },
+    "/v1/traces/{session_id}/lineage": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_trace_lineage",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id whose subagent descendants to fetch",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every subagent session descended from this one, flattened. Each row carries its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), the external-agent backend that ran it (`external_agent`, absent for in-process children), and its turn summaries in the same shape as the overview's `turns`. No step/span tree: the client fetches a child's turn trees lazily through the per-turn endpoint, and an external child has no tree at all. Untyped JSON, consistent with the rest of the per-session traces family.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/traces/{session_id}/turns/{turn_id}": {
       "get": {
         "tags": [
