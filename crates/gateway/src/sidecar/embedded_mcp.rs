@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use baybo_config::BayboConfig;
-use baybo_tools::mcp::{EmbeddedMcpProfile, browser_mcp_profile};
+use baybo_tools::mcp::{BrowserProfileParams, EmbeddedMcpProfile, browser_mcp_profile};
 use baybo_workspace::WorkspacePaths;
 
 use crate::sidecar::SidecarRuntime;
@@ -64,22 +64,32 @@ pub fn collect_profiles(
         .profile_dir
         .as_deref()
         .unwrap_or(workspace_browser_profile.as_path());
+    // Read-only view of the agent's own work dir, so a `file://` URL for
+    // an artefact the agent just wrote resolves inside the container.
+    // Opt-out leaves the container with no view of the workspace at all.
+    let browser_work_dir = workspace_paths.work_dir();
     [runtime.bundle_for("browser").and_then(|bundle| {
-        browser_mcp_profile(
-            config.browser.enable,
-            config.browser.chrome_path.as_deref(),
-            Some(effective_profile_dir),
-            config.browser.sandbox,
-            config.browser.width,
-            config.browser.height,
-            node_cmd.clone(),
-            bundle,
-            &[browser_font_dir.as_path()],
-            config.browser.docker.enable,
-            config.browser.docker.cdp_url.as_deref(),
-            config.browser.docker.web_vnc_port,
-            config.browser.docker.image_tag.as_deref(),
-        )
+        browser_mcp_profile(BrowserProfileParams {
+            enable: config.browser.enable,
+            chrome_path: config.browser.chrome_path.as_deref(),
+            profile_dir: Some(effective_profile_dir),
+            sandbox: config.browser.sandbox,
+            width: config.browser.width,
+            height: config.browser.height,
+            command: node_cmd.clone(),
+            bundle_path: bundle,
+            extra_font_dirs: &[browser_font_dir.as_path()],
+            docker_enable: config.browser.docker.enable,
+            docker_cdp_url: config.browser.docker.cdp_url.as_deref(),
+            docker_web_vnc_port: config.browser.docker.web_vnc_port,
+            docker_image_tag: config.browser.docker.image_tag.as_deref(),
+            docker_work_dir: config
+                .browser
+                .docker
+                .mount_work_dir
+                .then_some(browser_work_dir.as_path()),
+            docker_memory_limit_mb: config.browser.docker.memory_limit_mb,
+        })
     })]
     .into_iter()
     .flatten()
@@ -212,6 +222,74 @@ mod tests {
         assert_eq!(
             env.get("BAYBO_BROWSER_DOCKER_IMAGE_TAG"),
             Some(&"custom/chrome:test".to_string())
+        );
+    }
+
+    /// The work mount is what makes `file://` URLs for agent-written
+    /// artefacts resolve inside the container. It has to point at the
+    /// workspace's `work/` dir specifically — the fonts dir sits one
+    /// level below it, so a wrong accessor here still looks plausible.
+    #[test]
+    fn work_dir_is_mounted_by_default_and_points_at_the_work_root() {
+        let Ok(rt) = SidecarRuntime::install() else {
+            return;
+        };
+        if rt.bundle_for("browser").is_none() {
+            return;
+        }
+        let mut cfg = BayboConfig::default();
+        cfg.browser.enable = true;
+        cfg.browser.docker.enable = true;
+        let profiles = collect_profiles(&rt, &cfg, &ws());
+        assert_eq!(
+            profiles[0]
+                .extra_env
+                .get("BAYBO_BROWSER_DOCKER_WORK_DIR")
+                .expect("work dir is mounted by default"),
+            "/tmp/baybo-test-workspace/work",
+        );
+    }
+
+    #[test]
+    fn mount_work_dir_false_drops_the_mount_entirely() {
+        let Ok(rt) = SidecarRuntime::install() else {
+            return;
+        };
+        if rt.bundle_for("browser").is_none() {
+            return;
+        }
+        let mut cfg = BayboConfig::default();
+        cfg.browser.enable = true;
+        cfg.browser.docker.enable = true;
+        cfg.browser.docker.mount_work_dir = false;
+        let profiles = collect_profiles(&rt, &cfg, &ws());
+        assert!(
+            !profiles[0]
+                .extra_env
+                .contains_key("BAYBO_BROWSER_DOCKER_WORK_DIR"),
+            "opting out must omit the var, not pass an empty path the wrapper would try to bind",
+        );
+    }
+
+    /// The memory ceiling defaults to a real value, so a wiring slip that
+    /// dropped it would leave the deployment uncapped while the config
+    /// still read as capped.
+    #[test]
+    fn memory_ceiling_reaches_the_child_by_default() {
+        let Ok(rt) = SidecarRuntime::install() else {
+            return;
+        };
+        if rt.bundle_for("browser").is_none() {
+            return;
+        }
+        let mut cfg = BayboConfig::default();
+        cfg.browser.enable = true;
+        cfg.browser.docker.enable = true;
+        let profiles = collect_profiles(&rt, &cfg, &ws());
+        let env = &profiles[0].extra_env;
+        assert_eq!(
+            env.get("BAYBO_BROWSER_DOCKER_MEMORY_LIMIT"),
+            Some(&"4096m".to_string()),
         );
     }
 }

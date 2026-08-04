@@ -30,7 +30,7 @@ use crate::ToolCapability;
 use crate::mcp::config::{McpServerEntry, McpTransportConfig, TrustLevelConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
 
-pub use browser::browser_mcp_profile;
+pub use browser::{BrowserProfileParams, browser_mcp_profile};
 
 /// One embedded MCP server's wiring. Tool-domain families build these
 /// via their own `*_mcp_profile()` helper from the corresponding config

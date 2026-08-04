@@ -51,7 +51,22 @@ export interface DockerSpawnOptions {
     imageTag?: string;
     profileDir: string;
     fontDir?: string;
+    /**
+     * Host directory bind-mounted read-only at {@link CONTAINER_WORK_DIR} so
+     * the agent can open artefacts it just wrote via `file://`. Undefined
+     * leaves the container with no view of the workspace at all.
+     */
+    workDir?: string;
     webVncPort?: number;
+    /** `docker run --memory` value, e.g. `4g`. Undefined leaves the container uncapped. */
+    memoryLimit?: string;
+    /** Publish {@link HOST_GATEWAY_ALIAS} via `--add-host`. Requires Docker >= 20.10. */
+    hostGatewayAlias?: boolean;
+    /**
+     * Chrome's `--disk-cache-size` in bytes, forwarded to the entrypoint so
+     * both modes cap the (bind-mounted, never-swept) profile identically.
+     */
+    diskCacheBytes: number;
     viewport: { width: number; height: number };
     onPhase: (p: DockerPhase) => void;
     /**
@@ -60,6 +75,24 @@ export interface DockerSpawnOptions {
      */
     neverBuild?: boolean;
 }
+
+/** Where {@link DockerSpawnOptions.profileDir} lands inside the container. */
+export const CONTAINER_PROFILE_DIR = "/data/profile";
+/** Where {@link DockerSpawnOptions.fontDir} lands inside the container. */
+export const CONTAINER_FONTS_DIR = "/data/fonts";
+/** Where {@link DockerSpawnOptions.workDir} lands inside the container. */
+export const CONTAINER_WORK_DIR = "/data/work";
+
+/**
+ * Cap on the container's **task** count. `--pids-limit` writes cgroup
+ * `pids.max`, which counts threads, not processes — and Chrome is
+ * lavishly threaded: a measured 7-tab browser sat at 386 tasks across 29
+ * processes, roughly 55 tasks per tab. A cap sized as if it counted
+ * processes would strangle a normal working set. 8192 leaves ~20x
+ * headroom over that measurement while still stopping a fork bomb in
+ * page JS before it reaches the host's pid space.
+ */
+const CONTAINER_PIDS_LIMIT = 8192;
 
 export interface DockerHandle {
     cdpUrl: string;
@@ -83,6 +116,26 @@ const BUILD_STDERR_TAIL_LINES = 30;
  * an unbounded build on the watchdog's repair path takes the watchdog with it.
  */
 const BUILD_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * The `host-gateway` magic value for `--add-host` landed in Docker 20.10.
+ * Passing it to an older daemon fails the whole `docker run`, which would
+ * demote the operator to host-headless over a diagnostic nicety — so the
+ * flag is gated on the version we already read in
+ * {@link checkDockerAvailable}. Unparseable versions are treated as too
+ * old: losing the alias costs a hint, losing the container costs the mode.
+ */
+export function supportsHostGateway(serverVersion: string): boolean {
+    const m = serverVersion.trim().match(/^(\d+)\.(\d+)/);
+    if (!m || m[1] === undefined || m[2] === undefined) return false;
+    const major = Number(m[1]);
+    const minor = Number(m[2]);
+    if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
+    return major > 20 || (major === 20 && minor >= 10);
+}
+
+/** Docker's conventional alias for the host, published via `--add-host`. */
+export const HOST_GATEWAY_ALIAS = "host.docker.internal";
 
 export async function checkDockerAvailable(): Promise<
     { ok: true; serverVersion: string } | { ok: false; reason: string }
@@ -144,12 +197,62 @@ export async function sweepStaleContainers(): Promise<void> {
     }
 }
 
+/**
+ * Drop `baybo-browser:*` images that nothing references and that are past
+ * {@link STALE_IMAGE_MAX_AGE_DAYS}.
+ *
+ * The image tag is a content hash of `Dockerfile` + `entrypoint.sh`, so
+ * every edit to either mints a fresh ~1.3 GB image and the old one is
+ * never looked at again. Nothing upstream reclaims them; a handful of
+ * Dockerfile revisions is several gigabytes of dead layers.
+ *
+ * `keepTag` is the image this process is about to run — it may be newly
+ * built and is therefore young, but pinning it explicitly means a clock
+ * skew can't make us delete the image we depend on. `docker rmi` refuses
+ * to remove an image a container still references, including exited
+ * ones, so that case needs no special handling here.
+ */
+export async function sweepStaleImages(keepTag?: string): Promise<void> {
+    let stdout: string;
+    try {
+        const r = await exec(
+            "docker",
+            ["images", "baybo-browser", "--format", "{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}"],
+            { timeout: 5000 },
+        );
+        stdout = r.stdout;
+    } catch (e) {
+        log(`image sweep: docker images failed (${(e as Error).message}); skipping`);
+        return;
+    }
+    for (const line of stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0)) {
+        const [tag, createdAt] = line.split("\t");
+        if (tag === undefined || tag.startsWith("baybo-browser:<none>")) continue;
+        if (tag === keepTag) continue;
+        if (createdAt === undefined || createdAt.length === 0) continue;
+        const ageDays = parseDockerCreatedAtAgeDays(createdAt);
+        if (ageDays === undefined || ageDays <= STALE_IMAGE_MAX_AGE_DAYS) continue;
+        try {
+            await exec("docker", ["rmi", tag], { timeout: 30_000 });
+            log(`image sweep: removed ${tag} (${ageDays.toFixed(1)} days old, unreferenced)`);
+        } catch (e) {
+            // Almost always "image is referenced in multiple repositories"
+            // or a container still holding it. Both are correct refusals.
+            logDebug(`image sweep: docker rmi ${tag} skipped (${(e as Error).message.split("\n")[0]})`);
+        }
+    }
+}
+
 export function isPidAlive(pid: number): boolean {
     try {
         process.kill(pid, 0);
         return true;
-    } catch {
-        return false;
+    } catch (e) {
+        // EPERM means the process EXISTS but belongs to another uid — we
+        // are not allowed to signal it. Reading that as "dead" inverts the
+        // check: the sweep would force-remove the container of a *running*
+        // sidecar owned by a different user on the same host.
+        return (e as NodeJS.ErrnoException).code === "EPERM";
     }
 }
 
@@ -370,6 +473,9 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     if (opts.fontDir !== undefined) {
         rejectColonInBindPath(opts.fontDir, "<workspace>/work/.fonts (font bind-mount source)");
     }
+    if (opts.workDir !== undefined) {
+        rejectColonInBindPath(opts.workDir, "<workspace>/work (work bind-mount source)");
+    }
 
     const tag = await resolveImageTag(opts);
 
@@ -410,10 +516,13 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
         "--user",
         `${uid}:${gid}`,
         "--shm-size=2g",
+        `--pids-limit=${CONTAINER_PIDS_LIMIT}`,
         "-v",
-        `${opts.profileDir}:/data/profile`,
+        `${opts.profileDir}:${CONTAINER_PROFILE_DIR}`,
         "-e",
         `VIEWPORT=${viewport}`,
+        "-e",
+        `DISK_CACHE_SIZE=${opts.diskCacheBytes}`,
         // Container port 9223 is the socat relay (entrypoint.sh) bound to
         // 0.0.0.0, which forwards to Chrome's loopback-only 127.0.0.1:9222.
         // Chrome 134+ silently ignores `--remote-debugging-address=0.0.0.0`
@@ -422,8 +531,44 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
         "-p",
         "127.0.0.1::9223",
     ];
+    // Chrome's `localhost` is this container, which is the single most
+    // confusing thing about docker mode. Publishing the bridge gateway
+    // under docker's conventional name gives the agent a name that
+    // resolves *correctly* — and, on a host whose DNS is rewritten by a
+    // proxy, an /etc/hosts entry is what stops that name from silently
+    // resolving to a decoy that accepts connections and returns nothing.
+    if (opts.hostGatewayAlias === true) {
+        runArgs.push("--add-host", `${HOST_GATEWAY_ALIAS}:host-gateway`);
+    }
     if (opts.fontDir !== undefined) {
-        runArgs.push("-v", `${opts.fontDir}:/data/fonts:ro`);
+        runArgs.push("-v", `${opts.fontDir}:${CONTAINER_FONTS_DIR}:ro`);
+    }
+    // Read-only on purpose. The agent needs to *view* what it just wrote
+    // (an HTML report, a rendered chart); it has a filesystem tool for
+    // writing. Read-only also keeps page JS from reaching back into the
+    // workspace through a `file://` origin.
+    if (opts.workDir !== undefined) {
+        runArgs.push("-v", `${opts.workDir}:${CONTAINER_WORK_DIR}:ro`);
+    }
+    // Without a limit the container inherits the host's memory. Chrome
+    // never gives a tab back, so "unbounded" is the operative word: the
+    // ceiling is whatever the host has, and the host OOM killer picks the
+    // victim — possibly the gateway.
+    //
+    // What a cap buys is containment, NOT automatic recovery. The cgroup
+    // OOM killer picks within the container, and Chrome renderers carry
+    // `oom_score_adj=300` so a tab dies first; the browser process and the
+    // CDP relay survive, which means the watchdog's `/json/version` probe
+    // still answers and `recover()` never fires. The agent sees a dead tab
+    // (a page that stops responding), the host sees nothing. Detecting
+    // renderer death would need a CDP `Target.targetCrashed` subscription,
+    // which the watchdog does not have.
+    //
+    // `--memory-swap` equal to `--memory` disables swap for the container
+    // on purpose: swapping a browser trades an honest OOM for minutes of
+    // thrash that looks like a hang.
+    if (opts.memoryLimit !== undefined) {
+        runArgs.push(`--memory=${opts.memoryLimit}`, `--memory-swap=${opts.memoryLimit}`);
     }
     // Browser-based VNC observability via noVNC + websockify on
     // webVncPort. x11vnc runs on a fixed internal :5900 inside the

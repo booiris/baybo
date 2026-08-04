@@ -13,7 +13,11 @@ declare module "chrome-devtools-mcp" {
     proxyServer?: string | undefined;
     viewport?: { width: number; height: number } | undefined;
     redactNetworkHeaders: boolean;
-    categoryNavigationAutomation: boolean;
+    // Keys are `category<Capitalised ToolCategory value>`; CDDM derives
+    // them from the category string at runtime, so a mistyped key is not
+    // a type error there — it just never matches and the category keeps
+    // its default.
+    categoryNavigation: boolean;
     categoryDebugging: boolean;
     categoryEmulation: boolean;
     categoryPerformance: boolean;
@@ -21,6 +25,7 @@ declare module "chrome-devtools-mcp" {
     categoryExtensions: boolean;
     slim: boolean;
     experimentalPageIdRouting?: boolean | undefined;
+    experimentalStructuredContent?: boolean | undefined;
     [extra: string]: unknown;
   }
 
