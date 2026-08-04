@@ -299,15 +299,26 @@ pub struct Session {
 }
 
 impl Session {
-    /// Whether this session can host background jobs (detached subagents
-    /// or detached `Bash` commands). Only a live, registered, top-level
-    /// **user** session can run the autonomous notification turn that
-    /// delivers a background result, so cron sessions (one-shot +
-    /// unregistered) and subagent sessions (their turn ends with the
-    /// child) are out of scope and keep blocking / kill-on-timeout
-    /// behaviour.
-    pub fn supports_background_jobs(&self) -> bool {
-        matches!(self.trigger, TriggerSource::User)
+    /// Whether a background job's completion notification could land here —
+    /// the **session** half of the background-job gate (detached subagents
+    /// and detached `Bash` commands).
+    ///
+    /// Delivering a background result means running an autonomous
+    /// notification turn in a conversation the user can open and read, so
+    /// the requirement is a live, registered, user-visible conversation.
+    /// Top-level user sessions qualify, and so does a recurring cron fire's
+    /// own conversation: it is listed, replyable and pushable, and its actor
+    /// is registered with the supervisor exactly so a reply reaches it (see
+    /// `agent::actor::router::cron`). A one-shot fire's workspace is
+    /// invisible and deliberately unregistered, and a subagent session's
+    /// turn ends with the child, so both keep blocking / kill-on-timeout.
+    ///
+    /// The **turn** half lives in the agent loop: a cron fire's own turn
+    /// must still block rather than convert, so the fire's report is
+    /// complete by the time it notifies. See
+    /// `agent::runtime::background_jobs::background_eligible`.
+    pub fn can_host_background_jobs(&self) -> bool {
+        (matches!(self.trigger, TriggerSource::User) || self.trigger.is_cron_conversation())
             && match &self.lineage {
                 None => true,
                 Some(l) => !matches!(l.kind, LineageKind::Subagent),

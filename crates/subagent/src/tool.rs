@@ -109,7 +109,8 @@ struct SpawnParams {
     #[serde(default)]
     background: bool,
     /// `"background"` (default) or `"kill"`: what to do when a foreground
-    /// spawn exceeds its 2-minute foreground wait in a user session.
+    /// spawn exceeds its 2-minute foreground wait. Ignored when the turn is
+    /// not `ToolContext::background_eligible`.
     #[serde(default)]
     on_timeout: Option<String>,
     #[serde(default)]
@@ -490,7 +491,7 @@ fn parameters_schema() -> Value {
             "on_timeout": {
                 "type": "string",
                 "enum": ["background", "kill"],
-                "description": "What to do if a foreground (background=false) subagent is still running after a 2-minute foreground wait. 'background' (default) detaches it — you get a handle now and a notification when it finishes — so a slow subagent never blocks you. 'kill' cancels it and returns a timeout instead. Only applies to foreground spawns from a top-level user chat; ignored when background=true."
+                "description": "What to do if a foreground (background=false) subagent is still running after a 2-minute foreground wait. 'background' (default) detaches it — you get a handle now and a notification when it finishes — so a slow subagent never blocks you. 'kill' cancels it and returns a timeout instead. Ignored when background=true, during a scheduled job's own run, and in nested subagents — those always block until the child finishes."
             },
             "group": {
                 "type": "string",
@@ -579,6 +580,7 @@ impl Tool for SpawnSubagentTool {
             turn_id: ctx.turn_id,
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
+            background_eligible: ctx.background_eligible,
         };
         let mut request = request;
         request.fan_out_root = Some(root_session_id.clone());

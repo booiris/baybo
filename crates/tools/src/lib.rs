@@ -338,14 +338,25 @@ pub struct ToolContext {
     /// for the interactive agent loop**; argv-mode / test call sites leave it
     /// `None`, which disables the contract. See [`ReadTracker`].
     pub read_tracker: Option<ReadTracker>,
+    /// Whether this call may **create** background work: a `Bash` command
+    /// that converts to background on timeout, or a subagent that converts
+    /// (or is dispatched) instead of blocking. Decided per turn by the agent
+    /// loop — the session must be somewhere a completion notification can
+    /// land, and the turn must not be a cron fire's own turn (a fire blocks
+    /// so its report is complete when it notifies). `false` for cron fires,
+    /// nested subagents and argv-mode boots, which keep kill-on-timeout.
+    ///
+    /// Observing existing jobs is not creating work, so `JobList` / `JobStop`
+    /// deliberately ignore this and go straight to
+    /// [`Self::background_control`].
+    pub background_eligible: bool,
     /// Runtime hook for detaching a slow command into the background.
-    /// `Some` **only for user-facing sessions** (the runtime gates the
-    /// injection), so its presence is the "may this command convert to
-    /// background on timeout" signal. `None` for cron / nested-subagent
-    /// sessions and argv-mode boots — those keep kill-on-timeout.
+    /// A capability handle, not a policy switch: `None` only when the
+    /// runtime has no background-job manager wired (argv-mode boots, tests).
+    /// Whether a given call may use it is [`Self::background_eligible`].
     pub background_jobs: Option<Arc<dyn BackgroundJobSink>>,
     /// View + control of this session's in-flight background jobs, for the
-    /// `JobList` / `JobStop` tools. Gated like [`Self::background_jobs`].
+    /// `JobList` / `JobStop` tools. Wired like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
     /// Handle a tool flips to suppress this turn's user-facing notification.
     /// `Some` **only for a recurring cron fire turn** (wired by the actor's
@@ -392,6 +403,10 @@ impl ToolContext {
             secrets: None,
             virtual_reads: None,
             read_tracker: None,
+            // Inert on its own — nothing backgrounds until a test also wires
+            // `background_jobs`, so defaulting to eligible keeps a fixture
+            // that wires the sink meaning what it says.
+            background_eligible: true,
             background_jobs: None,
             background_control: None,
             notify_silence: None,

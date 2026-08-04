@@ -155,6 +155,13 @@ pub struct SubagentParentContext {
     /// tool span to the child session.
     pub span_id: SpanId,
     pub cancel_token: CancellationToken,
+    /// Whether the dispatching turn may create background work — the gate
+    /// the agent loop computed for this turn (see
+    /// `ToolContext::background_eligible`), carried through the tool so the
+    /// spawner does not re-derive it from the parent session alone and miss
+    /// the turn half. `false` makes a foreground spawn block until terminal
+    /// and downgrades an explicit `background: true` to a blocking run.
+    pub background_eligible: bool,
 }
 
 #[derive(Debug, Clone)]

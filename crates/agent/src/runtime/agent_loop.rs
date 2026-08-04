@@ -10,7 +10,7 @@ use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
     ChatMessage, ContentBlock, LlmEntryName, MessageSource, ThinkingContent, TurnId,
 };
-use baybo_turn::{TurnInput, TurnLifecycle, TurnOutput};
+use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -825,7 +825,7 @@ impl AgentLoop {
         // Memory recall query (and write eligibility) for this turn — `None`
         // for kinds that don't participate (Spawned / notification).
         let memory_query = memory_recall_query(&turn_input);
-        let is_user_turn = matches!(turn_input.input_kind(), baybo_turn::TurnInputKind::UserChat);
+        let turn_kind = turn_input.input_kind();
         let spec = TurnSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
@@ -861,7 +861,7 @@ impl AgentLoop {
                         cancel_token,
                         interjections,
                         memory_query,
-                        is_user_turn,
+                        turn_kind,
                         notify_silence.clone(),
                     )
                     .await?;
@@ -918,9 +918,12 @@ impl AgentLoop {
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
-        is_user_turn: bool,
+        turn_kind: TurnInputKind,
         notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
+        let is_user_turn = matches!(turn_kind, TurnInputKind::UserChat);
+        let background_eligible =
+            crate::runtime::background_jobs::background_eligible(session, turn_kind);
         self.context_manager.ensure_seeded().await;
 
         // Fire-and-forget at turn start so the title derives concurrently with
@@ -1096,6 +1099,7 @@ impl AgentLoop {
                         notifier.clone(),
                         &cancel_token,
                         &mut turn_attachments,
+                        background_eligible,
                         notify_silence.clone(),
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
@@ -1201,6 +1205,9 @@ impl AgentLoop {
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
         turn_attachments: &mut Vec<ContentBlock>,
+        // Whether this turn may create background work — computed once per
+        // turn in `run_inner`.
+        background_eligible: bool,
         notify_silence: Option<baybo_tools::NotifySilence>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
@@ -1335,10 +1342,6 @@ impl AgentLoop {
         // sessions resolve to the built-in.
         let agent_for_calls = session.state.agent_id_or_builtin();
         let user_for_calls = session.user.clone();
-        // Gate (Copy, captured per closure): only a user-facing session may
-        // background a slow command — keeps cron / nested-subagent bash on
-        // kill-on-timeout. Mirrors the subagent-conversion gate.
-        let background_eligible = session.supports_background_jobs();
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();

@@ -562,10 +562,11 @@ struct Params {
     cwd: Option<PathBuf>,
     #[serde(default)]
     secret_env: Vec<String>,
-    /// `"background"` (default) or `"kill"`: in a user chat, what to do
-    /// when the command exceeds its timeout. `background` detaches it
-    /// (you get a handle + a completion notification); `kill` keeps the
-    /// old kill-on-timeout behaviour. Ignored outside user sessions.
+    /// `"background"` (default) or `"kill"`: what to do when the command
+    /// exceeds its timeout. `background` detaches it (you get a handle + a
+    /// completion notification); `kill` keeps the old kill-on-timeout
+    /// behaviour. Ignored when the turn is not
+    /// [`ToolContext::background_eligible`](crate::ToolContext::background_eligible).
     #[serde(default)]
     on_timeout: Option<String>,
 }
@@ -593,7 +594,7 @@ impl Tool for BashTool {
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
                 "cwd":        { "type": "string", "description": "Working directory for the command" },
                 "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
-                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout in a user chat. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' keeps the old behaviour (terminate + return a timeout error). Ignored in cron / nested-subagent sessions, which always kill on timeout." }
+                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' keeps the old behaviour (terminate + return a timeout error). Ignored during a scheduled job's own run and in nested subagents, which always kill on timeout." }
             },
             "required": ["command"]
         })
@@ -800,9 +801,9 @@ impl Tool for BashTool {
             execution_route.detached_route()
         };
 
-        // Convertible path: in a user session (sink present) the default
-        // `on_timeout` detaches a command that overruns its budget instead
-        // of killing it. `run_detached` returns `Some` on success (completed
+        // Convertible path: when the turn may create background work the
+        // default `on_timeout` detaches a command that overruns its budget
+        // instead of killing it. `run_detached` returns `Some` on success (completed
         // in-window, or backgrounded) and `None` if it couldn't detach
         // (sandbox backend without detached support), in which case we fall
         // through to the blocking kill-on-timeout path below.
@@ -815,6 +816,7 @@ impl Tool for BashTool {
             .map(str::trim)
             .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
+            && ctx.background_eligible
             && let Some(detached_route) = detached_route
             && let Some(sink) = ctx.background_jobs.clone()
             && let Some(output) = run_detached(
@@ -3896,6 +3898,38 @@ mod tests {
             recorded.map(|(_, cmd)| cmd),
             Some("sleep 30".to_string()),
             "permission=free must use the detached background path"
+        );
+    }
+
+    /// An ineligible turn (a cron fire's own run, a nested subagent) keeps
+    /// kill-on-timeout even with a sink wired: the sink is a capability, the
+    /// gate is `background_eligible`. Same command + timeout as the test
+    /// above, which backgrounds.
+    #[tokio::test]
+    async fn an_ineligible_turn_kills_on_timeout_despite_a_wired_sink() {
+        let (mut ctx, seen) = ctx_for_detached();
+        ctx.sandbox = None;
+        ctx.background_eligible = false;
+        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+
+        let err = tool
+            .execute(
+                json!({
+                    "command": "sleep 30",
+                    "timeout_ms": 150,
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("an ineligible turn must time out, not background");
+
+        assert!(
+            matches!(err, ToolError::Timeout(_)),
+            "expected a timeout error, got {err:?}"
+        );
+        assert!(
+            seen.lock().is_none(),
+            "an ineligible turn must not reach the background sink"
         );
     }
 
