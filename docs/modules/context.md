@@ -163,8 +163,25 @@ honest, in ascending order of cost:
    same file produces an identical update that the dedupe drops — repeated
    self-edits cost one row, not one per edit.
 
-   That last property is exactly why the claim has to be **verified rather than
-   assumed**, and `verified_self_edited_paths` is where it is. Keying on "this
+   **Once the model has rewritten a file, its own copy — not `messages[0]` — is
+   what the next change is diffed against.** The elision above is what makes
+   this necessary: the model's body never entered the transcript, so the leading
+   row stays stale by an entire rewrite and a later one-line change by somebody
+   else diffs to both copies of the file and loses to sending it whole. That is
+   how a renamed persona came out as its own full text. A `Write`'s `content`
+   parameter *is* the new body and is sitting in the transcript verbatim, so it
+   is the baseline instead, and the block says which copy it is against:
+   `<tag path="…" diff changed_since_you_wrote_it>`. An `Edit` names the fragment
+   it replaced rather than the result, leaves no copy, and keeps the leading row
+   — which an edit leaves only slightly stale. Two consequences fall out: a
+   `touch` that changed no bytes goes back to being the pointer instead of a full
+   resend, and the size guard for this block alone does **not** charge its framing
+   paragraph — a plain diff and a full body say the same thing and compete on
+   size, but no full body can say that the model's own write was overwritten or
+   where.
+
+   That elision is exactly why the claim has to be **verified rather than
+   assumed**, and `self_written_sections` is where it is. Keying on "this
    conversation's `Edit`/`Write` named this path" is not the same question: a
    persona file is writable by more than one writer — the shared
    `personas/USER.md` by every agent, an `IDENTITY.md` by the agents admin API,
@@ -183,8 +200,10 @@ honest, in ascending order of cost:
    failed and denied writes as well, carrying the pre-call anchor, which is what
    made it the wrong input). It rides the persisted `ToolResult`, so the check
    survives rehydration with the transcript instead of living in a field. Newest
-   write per path wins; a live `stat` that no longer matches drops the path and
-   the section is diffed honestly instead. Every miss falls the safe way — an
+   write per path wins — body as well as fingerprint, so an `Edit` after a
+   `Write` does not leave the pre-edit copy behind as a baseline — and a live
+   `stat` that no longer matches turns the pointer into the diff described
+   above. Every miss falls the safe way — an
    unstamped call, a path that fails to match (a symlink, a `..` spelling), a
    hint with no file behind it — toward saying more, never toward claiming
    authorship.

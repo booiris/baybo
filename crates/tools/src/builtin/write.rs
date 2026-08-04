@@ -28,9 +28,11 @@ use super::managed_repo::{
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
-/// Named once: `name()`, rejection messages, and the `Tool:` trailer of
-/// every audit commit have to agree.
-pub(crate) const WRITE_TOOL_NAME: &str = "Write";
+/// Named once: `name()`, rejection messages, the `Tool:` trailer of every
+/// audit commit, and `baybo-context` — which tells a whole-file rewrite apart
+/// from an `Edit` when it looks for the copy of a file the model is holding —
+/// all have to agree.
+pub const WRITE_TOOL_NAME: &str = "Write";
 
 pub struct WriteTool {
     roots: ManagedRoots,
