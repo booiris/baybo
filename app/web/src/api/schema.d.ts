@@ -1016,6 +1016,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/{session_id}/lineage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_trace_lineage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/traces/{session_id}/turns/{turn_id}": {
         parameters: {
             query?: never;
@@ -6073,6 +6089,38 @@ export interface operations {
             };
             /** @description No trace for that session */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_trace_lineage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id whose subagent descendants to fetch */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every subagent session descended from this one, flattened. Each row carries its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), the external-agent backend that ran it (`external_agent`, absent for in-process children), and its turn summaries in the same shape as the overview's `turns`. No step/span tree: the client fetches a child's turn trees lazily through the per-turn endpoint, and an external child has no tree at all. Untyped JSON, consistent with the rest of the per-session traces family. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

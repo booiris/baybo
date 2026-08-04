@@ -3,9 +3,12 @@ import type { components } from './schema';
 import type {
   ChatMessage,
   LifecycleState,
+  LineageSession,
+  SessionMessageRow,
   Span,
   Step,
   StepKind,
+  ToolCallBegin,
   TraceOverview,
   TraceTurnSummary,
   TurnTrace,
@@ -331,8 +334,21 @@ function interjectMsg(text: string): ChatMessage {
 interface MockSessionFixture {
   turns: TurnTrace[];
   overview: TraceOverview;
+  lineage: LineageSession[];
 }
+
+/** A subagent session hanging off the fixture's parent. */
+interface MockChild {
+  overview: TraceOverview;
+  turns: TurnTrace[];
+  lineage: LineageSession;
+}
+
 const mockFixtures = new Map<string, MockSessionFixture>();
+// Child sessions are addressable in their own right — the page fetches each
+// expanded child's overview, and the reader can open one as a full page.
+const mockChildOverviews = new Map<string, TraceOverview>();
+const mockChildTurns = new Map<string, TurnTrace>();
 
 function buildMockSession(sessionId: string): MockSessionFixture {
   const cached = mockFixtures.get(sessionId);
@@ -606,6 +622,84 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     cache_creation_input_tokens: 30,
   };
 
+  // Third turn: STILL RUNNING, and its only work is a subagent it spawned onto
+  // the claude backend. Exercises the cases the earlier fixtures couldn't —
+  // a live turn, an external child with zero steps whose transcript IS its
+  // trace, an in-flight tool call with no result yet, and the nesting of a
+  // child session under the `spawn_subagent` span that opened it.
+  const turn3 = mid('turn');
+  const t2 = t1 + 60_000;
+  const turn3Created = new Date(t2 - 150).toISOString();
+  const turn3Started = new Date(t2).toISOString();
+
+  const it4Start = new Date(t2 + 50);
+  const it4Step = step(turn3, { kind: 'llm_iteration' }, it4Start, null, { outcome: 'pending' });
+  const it4Llm = llmSpan(
+    it4Step.id,
+    'claude-sonnet-4-6',
+    [systemMsg('You are a helpful assistant.'), userMsg('Have claude audit the error paths.')],
+    '',
+    [{ id: 'tu_sa2', name: 'spawn_subagent', arguments: { backend: 'claude', prompt: 'Audit the error paths' } }],
+    410,
+    58,
+    it4Start,
+    new Date(t2 + 900),
+  );
+  const liveSpawnSpan: Span = {
+    ...toolSpan(
+      it4Step.id,
+      'spawn_subagent',
+      it4Llm.id,
+      'tu_sa2',
+      { backend: 'claude', subagent_type: 'general-purpose', prompt: 'Audit the error paths' },
+      null,
+      new Date(t2 + 950),
+      new Date(t2 + 950),
+    ),
+    ended_at: null,
+    outcome: { outcome: 'pending' },
+  };
+  liveSpawnSpan.kind = {
+    kind: 'tool_call',
+    begin: (liveSpawnSpan.kind as { kind: 'tool_call'; begin: ToolCallBegin }).begin,
+    result: null,
+  };
+
+  const turn3Trace: TurnTrace = {
+    turn_id: turn3,
+    session_id: sessionId,
+    turn_status_kind: 'in_progress',
+    turn_input_kind: 'user_chat',
+    created_at: turn3Created,
+    started_at: turn3Started,
+    ended_at: null,
+    steps: [{ step: it4Step, spans: [it4Llm, liveSpawnSpan] }],
+  };
+
+  const turn3Summary: TraceTurnSummary = {
+    turn_id: turn3,
+    session_id: sessionId,
+    turn_status_kind: 'in_progress',
+    turn_input_kind: 'user_chat',
+    created_at: turn3Created,
+    started_at: turn3Started,
+    ended_at: null,
+    input_tokens: 410,
+    output_tokens: 58,
+    cached_input_tokens: 246,
+    cache_creation_input_tokens: 41,
+  };
+
+  const children = [
+    buildExplorerChild(sessionId, turn2, spawnSpan.id, t1),
+    buildClaudeChild(sessionId, turn3, liveSpawnSpan.id, t2),
+  ];
+  for (const child of children) {
+    mockChildOverviews.set(child.overview.session_id, child.overview);
+    for (const t of child.turns) mockChildTurns.set(t.turn_id, t);
+  }
+  const lineage = children.map((c) => c.lineage);
+
   const overview: TraceOverview = {
     session_id: sessionId,
     // Mock spans use `LlmCallInputs::Inline`, so the transcript log isn't
@@ -620,22 +714,239 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         message: interjectMsg('Actually, also tell me the package name.'),
       },
     ],
-    turns: [turn1Summary, turn2Summary],
+    turns: [turn1Summary, turn2Summary, turn3Summary],
     supersede_watermark: null,
   };
 
-  const fixture: MockSessionFixture = { turns: [turn1Trace, turn2Trace], overview };
+  const fixture: MockSessionFixture = {
+    turns: [turn1Trace, turn2Trace, turn3Trace],
+    overview,
+    lineage,
+  };
   mockFixtures.set(sessionId, fixture);
   return fixture;
 }
 
+// A baybo-backed subagent: it has a real step tree, so it exercises nesting a
+// full `Turn → Step → Span` subtree under the parent's spawn span.
+function buildExplorerChild(
+  parentSessionId: string,
+  parentTurnId: string,
+  parentSpanId: string,
+  base: number,
+): MockChild {
+  const childSession = 'sess-child-explorer';
+  const childTurn = mid('turn');
+  const started = new Date(base + 220);
+  const ended = new Date(base + 660);
+  const iterStep = step(childTurn, { kind: 'llm_iteration' }, started, ended);
+  const iterLlm = llmSpan(
+    iterStep.id,
+    'claude-haiku-4-5',
+    [systemMsg('You are an explorer subagent.'), userMsg('Find where the test fixtures live')],
+    'Fixtures live under app/web/src/test.',
+    [{ id: 'tu_c1', name: 'grep', arguments: { pattern: 'fixture' } }],
+    140,
+    28,
+    started,
+    new Date(base + 400),
+  );
+  const grepTool = toolSpan(
+    iterStep.id,
+    'grep',
+    iterLlm.id,
+    'tu_c1',
+    { pattern: 'fixture' },
+    { matches: ['app/web/src/test/domGaps.ts'] },
+    new Date(base + 420),
+    ended,
+  );
+
+  const summary: TraceTurnSummary = {
+    turn_id: childTurn,
+    session_id: childSession,
+    turn_status_kind: 'completed',
+    turn_input_kind: 'spawned',
+    created_at: started.toISOString(),
+    started_at: started.toISOString(),
+    ended_at: ended.toISOString(),
+    input_tokens: 140,
+    output_tokens: 28,
+    cached_input_tokens: 84,
+    cache_creation_input_tokens: 14,
+  };
+
+  return {
+    overview: {
+      session_id: childSession,
+      session_messages: [],
+      turns: [summary],
+      supersede_watermark: null,
+      subagent_type: 'explorer',
+    },
+    turns: [
+      {
+        turn_id: childTurn,
+        session_id: childSession,
+        turn_status_kind: 'completed',
+        turn_input_kind: 'spawned',
+        created_at: started.toISOString(),
+        started_at: started.toISOString(),
+        ended_at: ended.toISOString(),
+        steps: [{ step: iterStep, spans: [iterLlm, grepTool] }],
+      },
+    ],
+    lineage: {
+      session_id: childSession,
+      parent_session_id: parentSessionId,
+      parent_turn_id: parentTurnId,
+      parent_span_id: parentSpanId,
+      subagent_type: 'explorer',
+      turns: [summary],
+    },
+  };
+}
+
+// An EXTERNAL (claude) subagent, still running: zero steps forever, so its
+// transcript is the only trace it will ever have — including the tool call at
+// the end that has not returned yet.
+function buildClaudeChild(
+  parentSessionId: string,
+  parentTurnId: string,
+  parentSpanId: string,
+  base: number,
+): MockChild {
+  const childSession = 'sess-child-claude';
+  const childTurn = mid('turn');
+  const started = new Date(base + 1000);
+
+  const messages: SessionMessageRow[] = [
+    {
+      ordinal: 1,
+      superseded_by: null,
+      created_at: new Date(base + 1000).toISOString(),
+      message: userMsg('Audit the error paths in crates/gateway and report anything unhandled.'),
+    },
+    {
+      ordinal: 2,
+      superseded_by: null,
+      created_at: new Date(base + 2400).toISOString(),
+      message: {
+        role: 'assistant',
+        content: [
+          { Thinking: { id: null, content: [{ kind: 'summary', text: 'Start by finding the error enum.' }] } },
+          { Text: 'Let me look at the gateway error type first.' },
+          { ToolUse: { id: 'ctu_1', name: 'Bash', input: { command: 'rg -n "enum GatewayError" -A 20' } } },
+        ],
+        source: 'agent',
+      },
+    },
+    {
+      ordinal: 3,
+      superseded_by: null,
+      created_at: new Date(base + 3900).toISOString(),
+      message: {
+        role: 'tool',
+        content: [
+          {
+            ToolResult: {
+              tool_use_id: 'ctu_1',
+              content: 'crates/gateway/src/error.rs:14:pub enum GatewayError {\n  NotFound(String),\n  Trace(String),',
+            },
+          },
+        ],
+        source: 'agent',
+      },
+    },
+    {
+      ordinal: 4,
+      superseded_by: null,
+      created_at: new Date(base + 5200).toISOString(),
+      message: {
+        role: 'assistant',
+        content: [
+          { Text: 'Three variants map to 500s without a reason string. Checking the handlers now.' },
+          { ToolUse: { id: 'ctu_2', name: 'Read', input: { file_path: 'crates/gateway/src/api/admin/traces.rs' } } },
+        ],
+        source: 'agent',
+      },
+    },
+  ];
+
+  const summary: TraceTurnSummary = {
+    turn_id: childTurn,
+    session_id: childSession,
+    turn_status_kind: 'in_progress',
+    turn_input_kind: 'spawned',
+    created_at: started.toISOString(),
+    started_at: started.toISOString(),
+    ended_at: null,
+    input_tokens: 8_400,
+    output_tokens: 610,
+    cached_input_tokens: 6_100,
+    cache_creation_input_tokens: 900,
+  };
+
+  return {
+    overview: {
+      session_id: childSession,
+      session_messages: messages,
+      turns: [summary],
+      supersede_watermark: null,
+      external_agent: 'claude',
+      subagent_type: 'general-purpose',
+    },
+    turns: [
+      {
+        turn_id: childTurn,
+        session_id: childSession,
+        turn_status_kind: 'in_progress',
+        turn_input_kind: 'spawned',
+        created_at: started.toISOString(),
+        started_at: started.toISOString(),
+        ended_at: null,
+        steps: [],
+      },
+    ],
+    lineage: {
+      session_id: childSession,
+      parent_session_id: parentSessionId,
+      parent_turn_id: parentTurnId,
+      parent_span_id: parentSpanId,
+      external_agent: 'claude',
+      subagent_type: 'general-purpose',
+      turns: [summary],
+    },
+  };
+}
+
+/** The subagent sessions the fixture spawns, by the fixed ids they are built with. */
+const MOCK_CHILD_SESSION_IDS = ['sess-child-explorer', 'sess-child-claude'];
+/** Parent to build the fixture under when a child is deep-linked directly. */
+const MOCK_SYNTHETIC_PARENT = 'sess-mock-parent';
+
 export function getMockTraceOverview(sessionId: string): TraceOverview {
-  return buildMockSession(sessionId).overview;
+  // A deep link straight to a child id arrives before any parent fixture has
+  // been built, so the child registry is still cold. Warm it off a synthetic
+  // parent — otherwise this falls through and serves the generic PARENT
+  // fixture under the child's id, which is exactly the case (an external
+  // agent's own page) mock mode is there to exercise.
+  if (MOCK_CHILD_SESSION_IDS.includes(sessionId) && !mockChildOverviews.has(sessionId)) {
+    buildMockSession(MOCK_SYNTHETIC_PARENT);
+  }
+  return mockChildOverviews.get(sessionId) ?? buildMockSession(sessionId).overview;
 }
 
 export function getMockTurnTrace(sessionId: string, turnId: string): TurnTrace | null {
+  const child = mockChildTurns.get(turnId);
+  if (child) return child;
   const fx = buildMockSession(sessionId);
   return fx.turns.find((t) => t.turn_id === turnId) ?? null;
+}
+
+export function getMockTraceLineage(sessionId: string): LineageSession[] {
+  if (mockChildOverviews.has(sessionId)) return [];
+  return buildMockSession(sessionId).lineage;
 }
 
 

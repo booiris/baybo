@@ -7,19 +7,23 @@
 import type { IconType } from 'react-icons';
 import {
   RiArchiveLine,
+  RiAttachment2,
   RiBookmark3Line,
   RiBroadcastLine,
   RiBrainLine,
+  RiChat3Line,
   RiCpuLine,
   RiPriceTag3Line,
   RiSave3Line,
   RiSearchEyeLine,
   RiTeamLine,
   RiToolsLine,
+  RiUser3Line,
 } from 'react-icons/ri';
 import type {
   ChatMessage,
   ContentBlock,
+  ExternalAgentKind,
   LifecycleState,
   LlmCallResult,
   ReplayStep,
@@ -32,6 +36,7 @@ import type {
   TurnTrace,
 } from '../../types/trace';
 import { resolveInputMessages } from '../../types/trace';
+import type { TranscriptNodeKind } from './transcriptModel';
 
 // ── Visual mapping per StepKind / SpanKind ───────────────────────────
 
@@ -145,6 +150,38 @@ const SUBAGENT_VISUAL: KindVisual = {
   stripe: 'border-l-brand',
   cell: 'bg-brand',
   label: 'Subagent',
+};
+
+/** Visual for a child-session node — the subagent's own trace, nested under the
+ *  `spawn_subagent` span that started it. Shares the Subagent identity so the
+ *  boundary reads as one continuous thing with the call that opened it. */
+export const CHILD_SESSION_VISUAL: KindVisual = SUBAGENT_VISUAL;
+
+/**
+ * Visuals for an external agent's transcript rows. An external run has no
+ * step/span tree, so its transcript stands in for one — these keep it speaking
+ * the same colour language as a real tree: its tool calls are Tool-orange like
+ * any other tool call, its assistant output and reasoning are LLM-green, and
+ * the human/attachment rows sit in the neutral Meta group. No new legend entry:
+ * every row still lands in a group the legend already names.
+ */
+export const TRANSCRIPT_VISUALS: Record<TranscriptNodeKind, KindVisual> = {
+  user: { group: 'meta', icon: RiUser3Line, glyph: 'U', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'User' },
+  assistant: { group: 'llm', icon: RiChat3Line, glyph: 'a', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'Assistant' },
+  thinking: { group: 'llm', icon: RiBrainLine, glyph: '~', accent: 'text-ok', bg: 'bg-ok/10', stripe: 'border-l-ok', cell: 'bg-ok', label: 'Thinking' },
+  tool: { group: 'tool', icon: RiToolsLine, glyph: 't', accent: 'text-warn', bg: 'bg-warn/10', stripe: 'border-l-warn', cell: 'bg-warn', label: 'Tool call' },
+  attachment: { group: 'meta', icon: RiAttachment2, glyph: '@', accent: 'text-ink-soft', bg: 'bg-gray-100', stripe: 'border-l-ink-soft', cell: 'bg-ink-soft', label: 'Attachment' },
+};
+
+/** Human-facing name of an external agent backend. */
+export function externalAgentLabel(kind: ExternalAgentKind): string {
+  return EXTERNAL_AGENT_LABELS[kind] ?? kind;
+}
+
+const EXTERNAL_AGENT_LABELS: Partial<Record<string, string>> = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  gemini: 'Gemini',
 };
 
 /** The tool name a span calls, when it is a tool call. */
@@ -377,8 +414,22 @@ export function summaryTokens(summary: TraceTurnSummary): TurnTokenTotals {
   };
 }
 
-// Derive token totals from a loaded TurnTrace's spans. Used when we have the
-// full step/span tree; otherwise prefer `summaryTokens`.
+/**
+ * A turn's token totals, from whichever source actually has them.
+ *
+ * The span tree is preferred once loaded — it is live, while the summary's
+ * figures come from a grouped cost query — but only when it has spans to sum.
+ * A turn with a **stepless** trace is not a turn that spent nothing: an
+ * external agent records no spans at all, yet its usage is written to
+ * `cost_records` and arrives on the summary. Summing its (empty) tree would
+ * report a hard zero next to a transcript full of work.
+ */
+export function turnTokens(summary: TraceTurnSummary, trace: TurnTrace | undefined): TurnTokenTotals {
+  return trace && trace.steps.length > 0 ? traceTokens(trace) : summaryTokens(summary);
+}
+
+// Derive token totals from a loaded TurnTrace's spans. Prefer `turnTokens`,
+// which falls back to the summary when the tree is empty.
 export function traceTokens(trace: TurnTrace): TurnTokenTotals {
   let input = 0;
   let output = 0;
@@ -434,6 +485,25 @@ function conversationSteps(trace: TurnTrace): ReplayStep[] {
 
 // Derive the user-facing input that kicked off the turn: the last message in
 // the *first* conversation LLM call's input_messages whose `source` is 'user'.
+/**
+ * The prompt a turn was given, read straight off its transcript.
+ *
+ * `turnInputText` recovers it from an LLM span's resolved input, which an
+ * external-agent turn does not have — its loop is out of process and records no
+ * spans. Its task is simply the first genuine user row the spawn router wrote
+ * before handing off, so that is what this returns. Agent-injected `user`-role
+ * rows (framing, reminders) are skipped: they are not what was asked.
+ */
+export function transcriptInputText(rows: SessionMessageRow[]): string | null {
+  for (const row of rows) {
+    if (row.message.role !== 'user') continue;
+    if (row.message.source !== 'user' && row.message.source !== 'agent') continue;
+    const text = contentText(row.message.content);
+    if (text.length > 0) return text;
+  }
+  return null;
+}
+
 export function turnInputText(trace: TurnTrace, messageLog: SessionMessageRow[]): string | null {
   for (const rs of conversationSteps(trace)) {
     for (const span of rs.spans) {

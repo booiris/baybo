@@ -371,6 +371,13 @@ export interface TraceTurnSummary {
   cache_creation_input_tokens: number;
 }
 
+/**
+ * Which external agent binary ran a session's work (mirrors
+ * `baybo_model::ExternalAgentKind`). Present only on subagent sessions
+ * delegated to an out-of-process agent.
+ */
+export type ExternalAgentKind = 'claude' | 'codex' | 'gemini';
+
 /** Response shape of `GET /v1/traces/{session_id}`. */
 export interface TraceOverview {
   session_id: string;
@@ -381,6 +388,43 @@ export interface TraceOverview {
   // (`since_ordinal`) poll compares it against the cached value to decide
   // whether the cached prefix is still valid or needs a full reload.
   supersede_watermark: number | null;
+  /**
+   * Set when this session's work ran on an external agent binary. Such a
+   * session records no step/span tree at all — its transcript IS the trace —
+   * so the viewer must not wait for a terminal status before showing
+   * something, the way it has to for an in-process turn that may simply not
+   * have flushed its first step yet. Absent on sessions written before the
+   * backend tag existed, which fall back to the terminal-and-stepless
+   * heuristic.
+   */
+  external_agent?: ExternalAgentKind | null;
+  /** The `subagent_type` profile this session was spawned with, if any. */
+  subagent_type?: string | null;
+}
+
+/**
+ * One subagent session descended from the session being viewed, as
+ * returned by `GET /v1/traces/{session_id}/lineage`. Carries where the
+ * child attaches in the parent's tree plus its turn chips — enough to
+ * draw and badge the child inline. The child's transcript and step trees
+ * are fetched lazily through the overview / per-turn endpoints.
+ */
+export interface LineageSession {
+  session_id: string;
+  parent_session_id: string;
+  parent_turn_id: string;
+  /** The parent's `spawn_subagent` tool-call span. Absent on rows written
+   *  before the field existed — such a child attaches at its parent turn. */
+  parent_span_id?: string | null;
+  external_agent?: ExternalAgentKind | null;
+  subagent_type?: string | null;
+  turns: TraceTurnSummary[];
+}
+
+/** Response shape of `GET /v1/traces/{session_id}/lineage`. */
+export interface TraceLineage {
+  root_session_id: string;
+  sessions: LineageSession[];
 }
 
 /** Response shape of `GET /v1/traces/{session_id}/turns/{turn_id}`. */

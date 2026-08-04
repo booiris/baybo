@@ -1,20 +1,25 @@
 //! `/v1/traces` — trace browser endpoints.
 //!
-//! Three surfaces:
+//! Four surfaces:
 //!
 //! * `GET /v1/traces` — paginated, filtered list of session summaries
 //!   used by the trace browser table. Typed via [`TraceSessionSummary`]
 //!   so the OpenAPI/ts-rs surface picks it up.
 //! * `GET /v1/traces/{session_id}` — session overview: the full
 //!   `session_messages` log + turn summaries (no step/span tree).
-//!   The client lazily fetches each turn's tree via the third endpoint.
+//!   The client lazily fetches each turn's tree via the per-turn endpoint.
+//! * `GET /v1/traces/{session_id}/lineage` — the subagent sessions
+//!   descended from this one, so the viewer can nest a child's trace
+//!   under the `spawn_subagent` span that started it instead of making
+//!   the reader navigate away. Summaries only; the child's own overview
+//!   and turn trees are fetched lazily through the endpoints above.
 //! * `GET /v1/traces/{session_id}/turns/{turn_id}` — per-turn step/span
 //!   tree. Spans carry `LlmCallInputs::Persisted` (by ordinal) and
 //!   `ToolCallOutput::Persisted` (by `tool_use_id`) references unresolved;
 //!   the client resolves them against the message log it already has from the
 //!   overview call.
 //!
-//! Both per-session endpoints stay untyped `serde_json::Value` because
+//! The three per-session endpoints stay untyped `serde_json::Value` because
 //! the columnar Step/Span tree is polymorphic and re-mirroring the
 //! closed enums in this crate would double the surface for no benefit;
 //! the web client mirrors the trace types directly.
@@ -40,6 +45,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_traces))
         .routes(routes!(get_trace))
+        .routes(routes!(get_trace_lineage))
         .routes(routes!(get_turn_trace))
 }
 
@@ -119,8 +125,21 @@ async fn get_trace(
         return Err(GatewayError::NotFound(format!("trace {session_id}")));
     }
 
-    let turns: Vec<serde_json::Value> = overview
-        .turns
+    Ok(Json(json!({
+        "session_id": overview.session_id.as_str(),
+        "session_messages": overview.session_messages,
+        "turns": turn_summaries_json(&overview.turns),
+        "supersede_watermark": overview.supersede_watermark,
+        "external_agent": overview.external_agent,
+        "subagent_type": overview.subagent_type,
+    })))
+}
+
+/// The turn-summary projection shared by the overview and lineage
+/// bodies, so a child session's turn rows are byte-identical to the
+/// root's and the client can render both through one type.
+fn turn_summaries_json(turns: &[baybo_query::TraceTurnSummary]) -> Vec<serde_json::Value> {
+    turns
         .iter()
         .map(|j| {
             let s = &j.summary;
@@ -138,13 +157,55 @@ async fn get_trace(
                 "cache_creation_input_tokens": j.cache_creation_input_tokens,
             })
         })
+        .collect()
+}
+
+#[utoipa::path(
+    get,
+    path = "/traces/{session_id}/lineage",
+    tag = "traces",
+    params(
+        ("session_id" = String, Path, description = "Session id whose subagent descendants to fetch"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Every subagent session descended from this one, flattened. Each row carries its attach point (`parent_span_id` — the parent's `spawn_subagent` tool-call span), the external-agent backend that ran it (`external_agent`, absent for in-process children), and its turn summaries in the same shape as the overview's `turns`. No step/span tree: the client fetches a child's turn trees lazily through the per-turn endpoint, and an external child has no tree at all. Untyped JSON, consistent with the rest of the per-session traces family.",
+            body = serde_json::Value,
+            content_type = "application/json",
+        ),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn get_trace_lineage(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let typed_session = baybo_model::SessionId::from(session_id.as_str());
+    let sessions = state
+        .query_api
+        .load_lineage_overview(&typed_session)
+        .await
+        .map_err(|e| GatewayError::Trace(e.to_string()))?;
+
+    let rows: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|c| {
+            json!({
+                "session_id": c.session_id.as_str(),
+                "parent_session_id": c.parent_session_id.as_str(),
+                "parent_turn_id": c.parent_turn_id.to_string(),
+                "parent_span_id": c.parent_span_id.map(|id| id.to_string()),
+                "external_agent": c.external_agent,
+                "subagent_type": c.subagent_type,
+                "turns": turn_summaries_json(&c.turns),
+            })
+        })
         .collect();
 
     Ok(Json(json!({
-        "session_id": overview.session_id.as_str(),
-        "session_messages": overview.session_messages,
-        "turns": turns,
-        "supersede_watermark": overview.supersede_watermark,
+        "root_session_id": typed_session.as_str(),
+        "sessions": rows,
     })))
 }
 

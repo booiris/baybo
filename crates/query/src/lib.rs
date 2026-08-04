@@ -16,12 +16,13 @@
 //! Errors collapse into a single `QueryError` so callers don't need to
 //! match four different store error types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use baybo_cost::{CostError, CostStore, CostSummary, TimeRange};
 use baybo_model::{
-    CallReason, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId, TriggerKind, TurnId,
+    CallReason, ExternalAgentKind, Lineage, LineageKind, MicroUsd, Session, SessionId, SpanId,
+    StepId, SubagentBackendTag, TriggerKind, TurnId,
 };
 use baybo_session::{SessionError, SessionStore, StoredMessage};
 use baybo_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
@@ -47,6 +48,15 @@ pub enum QueryError {
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+/// Cycle protection for both lineage walks — a runaway lineage tree
+/// indicates a bug and we'd rather truncate than stack overflow.
+const MAX_LINEAGE_DEPTH: usize = 32;
+
+/// Breadth ceiling for [`QueryApi::load_lineage_overview`]. The depth cap
+/// alone doesn't bound a fan-out-heavy tree, and each node costs a session
+/// read + a turn list + a cost query.
+const MAX_LINEAGE_SESSIONS: usize = 200;
 
 // ── DTOs ────────────────────────────────────────────────────────────
 
@@ -378,6 +388,46 @@ pub struct TraceOverview {
     /// compaction re-marked rows they already hold, so the cached
     /// prefix is stale and a full reload is required.
     pub supersede_watermark: Option<i64>,
+    /// `Some` when this session's work was delegated to an external
+    /// agent binary. Such a session records **no** step/span tree, so
+    /// its transcript is the trace; the viewer keys off this instead of
+    /// guessing from an empty step list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_agent: Option<ExternalAgentKind>,
+    /// The `subagent_type` profile this session was spawned with, when
+    /// it is a subagent at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+}
+
+/// The subset of a session's [`SubagentBackendTag`] the trace surface
+/// exposes. Internal projection — the operational fields
+/// (`workspace_dir`, `resume_key`) never reach an HTTP body.
+#[derive(Debug, Clone, Default)]
+struct SubagentBackendView {
+    external_agent: Option<ExternalAgentKind>,
+    subagent_type: Option<String>,
+}
+
+/// One descendant session in [`QueryApi::load_lineage_overview`]:
+/// enough to draw the child in the parent's trace tree — where it
+/// attaches, what backend ran it, and its turns' status/token chips —
+/// without loading any step/span tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageSessionSummary {
+    pub session_id: SessionId,
+    pub parent_session_id: SessionId,
+    pub parent_turn_id: TurnId,
+    /// The parent's `ToolCall(spawn_subagent)` span this child hangs
+    /// under. `None` on rows written before the field existed, which
+    /// the viewer falls back to attaching at the parent turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<SpanId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_agent: Option<ExternalAgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    pub turns: Vec<TraceTurnSummary>,
 }
 
 /// Full step/span tree for a single turn, served by
@@ -674,18 +724,16 @@ impl QueryApi {
 
     // ── 7. lineage_tree ────────────────────────────────────────
 
-    /// Walks descendants via `list_lineage_children`. Cycle protection
-    /// caps recursion at `MAX_DEPTH = 32` — a runaway lineage tree
-    /// indicates a bug and we'd rather truncate than stack overflow.
+    /// Walks descendants via `list_lineage_children`, capped at
+    /// [`MAX_LINEAGE_DEPTH`].
     pub async fn lineage_tree(&self, root_session_id: &SessionId) -> Result<LineageNode> {
-        const MAX_DEPTH: usize = 32;
         // BFS to fetch every parent → children edge, then assemble the
         // tree in safe code. Two passes so the async fetch loop owns no
         // node references that could be invalidated by a later push.
         let mut edges: HashMap<SessionId, Vec<(SessionId, LineageKind)>> = HashMap::new();
         let mut frontier: Vec<(SessionId, usize)> = vec![(root_session_id.clone(), 0)];
         while let Some((parent_id, depth)) = frontier.pop() {
-            if depth >= MAX_DEPTH {
+            if depth >= MAX_LINEAGE_DEPTH {
                 continue;
             }
             let kids = self
@@ -702,6 +750,106 @@ impl QueryApi {
             }
         }
         Ok(build_lineage_node(root_session_id.clone(), None, &edges))
+    }
+
+    /// Every descendant session of `root_session_id`, flattened, each
+    /// carrying the attach point (`parent_span_id`) and turn summaries a
+    /// trace viewer needs to nest it under the span that spawned it.
+    ///
+    /// The root itself is excluded — a caller drawing the tree already
+    /// holds the root's own [`Self::load_trace_overview`].
+    ///
+    /// Flat, not nested: the parent pointers are already on every row, so
+    /// nesting the response would only duplicate what the client must
+    /// index by `parent_span_id` anyway.
+    pub async fn load_lineage_overview(
+        &self,
+        root_session_id: &SessionId,
+    ) -> Result<Vec<LineageSessionSummary>> {
+        let mut out: Vec<LineageSessionSummary> = Vec::new();
+        let mut frontier: Vec<(SessionId, usize)> = vec![(root_session_id.clone(), 0)];
+        // A depth cap alone does not stop a cycle from being *walked* — it only
+        // stops it going deeper, after emitting the same sessions once per
+        // level. `visited` makes each session cost exactly one visit, which is
+        // also what keeps a diamond (two parents reaching one child) from
+        // emitting duplicate rows the viewer would draw twice.
+        let mut visited: HashSet<SessionId> = HashSet::new();
+        visited.insert(root_session_id.clone());
+        let mut truncated = false;
+        // Breadth is unbounded in principle (one turn can spawn many
+        // subagents, each of which can spawn more), so the walk needs its
+        // own ceiling on top of the depth cap — this is one session row + one
+        // turn list + one cost query per node.
+        while let Some((parent_id, depth)) = frontier.pop() {
+            if depth >= MAX_LINEAGE_DEPTH {
+                truncated = true;
+                continue;
+            }
+            if out.len() >= MAX_LINEAGE_SESSIONS {
+                truncated = true;
+                break;
+            }
+            let kids = self
+                .sessions
+                .list_lineage_children(&parent_id)
+                .await
+                .map_err(SessionError::from)?;
+            for (child_id, kind) in kids {
+                if !matches!(kind, LineageKind::Subagent) {
+                    continue;
+                }
+                if out.len() >= MAX_LINEAGE_SESSIONS {
+                    truncated = true;
+                    break;
+                }
+                if !visited.insert(child_id.clone()) {
+                    continue;
+                }
+                let Some(child) = self
+                    .sessions
+                    .get(&child_id)
+                    .await
+                    .map_err(SessionError::from)?
+                else {
+                    continue;
+                };
+                // Without a `Lineage` there is nowhere to attach the child,
+                // so it can't be drawn — and its own descendants hang off a
+                // node that isn't there either.
+                let Some(lineage) = child.lineage.clone() else {
+                    continue;
+                };
+                let mut summaries = self.list_turns(&child_id, TurnFilter::default()).await?;
+                summaries.sort_by_key(|t| t.created_at);
+                let turns = self.attach_turn_tokens(&child_id, summaries).await;
+                out.push(LineageSessionSummary {
+                    session_id: child_id.clone(),
+                    parent_session_id: lineage.parent_session_id,
+                    parent_turn_id: lineage.parent_turn_id,
+                    parent_span_id: lineage.parent_span_id,
+                    external_agent: match child.state.subagent_backend {
+                        Some(SubagentBackendTag::External { external_kind, .. }) => {
+                            Some(external_kind)
+                        }
+                        _ => None,
+                    },
+                    subagent_type: child.state.subagent_type,
+                    turns,
+                });
+                frontier.push((child_id, depth + 1));
+            }
+        }
+        // A silently-trimmed sweep reads as "this is everything" when it isn't.
+        if truncated {
+            tracing::warn!(
+                root_session_id = %root_session_id,
+                returned = out.len(),
+                max_depth = MAX_LINEAGE_DEPTH,
+                max_sessions = MAX_LINEAGE_SESSIONS,
+                "lineage overview truncated at its cap; some subagent sessions are omitted"
+            );
+        }
+        Ok(out)
     }
 
     // ── 8. cost_summary ────────────────────────────────────────
@@ -1139,10 +1287,28 @@ impl QueryApi {
                 }
             };
 
-        // Per-turn token aggregates power the sidebar's `↑in ↓out`
-        // chips: one grouped cost query for the whole session. A cost
-        // failure degrades to zeroed chips rather than failing the
-        // overview.
+        let turns = self.attach_turn_tokens(session_id, summaries).await;
+        let backend = self.subagent_backend_of(session_id).await;
+
+        Ok(TraceOverview {
+            session_id: session_id.clone(),
+            session_messages,
+            turns,
+            supersede_watermark,
+            external_agent: backend.external_agent,
+            subagent_type: backend.subagent_type,
+        })
+    }
+
+    /// Attaches the per-turn token aggregates the trace sidebar's
+    /// `↑in ↓out` chips need: one grouped cost query for the whole
+    /// session. A cost failure degrades to zeroed chips rather than
+    /// failing the caller.
+    async fn attach_turn_tokens(
+        &self,
+        session_id: &SessionId,
+        summaries: Vec<TurnSummary>,
+    ) -> Vec<TraceTurnSummary> {
         let costs_by_turn: HashMap<String, CostSummary> = match self.costs.as_ref() {
             Some(c) => match c.query_session_by_turn(session_id).await {
                 Ok(buckets) => buckets.into_iter().map(|b| (b.key, b.summary)).collect(),
@@ -1150,7 +1316,7 @@ impl QueryApi {
             },
             None => HashMap::new(),
         };
-        let turns = summaries
+        summaries
             .into_iter()
             .map(|summary| {
                 let c = costs_by_turn.get(&summary.id.to_string());
@@ -1163,14 +1329,27 @@ impl QueryApi {
                     summary,
                 }
             })
-            .collect();
+            .collect()
+    }
 
-        Ok(TraceOverview {
-            session_id: session_id.clone(),
-            session_messages,
-            turns,
-            supersede_watermark,
-        })
+    /// Projects a session's durable `SubagentBackendTag` down to the two
+    /// fields a trace viewer needs. An external-agent session records no
+    /// step/span tree — its internal loop is opaque — so without this
+    /// marker the viewer cannot tell "opaque by design" from "hasn't
+    /// flushed its first step yet", and a running external child renders
+    /// as an empty turn. A missing session row or an untagged one
+    /// degrades to `None` rather than failing the overview.
+    async fn subagent_backend_of(&self, session_id: &SessionId) -> SubagentBackendView {
+        let Ok(Some(session)) = self.sessions.get(session_id).await else {
+            return SubagentBackendView::default();
+        };
+        SubagentBackendView {
+            external_agent: match session.state.subagent_backend {
+                Some(SubagentBackendTag::External { external_kind, .. }) => Some(external_kind),
+                _ => None,
+            },
+            subagent_type: session.state.subagent_type,
+        }
     }
 
     // ── 13. load_turn_trace ─────────────────────────────────────
@@ -2365,6 +2544,231 @@ mod tests {
         assert_eq!(tree.children[0].session_id, mid);
         assert_eq!(tree.children[0].children.len(), 1);
         assert_eq!(tree.children[0].children[0].session_id, leaf);
+    }
+
+    /// A subagent child session as the spawn router would have stamped it.
+    fn make_child(id: &str, parent: &SessionId, backend: SubagentBackendTag) -> Session {
+        let mut s = make_session(id);
+        s.root_session_id = parent.clone();
+        s.lineage = Some(Lineage {
+            parent_session_id: parent.clone(),
+            parent_turn_id: TurnId::new(),
+            parent_span_id: Some(SpanId::new()),
+            kind: LineageKind::Subagent,
+        });
+        s.state.subagent_backend = Some(backend);
+        s.state.subagent_type = Some("general-purpose".into());
+        s
+    }
+
+    fn external_claude() -> SubagentBackendTag {
+        SubagentBackendTag::External {
+            external_kind: ExternalAgentKind::Claude,
+            workspace_dir: "/tmp/work/claude/child".into(),
+            resume_key: Some("resume-uuid".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn lineage_overview_reports_external_backend_and_attach_point() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let child = make_child("child", &parent.id, external_claude());
+        let child_span = child.lineage.as_ref().and_then(|l| l.parent_span_id);
+        store.save(&parent).await.unwrap();
+        store.save(&child).await.unwrap();
+        store.children.lock().insert(
+            parent.id.clone(),
+            vec![(child.id.clone(), LineageKind::Subagent)],
+        );
+
+        let api = make_query_api(store);
+        let rows = api.load_lineage_overview(&parent.id).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "the root itself must not be in its own lineage"
+        );
+        assert_eq!(rows[0].session_id, child.id);
+        assert_eq!(rows[0].parent_session_id, parent.id);
+        assert_eq!(rows[0].parent_span_id, child_span);
+        assert_eq!(rows[0].external_agent, Some(ExternalAgentKind::Claude));
+        assert_eq!(rows[0].subagent_type.as_deref(), Some("general-purpose"));
+    }
+
+    #[tokio::test]
+    async fn lineage_overview_leaves_baybo_children_unmarked() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let child = make_child("child", &parent.id, SubagentBackendTag::Baybo);
+        store.save(&parent).await.unwrap();
+        store.save(&child).await.unwrap();
+        store.children.lock().insert(
+            parent.id.clone(),
+            vec![(child.id.clone(), LineageKind::Subagent)],
+        );
+
+        let api = make_query_api(store);
+        let rows = api.load_lineage_overview(&parent.id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].external_agent, None,
+            "an in-process child must not be labelled external — the viewer would \
+             stop waiting for its step tree"
+        );
+    }
+
+    /// A lineage cycle is a bug, but it must not hang the endpoint: the depth
+    /// cap alone would still walk the loop 32 times and emit each session
+    /// repeatedly, which the viewer would then render as an infinitely nested
+    /// tree.
+    #[tokio::test]
+    async fn lineage_overview_terminates_on_a_cycle() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let a = make_child("a", &parent.id, SubagentBackendTag::Baybo);
+        let b = make_child("b", &a.id, SubagentBackendTag::Baybo);
+        for s in [&parent, &a, &b] {
+            store.save(s).await.unwrap();
+        }
+        {
+            let mut children = store.children.lock();
+            children.insert(
+                parent.id.clone(),
+                vec![(a.id.clone(), LineageKind::Subagent)],
+            );
+            children.insert(a.id.clone(), vec![(b.id.clone(), LineageKind::Subagent)]);
+            // The cycle: b claims a as its child.
+            children.insert(b.id.clone(), vec![(a.id.clone(), LineageKind::Subagent)]);
+        }
+
+        let api = make_query_api(store);
+        let rows = api.load_lineage_overview(&parent.id).await.unwrap();
+
+        assert_eq!(rows.len(), 2, "each session is visited exactly once");
+        let mut ids: Vec<String> = rows.iter().map(|r| r.session_id.to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Two parents pointing at one child (a resumed subagent re-attached under a
+    /// later turn) must not produce the same session twice.
+    #[tokio::test]
+    async fn lineage_overview_dedupes_a_diamond() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let a = make_child("a", &parent.id, SubagentBackendTag::Baybo);
+        let b = make_child("b", &parent.id, SubagentBackendTag::Baybo);
+        let shared = make_child("shared", &a.id, SubagentBackendTag::Baybo);
+        for s in [&parent, &a, &b, &shared] {
+            store.save(s).await.unwrap();
+        }
+        {
+            let mut children = store.children.lock();
+            children.insert(
+                parent.id.clone(),
+                vec![
+                    (a.id.clone(), LineageKind::Subagent),
+                    (b.id.clone(), LineageKind::Subagent),
+                ],
+            );
+            children.insert(
+                a.id.clone(),
+                vec![(shared.id.clone(), LineageKind::Subagent)],
+            );
+            children.insert(
+                b.id.clone(),
+                vec![(shared.id.clone(), LineageKind::Subagent)],
+            );
+        }
+
+        let api = make_query_api(store);
+        let rows = api.load_lineage_overview(&parent.id).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().filter(|r| r.session_id == shared.id).count(),
+            1,
+            "a session reachable by two paths is emitted once"
+        );
+    }
+
+    /// A child row with no `Lineage` has no attach point, so it cannot be drawn;
+    /// it must be skipped rather than crashing or attaching arbitrarily.
+    #[tokio::test]
+    async fn lineage_overview_skips_a_child_without_lineage() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let orphan = make_session("orphan");
+        store.save(&parent).await.unwrap();
+        store.save(&orphan).await.unwrap();
+        store.children.lock().insert(
+            parent.id.clone(),
+            vec![(orphan.id.clone(), LineageKind::Subagent)],
+        );
+
+        let api = make_query_api(store);
+        assert!(
+            api.load_lineage_overview(&parent.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_overview_carries_the_external_agent_marker() {
+        let store = Arc::new(MemSessionStore::default());
+        let parent = make_session("parent");
+        let child = make_child("child", &parent.id, external_claude());
+        store.save(&child).await.unwrap();
+
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
+        let turn = lifecycle
+            .start_turn(child.id.clone(), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+        lifecycle.start(&turn.id).await.unwrap();
+
+        let api = QueryApi::new(
+            store,
+            lifecycle,
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let overview = api.load_trace_overview(&child.id, None).await.unwrap();
+        assert_eq!(overview.external_agent, Some(ExternalAgentKind::Claude));
+        assert_eq!(overview.subagent_type.as_deref(), Some("general-purpose"));
+
+        // The marker must not drag the operational fields onto the wire.
+        let body = serde_json::to_string(&overview).unwrap();
+        assert!(
+            !body.contains("workspace_dir"),
+            "workspace_dir leaked: {body}"
+        );
+        assert!(!body.contains("resume-uuid"), "resume_key leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn trace_overview_marker_absent_for_a_plain_session() {
+        let store = Arc::new(MemSessionStore::default());
+        let s = make_session("plain");
+        store.save(&s).await.unwrap();
+        let turn_store = Arc::new(MemoryTurnStore::new());
+        let lifecycle = Arc::new(TurnLifecycle::new(turn_store));
+        lifecycle
+            .start_turn(s.id.clone(), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+        let api = QueryApi::new(
+            store,
+            lifecycle,
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let overview = api.load_trace_overview(&s.id, None).await.unwrap();
+        assert_eq!(overview.external_agent, None);
     }
 
     #[tokio::test]

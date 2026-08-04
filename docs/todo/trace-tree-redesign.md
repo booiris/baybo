@@ -104,9 +104,12 @@ span that spawned it (`Lineage.parent_span_id`), recursively.
 
 ### Edge case — external-agent turns
 
-`claude` / `codex` turns record no step/span tree (their internal loop is opaque). Such
-a turn node is a leaf; selecting it renders the persisted `session_messages` transcript
-in the right panel (the fallback already in the page today).
+`claude` / `codex` / `gemini` turns record no step/span tree (their internal loop is
+opaque). **Shipped** differently from the sketch above: rather than a leaf whose
+transcript appears in the right panel, such a turn expands into its transcript **in the
+tree itself** — one row per message, a `tool_use` folded together with its `tool_result`
+so it reads like the `ToolCall` spans around it. The right panel holds the full text of
+whichever row is selected. See [`../external-agents.md`](../external-agents.md).
 
 ## Data model — already supports this
 
@@ -211,23 +214,36 @@ time and `before→after` tokens, clickable to jump to that step. The token figu
 cache reads and cache writes as context, because they occupied the window that got
 compacted.
 
-## PR2 — subagent lineage nesting
+## PR2 — subagent lineage nesting — SHIPPED
 
 Delivers pain **3**.
 
-- **Backend:** new `GET /v1/traces/{session_id}/lineage` in
-  `crates/gateway/src/api/admin/traces.rs`, reusing `QueryApi::lineage_tree`. Returns
-  the lineage tree with each descendant session's turn summaries (status/tokens — the
-  same shape as `TraceOverview.turns`, minus the step tree). Response body is **untyped
-  JSON** hand-mirrored in `trace.ts`, consistent with the rest of the traces family
-  ("untyped JSON on the Rust side by design"); no `openapi` / ts-rs churn.
-- **Front-end:** one up-front `/lineage` call builds the whole nav tree + cross-boundary
-  roll-up badges; per-turn step trees + per-child `session_messages` stay lazy on expand.
-  Child sessions nest in place under their spawning span; the drill-out navigate becomes
-  a secondary "open as full page" action.
-- Extend polling to refresh `/lineage` on the slow tier (new subagents + forest status).
-- Mock: add a subagent lineage fixture (parent turn spawning a child session with its own
-  failing turn) so the nested view is exercised in mock mode.
+- **Backend:** `GET /v1/traces/{session_id}/lineage` in
+  `crates/gateway/src/api/admin/traces.rs`, over a new
+  `QueryApi::load_lineage_overview`. Returns the descendants **flat**, not nested — the
+  parent pointers are on every row anyway, and the client has to index by
+  `parent_span_id` regardless, so nesting the response would only duplicate that work.
+  Each row carries `parent_span_id` (the attach point), `external_agent`,
+  `subagent_type`, and turn summaries in the same projection as the overview's `turns`
+  (`turn_summaries_json`, shared so the two can't drift). Untyped JSON hand-mirrored in
+  `trace.ts`, consistent with the rest of the traces family.
+  - Bounded **and** de-duplicated: a visited set, because the depth cap alone would walk
+    a lineage cycle once per level and emit each session repeatedly; plus
+    `MAX_LINEAGE_SESSIONS` for breadth, with a `warn!` when either trims.
+- **Front-end:** `buildForest` (`components/trace/traceForest.ts`) indexes the response;
+  children nest in place under their spawning span (or their parent turn, when
+  `parent_span_id` predates the field). A child's own overview + step trees stay lazy on
+  expand — and an **external** child's per-turn fetches are skipped entirely, since that
+  backend has no step tree to return. The drill-out navigate is now the secondary "open
+  as its own trace" action. `MAX_RENDER_DEPTH` backstops the recursive render.
+- Cross-boundary roll-up badges come from the turn statuses the lineage response supplies
+  up front, so a collapsed subagent can say "something failed in there" before anything
+  is expanded.
+- Polling refreshes `/lineage` on the same tick as the overview, and a running subagent
+  now holds the page on the **fast** tier (see `liveSessions`).
+- Mock: `buildExplorerChild` (baybo-backed, full step tree) + `buildClaudeChild`
+  (external, live, zero steps, transcript with an in-flight tool call) in
+  `app/web/src/api/mock.ts`, plus a live third turn on the parent that spawns the latter.
 
 ## Deferred / cheap-approximation decisions (on the record)
 
@@ -239,8 +255,11 @@ Delivers pain **3**.
   results are complete. A backend content-search endpoint is out of scope; for a session
   with an enormous trace this loads all turn trees — acceptable for an explicit filter on
   a debug surface, revisit if it bites.
-- **External-agent detection** is `terminal turn + zero recorded steps` (no external-agent
-  marker on the trace wire). A live 0-step turn is *not* mislabeled (it may just not have
-  flushed steps yet); a terminal 0-step turn renders its transcript.
+- ~~**External-agent detection** is `terminal turn + zero recorded steps`~~ — **fixed.**
+  The heuristic could not run until the turn ended, so a live external agent showed
+  nothing for the whole run. `TraceOverview.external_agent` now carries the backend
+  explicitly (from the durable `SessionState.subagent_backend` tag), and a marked session
+  is treated as external while live. The old heuristic survives only as the fallback for
+  sessions written before the marker reached the wire.
 - **No feature flag** — this is an internal admin/debug page; PR1 rewrites in place on
   the same `/traces/:id` route. Old 3-pane code is removed, not parked behind a flag.

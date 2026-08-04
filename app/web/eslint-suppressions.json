@@ -87,10 +87,7 @@
   },
   "src/pages/TraceSessionPage.tsx": {
     "@typescript-eslint/no-unnecessary-condition": {
-      "count": 3
-    },
-    "@typescript-eslint/strict-boolean-expressions": {
-      "count": 22
+      "count": 1
     }
   },
   "src/pages/TracesPage.tsx": {
