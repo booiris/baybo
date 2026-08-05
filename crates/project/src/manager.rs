@@ -661,6 +661,9 @@ impl ProjectManager {
             description: new.description.trim().to_owned(),
             workdir,
             daily_budget: new.daily_budget,
+            // Never read, so a board's first agent comment is unread even
+            // if it lands before anybody opens it.
+            read_at: None,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -1266,6 +1269,19 @@ impl ProjectManager {
         // Stable order so a badge does not reshuffle between polls.
         out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         Ok(out)
+    }
+
+    /// Note that the operator has looked at this board.
+    ///
+    /// Called when the board page loads, and only there: the detail route
+    /// is one card, and marking the whole board read from it would clear a
+    /// question asked on a card the operator never saw.
+    pub async fn mark_read(&self, project: &ProjectId) -> Result<()> {
+        self.get_project(project).await?;
+        self.store
+            .mark_project_read(project, chrono::Utc::now())
+            .await?;
+        Ok(())
     }
 
     /// The whole board's activity, newest first.

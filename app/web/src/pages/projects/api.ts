@@ -518,3 +518,27 @@ export async function setProjectArchived(
     return { kind: 'failed', message: networkMessage(e) };
   }
 }
+
+/**
+ * Note that the operator looked at this board.
+ *
+ * Called from the board page only. The detail route is one card, and
+ * marking the whole board read from it would clear a question asked on a
+ * card the operator never saw.
+ */
+export async function markProjectRead(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.POST('/v1/projects/{project_id}/read', {
+      params: { path: { project_id: projectId } },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}

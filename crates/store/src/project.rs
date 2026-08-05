@@ -124,6 +124,14 @@ pub struct ProjectRow {
     /// ceiling — the default, because a board that stops working against a
     /// limit nobody chose is a board whose silence nobody can explain.
     pub daily_budget: Option<baybo_model::MicroUsd>,
+    /// When the operator last looked at this board. `None` means never.
+    ///
+    /// The only read cursor in the feature. Everything else the badge
+    /// counts is state a person can act on and clears when they do; these
+    /// two — an agent asking a question, a card arriving in Review — leave
+    /// no trace at all when read, so without a cursor they could only be
+    /// approximated or dropped.
+    pub read_at: Option<DateTime<Utc>>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -508,6 +516,10 @@ pub trait ProjectStore: Send + Sync {
     /// `Held`, so two concurrent releases start it once.
     async fn release_run(&self, id: &IssueRunId) -> Result<bool>;
 
+    /// Stamp when the operator looked at this board. `Ok(false)` if no row
+    /// matched.
+    async fn mark_project_read(&self, id: &ProjectId, at: DateTime<Utc>) -> Result<bool>;
+
     /// Stamp or clear `archived_at`. `Ok(false)` if no row matched.
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
 
@@ -716,6 +728,10 @@ pub struct AttentionCounts {
     pub approvals: usize,
     /// Runs recorded but not started, because the board is over budget.
     pub held: usize,
+    /// Since the operator last looked: agents' comments and cards arriving
+    /// in Review. Unlike the other three this is time-based, because
+    /// reading either of them changes nothing a query could see.
+    pub unread: usize,
     /// Live cards whose newest run failed. Nothing retries by itself, so
     /// these sit until somebody looks.
     pub failed: usize,
@@ -723,7 +739,7 @@ pub struct AttentionCounts {
 
 impl AttentionCounts {
     pub fn total(self) -> usize {
-        self.approvals + self.held + self.failed
+        self.approvals + self.held + self.failed + self.unread
     }
 
     pub fn is_empty(self) -> bool {

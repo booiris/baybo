@@ -94,9 +94,11 @@ export function attentionSummary(boards: ProjectAttention[]): string {
   const approvals = sum((b) => b.approvals);
   const held = sum((b) => b.held);
   const failed = sum((b) => b.failed);
+  const unread = sum((b) => b.unread);
   if (approvals > 0) parts.push(`${approvals} waiting on approval`);
   if (held > 0) parts.push(`${held} held on budget`);
   if (failed > 0) parts.push(`${failed} failed`);
+  if (unread > 0) parts.push(`${unread} new since you looked`);
   const where = boards.length === 1 ? boards[0].name : `${boards.length} boards`;
   return `${where}: ${parts.join(', ')}`;
 }

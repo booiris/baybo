@@ -28,6 +28,7 @@ import {
   fetchActiveRuns,
   fetchTeam,
   hireAgent,
+  markProjectRead,
   removeAgent,
   fetchIssues,
   fetchProject,
@@ -156,6 +157,11 @@ export function ProjectBoardPage() {
       // Remembered only once the board actually resolved: a 404'd deep link
       // must not poison what the rail opens next time.
       writeLastProjectId(projectId);
+      // Looking at the board is what clears its unread count. Fire and
+      // forget: a failed mark leaves the badge up, which is the harmless
+      // direction — the alternative is hiding something that needs
+      // attention because one request dropped.
+      void markProjectRead(client, projectId);
     }
     void load();
     return () => {

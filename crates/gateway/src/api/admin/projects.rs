@@ -37,6 +37,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_issue_events))
         .routes(routes!(project_feed))
         .routes(routes!(projects_attention))
+        .routes(routes!(mark_project_read))
         .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
@@ -1160,6 +1161,32 @@ pub struct ProjectAttentionDto {
     pub held: usize,
     /// Live cards whose newest run failed.
     pub failed: usize,
+    /// Agents' comments and cards arriving in Review since you last looked.
+    pub unread: usize,
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/read",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 204, description = "Noted; the board's unread count resets"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn mark_project_read(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<StatusCode> {
+    let id = parse_project_id(&project_id)?;
+    state
+        .project_manager
+        .mark_read(&id)
+        .await
+        .map_err(project_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1207,6 +1234,7 @@ async fn projects_attention(
                 approvals: count.approvals,
                 held: count.held,
                 failed: count.failed,
+                unread: count.unread,
             })
         })
         .collect();

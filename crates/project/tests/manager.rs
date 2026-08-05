@@ -2278,3 +2278,124 @@ async fn an_archived_board_asks_for_nothing() {
             .is_empty()
     );
 }
+
+/// The one read cursor in the feature, and what it is for: two signals
+/// that leave no trace when read, so nothing derived could clear them.
+#[tokio::test]
+async fn a_boards_unread_count_is_what_happened_since_you_looked() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Unread"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                status: IssueStatus::Todo,
+                ..new_issue("work")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    // The operator's own comment is not news to the operator.
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "any progress?")
+        .await
+        .expect("comment");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty(),
+        "your own words are not unread"
+    );
+
+    // An agent's is.
+    f.manager
+        .comment(
+            &p.id,
+            1,
+            IssueActor::Agent(dev.clone()),
+            "blocked on the API",
+        )
+        .await
+        .expect("comment");
+    let counts = f.manager.attention(&[]).await.expect("attention");
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].1.unread, 1);
+
+    // …and so is a card arriving in Review, which nothing else notices.
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::Agent(dev), IssueStatus::Review, &[1])
+        .await
+        .expect("move to review");
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .unread,
+        2
+    );
+
+    // Looking at the board clears it, and nothing else does.
+    f.manager.mark_read(&p.id).await.expect("mark read");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty()
+    );
+}
+
+/// Ordinary board traffic is not news. This is the line between "something
+/// needs you" and "the board is working", and getting it wrong makes the
+/// badge permanent.
+#[tokio::test]
+async fn the_boards_own_traffic_is_never_unread() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Noise"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager.mark_read(&p.id).await.expect("mark read");
+
+    // Opening a card, assigning it, starting it, moving it anywhere but
+    // Review — all of it is the board doing its job.
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                status: IssueStatus::InProgress,
+                ..new_issue("in flight")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::Agent(dev), IssueStatus::Done, &[1])
+        .await
+        .expect("finish");
+
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .iter()
+            .all(|(_, c)| c.unread == 0),
+        "run and column traffic is not something waiting on a person"
+    );
+}

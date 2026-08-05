@@ -308,6 +308,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
+        table: "projects",
+        column: "read_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
         table: "issues",
         column: "parent_issue_id",
         definition: "TEXT",
@@ -1329,6 +1334,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- NULL is no ceiling. INTEGER, never REAL — see
                     -- `cost_records.cost_usd`.
                     daily_budget_micros INTEGER,
+                    -- When the operator last looked at this board. The only
+                    -- read state in the feature, and it exists because the
+                    -- two signals that need it — an agent's comment, a card
+                    -- arriving in Review — leave no other trace when read.
+                    read_at     INTEGER,
                     archived_at INTEGER,
                     created_at  INTEGER NOT NULL,
                     updated_at  INTEGER NOT NULL

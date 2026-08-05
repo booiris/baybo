@@ -110,7 +110,7 @@ export function ProjectSwitcher({
                             title={stuckSummary(stuck)}
                             className="shrink-0 rounded-full border-2 border-black bg-err text-white px-1.5 font-mono text-[0.55rem] font-bold leading-[0.85rem] tabular-nums"
                           >
-                            {stuck.approvals + stuck.held + stuck.failed}
+                            {stuck.approvals + stuck.held + stuck.failed + stuck.unread}
                           </span>
                         )}
                         <span className="ml-auto shrink-0 text-[0.58rem] text-ink-soft truncate max-w-[45%]">
@@ -161,5 +161,6 @@ function stuckSummary(stuck: ProjectAttention): string {
   if (stuck.approvals > 0) parts.push(`${stuck.approvals} waiting on approval`);
   if (stuck.held > 0) parts.push(`${stuck.held} held on budget`);
   if (stuck.failed > 0) parts.push(`${stuck.failed} failed`);
+  if (stuck.unread > 0) parts.push(`${stuck.unread} new since you looked`);
   return parts.join(', ');
 }

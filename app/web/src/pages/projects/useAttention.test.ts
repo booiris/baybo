@@ -14,6 +14,7 @@ function board(overrides: Partial<ProjectAttention> = {}): ProjectAttention {
     approvals: 0,
     held: 0,
     failed: 0,
+    unread: 0,
     ...overrides,
   };
 }
@@ -53,6 +54,14 @@ describe('attentionSummary', () => {
       board({ project_id: '01JB', name: 'Beta', held: 2, failed: 1 }),
     ]);
     expect(summary).toBe('2 boards: 3 held on budget, 1 failed');
+  });
+
+  it('names the unread signal separately from the actionable ones', () => {
+    // It is the one count that is time-based rather than state-based, so
+    // "3 new since you looked" has to read differently from "3 failed".
+    expect(attentionSummary([board({ unread: 3 })])).toBe(
+      'Alpha: 3 new since you looked',
+    );
   });
 
   it('omits the kinds that are at zero', () => {

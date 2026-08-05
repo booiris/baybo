@@ -81,7 +81,7 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 }
 
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micros, \
-     archived_at, created_at, updated_at";
+     read_at, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
@@ -171,6 +171,7 @@ type RawProject = (
     String,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
     i64,
     i64,
 );
@@ -206,6 +207,7 @@ fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -244,8 +246,17 @@ fn ts_opt(column: &str, us: Option<i64>) -> Result<Option<chrono::DateTime<chron
 }
 
 fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
-    let (id, name, description, workdir, daily_budget_micros, archived_at, created_at, updated_at) =
-        raw;
+    let (
+        id,
+        name,
+        description,
+        workdir,
+        daily_budget_micros,
+        read_at,
+        archived_at,
+        created_at,
+        updated_at,
+    ) = raw;
     Ok(ProjectRow {
         // A stored id runs the grammar again on the way out: the row is the
         // source of a directory name, and a hand-edited DB is still a way in.
@@ -254,6 +265,7 @@ fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
         description,
         workdir,
         daily_budget: daily_budget_micros.map(baybo_model::MicroUsd::from_micros),
+        read_at: ts_opt("projects.read_at", read_at)?,
         archived_at: ts_opt("projects.archived_at", archived_at)?,
         created_at: ts("projects.created_at", created_at)?,
         updated_at: ts("projects.updated_at", updated_at)?,
@@ -362,9 +374,9 @@ impl ProjectStore for SqliteProjectStore {
             .interact("projects.create", move |conn| {
                 conn.execute(
                     "INSERT INTO projects \
-                     (id, name, description, workdir, daily_budget_micros, archived_at, \
-                      created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                     (id, name, description, workdir, daily_budget_micros, read_at, \
+                      archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
                     rusqlite::params![
                         id,
                         name,
@@ -426,6 +438,29 @@ impl ProjectStore for SqliteProjectStore {
             })
             .await?;
         Ok(baybo_model::MicroUsd::from_micros(micros))
+    }
+
+    async fn mark_project_read(
+        &self,
+        id: &ProjectId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let at = super::time::to_us(at);
+        let affected = self
+            .pool
+            .interact("projects.mark_read", move |conn| {
+                // `MAX` rather than a plain set: two tabs on one board race,
+                // and the later read is the true one. A blind write lets a
+                // slow request rewind the cursor and resurrect a badge that
+                // was already cleared.
+                Ok(conn.execute(
+                    "UPDATE projects SET read_at = MAX(COALESCE(read_at, 0), ?2) WHERE id = ?1",
+                    rusqlite::params![id, at],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
     }
 
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool> {
@@ -636,10 +671,11 @@ impl ProjectStore for SqliteProjectStore {
         let held_status = RunStatus::Held.as_str();
         let failed_status = RunStatus::Failed.as_str();
         let done_status = IssueStatus::Done.as_str();
+        let review_status = IssueStatus::Review.as_str();
         let rows = self
             .pool
             .interact("projects.attention", move |conn| {
-                let mut counts: std::collections::HashMap<String, (usize, usize)> =
+                let mut counts: std::collections::HashMap<String, (usize, usize, usize)> =
                     std::collections::HashMap::new();
 
                 // Held runs. Served by `idx_issue_runs_unsettled`, which is
@@ -691,18 +727,44 @@ impl ProjectStore for SqliteProjectStore {
                         counts.entry(project).or_default().1 += count.max(0) as usize;
                     }
                 }
+
+                // What has happened since the operator looked. Only the two
+                // things that leave no other trace when read: an agent
+                // asking something, and a card arriving in Review. Every
+                // other event kind is either already counted above as
+                // actionable state, or is the board's own traffic.
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT e.project_id, COUNT(*) FROM issue_events e \
+                         JOIN projects p ON p.id = e.project_id \
+                         WHERE p.archived_at IS NULL \
+                           AND e.created_at > COALESCE(p.read_at, 0) \
+                           AND ( \
+                             (e.kind = 'comment' AND e.actor LIKE 'agent:%') \
+                             OR (e.kind = 'moved' \
+                                 AND json_extract(e.body, '$.to') = ?1)) \
+                         GROUP BY e.project_id",
+                    )?;
+                    for row in stmt.query_map(rusqlite::params![review_status], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })? {
+                        let (project, count) = row?;
+                        counts.entry(project).or_default().2 += count.max(0) as usize;
+                    }
+                }
                 Ok(counts.into_iter().collect::<Vec<_>>())
             })
             .await?;
 
         rows.into_iter()
-            .map(|(project, (held, failed))| {
+            .map(|(project, (held, failed, unread))| {
                 Ok((
                     ProjectId::parse(project).map_err(|e| StorageError::Storage(e.to_string()))?,
                     AttentionCounts {
                         approvals: 0,
                         held,
                         failed,
+                        unread,
                     },
                 ))
             })
@@ -1217,6 +1279,7 @@ mod tests {
             description: String::new(),
             workdir: format!("/tmp/{id}"),
             daily_budget: None,
+            read_at: None,
             archived_at: None,
             created_at: now,
             updated_at: now,
