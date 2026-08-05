@@ -4131,6 +4131,85 @@
         }
       }
     },
+    "/v1/projects/attention": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "projects_attention",
+        "responses": {
+          "200": {
+            "description": "Boards with work stuck on the operator. Boards with nothing waiting are absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One board with something waiting on the operator.",
+                        "required": [
+                          "project_id",
+                          "name",
+                          "approvals",
+                          "held",
+                          "failed"
+                        ],
+                        "properties": {
+                          "approvals": {
+                            "type": "integer",
+                            "description": "Tool calls parked on an approval prompt.",
+                            "minimum": 0
+                          },
+                          "failed": {
+                            "type": "integer",
+                            "description": "Live cards whose newest run failed.",
+                            "minimum": 0
+                          },
+                          "held": {
+                            "type": "integer",
+                            "description": "Runs recorded but not started, because the board is over budget.",
+                            "minimum": 0
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "project_id": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}": {
       "get": {
         "tags": [

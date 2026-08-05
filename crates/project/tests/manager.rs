@@ -14,6 +14,10 @@ use baybo_workspace::WorkspacePaths;
 
 struct Fixture {
     manager: ProjectManager,
+    /// The raw store, for the few facts a test has to arrange that no
+    /// public method produces — a run that failed, which only an executor
+    /// settles.
+    store: Arc<dyn baybo_store::project::ProjectStore>,
     /// Every run the manager announced, in order — what an executor would
     /// have been handed.
     dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
@@ -76,9 +80,21 @@ async fn fixture() -> Fixture {
             },
         ),
         agents: Arc::clone(&store.agent_profile),
+        store: Arc::clone(&store.project),
         dispatched,
         paths,
         _workspace: workspace,
+    }
+}
+
+impl Fixture {
+    /// Settle a run the way the waiter would. There is no public path: the
+    /// manager records runs and an executor settles them.
+    async fn store_settle(&self, run: &baybo_model::IssueRunId, status: RunStatus) {
+        self.store
+            .settle_run(run, status, None)
+            .await
+            .expect("settle");
     }
 }
 
@@ -2037,4 +2053,192 @@ async fn a_cross_column_move_names_the_destination_plus_the_card() {
         .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Todo, &[2, 1])
         .await
         .expect("both named");
+}
+
+/// The badge's contract: it counts things only the operator can unstick,
+/// and each one disappears when they unstick it. No read state, so nothing
+/// can be left showing a fact that is no longer true.
+#[tokio::test]
+async fn the_attention_count_is_what_only_the_operator_can_clear() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Stuck")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+
+    // Nothing waiting yet: a board with no work is absent entirely, not a
+    // row of zeroes.
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty()
+    );
+
+    // A run the budget held.
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("cannot afford this")
+            },
+        )
+        .await
+        .expect("create");
+    let counts = f.manager.attention(&[]).await.expect("attention");
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].1.held, 1);
+    assert_eq!(counts[0].1.failed, 0);
+
+    // Raising the ceiling releases it — the operator's action, and the
+    // count goes with it rather than needing to be marked read.
+    f.manager
+        .update_project(
+            &p.id,
+            ProjectUpdate {
+                name: p.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+            },
+        )
+        .await
+        .expect("raise");
+    let counts = f.manager.attention(&[]).await.expect("attention");
+    assert!(
+        counts.iter().all(|(_, c)| c.held == 0),
+        "the hold was released: {counts:?}"
+    );
+}
+
+/// A failed run counts only while the card is live and nobody has parked
+/// it, and only if it is the *newest* run — a retry supersedes it.
+#[tokio::test]
+async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Failing"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("went wrong")
+            },
+        )
+        .await
+        .expect("create");
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&run, RunStatus::Failed).await;
+
+    let counts = f.manager.attention(&[]).await.expect("attention");
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].1.failed, 1);
+
+    // Blocking it with a reason is the operator saying "I know" — the card
+    // stops asking.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(Some("waiting on upstream".to_owned())),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("block");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty()
+    );
+
+    // Unblocking brings it back, and a retry supersedes it for good.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                blocked_reason: Some(None),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("unblock");
+    assert_eq!(
+        f.manager.attention(&[]).await.expect("attention")[0]
+            .1
+            .failed,
+        1
+    );
+    f.manager.retry_run(&p.id, 1).await.expect("retry");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty(),
+        "the newest run is queued, so nothing is asking for a person"
+    );
+}
+
+/// An archived board is read-only, so nothing on it is waiting for anybody.
+#[tokio::test]
+async fn an_archived_board_asks_for_nothing() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Shelved")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("held")
+            },
+        )
+        .await
+        .expect("create");
+    assert_eq!(f.manager.attention(&[]).await.expect("attention").len(), 1);
+
+    f.manager
+        .set_project_archived(&p.id, true)
+        .await
+        .expect("archive");
+    assert!(
+        f.manager
+            .attention(&[])
+            .await
+            .expect("attention")
+            .is_empty()
+    );
 }

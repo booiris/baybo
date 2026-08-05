@@ -920,6 +920,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/attention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["projects_attention"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}": {
         parameters: {
             query?: never;
@@ -6529,6 +6545,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    projects_attention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Boards with work stuck on the operator. Boards with nothing waiting are absent. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /** @description Tool calls parked on an approval prompt. */
+                            approvals: number;
+                            /** @description Live cards whose newest run failed. */
+                            failed: number;
+                            /** @description Runs recorded but not started, because the board is over budget. */
+                            held: number;
+                            name: string;
+                            project_id: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
                 };
             };
             /** @description Unauthorized */

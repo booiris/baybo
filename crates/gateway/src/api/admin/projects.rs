@@ -36,6 +36,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_issue_runs))
         .routes(routes!(list_issue_events))
         .routes(routes!(project_feed))
+        .routes(routes!(projects_attention))
         .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
@@ -1139,6 +1140,70 @@ async fn resolve_approval(
     };
     channel.dispatch_approval_resolved(call_id, session_id, decision);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// One board with something waiting on the operator.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectAttentionDto {
+    pub project_id: String,
+    pub name: String,
+    /// Tool calls parked on an approval prompt.
+    pub approvals: usize,
+    /// Runs recorded but not started, because the board is over budget.
+    pub held: usize,
+    /// Live cards whose newest run failed.
+    pub failed: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/attention",
+    tag = "projects",
+    responses(
+        (status = 200, description = "Boards with work stuck on the operator. Boards with nothing waiting are absent.", body = inline(ListResponse<ProjectAttentionDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn projects_attention(
+    State(state): State<AdminState>,
+) -> Result<Json<ListResponse<ProjectAttentionDto>>> {
+    // One snapshot of the live approval queue, taken with no `.await`
+    // between reading it and using it — the same discipline the chat list
+    // uses, so a prompt cannot be counted after it has been answered.
+    let pending: Vec<baybo_model::SessionId> = state
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .map(|channel| channel.pending_approval_sessions().into_iter().collect())
+        .unwrap_or_default();
+    let counts = state
+        .project_manager
+        .attention(&pending)
+        .await
+        .map_err(project_err)?;
+    // One listing rather than a `get_project` per row: this repaints on
+    // every board change, and the set is small.
+    let names: std::collections::HashMap<String, String> = state
+        .project_manager
+        .list_projects(false)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(|row| (row.id.as_str().to_owned(), row.name))
+        .collect();
+    let items = counts
+        .into_iter()
+        .filter_map(|(project_id, count)| {
+            let id = project_id.as_str().to_owned();
+            names.get(&id).map(|name| ProjectAttentionDto {
+                project_id: id.clone(),
+                name: name.clone(),
+                approvals: count.approvals,
+                held: count.held,
+                failed: count.failed,
+            })
+        })
+        .collect();
+    Ok(Json(ListResponse::new(items)))
 }
 
 #[utoipa::path(

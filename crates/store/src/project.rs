@@ -437,6 +437,26 @@ pub trait ProjectStore: Send + Sync {
         since: DateTime<Utc>,
     ) -> Result<baybo_model::MicroUsd>;
 
+    /// Per-board counts of work that is stuck on the operator: held runs
+    /// and live cards whose newest run failed.
+    ///
+    /// Approvals are **not** here — they live in the channel's in-memory
+    /// queue, which is authoritative and self-expiring, so the caller adds
+    /// them. Archived boards are excluded: they are read-only, so nothing
+    /// on them is waiting for anybody.
+    ///
+    /// One call for every board rather than one per board: this feeds a
+    /// rail badge that repaints on every board change, and a fan-out would
+    /// make that cost grow with the number of projects.
+    async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>>;
+
+    /// Which board each of these sessions belongs to, for the sessions that
+    /// are an issue run's. Sessions that are not are simply absent.
+    async fn projects_for_sessions(
+        &self,
+        sessions: &[SessionId],
+    ) -> Result<Vec<(SessionId, ProjectId)>>;
+
     /// One project's timeline, newest first — the activity feed.
     ///
     /// Derived from `issue_events` rather than stored a second time: the
@@ -657,6 +677,38 @@ impl RunStatus {
             self,
             RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled
         )
+    }
+}
+
+/// What is waiting on the operator on one board.
+///
+/// Every field counts something **only a person can clear** — an agent
+/// cannot approve its own tool call, raise its own budget, or retry its own
+/// failed run. That is what lets the whole thing be derived: each count
+/// goes away when the operator does the thing they were going to do anyway,
+/// so there is no read cursor, no `seen_at`, and no way to be stuck showing
+/// a fact that is no longer true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttentionCounts {
+    /// Tool calls parked on an approval prompt. Filled from the channel's
+    /// live queue rather than from the timeline — the queue cannot show a
+    /// prompt that already timed out, and pairing request/resolution by
+    /// `call_id` in SQL would scan a table that grows forever.
+    pub approvals: usize,
+    /// Runs recorded but not started, because the board is over budget.
+    pub held: usize,
+    /// Live cards whose newest run failed. Nothing retries by itself, so
+    /// these sit until somebody looks.
+    pub failed: usize,
+}
+
+impl AttentionCounts {
+    pub fn total(self) -> usize {
+        self.approvals + self.held + self.failed
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
     }
 }
 

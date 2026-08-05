@@ -4,6 +4,7 @@ import { RiArrowDownSLine } from 'react-icons/ri';
 
 import type { Project } from './boardModel';
 import { CreateProjectForm } from './CreateProjectForm';
+import { attentionFor, useAttention, type ProjectAttention } from './useAttention';
 
 /**
  * The board's top-left pill. There is no project list page, so this is the
@@ -19,6 +20,7 @@ export function ProjectSwitcher({
   onCreated: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const waiting = useAttention();
   const [creating, setCreating] = useState(false);
   const root = useRef<HTMLDivElement>(null);
 
@@ -74,6 +76,7 @@ export function ProjectSwitcher({
               <ul className="max-h-[300px] overflow-y-auto">
                 {projects.map((project) => {
                   const isCurrent = project.id === current?.id;
+                  const stuck = attentionFor(waiting, project.id);
                   return (
                     <li key={project.id}>
                       <Link
@@ -86,6 +89,17 @@ export function ProjectSwitcher({
                         }`}
                       >
                         <span className="truncate">{project.name}</span>
+                        {/* The rail badge counts boards; this is where the
+                            board says what, so a number the rail cannot
+                            explain always has somewhere to decompose. */}
+                        {stuck === null ? null : (
+                          <span
+                            title={stuckSummary(stuck)}
+                            className="shrink-0 rounded-full border-2 border-black bg-err text-white px-1.5 font-mono text-[0.55rem] font-bold leading-[0.85rem] tabular-nums"
+                          >
+                            {stuck.approvals + stuck.held + stuck.failed}
+                          </span>
+                        )}
                         <span className="ml-auto shrink-0 text-[0.58rem] text-ink-soft truncate max-w-[45%]">
                           {project.workdir}
                         </span>
@@ -114,4 +128,13 @@ export function ProjectSwitcher({
       ) : null}
     </div>
   );
+}
+
+/** What one board's counts say, for the row's tooltip. */
+function stuckSummary(stuck: ProjectAttention): string {
+  const parts: string[] = [];
+  if (stuck.approvals > 0) parts.push(`${stuck.approvals} waiting on approval`);
+  if (stuck.held > 0) parts.push(`${stuck.held} held on budget`);
+  if (stuck.failed > 0) parts.push(`${stuck.failed} failed`);
+  return parts.join(', ');
 }

@@ -1132,6 +1132,48 @@ impl ProjectManager {
         Ok(after)
     }
 
+    /// What is stuck on the operator, per board.
+    ///
+    /// `pending_approval_sessions` is the channel's live approval queue,
+    /// passed in rather than reached for: this crate must not know about
+    /// channels, and the queue is the authority on which prompts are still
+    /// open — it cannot show one that already timed out.
+    pub async fn attention(
+        &self,
+        pending_approval_sessions: &[baybo_model::SessionId],
+    ) -> Result<Vec<(ProjectId, baybo_store::project::AttentionCounts)>> {
+        let mut counts: std::collections::HashMap<
+            ProjectId,
+            baybo_store::project::AttentionCounts,
+        > = self.store.attention().await?.into_iter().collect();
+        for (_, project) in self
+            .store
+            .projects_for_sessions(pending_approval_sessions)
+            .await?
+        {
+            // Only boards the query above already considered: it excludes
+            // archived ones, and a prompt parked on an archived board's old
+            // run is not work anybody is being asked to do.
+            if let Some(entry) = counts.get_mut(&project) {
+                entry.approvals += 1;
+            } else if self
+                .store
+                .get_project(&project)
+                .await?
+                .is_some_and(|row| row.archived_at.is_none())
+            {
+                counts.entry(project).or_default().approvals += 1;
+            }
+        }
+        // No empty-row filter: every group SQL emits has at least one row,
+        // and the approval pass only ever increments — so a board with
+        // nothing waiting is absent rather than a row of zeroes.
+        let mut out: Vec<_> = counts.into_iter().collect();
+        // Stable order so a badge does not reshuffle between polls.
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        Ok(out)
+    }
+
     /// The whole board's activity, newest first.
     ///
     /// Capped rather than paged-without-limit: a feed is read from the top

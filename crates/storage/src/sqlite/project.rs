@@ -7,9 +7,9 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
-    NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result,
-    RunStatus, RunTrigger,
+    AttentionCounts, IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate,
+    Result, RunStatus, RunTrigger,
 };
 
 pub struct SqliteProjectStore {
@@ -623,6 +623,119 @@ impl ProjectStore for SqliteProjectStore {
             })
             .await?;
         Ok(affected > 0)
+    }
+
+    async fn attention(&self) -> Result<Vec<(ProjectId, AttentionCounts)>> {
+        let held_status = RunStatus::Held.as_str();
+        let failed_status = RunStatus::Failed.as_str();
+        let done_status = IssueStatus::Done.as_str();
+        let rows = self
+            .pool
+            .interact("projects.attention", move |conn| {
+                let mut counts: std::collections::HashMap<String, (usize, usize)> =
+                    std::collections::HashMap::new();
+
+                // Held runs. Served by `idx_issue_runs_unsettled`, which is
+                // small by construction, and already per-issue because
+                // `idx_issue_runs_live` makes at most one unfinished run per
+                // issue structurally possible.
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT r.project_id, COUNT(*) FROM issue_runs r \
+                         JOIN projects p ON p.id = r.project_id \
+                         WHERE r.status = ?1 AND r.settled_at IS NULL \
+                           AND p.archived_at IS NULL \
+                         GROUP BY r.project_id",
+                    )?;
+                    for row in stmt.query_map(rusqlite::params![held_status], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })? {
+                        let (project, count) = row?;
+                        counts.entry(project).or_default().0 += count.max(0) as usize;
+                    }
+                }
+
+                // Live cards whose NEWEST run failed. A correlated subquery
+                // rather than a window function over every run: this way the
+                // cost is one index seek per live card
+                // (`idx_issue_runs_log`), bounded by the working set, where
+                // a partition would be bounded by run history.
+                //
+                // `id DESC` tiebreaks alongside `created_at DESC` for the
+                // same reason the feed does: two runs written in one
+                // microsecond must not flip the answer.
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT i.project_id, COUNT(*) FROM issues i \
+                         JOIN projects p ON p.id = i.project_id \
+                         WHERE i.status <> ?1 AND i.cancelled_at IS NULL \
+                           AND i.blocked_reason IS NULL AND p.archived_at IS NULL \
+                           AND (SELECT r.status FROM issue_runs r \
+                                WHERE r.issue_id = i.id \
+                                ORDER BY r.created_at DESC, r.id DESC LIMIT 1) = ?2 \
+                         GROUP BY i.project_id",
+                    )?;
+                    for row in stmt
+                        .query_map(rusqlite::params![done_status, failed_status], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })?
+                    {
+                        let (project, count) = row?;
+                        counts.entry(project).or_default().1 += count.max(0) as usize;
+                    }
+                }
+                Ok(counts.into_iter().collect::<Vec<_>>())
+            })
+            .await?;
+
+        rows.into_iter()
+            .map(|(project, (held, failed))| {
+                Ok((
+                    ProjectId::parse(project).map_err(|e| StorageError::Storage(e.to_string()))?,
+                    AttentionCounts {
+                        approvals: 0,
+                        held,
+                        failed,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn projects_for_sessions(
+        &self,
+        sessions: &[SessionId],
+    ) -> Result<Vec<(SessionId, ProjectId)>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sessions: Vec<String> = sessions.iter().map(|s| s.as_str().to_string()).collect();
+        let rows = self
+            .pool
+            .interact("issue_runs.projects_for_sessions", move |conn| {
+                // Built from the bind count, never from the values: the
+                // placeholders are the only thing interpolated.
+                let placeholders = vec!["?"; sessions.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT DISTINCT session_id, project_id FROM issue_runs \
+                     WHERE session_id IN ({placeholders})"
+                ))?;
+                let params = rusqlite::params_from_iter(sessions.iter());
+                Ok(stmt
+                    .query_map(params, |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(session, project)| {
+                Ok((
+                    SessionId::from(session),
+                    ProjectId::parse(project).map_err(|e| StorageError::Storage(e.to_string()))?,
+                ))
+            })
+            .collect()
     }
 
     async fn project_feed(
