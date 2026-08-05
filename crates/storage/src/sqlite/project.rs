@@ -83,7 +83,7 @@ fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
-     assignee, position, blocked_reason, cancelled_at, created_at, updated_at";
+     assignee, position, blocked_reason, branch, cancelled_at, created_at, updated_at";
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
@@ -176,6 +176,7 @@ type RawIssue = (
     Option<String>,
     i64,
     Option<String>,
+    Option<String>,
     Option<i64>,
     i64,
     i64,
@@ -208,6 +209,7 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -250,6 +252,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         assignee,
         position,
         blocked_reason,
+        branch,
         cancelled_at,
         created_at,
         updated_at,
@@ -273,6 +276,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
             .map_err(|e| StorageError::Storage(e.to_string()))?,
         position,
         blocked_reason,
+        branch,
         cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
         created_at: ts("issues.created_at", created_at)?,
         updated_at: ts("issues.updated_at", updated_at)?,
@@ -701,6 +705,22 @@ impl ProjectStore for SqliteProjectStore {
     ) -> Result<Vec<IssueEventRow>> {
         self.events_query(issue.as_str().to_string(), Some(super::time::to_us(since)))
             .await
+    }
+
+    async fn set_issue_branch(&self, id: &IssueId, branch: &str) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let branch = branch.to_owned();
+        let now = super::time::now_us();
+        let changed = self
+            .pool
+            .interact("issues.set_branch", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE issues SET branch = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, branch, now],
+                )?)
+            })
+            .await?;
+        Ok(changed > 0)
     }
 
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>> {

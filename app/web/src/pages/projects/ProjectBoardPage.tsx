@@ -494,6 +494,16 @@ function IssueCard({
           ⚑ Blocked
         </span>
       ) : null}
+      {/* Only once the work produced a commit — the server leaves `branch`
+          unset until then, so a research issue never shows one. */}
+      {issue.branch != null ? (
+        <span
+          className="self-start max-w-full truncate border border-black/25 bg-canvas rounded px-1.5 font-mono text-[0.56rem] text-ink-soft"
+          title={issue.branch}
+        >
+          ⑂ {issue.branch}
+        </span>
+      ) : null}
       {issue.assignee != null ? (
         <div className="flex items-center gap-1.5">
           <AssigneeDot assignee={issue.assignee} working={run === 'running'} />

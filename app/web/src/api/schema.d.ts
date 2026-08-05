@@ -2223,6 +2223,11 @@ export interface components {
              */
             blocked_reason?: string | null;
             /**
+             * @description The branch this issue's work landed on. Absent until it has a
+             *     commit, so a research issue never shows one.
+             */
+            branch?: string | null;
+            /**
              * Format: int64
              * @description Present once the issue is cancelled. The row is never deleted.
              */
@@ -2295,6 +2300,14 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "cancelled";
+        } | {
+            branch_deleted: boolean;
+            /** @enum {string} */
+            kind: "worktree_reclaimed";
+        } | {
+            /** @enum {string} */
+            kind: "worktree_kept";
+            reason: string;
         };
         /** @description One entry on an issue's timeline. */
         IssueEventDto: {
@@ -6488,6 +6501,11 @@ export interface operations {
                              *     whichever column it was in.
                              */
                             blocked_reason?: string | null;
+                            /**
+                             * @description The branch this issue's work landed on. Absent until it has a
+                             *     commit, so a research issue never shows one.
+                             */
+                            branch?: string | null;
                             /**
                              * Format: int64
                              * @description Present once the issue is cancelled. The row is never deleted.

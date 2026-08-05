@@ -373,10 +373,11 @@ announces which of these will happen before sending.
     looked up by a name recomputed from the *current* title, so renaming
     an issue makes the next run cut a second branch and leave the first
     one's commits behind.
-  - `git worktree remove` (Phase 3) needs care: it refuses on a dirty
-    tree, exits **255 after already deleting the checkout** when
-    `.git/worktrees` is not writable, keeps the branch, and `prune`
-    reports failure on stderr while **exiting 0**.
+  - ~~`git worktree remove` needs care~~ **handled**: a dirty tree comes
+    back as `Reclaimed::Kept` with git's reason for the timeline; the
+    255-after-deleting case is detected by re-checking the directory and
+    finished with a `prune`; a commit-less branch is deleted only after
+    the tree is gone, because until then it is checked out in it.
 - **No merge machinery**: the platform never merges. The assignee merges
   when asked (an ordinary comment-triggered run in its worktree) or the
   user merges in a terminal. Worktree reclamation runs when an issue
@@ -411,10 +412,16 @@ announces which of these will happen before sending.
 2. **Execution.** `issue_runs` + trigger predicate + ledger, per-issue
    sessions, worktree/branch creation, timeline events + WS deltas,
    execution log + transcript links, comment delivery (wake/interject).
-3. **Review plane.** Worktree reclamation on Done/Cancelled with the
-   dirty-worktree guard, branch chip + copy on card and rail, and the
-   merge-by-assignee comment flow exercised end to end. (Diff viewer and
-   merge button are cut from v1.)
+3. **Review plane.** ✅ **Shipped.** `issues.branch` (written only once
+   the work has a commit, so "has a branch" and "produced something" are
+   the same fact and cannot disagree), branch chip on the card face and a
+   copy box in the rail, and worktree reclamation on Done/Cancelled with
+   the dirty guard — uncommitted work is never destroyed, and the reason
+   git gave lands on the timeline. A commit-less branch goes with its
+   tree; one with commits is the deliverable and is kept.
+
+   The merge-by-assignee flow needs no code: it is an ordinary comment on
+   a live card, which now wakes the assignee in its own worktree.
 4. **Team autonomy.** Lead bootstrap + triage loop, `ProjectAgentCreate`,
    budget gate, approvals on the timeline, stages + parent wake,
    activity feed drawer.

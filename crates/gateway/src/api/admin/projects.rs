@@ -201,6 +201,10 @@ pub struct IssueDto {
     pub assignee: Option<String>,
     /// Rank within the column, dense and ascending.
     pub position: i64,
+    /// The branch this issue's work landed on. Absent until it has a
+    /// commit, so a research issue never shows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Why work stopped. A badge on the card — blocked work stays in
     /// whichever column it was in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,7 @@ impl From<IssueRow> for IssueDto {
             priority: row.priority.into(),
             assignee: row.assignee.map(|a| a.to_string()),
             position: row.position,
+            branch: row.branch,
             blocked_reason: row.blocked_reason,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
@@ -314,6 +319,12 @@ pub enum IssueEventBodyDto {
     },
     Unblocked,
     Cancelled,
+    WorktreeReclaimed {
+        branch_deleted: bool,
+    },
+    WorktreeKept {
+        reason: String,
+    },
 }
 
 impl From<IssueEventBody> for IssueEventBodyDto {
@@ -352,6 +363,10 @@ impl From<IssueEventBody> for IssueEventBodyDto {
             IssueEventBody::Blocked { reason } => Self::Blocked { reason },
             IssueEventBody::Unblocked => Self::Unblocked,
             IssueEventBody::Cancelled => Self::Cancelled,
+            IssueEventBody::WorktreeReclaimed { branch_deleted } => {
+                Self::WorktreeReclaimed { branch_deleted }
+            }
+            IssueEventBody::WorktreeKept { reason } => Self::WorktreeKept { reason },
         }
     }
 }

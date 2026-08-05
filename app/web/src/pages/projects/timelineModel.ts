@@ -56,6 +56,14 @@ export function describeEvent(body: IssueEventBody): string | null {
       return 'unblocked it';
     case 'cancelled':
       return 'cancelled it';
+    case 'worktree_reclaimed':
+      return body.branch_deleted
+        ? 'reclaimed the worktree and deleted its branch — nothing was committed'
+        : 'reclaimed the worktree; the branch is still there';
+    case 'worktree_kept':
+      // git's own reason, because it is the actionable part: the operator
+      // has to commit or discard before the tree can go.
+      return `kept the worktree — ${body.reason}`;
   }
 }
 

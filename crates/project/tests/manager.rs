@@ -858,3 +858,106 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
         "and the composer is told exactly that"
     );
 }
+
+#[tokio::test]
+async fn finishing_an_issue_gives_its_worktree_back_and_says_so() {
+    // Reclamation is the only thing that ever removes a worktree — nothing
+    // sweeps them — so an issue that reaches Done and keeps its checkout
+    // forever is a disk leak with no other backstop.
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Reclaim"))
+        .await
+        .expect("create");
+    let issue = f
+        .manager
+        .create_issue(&project.id, IssueActor::User, new_issue("Do it"))
+        .await
+        .expect("create issue");
+
+    let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+    let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+    baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch)
+        .await
+        .expect("cut a worktree the way a run would");
+    assert!(root.exists());
+
+    f.manager
+        .move_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueStatus::Done,
+            &[issue.number],
+        )
+        .await
+        .expect("finish it");
+
+    assert!(!root.exists(), "the checkout is gone");
+    let kinds: Vec<_> = f
+        .manager
+        .timeline(&project.id, issue.number)
+        .await
+        .expect("timeline")
+        .iter()
+        .map(|e| e.body.kind())
+        .collect();
+    assert!(
+        kinds.contains(&"worktree_reclaimed"),
+        "and the timeline says so: {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
+    // The checkout is the only copy of whatever the agent had not
+    // committed. Reaching Done is a statement about the work, not
+    // permission to delete it.
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Careful"))
+        .await
+        .expect("create");
+    let issue = f
+        .manager
+        .create_issue(&project.id, IssueActor::User, new_issue("Half done"))
+        .await
+        .expect("create issue");
+    let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
+    let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+    baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch)
+        .await
+        .expect("cut");
+    tokio::fs::write(root.join("scratch.txt"), b"not committed")
+        .await
+        .expect("leave work behind");
+
+    f.manager
+        .update_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel it");
+
+    assert!(root.join("scratch.txt").exists(), "the work is still there");
+    let kinds: Vec<_> = f
+        .manager
+        .timeline(&project.id, issue.number)
+        .await
+        .expect("timeline")
+        .iter()
+        .map(|e| e.body.kind())
+        .collect();
+    assert!(
+        kinds.contains(&"worktree_kept"),
+        "and the operator is told why rather than left to notice: {kinds:?}"
+    );
+}

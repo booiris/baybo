@@ -186,6 +186,86 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
     Ok(checkout)
 }
 
+/// What happened when an issue's worktree was reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reclaimed {
+    /// The checkout is gone. `branch_deleted` is true when it had produced
+    /// nothing and was removed with it.
+    Removed { branch_deleted: bool },
+    /// Left alone, with the reason to put on the timeline. Uncommitted work
+    /// is the common one: deleting it would destroy the only copy.
+    Kept { reason: String },
+    /// There was nothing there — already reclaimed, or never created.
+    Absent,
+}
+
+/// Give an issue's worktree back when the issue is finished.
+///
+/// Refuses to destroy work: `git worktree remove` will not delete a tree
+/// with modified or untracked files, and that refusal is passed through as
+/// [`Reclaimed::Kept`] rather than forced. The operator can commit or
+/// discard and the next reclamation will take it.
+///
+/// A branch that never produced a commit is deleted with the tree. One
+/// that did is kept — it is the deliverable, and the whole point of not
+/// merging automatically is that the operator decides what happens to it.
+pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed> {
+    if !root.exists() {
+        // A stale admin record can outlive the directory; tidying it here
+        // keeps `git worktree list` honest and costs nothing.
+        let _ = git(repo, &["worktree", "prune"]).await;
+        return Ok(Reclaimed::Absent);
+    }
+    let root_str = root.to_string_lossy().into_owned();
+    let out = run(repo, &["worktree", "remove", &root_str]).await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        // git exits 255 *after* deleting the checkout when it cannot write
+        // its own admin dir, which leaves a half-removed worktree only a
+        // prune can finish. Try that either way before reporting.
+        if !root.exists() {
+            let _ = git(repo, &["worktree", "prune"]).await;
+        }
+        return Ok(Reclaimed::Kept { reason: stderr });
+    }
+
+    // Deleting the branch is safe only now: while the worktree existed the
+    // branch was checked out in it, and git would have refused anyway.
+    let mut branch_deleted = false;
+    if branch_exists(repo, branch).await? && commits_ahead(repo, branch).await == 0 {
+        branch_deleted = git(repo, &["branch", "-D", branch]).await.is_ok();
+    }
+    Ok(Reclaimed::Removed { branch_deleted })
+}
+
+/// How many commits `branch` has that the repository's own checked-out
+/// branch does not — what the issue actually produced.
+///
+/// The base is the main checkout's current branch, which is reliable here
+/// because `git worktree add` never moves it: issue branches live in
+/// worktrees, so the repository's own HEAD stays on whatever the operator
+/// left it on.
+///
+/// Returns 0 rather than an error when git cannot answer. A miscount makes
+/// a branch chip appear or not appear; failing the run that produced the
+/// work would be the more expensive way to be wrong.
+pub async fn commits_ahead(repo: &Path, branch: &str) -> usize {
+    let base = match run(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => return 0,
+    };
+    if base.is_empty() || base == branch {
+        return 0;
+    }
+    match run(repo, &["rev-list", "--count", &format!("{base}..{branch}")]).await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 async fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     Ok(run(
         repo,
@@ -466,6 +546,166 @@ mod tests {
             .await
             .expect("a lost worktree must be recoverable, not permanent");
         assert!(root.join(".git").exists());
+    }
+
+    /// A repository with one commit — the shape a project pointed at a real
+    /// checkout has, and the one where `worktree add -b` makes a real ref.
+    async fn repo_with_commit() -> tempfile::TempDir {
+        let dir = fresh_repo().await;
+        tokio::fs::write(dir.path().join("seed.txt"), b"seed")
+            .await
+            .expect("write");
+        git(dir.path(), &["add", "."]).await.expect("add");
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "--quiet",
+                "-m",
+                "seed",
+            ],
+        )
+        .await
+        .expect("commit");
+        dir
+    }
+
+    #[tokio::test]
+    async fn reclaiming_a_clean_worktree_takes_its_commit_less_branch_with_it() {
+        let repo = repo_with_commit().await;
+        let root = repo.path().join("wt").join("6");
+        ensure(repo.path(), &root, "issue/6-x").await.expect("cut");
+        assert!(
+            branch_exists(repo.path(), "issue/6-x")
+                .await
+                .expect("check"),
+            "the branch is real once there is a commit to branch from"
+        );
+
+        assert_eq!(
+            reclaim(repo.path(), &root, "issue/6-x")
+                .await
+                .expect("reclaim"),
+            Reclaimed::Removed {
+                branch_deleted: true
+            },
+            "a branch that produced nothing is not a deliverable"
+        );
+        assert!(!root.exists());
+        assert!(
+            !branch_exists(repo.path(), "issue/6-x")
+                .await
+                .expect("check")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_orphan_worktree_leaves_no_branch_to_delete() {
+        // A project created without a workdir has no commits, so git infers
+        // `--orphan` and the ref does not exist until the first commit —
+        // there is nothing to clean up, and nothing to report cleaning.
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("6b");
+        ensure(repo.path(), &root, "issue/6-x").await.expect("cut");
+        assert!(
+            !branch_exists(repo.path(), "issue/6-x")
+                .await
+                .expect("check")
+        );
+        assert_eq!(
+            reclaim(repo.path(), &root, "issue/6-x")
+                .await
+                .expect("reclaim"),
+            Reclaimed::Removed {
+                branch_deleted: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_with_commits_outlives_its_worktree() {
+        // The deliverable survives: the platform never merges, so the
+        // branch is what the operator is left holding.
+        let repo = repo_with_commit().await;
+        let root = repo.path().join("wt").join("7");
+        ensure(repo.path(), &root, "issue/7-x").await.expect("cut");
+        tokio::fs::write(root.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        git(&root, &["add", "."]).await.expect("add");
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "--quiet",
+                "-m",
+                "work",
+            ],
+        )
+        .await
+        .expect("commit");
+
+        assert_eq!(
+            reclaim(repo.path(), &root, "issue/7-x")
+                .await
+                .expect("reclaim"),
+            Reclaimed::Removed {
+                branch_deleted: false
+            }
+        );
+        assert!(
+            branch_exists(repo.path(), "issue/7-x")
+                .await
+                .expect("check")
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_work_is_never_destroyed_by_reclamation() {
+        // The expensive mistake this guard prevents: the worktree holds the
+        // only copy of whatever the agent had not committed.
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("8");
+        ensure(repo.path(), &root, "issue/8-x").await.expect("cut");
+        tokio::fs::write(root.join("half-done.txt"), b"in progress")
+            .await
+            .expect("write");
+
+        let outcome = reclaim(repo.path(), &root, "issue/8-x")
+            .await
+            .expect("reclaim");
+        assert!(
+            matches!(&outcome, Reclaimed::Kept { reason } if reason.contains("untracked")),
+            "the reason has to say why, because it lands on the timeline: {outcome:?}"
+        );
+        assert!(
+            root.join("half-done.txt").exists(),
+            "the work is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_twice_is_not_an_error() {
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("9");
+        ensure(repo.path(), &root, "issue/9-x").await.expect("cut");
+        reclaim(repo.path(), &root, "issue/9-x")
+            .await
+            .expect("first");
+        assert_eq!(
+            reclaim(repo.path(), &root, "issue/9-x")
+                .await
+                .expect("second"),
+            Reclaimed::Absent
+        );
     }
 
     #[tokio::test]

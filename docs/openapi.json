@@ -4373,6 +4373,13 @@
                             ],
                             "description": "Why work stopped. A badge on the card — blocked work stays in\nwhichever column it was in."
                           },
+                          "branch": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The branch this issue's work landed on. Absent until it has a\ncommit, so a research issue never shows one."
+                          },
                           "cancelled_at_ms": {
                             "type": [
                               "integer",
@@ -7794,6 +7801,13 @@
             ],
             "description": "Why work stopped. A badge on the card — blocked work stays in\nwhichever column it was in."
           },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch this issue's work landed on. Absent until it has a\ncommit, so a research issue never shows one."
+          },
           "cancelled_at_ms": {
             "type": [
               "integer",
@@ -8014,6 +8028,42 @@
                 "enum": [
                   "cancelled"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "branch_deleted",
+              "kind"
+            ],
+            "properties": {
+              "branch_deleted": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "worktree_reclaimed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "worktree_kept"
+                ]
+              },
+              "reason": {
+                "type": "string"
               }
             }
           }

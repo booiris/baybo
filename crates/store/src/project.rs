@@ -147,6 +147,12 @@ pub struct IssueRow {
     /// Why work stopped, when it did. A badge on the card, not a column —
     /// blocked work is still in whichever column it was in.
     pub blocked_reason: Option<String>,
+    /// The branch this issue's work landed on, once it has landed. `None`
+    /// while the worktree exists but has produced no commit — which is the
+    /// state a research issue stays in for its whole life, and is why the
+    /// UI can key "show a branch" on this field alone rather than on a
+    /// second has-commits flag that could disagree with it.
+    pub branch: Option<String>,
     /// The terminal negative. A cancelled issue keeps its row, its number
     /// and its history; it just stops counting as live work.
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -264,6 +270,18 @@ pub enum IssueEventBody {
     },
     Unblocked,
     Cancelled,
+    /// The issue's worktree was given back. `branch_deleted` says whether
+    /// the branch went with it, which only happens when it never produced
+    /// a commit.
+    WorktreeReclaimed {
+        branch_deleted: bool,
+    },
+    /// The worktree was left in place, and why. Almost always uncommitted
+    /// work: the checkout holds the only copy, so the operator gets told
+    /// rather than the board deciding for them.
+    WorktreeKept {
+        reason: String,
+    },
 }
 
 impl IssueEventBody {
@@ -281,6 +299,8 @@ impl IssueEventBody {
             IssueEventBody::Blocked { .. } => "blocked",
             IssueEventBody::Unblocked => "unblocked",
             IssueEventBody::Cancelled => "cancelled",
+            IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
+            IssueEventBody::WorktreeKept { .. } => "worktree_kept",
         }
     }
 }
@@ -385,6 +405,10 @@ pub trait ProjectStore: Send + Sync {
         issue: &IssueId,
         since: DateTime<Utc>,
     ) -> Result<Vec<IssueEventRow>>;
+
+    /// Record the branch an issue's work landed on. Called once its
+    /// worktree has a commit; `Ok(false)` if no row matched.
+    async fn set_issue_branch(&self, id: &IssueId, branch: &str) -> Result<bool>;
 
     /// Every run of one issue, newest first — the execution log.
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;

@@ -157,6 +157,49 @@ impl ProjectManager {
         }
     }
 
+    /// Give the worktree back when an issue reaches Done or Cancelled.
+    ///
+    /// Only on the *transition*: re-saving a card that was already Done
+    /// must not keep trying, and an issue reopened and finished again gets
+    /// its second reclamation honestly.
+    ///
+    /// Nothing here fails the edit. Dragging a card to Done is a statement
+    /// about the work, not a filesystem operation, and it stands whatever
+    /// git says.
+    async fn reclaim_if_finished(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
+        let finished =
+            |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
+        if finished(before) || !finished(after) {
+            return;
+        }
+        let Ok(Some(project)) = self.store.get_project(&after.project_id).await else {
+            return;
+        };
+        let root = crate::worktree::worktree_root(&self.paths, &after.project_id, after.number);
+        let branch = crate::worktree::branch_name(after.number, &after.title);
+        match crate::worktree::reclaim(Path::new(&project.workdir), &root, &branch).await {
+            Ok(crate::worktree::Reclaimed::Removed { branch_deleted }) => {
+                self.record(
+                    after,
+                    actor,
+                    IssueEventBody::WorktreeReclaimed { branch_deleted },
+                )
+                .await;
+            }
+            Ok(crate::worktree::Reclaimed::Kept { reason }) => {
+                self.record(after, actor, IssueEventBody::WorktreeKept { reason })
+                    .await;
+            }
+            // Nothing was there. Silent on purpose: an issue that never ran
+            // has no worktree, and saying so on every card that reaches
+            // Done would be noise on the entries that matter.
+            Ok(crate::worktree::Reclaimed::Absent) => {}
+            Err(e) => {
+                tracing::error!(issue = after.number, error = %e, "could not reclaim the worktree");
+            }
+        }
+    }
+
     /// Say something on an issue, and reach whoever should hear it.
     ///
     /// The comment always lands on the timeline; what else happens is
@@ -552,7 +595,8 @@ impl ProjectManager {
         }
         let after = self.get_issue(project, number).await?;
         self.events.board_changed(project, Some(number));
-        self.record_diff(&before, &after, actor).await;
+        self.record_diff(&before, &after, actor.clone()).await;
+        self.reclaim_if_finished(&before, &after, actor).await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         Ok(after)
@@ -588,7 +632,8 @@ impl ProjectManager {
             });
         }
         let after = self.get_issue(project, number).await?;
-        self.record_diff(&before, &after, actor).await;
+        self.record_diff(&before, &after, actor.clone()).await;
+        self.reclaim_if_finished(&before, &after, actor).await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         Ok(after)

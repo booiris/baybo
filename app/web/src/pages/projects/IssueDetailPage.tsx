@@ -461,6 +461,30 @@ export function IssueDetailPage() {
             </label>
           </section>
 
+          {/* No diff viewer and no merge button, per decision 9: review
+              rides the transcript plus the branch checked out locally, and
+              merging is the assignee's job on request or yours in a
+              terminal. So the branch's whole job here is to be copied. */}
+          {issue.branch != null ? (
+            <section className="border-2 border-black rounded-md bg-surface p-3">
+              <h2 className={railLabel}>Branch</h2>
+              <div className="mt-1 flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate font-mono text-[0.7rem]" title={issue.branch}>
+                  {issue.branch}
+                </code>
+                <button
+                  type="button"
+                  className="shrink-0 font-mono text-[0.66rem] underline cursor-pointer"
+                  onClick={() => {
+                    if (issue.branch != null) void navigator.clipboard.writeText(issue.branch);
+                  }}
+                >
+                  copy
+                </button>
+              </div>
+            </section>
+          ) : null}
+
           <section className="border-2 border-black rounded-md bg-surface p-3">
             <h2 className={railLabel}>Execution log</h2>
             {runs.some((run) => run.status === 'queued' || run.status === 'running') ? null : (

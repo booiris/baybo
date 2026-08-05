@@ -65,6 +65,7 @@ mod tests {
             assignee: None,
             position: 0,
             blocked_reason: None,
+            branch: None,
             cancelled_at: None,
             created_at: now,
             updated_at: now,

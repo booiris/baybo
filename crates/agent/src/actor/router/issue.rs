@@ -308,6 +308,43 @@ async fn follow_up_on_comments(
     }
 }
 
+/// Record the branch on the issue once the work has actually produced
+/// something.
+///
+/// Worktree and branch are separate ideas: every run gets a worktree, but
+/// the branch is the *deliverable*, and an issue whose answer was a report
+/// rather than code should show no branch anywhere. Keying the row's
+/// `branch` on "has a commit" rather than storing it at creation is what
+/// makes that fall out — there is no second flag that could disagree.
+async fn surface_branch(
+    store: &Arc<dyn ProjectStore>,
+    events: Option<&Arc<dyn ProjectEvents>>,
+    run: &IssueRunRow,
+) {
+    let (Ok(Some(issue)), Ok(Some(project))) = (
+        store.get_issue(&run.project_id, run.number).await,
+        store.get_project(&run.project_id).await,
+    ) else {
+        return;
+    };
+    if issue.branch.is_some() {
+        return;
+    }
+    let branch = worktree::branch_name(issue.number, &issue.title);
+    if worktree::commits_ahead(Path::new(&project.workdir), &branch).await == 0 {
+        return;
+    }
+    match store.set_issue_branch(&issue.id, &branch).await {
+        Ok(true) => {
+            if let Some(events) = events {
+                events.board_changed(&issue.project_id, Some(issue.number));
+            }
+        }
+        Ok(false) => {}
+        Err(e) => warn!(run = %run.id, error = %e, "could not record the issue's branch"),
+    }
+}
+
 async fn settle(
     store: &Arc<dyn ProjectStore>,
     events: Option<&Arc<dyn ProjectEvents>>,
@@ -338,6 +375,7 @@ async fn settle(
             // Only after the row is settled: the per-issue live index would
             // refuse the follow-up while this run still holds the slot.
             follow_up_on_comments(store, events, run).await;
+            surface_branch(store, events, run).await;
         }
         Ok(false) => {}
         Err(e) => {

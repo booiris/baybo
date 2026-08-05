@@ -282,6 +282,11 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
 
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
+    AddColumn {
+        table: "issues",
+        column: "branch",
+        definition: "TEXT",
+    },
     // `issues` was created one commit ago and has never shipped, so its
     // CREATE carries `assignee` directly. The ALTER is here for the
     // databases that commit already made — the pragma guard makes it a
@@ -1297,6 +1302,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- renumbers the whole target column in one transaction.
                     position       INTEGER NOT NULL,
                     blocked_reason TEXT,
+                    -- The branch this issue's work landed on. NULL until it
+                    -- has a commit: worktree and branch are separate ideas,
+                    -- and a research issue that produced a report and no
+                    -- code should show no branch anywhere.
+                    branch         TEXT,
                     cancelled_at   INTEGER,
                     created_at     INTEGER NOT NULL,
                     updated_at     INTEGER NOT NULL

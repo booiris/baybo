@@ -39,6 +39,18 @@ describe('describeEvent', () => {
     expect(describeEvent({ kind: 'run_settled', attempt: 1, status: 'done' })).toBe('run #1 done');
   });
 
+  it('distinguishes a reclaimed worktree from one that was left alone', () => {
+    expect(describeEvent({ kind: 'worktree_reclaimed', branch_deleted: true })).toContain(
+      'nothing was committed',
+    );
+    expect(describeEvent({ kind: 'worktree_reclaimed', branch_deleted: false })).toContain(
+      'branch is still there',
+    );
+    expect(
+      describeEvent({ kind: 'worktree_kept', reason: 'contains modified or untracked files' }),
+    ).toContain('contains modified or untracked files');
+  });
+
   it('says nothing for a comment, because a comment is shown rather than narrated', () => {
     expect(describeEvent({ kind: 'comment', text: 'have a look' })).toBeNull();
     expect(eventShape(entry({ kind: 'comment', text: 'have a look' }))).toBe('comment');
@@ -55,6 +67,8 @@ describe('describeEvent', () => {
       { kind: 'blocked', reason: 'waiting' },
       { kind: 'unblocked' },
       { kind: 'cancelled' },
+      { kind: 'worktree_reclaimed', branch_deleted: true },
+      { kind: 'worktree_kept', reason: 'contains modified or untracked files' },
     ];
     for (const body of kinds) {
       expect(describeEvent(body), body.kind).toBeTypeOf('string');

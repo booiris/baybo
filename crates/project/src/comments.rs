@@ -72,6 +72,7 @@ mod tests {
             assignee: assigned.then(|| AgentProfileId::parse("dev-1".to_owned()).expect("agent")),
             position: 0,
             blocked_reason: None,
+            branch: None,
             cancelled_at: None,
             created_at: now,
             updated_at: now,
