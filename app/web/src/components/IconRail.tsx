@@ -6,6 +6,7 @@ import {
   RiCpuLine,
   RiFileList3Line,
   RiGitMergeLine,
+  RiKanbanView2,
   RiLogoutBoxRLine,
   RiRobot2Line,
   RiStackLine,
@@ -26,6 +27,7 @@ const railActive =
   'bg-surface border-black shadow-brutal-sm active:translate-x-[1px] active:translate-y-[1px] active:shadow-none';
 
 const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
+  { to: '/projects', label: 'Projects', Icon: RiKanbanView2 },
   { to: '/logs', label: 'Log', Icon: RiFileList3Line },
   { to: '/traces', label: 'Trace', Icon: RiGitMergeLine },
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },

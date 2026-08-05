@@ -397,15 +397,25 @@ impl ProjectStore for SqliteProjectStore {
             .interact("issues.move", move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let moved = tx.execute(
+                // Read the column it is leaving before the update overwrites
+                // it: the card it vacates has to close ranks behind it, and
+                // afterwards there is no way to know where it came from.
+                let previous: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM issues WHERE project_id = ?1 AND number = ?2",
+                        rusqlite::params![project, number],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(previous) = previous else {
+                    drop(tx);
+                    return Ok(false);
+                };
+                tx.execute(
                     "UPDATE issues SET status = ?3, updated_at = ?4 \
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![project, number, status, now],
                 )?;
-                if moved == 0 {
-                    drop(tx);
-                    return Ok(false);
-                }
                 // Renumber the destination column densely. Every UPDATE is
                 // scoped to (project, status), so a number from another
                 // project — or from a column the caller mis-read — updates
@@ -416,6 +426,29 @@ impl ProjectStore for SqliteProjectStore {
                          WHERE project_id = ?1 AND number = ?2 AND status = ?4",
                         rusqlite::params![project, target, index as i64, status],
                     )?;
+                }
+                if previous != status {
+                    // The source column keeps its order and closes the gap.
+                    // Left alone it would hold a hole at the departed card's
+                    // rank — harmless for sorting, but it makes `position`
+                    // mean two different things depending on history, and a
+                    // later reader that trusts density would be wrong.
+                    let remaining: Vec<i64> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT number FROM issues \
+                             WHERE project_id = ?1 AND status = ?2 \
+                             ORDER BY position, number",
+                        )?;
+                        stmt.query_map(rusqlite::params![project, previous], |row| row.get(0))?
+                            .collect::<rusqlite::Result<Vec<i64>>>()?
+                    };
+                    for (index, target) in remaining.iter().enumerate() {
+                        tx.execute(
+                            "UPDATE issues SET position = ?3 \
+                             WHERE project_id = ?1 AND number = ?2",
+                            rusqlite::params![project, target, index as i64],
+                        )?;
+                    }
                 }
                 tx.commit()?;
                 Ok(true)
@@ -639,6 +672,40 @@ mod tests {
                 .await
                 .unwrap(),
             "an unknown issue reports no row moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_column_a_card_leaves_closes_its_gap() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        for title in ["a", "b", "c", "d"] {
+            store
+                .create_issue(&new_issue(&p.id, title, IssueStatus::Backlog))
+                .await
+                .unwrap();
+        }
+        // #2 leaves from the middle. The caller only ever knows the
+        // destination's contents, so closing the source's rank is the
+        // store's job — otherwise position 1 stays vacant forever.
+        assert!(
+            store
+                .move_issue(&p.id, 2, IssueStatus::Review, &[2])
+                .await
+                .unwrap()
+        );
+
+        let issues = store.list_issues(&p.id).await.unwrap();
+        let backlog: Vec<(i64, i64)> = issues
+            .iter()
+            .filter(|i| i.status == IssueStatus::Backlog)
+            .map(|i| (i.number, i.position))
+            .collect();
+        assert_eq!(
+            backlog,
+            vec![(1, 0), (3, 1), (4, 2)],
+            "the survivors keep their order and take consecutive ranks"
         );
     }
 
