@@ -154,7 +154,7 @@ export function CreateIssueModal({
                 <option value="">Unassigned</option>
                 {agents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
-                    {agent.name}
+                    @{agent.handle} — {agent.name}
                   </option>
                 ))}
               </select>

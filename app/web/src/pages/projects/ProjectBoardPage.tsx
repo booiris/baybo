@@ -26,7 +26,9 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
 import {
   fetchActiveRuns,
-  fetchAgents,
+  fetchTeam,
+  hireAgent,
+  removeAgent,
   fetchIssues,
   fetchProject,
   fetchProjects,
@@ -59,6 +61,8 @@ import {
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
+import { TeamStrip } from './TeamStrip';
+import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
 import { useBoardStream } from './useBoardStream';
 
@@ -80,7 +84,7 @@ export function ProjectBoardPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [agents, setAgents] = useState<Agent[]>([]);
+  const [team, setTeam] = useState<Agent[]>([]);
   const [activeRuns, setActiveRuns] = useState<IssueRun[]>([]);
   const [board, setBoard] = useState<Board>(emptyBoard);
   const [loading, setLoading] = useState(true);
@@ -103,7 +107,7 @@ export function ProjectBoardPage() {
           fetchProject(client, projectId),
           fetchIssues(client, projectId),
           fetchProjects(client, false),
-          fetchAgents(client),
+          fetchTeam(client, projectId),
           fetchActiveRuns(client, projectId),
         ]);
       if (canceled) return;
@@ -129,7 +133,7 @@ export function ProjectBoardPage() {
       setProject(projectOutcome.value);
       setBoard(groupByStatus(issuesOutcome.value, showCancelled));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
-      if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
+      if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
       setLoading(false);
       // Remembered only once the board actually resolved: a 404'd deep link
@@ -276,6 +280,35 @@ export function ProjectBoardPage() {
             <RiArchiveLine /> Archived — read only
           </span>
         ) : null}
+        <TeamStrip
+          team={team}
+          activeRuns={activeRuns}
+          readOnly={archived}
+          onHire={async (body) => {
+            const outcome = await hireAgent(client, projectId, body);
+            if (outcome.kind === 'unauthorized') {
+              logout();
+              return null;
+            }
+            if (outcome.kind === 'failed') return outcome.message;
+            pushToast('ok', `@${outcome.value.handle} joined the project`);
+            setRefreshKey((key) => key + 1);
+            return null;
+          }}
+          onRemove={(agent) => {
+            void removeAgent(client, projectId, agent.id).then((outcome) => {
+              if (outcome.kind === 'unauthorized') {
+                logout();
+                return;
+              }
+              pushToast(
+                outcome.kind === 'ok' ? 'ok' : 'err',
+                outcome.kind === 'ok' ? `@${agent.handle} left the project` : outcome.message,
+              );
+              setRefreshKey((key) => key + 1);
+            });
+          }}
+        />
         <div className="ml-auto flex items-center gap-2">
           <label className="flex items-center gap-1.5 font-mono text-[0.68rem] text-ink-soft cursor-pointer">
             <input
@@ -313,6 +346,7 @@ export function ProjectBoardPage() {
               status={status}
               issues={board[status]}
               activeRuns={activeRuns}
+              team={team}
               disabled={archived}
               onOpen={openIssue}
               onCreate={() => {
@@ -323,7 +357,7 @@ export function ProjectBoardPage() {
         </div>
 
         <DragOverlay>
-          {dragging !== null ? <IssueCard issue={dragging} overlay /> : null}
+          {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
         </DragOverlay>
       </DndContext>
 
@@ -331,7 +365,7 @@ export function ProjectBoardPage() {
         <CreateIssueModal
           projectId={projectId}
           status={createIn}
-          agents={agents}
+          agents={assignableAgents(team)}
           onClose={() => {
             setCreateIn(null);
           }}
@@ -351,6 +385,7 @@ function BoardColumn({
   status,
   issues,
   activeRuns,
+  team,
   disabled,
   onOpen,
   onCreate,
@@ -358,6 +393,7 @@ function BoardColumn({
   status: IssueStatus;
   issues: Issue[];
   activeRuns: IssueRun[];
+  team: Agent[];
   disabled: boolean;
   onOpen: (number: number) => void;
   onCreate: () => void;
@@ -400,6 +436,7 @@ function BoardColumn({
               key={issue.number}
               issue={issue}
               run={runIndicator(activeRuns, issue.number)}
+              team={team}
               disabled={disabled}
               onOpen={onOpen}
             />
@@ -418,11 +455,13 @@ function BoardColumn({
 function SortableIssueCard({
   issue,
   run,
+  team,
   disabled,
   onOpen,
 }: {
   issue: Issue;
   run: 'queued' | 'running' | null;
+  team: Agent[];
   disabled: boolean;
   onOpen: (number: number) => void;
 }) {
@@ -442,7 +481,7 @@ function SortableIssueCard({
         onOpen(issue.number);
       }}
     >
-      <IssueCard issue={issue} run={run} />
+      <IssueCard issue={issue} run={run} team={team} />
     </div>
   );
 }
@@ -463,10 +502,12 @@ function IssueCard({
   issue,
   run = null,
   overlay = false,
+  team = [],
 }: {
   issue: Issue;
   run?: 'queued' | 'running' | null;
   overlay?: boolean;
+  team?: Agent[];
 }) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
@@ -506,8 +547,10 @@ function IssueCard({
       ) : null}
       {issue.assignee != null ? (
         <div className="flex items-center gap-1.5">
-          <AssigneeDot assignee={issue.assignee} working={run === 'running'} />
-          <span className="font-mono text-[0.58rem] text-ink-soft truncate">{issue.assignee}</span>
+          <AssigneeDot assignee={handleOf(team, issue.assignee)} working={run === 'running'} />
+          <span className="font-mono text-[0.58rem] text-ink-soft truncate">
+            @{handleOf(team, issue.assignee)}
+          </span>
           {run !== null ? (
             <span
               className={`ml-auto shrink-0 font-mono text-[0.54rem] font-bold uppercase ${

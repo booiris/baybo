@@ -43,6 +43,40 @@ const LEAD_DISPLAY_NAME: &str = "Lead";
 const LEAD_DESCRIPTION: &str =
     "Coordinates this project's board: triages Backlog, assigns work, and staffs the team.";
 
+/// How many live agents one project may have, lead included.
+///
+/// A ceiling rather than a budget: each agent is a persona directory, a
+/// slice of every roster read, and a possible concurrent run. The number is
+/// not load-bearing — it exists so a hiring loop cannot staff a board with
+/// two hundred agents before anybody notices.
+pub const MAX_TEAM_AGENTS: usize = 16;
+
+/// Upper bound on a teammate's role line (chars, after trim). It seeds a
+/// SOUL and shows on a roster card, so it is a sentence, not a brief.
+pub const MAX_ROLE_CHARS: usize = 280;
+
+/// How many `-2`, `-3`, … suffixes to try when a derived handle is taken.
+///
+/// Bounded because handles stay reserved after removal: a board that has
+/// hired and released "QA" a dozen times should get a clear refusal, not a
+/// silent `@qa-47`.
+const MAX_HANDLE_ATTEMPTS: usize = 9;
+
+/// What a caller supplies to put somebody new on a team.
+#[derive(Debug, Clone)]
+pub struct NewTeamMember {
+    /// Display name. The `@handle` is derived from it and then immutable.
+    pub name: String,
+    /// One line saying what this agent is for. Seeds its `SOUL.md` and
+    /// becomes its roster description.
+    pub role: String,
+    /// `None` follows the workspace default (baybo). Only the operator's
+    /// form sets this; `ProjectAgentCreate` deliberately does not.
+    pub framework: Option<AgentFramework>,
+    /// `None` follows `default-llm`.
+    pub llm: Option<baybo_model::LlmEntryName>,
+}
+
 /// What a caller supplies to open a project.
 #[derive(Debug, Clone, Default)]
 pub struct NewProject {
@@ -490,6 +524,167 @@ impl ProjectManager {
         Ok(self.agents.list_team(project).await?)
     }
 
+    /// Put somebody new on a team.
+    ///
+    /// `hired_by` is `None` when the operator did it and `Some(agent)` when
+    /// a teammate did — the lead staffing its own team. The distinction is
+    /// kept on the row rather than in a log line because the profile panel
+    /// shows it, and because a hiring loop is only auditable if each hire
+    /// names who made it.
+    ///
+    /// Refusals are all things the caller can fix: a blank or unusable
+    /// name, a role that is too long, a full team, or a name whose handle
+    /// is already taken and stays taken.
+    pub async fn hire(
+        &self,
+        project: &ProjectId,
+        new: NewTeamMember,
+        hired_by: Option<AgentProfileId>,
+    ) -> Result<baybo_store::AgentProfileRow> {
+        self.writable_project(project).await?;
+        let name = validate_agent_name(&new.name)?;
+        let role = validate_role(&new.role)?;
+        let team = self.agents.list_team(project).await?;
+        if team.len() >= MAX_TEAM_AGENTS {
+            return Err(ProjectError::invalid(
+                "team",
+                format!(
+                    "this project already has {MAX_TEAM_AGENTS} agents. Remove one before \
+                     adding another."
+                ),
+            ));
+        }
+        let base = AgentHandle::derive(&name).ok_or_else(|| {
+            ProjectError::invalid(
+                "name",
+                format!(
+                    "{name:?} has no letters or digits to make a handle from — \
+                     an agent has to be addressable as @something"
+                ),
+            )
+        })?;
+
+        let id = AgentProfileId::generate();
+        let soul =
+            baybo_workspace::prompt::PROJECT_TEAMMATE_SOUL_TEMPLATE.replace("{{role}}", &role);
+        baybo_workspace::ensure_named_persona_layout(&self.paths, id.as_str(), &soul, &name)
+            .await
+            .map_err(|e| anyhow::anyhow!("materialise the new agent's persona: {e}"))?;
+
+        let now = chrono::Utc::now();
+        let row = baybo_store::AgentProfileRow {
+            id,
+            description: role,
+            avatar_blob_id: None,
+            framework: new.framework.unwrap_or_default(),
+            llm: new.llm,
+            builtin: false,
+            team: Some(TeamMembership {
+                project_id: project.clone(),
+                handle: base.clone(),
+            }),
+            hired_by,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        // The handle index is the arbiter, not the roster read above: two
+        // hires racing for `@qa` both see it free, and only the loser needs
+        // a different one. Suffixing on the conflict rather than checking
+        // first is what makes that race correct instead of merely unlikely.
+        for attempt in 1..=MAX_HANDLE_ATTEMPTS {
+            let candidate = if attempt == 1 {
+                base.clone()
+            } else {
+                suffixed_handle(&base, attempt)?
+            };
+            let row = baybo_store::AgentProfileRow {
+                team: Some(TeamMembership {
+                    project_id: project.clone(),
+                    handle: candidate,
+                }),
+                ..row.clone()
+            };
+            match self.agents.create(&row).await {
+                Ok(()) => {
+                    self.events.project_changed(project);
+                    return Ok(row);
+                }
+                Err(baybo_store::StorageError::Conflict(_)) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(ProjectError::invalid(
+            "name",
+            format!(
+                "@{base} and every numbered variant are taken on this board. Handles stay \
+                 reserved after an agent is removed, so pick a different name."
+            ),
+        ))
+    }
+
+    /// Take somebody off a team.
+    ///
+    /// A tombstone, never a delete: the agent's id is written into every
+    /// issue it was assigned, every run it executed and every timeline entry
+    /// it wrote, and the board has to keep being able to say who did what.
+    ///
+    /// Two refusals. The **lead** cannot leave — the board would have no
+    /// coordinator, which nothing downstream is written to handle. An agent
+    /// with a **run in flight** cannot leave either: the run keeps going
+    /// (its row is what it reads, not the roster), so removing it now just
+    /// hides who is doing the work that is happening. Cancel the run first.
+    pub async fn remove_from_team(
+        &self,
+        project: &ProjectId,
+        agent: &AgentProfileId,
+    ) -> Result<()> {
+        self.writable_project(project).await?;
+        let profile = self
+            .agents
+            .get(agent)
+            .await?
+            .filter(|p| {
+                p.team
+                    .as_ref()
+                    .is_some_and(|team| &team.project_id == project)
+            })
+            .ok_or_else(|| {
+                ProjectError::invalid("agent", format!("{agent} is not on this project's team"))
+            })?;
+        if profile
+            .team
+            .as_ref()
+            .is_some_and(|team| team.handle.as_str() == LEAD_HANDLE)
+        {
+            return Err(ProjectError::invalid(
+                "agent",
+                "the lead coordinates the board and cannot be removed from it",
+            ));
+        }
+        let busy = self
+            .store
+            .active_runs(project)
+            .await?
+            .into_iter()
+            .any(|run| &run.agent_id == agent);
+        if busy {
+            return Err(ProjectError::invalid(
+                "agent",
+                format!("{agent} has a run in flight — cancel it before removing the agent"),
+            ));
+        }
+        if !self.agents.remove_from_team(agent).await? {
+            // Somebody removed it between the read and the write.
+            return Err(ProjectError::invalid(
+                "agent",
+                format!("{agent} is no longer on this project's team"),
+            ));
+        }
+        self.events.project_changed(project);
+        Ok(())
+    }
+
     /// Create `work/<slug>/` and make it a git repository.
     ///
     /// An existing non-empty directory is an error rather than a silent
@@ -811,6 +1006,51 @@ fn validate_name(name: &str) -> Result<String> {
         ));
     }
     Ok(trimmed.to_owned())
+}
+
+fn validate_agent_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ProjectError::invalid("name", "must not be empty"));
+    }
+    if trimmed.chars().count() > baybo_model::MAX_AGENT_PROFILE_NAME_CHARS {
+        return Err(ProjectError::invalid(
+            "name",
+            format!(
+                "longer than {} characters",
+                baybo_model::MAX_AGENT_PROFILE_NAME_CHARS
+            ),
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_role(role: &str) -> Result<String> {
+    let trimmed = role.trim();
+    if trimmed.is_empty() {
+        return Err(ProjectError::invalid(
+            "role",
+            "say what this agent is for — it seeds the agent's own soul",
+        ));
+    }
+    if trimmed.chars().count() > MAX_ROLE_CHARS {
+        return Err(ProjectError::invalid(
+            "role",
+            format!("longer than {MAX_ROLE_CHARS} characters"),
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// `base` with `-n` appended, truncated so the result still fits the handle
+/// grammar's length bound.
+fn suffixed_handle(base: &AgentHandle, n: usize) -> Result<AgentHandle> {
+    let suffix = format!("-{n}");
+    let room = baybo_model::MAX_AGENT_HANDLE_CHARS.saturating_sub(suffix.chars().count());
+    let stem: String = base.as_str().chars().take(room).collect();
+    AgentHandle::parse(format!("{}{suffix}", stem.trim_end_matches('-'))).map_err(|e| {
+        ProjectError::invalid("name", format!("could not number the handle @{base}: {e}"))
+    })
 }
 
 fn validate_issue_title(title: &str) -> Result<String> {

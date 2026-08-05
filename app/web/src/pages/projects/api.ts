@@ -45,13 +45,61 @@ export async function fetchProjects(
   }
 }
 
-export async function fetchAgents(client: AdminClient): Promise<Outcome<Agent[]>> {
+/**
+ * This board's team — not `/v1/agents`, which lists global chat personas.
+ * The two rosters are disjoint on the server: only a teammate can be
+ * assigned an issue here, and only a global persona can be a chat persona.
+ */
+export async function fetchTeam(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<Agent[]>> {
   try {
-    const { data, error, response } = await client.GET('/v1/agents');
+    const { data, error, response } = await client.GET('/v1/projects/{project_id}/agents', {
+      params: { path: { project_id: projectId } },
+    });
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
     return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function hireAgent(
+  client: AdminClient,
+  projectId: string,
+  body: { name: string; role: string },
+): Promise<Outcome<Agent>> {
+  try {
+    const { data, error, response } = await client.POST('/v1/projects/{project_id}/agents', {
+      params: { path: { project_id: projectId } },
+      body,
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function removeAgent(
+  client: AdminClient,
+  projectId: string,
+  agentId: string,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.DELETE(
+      '/v1/projects/{project_id}/agents/{agent_id}',
+      { params: { path: { project_id: projectId, agent_id: agentId } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
   }

@@ -6,7 +6,7 @@ import { useAdminClient, useAuth } from '../../api/auth';
 import { Button } from '../../components/Button';
 import {
   cancelRun,
-  fetchAgents,
+  fetchTeam,
   fetchIssue,
   fetchIssueRuns,
   fetchIssues,
@@ -132,7 +132,7 @@ export function IssueDetailPage() {
     async function load() {
       const [outcome, agentsOutcome, runsOutcome, timelineOutcome] = await Promise.all([
         fetchIssue(client, projectId, number),
-        fetchAgents(client),
+        fetchTeam(client, projectId),
         fetchIssueRuns(client, projectId, number),
         fetchTimeline(client, projectId, number),
       ]);
@@ -438,7 +438,7 @@ export function IssueDetailPage() {
                 <option value="">Unassigned</option>
                 {agents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
-                    {agent.name}
+                    @{agent.handle} — {agent.name}
                   </option>
                 ))}
               </select>

@@ -4253,6 +4253,287 @@
         }
       }
     },
+    "/v1/projects/{project_id}/agents": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_team",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This project's team, by handle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One member of a project's team.\n\nDeliberately carries no \"is working\" flag: the board already subscribes\nto run frames, and a second copy of that state on a roster read is a\ncopy that can disagree with the shimmer on the card.",
+                        "required": [
+                          "id",
+                          "handle",
+                          "name",
+                          "description",
+                          "framework",
+                          "lead",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "avatar_blob_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "description": {
+                            "type": "string",
+                            "description": "One line saying what this agent is for."
+                          },
+                          "framework": {
+                            "$ref": "#/components/schemas/AgentFrameworkDto"
+                          },
+                          "handle": {
+                            "type": "string",
+                            "description": "Immutable `@handle` on this board — what a comment mentions."
+                          },
+                          "hired_by": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/HiredByDto"
+                              }
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "lead": {
+                            "type": "boolean",
+                            "description": "The coordinator, which every board has and none may remove."
+                          },
+                          "llm": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "Display name from the agent's own `IDENTITY.md`."
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "hire_agent",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HireAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new teammate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unusable name, missing role, full team, or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/agents/{agent_id}": {
+      "delete": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "remove_agent",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The agent left the team; its past work still names it"
+          },
+          "400": {
+            "description": "Not on this team, the lead, or an agent with a run in flight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/archive": {
       "post": {
         "tags": [
@@ -7773,6 +8054,58 @@
           }
         }
       },
+      "HireAgentRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/projects/{project_id}/agents`.",
+        "required": [
+          "name",
+          "role"
+        ],
+        "properties": {
+          "framework": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AgentFrameworkDto",
+                "description": "The operator's form may pin a framework; `ProjectAgentCreate`\ndeliberately exposes neither this nor `llm`."
+              }
+            ]
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name; must match a configured entry."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name. The `@handle` is derived from it and then immutable —\nrenaming the agent later never moves its handle."
+          },
+          "role": {
+            "type": "string",
+            "description": "One line saying what this agent is for. Seeds its `SOUL.md` and\nbecomes its roster description."
+          }
+        }
+      },
+      "HiredByDto": {
+        "type": "object",
+        "description": "Who brought an agent onto the board. Absent means the operator did.\n\nThe handle rides along because that is what gets rendered — resolved\nhere rather than by the client, since a hire made by an agent that has\nsince been removed is not in the team list the client holds.",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
       "IssueDto": {
         "type": "object",
         "required": [
@@ -9215,6 +9548,69 @@
           },
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "TeamMemberDto": {
+        "type": "object",
+        "description": "One member of a project's team.\n\nDeliberately carries no \"is working\" flag: the board already subscribes\nto run frames, and a second copy of that state on a roster read is a\ncopy that can disagree with the shimmer on the card.",
+        "required": [
+          "id",
+          "handle",
+          "name",
+          "description",
+          "framework",
+          "lead",
+          "created_at_ms"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string",
+            "description": "One line saying what this agent is for."
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "handle": {
+            "type": "string",
+            "description": "Immutable `@handle` on this board — what a comment mentions."
+          },
+          "hired_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HiredByDto"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "lead": {
+            "type": "boolean",
+            "description": "The coordinator, which every board has and none may remove."
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name from the agent's own `IDENTITY.md`."
           }
         }
       },

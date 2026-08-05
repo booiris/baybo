@@ -220,6 +220,258 @@ async fn the_lead_can_be_assigned_work() {
     assert_eq!(f.dispatched.lock().len(), 1, "and starting it runs");
 }
 
+fn new_member(name: &str) -> baybo_project::NewTeamMember {
+    baybo_project::NewTeamMember {
+        name: name.to_owned(),
+        role: "Writes the tests nobody else wants to.".to_owned(),
+        framework: None,
+        llm: None,
+    }
+}
+
+#[tokio::test]
+async fn a_hire_gets_a_handle_a_soul_and_a_name() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Hiring"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+
+    let hired = f
+        .manager
+        .hire(&p.id, new_member("Test Engineer"), Some(lead.clone()))
+        .await
+        .expect("hire");
+    assert_eq!(
+        hired.team.as_ref().map(|t| t.handle.as_str()),
+        Some("test-engineer"),
+        "the handle comes from the name"
+    );
+    assert_eq!(hired.hired_by, Some(lead), "and the hire names who made it");
+
+    let soul = tokio::fs::read_to_string(
+        hired
+            .id
+            .identity_file(&f.paths, baybo_workspace::IdentityKind::Soul),
+    )
+    .await
+    .expect("soul");
+    assert!(
+        soul.contains("Writes the tests nobody else wants to."),
+        "the role seeds the soul: {soul}"
+    );
+    assert!(
+        !soul.contains("{{role}}"),
+        "and the placeholder is substituted, not shipped: {soul}"
+    );
+
+    let team = f.manager.team(&p.id).await.expect("team");
+    assert_eq!(team.len(), 2);
+    // Still nobody's chat persona.
+    assert!(
+        f.agents
+            .list()
+            .await
+            .expect("global")
+            .iter()
+            .all(|row| row.id != hired.id)
+    );
+}
+
+/// Handles stay reserved after a removal, so a second "QA" cannot simply
+/// take `@qa` back — it gets numbered rather than refused or, worse,
+/// silently inheriting the departed agent's mentions.
+#[tokio::test]
+async fn a_taken_handle_is_numbered_rather_than_reused() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Numbering"))
+        .await
+        .expect("p");
+
+    let first = f
+        .manager
+        .hire(&p.id, new_member("QA"), None)
+        .await
+        .expect("hire");
+    assert_eq!(first.team.as_ref().map(|t| t.handle.as_str()), Some("qa"));
+
+    let second = f
+        .manager
+        .hire(&p.id, new_member("QA"), None)
+        .await
+        .expect("hire");
+    assert_eq!(
+        second.team.as_ref().map(|t| t.handle.as_str()),
+        Some("qa-2")
+    );
+
+    // Even after the first one leaves: its timeline entries still say @qa.
+    f.manager
+        .remove_from_team(&p.id, &first.id)
+        .await
+        .expect("remove");
+    let third = f
+        .manager
+        .hire(&p.id, new_member("QA"), None)
+        .await
+        .expect("hire");
+    assert_eq!(third.team.as_ref().map(|t| t.handle.as_str()), Some("qa-3"));
+}
+
+#[tokio::test]
+async fn hiring_refuses_a_nameless_agent_and_a_full_team() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Full"))
+        .await
+        .expect("p");
+
+    for (member, why) in [
+        (
+            baybo_project::NewTeamMember {
+                name: "   ".to_owned(),
+                ..new_member("x")
+            },
+            "a blank name",
+        ),
+        (
+            baybo_project::NewTeamMember {
+                name: "!!!".to_owned(),
+                ..new_member("x")
+            },
+            "a name with no handle in it",
+        ),
+        (
+            baybo_project::NewTeamMember {
+                role: "  ".to_owned(),
+                ..new_member("Roleless")
+            },
+            "a missing role",
+        ),
+    ] {
+        let refused = f.manager.hire(&p.id, member, None).await.expect_err(why);
+        assert!(matches!(refused, ProjectError::Invalid { .. }), "{why}");
+    }
+
+    // The board already has its lead, so the cap allows one fewer hire.
+    for n in 1..baybo_project::MAX_TEAM_AGENTS {
+        f.manager
+            .hire(&p.id, new_member(&format!("Dev {n}")), None)
+            .await
+            .unwrap_or_else(|e| panic!("hire {n}: {e}"));
+    }
+    let refused = f
+        .manager
+        .hire(&p.id, new_member("One Too Many"), None)
+        .await
+        .expect_err("the cap holds");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        f.manager.team(&p.id).await.expect("team").len(),
+        baybo_project::MAX_TEAM_AGENTS
+    );
+}
+
+#[tokio::test]
+async fn the_lead_cannot_be_removed_and_neither_can_a_busy_agent() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Removal"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+
+    let refused = f
+        .manager
+        .remove_from_team(&p.id, &lead)
+        .await
+        .expect_err("a board keeps its coordinator");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    let dev = f
+        .manager
+        .hire(&p.id, new_member("Dev"), None)
+        .await
+        .expect("hire");
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.id.clone()),
+                ..new_issue("in flight")
+            },
+        )
+        .await
+        .expect("start work");
+
+    let refused = f
+        .manager
+        .remove_from_team(&p.id, &dev.id)
+        .await
+        .expect_err("removing somebody mid-run only hides who is working");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    // Cancel the run and the removal goes through.
+    f.manager.cancel_run(&p.id, 1).await.expect("cancel");
+    f.manager
+        .remove_from_team(&p.id, &dev.id)
+        .await
+        .expect("remove");
+    assert_eq!(f.manager.team(&p.id).await.expect("team").len(), 1);
+    // Twice is refused rather than silently accepted.
+    assert!(f.manager.remove_from_team(&p.id, &dev.id).await.is_err());
+}
+
+/// Another board's agent is not this board's to remove, even though the row
+/// resolves and the tombstone would happily be written.
+#[tokio::test]
+async fn removal_is_scoped_to_the_board_that_asks() {
+    let f = fixture().await;
+    let mine = f
+        .manager
+        .create_project(new_project("mine"))
+        .await
+        .expect("p");
+    let theirs = f
+        .manager
+        .create_project(new_project("theirs"))
+        .await
+        .expect("p");
+    let outsider = f
+        .manager
+        .hire(&theirs.id, new_member("Dev"), None)
+        .await
+        .expect("hire");
+
+    let refused = f
+        .manager
+        .remove_from_team(&mine.id, &outsider.id)
+        .await
+        .expect_err("not this board's agent");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(f.manager.team(&theirs.id).await.expect("team").len(), 2);
+}
+
 #[tokio::test]
 async fn a_non_empty_work_directory_is_never_silently_adopted() {
     let f = fixture().await;

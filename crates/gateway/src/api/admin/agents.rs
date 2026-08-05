@@ -125,7 +125,7 @@ fn fallback_display_name(row: &AgentProfileRow) -> String {
 /// A file that is missing, unreadable, or has been reformatted past
 /// recognition falls back rather than failing the request: the roster must
 /// still render, and the agent owns that file.
-async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
+pub(super) async fn read_display_name(state: &AdminState, row: &AgentProfileRow) -> String {
     let path = row
         .id
         .identity_file(&state.workspace_paths, IdentityKind::Identity);
@@ -225,7 +225,7 @@ async fn commit_persona_edit(state: &AdminState, agent_id: &str, file: &str) {
 }
 
 /// [`AgentProfileDto`] for one row, with its name read from disk.
-async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
+pub(super) async fn agent_dto(state: &AdminState, row: AgentProfileRow) -> AgentProfileDto {
     let name = read_display_name(state, &row).await;
     AgentProfileDto::from_parts(row, name)
 }

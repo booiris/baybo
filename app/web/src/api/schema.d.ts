@@ -936,6 +936,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_team"];
+        put?: never;
+        post: operations["hire_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/agents/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["remove_agent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/archive": {
         parameters: {
             query?: never;
@@ -2214,6 +2246,33 @@ export interface components {
              */
             session_ids: string[];
         };
+        /** @description Request body for `POST /v1/projects/{project_id}/agents`. */
+        HireAgentRequest: {
+            framework?: null | components["schemas"]["AgentFrameworkDto"];
+            /** @description `baybo.json` LLM entry name; must match a configured entry. */
+            llm?: string | null;
+            /**
+             * @description Display name. The `@handle` is derived from it and then immutable —
+             *     renaming the agent later never moves its handle.
+             */
+            name: string;
+            /**
+             * @description One line saying what this agent is for. Seeds its `SOUL.md` and
+             *     becomes its roster description.
+             */
+            role: string;
+        };
+        /**
+         * @description Who brought an agent onto the board. Absent means the operator did.
+         *
+         *     The handle rides along because that is what gets rendered — resolved
+         *     here rather than by the client, since a hire made by an agent that has
+         *     since been removed is not in the team list the client holds.
+         */
+        HiredByDto: {
+            handle: string;
+            id: string;
+        };
         IssueDto: {
             /** @description The agent on it, if any. In Progress always has one. */
             assignee?: string | null;
@@ -2870,6 +2929,30 @@ export interface components {
             sessions: number;
             turns_in_flight: number;
             version: string;
+        };
+        /**
+         * @description One member of a project's team.
+         *
+         *     Deliberately carries no "is working" flag: the board already subscribes
+         *     to run frames, and a second copy of that state on a roster read is a
+         *     copy that can disagree with the shimmer on the card.
+         */
+        TeamMemberDto: {
+            avatar_blob_id?: string | null;
+            /** Format: int64 */
+            created_at_ms: number;
+            /** @description One line saying what this agent is for. */
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            /** @description Immutable `@handle` on this board — what a comment mentions. */
+            handle: string;
+            hired_by?: null | components["schemas"]["HiredByDto"];
+            id: string;
+            /** @description The coordinator, which every board has and none may remove. */
+            lead: boolean;
+            llm?: string | null;
+            /** @description Display name from the agent's own `IDENTITY.md`. */
+            name: string;
         };
         /**
          * @description One row of the trace browser list view. Mirrors
@@ -6392,6 +6475,188 @@ export interface operations {
                 };
             };
             /** @description Blank name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This project's team, by handle */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            avatar_blob_id?: string | null;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            /** @description One line saying what this agent is for. */
+                            description: string;
+                            framework: components["schemas"]["AgentFrameworkDto"];
+                            /** @description Immutable `@handle` on this board — what a comment mentions. */
+                            handle: string;
+                            hired_by?: null | components["schemas"]["HiredByDto"];
+                            id: string;
+                            /** @description The coordinator, which every board has and none may remove. */
+                            lead: boolean;
+                            llm?: string | null;
+                            /** @description Display name from the agent's own `IDENTITY.md`. */
+                            name: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    hire_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HireAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description The new teammate */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamMemberDto"];
+                };
+            };
+            /** @description Unusable name, missing role, full team, or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The project is archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent left the team; its past work still names it */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not on this team, the lead, or an agent with a run in flight */
             400: {
                 headers: {
                     [name: string]: unknown;

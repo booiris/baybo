@@ -1,7 +1,7 @@
 import type { components, paths } from '../../api/schema';
 
 export type Issue = components['schemas']['IssueDto'];
-export type Agent = components['schemas']['AgentProfileDto'];
+export type Agent = components['schemas']['TeamMemberDto'];
 // Runs have no point-lookup endpoint, so the generator inlines their shape
 // rather than emitting a named component. Taking the type from the response
 // keeps it pinned to the spec without inventing an endpoint to name it.

@@ -42,7 +42,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
 }
 
 /// Map the domain's error onto a status once, for every handler here.
-fn project_err(e: ProjectError) -> GatewayError {
+pub(super) fn project_err(e: ProjectError) -> GatewayError {
     match e {
         ProjectError::NoSuchProject(id) => GatewayError::NotFound(format!("project {id}")),
         ProjectError::NoSuchIssue { project, number } => {
@@ -60,7 +60,7 @@ fn project_err(e: ProjectError) -> GatewayError {
 
 /// Parse a path segment into a [`ProjectId`], running the same grammar the
 /// filesystem depends on rather than trusting the URL.
-fn parse_project_id(raw: &str) -> Result<ProjectId> {
+pub(super) fn parse_project_id(raw: &str) -> Result<ProjectId> {
     ProjectId::parse(raw).map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 

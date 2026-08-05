@@ -406,6 +406,120 @@ async fn in_progress_is_refused_without_an_assignee() {
     .await;
 }
 
+/// The team surface is the board's roster: it opens with a lead, hires get
+/// handles, and nothing on it leaks into `/v1/agents`.
+#[tokio::test]
+async fn a_board_staffs_itself_through_its_own_roster() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "staffing").await;
+
+    let team = get(&router, &format!("/v1/projects/{p}/agents"), StatusCode::OK).await;
+    let items = team["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "a new board comes with its lead");
+    assert_eq!(items[0]["handle"], "lead");
+    assert_eq!(items[0]["lead"], true);
+    assert_eq!(items[0]["name"], "Lead");
+    assert!(items[0].get("hired_by").is_none(), "nobody hired the lead");
+    let lead_id = items[0]["id"].as_str().expect("id").to_owned();
+
+    let hired = post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(hired["handle"], "test-engineer");
+    assert_eq!(hired["lead"], false);
+    assert_eq!(hired["description"], "Writes the tests.");
+    // The operator did this one, so nobody is credited with the hire.
+    assert!(hired.get("hired_by").is_none());
+
+    // …and the global roster is untouched: a teammate is not a chat persona.
+    let global = get(&router, "/v1/agents", StatusCode::OK).await;
+    let ids: Vec<&str> = global["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|a| a["id"].as_str().expect("id"))
+        .collect();
+    assert!(!ids.contains(&lead_id.as_str()), "{ids:?}");
+    assert!(!ids.contains(&hired["id"].as_str().expect("id")), "{ids:?}");
+
+    // A name with no handle in it is refused rather than given a ULID.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "!!!", "role": "unnameable" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // And so is a hire with no role — it is what seeds the agent's soul.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "Roleless", "role": "  " }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+/// Removing an agent keeps its row, because the board still has to say who
+/// did the work it did.
+#[tokio::test]
+async fn a_removed_teammate_leaves_the_roster_but_not_the_record() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "leaving").await;
+    let hired = post(
+        &router,
+        &format!("/v1/projects/{p}/agents"),
+        json!({ "name": "Dev", "role": "Writes code." }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let dev = hired["id"].as_str().expect("id").to_owned();
+
+    // The card it worked on keeps naming it after it leaves.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "its work", "assignee": dev }),
+        StatusCode::CREATED,
+    )
+    .await;
+    delete(
+        &router,
+        &format!("/v1/projects/{p}/agents/{dev}"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let team = get(&router, &format!("/v1/projects/{p}/agents"), StatusCode::OK).await;
+    assert_eq!(team["items"].as_array().expect("items").len(), 1);
+    let issue = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(issue["assignee"], dev, "the card still says who was on it");
+
+    // Twice is a refusal, and the lead never leaves at all.
+    delete(
+        &router,
+        &format!("/v1/projects/{p}/agents/{dev}"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    let lead = team["items"][0]["id"].as_str().expect("id").to_owned();
+    delete(
+        &router,
+        &format!("/v1/projects/{p}/agents/{lead}"),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     let (router, tg) = router().await;
@@ -579,4 +693,8 @@ async fn put(router: &axum::Router, uri: &str, body: Value, expected: StatusCode
 
 async fn patch(router: &axum::Router, uri: &str, body: Value, expected: StatusCode) -> Value {
     request(router, "PATCH", uri, Some(body), expected).await
+}
+
+async fn delete(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
+    request(router, "DELETE", uri, None, expected).await
 }
