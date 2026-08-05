@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   DndContext,
   DragOverlay,
@@ -62,6 +62,9 @@ import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ActivityDrawer } from './ActivityDrawer';
+import { BoardFilterBar } from './BoardFilterBar';
+import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
+import type { BoardFilter } from './boardFilter';
 import { TeamStrip } from './TeamStrip';
 import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
@@ -93,7 +96,10 @@ export function ProjectBoardPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [dragging, setDragging] = useState<Issue | null>(null);
   const [createIn, setCreateIn] = useState<IssueStatus | null>(null);
-  const [showCancelled, setShowCancelled] = useState(false);
+  const [params, setParams] = useSearchParams();
+  // The filter lives in the URL so the board→detail→back loop and a reload
+  // keep it, and so a narrowed board is a link somebody can send.
+  const filter = useMemo(() => parseBoardFilter(params), [params]);
   const [showActivity, setShowActivity] = useState(false);
 
   // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
@@ -133,7 +139,7 @@ export function ProjectBoardPage() {
       }
       setError(null);
       setProject(projectOutcome.value);
-      setBoard(groupByStatus(issuesOutcome.value, showCancelled));
+      setBoard(groupByStatus(issuesOutcome.value));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
       if (agentsOutcome.kind === 'ok') setTeam(agentsOutcome.value);
       setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
@@ -146,7 +152,15 @@ export function ProjectBoardPage() {
     return () => {
       canceled = true;
     };
-  }, [client, logout, projectId, refreshKey, showCancelled]);
+    // Deliberately not keyed on the filter: narrowing the board is a
+    // render-time concern, and refetching five endpoints per keystroke
+    // would be the cost of a `useMemo`.
+  }, [client, logout, projectId, refreshKey]);
+
+  // `board` is every card the server has; `view` is what is rendered. They
+  // must not be conflated: a move sends its destination column's whole new
+  // order, which only `board` knows.
+  const view = useMemo(() => filterBoard(board, filter, team), [board, filter, team]);
 
   // The board refetches when the server says this project changed —
   // including changes nobody on this page made, which is how a lead's own
@@ -176,16 +190,21 @@ export function ProjectBoardPage() {
   // dnd-kit only opens a gap in a column whose SortableContext actually
   // holds the dragged id, so the cross-column move has to be applied while
   // the pointer is still down — not on drop.
-  const onDragOver = useCallback((event: DragOverEvent) => {
-    setBoard((current) => {
-      const drop = resolveDrop(
-        current,
-        String(event.active.id),
-        event.over === null ? null : String(event.over.id),
-      );
-      return drop === null ? current : moveCard(current, drop);
-    });
-  }, []);
+  const onDragOver = useCallback(
+    (event: DragOverEvent) => {
+      const activeId = String(event.active.id);
+      const overId = event.over === null ? null : String(event.over.id);
+      setBoard((current) => {
+        // Resolved against the *view* — those are the ids dnd-kit collided
+        // with — and applied to the whole board. The view is recomputed from
+        // `current` rather than closed over, so a burst of drag-over events
+        // between renders still resolves against the freshest state.
+        const drop = resolveDrop(filterBoard(current, filter, team), activeId, overId);
+        return drop === null ? current : moveCard(current, drop);
+      });
+    },
+    [filter, team],
+  );
 
   const onDragEnd = useCallback(
     async (event: DragEndEvent) => {
@@ -201,7 +220,7 @@ export function ProjectBoardPage() {
       // `board` here is the preview `onDragOver` built; resolve once more so
       // a drop straight onto a card lands in that card's slot.
       const drop = resolveDrop(
-        board,
+        filterBoard(board, filter, team),
         String(event.active.id),
         event.over === null ? null : String(event.over.id),
       );
@@ -240,7 +259,7 @@ export function ProjectBoardPage() {
       }
       pushToast('ok', `#${number} → ${COLUMN_LABEL[issue.status]}`);
     },
-    [board, client, logout, projectId, pushToast],
+    [board, client, filter, logout, projectId, pushToast, team],
   );
 
   const onDragCancel = useCallback(() => {
@@ -324,18 +343,18 @@ export function ProjectBoardPage() {
           >
             Activity
           </button>
-          <label className="flex items-center gap-1.5 font-mono text-[0.68rem] text-ink-soft cursor-pointer">
-            <input
-              type="checkbox"
-              checked={showCancelled}
-              onChange={(event) => {
-                setShowCancelled(event.target.checked);
-              }}
-            />
-            Show cancelled
-          </label>
         </div>
       </header>
+
+      <BoardFilterBar
+        filter={filter}
+        team={team}
+        onChange={(next: BoardFilter) => {
+          // `replace` because a search box that pushes a history entry per
+          // keystroke makes the back button useless.
+          setParams(boardFilterParams(next), { replace: true });
+        }}
+      />
 
       {error != null ? (
         <div className="m-4 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm break-words">
@@ -359,7 +378,8 @@ export function ProjectBoardPage() {
             <BoardColumn
               key={status}
               status={status}
-              issues={board[status]}
+              issues={view[status]}
+              total={liveCount(board[status])}
               activeRuns={activeRuns}
               team={team}
               disabled={archived}
@@ -412,6 +432,7 @@ export function ProjectBoardPage() {
 function BoardColumn({
   status,
   issues,
+  total,
   activeRuns,
   team,
   disabled,
@@ -419,7 +440,10 @@ function BoardColumn({
   onCreate,
 }: {
   status: IssueStatus;
+  /** The cards this column is showing, after the filter. */
   issues: Issue[];
+  /** How much live work the column actually holds, filter or no filter. */
+  total: number;
   activeRuns: IssueRun[];
   team: Agent[];
   disabled: boolean;
@@ -437,8 +461,20 @@ function BoardColumn({
         <h2 className="font-mono text-[0.68rem] font-bold uppercase tracking-wider">
           {COLUMN_LABEL[status]}
         </h2>
-        <span className="rounded-full bg-ink text-brand font-mono text-[0.58rem] px-2 leading-[1.15rem]">
-          {liveCount(issues)}
+        {/* The count keeps meaning the column's true live size. Letting it
+            follow the filter would render 1,0,2,0,0 over a forty-card board,
+            which is indistinguishable from an empty one — and saying how
+            much work a column holds is the count's whole job. When the
+            filter hides something, both numbers are shown. */}
+        <span
+          className="rounded-full bg-ink text-brand font-mono text-[0.58rem] px-2 leading-[1.15rem] tabular-nums"
+          title={
+            liveCount(issues) === total
+              ? `${total} live`
+              : `${liveCount(issues)} of ${total} live cards match the filter`
+          }
+        >
+          {liveCount(issues) === total ? total : `${liveCount(issues)}/${total}`}
         </span>
         <IconButton
           className="ml-auto !w-6 !h-6 bg-surface"
@@ -472,7 +508,7 @@ function BoardColumn({
         </SortableContext>
         {issues.length === 0 ? (
           <p className="m-auto text-center font-mono text-[0.62rem] text-ink-soft leading-snug">
-            No issues
+            {total === 0 ? 'No issues' : 'No matches'}
           </p>
         ) : null}
       </div>

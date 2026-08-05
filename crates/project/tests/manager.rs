@@ -1919,3 +1919,122 @@ async fn a_parent_from_another_board_does_not_resolve() {
         "{refused:?}"
     );
 }
+
+/// A move renumbers the destination column densely, so an `ordered_numbers`
+/// that omits a card in that column leaves it holding a stale rank that
+/// collides with a renumbered one — silently, because nothing downstream
+/// reads `position` for anything but sorting.
+///
+/// The way a client gets this wrong is by sending the list it is *showing*:
+/// a filtered board omits exactly the cards the operator cannot see.
+#[tokio::test]
+async fn a_move_must_name_its_whole_destination_column() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Ranks"))
+        .await
+        .expect("p");
+    for title in ["one", "two", "three"] {
+        f.manager
+            .create_issue(&p.id, IssueActor::User, new_issue(title))
+            .await
+            .expect("issue");
+    }
+    // #2 is cancelled — still in Backlog, still holding rank 1, and exactly
+    // the kind of card a board hides.
+    f.manager
+        .update_issue(
+            &p.id,
+            2,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("cancel");
+
+    let refused = f
+        .manager
+        .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Backlog, &[3, 1])
+        .await
+        .expect_err("a list that omits #2 does not describe this column");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    // The board is untouched: refusing beats renumbering half a column.
+    let mut ranks: Vec<(i64, i64)> = f
+        .manager
+        .list_issues(&p.id)
+        .await
+        .expect("issues")
+        .into_iter()
+        .map(|issue| (issue.number, issue.position))
+        .collect();
+    ranks.sort();
+    assert_eq!(ranks, vec![(1, 0), (2, 1), (3, 2)]);
+
+    // Naming every card in the column — cancelled ones included — works.
+    f.manager
+        .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Backlog, &[3, 1, 2])
+        .await
+        .expect("the whole column is a valid order");
+    // By number, because `list_issues` returns board order and the claim
+    // here is about ranks, not about listing order.
+    let mut ranks: Vec<(i64, i64)> = f
+        .manager
+        .list_issues(&p.id)
+        .await
+        .expect("issues")
+        .into_iter()
+        .map(|issue| (issue.number, issue.position))
+        .collect();
+    ranks.sort();
+    assert_eq!(
+        ranks,
+        vec![(1, 1), (2, 2), (3, 0)],
+        "dense and collision-free"
+    );
+}
+
+/// The same rule across a column boundary: the destination list is the
+/// column the card is arriving in, plus the card.
+#[tokio::test]
+async fn a_cross_column_move_names_the_destination_plus_the_card() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Across"))
+        .await
+        .expect("p");
+    for title in ["stays", "moves"] {
+        f.manager
+            .create_issue(&p.id, IssueActor::User, new_issue(title))
+            .await
+            .expect("issue");
+    }
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
+        .await
+        .expect("todo was empty");
+
+    // Todo now holds #1; moving #2 in has to name both.
+    let refused = f
+        .manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Todo, &[2])
+        .await
+        .expect_err("the list omits the card already in Todo");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Todo, &[2, 1])
+        .await
+        .expect("both named");
+}

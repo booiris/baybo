@@ -45,14 +45,18 @@ export function emptyBoard(): Board {
 }
 
 /**
- * Split a flat listing into columns, dropping cancelled cards unless they
- * were asked for. Column order within each list follows `position`, which
- * the server keeps dense.
+ * Split a flat listing into columns. Column order within each list follows
+ * `position`, which the server keeps dense.
+ *
+ * Nothing is dropped here. The board state has to hold every card the
+ * server has, because a move sends its destination column's *whole* new
+ * order — a state built from what is visible would omit exactly the rows
+ * nobody is looking at, and the server would renumber around them. Hiding
+ * is a render-time concern; see `filterBoard`.
  */
-export function groupByStatus(issues: Issue[], showCancelled: boolean): Board {
+export function groupByStatus(issues: Issue[]): Board {
   const board = emptyBoard();
   for (const issue of issues) {
-    if (!showCancelled && issue.cancelled_at_ms != null) continue;
     board[issue.status].push(issue);
   }
   for (const status of COLUMNS) {
@@ -118,7 +122,17 @@ function statusOf(board: Board, number: number): IssueStatus | null {
 }
 
 /** Where a drop lands. `null` when the drag resolves to nothing. */
-export type Drop = { status: IssueStatus; index: number; issue: Issue };
+/**
+ * A resolved placement, named by the card it lands in front of rather than
+ * by an index.
+ *
+ * An index is only meaningful against the list it was resolved on. A drag
+ * is resolved against what the operator can *see* — which is a filtered
+ * view — and then applied to the whole board, so an index would place the
+ * card somewhere else entirely as soon as anything is hidden. `before` is
+ * a card number, which means the same thing in both lists; `null` appends.
+ */
+export type Drop = { status: IssueStatus; before: number | null; issue: Issue };
 
 /**
  * Resolve a drag into a placement.
@@ -126,11 +140,14 @@ export type Drop = { status: IssueStatus; index: number; issue: Issue };
  * Dropping onto a card means "take that card's slot"; dropping onto a
  * column's body means "append" — which is the only way to reach an empty
  * column, since it has no cards to collide with.
+ *
+ * `view` is what is rendered, because those are the ids dnd-kit collided
+ * against. The result is applied to the full board.
  */
-export function resolveDrop(board: Board, activeId: string, overId: string | null): Drop | null {
+export function resolveDrop(view: Board, activeId: string, overId: string | null): Drop | null {
   const active = parseDragId(activeId);
   if (active === null || active.kind !== 'card') return null;
-  const issue = findIssue(board, active.number);
+  const issue = findIssue(view, active.number);
   if (issue === null) return null;
   if (overId === null) return null;
 
@@ -138,22 +155,28 @@ export function resolveDrop(board: Board, activeId: string, overId: string | nul
   if (over === null) return null;
 
   if (over.kind === 'column') {
-    const from = statusOf(board, active.number);
+    const from = statusOf(view, active.number);
     // Already the last card of that column: appending would be a no-op that
     // still costs a request.
-    const target = board[over.status];
+    const target = view[over.status];
     if (from === over.status && target[target.length - 1]?.number === active.number) {
       return null;
     }
-    const index = from === over.status ? target.length - 1 : target.length;
-    return { status: over.status, index, issue };
+    return { status: over.status, before: null, issue };
   }
 
   if (over.number === active.number) return null;
-  const overStatus = statusOf(board, over.number);
+  const overStatus = statusOf(view, over.number);
   if (overStatus === null) return null;
-  const index = board[overStatus].findIndex((candidate) => candidate.number === over.number);
-  return { status: overStatus, index, issue };
+  const column = view[overStatus];
+  const overIndex = column.findIndex((candidate) => candidate.number === over.number);
+  const activeIndex = column.findIndex((candidate) => candidate.number === active.number);
+  // Taking the over-card's slot means landing in front of it — unless the
+  // dragged card is already above it in the same column, in which case its
+  // slot is the one *after* it. Same rule as the old index arithmetic, said
+  // in card numbers so it survives being applied to a longer list.
+  const anchorIndex = activeIndex !== -1 && activeIndex < overIndex ? overIndex + 1 : overIndex;
+  return { status: overStatus, before: column[anchorIndex]?.number ?? null, issue };
 }
 
 /** Apply a placement. Pure, so the optimistic move and its test agree. */
@@ -163,8 +186,18 @@ export function moveCard(board: Board, drop: Drop): Board {
     next[status] = board[status].filter((issue) => issue.number !== drop.issue.number);
   }
   const moved: Issue = { ...drop.issue, status: drop.status };
-  const clamped = Math.max(0, Math.min(drop.index, next[drop.status].length));
-  next[drop.status].splice(clamped, 0, moved);
+  const column = next[drop.status];
+  // An anchor that is not in this column — hidden by a filter, or gone
+  // since the drag started — appends rather than throwing the card at
+  // index 0, which is where `indexOf`'s -1 would put it.
+  const at =
+    drop.before === null
+      ? column.length
+      : (() => {
+          const found = column.findIndex((issue) => issue.number === drop.before);
+          return found === -1 ? column.length : found;
+        })();
+  column.splice(at, 0, moved);
   return next;
 }
 

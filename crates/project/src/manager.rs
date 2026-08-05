@@ -1108,13 +1108,9 @@ impl ProjectManager {
         ordered_numbers: &[i64],
     ) -> Result<IssueRow> {
         self.writable_project(project).await?;
-        if !ordered_numbers.contains(&number) {
-            return Err(ProjectError::invalid(
-                "ordered_numbers",
-                "must contain the moved issue — it is the destination column's new contents",
-            ));
-        }
         let before = self.get_issue(project, number).await?;
+        self.validate_column_order(project, number, status, ordered_numbers)
+            .await?;
         self.validate_staffing(status, before.assignee.as_ref())?;
         if !self
             .store
@@ -1223,6 +1219,56 @@ impl ProjectManager {
             .into_iter()
             .find(|issue| &issue.id == id)
             .ok_or_else(|| ProjectError::invalid("parent", format!("no issue {id} on this board")))
+    }
+
+    /// `ordered_numbers` has to be the destination column's **whole** new
+    /// membership: every card that will be in it once the move lands, and
+    /// nothing else.
+    ///
+    /// Checked rather than assumed, because the store renumbers exactly the
+    /// numbers it is handed and leaves every other row's `position` alone.
+    /// A caller that sends the list it is *showing* — a board with cancelled
+    /// cards hidden, or any later filter — omits precisely the rows nobody
+    /// is looking at, and those keep a stale rank that now collides with a
+    /// renumbered one. Nothing downstream reads `position` for anything but
+    /// sorting, so the corruption is silent and permanent.
+    ///
+    /// A refusal is not a cost here: every legitimate caller already knows
+    /// the whole column, because it just read the board to compute the
+    /// order.
+    async fn validate_column_order(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        status: IssueStatus,
+        ordered_numbers: &[i64],
+    ) -> Result<()> {
+        let mut expected: std::collections::BTreeSet<i64> = self
+            .store
+            .list_issues(project)
+            .await?
+            .into_iter()
+            .filter(|issue| issue.status == status && issue.number != number)
+            .map(|issue| issue.number)
+            .collect();
+        // The moved card belongs in the destination whether or not it is
+        // there yet, which is what makes one rule cover both a reorder and a
+        // cross-column move.
+        expected.insert(number);
+        let given: std::collections::BTreeSet<i64> = ordered_numbers.iter().copied().collect();
+        if given == expected {
+            return Ok(());
+        }
+        let missing: Vec<i64> = expected.difference(&given).copied().collect();
+        let extra: Vec<i64> = given.difference(&expected).copied().collect();
+        Err(ProjectError::invalid(
+            "ordered_numbers",
+            format!(
+                "must be {}'s whole new contents, in order. Missing: {missing:?}. \
+                 Not in that column: {extra:?}.",
+                status.as_str()
+            ),
+        ))
     }
 
     /// An assignee has to be an agent on *this* board that can actually run.

@@ -60,18 +60,18 @@ describe('groupByStatus', () => {
         issue(3, { status: 'todo', position: 1 }),
         issue(1, { status: 'backlog', position: 0 }),
         issue(2, { status: 'todo', position: 0 }),
-      ],
-      false,
-    );
+      ]);
     expect(grouped.backlog.map((i) => i.number)).toEqual([1]);
     expect(grouped.todo.map((i) => i.number)).toEqual([2, 3]);
     expect(grouped.review).toEqual([]);
   });
 
-  it('hides cancelled cards unless they are asked for', () => {
+  it('keeps every card, cancelled ones included', () => {
+    // Hiding is a render-time concern. The board state has to hold the
+    // whole column, because a move sends that column's full new order and
+    // the server renumbers exactly what it is handed.
     const issues = [issue(1), issue(2, { cancelled_at_ms: 123 })];
-    expect(groupByStatus(issues, false).backlog.map((i) => i.number)).toEqual([1]);
-    expect(groupByStatus(issues, true).backlog.map((i) => i.number)).toEqual([1, 2]);
+    expect(groupByStatus(issues).backlog.map((i) => i.number)).toEqual([1, 2]);
   });
 });
 
@@ -100,13 +100,13 @@ describe('resolveDrop', () => {
 
   it('takes the slot of the card it was dropped on', () => {
     const drop = resolveDrop(start, cardDragId(2), cardDragId(1));
-    expect(drop).toMatchObject({ status: 'backlog', index: 0 });
+    expect(drop).toMatchObject({ status: 'backlog', before: 1 });
     expect(moveCard(start, drop!).backlog.map((i) => i.number)).toEqual([2, 1]);
   });
 
   it('appends when dropped on a column body — the only way into an empty column', () => {
     const drop = resolveDrop(start, cardDragId(1), columnDropId('review'));
-    expect(drop).toMatchObject({ status: 'review', index: 0 });
+    expect(drop).toMatchObject({ status: 'review', before: null });
     const next = moveCard(start, drop!);
     expect(next.review.map((i) => i.number)).toEqual([1]);
     expect(next.backlog.map((i) => i.number)).toEqual([2]);
@@ -129,33 +129,62 @@ describe('resolveDrop', () => {
 describe('moveCard', () => {
   it('never leaves a copy behind in the source column', () => {
     const start = board({ backlog: [issue(1), issue(2)], done: [] });
-    const next = moveCard(start, { status: 'done', index: 0, issue: issue(1) });
+    const next = moveCard(start, { status: 'done', before: null, issue: issue(1) });
     expect(next.backlog.map((i) => i.number)).toEqual([2]);
     expect(next.done.map((i) => i.number)).toEqual([1]);
     // …and the input is untouched, so a rollback has something to roll back to.
     expect(start.backlog.map((i) => i.number)).toEqual([1, 2]);
   });
 
-  it('clamps an out-of-range index rather than tearing a hole', () => {
-    const start = board({ todo: [issue(1, { status: 'todo' })] });
-    const next = moveCard(start, { status: 'todo', index: 99, issue: issue(1, { status: 'todo' }) });
-    expect(next.todo.map((i) => i.number)).toEqual([1]);
+  it('appends when the anchor is not in the destination column', () => {
+    // The anchor can be a card the filter hides, or one that moved since
+    // the drag began. Appending beats what `findIndex`'s -1 would do,
+    // which is to throw the card at the front of the column.
+    const start = board({ todo: [issue(1, { status: 'todo' }), issue(2, { status: 'todo' })] });
+    const next = moveCard(start, {
+      status: 'todo',
+      before: 99,
+      issue: issue(3, { status: 'todo' }),
+    });
+    expect(next.todo.map((i) => i.number)).toEqual([1, 2, 3]);
+  });
+
+  it('lands the card in front of its anchor', () => {
+    const start = board({ backlog: [issue(1), issue(2), issue(3)] });
+    const next = moveCard(start, { status: 'backlog', before: 2, issue: issue(3) });
+    expect(next.backlog.map((i) => i.number)).toEqual([1, 3, 2]);
+  });
+
+  /**
+   * The anchor exists so one drop can be applied to two different lists:
+   * resolved against what the operator sees, applied to the whole board.
+   */
+  it('places the same drop consistently in a filtered and an unfiltered column', () => {
+    const full = board({ backlog: [issue(1), issue(2, { cancelled_at_ms: 1 }), issue(3)] });
+    const visible = board({ backlog: [issue(1), issue(3)] });
+    const drop = { status: 'backlog' as const, before: 3, issue: issue(4) };
+    expect(moveCard(visible, drop).backlog.map((i) => i.number)).toEqual([1, 4, 3]);
+    // The hidden card keeps its place, and the request still names it.
+    expect(moveCard(full, drop).backlog.map((i) => i.number)).toEqual([1, 2, 4, 3]);
   });
 });
 
 describe('orderedNumbers + placementChanged', () => {
   it('reports the destination contents a move request has to send', () => {
     const start = board({ backlog: [issue(1), issue(2), issue(3)] });
-    const next = moveCard(start, { status: 'backlog', index: 0, issue: issue(3) });
+    const next = moveCard(start, { status: 'backlog', before: 1, issue: issue(3) });
     expect(orderedNumbers(next, 'backlog')).toEqual([3, 1, 2]);
   });
 
   it('spots a no-op so a drop that changed nothing costs no request', () => {
     const start = board({ backlog: [issue(1), issue(2)] });
-    const moved = moveCard(start, { status: 'todo', index: 0, issue: issue(1) });
+    const moved = moveCard(start, { status: 'todo', before: null, issue: issue(1) });
     expect(placementChanged(start, moved, 1)).toBe(true);
 
-    const same = moveCard(start, { status: 'backlog', index: 0, issue: issue(1) });
+    // Back where it started. With an anchor that is the card *after* it —
+    // which is what `resolveDrop` computes for a downward-into-its-own-slot
+    // drop — the card lands exactly where it was.
+    const same = moveCard(start, { status: 'backlog', before: 2, issue: issue(1) });
     expect(placementChanged(start, same, 1)).toBe(false);
   });
 });

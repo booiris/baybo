@@ -56,6 +56,18 @@ const RUNS = [
   { number: 1, attempt: 1, agent_id: 'dev-1', status: 'queued', trigger: 'started', created_at_ms: 0 },
 ];
 
+const TEAM = [
+  {
+    id: 'dev-1',
+    handle: 'dev-1',
+    name: 'Dev',
+    description: '',
+    framework: 'baybo' as const,
+    lead: false,
+    created_at_ms: 0,
+  },
+];
+
 const ok = { status: 200, ok: true } as Response;
 
 function stubClient() {
@@ -73,8 +85,8 @@ function stubClient() {
       if (path === '/v1/projects/{project_id}/runs') {
         return { data: { items: RUNS }, error: undefined, response: ok };
       }
-      if (path === '/v1/agents') {
-        return { data: { items: [] }, error: undefined, response: ok };
+      if (path === '/v1/projects/{project_id}/agents') {
+        return { data: { items: TEAM }, error: undefined, response: ok };
       }
       throw new Error(`unexpected GET ${path}`);
     }),
@@ -85,14 +97,19 @@ function stubClient() {
 
 const client = stubClient();
 
+// Both hooks must return a STABLE value, as the real context does. A fresh
+// object per call changes the identity of the load effect's dependencies on
+// every render, which re-fetches the board continuously — and hides exactly
+// the kind of over-fetching a test would otherwise catch.
+const auth = { logout: vi.fn() };
 vi.mock('../../api/auth', () => ({
   useAdminClient: () => client,
-  useAuth: () => ({ logout: vi.fn() }),
+  useAuth: () => auth,
 }));
 
-function renderBoard() {
+function renderBoard(query = '') {
   return render(
-    <MemoryRouter initialEntries={[`/projects/${PROJECT.id}`]}>
+    <MemoryRouter initialEntries={[`/projects/${PROJECT.id}${query}`]}>
       <Routes>
         <Route path="/projects/:pid" element={<ProjectBoardPage />} />
       </Routes>
@@ -168,5 +185,41 @@ describe('ProjectBoardPage', () => {
     // The pre-filled column is the whole reason the modal knows the status.
     const modal = screen.getByPlaceholderText('Issue title').closest('div')?.parentElement;
     expect(modal?.textContent).toContain('Review');
+  });
+
+  /**
+   * Narrowing the board is a render-time concern. Keying the load effect on
+   * the filter would spend five requests per keystroke, and — worse — a
+   * board rebuilt from a filtered fetch would be a board that cannot
+   * describe its own columns to a move request.
+   */
+  it('does not refetch when the filter changes', async () => {
+    const { rerender } = renderBoard();
+    await screen.findByText('Wire the board');
+    const before = client.GET.mock.calls.length;
+
+    await userEvent.type(screen.getByLabelText(/Filter cards by title/), 'blocked');
+    await screen.findByText('Blocked one');
+    expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
+    expect(client.GET.mock.calls.length).toBe(before);
+    expect(rerender).toBeTypeOf('function');
+  });
+
+  it('narrows the board from the URL without refetching it', async () => {
+    renderBoard('?q=blocked');
+    await screen.findByText('Blocked one');
+    expect(screen.queryByText('Wire the board')).not.toBeInTheDocument();
+
+    // The header still says how much live work the column holds, with the
+    // matching count beside it — a count that followed the filter would be
+    // indistinguishable from an empty board.
+    expect(await screen.findByTitle(/1 of 2 live cards match/)).toBeInTheDocument();
+  });
+
+  it('shows cancelled cards only when the URL asks for them', async () => {
+    renderBoard('?cancelled=1');
+    expect(await screen.findByText('Cancelled one')).toBeInTheDocument();
+    // …and they still do not count as live work.
+    expect(await screen.findByTitle('2 live')).toBeInTheDocument();
   });
 });
