@@ -1,7 +1,13 @@
-import type { components } from '../../api/schema';
+import type { components, paths } from '../../api/schema';
 
 export type Issue = components['schemas']['IssueDto'];
 export type Agent = components['schemas']['AgentProfileDto'];
+// Runs have no point-lookup endpoint, so the generator inlines their shape
+// rather than emitting a named component. Taking the type from the response
+// keeps it pinned to the spec without inventing an endpoint to name it.
+export type IssueRun =
+  paths['/v1/projects/{project_id}/runs']['get']['responses'][200]['content']['application/json']['items'][number];
+export type RunStatus = IssueRun['status'];
 export type Project = components['schemas']['ProjectDto'];
 export type IssueStatus = Issue['status'];
 export type IssuePriority = Issue['priority'];
@@ -179,6 +185,31 @@ export function placementChanged(before: Board, after: Board, number: number): b
   const beforeIndex = before[beforeStatus].findIndex((issue) => issue.number === number);
   const afterIndex = after[afterStatus].findIndex((issue) => issue.number === number);
   return beforeIndex !== afterIndex;
+}
+
+/**
+ * What a card should say about its work, given the board's unfinished
+ * runs. `null` means nothing is happening on it.
+ *
+ * Only the unfinished states reach a card: a finished run is history and
+ * belongs in the issue's execution log, not on its face.
+ */
+export function runIndicator(
+  activeRuns: IssueRun[],
+  number: number,
+): 'queued' | 'running' | null {
+  const run = activeRuns.find((candidate) => candidate.number === number);
+  if (run === undefined) return null;
+  return run.status === 'running' ? 'running' : 'queued';
+}
+
+/** How long a run took, or has been going. */
+export function runDuration(run: IssueRun, now: number): string | null {
+  if (run.started_at_ms == null) return null;
+  const end = run.settled_at_ms ?? now;
+  const seconds = Math.max(0, Math.round((end - run.started_at_ms) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
 }
 
 /**

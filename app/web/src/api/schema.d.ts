@@ -1000,6 +1000,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_issue_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_active_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/push/params": {
         parameters: {
             query?: never;
@@ -2510,6 +2542,17 @@ export interface components {
             /** @description Parent of the sibling group being reordered (`null` = top-level). */
             parent_id?: string | null;
         };
+        /**
+         * @description Where a run is. `queued` and `running` are the unfinished states — a
+         *     card showing either is a card being worked.
+         * @enum {string}
+         */
+        RunStatusDto: "queued" | "running" | "done" | "failed" | "cancelled";
+        /**
+         * @description Why a run was started.
+         * @enum {string}
+         */
+        RunTriggerDto: "started" | "assigned" | "retry";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
@@ -6560,6 +6603,150 @@ export interface operations {
             };
             /** @description The project is archived */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_issue_runs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every run of this issue, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            agent_id: string;
+                            /**
+                             * Format: int64
+                             * @description 1 for an issue's first run, incrementing thereafter — how the
+                             *     execution log addresses it.
+                             */
+                            attempt: number;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            error?: string | null;
+                            /**
+                             * Format: int64
+                             * @description The issue this ran, by its per-project number.
+                             */
+                            number: number;
+                            /**
+                             * @description The session the run executed in. Present once claimed; it is what
+                             *     the trace viewer opens.
+                             */
+                            session_id?: string | null;
+                            /** Format: int64 */
+                            settled_at_ms?: number | null;
+                            /** Format: int64 */
+                            started_at_ms?: number | null;
+                            status: components["schemas"]["RunStatusDto"];
+                            trigger: components["schemas"]["RunTriggerDto"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_active_runs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The board's unfinished runs — which cards are working */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            agent_id: string;
+                            /**
+                             * Format: int64
+                             * @description 1 for an issue's first run, incrementing thereafter — how the
+                             *     execution log addresses it.
+                             */
+                            attempt: number;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            error?: string | null;
+                            /**
+                             * Format: int64
+                             * @description The issue this ran, by its per-project number.
+                             */
+                            number: number;
+                            /**
+                             * @description The session the run executed in. Present once claimed; it is what
+                             *     the trace viewer opens.
+                             */
+                            session_id?: string | null;
+                            /** Format: int64 */
+                            settled_at_ms?: number | null;
+                            /** Format: int64 */
+                            started_at_ms?: number | null;
+                            status: components["schemas"]["RunStatusDto"];
+                            trigger: components["schemas"]["RunTriggerDto"];
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

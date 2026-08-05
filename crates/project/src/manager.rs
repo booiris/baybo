@@ -118,6 +118,12 @@ impl ProjectManager {
         Ok(self.store.list_runs(&issue.id).await?)
     }
 
+    /// The unfinished runs of one board — which cards are working.
+    pub async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
+        self.get_project(project).await?;
+        Ok(self.store.active_runs(project).await?)
+    }
+
     /// Return orphaned runs to the queue and hand each back for dispatch.
     /// Called once at boot, before live traffic: a `running` row whose
     /// actor died with the process is work that never finished.

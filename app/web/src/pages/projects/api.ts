@@ -1,6 +1,6 @@
 import type { AdminClient } from '../../api/client';
 import type { components } from '../../api/schema';
-import type { Agent, Issue, IssueStatus, Project } from './boardModel';
+import type { Agent, Issue, IssueRun, IssueStatus, Project } from './boardModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
@@ -96,6 +96,42 @@ export async function fetchIssues(
     const { data, error, response } = await client.GET('/v1/projects/{project_id}/issues', {
       params: { path: { project_id: projectId } },
     });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function fetchActiveRuns(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<IssueRun[]>> {
+  try {
+    const { data, error, response } = await client.GET('/v1/projects/{project_id}/runs', {
+      params: { path: { project_id: projectId } },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function fetchIssueRuns(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+): Promise<Outcome<IssueRun[]>> {
+  try {
+    const { data, error, response } = await client.GET(
+      '/v1/projects/{project_id}/issues/{number}/runs',
+      { params: { path: { project_id: projectId, number } } },
+    );
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);

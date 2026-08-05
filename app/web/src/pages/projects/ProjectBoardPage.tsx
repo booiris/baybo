@@ -24,13 +24,21 @@ import { RiAddLine, RiArchiveLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
-import { fetchAgents, fetchIssues, fetchProject, fetchProjects, moveIssue } from './api';
+import {
+  fetchActiveRuns,
+  fetchAgents,
+  fetchIssues,
+  fetchProject,
+  fetchProjects,
+  moveIssue,
+} from './api';
 import {
   COLUMNS,
   COLUMN_LABEL,
   type Agent,
   type Board,
   type Issue,
+  type IssueRun,
   type IssueStatus,
   type Project,
   cardDragId,
@@ -46,6 +54,7 @@ import {
   parseDragId,
   placementChanged,
   resolveDrop,
+  runIndicator,
 } from './boardModel';
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
@@ -71,6 +80,7 @@ export function ProjectBoardPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [activeRuns, setActiveRuns] = useState<IssueRun[]>([]);
   const [board, setBoard] = useState<Board>(emptyBoard);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -87,12 +97,14 @@ export function ProjectBoardPage() {
     let canceled = false;
     async function load() {
       setLoading(true);
-      const [projectOutcome, issuesOutcome, listOutcome, agentsOutcome] = await Promise.all([
-        fetchProject(client, projectId),
-        fetchIssues(client, projectId),
-        fetchProjects(client, false),
-        fetchAgents(client),
-      ]);
+      const [projectOutcome, issuesOutcome, listOutcome, agentsOutcome, runsOutcome] =
+        await Promise.all([
+          fetchProject(client, projectId),
+          fetchIssues(client, projectId),
+          fetchProjects(client, false),
+          fetchAgents(client),
+          fetchActiveRuns(client, projectId),
+        ]);
       if (canceled) return;
       if (
         projectOutcome.kind === 'unauthorized' ||
@@ -117,6 +129,7 @@ export function ProjectBoardPage() {
       setBoard(groupByStatus(issuesOutcome.value, showCancelled));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
       if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
+      setActiveRuns(runsOutcome.kind === 'ok' ? runsOutcome.value : []);
       setLoading(false);
       // Remembered only once the board actually resolved: a 404'd deep link
       // must not poison what the rail opens next time.
@@ -127,6 +140,19 @@ export function ProjectBoardPage() {
       canceled = true;
     };
   }, [client, logout, projectId, refreshKey, showCancelled]);
+
+  // No board frame on the wire yet, so a working card is kept honest by a
+  // slow poll — and only while something is actually running. An idle
+  // board makes no requests.
+  useEffect(() => {
+    if (activeRuns.length === 0) return;
+    const timer = window.setInterval(() => {
+      setRefreshKey((key) => key + 1);
+    }, 4000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activeRuns.length]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -287,6 +313,7 @@ export function ProjectBoardPage() {
               key={status}
               status={status}
               issues={board[status]}
+              activeRuns={activeRuns}
               disabled={archived}
               onOpen={openIssue}
               onCreate={() => {
@@ -324,12 +351,14 @@ export function ProjectBoardPage() {
 function BoardColumn({
   status,
   issues,
+  activeRuns,
   disabled,
   onOpen,
   onCreate,
 }: {
   status: IssueStatus;
   issues: Issue[];
+  activeRuns: IssueRun[];
   disabled: boolean;
   onOpen: (number: number) => void;
   onCreate: () => void;
@@ -371,6 +400,7 @@ function BoardColumn({
             <SortableIssueCard
               key={issue.number}
               issue={issue}
+              run={runIndicator(activeRuns, issue.number)}
               disabled={disabled}
               onOpen={onOpen}
             />
@@ -388,10 +418,12 @@ function BoardColumn({
 
 function SortableIssueCard({
   issue,
+  run,
   disabled,
   onOpen,
 }: {
   issue: Issue;
+  run: 'queued' | 'running' | null;
   disabled: boolean;
   onOpen: (number: number) => void;
 }) {
@@ -411,22 +443,32 @@ function SortableIssueCard({
         onOpen(issue.number);
       }}
     >
-      <IssueCard issue={issue} />
+      <IssueCard issue={issue} run={run} />
     </div>
   );
 }
 
 /** Initial-free avatar dot — the agent's identity is its colour and title. */
-function AssigneeDot({ assignee }: { assignee: string }) {
+function AssigneeDot({ assignee, working = false }: { assignee: string; working?: boolean }) {
   return (
     <span
-      title={assignee}
-      className="w-4 h-4 rounded-full border-2 border-black bg-brand shrink-0"
+      title={working ? `${assignee} — working` : assignee}
+      className={`w-4 h-4 rounded-full border-2 border-black shrink-0 ${
+        working ? 'bg-ok motion-safe:animate-pulse' : 'bg-brand'
+      }`}
     />
   );
 }
 
-function IssueCard({ issue, overlay = false }: { issue: Issue; overlay?: boolean }) {
+function IssueCard({
+  issue,
+  run = null,
+  overlay = false,
+}: {
+  issue: Issue;
+  run?: 'queued' | 'running' | null;
+  overlay?: boolean;
+}) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
   return (
@@ -455,8 +497,17 @@ function IssueCard({ issue, overlay = false }: { issue: Issue; overlay?: boolean
       ) : null}
       {issue.assignee != null ? (
         <div className="flex items-center gap-1.5">
-          <AssigneeDot assignee={issue.assignee} />
+          <AssigneeDot assignee={issue.assignee} working={run === 'running'} />
           <span className="font-mono text-[0.58rem] text-ink-soft truncate">{issue.assignee}</span>
+          {run !== null ? (
+            <span
+              className={`ml-auto shrink-0 font-mono text-[0.54rem] font-bold uppercase ${
+                run === 'running' ? 'text-ok' : 'text-ink-soft'
+              }`}
+            >
+              {run === 'running' ? 'working' : 'queued'}
+            </span>
+          ) : null}
         </div>
       ) : null}
     </article>

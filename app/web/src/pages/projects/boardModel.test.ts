@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   type Board,
   type Issue,
+  type IssueRun,
   type Project,
   assignableAgents,
   cardDragId,
@@ -15,6 +16,8 @@ import {
   orderedNumbers,
   parseDragId,
   placementChanged,
+  runDuration,
+  runIndicator,
   resolveDrop,
   resolveLanding,
 } from './boardModel';
@@ -153,6 +156,40 @@ describe('orderedNumbers + placementChanged', () => {
 
     const same = moveCard(start, { status: 'backlog', index: 0, issue: issue(1) });
     expect(placementChanged(start, same, 1)).toBe(false);
+  });
+});
+
+function run(number: number, overrides: Partial<IssueRun> = {}): IssueRun {
+  return {
+    number,
+    attempt: 1,
+    agent_id: 'dev-1',
+    status: 'queued',
+    trigger: 'started',
+    created_at_ms: 0,
+    ...overrides,
+  };
+}
+
+describe('runIndicator', () => {
+  it('says what a card is doing, and nothing when it is doing nothing', () => {
+    const active = [run(1, { status: 'running' }), run(2)];
+    expect(runIndicator(active, 1)).toBe('running');
+    expect(runIndicator(active, 2)).toBe('queued');
+    expect(runIndicator(active, 3)).toBeNull();
+    // A finished run is history and belongs in the log, not on the card —
+    // the board is only ever handed unfinished ones.
+    expect(runIndicator([], 1)).toBeNull();
+  });
+});
+
+describe('runDuration', () => {
+  it('measures a finished run, and an unfinished one against now', () => {
+    expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 45_000 }), 99_000)).toBe('45s');
+    expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 125_000 }), 0)).toBe('2m05s');
+    expect(runDuration(run(1, { started_at_ms: 10_000 }), 40_000)).toBe('30s');
+    // A queued run has not started, so it has no duration to report.
+    expect(runDuration(run(1), 40_000)).toBeNull();
   });
 });
 

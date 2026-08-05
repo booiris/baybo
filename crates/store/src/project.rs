@@ -257,6 +257,10 @@ pub trait ProjectStore: Send + Sync {
     /// Every run of one issue, newest first — the execution log.
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;
 
+    /// The unfinished runs of one board. One query rather than a lookup per
+    /// card: this is what tells the board which cards are working.
+    async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
+
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
     /// Every unfinished run, oldest first. The boot sweep's scan.

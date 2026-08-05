@@ -616,6 +616,23 @@ impl ProjectStore for SqliteProjectStore {
         raws.into_iter().map(run_from_raw).collect()
     }
 
+    async fn active_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>> {
+        let project = project.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("issue_runs.active", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_COLUMNS} FROM issue_runs \
+                     WHERE project_id = ?1 AND settled_at IS NULL ORDER BY number"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![project], read_raw_run)?
+                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(run_from_raw).collect()
+    }
+
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
         let id = id.as_str().to_string();
         let raw = self

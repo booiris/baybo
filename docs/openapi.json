@@ -4771,6 +4771,276 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/runs": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_issue_runs",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every run of this issue, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One execution of an issue.",
+                        "required": [
+                          "number",
+                          "attempt",
+                          "agent_id",
+                          "status",
+                          "trigger",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "agent_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "The issue this ran, by its per-project number."
+                          },
+                          "session_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+                          },
+                          "settled_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "started_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/RunStatusDto"
+                          },
+                          "trigger": {
+                            "$ref": "#/components/schemas/RunTriggerDto"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/runs": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_active_runs",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The board's unfinished runs — which cards are working",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One execution of an issue.",
+                        "required": [
+                          "number",
+                          "attempt",
+                          "agent_id",
+                          "status",
+                          "trigger",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "agent_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "The issue this ran, by its per-project number."
+                          },
+                          "session_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+                          },
+                          "settled_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "started_at_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64"
+                          },
+                          "status": {
+                            "$ref": "#/components/schemas/RunStatusDto"
+                          },
+                          "trigger": {
+                            "$ref": "#/components/schemas/RunTriggerDto"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/push/params": {
       "get": {
         "tags": [
@@ -7984,6 +8254,26 @@
             "description": "Parent of the sibling group being reordered (`null` = top-level)."
           }
         }
+      },
+      "RunStatusDto": {
+        "type": "string",
+        "description": "Where a run is. `queued` and `running` are the unfinished states — a\ncard showing either is a card being worked.",
+        "enum": [
+          "queued",
+          "running",
+          "done",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "RunTriggerDto": {
+        "type": "string",
+        "description": "Why a run was started.",
+        "enum": [
+          "started",
+          "assigned",
+          "retry"
+        ]
       },
       "SessionKind": {
         "type": "string",

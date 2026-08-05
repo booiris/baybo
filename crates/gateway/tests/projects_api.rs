@@ -379,6 +379,72 @@ async fn in_progress_is_refused_without_an_assignee() {
     .await;
 }
 
+#[tokio::test]
+async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
+    let (router, tg) = router().await;
+    // An agent that can actually host a run.
+    let now = chrono::Utc::now();
+    tg.deps
+        .stores
+        .agent_profile
+        .create(&baybo_store::AgentProfileRow {
+            id: baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed agent");
+
+    let p = open_project(&router, "runs").await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "do it", "status": "in_progress", "assignee": "dev-1" }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // The card is working, and the board learns that in one read rather
+    // than a lookup per card.
+    let active = get(&router, &format!("/v1/projects/{p}/runs"), StatusCode::OK).await;
+    let items = active["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["number"], 1);
+    assert_eq!(items[0]["attempt"], 1);
+    assert_eq!(items[0]["trigger"], "started");
+    assert_eq!(items[0]["agent_id"], "dev-1");
+
+    // …and the issue's own log has it too.
+    let log = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(log["items"].as_array().expect("items").len(), 1);
+
+    // A card nobody started has an empty log rather than a 404.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "not started" }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let log = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/2/runs"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(log["items"].as_array().expect("items").len(), 0);
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
 async fn request(

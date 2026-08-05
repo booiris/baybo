@@ -4,14 +4,23 @@ import { RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { Button } from '../../components/Button';
-import { fetchAgents, fetchIssue, fetchIssues, moveIssue, patchIssue } from './api';
+import {
+  fetchAgents,
+  fetchIssue,
+  fetchIssueRuns,
+  fetchIssues,
+  moveIssue,
+  patchIssue,
+} from './api';
 import {
   COLUMNS,
   COLUMN_LABEL,
   PRIORITIES,
   assignableAgents,
+  runDuration,
   type Agent,
   type Issue,
+  type IssueRun,
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
@@ -25,6 +34,42 @@ const PRIORITY_LABEL: Record<IssuePriority, string> = {
 };
 
 const railLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft';
+
+const RUN_TONE: Record<IssueRun['status'], string> = {
+  queued: 'border-black/35 bg-canvas text-ink-soft',
+  running: 'border-black bg-brand/40 text-ink',
+  done: 'border-ok/50 bg-ok/15 text-ok',
+  failed: 'border-err/45 bg-err/12 text-err',
+  cancelled: 'border-black/35 bg-canvas text-ink-soft',
+};
+
+const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
+  started: 'started',
+  assigned: 'assigned',
+  retry: 'retry',
+};
+
+function RunRow({ run }: { run: IssueRun }) {
+  const duration = runDuration(run, Date.now());
+  return (
+    <li className="flex items-center gap-2 py-1.5 border-b border-black/15 last:border-0 font-mono text-[0.62rem]">
+      <span className="font-bold">#{run.attempt}</span>
+      <span className="text-ink-soft">{RUN_TRIGGER_LABEL[run.trigger]}</span>
+      <span className={`rounded-full border px-2 font-bold ${RUN_TONE[run.status]}`}>
+        {run.status}
+      </span>
+      {duration != null ? <span className="text-ink-soft">{duration}</span> : null}
+      {run.session_id != null ? (
+        <a
+          className="ml-auto text-info underline"
+          href={`#/traces/${encodeURIComponent(run.session_id)}`}
+        >
+          transcript
+        </a>
+      ) : null}
+    </li>
+  );
+}
 
 const railSelect =
   'w-full mt-1 px-2 py-1 bg-surface border-2 border-black rounded-md font-mono text-[0.72rem] outline-none cursor-pointer';
@@ -44,6 +89,7 @@ export function IssueDetailPage() {
 
   const [issue, setIssue] = useState<Issue | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [runs, setRuns] = useState<IssueRun[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
@@ -53,12 +99,14 @@ export function IssueDetailPage() {
   useEffect(() => {
     let canceled = false;
     async function load() {
-      const [outcome, agentsOutcome] = await Promise.all([
+      const [outcome, agentsOutcome, runsOutcome] = await Promise.all([
         fetchIssue(client, projectId, number),
         fetchAgents(client),
+        fetchIssueRuns(client, projectId, number),
       ]);
       if (canceled) return;
       if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
+      if (runsOutcome.kind === 'ok') setRuns(runsOutcome.value);
       if (outcome.kind === 'unauthorized') {
         logout();
         return;
@@ -291,6 +339,22 @@ export function IssueDetailPage() {
                 ))}
               </select>
             </label>
+          </section>
+
+          <section className="border-2 border-black rounded-md bg-surface p-3">
+            <h2 className={railLabel}>Execution log</h2>
+            {runs.length === 0 ? (
+              <p className="mt-2 font-mono text-[0.62rem] text-ink-soft leading-snug">
+                No runs yet — this card starts working when it reaches In Progress with an
+                assignee.
+              </p>
+            ) : (
+              <ul className="mt-2 flex flex-col">
+                {runs.map((run) => (
+                  <RunRow key={run.attempt} run={run} />
+                ))}
+              </ul>
+            )}
           </section>
 
           <section className="border-2 border-black rounded-md bg-surface p-3">

@@ -36,10 +36,22 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
 }
 
 const ISSUES: Issue[] = [
-  issue(1, { title: 'Wire the board', position: 0 }),
+  issue(1, { title: 'Wire the board', position: 0, assignee: 'dev-1' }),
   issue(2, { title: 'Blocked one', position: 1, blocked_reason: 'waiting on tmux' }),
   issue(3, { title: 'Cancelled one', position: 2, cancelled_at_ms: 111 }),
-  issue(4, { title: 'Under way', status: 'in_progress', position: 0, priority: 'urgent' }),
+  issue(4, {
+    title: 'Under way',
+    status: 'in_progress',
+    position: 0,
+    priority: 'urgent',
+    assignee: 'dev-1',
+  }),
+];
+
+// #4 is being worked on right now; #1 is waiting its turn.
+const RUNS = [
+  { number: 4, attempt: 1, agent_id: 'dev-1', status: 'running', trigger: 'started', created_at_ms: 0 },
+  { number: 1, attempt: 1, agent_id: 'dev-1', status: 'queued', trigger: 'started', created_at_ms: 0 },
 ];
 
 const ok = { status: 200, ok: true } as Response;
@@ -55,6 +67,12 @@ function stubClient() {
       }
       if (path === '/v1/projects/{project_id}/issues') {
         return { data: { items: ISSUES }, error: undefined, response: ok };
+      }
+      if (path === '/v1/projects/{project_id}/runs') {
+        return { data: { items: RUNS }, error: undefined, response: ok };
+      }
+      if (path === '/v1/agents') {
+        return { data: { items: [] }, error: undefined, response: ok };
       }
       throw new Error(`unexpected GET ${path}`);
     }),
@@ -123,6 +141,18 @@ describe('ProjectBoardPage', () => {
     expect(screen.getByText('⚑ Blocked')).toBeInTheDocument();
     // Urgent renders its mark on the card face; priority never reorders.
     expect(screen.getByText('▲▲')).toBeInTheDocument();
+  });
+
+  it('says which cards are working and which are waiting', async () => {
+    renderBoard();
+    await screen.findByText('Under way');
+
+    // The state a card shows is its run's, and only unfinished runs reach
+    // the board — a finished one is history for the execution log.
+    expect(screen.getByText('working')).toBeInTheDocument();
+    expect(screen.getByText('queued')).toBeInTheDocument();
+    // The cards nobody is on say nothing.
+    expect(screen.getAllByText(/^(working|queued)$/)).toHaveLength(2);
   });
 
   it('opens the create modal on the column it was pressed in', async () => {

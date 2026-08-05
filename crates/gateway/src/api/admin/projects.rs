@@ -17,7 +17,8 @@ use utoipa_axum::routes;
 use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
+    RunStatus, RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -32,6 +33,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_issues, create_issue))
         .routes(routes!(get_issue, update_issue))
         .routes(routes!(move_issue))
+        .routes(routes!(list_issue_runs))
+        .routes(routes!(list_active_runs))
 }
 
 /// Map the domain's error onto a status once, for every handler here.
@@ -220,6 +223,90 @@ impl From<IssueRow> for IssueDto {
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
+        }
+    }
+}
+
+/// Where a run is. `queued` and `running` are the unfinished states — a
+/// card showing either is a card being worked.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatusDto {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl From<RunStatus> for RunStatusDto {
+    fn from(status: RunStatus) -> Self {
+        match status {
+            RunStatus::Queued => Self::Queued,
+            RunStatus::Running => Self::Running,
+            RunStatus::Done => Self::Done,
+            RunStatus::Failed => Self::Failed,
+            RunStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Why a run was started.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTriggerDto {
+    Started,
+    Assigned,
+    Retry,
+}
+
+impl From<RunTrigger> for RunTriggerDto {
+    fn from(trigger: RunTrigger) -> Self {
+        match trigger {
+            RunTrigger::Started => Self::Started,
+            RunTrigger::Assigned => Self::Assigned,
+            RunTrigger::Retry => Self::Retry,
+        }
+    }
+}
+
+/// One execution of an issue.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueRunDto {
+    /// The issue this ran, by its per-project number.
+    pub number: i64,
+    /// 1 for an issue's first run, incrementing thereafter — how the
+    /// execution log addresses it.
+    pub attempt: i64,
+    pub agent_id: String,
+    pub status: RunStatusDto,
+    pub trigger: RunTriggerDto,
+    /// The session the run executed in. Present once claimed; it is what
+    /// the trace viewer opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at_ms: Option<i64>,
+}
+
+impl From<IssueRunRow> for IssueRunDto {
+    fn from(row: IssueRunRow) -> Self {
+        Self {
+            number: row.number,
+            attempt: row.attempt,
+            agent_id: row.agent_id.to_string(),
+            status: row.status.into(),
+            trigger: row.trigger.into(),
+            session_id: row.session_id.map(|s| s.into_inner()),
+            error: row.error,
+            created_at_ms: row.created_at.timestamp_millis(),
+            started_at_ms: row.started_at.map(|t| t.timestamp_millis()),
+            settled_at_ms: row.settled_at.map(|t| t.timestamp_millis()),
         }
     }
 }
@@ -602,4 +689,61 @@ async fn move_issue(
         .await
         .map_err(project_err)?;
     Ok(Json(IssueDto::from(row)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/issues/{number}/runs",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    responses(
+        (status = 200, description = "Every run of this issue, newest first", body = inline(ListResponse<IssueRunDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+    )
+)]
+async fn list_issue_runs(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+) -> Result<Json<ListResponse<IssueRunDto>>> {
+    let id = parse_project_id(&project_id)?;
+    let items = state
+        .project_manager
+        .list_runs(&id, number)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(IssueRunDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/runs",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, description = "The board's unfinished runs — which cards are working", body = inline(ListResponse<IssueRunDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn list_active_runs(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ListResponse<IssueRunDto>>> {
+    let id = parse_project_id(&project_id)?;
+    let items = state
+        .project_manager
+        .active_runs(&id)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(IssueRunDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
 }
