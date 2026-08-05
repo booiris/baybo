@@ -10,7 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use baybo_model::{AgentFramework, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId};
+use baybo_model::{
+    AgentFramework, AgentHandle, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId,
+    TeamMembership,
+};
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
     IssueActor, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
@@ -27,6 +30,18 @@ use crate::runs::{Transition, ledger_entry, triggers_run};
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
 pub const MAX_ISSUE_TITLE_CHARS: usize = 200;
+
+/// The handle every project's coordinator answers to. Fixed rather than
+/// derived: `@lead` means the same thing on every board, and it is the one
+/// handle a person can type without looking the team up first.
+pub const LEAD_HANDLE: &str = "lead";
+
+/// What the lead calls itself before it renames itself.
+const LEAD_DISPLAY_NAME: &str = "Lead";
+
+/// The lead's roster line. The operator can edit it like any other agent's.
+const LEAD_DESCRIPTION: &str =
+    "Coordinates this project's board: triages Backlog, assigns work, and staffs the team.";
 
 /// What a caller supplies to open a project.
 #[derive(Debug, Clone, Default)]
@@ -402,6 +417,14 @@ impl ProjectManager {
             _ => self.materialise_workdir(&name).await?,
         };
 
+        // Before the project row, not after. A lead that fails to
+        // materialise this way leaves an agent row whose project does not
+        // exist — invisible to both rosters and inert, like the orphaned
+        // persona directory above. The other order leaves a *visible* board
+        // with no coordinator, which is the state every other path here
+        // assumes cannot happen.
+        self.seed_lead(&id).await?;
+
         let now = chrono::Utc::now();
         let row = ProjectRow {
             id,
@@ -415,6 +438,56 @@ impl ProjectManager {
         self.store.create_project(&row).await?;
         self.events.project_changed(&row.id);
         Ok(row)
+    }
+
+    /// Staff a brand-new board with its coordinator.
+    ///
+    /// Every project has a lead, and it is created here rather than on first
+    /// use so the invariant holds for every reader — the team strip, the
+    /// triage loop, the chat panel — instead of each one having to handle a
+    /// board that has nobody on it yet.
+    async fn seed_lead(&self, project: &ProjectId) -> Result<()> {
+        // A compile-time literal, so this can only fail if somebody edits
+        // `LEAD_HANDLE` into something the grammar refuses — which the test
+        // below catches long before a project is ever opened.
+        let handle = AgentHandle::parse(LEAD_HANDLE)
+            .map_err(|e| anyhow::anyhow!("LEAD_HANDLE is not a valid handle: {e}"))?;
+        let id = AgentProfileId::generate();
+        baybo_workspace::ensure_named_persona_layout(
+            &self.paths,
+            id.as_str(),
+            baybo_workspace::prompt::PROJECT_LEAD_SOUL_TEMPLATE,
+            LEAD_DISPLAY_NAME,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("materialise the project lead's persona: {e}"))?;
+        let now = chrono::Utc::now();
+        self.agents
+            .create(&baybo_store::AgentProfileRow {
+                id,
+                description: LEAD_DESCRIPTION.to_owned(),
+                avatar_blob_id: None,
+                framework: AgentFramework::Baybo,
+                llm: None,
+                builtin: false,
+                team: Some(TeamMembership {
+                    project_id: project.clone(),
+                    handle,
+                }),
+                // Nobody hired the lead: it comes with the board.
+                hired_by: None,
+                deleted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// One project's live team, by handle. The lead is always in it.
+    pub async fn team(&self, project: &ProjectId) -> Result<Vec<baybo_store::AgentProfileRow>> {
+        self.get_project(project).await?;
+        Ok(self.agents.list_team(project).await?)
     }
 
     /// Create `work/<slug>/` and make it a git repository.

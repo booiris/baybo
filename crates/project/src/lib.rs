@@ -17,8 +17,8 @@ pub use comments::{CommentDelivery, comment_delivery};
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
-    MAX_ISSUE_TITLE_CHARS, NewIssueRequest, NewProject, ProjectManager, RunDispatch, no_dispatch,
-    validate_workdir,
+    LEAD_HANDLE, MAX_ISSUE_TITLE_CHARS, NewIssueRequest, NewProject, ProjectManager, RunDispatch,
+    no_dispatch, validate_workdir,
 };
 pub use runs::{Transition, triggers_run};
 pub use timeline::diff_events;

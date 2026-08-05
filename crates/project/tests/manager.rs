@@ -118,6 +118,108 @@ async fn an_empty_workdir_is_materialised_as_a_repo_under_work() {
     assert!(expected.join(".git").exists(), "and it is a git repository");
 }
 
+/// Every board opens with a coordinator, so no reader — the team strip, the
+/// triage loop, the chat panel — has to handle a project nobody is on.
+#[tokio::test]
+async fn a_new_project_comes_with_a_lead() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Staffed"))
+        .await
+        .expect("create");
+
+    let team = f.manager.team(&project.id).await.expect("team");
+    assert_eq!(team.len(), 1, "exactly the lead");
+    let lead = &team[0];
+    let membership = lead.team.as_ref().expect("the lead is on the team");
+    assert_eq!(membership.project_id, project.id);
+    assert_eq!(membership.handle.as_str(), baybo_project::LEAD_HANDLE);
+    assert!(
+        lead.hired_by.is_none(),
+        "nobody hired the lead; it comes with the board"
+    );
+    assert_eq!(lead.framework, AgentFramework::Baybo);
+
+    // Its persona is on disk with the coordinator soul and a name, so the
+    // first run reads a lead rather than the blank custom-agent skeleton.
+    let soul = tokio::fs::read_to_string(
+        lead.id
+            .identity_file(&f.paths, baybo_workspace::IdentityKind::Soul),
+    )
+    .await
+    .expect("soul");
+    assert!(
+        soul.contains("You coordinate one project's board"),
+        "{soul}"
+    );
+    let identity = tokio::fs::read_to_string(
+        lead.id
+            .identity_file(&f.paths, baybo_workspace::IdentityKind::Identity),
+    )
+    .await
+    .expect("identity");
+    assert_eq!(
+        baybo_workspace::display_name(&identity).as_deref(),
+        Some("Lead")
+    );
+
+    // And it is a teammate, not a chat persona: the global roster is
+    // exactly what it was before the project existed.
+    let global = f.agents.list().await.expect("global roster");
+    assert!(
+        global.iter().all(|row| row.id != lead.id),
+        "the lead must not appear in the global agent list"
+    );
+
+    // Two boards get two leads, each answering to `@lead` on its own.
+    let other = f
+        .manager
+        .create_project(new_project("Also Staffed"))
+        .await
+        .expect("create");
+    let other_lead = &f.manager.team(&other.id).await.expect("team")[0];
+    assert_ne!(other_lead.id, lead.id);
+    assert_eq!(
+        other_lead
+            .team
+            .as_ref()
+            .map(|t| t.handle.as_str().to_owned()),
+        Some(baybo_project::LEAD_HANDLE.to_owned())
+    );
+}
+
+/// The lead is a teammate like any other, which is what makes it usable as
+/// an assignee without a special case anywhere.
+#[tokio::test]
+async fn the_lead_can_be_assigned_work() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Solo"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&project.id).await.expect("team")[0]
+        .id
+        .clone();
+
+    let issue = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(lead.clone()),
+                ..new_issue("do it yourself")
+            },
+        )
+        .await
+        .expect("the lead can take work");
+    assert_eq!(issue.assignee, Some(lead));
+    assert_eq!(f.dispatched.lock().len(), 1, "and starting it runs");
+}
+
 #[tokio::test]
 async fn a_non_empty_work_directory_is_never_silently_adopted() {
     let f = fixture().await;

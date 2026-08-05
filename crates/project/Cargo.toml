@@ -9,7 +9,7 @@ doctest = false
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
-baybo-workspace = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

@@ -195,6 +195,54 @@ pub async fn ensure_persona_layout(
     Ok(())
 }
 
+/// Materialise a persona and give it a name in one step, for an agent the
+/// system is creating on the operator's behalf rather than at their keyboard
+/// — currently a project's lead.
+///
+/// Two writes, in the order that matters: [`ensure_persona_layout`] seeds
+/// the files and commits the baseline, then the name is spliced into the
+/// `IDENTITY.md` that call just wrote and committed on top. Doing it the
+/// other way round would show the name as part of the baseline, so a later
+/// rename would read as the *first* time the agent was ever named.
+///
+/// Unlocked on purpose: `agent_id` was minted a moment ago and nothing else
+/// in the process can be holding this file yet. Every *edit* path — the
+/// gateway's rename, the agent's own rewrite — still goes through
+/// [`personas_git_lock`] and the identity write lock.
+pub async fn ensure_named_persona_layout(
+    paths: &WorkspacePaths,
+    agent_id: &str,
+    seed_soul: &str,
+    display_name: &str,
+) -> anyhow::Result<()> {
+    ensure_persona_layout(paths, agent_id, seed_soul).await?;
+    let path = paths.persona_identity_file(agent_id, IdentityKind::Identity);
+    let current = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let named = crate::name::with_display_name(&current, display_name);
+    if named == current {
+        return Ok(());
+    }
+    let tmp = path.with_extension("md.tmp");
+    tokio::fs::write(&tmp, &named)
+        .await
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| anyhow::anyhow!("rename into {}: {e}", path.display()))?;
+    commit_personas(
+        paths,
+        &[&format!(
+            "{agent_id}/{}",
+            IdentityKind::Identity.file_name()
+        )],
+        &format!("personas: name {agent_id}"),
+    )
+    .await;
+    Ok(())
+}
+
 /// Serialises everything that runs `git` against `personas/`.
 ///
 /// `add` + `commit` hold `.git/index.lock` for their whole run, and a `git`
