@@ -530,7 +530,7 @@ fn validate_issue_title(title: &str) -> Result<String> {
 
 /// A project name reduced to a directory name: lowercase, ASCII
 /// alphanumerics and dashes, no runs, no leading or trailing dash.
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {

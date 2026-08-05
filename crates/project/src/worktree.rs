@@ -46,10 +46,19 @@ pub struct Checkout {
 pub fn worktree_root(paths: &WorkspacePaths, project: &ProjectId, number: i64) -> PathBuf {
     paths
         .work_dir()
-        .join("projects")
+        .join(WORKTREES_DIR)
         .join(project.as_str())
         .join(number.to_string())
 }
+
+/// Where every project's worktrees live, as a child of the work dir.
+///
+/// The leading dot is load-bearing. A project created without a workdir
+/// gets `work/<slugify(name)>`, and `slugify` emits only ASCII
+/// alphanumerics and `-` — so a name that produced this directory would
+/// collide with it, and "Projects" is not an exotic name for a project.
+/// A dot is the one thing a slug cannot contain.
+const WORKTREES_DIR: &str = ".worktrees";
 
 /// `issue/<number>-<slug>`, the branch a run's commits land on.
 ///
@@ -225,6 +234,21 @@ mod tests {
             .await
             .expect("git init");
         dir
+    }
+
+    #[test]
+    fn no_project_name_can_claim_the_worktrees_directory() {
+        // `materialise_workdir` puts an auto-created repo at
+        // `work/<slugify(name)>`, so if a project name could slugify to the
+        // worktrees directory the two would fight over one path — and
+        // "Projects" is not an exotic name for a project.
+        assert!(
+            WORKTREES_DIR
+                .chars()
+                .any(|c| !c.is_ascii_alphanumeric() && c != '-'),
+            "the worktrees directory must contain a character slugify cannot emit"
+        );
+        assert_eq!(crate::manager::slugify("Projects"), "projects");
     }
 
     #[test]

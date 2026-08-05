@@ -356,9 +356,9 @@ announces which of these will happen before sending.
     `select!` loop**, which also serves every user message and agent
     response. A slow checkout is head-of-line blocking for the whole
     process.
-  - **`work/projects/` collides with a project literally named
-    "Projects"** — `materialise_workdir` puts an auto-created repo at
-    `work/<slug>`, and `slugify("Projects") == "projects"`.
+  - ~~`work/projects/` collides with a project named "Projects"~~
+    **fixed**: worktrees live under `work/.worktrees/`, and a slug cannot
+    contain a dot.
   - **A retitle between runs strands the previous branch.** The branch is
     looked up by a name recomputed from the *current* title, so renaming
     an issue makes the next run cut a second branch and leave the first
