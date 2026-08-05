@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_store::project::{IssuePriority, IssueStatus};
+use baybo_store::project::{IssuePriority, IssueRow, IssueStatus};
 use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, ToolTriggerScope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, parse_status, render_issue, scope, status_schema};
+use super::{exec_err, parse_status, render_issue, scope, status_schema, usd};
 use crate::ProjectManager;
 
 pub const ISSUE_LIST_TOOL_NAME: &str = "IssueList";
@@ -46,7 +46,11 @@ impl Tool for IssueListTool {
 
     fn description(&self) -> String {
         format!(
-            r#"List the issues on this project's board. Returns each card's number, title, status, priority, assignee handle, and branch if it has produced one. Filter with `status` (one column) and `assignee` (an `@handle`, or `{UNASSIGNED}` for the cards nobody has picked up — that set is what triage is about). Cancelled issues are left out unless you ask for them. Also returns the project's team, so you can see who is available before assigning anything."#
+            r#"List the issues on this project's board. Returns each card's number, title, status, priority, assignee handle, and branch if it has produced one. Filter with `status` (one column) and `assignee` (an `@handle`, or `{UNASSIGNED}` for the cards nobody has picked up — that set is what triage is about). Cancelled issues are left out unless you ask for them.
+
+Rows come back **most urgent first within each column**, so the order is already a triage order.
+
+Alongside them: `team`, where each member's `working_on` is what they have in flight **right now** — which is not the same as which column a card sits in, because a run outlives the column it started in. `you` marks your own entry, so you know the handle to assign work to yourself. And `board`, which says what is held and what is left of today's budget: promoting a card on an exhausted board records a run that does not start."#
         )
     }
 
@@ -85,6 +89,12 @@ impl Tool for IssueListTool {
         let status = p.status.as_deref().map(parse_status).transpose()?;
 
         let team = self.manager.team(&project).await.map_err(exec_err)?;
+        // Every derived fact below is computed over the WHOLE board, never
+        // the filtered rows. `assignee: unassigned` is the canonical triage
+        // call, and a roster load derived from that set would always read
+        // as an idle team.
+        let load = self.manager.board_load(&project).await.map_err(exec_err)?;
+        let board = self.manager.list_issues(&project).await.map_err(exec_err)?;
         let wanted_assignee = match p.assignee.as_deref().map(str::trim) {
             None => None,
             Some(raw) if raw.eq_ignore_ascii_case(UNASSIGNED) => Some(None),
@@ -93,7 +103,7 @@ impl Tool for IssueListTool {
             )),
         };
 
-        let mut issues = self.manager.list_issues(&project).await.map_err(exec_err)?;
+        let mut issues = board.clone();
         issues.retain(|issue| {
             (p.include_cancelled || issue.cancelled_at.is_none())
                 && status.is_none_or(|s| issue.status == s)
@@ -116,15 +126,94 @@ impl Tool for IssueListTool {
         let roster: Vec<Value> = team
             .iter()
             .filter_map(|row| {
-                row.team
-                    .as_ref()
-                    .map(|t| json!({ "handle": format!("@{}", t.handle), "role": row.description }))
+                let handle = row.team.as_ref()?;
+                let mut entry = serde_json::Map::new();
+                entry.insert("handle".into(), json!(format!("@{}", handle.handle)));
+                entry.insert("role".into(), json!(row.description));
+                if handle.handle.as_str() == crate::LEAD_HANDLE {
+                    entry.insert("lead".into(), json!(true));
+                }
+                if row.id == ctx.agent_id {
+                    // Nothing else tells an agent its own handle, and
+                    // `IssueUpdate` takes handles — so without this the
+                    // lead cannot reliably assign work to itself.
+                    entry.insert("you".into(), json!(true));
+                }
+                // Load comes from runs, never from the In Progress column:
+                // a run outlives the column, and a held run is not work.
+                let working: Vec<i64> = load
+                    .working
+                    .iter()
+                    .filter(|run| run.agent_id == row.id)
+                    .map(|run| run.number)
+                    .collect();
+                if !working.is_empty() {
+                    entry.insert("working_on".into(), json!(working));
+                }
+                Some(Value::Object(entry))
             })
             .collect();
+
+        let mut board_facts = serde_json::Map::new();
+        let held: Vec<i64> = load.held.iter().map(|run| run.number).collect();
+        if !held.is_empty() {
+            board_facts.insert("held".into(), json!(held));
+        }
+        if let Some((spent, limit)) = load.headroom.figures() {
+            board_facts.insert(
+                "budget".into(),
+                json!({
+                    "spent": usd(spent),
+                    "limit": usd(limit),
+                    "exhausted": load.headroom.is_exhausted(),
+                }),
+            );
+        }
+
+        // One pass over the board rather than a rescan per card.
+        let mut children: std::collections::HashMap<&baybo_model::IssueId, Vec<&IssueRow>> =
+            std::collections::HashMap::new();
+        for issue in &board {
+            if let Some(parent) = issue.parent_issue_id.as_ref() {
+                children.entry(parent).or_default().push(issue);
+            }
+        }
+        let rows: Vec<Value> = issues
+            .iter()
+            .map(|issue| {
+                let mut row = render_issue(issue, &team);
+                let Value::Object(map) = &mut row else {
+                    return row;
+                };
+                if let Some(parent) = issue
+                    .parent_issue_id
+                    .as_ref()
+                    .and_then(|id| board.iter().find(|candidate| &candidate.id == id))
+                {
+                    map.insert("parent".into(), json!(parent.number));
+                    map.insert("stage".into(), json!(issue.stage));
+                }
+                if let Some(kids) = children.get(&issue.id) {
+                    let owned: Vec<IssueRow> = kids.iter().map(|k| (*k).clone()).collect();
+                    let (done, total) = crate::progress(&owned);
+                    map.insert(
+                        "sub_issues".into(),
+                        json!({
+                            "done": done,
+                            "total": total,
+                            "open_stages": crate::open_stages(&owned),
+                        }),
+                    );
+                }
+                row
+            })
+            .collect();
+
         Ok(ToolOutput::Json(json!({
-            "count": issues.len(),
-            "issues": issues.iter().map(|i| render_issue(i, &team)).collect::<Vec<_>>(),
+            "count": rows.len(),
+            "issues": rows,
             "team": roster,
+            "board": Value::Object(board_facts),
         })))
     }
 }

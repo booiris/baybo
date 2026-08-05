@@ -23,7 +23,7 @@ pub use comments::{CommentDelivery, comment_delivery};
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
-    LEAD_HANDLE, MAX_FEED_PAGE, MAX_ISSUE_TITLE_CHARS, MAX_ROLE_CHARS, MAX_TEAM_AGENTS,
+    BoardLoad, LEAD_HANDLE, MAX_FEED_PAGE, MAX_ISSUE_TITLE_CHARS, MAX_ROLE_CHARS, MAX_TEAM_AGENTS,
     NewIssueRequest, NewProject, NewTeamMember, ProjectManager, RunDispatch, no_dispatch,
     validate_workdir,
 };

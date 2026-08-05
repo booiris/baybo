@@ -686,3 +686,174 @@ mod approvals {
         assert_eq!(*asked.lock(), vec!["c9".to_owned()]);
     }
 }
+
+/// What the lead is told when it sits down to triage.
+///
+/// Every fact here is derived over the WHOLE board — the canonical triage
+/// call filters to unassigned cards, and a roster load derived from that
+/// set would always read as an idle team.
+#[tokio::test]
+async fn the_triage_read_says_who_is_free_and_what_is_stuck() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Triage Facts").await;
+    let ctx = f.ctx(&project, &lead);
+    f.call(
+        "ProjectAgentCreate",
+        &ctx,
+        json!({ "name": "Dev", "role": "Codes." }),
+    )
+    .await;
+
+    // #1 is being worked by @dev; #2 is unassigned and waiting.
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "in flight", "assignee": "@dev", "status": "in_progress" }),
+    )
+    .await;
+    f.call("IssueCreate", &ctx, json!({ "title": "waiting" }))
+        .await;
+
+    let listed = f
+        .call("IssueList", &ctx, json!({ "assignee": "unassigned" }))
+        .await;
+    assert_eq!(listed["count"], 1, "the filter still narrows the rows");
+
+    let team = listed["team"].as_array().expect("team");
+    let dev = team
+        .iter()
+        .find(|m| m["handle"] == "@dev")
+        .expect("dev is on the roster");
+    assert_eq!(
+        dev["working_on"].as_array().expect("working_on"),
+        &vec![json!(1)],
+        "load is derived from runs over the whole board, not from the filtered rows"
+    );
+    let lead_row = team
+        .iter()
+        .find(|m| m["handle"] == "@lead")
+        .expect("the lead is on the roster");
+    assert_eq!(lead_row["lead"], true);
+    assert_eq!(
+        lead_row["you"], true,
+        "the caller needs its own handle to assign work to itself"
+    );
+    assert!(lead_row.get("working_on").is_none(), "nothing in flight");
+}
+
+/// A held run is idle work, not a busy agent. Reading it the other way
+/// inverts the truth exactly when it matters: the team is free and the
+/// wallet is empty.
+#[tokio::test]
+async fn an_exhausted_board_reads_as_idle_and_says_why() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            name: "Skint".to_owned(),
+            description: String::new(),
+            workdir: None,
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+        })
+        .await
+        .expect("project");
+    let lead = f.manager.team(&project.id).await.expect("team")[0]
+        .id
+        .clone();
+    let ctx = f.ctx(&project.id, &lead);
+    f.call(
+        "IssueCreate",
+        &ctx,
+        json!({ "title": "held work", "assignee": "@lead", "status": "in_progress" }),
+    )
+    .await;
+
+    let listed = f.call("IssueList", &ctx, json!({})).await;
+    let lead_row = listed["team"]
+        .as_array()
+        .expect("team")
+        .iter()
+        .find(|m| m["handle"] == "@lead")
+        .expect("lead");
+    assert!(
+        lead_row.get("working_on").is_none(),
+        "a held run is not somebody working: {lead_row}"
+    );
+    assert_eq!(
+        listed["board"]["held"].as_array().expect("held"),
+        &vec![json!(1)]
+    );
+    assert_eq!(listed["board"]["budget"]["exhausted"], true);
+    assert_eq!(listed["board"]["budget"]["limit"], "$0.00");
+}
+
+/// A board with no ceiling reports no budget block at all — no spend query
+/// ran, and an absent key is honest where `$0.00` would be a lie.
+#[tokio::test]
+async fn a_board_with_no_ceiling_reports_no_budget() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Unlimited").await;
+    let ctx = f.ctx(&project, &lead);
+    let listed = f.call("IssueList", &ctx, json!({})).await;
+    assert!(
+        listed["board"].get("budget").is_none(),
+        "{}",
+        listed["board"]
+    );
+    assert!(listed["board"].get("held").is_none());
+}
+
+/// Parents and steps, derived over the whole board so a filtered call
+/// cannot make a parent read `0/0`.
+#[tokio::test]
+async fn a_parent_row_carries_its_progress_and_open_stages() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Stages").await;
+    let ctx = f.ctx(&project, &lead);
+    f.call("IssueCreate", &ctx, json!({ "title": "the whole thing" }))
+        .await;
+    for (title, stage) in [("design", 0), ("build", 1)] {
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": title, "parent": 1, "stage": stage }),
+        )
+        .await;
+    }
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({ "number": 2, "status": "done" }),
+    )
+    .await;
+
+    // Filtered to the parent alone: its ring still counts its children.
+    let listed = f
+        .call("IssueList", &ctx, json!({ "status": "backlog" }))
+        .await;
+    let parent = listed["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .find(|i| i["number"] == 1)
+        .expect("the parent");
+    assert_eq!(parent["sub_issues"]["done"], 1);
+    assert_eq!(parent["sub_issues"]["total"], 2);
+    assert_eq!(
+        parent["sub_issues"]["open_stages"]
+            .as_array()
+            .expect("stages"),
+        &vec![json!(1)],
+        "stage 0 finished, so stage 1 is what is left"
+    );
+    assert!(parent.get("parent").is_none(), "a top-level card has none");
+
+    let child = listed["issues"]
+        .as_array()
+        .expect("issues")
+        .iter()
+        .find(|i| i["number"] == 3)
+        .expect("the step still in backlog");
+    assert_eq!(child["parent"], 1);
+    assert_eq!(child["stage"], 1);
+}

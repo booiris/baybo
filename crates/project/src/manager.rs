@@ -65,6 +65,17 @@ pub const MAX_FEED_PAGE: usize = 100;
 /// silent `@qa-47`.
 const MAX_HANDLE_ATTEMPTS: usize = 9;
 
+/// A board's capacity, as [`ProjectManager::board_load`] reports it.
+#[derive(Debug, Clone)]
+pub struct BoardLoad {
+    pub headroom: Headroom,
+    /// Runs actually executing or queued to. What "who is free" means.
+    pub working: Vec<IssueRunRow>,
+    /// Runs recorded and deliberately not started, because the board is
+    /// over budget. Idle work, not busy agents.
+    pub held: Vec<IssueRunRow>,
+}
+
 /// What a caller supplies to put somebody new on a team.
 #[derive(Debug, Clone)]
 pub struct NewTeamMember {
@@ -1130,6 +1141,34 @@ impl ProjectManager {
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)
+    }
+
+    /// One board's capacity right now: who is actually executing, what is
+    /// parked on budget, and how much is left to spend.
+    ///
+    /// One typed read rather than three public accessors, because the rule
+    /// that makes it correct — **a held run is not a busy agent** — has to
+    /// live in one place. On an exhausted board the opposite reading
+    /// inverts the truth exactly when it matters: the team is idle and the
+    /// wallet is empty, but a caller counting held runs as work sees a
+    /// saturated roster and stops promoting, so the hold is never noticed.
+    ///
+    /// `headroom` fails open, so a board that cannot be measured reports
+    /// `Unlimited` — which is what the enqueue gate acts on too, so a
+    /// reader is told the same story the gate believes.
+    pub async fn board_load(&self, project: &ProjectId) -> Result<BoardLoad> {
+        self.get_project(project).await?;
+        let (held, working) = self
+            .store
+            .active_runs(project)
+            .await?
+            .into_iter()
+            .partition(|run| run.status == RunStatus::Held);
+        Ok(BoardLoad {
+            headroom: self.headroom(project).await,
+            working,
+            held,
+        })
     }
 
     /// What is stuck on the operator, per board.

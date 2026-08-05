@@ -6,7 +6,7 @@ use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, Too
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{exec_err, handle_of, project_err, render_issue, scope};
+use super::{exec_err, handle_of, project_err, render_issue, scope, usd};
 use crate::ProjectManager;
 
 pub const ISSUE_GET_TOOL_NAME: &str = "IssueGet";
@@ -181,12 +181,4 @@ fn narrate(body: &IssueEventBody) -> String {
             usd(*limit_micros)
         ),
     }
-}
-
-/// Micro-USD as the dollars a reader thinks in.
-fn usd(micros: i64) -> String {
-    format!(
-        "${:.2}",
-        micros as f64 / baybo_model::MicroUsd::PER_USD as f64
-    )
 }

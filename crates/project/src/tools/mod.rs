@@ -184,6 +184,18 @@ fn render_issue(issue: &IssueRow, team: &[baybo_store::AgentProfileRow]) -> Valu
     Value::Object(obj)
 }
 
+/// Micro-USD as the dollars a reader thinks in.
+///
+/// Presentation only — the `i64` stays the value everywhere else, because
+/// money never rides a float here. One helper rather than a `format!` per
+/// site, so two readers cannot round differently.
+pub(super) fn usd(micros: i64) -> String {
+    format!(
+        "${:.2}",
+        micros as f64 / baybo_model::MicroUsd::PER_USD as f64
+    )
+}
+
 fn exec_err(e: impl std::fmt::Display) -> ToolError {
     ToolError::Execution(e.to_string())
 }
