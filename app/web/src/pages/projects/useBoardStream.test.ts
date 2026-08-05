@@ -28,6 +28,15 @@ describe('wantsRefresh', () => {
     expect(wantsRefresh(changed({ scope: 'project' }), 'p1', null)).toBe(true);
   });
 
+  it('does not drag the board through a refetch because somebody commented', () => {
+    // The board shows no timeline, so a comment changes nothing on it.
+    // Without this the Timeline scope buys nothing over Board.
+    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p1', null)).toBe(false);
+    // …but the card that was commented on does want it.
+    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 7 }), 'p1', 7)).toBe(true);
+    expect(wantsRefresh(changed({ scope: 'timeline', issue_number: 8 }), 'p1', 7)).toBe(false);
+  });
+
   it('refreshes a card only for its own number — but never ignores a board-wide change', () => {
     expect(wantsRefresh(changed({ scope: 'run', issue_number: 7 }), 'p1', 7)).toBe(true);
     expect(wantsRefresh(changed({ scope: 'run', issue_number: 8 }), 'p1', 7)).toBe(false);

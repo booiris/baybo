@@ -17,8 +17,8 @@ use utoipa_axum::routes;
 use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
-    ProjectRow, ProjectUpdate, RunStatus, RunTrigger,
+    IssueActor, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, ProjectRow, ProjectUpdate, RunStatus, RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -274,11 +274,87 @@ impl From<RunTrigger> for RunTriggerDto {
     }
 }
 
-/// One entry on an issue's timeline.
+/// What one timeline entry says.
 ///
-/// The body is flattened, so an entry is one object with a `kind` field
-/// rather than a wrapper around a payload — the client switches on `kind`
-/// to pick a renderer and reads the rest off the same object.
+/// A mirror of the store's `IssueEventBody` rather than the type itself,
+/// like every other enum on this surface. Tagged on `kind`, so the client
+/// gets a discriminated union it can exhaustively switch on — the whole
+/// reason this is not a free-form payload.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssueEventBodyDto {
+    Comment {
+        text: String,
+    },
+    Opened,
+    Moved {
+        from: IssueStatusDto,
+        to: IssueStatusDto,
+    },
+    Assigned {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
+    RunStarted {
+        attempt: i64,
+        trigger: RunTriggerDto,
+    },
+    RunSettled {
+        attempt: i64,
+        status: RunStatusDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Blocked {
+        reason: String,
+    },
+    Unblocked,
+    Cancelled,
+}
+
+impl From<IssueEventBody> for IssueEventBodyDto {
+    fn from(body: IssueEventBody) -> Self {
+        match body {
+            IssueEventBody::Comment { text } => Self::Comment { text },
+            IssueEventBody::Opened => Self::Opened,
+            IssueEventBody::Moved { from, to } => Self::Moved {
+                from: from.into(),
+                to: to.into(),
+            },
+            IssueEventBody::Assigned { from, to } => Self::Assigned {
+                from: from.map(|id| id.to_string()),
+                to: to.map(|id| id.to_string()),
+            },
+            // The run id is deliberately dropped: the execution log in the
+            // rail addresses a run by its attempt within this issue, and a
+            // second identifier for the same thing is one the UI would have
+            // to keep consistent for no reader's benefit.
+            IssueEventBody::RunStarted {
+                attempt, trigger, ..
+            } => Self::RunStarted {
+                attempt,
+                trigger: trigger.into(),
+            },
+            IssueEventBody::RunSettled {
+                attempt,
+                status,
+                error,
+                ..
+            } => Self::RunSettled {
+                attempt,
+                status: status.into(),
+                error,
+            },
+            IssueEventBody::Blocked { reason } => Self::Blocked { reason },
+            IssueEventBody::Unblocked => Self::Unblocked,
+            IssueEventBody::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// One entry on an issue's timeline.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssueEventDto {
     pub id: String,
@@ -287,9 +363,7 @@ pub struct IssueEventDto {
     /// [`Self::actor_is_agent`] rather than from parsing this.
     pub actor: String,
     pub actor_is_agent: bool,
-    /// The typed body: `kind` plus that kind's own fields.
-    #[serde(flatten)]
-    pub body: serde_json::Value,
+    pub body: IssueEventBodyDto,
     pub created_at_ms: i64,
 }
 
@@ -304,10 +378,7 @@ impl From<IssueEventRow> for IssueEventDto {
             number: row.number,
             actor,
             actor_is_agent,
-            // Infallible in practice: the body was deserialized from this
-            // same representation on the way out of the store. `null` keeps
-            // the surrounding entry renderable if that ever stops holding.
-            body: serde_json::to_value(&row.body).unwrap_or(serde_json::Value::Null),
+            body: row.body.into(),
             created_at_ms: row.created_at.timestamp_millis(),
         }
     }

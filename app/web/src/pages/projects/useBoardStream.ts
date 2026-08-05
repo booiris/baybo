@@ -11,6 +11,11 @@ import { useAuth } from '../../api/auth';
  * detail page additionally ignores anything about a different card — but
  * never a frame with no issue number, since that is a board-wide change
  * (an archive, a reorder) that could still move what it is showing.
+ *
+ * A board also ignores `timeline`: somebody saying something on one card
+ * moves nothing on the board, and refetching five columns to learn it
+ * would be the most expensive answer to the least interesting question.
+ * That is the whole reason the scope exists apart from `board`.
  */
 export function wantsRefresh(
   frame: Frame,
@@ -19,7 +24,7 @@ export function wantsRefresh(
 ): boolean {
   if (frame.kind !== 'project_changed') return false;
   if (frame.project_id !== projectId) return false;
-  if (issueNumber === null) return true;
+  if (issueNumber === null) return frame.scope !== 'timeline';
   return frame.issue_number === undefined || frame.issue_number === issueNumber;
 }
 

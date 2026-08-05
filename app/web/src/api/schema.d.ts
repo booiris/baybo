@@ -2248,19 +2248,63 @@ export interface components {
             updated_at_ms: number;
         };
         /**
-         * @description One entry on an issue's timeline.
+         * @description What one timeline entry says.
          *
-         *     The body is flattened, so an entry is one object with a `kind` field
-         *     rather than a wrapper around a payload — the client switches on `kind`
-         *     to pick a renderer and reads the rest off the same object.
+         *     A mirror of the store's `IssueEventBody` rather than the type itself,
+         *     like every other enum on this surface. Tagged on `kind`, so the client
+         *     gets a discriminated union it can exhaustively switch on — the whole
+         *     reason this is not a free-form payload.
          */
-        IssueEventDto: unknown & {
+        IssueEventBodyDto: {
+            /** @enum {string} */
+            kind: "comment";
+            text: string;
+        } | {
+            /** @enum {string} */
+            kind: "opened";
+        } | {
+            from: components["schemas"]["IssueStatusDto"];
+            /** @enum {string} */
+            kind: "moved";
+            to: components["schemas"]["IssueStatusDto"];
+        } | {
+            from?: string | null;
+            /** @enum {string} */
+            kind: "assigned";
+            to?: string | null;
+        } | {
+            /** Format: int64 */
+            attempt: number;
+            /** @enum {string} */
+            kind: "run_started";
+            trigger: components["schemas"]["RunTriggerDto"];
+        } | {
+            /** Format: int64 */
+            attempt: number;
+            error?: string | null;
+            /** @enum {string} */
+            kind: "run_settled";
+            status: components["schemas"]["RunStatusDto"];
+        } | {
+            /** @enum {string} */
+            kind: "blocked";
+            reason: string;
+        } | {
+            /** @enum {string} */
+            kind: "unblocked";
+        } | {
+            /** @enum {string} */
+            kind: "cancelled";
+        };
+        /** @description One entry on an issue's timeline. */
+        IssueEventDto: {
             /**
              * @description `"user"`, or the agent's id. Which of the two it is comes from
              *     [`Self::actor_is_agent`] rather than from parsing this.
              */
             actor: string;
             actor_is_agent: boolean;
+            body: components["schemas"]["IssueEventBodyDto"];
             /** Format: int64 */
             created_at_ms: number;
             id: string;
@@ -6741,19 +6785,20 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        items: (unknown & {
+                        items: {
                             /**
                              * @description `"user"`, or the agent's id. Which of the two it is comes from
                              *     [`Self::actor_is_agent`] rather than from parsing this.
                              */
                             actor: string;
                             actor_is_agent: boolean;
+                            body: components["schemas"]["IssueEventBodyDto"];
                             /** Format: int64 */
                             created_at_ms: number;
                             id: string;
                             /** Format: int64 */
                             number: number;
-                        })[];
+                        }[];
                         next_cursor?: string | null;
                     };
                 };

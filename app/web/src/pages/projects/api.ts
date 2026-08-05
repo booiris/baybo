@@ -1,6 +1,7 @@
 import type { AdminClient } from '../../api/client';
 import type { components } from '../../api/schema';
 import type { Agent, Issue, IssueRun, IssueStatus, Project } from './boardModel';
+import type { IssueEvent } from './timelineModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
@@ -251,6 +252,45 @@ export async function retryRun(
     const { data, error, response } = await client.POST(
       '/v1/projects/{project_id}/issues/{number}/runs/retry',
       { params: { path: { project_id: projectId, number } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function fetchTimeline(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+): Promise<Outcome<IssueEvent[]>> {
+  try {
+    const { data, error, response } = await client.GET(
+      '/v1/projects/{project_id}/issues/{number}/events',
+      { params: { path: { project_id: projectId, number } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function postComment(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+  text: string,
+): Promise<Outcome<IssueEvent>> {
+  try {
+    const { data, error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/comments',
+      { params: { path: { project_id: projectId, number } }, body: { text } },
     );
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);

@@ -4803,42 +4803,39 @@
                     "items": {
                       "type": "array",
                       "items": {
-                        "allOf": [
-                          {
-                            "description": "The typed body: `kind` plus that kind's own fields."
-                          },
-                          {
-                            "type": "object",
-                            "required": [
-                              "id",
-                              "number",
-                              "actor",
-                              "actor_is_agent",
-                              "created_at_ms"
-                            ],
-                            "properties": {
-                              "actor": {
-                                "type": "string",
-                                "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
-                              },
-                              "actor_is_agent": {
-                                "type": "boolean"
-                              },
-                              "created_at_ms": {
-                                "type": "integer",
-                                "format": "int64"
-                              },
-                              "id": {
-                                "type": "string"
-                              },
-                              "number": {
-                                "type": "integer",
-                                "format": "int64"
-                              }
-                            }
-                          }
+                        "type": "object",
+                        "description": "One entry on an issue's timeline.",
+                        "required": [
+                          "id",
+                          "number",
+                          "actor",
+                          "actor_is_agent",
+                          "body",
+                          "created_at_ms"
                         ],
-                        "description": "One entry on an issue's timeline.\n\nThe body is flattened, so an entry is one object with a `kind` field\nrather than a wrapper around a payload — the client switches on `kind`\nto pick a renderer and reads the rest off the same object."
+                        "properties": {
+                          "actor": {
+                            "type": "string",
+                            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+                          },
+                          "actor_is_agent": {
+                            "type": "boolean"
+                          },
+                          "body": {
+                            "$ref": "#/components/schemas/IssueEventBodyDto"
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
                       }
                     },
                     "next_cursor": {
@@ -7840,43 +7837,223 @@
           }
         }
       },
-      "IssueEventDto": {
-        "allOf": [
+      "IssueEventBodyDto": {
+        "oneOf": [
           {
-            "description": "The typed body: `kind` plus that kind's own fields."
+            "type": "object",
+            "required": [
+              "text",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "comment"
+                ]
+              },
+              "text": {
+                "type": "string"
+              }
+            }
           },
           {
             "type": "object",
             "required": [
-              "id",
-              "number",
-              "actor",
-              "actor_is_agent",
-              "created_at_ms"
+              "kind"
             ],
             "properties": {
-              "actor": {
+              "kind": {
                 "type": "string",
-                "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+                "enum": [
+                  "opened"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "to",
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/components/schemas/IssueStatusDto"
               },
-              "actor_is_agent": {
-                "type": "boolean"
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "moved"
+                ]
               },
-              "created_at_ms": {
+              "to": {
+                "$ref": "#/components/schemas/IssueStatusDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "assigned"
+                ]
+              },
+              "to": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "attempt",
+              "trigger",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
                 "type": "integer",
                 "format": "int64"
               },
-              "id": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_started"
+                ]
+              },
+              "trigger": {
+                "$ref": "#/components/schemas/RunTriggerDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "attempt",
+              "status",
+              "kind"
+            ],
+            "properties": {
+              "attempt": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "run_settled"
+                ]
+              },
+              "status": {
+                "$ref": "#/components/schemas/RunStatusDto"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "blocked"
+                ]
+              },
+              "reason": {
                 "type": "string"
-              },
-              "number": {
-                "type": "integer",
-                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unblocked"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cancelled"
+                ]
               }
             }
           }
         ],
-        "description": "One entry on an issue's timeline.\n\nThe body is flattened, so an entry is one object with a `kind` field\nrather than a wrapper around a payload — the client switches on `kind`\nto pick a renderer and reads the rest off the same object."
+        "description": "What one timeline entry says.\n\nA mirror of the store's `IssueEventBody` rather than the type itself,\nlike every other enum on this surface. Tagged on `kind`, so the client\ngets a discriminated union it can exhaustively switch on — the whole\nreason this is not a free-form payload."
+      },
+      "IssueEventDto": {
+        "type": "object",
+        "description": "One entry on an issue's timeline.",
+        "required": [
+          "id",
+          "number",
+          "actor",
+          "actor_is_agent",
+          "body",
+          "created_at_ms"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+          },
+          "actor_is_agent": {
+            "type": "boolean"
+          },
+          "body": {
+            "$ref": "#/components/schemas/IssueEventBodyDto"
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
       },
       "IssuePriorityDto": {
         "type": "string",

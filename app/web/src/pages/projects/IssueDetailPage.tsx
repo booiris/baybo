@@ -10,8 +10,10 @@ import {
   fetchIssue,
   fetchIssueRuns,
   fetchIssues,
+  fetchTimeline,
   moveIssue,
   patchIssue,
+  postComment,
   retryRun,
 } from './api';
 import {
@@ -26,6 +28,8 @@ import {
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
+import { Timeline } from './Timeline';
+import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
 
 const PRIORITY_LABEL: Record<IssuePriority, string> = {
@@ -111,6 +115,7 @@ export function IssueDetailPage() {
   const [issue, setIssue] = useState<Issue | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [runs, setRuns] = useState<IssueRun[]>([]);
+  const [events, setEvents] = useState<IssueEvent[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -124,14 +129,16 @@ export function IssueDetailPage() {
   useEffect(() => {
     let canceled = false;
     async function load() {
-      const [outcome, agentsOutcome, runsOutcome] = await Promise.all([
+      const [outcome, agentsOutcome, runsOutcome, timelineOutcome] = await Promise.all([
         fetchIssue(client, projectId, number),
         fetchAgents(client),
         fetchIssueRuns(client, projectId, number),
+        fetchTimeline(client, projectId, number),
       ]);
       if (canceled) return;
       if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
       if (runsOutcome.kind === 'ok') setRuns(runsOutcome.value);
+      if (timelineOutcome.kind === 'ok') setEvents(timelineOutcome.value);
       if (outcome.kind === 'unauthorized') {
         logout();
         return;
@@ -256,6 +263,27 @@ export function IssueDetailPage() {
     setRefreshKey((key) => key + 1);
   }, [client, logout, number, projectId]);
 
+  const comment = useCallback(
+    async (text: string) => {
+      setSaving(true);
+      const outcome = await postComment(client, projectId, number, text);
+      setSaving(false);
+      if (outcome.kind === 'unauthorized') {
+        logout();
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        setError(outcome.message);
+        return;
+      }
+      setError(null);
+      // Append rather than refetch: the entry is already in hand, and the
+      // broadcast this write triggers will reconcile the rest anyway.
+      setEvents((current) => [...current, outcome.value]);
+    },
+    [client, logout, number, projectId],
+  );
+
   const runAgain = useCallback(async () => {
     setSaving(true);
     const outcome = await retryRun(client, projectId, number);
@@ -363,6 +391,15 @@ export function IssueDetailPage() {
               </button>
             ) : null}
           </div>
+
+          <Timeline
+            events={events}
+            issue={issue}
+            busy={saving}
+            onComment={(text) => {
+              void comment(text);
+            }}
+          />
         </main>
 
         <aside className="w-[300px] shrink-0 border-l-2 border-black bg-canvas p-4 flex flex-col gap-4 overflow-y-auto">
