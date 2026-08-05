@@ -339,6 +339,46 @@ async fn a_card_can_open_straight_into_a_column() {
     assert_eq!(created["position"], 0);
 }
 
+#[tokio::test]
+async fn in_progress_is_refused_without_an_assignee() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "staffing").await;
+    open_issue(&router, &p, "unclaimed").await;
+
+    // The board must not claim work is under way that nobody is on.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/move"),
+        json!({ "status": "in_progress", "ordered_numbers": [1] }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "starts unclaimed", "status": "in_progress" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Every other column takes unassigned work.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/move"),
+        json!({ "status": "review", "ordered_numbers": [1] }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // An agent that does not exist is refused before it can be stored.
+    patch(
+        &router,
+        &format!("/v1/projects/{p}/issues/1"),
+        json!({ "assignee": "no-such-agent" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
 async fn request(

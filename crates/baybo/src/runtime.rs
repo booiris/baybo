@@ -583,6 +583,7 @@ pub async fn build_managers(
     // this same manager.
     let project_manager = Arc::new(baybo_project::ProjectManager::new(
         stores.project.clone(),
+        stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
     ));
 

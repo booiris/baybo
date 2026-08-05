@@ -1,7 +1,7 @@
 //! sqlite implementation of [`ProjectStore`].
 
 use async_trait::async_trait;
-use baybo_model::{IssueId, ProjectId};
+use baybo_model::{AgentProfileId, IssueId, ProjectId};
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
@@ -24,7 +24,7 @@ impl SqliteProjectStore {
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
-     position, blocked_reason, cancelled_at, created_at, updated_at";
+     assignee, position, blocked_reason, cancelled_at, created_at, updated_at";
 
 /// Raw project tuple, in `PROJECT_COLUMNS` order. Timestamps are µs.
 type RawProject = (String, String, String, String, Option<i64>, i64, i64);
@@ -38,6 +38,7 @@ type RawIssue = (
     String,
     String,
     String,
+    Option<String>,
     i64,
     Option<String>,
     Option<i64>,
@@ -71,6 +72,7 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -110,6 +112,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         description,
         status,
         priority,
+        assignee,
         position,
         blocked_reason,
         cancelled_at,
@@ -127,6 +130,12 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
             .ok_or_else(|| StorageError::Storage(format!("issues.status unknown: {status}")))?,
         priority: IssuePriority::parse(&priority)
             .ok_or_else(|| StorageError::Storage(format!("issues.priority unknown: {priority}")))?,
+        // The stored assignee re-runs its own grammar on the way out, the
+        // same reason the project id does: an agent id names a directory.
+        assignee: assignee
+            .map(AgentProfileId::parse)
+            .transpose()
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
         position,
         blocked_reason,
         cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
@@ -275,6 +284,7 @@ impl ProjectStore for SqliteProjectStore {
         let description = new.description.clone();
         let status = new.status.as_str();
         let priority = new.priority.as_str();
+        let assignee = new.assignee.as_ref().map(|a| a.as_str().to_string());
         let created_at = super::time::to_us(new.created_at);
         let raw = self
             .pool
@@ -298,8 +308,9 @@ impl ProjectStore for SqliteProjectStore {
                 )?;
                 tx.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, \
-                     priority, position, blocked_reason, cancelled_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
+                     priority, assignee, position, blocked_reason, cancelled_at, created_at, \
+                     updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?10)",
                     rusqlite::params![
                         id,
                         project,
@@ -308,6 +319,7 @@ impl ProjectStore for SqliteProjectStore {
                         description,
                         status,
                         priority,
+                        assignee,
                         position,
                         created_at
                     ],
@@ -350,6 +362,10 @@ impl ProjectStore for SqliteProjectStore {
                     Some(value) => (true, value.clone()),
                     None => (false, None),
                 };
+                let (set_assignee, assignee) = match &update.assignee {
+                    Some(value) => (true, value.as_ref().map(|a| a.as_str().to_string())),
+                    None => (false, None),
+                };
                 let (set_cancelled, cancelled) = match update.cancelled {
                     Some(true) => (true, Some(now)),
                     Some(false) => (true, None),
@@ -360,9 +376,10 @@ impl ProjectStore for SqliteProjectStore {
                        title          = COALESCE(?3, title), \
                        description    = COALESCE(?4, description), \
                        priority       = COALESCE(?5, priority), \
-                       blocked_reason = CASE WHEN ?6 THEN ?7 ELSE blocked_reason END, \
-                       cancelled_at   = CASE WHEN ?8 THEN ?9 ELSE cancelled_at END, \
-                       updated_at     = ?10 \
+                       assignee       = CASE WHEN ?6 THEN ?7 ELSE assignee END, \
+                       blocked_reason = CASE WHEN ?8 THEN ?9 ELSE blocked_reason END, \
+                       cancelled_at   = CASE WHEN ?10 THEN ?11 ELSE cancelled_at END, \
+                       updated_at     = ?12 \
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![
                         project,
@@ -370,6 +387,8 @@ impl ProjectStore for SqliteProjectStore {
                         title,
                         description,
                         priority,
+                        set_assignee,
+                        assignee,
                         set_blocked,
                         blocked,
                         set_cancelled,
@@ -488,6 +507,7 @@ mod tests {
             description: String::new(),
             status,
             priority: IssuePriority::None,
+            assignee: None,
             created_at: chrono::Utc::now(),
         }
     }

@@ -4,8 +4,10 @@ import {
   type Board,
   type Issue,
   type Project,
+  assignableAgents,
   cardDragId,
   columnDropId,
+  dropRejection,
   emptyBoard,
   groupByStatus,
   liveCount,
@@ -151,6 +153,32 @@ describe('orderedNumbers + placementChanged', () => {
 
     const same = moveCard(start, { status: 'backlog', index: 0, issue: issue(1) });
     expect(placementChanged(start, same, 1)).toBe(false);
+  });
+});
+
+describe('dropRejection', () => {
+  it('refuses In Progress for work nobody is on', () => {
+    const unclaimed = issue(1);
+    expect(dropRejection(unclaimed, 'in_progress')).toContain('needs an assignee');
+    // Every other column takes unassigned work.
+    for (const status of ['backlog', 'todo', 'review', 'done'] as const) {
+      expect(dropRejection(unclaimed, status)).toBeNull();
+    }
+    // Assigned, it starts.
+    expect(dropRejection(issue(1, { assignee: 'dev-1' }), 'in_progress')).toBeNull();
+  });
+});
+
+describe('assignableAgents', () => {
+  it('keeps only agents that can host an issue session', () => {
+    // An external profile has no top-level session leg, so a card assigned
+    // to one could never start — it must not be offerable.
+    const agents = [
+      { id: 'a', name: 'A', framework: 'baybo' },
+      { id: 'b', name: 'B', framework: 'codex' },
+      { id: 'c', name: 'C', framework: 'claude' },
+    ] as Parameters<typeof assignableAgents>[0];
+    expect(assignableAgents(agents).map((a) => a.id)).toEqual(['a']);
   });
 });
 

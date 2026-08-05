@@ -4359,6 +4359,13 @@
                           "updated_at_ms"
                         ],
                         "properties": {
+                          "assignee": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The agent on it, if any. In Progress always has one."
+                          },
                           "blocked_reason": {
                             "type": [
                               "string",
@@ -6698,6 +6705,13 @@
           "title"
         ],
         "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent to put on it. Required when opening straight into\nIn Progress."
+          },
           "description": {
             "type": "string"
           },
@@ -7159,6 +7173,13 @@
           "updated_at_ms"
         ],
         "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent on it, if any. In Progress always has one."
+          },
           "blocked_reason": {
             "type": [
               "string",
@@ -8548,6 +8569,13 @@
         "type": "object",
         "description": "Sparse patch: a field the body leaves out is left alone.\n`blocked_reason` is doubly optional — an explicit `null` clears the\nblock, an absent key leaves it.",
         "properties": {
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An explicit `null` unassigns; an absent key leaves the assignee."
+          },
           "blocked_reason": {
             "type": [
               "string",

@@ -14,7 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use baybo_model::ProjectId;
+use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
     IssuePriority, IssueRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
@@ -55,6 +55,14 @@ fn project_err(e: ProjectError) -> GatewayError {
 /// filesystem depends on rather than trusting the URL.
 fn parse_project_id(raw: &str) -> Result<ProjectId> {
     ProjectId::parse(raw).map_err(|e| GatewayError::BadRequest(e.to_string()))
+}
+
+/// Parse an assignee, running the agent-id grammar rather than trusting
+/// the body. The manager still checks the agent exists and can run.
+fn parse_assignee(raw: Option<String>) -> Result<Option<AgentProfileId>> {
+    raw.map(AgentProfileId::parse)
+        .transpose()
+        .map_err(|e| GatewayError::BadRequest(e.to_string()))
 }
 
 /// Deserialize a clearable optional field.
@@ -181,6 +189,9 @@ pub struct IssueDto {
     pub description: String,
     pub status: IssueStatusDto,
     pub priority: IssuePriorityDto,
+    /// The agent on it, if any. In Progress always has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
     /// Rank within the column, dense and ascending.
     pub position: i64,
     /// Why work stopped. A badge on the card — blocked work stays in
@@ -203,6 +214,7 @@ impl From<IssueRow> for IssueDto {
             description: row.description,
             status: row.status.into(),
             priority: row.priority.into(),
+            assignee: row.assignee.map(|a| a.to_string()),
             position: row.position,
             blocked_reason: row.blocked_reason,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
@@ -252,6 +264,10 @@ pub struct CreateIssueRequest {
     pub status: Option<IssueStatusDto>,
     #[serde(default)]
     pub priority: Option<IssuePriorityDto>,
+    /// The agent to put on it. Required when opening straight into
+    /// In Progress.
+    #[serde(default)]
+    pub assignee: Option<String>,
 }
 
 /// Sparse patch: a field the body leaves out is left alone.
@@ -265,6 +281,9 @@ pub struct UpdateIssueRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub priority: Option<IssuePriorityDto>,
+    /// An explicit `null` unassigns; an absent key leaves the assignee.
+    #[serde(default, deserialize_with = "double_option")]
+    pub assignee: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub blocked_reason: Option<Option<String>>,
     #[serde(default)]
@@ -477,6 +496,7 @@ async fn create_issue(
                 description: req.description,
                 status: req.status.unwrap_or(IssueStatusDto::Backlog).into(),
                 priority: req.priority.unwrap_or_default().into(),
+                assignee: parse_assignee(req.assignee)?,
             },
         )
         .await
@@ -543,6 +563,7 @@ async fn update_issue(
                 title: req.title,
                 description: req.description,
                 priority: req.priority.map(IssuePriority::from),
+                assignee: req.assignee.map(parse_assignee).transpose()?,
                 blocked_reason: req.blocked_reason,
                 cancelled: req.cancelled,
             },

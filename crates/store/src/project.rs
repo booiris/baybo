@@ -11,7 +11,7 @@
 //! the session-data-is-core rule in `CLAUDE.md` covers them too.
 
 use async_trait::async_trait;
-use baybo_model::{IssueId, ProjectId};
+use baybo_model::{AgentProfileId, IssueId, ProjectId};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -134,6 +134,10 @@ pub struct IssueRow {
     pub description: String,
     pub status: IssueStatus,
     pub priority: IssuePriority,
+    /// Who is on it. `None` is unclaimed work — which is also why an
+    /// unassigned issue cannot enter In Progress: a card in flight that
+    /// nobody is on is a lie the board would keep telling.
+    pub assignee: Option<AgentProfileId>,
     /// Manual order within `status`, ascending and dense: a move renumbers
     /// the whole target column in one transaction (the `reorder` shape),
     /// so positions never drift and never collide.
@@ -156,6 +160,8 @@ pub struct IssueUpdate {
     pub title: Option<String>,
     pub description: Option<String>,
     pub priority: Option<IssuePriority>,
+    /// `Some(None)` unassigns; `None` leaves the assignee alone.
+    pub assignee: Option<Option<AgentProfileId>>,
     pub blocked_reason: Option<Option<String>>,
     pub cancelled: Option<bool>,
 }
@@ -167,6 +173,7 @@ impl IssueUpdate {
         self.title.is_none()
             && self.description.is_none()
             && self.priority.is_none()
+            && self.assignee.is_none()
             && self.blocked_reason.is_none()
             && self.cancelled.is_none()
     }
@@ -181,6 +188,7 @@ pub struct NewIssue {
     pub description: String,
     pub status: IssueStatus,
     pub priority: IssuePriority,
+    pub assignee: Option<AgentProfileId>,
     pub created_at: DateTime<Utc>,
 }
 

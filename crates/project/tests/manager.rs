@@ -4,14 +4,36 @@
 
 use std::sync::Arc;
 
+use baybo_model::{AgentFramework, AgentProfileId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{IssuePriority, IssueStatus, IssueUpdate, ProjectUpdate};
 use baybo_workspace::WorkspacePaths;
 
 struct Fixture {
     manager: ProjectManager,
+    agents: Arc<dyn baybo_store::AgentProfileStore>,
     paths: WorkspacePaths,
     _workspace: tempfile::TempDir,
+}
+
+/// Seed an agent that can actually take work, and one that cannot.
+async fn seed_agent(f: &Fixture, id: &str, framework: AgentFramework) -> AgentProfileId {
+    let id = AgentProfileId::parse(id).expect("agent id");
+    let now = chrono::Utc::now();
+    f.agents
+        .create(&baybo_store::AgentProfileRow {
+            id: id.clone(),
+            description: String::new(),
+            avatar_blob_id: None,
+            framework,
+            llm: None,
+            builtin: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed agent");
+    id
 }
 
 async fn fixture() -> Fixture {
@@ -24,7 +46,12 @@ async fn fixture() -> Fixture {
         .await
         .expect("store");
     Fixture {
-        manager: ProjectManager::new(Arc::clone(&store.project), paths.clone()),
+        manager: ProjectManager::new(
+            Arc::clone(&store.project),
+            Arc::clone(&store.agent_profile),
+            paths.clone(),
+        ),
+        agents: Arc::clone(&store.agent_profile),
         paths,
         _workspace: workspace,
     }
@@ -44,6 +71,7 @@ fn new_issue(title: &str) -> NewIssueRequest {
         description: String::new(),
         status: IssueStatus::Backlog,
         priority: IssuePriority::None,
+        assignee: None,
     }
 }
 
@@ -371,4 +399,108 @@ async fn a_move_must_name_the_issue_it_moves() {
         .expect("move");
     assert_eq!(moved.status, IssueStatus::Todo);
     assert_eq!(moved.position, 0);
+}
+
+#[tokio::test]
+async fn in_progress_needs_somebody_on_it() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(&p.id, new_issue("unclaimed"))
+        .await
+        .expect("issue");
+
+    // The board would otherwise claim work is under way that nobody is doing.
+    let refused = f
+        .manager
+        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .await
+        .expect_err("an unassigned card cannot start");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    // Every other column is free to be unassigned.
+    f.manager
+        .move_issue(&p.id, 1, IssueStatus::Todo, &[1])
+        .await
+        .expect("todo takes unassigned work");
+
+    // Assigned, it moves.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueUpdate {
+                assignee: Some(Some(dev.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("assign");
+    let moved = f
+        .manager
+        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .await
+        .expect("assigned work starts");
+    assert_eq!(moved.assignee.as_ref(), Some(&dev));
+
+    // …and cannot be abandoned mid-flight.
+    let refused = f
+        .manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueUpdate {
+                assignee: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unassigning in-flight work recreates the zombie");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_assignee_must_exist_and_must_be_able_to_run() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let external = seed_agent(&f, "codex-1", AgentFramework::Codex).await;
+
+    let ghost = AgentProfileId::parse("nobody").expect("id");
+    let refused = f
+        .manager
+        .create_issue(
+            &p.id,
+            NewIssueRequest {
+                assignee: Some(ghost),
+                ..new_issue("to a ghost")
+            },
+        )
+        .await
+        .expect_err("an agent that does not exist cannot be assigned");
+    assert!(matches!(refused, ProjectError::Invalid { .. }));
+
+    // An external profile has no top-level session leg, so a card assigned
+    // to one could never start. Refused at the door rather than at run time.
+    let refused = f
+        .manager
+        .create_issue(
+            &p.id,
+            NewIssueRequest {
+                assignee: Some(external),
+                ..new_issue("to codex")
+            },
+        )
+        .await
+        .expect_err("external frameworks cannot host an issue session");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
 }

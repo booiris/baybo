@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use baybo_model::{IssueId, MAX_PROJECT_NAME_CHARS, ProjectId};
+use baybo_model::{AgentFramework, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId};
+use baybo_store::AgentProfileStore;
 use baybo_store::project::{
     IssuePriority, IssueRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow, ProjectStore,
     ProjectUpdate,
@@ -42,16 +43,26 @@ pub struct NewIssueRequest {
     pub description: String,
     pub status: IssueStatus,
     pub priority: IssuePriority,
+    pub assignee: Option<AgentProfileId>,
 }
 
 pub struct ProjectManager {
     store: Arc<dyn ProjectStore>,
+    agents: Arc<dyn AgentProfileStore>,
     paths: WorkspacePaths,
 }
 
 impl ProjectManager {
-    pub fn new(store: Arc<dyn ProjectStore>, paths: WorkspacePaths) -> Self {
-        Self { store, paths }
+    pub fn new(
+        store: Arc<dyn ProjectStore>,
+        agents: Arc<dyn AgentProfileStore>,
+        paths: WorkspacePaths,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            paths,
+        }
     }
 
     pub async fn create_project(&self, new: NewProject) -> Result<ProjectRow> {
@@ -192,6 +203,10 @@ impl ProjectManager {
     ) -> Result<IssueRow> {
         self.writable_project(project).await?;
         let title = validate_issue_title(&new.title)?;
+        if let Some(assignee) = new.assignee.as_ref() {
+            self.validate_assignee(assignee).await?;
+        }
+        self.validate_staffing(new.status, new.assignee.as_ref())?;
         Ok(self
             .store
             .create_issue(&NewIssue {
@@ -201,6 +216,7 @@ impl ProjectManager {
                 description: new.description.trim().to_owned(),
                 status: new.status,
                 priority: new.priority,
+                assignee: new.assignee,
                 created_at: chrono::Utc::now(),
             })
             .await?)
@@ -215,6 +231,16 @@ impl ProjectManager {
         self.writable_project(project).await?;
         if update.is_empty() {
             return Err(ProjectError::invalid("update", "sets no field"));
+        }
+        if let Some(next) = update.assignee.as_ref() {
+            if let Some(assignee) = next.as_ref() {
+                self.validate_assignee(assignee).await?;
+            }
+            // Checked against the column the issue is actually in: dropping
+            // the assignee of in-flight work recreates exactly the zombie
+            // the staffing rule exists to prevent.
+            let current = self.get_issue(project, number).await?;
+            self.validate_staffing(current.status, next.as_ref())?;
         }
         let update = IssueUpdate {
             title: update
@@ -258,6 +284,8 @@ impl ProjectManager {
                 "must contain the moved issue — it is the destination column's new contents",
             ));
         }
+        let issue = self.get_issue(project, number).await?;
+        self.validate_staffing(status, issue.assignee.as_ref())?;
         if !self
             .store
             .move_issue(project, number, status, ordered_numbers)
@@ -269,6 +297,48 @@ impl ProjectManager {
             });
         }
         self.get_issue(project, number).await
+    }
+
+    /// An assignee has to be an agent that exists and can actually run.
+    ///
+    /// External claude/codex profiles are refused: a top-level session
+    /// cannot be bound to a non-baybo framework today — the external
+    /// backend exists only inside the subagent spawner — so assigning one
+    /// would produce a card that can never start.
+    async fn validate_assignee(&self, assignee: &AgentProfileId) -> Result<()> {
+        let profile = self
+            .agents
+            .get(assignee)
+            .await?
+            .ok_or_else(|| ProjectError::invalid("assignee", format!("no agent {assignee}")))?;
+        if profile.framework != AgentFramework::Baybo {
+            return Err(ProjectError::invalid(
+                "assignee",
+                format!(
+                    "{assignee} runs on {}, which cannot yet host an issue's session — \
+                     assign a baybo agent",
+                    profile.framework.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// In Progress means somebody is on it. A card in that column with no
+    /// assignee is work the board claims is happening and nobody is doing;
+    /// every other column is free to be unassigned.
+    fn validate_staffing(
+        &self,
+        status: IssueStatus,
+        assignee: Option<&AgentProfileId>,
+    ) -> Result<()> {
+        if status == IssueStatus::InProgress && assignee.is_none() {
+            return Err(ProjectError::invalid(
+                "assignee",
+                "In Progress needs an assignee — assign someone before starting the work",
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve a project and refuse if it is archived. Every write path

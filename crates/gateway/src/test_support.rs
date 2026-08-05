@@ -236,6 +236,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
 
     let project_manager = Arc::new(baybo_project::ProjectManager::new(
         stores.project.clone(),
+        stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()),
     ));
 

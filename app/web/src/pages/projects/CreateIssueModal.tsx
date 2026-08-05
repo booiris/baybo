@@ -3,7 +3,13 @@ import { useEffect, useState } from 'react';
 import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createIssue } from './api';
-import { COLUMN_LABEL, PRIORITIES, type IssuePriority, type IssueStatus } from './boardModel';
+import {
+  COLUMN_LABEL,
+  PRIORITIES,
+  type Agent,
+  type IssuePriority,
+  type IssueStatus,
+} from './boardModel';
 
 const PRIORITY_LABEL: Record<IssuePriority, string> = {
   urgent: 'Urgent',
@@ -24,11 +30,13 @@ const pill =
 export function CreateIssueModal({
   projectId,
   status,
+  agents,
   onClose,
   onCreated,
 }: {
   projectId: string;
   status: IssueStatus;
+  agents: Agent[];
   onClose: () => void;
   onCreated: () => void;
 }) {
@@ -37,6 +45,7 @@ export function CreateIssueModal({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<IssuePriority>('none');
+  const [assignee, setAssignee] = useState('');
   const [keepOpen, setKeepOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -51,8 +60,11 @@ export function CreateIssueModal({
     };
   }, [onClose]);
 
+  // The modal twin of the drag bounce: In Progress means somebody is on it.
+  const needsAssignee = status === 'in_progress' && assignee.length === 0;
+
   async function submit() {
-    if (submitting || title.trim().length === 0) return;
+    if (submitting || title.trim().length === 0 || needsAssignee) return;
     setSubmitting(true);
     setError(null);
     const outcome = await createIssue(client, projectId, {
@@ -60,6 +72,7 @@ export function CreateIssueModal({
       description,
       status,
       priority,
+      ...(assignee.length > 0 ? { assignee } : {}),
     });
     setSubmitting(false);
     if (outcome.kind === 'unauthorized') {
@@ -130,6 +143,23 @@ export function CreateIssueModal({
           <div className="flex flex-wrap gap-2">
             <span className={`${pill} bg-brand/35 cursor-default`}>◐ {COLUMN_LABEL[status]}</span>
             <label className={pill}>
+              <span className="text-ink-soft">Assignee</span>
+              <select
+                className="bg-transparent outline-none font-bold cursor-pointer max-w-[9rem]"
+                value={assignee}
+                onChange={(event) => {
+                  setAssignee(event.target.value);
+                }}
+              >
+                <option value="">Unassigned</option>
+                {agents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className={pill}>
               <span className="text-ink-soft">Priority</span>
               <select
                 className="bg-transparent outline-none font-bold cursor-pointer"
@@ -146,6 +176,11 @@ export function CreateIssueModal({
               </select>
             </label>
           </div>
+          {needsAssignee ? (
+            <p className="font-mono text-[0.62rem] font-bold text-warn">
+              In Progress needs an assignee — pick who is on it.
+            </p>
+          ) : null}
           {error != null ? (
             <div className="bg-white border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.75rem] break-words">
               {error}
@@ -167,7 +202,7 @@ export function CreateIssueModal({
           <Button
             className="ml-auto !px-4 !py-1.5 !text-[0.78rem]"
             variant="primary"
-            disabled={submitting || title.trim().length === 0}
+            disabled={submitting || title.trim().length === 0 || needsAssignee}
             onClick={() => {
               void submit();
             }}

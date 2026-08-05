@@ -252,14 +252,24 @@ announces which of these will happen before sending.
   delivery pattern). A run row is the ledger entry; a crash between
   enqueue and wake re-drives on boot.
 - **Each issue owns a dedicated session**, created on first run, bound to
-  project + issue. **No project session appears in the global chat list**
+  project + issue, so a follow-up run sees what the last one did. This
+  costs a waiter subtlety: cron mints a fresh session per fire, so its
+  reconcile can take the first terminal turn it finds; a session hosting
+  many runs would hand run #3 run #1's outcome. What makes it safe is the
+  dedupe guard — at most one run per issue is ever in flight — so the
+  newest terminal turn at or after the run's own enqueue is unambiguously
+  the one being waited on. **No project session appears in the global chat list**
   — issue runs and the lead's planning session alike (the old
   filter-project-sessions todo lands here); the lead session is reached
   only through the in-board panel. The run brief = issue
   title/description + timeline delta since the last run + PROJECT.md +
   project memory, via the context crate's prompt assembly.
-- Assignee may be **any agent profile** — native baybo agents or external
-  claude/codex framework profiles; both already execute as sessions.
+- Assignee is **any baybo-framework agent profile**. The claim that
+  external claude/codex profiles "already execute as sessions" was wrong:
+  `chat.rs` refuses to bind a top-level session to a non-baybo framework,
+  and the external backend exists only inside the subagent spawner. An
+  external assignee is refused at enqueue with that reason, and giving
+  external agents a top-level leg is its own piece of work.
 - **Worktree per issue**: created lazily at first run under
   `<workspace>/projects/<pid>/worktrees/<number>-<slug>`, branch
   `issue/<number>-<slug>` off the repo's default branch. **Worktree and

@@ -1,6 +1,7 @@
 import type { components } from '../../api/schema';
 
 export type Issue = components['schemas']['IssueDto'];
+export type Agent = components['schemas']['AgentProfileDto'];
 export type Project = components['schemas']['ProjectDto'];
 export type IssueStatus = Issue['status'];
 export type IssuePriority = Issue['priority'];
@@ -178,6 +179,25 @@ export function placementChanged(before: Board, after: Board, number: number): b
   const beforeIndex = before[beforeStatus].findIndex((issue) => issue.number === number);
   const afterIndex = after[afterStatus].findIndex((issue) => issue.number === number);
   return beforeIndex !== afterIndex;
+}
+
+/**
+ * Why a drop is refused, or `null` when it is fine.
+ *
+ * In Progress means somebody is on it: a card in that column with no
+ * assignee is work the board claims is happening and nobody is doing. The
+ * server enforces the same rule, so this is the message, not the guard.
+ */
+export function dropRejection(issue: Issue, target: IssueStatus): string | null {
+  if (target === 'in_progress' && issue.assignee == null) {
+    return `#${issue.number} needs an assignee before it can start`;
+  }
+  return null;
+}
+
+/** Only baybo-framework agents can host an issue's session. */
+export function assignableAgents(agents: Agent[]): Agent[] {
+  return agents.filter((agent) => agent.framework === 'baybo');
 }
 
 /**

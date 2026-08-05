@@ -4,11 +4,13 @@ import { RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { Button } from '../../components/Button';
-import { fetchIssue, fetchIssues, moveIssue, patchIssue } from './api';
+import { fetchAgents, fetchIssue, fetchIssues, moveIssue, patchIssue } from './api';
 import {
   COLUMNS,
   COLUMN_LABEL,
   PRIORITIES,
+  assignableAgents,
+  type Agent,
   type Issue,
   type IssuePriority,
   type IssueStatus,
@@ -41,6 +43,7 @@ export function IssueDetailPage() {
   const { logout } = useAuth();
 
   const [issue, setIssue] = useState<Issue | null>(null);
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
@@ -50,8 +53,12 @@ export function IssueDetailPage() {
   useEffect(() => {
     let canceled = false;
     async function load() {
-      const outcome = await fetchIssue(client, projectId, number);
+      const [outcome, agentsOutcome] = await Promise.all([
+        fetchIssue(client, projectId, number),
+        fetchAgents(client),
+      ]);
       if (canceled) return;
+      if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
       if (outcome.kind === 'unauthorized') {
         logout();
         return;
@@ -245,6 +252,25 @@ export function IssueDetailPage() {
                 {COLUMNS.map((status) => (
                   <option key={status} value={status}>
                     {COLUMN_LABEL[status]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block mt-2">
+              <span className={railLabel}>Assignee</span>
+              <select
+                className={railSelect}
+                value={issue.assignee ?? ''}
+                disabled={saving}
+                onChange={(event) => {
+                  const picked = event.target.value;
+                  void apply({ assignee: picked.length > 0 ? picked : null });
+                }}
+              >
+                <option value="">Unassigned</option>
+                {agents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
                   </option>
                 ))}
               </select>

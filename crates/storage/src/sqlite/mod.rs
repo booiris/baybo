@@ -282,6 +282,15 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
 
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
+    // `issues` was created one commit ago and has never shipped, so its
+    // CREATE carries `assignee` directly. The ALTER is here for the
+    // databases that commit already made — the pragma guard makes it a
+    // no-op everywhere else.
+    AddColumn {
+        table: "issues",
+        column: "assignee",
+        definition: "TEXT",
+    },
     AddColumn {
         table: "sessions",
         column: "parent_span_id",
@@ -1281,6 +1290,9 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     description    TEXT    NOT NULL DEFAULT '',
                     status         TEXT    NOT NULL,
                     priority       TEXT    NOT NULL DEFAULT 'none',
+                    -- Who is on it. An agent profile id, or NULL for work
+                    -- nobody has picked up.
+                    assignee       TEXT,
                     -- Dense rank within (project_id, status); a move
                     -- renumbers the whole target column in one transaction.
                     position       INTEGER NOT NULL,

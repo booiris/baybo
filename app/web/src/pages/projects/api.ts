@@ -1,6 +1,6 @@
 import type { AdminClient } from '../../api/client';
 import type { components } from '../../api/schema';
-import type { Issue, IssueStatus, Project } from './boardModel';
+import type { Agent, Issue, IssueStatus, Project } from './boardModel';
 
 export type CreateIssueRequest = components['schemas']['CreateIssueRequest'];
 export type UpdateIssueRequest = components['schemas']['UpdateIssueRequest'];
@@ -35,6 +35,18 @@ export async function fetchProjects(
     const { data, error, response } = await client.GET('/v1/projects', {
       params: { query: { include_archived: includeArchived } },
     });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function fetchAgents(client: AdminClient): Promise<Outcome<Agent[]>> {
+  try {
+    const { data, error, response } = await client.GET('/v1/agents');
     if (response.status === 401) return { kind: 'unauthorized' };
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);

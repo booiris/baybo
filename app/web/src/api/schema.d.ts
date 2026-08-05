@@ -1919,6 +1919,11 @@ export interface components {
             parent_id?: string | null;
         };
         CreateIssueRequest: {
+            /**
+             * @description The agent to put on it. Required when opening straight into
+             *     In Progress.
+             */
+            assignee?: string | null;
             description?: string;
             priority?: null | components["schemas"]["IssuePriorityDto"];
             status?: null | components["schemas"]["IssueStatusDto"];
@@ -2114,6 +2119,8 @@ export interface components {
             session_ids: string[];
         };
         IssueDto: {
+            /** @description The agent on it, if any. In Progress always has one. */
+            assignee?: string | null;
             /**
              * @description Why work stopped. A badge on the card — blocked work stays in
              *     whichever column it was in.
@@ -2786,6 +2793,8 @@ export interface components {
          *     block, an absent key leaves it.
          */
         UpdateIssueRequest: {
+            /** @description An explicit `null` unassigns; an absent key leaves the assignee. */
+            assignee?: string | null;
             blocked_reason?: string | null;
             cancelled?: boolean | null;
             description?: string | null;
@@ -6268,6 +6277,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /** @description The agent on it, if any. In Progress always has one. */
+                            assignee?: string | null;
                             /**
                              * @description Why work stopped. A badge on the card — blocked work stays in
                              *     whichever column it was in.

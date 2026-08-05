@@ -24,16 +24,19 @@ import { RiAddLine, RiArchiveLine, RiLoader4Line } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import { IconButton } from '../../components/IconButton';
-import { fetchIssues, fetchProject, fetchProjects, moveIssue } from './api';
+import { fetchAgents, fetchIssues, fetchProject, fetchProjects, moveIssue } from './api';
 import {
   COLUMNS,
   COLUMN_LABEL,
+  type Agent,
   type Board,
   type Issue,
   type IssueStatus,
   type Project,
   cardDragId,
+  assignableAgents,
   columnDropId,
+  dropRejection,
   emptyBoard,
   findIssue,
   groupByStatus,
@@ -67,6 +70,7 @@ export function ProjectBoardPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [board, setBoard] = useState<Board>(emptyBoard);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -83,10 +87,11 @@ export function ProjectBoardPage() {
     let canceled = false;
     async function load() {
       setLoading(true);
-      const [projectOutcome, issuesOutcome, listOutcome] = await Promise.all([
+      const [projectOutcome, issuesOutcome, listOutcome, agentsOutcome] = await Promise.all([
         fetchProject(client, projectId),
         fetchIssues(client, projectId),
         fetchProjects(client, false),
+        fetchAgents(client),
       ]);
       if (canceled) return;
       if (
@@ -111,6 +116,7 @@ export function ProjectBoardPage() {
       setProject(projectOutcome.value);
       setBoard(groupByStatus(issuesOutcome.value, showCancelled));
       if (listOutcome.kind === 'ok') setProjects(listOutcome.value);
+      if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
       setLoading(false);
       // Remembered only once the board actually resolved: a 404'd deep link
       // must not poison what the rail opens next time.
@@ -177,6 +183,14 @@ export function ProjectBoardPage() {
 
       const issue = findIssue(next, number);
       if (issue === null) return;
+      const refusal = dropRejection(issue, issue.status);
+      if (refusal !== null) {
+        // Bounce before the request: the server refuses this too, but the
+        // card should snap back rather than flicker through the column.
+        setBoard(before);
+        pushToast('warn', refusal);
+        return;
+      }
       const outcome = await moveIssue(
         client,
         projectId,
@@ -291,6 +305,7 @@ export function ProjectBoardPage() {
         <CreateIssueModal
           projectId={projectId}
           status={createIn}
+          agents={agents}
           onClose={() => {
             setCreateIn(null);
           }}
@@ -401,6 +416,16 @@ function SortableIssueCard({
   );
 }
 
+/** Initial-free avatar dot — the agent's identity is its colour and title. */
+function AssigneeDot({ assignee }: { assignee: string }) {
+  return (
+    <span
+      title={assignee}
+      className="w-4 h-4 rounded-full border-2 border-black bg-brand shrink-0"
+    />
+  );
+}
+
 function IssueCard({ issue, overlay = false }: { issue: Issue; overlay?: boolean }) {
   const cancelled = issue.cancelled_at_ms != null;
   const priority = PRIORITY_MARK[issue.priority];
@@ -427,6 +452,12 @@ function IssueCard({ issue, overlay = false }: { issue: Issue; overlay?: boolean
         <span className="self-start border border-warn/50 bg-warn/10 text-warn rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase">
           ⚑ Blocked
         </span>
+      ) : null}
+      {issue.assignee != null ? (
+        <div className="flex items-center gap-1.5">
+          <AssigneeDot assignee={issue.assignee} />
+          <span className="font-mono text-[0.58rem] text-ink-soft truncate">{issue.assignee}</span>
+        </div>
       ) : null}
     </article>
   );
