@@ -423,9 +423,61 @@ announces which of these will happen before sending.
 
    The merge-by-assignee flow needs no code: it is an ordinary comment on
    a live card, which now wakes the assignee in its own worktree.
-4. **Team autonomy.** Lead bootstrap + triage loop, `ProjectAgentCreate`,
-   budget gate, approvals on the timeline, stages + parent wake,
-   activity feed drawer.
+4. **Team autonomy.** ✅ **Shipped, except approvals on the timeline.**
+
+   - **Teams.** `agent_profiles` gains a `TeamMembership` (`project_id` +
+     `handle` as one field, never two nullable columns that could
+     disagree). `list()` filters `project_id IS NULL` in SQL so no caller
+     can leak a teammate into the global roster. `@handle` is its own
+     grammar — narrower than the id's in every direction, because it is
+     typed from memory — derived from the display name and then permanent.
+   - **Removal is a tombstone**, the third exception to this repo's
+     hard-delete rule and for a reason the other two don't share:
+     `issues.assignee`, `issue_runs.agent_id` and every timeline `actor`
+     name an agent by id. There is no restore and no bin, and the handle
+     stays reserved forever — reissuing `@dev-1` would silently repoint
+     every entry that already said it. The roster is now the assignable
+     set: a global persona and another board's teammate are both refused.
+   - **Every project opens with a lead**, seeded before the project row so
+     a failure leaves an inert orphan rather than a visible board with no
+     coordinator. `PROJECT_LEAD_SOUL_TEMPLATE` carries no substitutions;
+     the project's name reaches the agent through each run's brief.
+   - **Six tools** (`IssueList`/`Get`/`Create`/`Update`/`Comment`,
+     `ProjectAgentCreate`), hosted by `baybo-project`. **None takes a
+     `project_id`** — the board comes from the session's
+     `TriggerSource::Issue`, which is the whole security model, backed by a
+     new `ToolTriggerScope::ProjectBoard` for visibility and a fail-closed
+     check for calls that arrive anyway. Agents address `#4` and `@dev-1`,
+     never a ULID. Cap 16, hires audited via `hired_by`.
+   - **Budget gate at enqueue**, on the single path every trigger passes
+     through. The row is written *before* the budget is consulted, so an
+     exhausted board records the work it owes as `RunStatus::Held` rather
+     than dropping it; holds are released by activity (any enqueue, a
+     budget change, the boot sweep) rather than by a timer. `spend_since`
+     uses `IN (SELECT session_id …)`, not a join — an issue reuses one
+     session across every run of it.
+   - **Stages + parent wake.** One level, enforced in both directions.
+     The barrier fires on the *transition* into a finished state; a
+     cancelled step counts as finished and leaves both sides of the
+     progress ring.
+   - **Activity feed drawer**, derived from `issue_events` across the
+     board. Paging tiebreaks on `id DESC` so same-microsecond entries
+     cannot page unstably.
+
+   **Not done: approvals on the timeline.** The hook is awkward rather
+   than hard. `ChannelApprovalGate` is constructed per *channel* inside
+   `crates/gateway/src/channel/boot.rs`, at a point in boot before
+   `ProjectManager` exists, and its pending-edge watcher is a single
+   closure fixed at construction. Recording an approval on the issue's
+   timeline therefore needs one of: a post-construction observer list on
+   `ApprovalQueue`, or a **session-level** gate registered by the issue
+   dispatcher when a run starts (`ApprovalGateMap` already resolves
+   session-level before type-level, so this is the smaller change). The
+   inline approve/deny also needs the board's WS to carry
+   `Frame::ApprovalRequested` / `ApprovalResolved`, which today only the
+   chat page's socket does. Approvals still work for issue runs — they
+   surface in the chat surface for that session — they are just not on the
+   card yet.
 5. **Polish.** Cron→issue creation (autopilot-lite on the existing cron
    system), push/badge integration, board filters, priority-driven lead
    triage hints.
