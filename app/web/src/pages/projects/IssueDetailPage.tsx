@@ -29,6 +29,7 @@ import {
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
+import { SubIssues } from './SubIssues';
 import { Timeline } from './Timeline';
 import type { IssueEvent } from './timelineModel';
 import { useBoardStream } from './useBoardStream';
@@ -119,6 +120,7 @@ export function IssueDetailPage() {
   const { logout } = useAuth();
 
   const [issue, setIssue] = useState<Issue | null>(null);
+  const [board, setBoard] = useState<Issue[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [runs, setRuns] = useState<IssueRun[]>([]);
   const [events, setEvents] = useState<IssueEvent[]>([]);
@@ -135,13 +137,18 @@ export function IssueDetailPage() {
   useEffect(() => {
     let canceled = false;
     async function load() {
-      const [outcome, agentsOutcome, runsOutcome, timelineOutcome] = await Promise.all([
-        fetchIssue(client, projectId, number),
-        fetchTeam(client, projectId),
-        fetchIssueRuns(client, projectId, number),
-        fetchTimeline(client, projectId, number),
-      ]);
+      const [outcome, agentsOutcome, runsOutcome, timelineOutcome, boardOutcome] =
+        await Promise.all([
+          fetchIssue(client, projectId, number),
+          fetchTeam(client, projectId),
+          fetchIssueRuns(client, projectId, number),
+          fetchTimeline(client, projectId, number),
+          // The whole board, because a step's own card carries only its
+          // parent's number — the children hang the other way round.
+          fetchIssues(client, projectId),
+        ]);
       if (canceled) return;
+      if (boardOutcome.kind === 'ok') setBoard(boardOutcome.value);
       if (agentsOutcome.kind === 'ok') setAgents(assignableAgents(agentsOutcome.value));
       if (runsOutcome.kind === 'ok') setRuns(runsOutcome.value);
       if (timelineOutcome.kind === 'ok') setEvents(timelineOutcome.value);
@@ -215,6 +222,53 @@ export function IssueDetailPage() {
    * so from here the card simply joins that column's tail — which means
    * reading the column first.
    */
+  /**
+   * Move one of this card's steps.
+   *
+   * The same column-order rule every move follows: the request carries the
+   * destination column's whole new membership, so the board is read first
+   * and the step joins that column's tail. Sharing `relocate`'s body was
+   * tempting and wrong — that one moves *this* card and reseeds the page's
+   * own prose from the response.
+   */
+  const moveChild = useCallback(
+    async (childNumber: number, status: IssueStatus) => {
+      setSaving(true);
+      const latest = await fetchIssues(client, projectId);
+      if (latest.kind === 'unauthorized') {
+        logout();
+        setSaving(false);
+        return;
+      }
+      if (latest.kind === 'failed') {
+        setError(latest.message);
+        setSaving(false);
+        return;
+      }
+      const ordered = latest.value
+        .filter((candidate) => candidate.status === status && candidate.number !== childNumber)
+        .sort((a, b) => a.position - b.position)
+        .map((candidate) => candidate.number);
+      ordered.push(childNumber);
+      const outcome = await moveIssue(client, projectId, childNumber, status, ordered);
+      setSaving(false);
+      if (outcome.kind === 'unauthorized') {
+        logout();
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        setError(outcome.message);
+        return;
+      }
+      setError(null);
+      // Refetch rather than patch in place: finishing a step can open the
+      // next stage and wake this card's assignee, so the timeline and the
+      // run log change too.
+      setRefreshKey((key) => key + 1);
+    },
+    [client, logout, projectId],
+  );
+
   const relocate = useCallback(
     async (status: IssueStatus) => {
       setSaving(true);
@@ -350,6 +404,7 @@ export function IssueDetailPage() {
   const cancelled = issue.cancelled_at_ms != null;
   const blocked = issue.blocked_reason != null;
   const dirty = title !== issue.title || description !== issue.description;
+  const children = board.filter((candidate) => candidate.parent === issue.number);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -420,6 +475,18 @@ export function IssueDetailPage() {
               </button>
             ) : null}
           </div>
+
+          <SubIssues
+            projectId={projectId}
+            // The whole board is held; the steps are whichever cards name
+            // this one as their parent.
+            children={children}
+            team={agents}
+            disabled={saving}
+            onStatus={(childNumber, status) => {
+              void moveChild(childNumber, status);
+            }}
+          />
 
           <Timeline
             events={events}
