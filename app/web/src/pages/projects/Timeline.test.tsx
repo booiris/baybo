@@ -39,7 +39,14 @@ function entry(body: IssueEventBody, agent?: string): IssueEvent {
 
 function renderTimeline(events: IssueEvent[], onComment = vi.fn(), busy = false) {
   render(
-    <Timeline events={events} issue={ISSUE} runs={[]} onComment={onComment} busy={busy} />,
+    <Timeline
+      events={events}
+      issue={ISSUE}
+      runs={[]}
+      onComment={onComment}
+      onResolveApproval={vi.fn()}
+      busy={busy}
+    />,
   );
   return onComment;
 }
@@ -92,5 +99,60 @@ describe('Timeline', () => {
     // will read it, and waits for an answer nobody is going to send.
     renderTimeline([]);
     expect(screen.getByText(/Starts a run/)).toBeInTheDocument();
+  });
+});
+
+describe('pending approvals', () => {
+  it('offers all three answers and reports which one was clicked', async () => {
+    const onResolveApproval = vi.fn();
+    render(
+      <Timeline
+        events={[
+          entry({
+            kind: 'approval_requested',
+            call_id: 'c1',
+            tool: 'Bash',
+            summary: 'rm -rf build',
+          }),
+        ]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={onResolveApproval}
+        busy={false}
+      />,
+    );
+    expect(screen.getByText(/Waiting on you/)).toBeInTheDocument();
+    expect(screen.getByText('rm -rf build')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Approve always' }));
+    expect(onResolveApproval).toHaveBeenCalledWith('c1', 'approve_always');
+    await userEvent.click(screen.getByRole('button', { name: 'Deny' }));
+    expect(onResolveApproval).toHaveBeenCalledWith('c1', 'deny');
+  });
+
+  it('stops offering a prompt that has been answered', () => {
+    // Derived from the timeline, so the card cannot offer to answer
+    // something the server already closed.
+    render(
+      <Timeline
+        events={[
+          entry({
+            kind: 'approval_requested',
+            call_id: 'c1',
+            tool: 'Bash',
+            summary: 'rm -rf build',
+          }),
+          entry({ kind: 'approval_resolved', call_id: 'c1', decision: 'deny' }),
+        ]}
+        issue={ISSUE}
+        runs={[]}
+        onComment={vi.fn()}
+        onResolveApproval={vi.fn()}
+        busy={false}
+      />,
+    );
+    expect(screen.queryByText(/Waiting on you/)).not.toBeInTheDocument();
+    expect(screen.getByText(/refusal was recorded/)).toBeInTheDocument();
   });
 });

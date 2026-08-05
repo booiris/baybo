@@ -7,6 +7,7 @@ import { Button } from '../../components/Button';
 import {
   cancelRun,
   fetchTeam,
+  resolveApproval,
   fetchIssue,
   fetchIssueRuns,
   fetchIssues,
@@ -289,6 +290,29 @@ export function IssueDetailPage() {
     [client, logout, number, projectId],
   );
 
+  const answerApproval = useCallback(
+    async (callId: string, decision: 'approve' | 'approve_always' | 'deny') => {
+      setSaving(true);
+      const outcome = await resolveApproval(client, projectId, number, callId, decision);
+      setSaving(false);
+      if (outcome.kind === 'unauthorized') {
+        logout();
+        return;
+      }
+      if (outcome.kind === 'failed') {
+        setError(outcome.message);
+        return;
+      }
+      setError(null);
+      // Refetch rather than append: the resolution is written by the gate
+      // on the server side, so this page has no entry in hand to add. The
+      // prompt disappears when that entry arrives, which is also what
+      // stops a stale click from looking like it worked.
+      setRefreshKey((key) => key + 1);
+    },
+    [client, logout, number, projectId],
+  );
+
   const runAgain = useCallback(async () => {
     setSaving(true);
     const outcome = await retryRun(client, projectId, number);
@@ -404,6 +428,9 @@ export function IssueDetailPage() {
             busy={saving}
             onComment={(text) => {
               void comment(text);
+            }}
+            onResolveApproval={(callId, decision) => {
+              void answerApproval(callId, decision);
             }}
           />
         </main>

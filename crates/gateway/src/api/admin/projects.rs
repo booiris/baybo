@@ -36,6 +36,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_issue_runs))
         .routes(routes!(list_issue_events))
         .routes(routes!(project_feed))
+        .routes(routes!(resolve_approval))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
         .routes(routes!(cancel_run))
@@ -363,6 +364,36 @@ impl From<RunTrigger> for RunTriggerDto {
     }
 }
 
+/// Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same
+/// discriminated union it switches on everywhere else here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionDto {
+    Approve,
+    ApproveAlways,
+    Deny,
+}
+
+impl From<baybo_model::ApprovalDecision> for ApprovalDecisionDto {
+    fn from(decision: baybo_model::ApprovalDecision) -> Self {
+        match decision {
+            baybo_model::ApprovalDecision::Approve => Self::Approve,
+            baybo_model::ApprovalDecision::ApproveAlways => Self::ApproveAlways,
+            baybo_model::ApprovalDecision::Deny => Self::Deny,
+        }
+    }
+}
+
+impl From<ApprovalDecisionDto> for baybo_model::ApprovalDecision {
+    fn from(decision: ApprovalDecisionDto) -> Self {
+        match decision {
+            ApprovalDecisionDto::Approve => Self::Approve,
+            ApprovalDecisionDto::ApproveAlways => Self::ApproveAlways,
+            ApprovalDecisionDto::Deny => Self::Deny,
+        }
+    }
+}
+
 /// What one timeline entry says.
 ///
 /// A mirror of the store's `IssueEventBody` rather than the type itself,
@@ -407,6 +438,15 @@ pub enum IssueEventBodyDto {
     WorktreeKept {
         reason: String,
     },
+    ApprovalRequested {
+        call_id: String,
+        tool: String,
+        summary: String,
+    },
+    ApprovalResolved {
+        call_id: String,
+        decision: ApprovalDecisionDto,
+    },
     StageCompleted {
         stage: i64,
     },
@@ -423,6 +463,19 @@ pub enum IssueEventBodyDto {
 impl From<IssueEventBody> for IssueEventBodyDto {
     fn from(body: IssueEventBody) -> Self {
         match body {
+            IssueEventBody::ApprovalRequested {
+                call_id,
+                tool,
+                summary,
+            } => Self::ApprovalRequested {
+                call_id,
+                tool,
+                summary,
+            },
+            IssueEventBody::ApprovalResolved { call_id, decision } => Self::ApprovalResolved {
+                call_id,
+                decision: decision.into(),
+            },
             IssueEventBody::StageCompleted { stage } => Self::StageCompleted { stage },
             IssueEventBody::BudgetExhausted {
                 spent_micros,
@@ -1033,6 +1086,59 @@ pub struct FeedQuery {
     /// How many entries. Clamped by the server.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Request body for resolving an approval from a card.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveApprovalRequest {
+    pub decision: ApprovalDecisionDto,
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues/{number}/approvals/{call_id}",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+        ("call_id" = String, Path, description = "The approval's call id, from its timeline entry"),
+    ),
+    request_body = ResolveApprovalRequest,
+    responses(
+        (status = 204, description = "The prompt was answered"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue, or no prompt is waiting on that call", body = ErrorBody),
+    )
+)]
+async fn resolve_approval(
+    State(state): State<AdminState>,
+    Path((project_id, number, call_id)): Path<(String, i64, String)>,
+    Json(req): Json<ResolveApprovalRequest>,
+) -> Result<StatusCode> {
+    let id = parse_project_id(&project_id)?;
+    // Resolve the issue first, so a request naming another board's card
+    // cannot answer a prompt it has no business seeing. The queue is
+    // keyed by call id alone, which is exactly why this check is here.
+    state
+        .project_manager
+        .get_issue(&id, number)
+        .await
+        .map_err(project_err)?;
+    let channel = state
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .ok_or_else(|| GatewayError::NotFound("the owner channel".to_owned()))?;
+    let decision: baybo_model::ApprovalDecision = req.decision.into();
+    // `resolve_approval` returns the queue entry's own session id, which is
+    // what the broadcast has to target — the fan-out is per session, and
+    // dispatching without one reaches nobody.
+    let Some(session_id) = channel.resolve_approval(&call_id, decision) else {
+        return Err(GatewayError::NotFound(format!(
+            "no approval waiting on call {call_id}"
+        )));
+    };
+    channel.dispatch_approval_resolved(call_id, session_id, decision);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(

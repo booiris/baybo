@@ -423,7 +423,7 @@ announces which of these will happen before sending.
 
    The merge-by-assignee flow needs no code: it is an ordinary comment on
    a live card, which now wakes the assignee in its own worktree.
-4. **Team autonomy.** ✅ **Shipped, except approvals on the timeline.**
+4. **Team autonomy.** ✅ **Shipped.**
 
    - **Teams.** `agent_profiles` gains a `TeamMembership` (`project_id` +
      `handle` as one field, never two nullable columns that could
@@ -464,20 +464,19 @@ announces which of these will happen before sending.
      board. Paging tiebreaks on `id DESC` so same-microsecond entries
      cannot page unstably.
 
-   **Not done: approvals on the timeline.** The hook is awkward rather
-   than hard. `ChannelApprovalGate` is constructed per *channel* inside
-   `crates/gateway/src/channel/boot.rs`, at a point in boot before
-   `ProjectManager` exists, and its pending-edge watcher is a single
-   closure fixed at construction. Recording an approval on the issue's
-   timeline therefore needs one of: a post-construction observer list on
-   `ApprovalQueue`, or a **session-level** gate registered by the issue
-   dispatcher when a run starts (`ApprovalGateMap` already resolves
-   session-level before type-level, so this is the smaller change). The
-   inline approve/deny also needs the board's WS to carry
-   `Frame::ApprovalRequested` / `ApprovalResolved`, which today only the
-   chat page's socket does. Approvals still work for issue runs — they
-   surface in the chat surface for that session — they are just not on the
-   card yet.
+   - **Approvals on the card.** `TimelineApprovalGate` wraps the owner
+     channel's **type-level** gate once, at boot, rather than being armed
+     per run: nothing to disarm, so nothing leaks when a run dies oddly,
+     and a board opened later is covered without registration. It asks the
+     *session* what it belongs to, so an ordinary chat prompt passes
+     straight through. Both halves are recorded — including the gate's own
+     deny-on-timeout, because the prompt is exactly where a reader would go
+     looking. Pending-ness is derived (a request with no resolution on the
+     same `call_id`), never a stored flag, on both sides of the wire.
+     Answering rides `POST …/issues/{n}/approvals/{call_id}`, which
+     resolves the **card** before touching the queue: the queue is keyed by
+     call id alone, so that check is the only thing stopping one board from
+     answering another's prompt.
 5. **Polish.** Cron→issue creation (autopilot-lite on the existing cron
    system), push/badge integration, board filters, priority-driven lead
    triage hints.

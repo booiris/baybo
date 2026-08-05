@@ -1032,6 +1032,22 @@ export interface paths {
         patch: operations["update_issue"];
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resolve_approval"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/issues/{number}/comments": {
         parameters: {
             query?: never;
@@ -1482,6 +1498,12 @@ export interface components {
              */
             until: string;
         };
+        /**
+         * @description Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same
+         *     discriminated union it switches on everywhere else here.
+         * @enum {string}
+         */
+        ApprovalDecisionDto: "approve" | "approve_always" | "deny";
         /**
          * @description One in-flight background job (detached subagent or `Bash` command),
          *     across all sessions — the cross-session twin of the `JobList` tool.
@@ -2414,6 +2436,17 @@ export interface components {
             kind: "worktree_kept";
             reason: string;
         } | {
+            call_id: string;
+            /** @enum {string} */
+            kind: "approval_requested";
+            summary: string;
+            tool: string;
+        } | {
+            call_id: string;
+            decision: components["schemas"]["ApprovalDecisionDto"];
+            /** @enum {string} */
+            kind: "approval_resolved";
+        } | {
             /** @enum {string} */
             kind: "stage_completed";
             /** Format: int64 */
@@ -2844,6 +2877,10 @@ export interface components {
             ordered_ids: string[];
             /** @description Parent of the sibling group being reordered (`null` = top-level). */
             parent_id?: string | null;
+        };
+        /** @description Request body for resolving an approval from a card. */
+        ResolveApprovalRequest: {
+            decision: components["schemas"]["ApprovalDecisionDto"];
         };
         /**
          * @description Where a run is. `queued` and `running` are the unfinished states — a
@@ -7153,6 +7190,53 @@ export interface operations {
             };
             /** @description The project is archived */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resolve_approval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+                /** @description The approval's call id, from its timeline entry */
+                call_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolveApprovalRequest"];
+            };
+        };
+        responses: {
+            /** @description The prompt was answered */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue, or no prompt is waiting on that call */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

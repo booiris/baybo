@@ -32,6 +32,43 @@ function usd(micros: number): string {
   return `$${(micros / 1_000_000).toFixed(2)}`;
 }
 
+/**
+ * What each decision reads as in a sentence. A record rather than the raw
+ * wire value: "approve_always was recorded" is not a sentence, and the
+ * exhaustiveness check is what will catch a fourth decision.
+ */
+const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
+  approve: 'approval',
+  approve_always: 'standing approval',
+  deny: 'refusal',
+};
+
+/**
+ * The approvals still waiting on a person, oldest first.
+ *
+ * Derived from the timeline, never a stored flag: a request with no
+ * matching resolution on the same `call_id` is open. Mirrors
+ * `pending_approvals` in `crates/project` — one rule, so a card cannot
+ * offer to answer a prompt the server already closed.
+ */
+export function pendingApprovals(
+  events: IssueEvent[],
+): { callId: string; tool: string; summary: string }[] {
+  const open = new Map<string, { callId: string; tool: string; summary: string }>();
+  for (const event of events) {
+    if (event.body.kind === 'approval_requested') {
+      open.set(event.body.call_id, {
+        callId: event.body.call_id,
+        tool: event.body.tool,
+        summary: event.body.summary,
+      });
+    } else if (event.body.kind === 'approval_resolved') {
+      open.delete(event.body.call_id);
+    }
+  }
+  return [...open.values()];
+}
+
 export function describeEvent(body: IssueEventBody): string | null {
   switch (body.kind) {
     case 'comment':
@@ -69,6 +106,10 @@ export function describeEvent(body: IssueEventBody): string | null {
       // git's own reason, because it is the actionable part: the operator
       // has to commit or discard before the tree can go.
       return `kept the worktree — ${body.reason}`;
+    case 'approval_requested':
+      return `asked you to approve a ${body.tool} call: ${body.summary}`;
+    case 'approval_resolved':
+      return `the ${DECISION_LABEL[body.decision]} was recorded`;
     case 'stage_completed':
       return `stage ${body.stage} finished — every step in it is done`;
     case 'budget_exhausted':

@@ -155,6 +155,12 @@ fn narrate(body: &IssueEventBody) -> String {
         IssueEventBody::WorktreeKept { reason } => {
             format!("left the worktree in place: {reason}")
         }
+        IssueEventBody::ApprovalRequested { tool, summary, .. } => {
+            format!("asked the operator to approve a {tool} call: {summary}")
+        }
+        IssueEventBody::ApprovalResolved { decision, .. } => {
+            format!("the operator answered: {}", decision.as_str())
+        }
         IssueEventBody::StageCompleted { stage } => {
             format!("stage {stage} finished — every step in it is done")
         }

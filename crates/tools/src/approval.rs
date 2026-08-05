@@ -161,6 +161,19 @@ impl ApprovalGateMap {
             .remove(&(channel.clone(), session_id.clone()));
     }
 
+    /// The **type-level** gate for a channel, ignoring any session-scoped
+    /// entry. Fail-closed like [`Self::get`].
+    ///
+    /// Exists for decorators: a wrapper that observes approvals has to
+    /// delegate to the gate it replaced, and reaching for it through
+    /// [`Self::get`] would find the wrapper itself and recurse forever.
+    pub fn type_gate(&self, channel: &ChannelType) -> Arc<dyn ApprovalGate> {
+        self.type_level
+            .get(channel)
+            .map(|e| Arc::clone(e.value()))
+            .unwrap_or_else(|| Arc::new(AutoDenyGate))
+    }
+
     /// Resolve the gate for one tool call. Tries the session-scoped
     /// entry first (a specific TUI instance answering for its own
     /// session) and falls back to the type-level gate (a sidecar that

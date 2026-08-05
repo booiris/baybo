@@ -5,6 +5,7 @@
 //! materialisation; `baybo-store` declares the persistence port and
 //! `baybo-storage` implements it.
 
+mod approvals;
 mod budget;
 mod comments;
 mod error;
@@ -16,6 +17,7 @@ mod timeline;
 pub mod tools;
 pub mod worktree;
 
+pub use approvals::{TimelineApprovalGate, pending_approvals};
 pub use budget::{Headroom, day_start, headroom};
 pub use comments::{CommentDelivery, comment_delivery};
 pub use error::{ProjectError, Result};

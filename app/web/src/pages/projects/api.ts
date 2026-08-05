@@ -373,3 +373,34 @@ export async function fetchFeed(
     return { kind: 'failed', message: networkMessage(e) };
   }
 }
+
+/**
+ * Answer an approval a run is blocked on, from its card.
+ *
+ * Scoped to the issue on purpose: the approval queue is keyed by call id
+ * alone, so the server checks the card exists on this board before it
+ * answers anything.
+ */
+export async function resolveApproval(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+  callId: string,
+  decision: 'approve' | 'approve_always' | 'deny',
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/approvals/{call_id}',
+      {
+        params: { path: { project_id: projectId, number, call_id: callId } },
+        body: { decision },
+      },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}

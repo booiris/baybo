@@ -5128,6 +5128,79 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/approvals/{call_id}": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "resolve_approval",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "call_id",
+            "in": "path",
+            "description": "The approval's call id, from its timeline entry",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The prompt was answered"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue, or no prompt is waiting on that call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/issues/{number}/comments": {
       "post": {
         "tags": [
@@ -7017,6 +7090,15 @@
           }
         }
       },
+      "ApprovalDecisionDto": {
+        "type": "string",
+        "description": "Mirror of [`baybo_model::ApprovalDecision`], so the client gets the same\ndiscriminated union it switches on everywhere else here.",
+        "enum": [
+          "approve",
+          "approve_always",
+          "deny"
+        ]
+      },
       "BackgroundJob": {
         "type": "object",
         "description": "One in-flight background job (detached subagent or `Bash` command),\nacross all sessions — the cross-session twin of the `JobList` tool.",
@@ -8612,6 +8694,54 @@
           {
             "type": "object",
             "required": [
+              "call_id",
+              "tool",
+              "summary",
+              "kind"
+            ],
+            "properties": {
+              "call_id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "approval_requested"
+                ]
+              },
+              "summary": {
+                "type": "string"
+              },
+              "tool": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "decision",
+              "kind"
+            ],
+            "properties": {
+              "call_id": {
+                "type": "string"
+              },
+              "decision": {
+                "$ref": "#/components/schemas/ApprovalDecisionDto"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "approval_resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "stage",
               "kind"
             ],
@@ -9550,6 +9680,18 @@
               "null"
             ],
             "description": "Parent of the sibling group being reordered (`null` = top-level)."
+          }
+        }
+      },
+      "ResolveApprovalRequest": {
+        "type": "object",
+        "description": "Request body for resolving an approval from a card.",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecisionDto"
           }
         }
       },

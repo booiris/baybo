@@ -314,6 +314,29 @@ pub enum IssueEventBody {
     WorktreeKept {
         reason: String,
     },
+    /// A run asked the operator to approve a tool call. Recorded before
+    /// the prompt is answered, so the card shows work that is *waiting on
+    /// a person* rather than work that has mysteriously stopped.
+    ///
+    /// Pending-ness is derived: a request with no matching
+    /// [`IssueEventBody::ApprovalResolved`] on the same `call_id` is still
+    /// open. Storing a `pending` flag would be a second copy of a fact the
+    /// timeline already carries, and the two would eventually disagree.
+    ApprovalRequested {
+        call_id: String,
+        /// The tool whose call is blocked.
+        tool: String,
+        /// One line a person can decide from — the tool's own label when it
+        /// has one, else a truncated parameter preview.
+        summary: String,
+    },
+    /// …and what was decided. Also written when nobody decided: the gate
+    /// denies on timeout, and a card that stops explaining itself at the
+    /// prompt is the worst version of this feature.
+    ApprovalResolved {
+        call_id: String,
+        decision: baybo_model::ApprovalDecision,
+    },
     /// Every non-cancelled child in one of this issue's stages reached
     /// Done, so its assignee was woken to drive the next one.
     StageCompleted {
@@ -351,6 +374,8 @@ impl IssueEventBody {
             IssueEventBody::Cancelled => "cancelled",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
+            IssueEventBody::ApprovalRequested { .. } => "approval_requested",
+            IssueEventBody::ApprovalResolved { .. } => "approval_resolved",
             IssueEventBody::StageCompleted { .. } => "stage_completed",
             IssueEventBody::BudgetExhausted { .. } => "budget_exhausted",
             IssueEventBody::BudgetRestored { .. } => "budget_restored",

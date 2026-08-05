@@ -471,3 +471,218 @@ fn member(name: &str) -> baybo_project::NewTeamMember {
         llm: None,
     }
 }
+
+/// The gate's own behaviour: it records both halves and stays out of the
+/// way of the decision itself.
+mod approvals {
+    use super::*;
+    use baybo_model::{ApprovalDecision, SessionId, TriggerSource};
+    use baybo_store::project::IssueEventBody;
+    use baybo_tools::{ApprovalGate, ApprovalRequest};
+
+    /// A gate that answers with whatever it was built with, and remembers
+    /// that it was asked — so the decorator can be shown to delegate
+    /// rather than decide.
+    struct FixedGate {
+        decision: ApprovalDecision,
+        asked: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for FixedGate {
+        async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+            self.asked.lock().push(req.call_id);
+            self.decision
+        }
+    }
+
+    fn request(session: &SessionId, call_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            call_id: call_id.to_owned(),
+            tool_call_id: None,
+            session_id: session.clone(),
+            user_id: "owner".to_owned(),
+            tool: "Bash".to_owned(),
+            accesses: Vec::new(),
+            params_preview: "{\"command\":\"rm -rf build\"}".to_owned(),
+            description: Some("Clean the build directory".to_owned()),
+        }
+    }
+
+    /// Bind a session to an issue the way an issue run's session is bound.
+    async fn issue_session(
+        store: &baybo_storage::Store,
+        project: &ProjectId,
+        number: i64,
+        issue_id: IssueId,
+    ) -> SessionId {
+        let now = chrono::Utc::now();
+        let id = SessionId::new();
+        let session = baybo_model::Session {
+            id: id.clone(),
+            user: baybo_model::User {
+                id: "owner".to_owned(),
+                name: None,
+                channel: baybo_model::ChannelType::owner(),
+            },
+            channel: baybo_model::ChannelType::owner(),
+            created_at: now,
+            last_active: now,
+            state: baybo_model::SessionState::default(),
+            root_session_id: id.clone(),
+            trigger: TriggerSource::Issue {
+                project_id: project.clone(),
+                issue_id,
+                number,
+            },
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        };
+        baybo_store::SessionStore::save(store.session.as_ref(), &session)
+            .await
+            .expect("create session");
+        id
+    }
+
+    #[tokio::test]
+    async fn a_prompt_from_a_run_lands_on_its_card_with_the_answer() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(workspace.path().to_path_buf());
+        tokio::fs::create_dir_all(paths.work_dir())
+            .await
+            .expect("work dir");
+        let store = baybo_storage::Store::open(workspace.path().join("storage.db"))
+            .await
+            .expect("store");
+        let manager = Arc::new(ProjectManager::new(
+            Arc::clone(&store.project),
+            Arc::clone(&store.agent_profile),
+            paths,
+            Arc::new(baybo_project::NoopProjectEvents),
+            baybo_project::no_dispatch(),
+        ));
+        let project = manager
+            .create_project(NewProject {
+                name: "Approving".to_owned(),
+                description: String::new(),
+                workdir: None,
+                daily_budget: None,
+            })
+            .await
+            .expect("project");
+        let lead = manager.team(&project.id).await.expect("team")[0].id.clone();
+        let issue = manager
+            .create_issue(
+                &project.id,
+                baybo_store::project::IssueActor::User,
+                baybo_project::NewIssueRequest {
+                    title: "needs a hand".to_owned(),
+                    description: String::new(),
+                    status: baybo_store::project::IssueStatus::InProgress,
+                    priority: baybo_store::project::IssuePriority::None,
+                    assignee: Some(lead.clone()),
+                    parent: None,
+                    stage: 0,
+                },
+            )
+            .await
+            .expect("issue");
+
+        let asked: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let gate = baybo_project::TimelineApprovalGate::new(
+            Arc::new(FixedGate {
+                decision: ApprovalDecision::Deny,
+                asked: Arc::clone(&asked),
+            }),
+            Arc::clone(&manager),
+            Arc::clone(&store.session),
+        );
+
+        let session = issue_session(&store, &project.id, issue.number, issue.id.clone()).await;
+        let decision = gate.request(request(&session, "c1")).await;
+
+        // The wrapper observes; it never decides.
+        assert_eq!(decision, ApprovalDecision::Deny);
+        assert_eq!(*asked.lock(), vec!["c1".to_owned()]);
+
+        let timeline = manager
+            .timeline(&project.id, issue.number)
+            .await
+            .expect("timeline");
+        let requested = timeline
+            .iter()
+            .find_map(|e| match &e.body {
+                IssueEventBody::ApprovalRequested {
+                    call_id,
+                    tool,
+                    summary,
+                } => Some((
+                    call_id.clone(),
+                    tool.clone(),
+                    summary.clone(),
+                    e.actor.clone(),
+                )),
+                _ => None,
+            })
+            .expect("the prompt is on the card");
+        assert_eq!(requested.0, "c1");
+        assert_eq!(requested.1, "Bash");
+        assert_eq!(requested.2, "Clean the build directory");
+        assert_eq!(
+            requested.3,
+            baybo_store::project::IssueActor::Agent(lead),
+            "a prompt is something the agent asked for, not something the operator did"
+        );
+        // Both halves, so the card never stops explaining itself at the
+        // prompt — including on the gate's own deny-on-timeout.
+        assert!(timeline.iter().any(|e| matches!(
+            &e.body,
+            IssueEventBody::ApprovalResolved { call_id, decision }
+                if call_id == "c1" && *decision == ApprovalDecision::Deny
+        )));
+        assert!(baybo_project::pending_approvals(&timeline).is_empty());
+    }
+
+    /// An ordinary conversation's prompt must pass straight through: the
+    /// gate is shared by every session on the channel.
+    #[tokio::test]
+    async fn a_prompt_from_an_ordinary_session_is_only_forwarded() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(workspace.path().to_path_buf());
+        tokio::fs::create_dir_all(paths.work_dir())
+            .await
+            .expect("work dir");
+        let store = baybo_storage::Store::open(workspace.path().join("storage.db"))
+            .await
+            .expect("store");
+        let manager = Arc::new(ProjectManager::new(
+            Arc::clone(&store.project),
+            Arc::clone(&store.agent_profile),
+            paths,
+            Arc::new(baybo_project::NoopProjectEvents),
+            baybo_project::no_dispatch(),
+        ));
+        let asked: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let gate = baybo_project::TimelineApprovalGate::new(
+            Arc::new(FixedGate {
+                decision: ApprovalDecision::Approve,
+                asked: Arc::clone(&asked),
+            }),
+            manager,
+            Arc::clone(&store.session),
+        );
+
+        // A session that was never created, let alone bound to an issue —
+        // the shape a chat prompt arrives in as far as this gate is
+        // concerned.
+        let decision = gate
+            .request(request(&SessionId::from("not-an-issue".to_owned()), "c9"))
+            .await;
+        assert_eq!(decision, ApprovalDecision::Approve);
+        assert_eq!(*asked.lock(), vec!["c9".to_owned()]);
+    }
+}

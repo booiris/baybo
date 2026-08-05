@@ -326,6 +326,29 @@ impl ProjectManager {
         }
     }
 
+    /// Append one entry to an issue's timeline, addressed the way the
+    /// board addresses everything: by number.
+    ///
+    /// Public because writers outside this manager have entries to add —
+    /// the approval gate, which sees prompts the board never asked for.
+    /// Swallows a missing issue for the same reason [`Self::record`]
+    /// swallows a failed append: losing the note is bad, and failing the
+    /// thing the note was about is worse.
+    pub async fn record_event(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        body: IssueEventBody,
+    ) {
+        match self.get_issue(project, number).await {
+            Ok(issue) => self.record(&issue, actor, body).await,
+            Err(e) => {
+                tracing::warn!(issue = number, error = %e, "no issue to record a timeline entry on")
+            }
+        }
+    }
+
     /// Record whatever this edit is worth saying, if anything.
     async fn record_diff(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         for body in crate::timeline::diff_events(before, after) {

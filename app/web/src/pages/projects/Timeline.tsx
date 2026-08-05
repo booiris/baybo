@@ -8,6 +8,7 @@ import {
   describeEvent,
   eventShape,
   eventTime,
+  pendingApprovals,
   type IssueEvent,
 } from './timelineModel';
 
@@ -43,6 +44,66 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
 }
 
 /**
+ * A prompt a run is blocked on, answerable from the card.
+ *
+ * Rendered above the composer rather than in timeline order: it is the one
+ * entry that is a *question*, and burying a question thirty rows up is how
+ * a card sits stuck for an hour with the answer one click away.
+ */
+function PendingApproval({
+  approval,
+  onResolve,
+  busy,
+}: {
+  approval: { callId: string; tool: string; summary: string };
+  onResolve: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
+  busy: boolean;
+}) {
+  return (
+    <div className="mt-3 border-[3px] border-warn rounded-md bg-warn/10 px-3 py-2 shadow-brutal-sm">
+      <p className="font-mono text-[0.62rem] font-bold uppercase tracking-wider text-warn">
+        Waiting on you — {approval.tool}
+      </p>
+      <p className="mt-1 whitespace-pre-wrap break-words font-mono text-[0.74rem]">
+        {approval.summary}
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            onResolve(approval.callId, 'approve');
+          }}
+          className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] font-bold bg-brand text-ink disabled:opacity-50"
+        >
+          Approve
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            onResolve(approval.callId, 'approve_always');
+          }}
+          className="border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.66rem] bg-surface disabled:opacity-50"
+        >
+          Approve always
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            onResolve(approval.callId, 'deny');
+          }}
+          className="border-2 border-err rounded-md px-2 py-0.5 font-mono text-[0.66rem] text-err bg-surface disabled:opacity-50"
+        >
+          Deny
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * The issue's history and the place to add to it.
  *
  * Comments are shown; everything else is narrated in one line. The two
@@ -54,23 +115,35 @@ export function Timeline({
   issue,
   runs,
   onComment,
+  onResolveApproval,
   busy,
 }: {
   events: IssueEvent[];
   issue: Issue;
   runs: IssueRun[];
   onComment: (text: string) => void;
+  onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
   busy: boolean;
 }) {
   const [draft, setDraft] = useState('');
   const now = Date.now();
   const trimmed = draft.trim();
+  const waiting = pendingApprovals(events);
 
   return (
     <section className="mt-6 border-t-2 border-black/20 pt-4">
       <h2 className="font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
         Timeline
       </h2>
+
+      {waiting.map((approval) => (
+        <PendingApproval
+          key={approval.callId}
+          approval={approval}
+          onResolve={onResolveApproval}
+          busy={busy}
+        />
+      ))}
 
       {events.length === 0 ? (
         <p className="mt-2 font-mono text-[0.7rem] text-ink-soft">Nothing has happened yet.</p>

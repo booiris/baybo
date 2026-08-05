@@ -676,6 +676,28 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
+
+    // Put a run's approval prompts on the card that asked for them.
+    //
+    // Installed once over the owner channel's **type-level** gate rather
+    // than per run: there is nothing to arm or disarm, so nothing leaks
+    // when a run dies in an unusual way, and a board opened after boot is
+    // covered without anybody remembering to register it. A prompt from an
+    // ordinary session passes straight through — the wrapper asks the
+    // session what it belongs to and finds no issue.
+    {
+        let owner = baybo_model::ChannelType::owner();
+        let inner = gate_map.type_gate(&owner);
+        gate_map.insert(
+            owner,
+            Arc::new(baybo_project::TimelineApprovalGate::new(
+                inner,
+                Arc::clone(&project_manager),
+                stores.session.clone(),
+            )),
+        );
+    }
+
     let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(config.permission).await?;
 
     // --- pluggable memory backend. Constructed here while

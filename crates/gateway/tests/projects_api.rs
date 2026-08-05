@@ -752,3 +752,114 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
     )
     .await;
 }
+
+/// The approval queue is keyed by call id alone, so the endpoint's job is
+/// to refuse a request that names a card it has no business answering for.
+#[tokio::test]
+async fn answering_an_approval_has_to_name_a_card_on_this_board() {
+    let (router, tg) = router().await;
+    // The harness installs no channels, so the route would otherwise 404 at
+    // the channel lookup — which looks exactly like the card check this
+    // test exists to exercise. Installed first, so every 404 below is the
+    // refusal it claims to be.
+    baybo_gateway::channel::boot::install_channels(
+        &tg.deps.channel_registry,
+        &tg.deps.config.channels,
+    )
+    .expect("install the owner channel");
+    let p = open_project(&router, "approving").await;
+    open_issue(&router, &p, "needs a hand").await;
+
+    // An unknown board and an unknown card are both 404s, and neither
+    // reaches the queue.
+    post(
+        &router,
+        "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/issues/1/approvals/c1",
+        json!({ "decision": "approve" }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/99/approvals/c1"),
+        json!({ "decision": "approve" }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // A real card with no prompt waiting on that call is also a 404 —
+    // "answered" and "there was nothing to answer" must not look alike.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c1"),
+        json!({ "decision": "approve" }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Now a real prompt, parked on the owner channel's queue the way a
+    // blocked tool call parks one. The queue is keyed by call id alone, so
+    // this is the case that says whether the card check does anything.
+    let other = open_project(&router, "somebody else's").await;
+    open_issue(&router, &other, "their card").await;
+    let channel = tg
+        .deps
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .expect("owner channel");
+    let gate = channel.approval_gate().expect("approval gate");
+    let session = baybo_model::SessionId::new();
+    let blocked = tokio::spawn({
+        let session = session.clone();
+        async move {
+            gate.request(baybo_tools::ApprovalRequest {
+                call_id: "c-real".to_owned(),
+                tool_call_id: None,
+                session_id: session,
+                user_id: "owner".to_owned(),
+                tool: "Bash".to_owned(),
+                accesses: Vec::new(),
+                params_preview: "{}".to_owned(),
+                description: None,
+            })
+            .await
+        }
+    });
+    for _ in 0..200 {
+        if !channel.pending_approvals(&session).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        channel.pending_approvals(&session).len(),
+        1,
+        "prompt parked"
+    );
+
+    // The other board's card must not be able to answer it…
+    post(
+        &router,
+        &format!("/v1/projects/{other}/issues/99/approvals/c-real"),
+        json!({ "decision": "approve" }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(
+        channel.pending_approvals(&session).len(),
+        1,
+        "and the prompt is still waiting"
+    );
+
+    // …while a card that exists answers it, and the blocked call unblocks.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-real"),
+        json!({ "decision": "approve" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        blocked.await.expect("the blocked call returns"),
+        baybo_model::ApprovalDecision::Approve
+    );
+}
