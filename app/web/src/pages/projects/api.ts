@@ -348,3 +348,28 @@ export async function postComment(
     return { kind: 'failed', message: networkMessage(e) };
   }
 }
+
+/**
+ * The whole board's activity, newest first — the same rows the per-issue
+ * timelines are, read across the board instead of down one card.
+ */
+export async function fetchFeed(
+  client: AdminClient,
+  projectId: string,
+  beforeMs: number | null,
+): Promise<Outcome<IssueEvent[]>> {
+  try {
+    const { data, error, response } = await client.GET('/v1/projects/{project_id}/feed', {
+      params: {
+        path: { project_id: projectId },
+        query: beforeMs == null ? {} : { before_ms: beforeMs },
+      },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}

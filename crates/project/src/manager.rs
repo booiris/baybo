@@ -55,6 +55,9 @@ pub const MAX_TEAM_AGENTS: usize = 16;
 /// SOUL and shows on a roster card, so it is a sentence, not a brief.
 pub const MAX_ROLE_CHARS: usize = 280;
 
+/// Upper bound on one activity-feed page.
+pub const MAX_FEED_PAGE: usize = 100;
+
 /// How many `-2`, `-3`, … suffixes to try when a derived handle is taken.
 ///
 /// Bounded because handles stay reserved after removal: a board that has
@@ -1108,6 +1111,24 @@ impl ProjectManager {
             .await;
         self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)
+    }
+
+    /// The whole board's activity, newest first.
+    ///
+    /// Capped rather than paged-without-limit: a feed is read from the top
+    /// and abandoned, and an unbounded read of a year-old board is a
+    /// request nobody wanted to make.
+    pub async fn feed(
+        &self,
+        project: &ProjectId,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        limit: usize,
+    ) -> Result<Vec<IssueEventRow>> {
+        self.get_project(project).await?;
+        Ok(self
+            .store
+            .project_feed(project, before, limit.clamp(1, MAX_FEED_PAGE))
+            .await?)
     }
 
     /// One issue's sub-issues, by stage then position.

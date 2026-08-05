@@ -625,6 +625,34 @@ impl ProjectStore for SqliteProjectStore {
         Ok(affected > 0)
     }
 
+    async fn project_feed(
+        &self,
+        project: &ProjectId,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        limit: usize,
+    ) -> Result<Vec<IssueEventRow>> {
+        let project = project.as_str().to_string();
+        let before = before.map(super::time::to_us);
+        let limit = limit as i64;
+        let raws = self
+            .pool
+            .interact("issue_events.feed", move |conn| {
+                // `id DESC` breaks the tie: two entries written in the same
+                // microsecond would otherwise page unstably, showing one row
+                // twice and skipping another.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {EVENT_COLUMNS} FROM issue_events WHERE project_id = ?1 \
+                     AND (?2 IS NULL OR created_at < ?2) \
+                     ORDER BY created_at DESC, id DESC LIMIT ?3"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![project, before, limit], read_raw_event)?
+                    .collect::<rusqlite::Result<Vec<RawEvent>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(event_from_raw).collect()
+    }
+
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>> {
         let parent = parent.as_str().to_string();
         let raws = self

@@ -984,6 +984,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/feed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["project_feed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/issues": {
         parameters: {
             query?: never;
@@ -6798,6 +6814,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProjectDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    project_feed: {
+        parameters: {
+            query?: {
+                /** @description Page backwards from this instant (ms). Omit for the newest. */
+                before_ms?: number | null;
+                /** @description How many entries. Clamped by the server. */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This project's activity, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            /**
+                             * @description `"user"`, or the agent's id. Which of the two it is comes from
+                             *     [`Self::actor_is_agent`] rather than from parsing this.
+                             */
+                            actor: string;
+                            actor_is_agent: boolean;
+                            body: components["schemas"]["IssueEventBodyDto"];
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            id: string;
+                            /** Format: int64 */
+                            number: number;
+                        }[];
+                        next_cursor?: string | null;
+                    };
                 };
             };
             /** @description Unauthorized */

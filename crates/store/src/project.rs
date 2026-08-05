@@ -412,6 +412,22 @@ pub trait ProjectStore: Send + Sync {
         since: DateTime<Utc>,
     ) -> Result<baybo_model::MicroUsd>;
 
+    /// One project's timeline, newest first — the activity feed.
+    ///
+    /// Derived from `issue_events` rather than stored a second time: the
+    /// feed is the same rows the per-issue timelines are, read across the
+    /// board instead of down one card. Two copies would be two things that
+    /// can disagree about what happened (the cron-groups lesson).
+    ///
+    /// `before` pages backwards from a µs cursor; `None` starts at the
+    /// newest.
+    async fn project_feed(
+        &self,
+        project: &ProjectId,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<IssueEventRow>>;
+
     /// One issue's direct children, by stage then position.
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>>;
 

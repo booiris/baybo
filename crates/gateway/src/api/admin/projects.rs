@@ -35,6 +35,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(move_issue))
         .routes(routes!(list_issue_runs))
         .routes(routes!(list_issue_events))
+        .routes(routes!(project_feed))
         .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
         .routes(routes!(cancel_run))
@@ -1019,6 +1020,56 @@ async fn list_issue_runs(
         .map_err(project_err)?
         .into_iter()
         .map(IssueRunDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+/// Query for `GET /projects/{project_id}/feed`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct FeedQuery {
+    /// Page backwards from this instant (ms). Omit for the newest.
+    #[serde(default)]
+    pub before_ms: Option<i64>,
+    /// How many entries. Clamped by the server.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/feed",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id"), FeedQuery),
+    responses(
+        (status = 200, description = "This project's activity, newest first", body = inline(ListResponse<IssueEventDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn project_feed(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+    Query(query): Query<FeedQuery>,
+) -> Result<Json<ListResponse<IssueEventDto>>> {
+    let id = parse_project_id(&project_id)?;
+    let before = query
+        .before_ms
+        .map(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .ok_or_else(|| GatewayError::BadRequest(format!("before_ms out of range: {ms}")))
+        })
+        .transpose()?;
+    let items = state
+        .project_manager
+        .feed(
+            &id,
+            before,
+            query.limit.unwrap_or(baybo_project::MAX_FEED_PAGE),
+        )
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(IssueEventDto::from)
         .collect();
     Ok(Json(ListResponse::new(items)))
 }

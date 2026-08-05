@@ -61,6 +61,7 @@ import {
 import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
+import { ActivityDrawer } from './ActivityDrawer';
 import { TeamStrip } from './TeamStrip';
 import { handleOf } from './teamModel';
 import { ToastStack, useToasts } from './Toasts';
@@ -93,6 +94,7 @@ export function ProjectBoardPage() {
   const [dragging, setDragging] = useState<Issue | null>(null);
   const [createIn, setCreateIn] = useState<IssueStatus | null>(null);
   const [showCancelled, setShowCancelled] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
 
   // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
   // a rollback needs the board as it was before the drag started.
@@ -310,6 +312,18 @@ export function ProjectBoardPage() {
           }}
         />
         <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            aria-pressed={showActivity}
+            onClick={() => {
+              setShowActivity((open) => !open);
+            }}
+            className={`border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
+              showActivity ? 'bg-brand text-ink' : 'bg-surface'
+            }`}
+          >
+            Activity
+          </button>
           <label className="flex items-center gap-1.5 font-mono text-[0.68rem] text-ink-soft cursor-pointer">
             <input
               type="checkbox"
@@ -329,6 +343,7 @@ export function ProjectBoardPage() {
         </div>
       ) : null}
 
+      <div className="flex-1 min-h-0 flex">
       <DndContext
         sensors={sensors}
         collisionDetection={closestCorners}
@@ -360,6 +375,19 @@ export function ProjectBoardPage() {
           {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
         </DragOverlay>
       </DndContext>
+      {showActivity ? (
+        <ActivityDrawer
+          projectId={projectId}
+          // The feed refetches on the same signal the board does, so an
+          // entry and the card it describes appear together.
+          refreshKey={refreshKey}
+          onClose={() => {
+            setShowActivity(false);
+          }}
+          onOpenIssue={openIssue}
+        />
+      ) : null}
+      </div>
 
       {createIn !== null ? (
         <CreateIssueModal

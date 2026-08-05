@@ -4603,6 +4603,133 @@
         }
       }
     },
+    "/v1/projects/{project_id}/feed": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "project_feed",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_ms",
+            "in": "query",
+            "description": "Page backwards from this instant (ms). Omit for the newest.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many entries. Clamped by the server.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This project's activity, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One entry on an issue's timeline.",
+                        "required": [
+                          "id",
+                          "number",
+                          "actor",
+                          "actor_is_agent",
+                          "body",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "actor": {
+                            "type": "string",
+                            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+                          },
+                          "actor_is_agent": {
+                            "type": "boolean"
+                          },
+                          "body": {
+                            "$ref": "#/components/schemas/IssueEventBodyDto"
+                          },
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "number": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/issues": {
       "get": {
         "tags": [

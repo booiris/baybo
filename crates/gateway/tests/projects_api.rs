@@ -698,3 +698,57 @@ async fn patch(router: &axum::Router, uri: &str, body: Value, expected: StatusCo
 async fn delete(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     request(router, "DELETE", uri, None, expected).await
 }
+
+/// The activity feed is derived, not stored twice: the same rows the
+/// per-issue timelines render, read across the board and newest first.
+#[tokio::test]
+async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
+    let (router, _tg) = router().await;
+    let a = open_project(&router, "watched").await;
+    let b = open_project(&router, "other").await;
+
+    open_issue(&router, &a, "first").await;
+    open_issue(&router, &a, "second").await;
+    post(
+        &router,
+        &format!("/v1/projects/{a}/issues/1/comments"),
+        json!({ "text": "a note on #1" }),
+        StatusCode::OK,
+    )
+    .await;
+    open_issue(&router, &b, "somebody else's").await;
+
+    let feed = get(&router, &format!("/v1/projects/{a}/feed"), StatusCode::OK).await;
+    let items = feed["items"].as_array().expect("items");
+    // Two opens plus one comment. The other board's card is not here.
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["body"]["kind"], "comment", "newest first");
+    assert_eq!(items[0]["number"], 1);
+    assert!(
+        items.iter().all(|e| e["number"] != 3),
+        "another board's issue must not appear: {items:?}"
+    );
+
+    // Paging backwards from the newest entry excludes it.
+    let cursor = items[0]["created_at_ms"].as_i64().expect("ms");
+    let older = get(
+        &router,
+        &format!("/v1/projects/{a}/feed?before_ms={cursor}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        older["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|e| e["created_at_ms"].as_i64().expect("ms") < cursor)
+    );
+
+    get(
+        &router,
+        "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/feed",
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
