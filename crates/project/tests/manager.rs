@@ -2399,3 +2399,136 @@ async fn the_boards_own_traffic_is_never_unread() {
         "run and column traffic is not something waiting on a person"
     );
 }
+
+/// An @mention on a card nobody is on hands it over — and then follows the
+/// ordinary assign rule, so a card already in a live column starts.
+#[tokio::test]
+async fn a_mention_on_an_unowned_card_hands_it_over() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Mentions"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                ..new_issue("nobody is on this")
+            },
+        )
+        .await
+        .expect_err("In Progress needs an assignee");
+    f.manager
+        .create_issue(&p.id, IssueActor::User, new_issue("nobody is on this"))
+        .await
+        .expect("create")
+        .into_issue();
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
+        .await
+        .expect("to todo");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@dev-1 could you take this?")
+        .await
+        .expect("comment");
+
+    let issue = f.manager.get_issue(&p.id, 1).await.expect("issue");
+    assert_eq!(issue.assignee.as_ref(), Some(&dev));
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "assigned into a live column, so it starts — one run, not two"
+    );
+    // The handover is on the timeline like any other, so the card explains
+    // itself without anybody re-reading the comment.
+    assert!(
+        f.manager
+            .timeline(&p.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                &e.body,
+                baybo_store::project::IssueEventBody::Assigned { to: Some(to), .. } if to == &dev
+            ))
+    );
+}
+
+/// On a card somebody is working, an @mention is a question — not a
+/// reassignment. Otherwise a passing remark takes work away from whoever
+/// is doing it.
+#[tokio::test]
+async fn a_mention_never_takes_a_card_off_its_owner() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Asking"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                status: IssueStatus::Todo,
+                ..new_issue("owned")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@dev-2 what do you think?")
+        .await
+        .expect("comment");
+    let issue = f.manager.get_issue(&p.id, 1).await.expect("issue");
+    assert_eq!(issue.assignee.as_ref(), Some(&dev), "still @dev-1's card");
+    assert_ne!(issue.assignee.as_ref(), Some(&other));
+}
+
+/// A mention that names nobody must not refuse the sentence around it.
+#[tokio::test]
+async fn a_mention_of_a_stranger_still_records_the_comment() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Typos"))
+        .await
+        .expect("p");
+    f.manager
+        .create_issue(&p.id, IssueActor::User, new_issue("unowned"))
+        .await
+        .expect("create")
+        .into_issue();
+
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@nobody-here please look")
+        .await
+        .expect("a typo in a mention is not a reason to lose the comment");
+    assert!(
+        f.manager
+            .get_issue(&p.id, 1)
+            .await
+            .expect("issue")
+            .assignee
+            .is_none()
+    );
+    assert!(
+        f.manager
+            .timeline(&p.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(&e.body, baybo_store::project::IssueEventBody::Comment { text } if text.contains("nobody-here")))
+    );
+}

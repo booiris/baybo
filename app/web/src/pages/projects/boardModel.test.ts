@@ -6,6 +6,7 @@ import {
   type IssueRun,
   type Project,
   assignableAgents,
+  updatedAgo,
   cardDragId,
   columnDropId,
   dropRejection,
@@ -264,5 +265,32 @@ describe('resolveLanding', () => {
 
   it('asks for a first project when there are none', () => {
     expect(resolveLanding([], 'anything')).toEqual({ kind: 'empty' });
+  });
+});
+
+describe('updatedAgo', () => {
+  const now = Date.UTC(2026, 7, 6, 12, 0, 0);
+  const ago = (ms: number) => updatedAgo(now - ms, now);
+
+  it('reads as `now` inside the minute, not as 0m', () => {
+    // `0m` looks like a missing value; `now` is what a reader means.
+    expect(ago(0)).toBe('now');
+    expect(ago(59_000)).toBe('now');
+  });
+
+  it('steps up one unit at a time', () => {
+    expect(ago(60_000)).toBe('1m');
+    expect(ago(59 * 60_000)).toBe('59m');
+    expect(ago(60 * 60_000)).toBe('1h');
+    expect(ago(23 * 3_600_000)).toBe('23h');
+    expect(ago(24 * 3_600_000)).toBe('1d');
+    expect(ago(6 * 86_400_000)).toBe('6d');
+    expect(ago(7 * 86_400_000)).toBe('1w');
+  });
+
+  it('never renders a negative age', () => {
+    // A card written a moment in the future — clock skew between the
+    // server's stamp and the browser — must not read as `-1m`.
+    expect(updatedAgo(now + 5_000, now)).toBe('now');
   });
 });

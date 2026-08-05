@@ -52,6 +52,7 @@ import {
   findIssue,
   groupByStatus,
   liveCount,
+  updatedAgo,
   moveCard,
   orderedNumbers,
   parseDragId,
@@ -63,6 +64,7 @@ import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ActivityDrawer } from './ActivityDrawer';
+import { AgentProfile } from './AgentProfile';
 import { LeadPanel } from './LeadPanel';
 import { ProjectSettings } from './ProjectSettings';
 import { BoardFilterBar } from './BoardFilterBar';
@@ -106,6 +108,11 @@ export function ProjectBoardPage() {
   // One right-hand slot, so the two panels are mutually exclusive — the
   // spec's rule, and the board would have no room for both anyway.
   const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
+  // The profile shares the right-hand slot with the other two panels: the
+  // board has room for one, and three mutually exclusive things read more
+  // simply as two pieces of state than as one four-way enum nobody can
+  // exhaustively name.
+  const [profileOf, setProfileOf] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
   // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
@@ -320,6 +327,10 @@ export function ProjectBoardPage() {
           team={team}
           activeRuns={activeRuns}
           readOnly={archived}
+          onOpenProfile={(agent) => {
+            setRightPanel(null);
+            setProfileOf(agent.id);
+          }}
           onHire={async (body) => {
             const outcome = await hireAgent(client, projectId, body);
             if (outcome.kind === 'unauthorized') {
@@ -445,6 +456,42 @@ export function ProjectBoardPage() {
           onOpenIssue={openIssue}
         />
       ) : null}
+      {profileOf !== null && rightPanel === null
+        ? (() => {
+            const agent = team.find((row) => row.id === profileOf);
+            return agent === undefined ? null : (
+              <AgentProfile
+                agent={agent}
+                team={team}
+                // Every card on the board, so a step assigned to this agent
+                // shows even when the filter hides it.
+                issues={Object.values(board).flat()}
+                activeRuns={activeRuns}
+                readOnly={archived}
+                projectId={projectId}
+                onClose={() => {
+                  setProfileOf(null);
+                }}
+                onRemove={(row) => {
+                  setProfileOf(null);
+                  void removeAgent(client, projectId, row.id).then((outcome) => {
+                    if (outcome.kind === 'unauthorized') {
+                      logout();
+                      return;
+                    }
+                    pushToast(
+                      outcome.kind === 'ok' ? 'ok' : 'err',
+                      outcome.kind === 'ok'
+                        ? `@${row.handle} left the project`
+                        : outcome.message,
+                    );
+                    setRefreshKey((key) => key + 1);
+                  });
+                }}
+              />
+            );
+          })()
+        : null}
       {rightPanel === 'lead' ? (
         <LeadPanel
           projectId={projectId}
@@ -680,6 +727,12 @@ function IssueCard({
           <span className={`${priority.tone} font-bold`}>{priority.glyph}</span>
         ) : null}
         <span className="font-bold">#{issue.number}</span>
+        <span
+          className="ml-auto tabular-nums"
+          title={`Last touched ${new Date(issue.updated_at_ms).toLocaleString()}`}
+        >
+          {updatedAgo(issue.updated_at_ms, Date.now())}
+        </span>
       </div>
       <p
         className={`font-mono text-[0.76rem] font-bold leading-snug line-clamp-2 ${

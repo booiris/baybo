@@ -25,9 +25,14 @@ const TEAM: Agent[] = [member('lead', true), member('dev-1')];
 
 function renderStrip(
   overrides: Partial<Parameters<typeof TeamStrip>[0]> = {},
-): { onHire: ReturnType<typeof vi.fn>; onRemove: ReturnType<typeof vi.fn> } {
+): {
+  onHire: ReturnType<typeof vi.fn>;
+  onRemove: ReturnType<typeof vi.fn>;
+  onOpenProfile: ReturnType<typeof vi.fn>;
+} {
   const onHire = vi.fn().mockResolvedValue(null);
   const onRemove = vi.fn();
+  const onOpenProfile = vi.fn();
   render(
     <TeamStrip
       team={TEAM}
@@ -35,10 +40,11 @@ function renderStrip(
       readOnly={false}
       onHire={onHire}
       onRemove={onRemove}
+      onOpenProfile={onOpenProfile}
       {...overrides}
     />,
   );
-  return { onHire, onRemove };
+  return { onHire, onRemove, onOpenProfile };
 }
 
 describe('TeamStrip', () => {
@@ -54,6 +60,12 @@ describe('TeamStrip', () => {
 
     await userEvent.click(screen.getByRole('button', { name: /Remove @dev-1/ }));
     expect(onRemove).toHaveBeenCalledWith(expect.objectContaining({ handle: 'dev-1' }));
+  });
+
+  it('opens a profile from any handle, including the lead\'s', async () => {
+    const { onOpenProfile } = renderStrip();
+    await userEvent.click(screen.getByRole('button', { name: /Open @lead's profile/ }));
+    expect(onOpenProfile).toHaveBeenCalledWith(expect.objectContaining({ handle: 'lead' }));
   });
 
   it('offers no writes on an archived board', () => {
@@ -81,6 +93,7 @@ describe('TeamStrip', () => {
         readOnly
         onHire={vi.fn()}
         onRemove={vi.fn()}
+        onOpenProfile={vi.fn()}
       />,
     );
     expect(screen.queryByTitle(/@dev-1\) — working/)).not.toBeInTheDocument();
@@ -92,6 +105,7 @@ describe('TeamStrip', () => {
         readOnly
         onHire={vi.fn()}
         onRemove={vi.fn()}
+        onOpenProfile={vi.fn()}
       />,
     );
     expect(screen.getByTitle(/@dev-1\) — working/)).toBeInTheDocument();
@@ -106,6 +120,7 @@ describe('TeamStrip', () => {
         readOnly={false}
         onHire={onHire}
         onRemove={vi.fn()}
+        onOpenProfile={vi.fn()}
       />,
     );
     await userEvent.click(screen.getByRole('button', { name: /Add an agent/ }));

@@ -559,6 +559,32 @@ announces which of these will happen before sending.
      one, so its execution history would describe work on a board it no
      longer touches).
 
+## What is still not built
+
+Everything in "Pages and interactions" above now exists. Three things
+remain, all recorded with their reasons rather than left to be re-derived:
+
+- **Mid-turn injection.** A comment on a card whose run is *executing* is
+  picked up by a follow-up run when that one settles, never lost and never
+  interrupting. Real injection would deliver it at a tool boundary inside
+  the running turn. It is a **latency** difference, not a capability one,
+  and the only thing that would want issue actors registered with the
+  supervisor — `build_oneshot_actor` deliberately does not register them
+  ("one-shot sessions have no follow-up traffic"), which is precisely the
+  assumption injection would break. Worth it only for "stop, you are going
+  the wrong way".
+- **Push about a board.** Not one predicate away: the iOS Projects tab is a
+  placeholder, a push payload can only address a session, and the tap
+  handler touches that session into the phone's chat list — which is what
+  the project-session exclusion exists to prevent. `APPROVAL_TIMEOUT` is
+  also a gateway-wide 300s, so pushing an approval deadline to a locked
+  phone is theatre. Its own phase. The rail badge reaches an operator with
+  a tab open, not one away from their machine; say so rather than letting
+  the badge imply coverage it does not have.
+- **Re-pointing a cron job at a different board.** Refused on purpose: its
+  past fires filed cards on the old board, so its execution history would
+  describe work on a board it no longer touches.
+
 ## Defaults chosen without a grill question (veto anytime)
 
 - Priority field exists (`urgent|high|medium|low|none`) but only informs

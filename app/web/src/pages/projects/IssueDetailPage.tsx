@@ -496,6 +496,7 @@ export function IssueDetailPage() {
             onComment={(text) => {
               void comment(text);
             }}
+            team={agents}
             onResolveApproval={(callId, decision) => {
               void answerApproval(callId, decision);
             }}

@@ -1,7 +1,13 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import { Button } from '../../components/Button';
-import type { Issue, IssueRun } from './boardModel';
+import type { Agent, Issue, IssueRun } from './boardModel';
+import {
+  applyMention,
+  mentionCandidates,
+  mentionHint,
+  mentionQuery,
+} from './mentionModel';
 import {
   actorLabel,
   commentHint,
@@ -116,6 +122,7 @@ export function Timeline({
   runs,
   onComment,
   onResolveApproval,
+  team = [],
   busy,
 }: {
   events: IssueEvent[];
@@ -123,9 +130,28 @@ export function Timeline({
   runs: IssueRun[];
   onComment: (text: string) => void;
   onResolveApproval: (callId: string, decision: 'approve' | 'approve_always' | 'deny') => void;
+  /** For `@` completion and the handover hint. */
+  team?: Agent[];
   busy: boolean;
 }) {
   const [draft, setDraft] = useState('');
+  const [caret, setCaret] = useState(0);
+  const box = useRef<HTMLTextAreaElement | null>(null);
+  const query = mentionQuery(draft, caret);
+  const candidates = query === null ? [] : mentionCandidates(team, query.prefix);
+
+  function complete(handle: string) {
+    if (query === null) return;
+    const next = applyMention(draft, query, handle);
+    setDraft(next.text);
+    setCaret(next.caret);
+    // The caret has to be restored after React re-renders the value, or it
+    // jumps to the end and the next keystroke lands outside the mention.
+    requestAnimationFrame(() => {
+      box.current?.setSelectionRange(next.caret, next.caret);
+      box.current?.focus();
+    });
+  }
   const now = Date.now();
   const trimmed = draft.trim();
   const waiting = pendingApprovals(events);
@@ -161,13 +187,26 @@ export function Timeline({
 
       <div className="mt-3">
         <textarea
+          ref={box}
           className="w-full min-h-[72px] bg-canvas border-2 border-black rounded-md px-3 py-2 font-sans text-[0.82rem] outline-none resize-y"
           placeholder="Say something about this issue…"
           value={draft}
           onChange={(event) => {
             setDraft(event.target.value);
+            setCaret(event.target.selectionStart);
+          }}
+          onSelect={(event) => {
+            setCaret(event.currentTarget.selectionStart);
           }}
           onKeyDown={(event) => {
+            // Tab accepts the top completion, the way the chat composer's
+            // slash completion does. Only while one is offered, so Tab
+            // still moves focus the rest of the time.
+            if (event.key === 'Tab' && candidates.length > 0) {
+              event.preventDefault();
+              complete(candidates[0].handle);
+              return;
+            }
             // ⌘/Ctrl+↵ sends, matching the create modal. A bare ↵ is a
             // newline: a comment is prose, and losing a half-written one to
             // a stray keystroke is worse than one extra key to send.
@@ -178,6 +217,25 @@ export function Timeline({
             }
           }}
         />
+        {candidates.length === 0 ? null : (
+          <ul className="mt-1 flex flex-wrap gap-1">
+            {candidates.map((agent, index) => (
+              <li key={agent.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    complete(agent.handle);
+                  }}
+                  className={`border-2 rounded-md px-1.5 py-0.5 font-mono text-[0.62rem] ${
+                    index === 0 ? 'border-black bg-brand/40' : 'border-black/30 bg-surface'
+                  }`}
+                >
+                  @{agent.handle}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="mt-2 flex items-center gap-3">
           <Button
             className="!px-4 !py-1.5 !text-[0.75rem]"
@@ -192,7 +250,9 @@ export function Timeline({
           </Button>
           {/* What sending will do, before it is sent — the two outcomes look
               identical in the composer otherwise. */}
-          <span className="font-mono text-[0.66rem] text-ink-soft">{commentHint(issue, runs)}</span>
+          <span className="font-mono text-[0.66rem] text-ink-soft">
+            {mentionHint(issue, draft, team) ?? commentHint(issue, runs)}
+          </span>
         </div>
       </div>
     </section>

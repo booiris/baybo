@@ -486,10 +486,65 @@ impl ProjectManager {
             .await?;
         self.events.timeline_changed(project, number);
 
+        // An @mention on a card nobody is on is the operator saying "you
+        // take this". Applied after the comment is recorded, so the words
+        // survive even if the assignment is refused — and applied through
+        // `update_issue`, so it goes down the same path a drag does and
+        // gets the same trigger, the same timeline entry, and the same
+        // refusals for an agent that cannot run.
+        let issue = match self.mention_assignment(project, &issue, text).await {
+            Some(assignee) => {
+                match self
+                    .update_issue(
+                        project,
+                        number,
+                        IssueActor::User,
+                        IssueUpdate {
+                            assignee: Some(Some(assignee)),
+                            ..IssueUpdate::default()
+                        },
+                    )
+                    .await
+                {
+                    // The assign may itself have started a run; re-read so
+                    // the delivery decision below sees that.
+                    Ok(after) => after,
+                    Err(e) => {
+                        tracing::debug!(issue = number, error = %e, "a mention named somebody who cannot take this card");
+                        issue
+                    }
+                }
+            }
+            None => issue,
+        };
+
         if self.delivery_for(&issue).await == CommentDelivery::Wake {
             self.enqueue(&issue, RunTrigger::Comment).await;
         }
         Ok(entry)
+    }
+
+    /// The teammate an @mention hands this card to, if it hands it to
+    /// anybody.
+    ///
+    /// A handle that names nobody on this board resolves to `None` rather
+    /// than to an error: the comment is still worth recording, and a typo
+    /// in a mention should not refuse the sentence around it.
+    async fn mention_assignment(
+        &self,
+        project: &ProjectId,
+        issue: &IssueRow,
+        text: &str,
+    ) -> Option<AgentProfileId> {
+        let handle = crate::assigns_to(issue.assignee.is_some(), text)?;
+        let team = self.agents.list_team(project).await.ok()?;
+        team.into_iter()
+            .find(|row| {
+                row.team
+                    .as_ref()
+                    .is_some_and(|t| t.handle.as_str() == handle.as_str())
+            })
+            .map(|row| row.id)
     }
 
     /// What this comment will do besides being recorded.

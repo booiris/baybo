@@ -11,6 +11,7 @@ mod comments;
 mod error;
 mod events;
 mod manager;
+mod mentions;
 mod runs;
 mod stages;
 mod timeline;
@@ -27,6 +28,7 @@ pub use manager::{
     NewIssueRequest, NewProject, NewTeamMember, ProjectManager, RunDispatch, no_dispatch,
     validate_workdir,
 };
+pub use mentions::{assigns_to, mentions};
 pub use runs::{Transition, triggers_run};
 pub use stages::{all_finished, open_stages, progress, stage_complete};
 pub use timeline::diff_events;

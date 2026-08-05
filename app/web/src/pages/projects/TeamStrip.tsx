@@ -18,12 +18,14 @@ export function TeamStrip({
   readOnly,
   onHire,
   onRemove,
+  onOpenProfile,
 }: {
   team: Agent[];
   activeRuns: IssueRun[];
   readOnly: boolean;
   onHire: (body: { name: string; role: string }) => Promise<string | null>;
   onRemove: (agent: Agent) => void;
+  onOpenProfile: (agent: Agent) => void;
 }) {
   const [hiring, setHiring] = useState(false);
   const working = workingAgentIds(activeRuns);
@@ -38,6 +40,9 @@ export function TeamStrip({
           readOnly={readOnly}
           onRemove={() => {
             onRemove(agent);
+          }}
+          onOpen={() => {
+            onOpenProfile(agent);
           }}
         />
       ))}
@@ -75,11 +80,13 @@ function TeamMemberChip({
   working,
   readOnly,
   onRemove,
+  onOpen,
 }: {
   agent: Agent;
   working: boolean;
   readOnly: boolean;
   onRemove: () => void;
+  onOpen: () => void;
 }) {
   return (
     <span
@@ -94,7 +101,14 @@ function TeamMemberChip({
           working ? 'bg-ok motion-safe:animate-pulse' : 'bg-ink-soft/40'
         }`}
       />
-      <span className="font-bold">@{agent.handle}</span>
+      <button
+        type="button"
+        aria-label={`Open @${agent.handle}'s profile`}
+        onClick={onOpen}
+        className="font-bold hover:underline"
+      >
+        @{agent.handle}
+      </button>
       {readOnly || agent.lead ? null : (
         <button
           type="button"
