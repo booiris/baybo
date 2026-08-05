@@ -477,9 +477,96 @@ announces which of these will happen before sending.
      resolves the **card** before touching the queue: the queue is keyed by
      call id alone, so that check is the only thing stopping one board from
      answering another's prompt.
-5. **Polish.** Cron→issue creation (autopilot-lite on the existing cron
-   system), push/badge integration, board filters, priority-driven lead
-   triage hints.
+5. **Polish.** Three of four shipped; cron→issue is designed and not built.
+
+   - **Board filters.** ✅ Free text over title and `#number`, an assignee
+     picker with a separate "Unassigned", a blocked-only toggle, and the
+     cancelled toggle, all in the query string so the board→detail→back
+     loop keeps them. Client-only: the board already fetches every issue,
+     and a client that only saw a filtered board could not describe a
+     column to a move request.
+
+     It landed on top of a **live corruption bug** it would otherwise have
+     made worse. `board` state *was* the filtered board, and a move sends
+     its destination column's full new order, which the store applies by
+     renumbering exactly the numbers it is handed — so dragging in a column
+     holding a hidden cancelled card left that card on a colliding rank,
+     silently. Fixed on both sides: the store's contract is now checked
+     (`validate_column_order`), and the client holds the whole board with
+     the view derived. That in turn required `Drop` to name an anchor
+     *card* rather than an index, because an index is only meaningful
+     against the list it was resolved on.
+
+   - **Attention badge.** ✅ `GET /v1/projects/attention` and a count on the
+     rail's Projects entry. It counts **boards, not items** — the entry
+     opens exactly one board (decision 12), so a total across boards is a
+     number clicking it cannot discharge; the switcher dropdown carries each
+     board's own counts. Three signals, all of them things only a person can
+     unstick: a tool call parked on an approval prompt, a run held on
+     budget, a live card whose newest run failed. **Nothing marks it read**
+     — each clears when the operator does the thing they were going to do
+     anyway — which is what keeps it free of a read cursor, a `seen_at`, or
+     any new durable state at all. The two signals that *would* need read
+     state (an agent's comment, a card arriving in Review) are left out
+     rather than approximated.
+
+     **Push is deliberately not part of this**, and not because of one
+     predicate. The iOS Projects tab is a placeholder, a push payload can
+     only address a session, and the tap handler touches that session into
+     the phone's chat list — which is exactly what the project-session
+     exclusion exists to prevent. `APPROVAL_TIMEOUT` is also a gateway-wide
+     300s, so pushing an approval deadline to a locked phone is theatre.
+     Board push is its own phase. State plainly in any PR: a web rail badge
+     reaches an operator with a tab open, not one away from their machine.
+
+   - **Priority-driven triage hints.** ✅ Facts on the `IssueList` result,
+     not behaviour: per-agent `working_on` (from runs, never from the In
+     Progress column — a run outlives its column), `you` and `lead` on the
+     roster, the board's held runs and remaining budget, and parent/stage/
+     progress per row. All derived over the *whole* board, because the
+     canonical triage call filters to unassigned cards and a load derived
+     from that set always reads as an idle team. Nothing ranks or promotes:
+     auto-ordering and auto-promotion are both forbidden above.
+
+   - **Cron→issue creation.** ❌ **Designed, not built.** The design is
+     sound and anchor-checked; it is simply six crates wide. Its shape:
+
+     1. `TriggerSource::Cron` gains `project_id: Option<ProjectId>`
+        (serde-default, so no migration), plus a **new** `project()`
+        accessor covering both `Issue` and bound `Cron`.
+        `ToolTriggerScope::ProjectBoard` and `tools::scope()` then read
+        `project()` — the board still comes from the session trigger, so no
+        tool gains a `project_id` parameter and the Phase 4 security
+        property is untouched. Do **not** widen `issue()` (the approval
+        gate resolves a *card* through it) or `is_project_session()` (it is
+        what keeps a session out of the chat list and out of push — a bound
+        fire's conversation must stay listed and pushable).
+     2. The binding rides the `data` blob on `cron_jobs`, is snapshotted
+        onto `CronExecution` (so the boot re-dispatch rebuilds it), and is
+        stamped onto the fire's trigger at mint. The fire binds to the
+        project's **lead**, or its timeline entries render as raw ULIDs and
+        it runs on the wrong persona and memory partition.
+     3. `issues.source_key` plus a partial unique index on
+        `(project_id, source_key) WHERE source_key IS NOT NULL AND
+        cancelled_at IS NULL AND status <> 'done'` is the structural answer
+        to "a daily job opens 365 identical cards" — and the card leaves the
+        index when it is finished, so next month's failure gets a fresh one.
+        `IssueCreate` takes at most a *suffix* and the server namespaces it
+        by job id; **omitting it gives the safe behaviour**, so the naive
+        reminder cannot duplicate itself.
+     4. `CronCreate` gains no `project_id`: it inherits from the calling
+        session like `origin_session` does, so an issue run cannot schedule
+        work onto a neighbouring board. Only the operator names a board, on
+        `POST /v1/cron`, validated in the handler rather than by growing a
+        `ProjectStore` dependency inside `baybo-cron`.
+
+     Two things the review said to drop from the original design: the
+     archived-board check at mint (`writable_project` already refuses every
+     board write with a readable error, and the router's `project_store` is
+     `Option` and `None` in the TUI runtime) and the standing-card lookup at
+     mint (same dependency, and the dedupe already reports the existing card
+     one tool call later). Rebinding a job to a different board is refused
+     on purpose: its past fires filed cards on the old board.
 
 ## Defaults chosen without a grill question (veto anytime)
 
