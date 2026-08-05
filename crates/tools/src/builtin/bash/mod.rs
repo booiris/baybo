@@ -222,6 +222,45 @@ impl LivePermissionMode {
     }
 }
 
+/// What a command's child is given, and what must never come back out.
+///
+/// These were one list. They read the same — pairs of names and values —
+/// but they are used for opposite things: `vars` is handed to the child,
+/// and `secret_values` is an exact-match filter applied to everything the
+/// child prints. Conflating them meant anything injected was also
+/// redacted, so a variable holding something ordinary (an agent's id, say)
+/// vanished from every command's output that happened to mention it.
+#[derive(Debug, Default, Clone)]
+struct ChildEnv {
+    /// Every variable the child process gets.
+    vars: Vec<(String, String)>,
+    /// Values scrubbed from stdout and stderr before anything sees them.
+    /// The resolved user secrets and nothing else — this is a filter, not
+    /// a record of what was injected.
+    secret_values: Vec<String>,
+}
+
+/// The identity git commits as inside an issue run.
+///
+/// Env beats every config file git would otherwise consult, so this is
+/// what makes a commit say which agent made it. The workspace-level
+/// `.gitconfig` stays as the fallback for every other session — one that
+/// never commits pays nothing for it, and one that does is still
+/// attributable to baybo rather than failing outright.
+///
+/// The address is deliberately unroutable: these commits are machine-made
+/// and nobody should be able to reply to one.
+fn git_identity(agent: &baybo_model::AgentProfileId) -> Vec<(String, String)> {
+    let name = agent.as_str().to_owned();
+    let email = format!("{name}@baybo.local");
+    vec![
+        ("GIT_AUTHOR_NAME".to_owned(), name.clone()),
+        ("GIT_AUTHOR_EMAIL".to_owned(), email.clone()),
+        ("GIT_COMMITTER_NAME".to_owned(), name),
+        ("GIT_COMMITTER_EMAIL".to_owned(), email),
+    ]
+}
+
 pub struct BashTool {
     /// Tool descriptions pre-rendered per [`BashPermissionMode`], indexed by
     /// the permission's encoded byte. [`Tool::description`] returns the one for the
@@ -771,9 +810,8 @@ impl Tool for BashTool {
         // Fail closed if requested but the secret store isn't wired. The names
         // (never the values) are recorded for audit; the values are scrubbed
         // back out of the output below. See docs/secret-management.md.
-        let extra_env = if p.secret_env.is_empty() {
-            Vec::new()
-        } else {
+        let mut extra_env = ChildEnv::default();
+        if !p.secret_env.is_empty() {
             let handle = ctx.secrets.as_deref().ok_or_else(|| {
                 ToolError::Execution(
                     "secret_env was requested but no secret store is available in this context"
@@ -785,8 +823,15 @@ impl Tool for BashTool {
                 secrets = ?p.secret_env,
                 "bash: injecting user secrets as environment variables"
             );
-            handle.resolve_env(&p.secret_env).await?
-        };
+            extra_env.vars = handle.resolve_env(&p.secret_env).await?;
+            extra_env.secret_values = extra_env.vars.iter().map(|(_, v)| v.clone()).collect();
+        }
+        // An issue run commits as the agent working the card. Only there:
+        // `checkout_root` is set for exactly those sessions, and a session
+        // that never commits gains nothing from carrying an identity.
+        if ctx.checkout_root.is_some() {
+            extra_env.vars.extend(git_identity(&ctx.agent_id));
+        }
 
         // Auto permission, destructive-token command: the LLM judge decides before
         // running whether this needs human approval (replacing the blunt
@@ -852,7 +897,7 @@ impl Tool for BashTool {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
-                res = run_unsandboxed("sh", &args, cwd_ref, &extra_env, timeout) => res?,
+                res = run_unsandboxed("sh", &args, cwd_ref, &extra_env.vars, timeout) => res?,
             }
         } else if execution_route.is_sandboxed() {
             if let Some(sandbox) = ctx.sandbox.as_ref() {
@@ -866,7 +911,7 @@ impl Tool for BashTool {
                         SpawnOpts {
                             cwd: cwd_ref.map(Path::to_path_buf),
                             stdin: None,
-                            extra_env: extra_env.clone(),
+                            extra_env: extra_env.vars.clone(),
                             timeout,
                         },
                     ) => res,
@@ -936,7 +981,7 @@ async fn format_command_result(
     exit_code: i32,
     stdout_bytes: &[u8],
     stderr_bytes: &[u8],
-    extra_env: &[(String, String)],
+    extra_env: &ChildEnv,
     ctx: &ToolContext,
     escalation_note: Option<&str>,
 ) -> crate::Result<ToolOutput> {
@@ -945,12 +990,11 @@ async fn format_command_result(
     // Scrub injected secret values out of the output before it reaches the
     // agent / LLM / trace — the leak detector only catches known formats,
     // so arbitrary user tokens are redacted here by exact match.
-    if !extra_env.is_empty()
+    if !extra_env.secret_values.is_empty()
         && let Some(handle) = ctx.secrets.as_deref()
     {
-        let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-        stdout = handle.redact(&stdout, &values).await?;
-        stderr = handle.redact(&stderr, &values).await?;
+        stdout = handle.redact(&stdout, &extra_env.secret_values).await?;
+        stderr = handle.redact(&stderr, &extra_env.secret_values).await?;
     }
     let mut result = json!({
         "exit_code": exit_code,
@@ -1149,13 +1193,14 @@ async fn run_detached(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
-    extra_env: &[(String, String)],
+    extra_env: &ChildEnv,
     timeout: Duration,
     ctx: &ToolContext,
     sink: &Arc<dyn BackgroundJobSink>,
     escape_policy: SandboxEscapePolicy,
 ) -> crate::Result<Option<ToolOutput>> {
-    let Some(mut child) = spawn_detached_child(route, args, cwd, extra_env, timeout, ctx).await?
+    let Some(mut child) =
+        spawn_detached_child(route, args, cwd, &extra_env.vars, timeout, ctx).await?
     else {
         return Ok(None);
     };
@@ -1238,13 +1283,13 @@ async fn run_detached(
         DetachedOutcome::Backgrounded => {
             let display_path = stdout_path.display().to_string();
             let stderr_display_path = stderr_path.display().to_string();
-            let secret_risk_note = if extra_env.is_empty() {
+            let secret_risk_note = if extra_env.secret_values.is_empty() {
                 ""
             } else {
                 tracing::warn!(
                     target: "baybo::tools::bash",
                     command = %command,
-                    secret_env_count = extra_env.len(),
+                    secret_env_count = extra_env.secret_values.len(),
                     stdout_path = %display_path,
                     stderr_path = %stderr_display_path,
                     "background Bash command injected secret_env; output files are not redacted"
@@ -1750,7 +1795,7 @@ impl BashTool {
         &self,
         command: &str,
         cwd: Option<&Path>,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         timeout: Duration,
         ctx: &ToolContext,
         sandbox_err: ToolError,
@@ -1774,7 +1819,7 @@ impl BashTool {
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 return self
-                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                     .await;
             }
             SandboxEscapeDecision::Prompt(rationale) => rationale,
@@ -1789,7 +1834,7 @@ impl BashTool {
             .await?
         {
             self.notify_escape(ctx, command, &rationale);
-            self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+            self.run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                 .await
         } else {
             Err(ToolError::Execution(format!(
@@ -1884,7 +1929,7 @@ impl BashTool {
         exit_code: i32,
         stdout: &str,
         stderr: &str,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         ctx: &ToolContext,
     ) -> crate::Result<SandboxEscapeDecision> {
         let Some(llm) = ctx.lite_llm.as_deref() else {
@@ -1901,10 +1946,9 @@ impl BashTool {
         let mut stdout_s = stdout.to_string();
         let mut stderr_s = stderr.to_string();
         if let Some(handle) = ctx.secrets.as_deref() {
-            if !extra_env.is_empty() {
-                let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-                stdout_s = handle.redact(&stdout_s, &values).await?;
-                stderr_s = handle.redact(&stderr_s, &values).await?;
+            if !extra_env.secret_values.is_empty() {
+                stdout_s = handle.redact(&stdout_s, &extra_env.secret_values).await?;
+                stderr_s = handle.redact(&stderr_s, &extra_env.secret_values).await?;
             }
             stdout_s = handle.sanitize(&stdout_s).await?;
             stderr_s = handle.sanitize(&stderr_s).await?;
@@ -1977,7 +2021,7 @@ impl BashTool {
         command: &str,
         cwd: Option<&Path>,
         out: crate::SandboxedOutput,
-        extra_env: &[(String, String)],
+        extra_env: &ChildEnv,
         timeout: Duration,
         ctx: &ToolContext,
         policy: SandboxEscapePolicy,
@@ -2013,7 +2057,7 @@ impl BashTool {
             SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 let new = self
-                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                     .await?;
                 Ok((
                     new,
@@ -2030,7 +2074,7 @@ impl BashTool {
                 {
                     self.notify_escape(ctx, command, &rationale);
                     let new = self
-                        .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                        .run_unsandboxed_wrapped(command, cwd, &extra_env.vars, timeout, ctx)
                         .await?;
                     Ok((
                         new,
@@ -3402,7 +3446,7 @@ mod tests {
                 "true",
                 None,
                 ok,
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3422,7 +3466,7 @@ mod tests {
                 "x",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::None,
@@ -3443,7 +3487,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3469,7 +3513,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3496,7 +3540,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3518,7 +3562,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3540,7 +3584,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3561,7 +3605,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3589,7 +3633,7 @@ mod tests {
                 "true",
                 None,
                 failed_out(),
-                &[],
+                &ChildEnv::default(),
                 Duration::from_secs(5),
                 &ctx,
                 SandboxEscapePolicy::AutoJudge,
@@ -3677,7 +3721,7 @@ mod tests {
             "curl https://example.com",
             None,
             leaky,
-            &[], // no injected secrets — the path that skipped redaction entirely
+            &ChildEnv::default(), // no injected secrets — the path that skipped redaction
             Duration::from_secs(5),
             &ctx,
             SandboxEscapePolicy::AutoJudge,
@@ -3827,7 +3871,7 @@ mod tests {
             "echo hi",
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_secs(5),
             &ctx,
             &sink,
@@ -3858,7 +3902,7 @@ mod tests {
             "sleep 30",
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
             &sink,
@@ -4000,7 +4044,7 @@ mod tests {
             &script,
             &args,
             None,
-            &[],
+            &ChildEnv::default(),
             Duration::from_millis(150),
             &ctx,
             &sink,
@@ -4122,6 +4166,100 @@ mod tests {
             fake.calls()[0].cwd.as_deref(),
             Some(ctx.workspace_root.as_path()),
             "an ordinary session must be unchanged by the checkout default"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_commits_as_the_agent_working_the_card() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = baybo_model::AgentProfileId::parse("dev-1".to_owned()).expect("agent id");
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        let env = &fake.calls()[0].extra_env;
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            assert!(
+                env.iter().any(|(k, _)| k == key),
+                "{key} must reach the child: {env:?}"
+            );
+        }
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "GIT_AUTHOR_NAME" && v == "dev-1"),
+            "and it is the agent on the card, not a generic bot: {env:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_session_carries_no_git_identity() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let ctx = ctx_with(Some(sandbox));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "ls" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert!(
+            !fake.calls()[0]
+                .extra_env
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_")),
+            "a session that never commits gains nothing from an identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_own_id_is_not_scrubbed_out_of_its_output() {
+        // The reason the injected env and the redaction list had to stop
+        // being one list: they are both name/value pairs, so conflating
+        // them made anything injected disappear from output that mentioned
+        // it — and an agent's id appears in its own output constantly.
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"switched to branch issue/4-x by dev-1
+"
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.secrets = Some(Arc::new(StubSecrets));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = baybo_model::AgentProfileId::parse("dev-1".to_owned()).expect("agent id");
+
+        let out = BashTool::for_test()
+            .execute(json!({ "command": "git status" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        let ToolOutput::Json(v) = out else {
+            panic!("bash returns json");
+        };
+        let stdout = v["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("dev-1"),
+            "the agent's own id must survive its own output: {stdout}"
         );
     }
 

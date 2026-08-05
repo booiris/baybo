@@ -350,13 +350,14 @@ announces which of these will happen before sending.
   `personas/USER.md`; audited commits on the per-project git lock).
 - **Known gaps in the shipped worktree layer** (adversarial review,
   2026-08-05 — the escape it found is fixed; these are not):
-  - ~~A run cannot commit~~ **fixed**: `<workspace>/work/.gitconfig` is
-    written on first run and is `$HOME/.gitconfig` inside the sandbox, so
-    git has a committer. Still **not per-agent** — attribution wants
-    `GIT_AUTHOR_*` in the child env, and the Bash tool's env channel is
-    also the exact-match redaction list for injected secrets, so an agent
-    id put through it would be scrubbed out of every command's output.
-    Splitting those two uses is the follow-up.
+  - ~~A run cannot commit~~ **fixed**, and ~~not per-agent~~ **also
+    fixed**: an issue run's shell carries its assignee's
+    `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, so `git log` says which agent wrote
+    what. That needed the Bash tool's env channel split from its
+    redaction list (`ChildEnv`) — they were one `Vec`, so anything
+    injected was also scrubbed from output, and an agent's id appears in
+    its own output constantly. `<workspace>/work/.gitconfig` stays as the
+    fallback for every other session.
   - ~~The Bash description says the cwd is `work/`~~ **worked around**:
     it still does (`Tool::description()` takes only `&self` and is
     pre-rendered per process), but the issue brief now names the checkout

@@ -102,12 +102,12 @@ const MAX_SLUG_CHARS: usize = 40;
 /// Never overwritten. It is an ordinary git config file in a directory the
 /// user can open, so once it exists it is theirs to edit.
 ///
-/// The identity is baybo's rather than the running agent's. Per-agent
-/// attribution wants `GIT_AUTHOR_*` in the child env, and the Bash tool's
-/// env channel is also the exact-match redaction list for injected
-/// secrets — putting an agent id through it would scrub that id out of
-/// every command's output. Splitting those two uses is the follow-up; a
-/// wrong-but-present committer beats a run that cannot commit.
+/// The identity here is baybo's, and it is the **fallback**. An issue run
+/// carries its assignee's identity in `GIT_AUTHOR_*`/`GIT_COMMITTER_*`,
+/// which beats every config file git consults — see `git_identity` in the
+/// Bash tool. This file is what every other session gets: one that never
+/// commits pays nothing for it, and one that does is attributable to
+/// baybo rather than failing outright.
 pub async fn ensure_commit_identity(work_dir: &Path) -> Result<()> {
     const IDENTITY: &str = r#"# Written by baybo so agent runs can commit. Yours to edit.
 [user]
