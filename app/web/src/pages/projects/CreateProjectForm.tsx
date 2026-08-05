@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { Button } from '../../components/Button';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { createProject } from './api';
+import { budgetHint, parseBudget } from './budgetModel';
 import { writeLastProjectId } from './lastProject';
 
 export const fieldLabel = 'block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-1';
@@ -18,6 +19,7 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [workdir, setWorkdir] = useState('');
+  const [budget, setBudget] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -27,12 +29,21 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
     setSubmitting(true);
     setError(null);
     const trimmedWorkdir = workdir.trim();
+    const micros = parseBudget(budget);
+    if (micros === undefined) {
+      setSubmitting(false);
+      setError('Daily budget must be an amount in dollars, or empty for no ceiling.');
+      return;
+    }
     const outcome = await createProject(client, {
       name,
       description,
       // An omitted directory is the signal to make one; sending an empty
       // string would be a different, invalid request.
       ...(trimmedWorkdir.length > 0 ? { workdir: trimmedWorkdir } : {}),
+      // Absent and zero are different answers — no ceiling versus paused —
+      // so an empty box omits the key rather than sending 0.
+      ...(micros === null ? {} : { daily_budget_micros: micros }),
     });
     setSubmitting(false);
     if (outcome.kind === 'unauthorized') {
@@ -100,6 +111,24 @@ export function CreateProjectForm({ onDone }: { onDone?: () => void }) {
         <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
           An absolute path to an existing git repository. Left empty, one is created and
           initialised for you.
+        </p>
+      </div>
+      <div>
+        <label className={fieldLabel} htmlFor="project-budget">
+          Daily budget — optional
+        </label>
+        <input
+          id="project-budget"
+          className={textInput}
+          value={budget}
+          inputMode="decimal"
+          onChange={(event) => {
+            setBudget(event.target.value);
+          }}
+          placeholder="Leave empty for no ceiling"
+        />
+        <p className="mt-1 text-[0.7rem] text-ink-soft leading-snug">
+          {budgetHint(parseBudget(budget) ?? null)} You can change it later.
         </p>
       </div>
       {error != null ? (

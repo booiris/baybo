@@ -480,3 +480,41 @@ export async function fetchLeadMessages(
     return { kind: 'failed', message: networkMessage(e) };
   }
 }
+
+export async function updateProject(
+  client: AdminClient,
+  projectId: string,
+  body: { name: string; description: string; daily_budget_micros?: number | null },
+): Promise<Outcome<Project>> {
+  try {
+    const { data, error, response } = await client.PUT('/v1/projects/{project_id}', {
+      params: { path: { project_id: projectId } },
+      body,
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function setProjectArchived(
+  client: AdminClient,
+  projectId: string,
+  archived: boolean,
+): Promise<Outcome<Project>> {
+  try {
+    const { data, error, response } = await client.POST('/v1/projects/{project_id}/archive', {
+      params: { path: { project_id: projectId } },
+      body: { archived },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}

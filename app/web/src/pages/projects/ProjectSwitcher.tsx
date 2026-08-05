@@ -22,7 +22,15 @@ export function ProjectSwitcher({
   const [open, setOpen] = useState(false);
   const waiting = useAttention();
   const [creating, setCreating] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const root = useRef<HTMLDivElement>(null);
+  // Archived boards are hidden rather than absent: the parent hands over
+  // every project, and this decides what the dropdown shows. The current
+  // board always appears, so opening an archived one by deep link does not
+  // produce a switcher that cannot name where you are.
+  const visible = projects.filter(
+    (project) => showArchived || project.archived_at_ms == null || project.id === current?.id,
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -74,7 +82,7 @@ export function ProjectSwitcher({
           ) : (
             <>
               <ul className="max-h-[300px] overflow-y-auto">
-                {projects.map((project) => {
+                {visible.map((project) => {
                   const isCurrent = project.id === current?.id;
                   const stuck = attentionFor(waiting, project.id);
                   return (
@@ -89,6 +97,11 @@ export function ProjectSwitcher({
                         }`}
                       >
                         <span className="truncate">{project.name}</span>
+                        {project.archived_at_ms == null ? null : (
+                          <span className="shrink-0 rounded border border-warn/50 bg-warn/10 text-warn px-1 font-mono text-[0.52rem] font-bold uppercase">
+                            archived
+                          </span>
+                        )}
                         {/* The rail badge counts boards; this is where the
                             board says what, so a number the rail cannot
                             explain always has somewhere to decompose. */}
@@ -107,9 +120,9 @@ export function ProjectSwitcher({
                     </li>
                   );
                 })}
-                {projects.length === 0 ? (
+                {visible.length === 0 ? (
                   <li className="px-3 py-2 font-mono text-[0.7rem] text-ink-soft">
-                    No projects yet
+                    {projects.length === 0 ? 'No projects yet' : 'No live projects'}
                   </li>
                 ) : null}
               </ul>
@@ -122,6 +135,18 @@ export function ProjectSwitcher({
               >
                 ＋ New project…
               </button>
+              {projects.some((project) => project.archived_at_ms != null) ? (
+                <label className="flex items-center gap-1.5 px-3 py-2 border-t border-black/20 font-mono text-[0.66rem] text-ink-soft cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showArchived}
+                    onChange={(event) => {
+                      setShowArchived(event.target.checked);
+                    }}
+                  />
+                  Show archived
+                </label>
+              ) : null}
             </>
           )}
         </div>

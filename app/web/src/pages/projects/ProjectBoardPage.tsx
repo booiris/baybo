@@ -63,6 +63,7 @@ import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ActivityDrawer } from './ActivityDrawer';
 import { LeadPanel } from './LeadPanel';
+import { ProjectSettings } from './ProjectSettings';
 import { BoardFilterBar } from './BoardFilterBar';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
@@ -104,6 +105,7 @@ export function ProjectBoardPage() {
   // One right-hand slot, so the two panels are mutually exclusive — the
   // spec's rule, and the board would have no room for both anyway.
   const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
 
   // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
   // a rollback needs the board as it was before the drag started.
@@ -117,7 +119,11 @@ export function ProjectBoardPage() {
         await Promise.all([
           fetchProject(client, projectId),
           fetchIssues(client, projectId),
-          fetchProjects(client, false),
+          // Archived boards included: the switcher hides them behind its
+          // own toggle, which is a render-time decision like the board's
+          // own filters. The landing resolver still asks for live ones
+          // only — it must never open a read-only board by default.
+          fetchProjects(client, true),
           fetchTeam(client, projectId),
           fetchActiveRuns(client, projectId),
         ]);
@@ -358,6 +364,17 @@ export function ProjectBoardPage() {
           >
             Activity
           </button>
+          <button
+            type="button"
+            aria-label="Project settings"
+            title="Project settings"
+            onClick={() => {
+              setShowSettings(true);
+            }}
+            className="border-2 border-black rounded-md bg-surface px-2 py-0.5 font-mono text-[0.62rem] font-bold"
+          >
+            ⚙
+          </button>
         </div>
       </header>
 
@@ -435,6 +452,21 @@ export function ProjectBoardPage() {
         />
       ) : null}
       </div>
+
+      {showSettings && project !== null ? (
+        <ProjectSettings
+          project={project}
+          onClose={() => {
+            setShowSettings(false);
+          }}
+          onSaved={(saved) => {
+            setProject(saved);
+            // The board refetches too: raising a ceiling releases held
+            // runs on the spot, so the cards change with the setting.
+            setRefreshKey((key) => key + 1);
+          }}
+        />
+      ) : null}
 
       {createIn !== null ? (
         <CreateIssueModal
