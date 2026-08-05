@@ -75,6 +75,8 @@ mod tests {
             position: 0,
             blocked_reason: None,
             branch: None,
+            parent_issue_id: None,
+            stage: 0,
             cancelled_at: None,
             created_at: now,
             updated_at: now,

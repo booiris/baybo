@@ -486,6 +486,35 @@ function SortableIssueCard({
   );
 }
 
+/**
+ * A parent card's progress: how many of its steps are done.
+ *
+ * The server counts cancelled steps out of *both* numbers, so a card whose
+ * last steps were called off reads `3/3` and finished rather than `3/5` and
+ * stuck. Rendered as a bar rather than a literal ring — at this size a ring
+ * is two pixels of arc and a bar is legible.
+ */
+function SubIssueRing({ progress }: { progress: { done: number; total: number } }) {
+  const { done, total } = progress;
+  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+  return (
+    <div
+      className="flex items-center gap-1.5"
+      title={`${done} of ${total} sub-issues done`}
+    >
+      <div className="flex-1 h-1 border border-black/25 rounded-full overflow-hidden bg-canvas">
+        <div
+          className={`h-full ${done === total ? 'bg-ok' : 'bg-brand'}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="font-mono text-[0.54rem] text-ink-soft tabular-nums">
+        {done}/{total}
+      </span>
+    </div>
+  );
+}
+
 /** Initial-free avatar dot — the agent's identity is its colour and title. */
 function AssigneeDot({ assignee, working = false }: { assignee: string; working?: boolean }) {
   return (
@@ -530,6 +559,7 @@ function IssueCard({
       >
         {issue.title}
       </p>
+      {issue.sub_issues != null ? <SubIssueRing progress={issue.sub_issues} /> : null}
       {issue.blocked_reason != null ? (
         <span className="self-start border border-warn/50 bg-warn/10 text-warn rounded px-1.5 font-mono text-[0.56rem] font-bold uppercase">
           ⚑ Blocked

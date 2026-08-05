@@ -11,6 +11,7 @@ mod error;
 mod events;
 mod manager;
 mod runs;
+mod stages;
 mod timeline;
 pub mod tools;
 pub mod worktree;
@@ -24,5 +25,6 @@ pub use manager::{
     NewProject, NewTeamMember, ProjectManager, RunDispatch, no_dispatch, validate_workdir,
 };
 pub use runs::{Transition, triggers_run};
+pub use stages::{all_finished, open_stages, progress, stage_complete};
 pub use timeline::diff_events;
 pub use worktree::Checkout;

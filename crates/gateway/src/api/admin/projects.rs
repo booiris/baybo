@@ -58,6 +58,21 @@ pub(super) fn project_err(e: ProjectError) -> GatewayError {
     }
 }
 
+/// One card, with the parent number and progress ring its board implies.
+///
+/// A second read of the board — the price of `parent` being a *number* on
+/// the wire while the row carries an id. Worth it: every other reference on
+/// this surface is a number, and a client that had to resolve ULIDs to draw
+/// a card would need a second endpoint to do it.
+async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Result<IssueDto> {
+    let board = state
+        .project_manager
+        .list_issues(project)
+        .await
+        .map_err(project_err)?;
+    Ok(IssueDto::on_board(row, &board))
+}
+
 /// Parse a path segment into a [`ProjectId`], running the same grammar the
 /// filesystem depends on rather than trusting the URL.
 pub(super) fn parse_project_id(raw: &str) -> Result<ProjectId> {
@@ -213,11 +228,64 @@ pub struct IssueDto {
     /// whichever column it was in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// The issue this one is a step of, by its number on this board.
+    /// Absent on a top-level card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<i64>,
+    /// Which barrier under that parent. `0` and meaningless without one.
+    pub stage: i64,
+    /// This card's own steps, if it has any: how many are done out of how
+    /// many still meant to happen. Cancelled steps leave both counts, so a
+    /// card whose last steps were called off reads finished rather than
+    /// stuck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_issues: Option<SubIssueProgress>,
     /// Present once the issue is cancelled. The row is never deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// A parent card's progress ring.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub struct SubIssueProgress {
+    pub done: i64,
+    pub total: i64,
+}
+
+impl IssueDto {
+    /// Build one card against the board it lives on.
+    ///
+    /// The parent number and the progress ring are both derived from
+    /// `board` rather than queried: a list read already holds every issue
+    /// in the project, so resolving them in memory costs nothing and
+    /// cannot disagree with the rows beside it.
+    pub fn on_board(row: IssueRow, board: &[IssueRow]) -> Self {
+        let parent = row.parent_issue_id.as_ref().and_then(|id| {
+            board
+                .iter()
+                .find(|issue| &issue.id == id)
+                .map(|issue| issue.number)
+        });
+        let children: Vec<IssueRow> = board
+            .iter()
+            .filter(|issue| issue.parent_issue_id.as_ref() == Some(&row.id))
+            .cloned()
+            .collect();
+        let sub_issues = (!children.is_empty()).then(|| {
+            let (done, total) = baybo_project::progress(&children);
+            SubIssueProgress {
+                done: done as i64,
+                total: total as i64,
+            }
+        });
+        Self {
+            parent,
+            sub_issues,
+            ..Self::from(row)
+        }
+    }
 }
 
 impl From<IssueRow> for IssueDto {
@@ -233,6 +301,9 @@ impl From<IssueRow> for IssueDto {
             position: row.position,
             branch: row.branch,
             blocked_reason: row.blocked_reason,
+            parent: None,
+            stage: row.stage,
+            sub_issues: None,
             cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -276,6 +347,7 @@ pub enum RunTriggerDto {
     Assigned,
     Retry,
     Comment,
+    StageBarrier,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -285,6 +357,7 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Assigned => Self::Assigned,
             RunTrigger::Retry => Self::Retry,
             RunTrigger::Comment => Self::Comment,
+            RunTrigger::StageBarrier => Self::StageBarrier,
         }
     }
 }
@@ -333,6 +406,9 @@ pub enum IssueEventBodyDto {
     WorktreeKept {
         reason: String,
     },
+    StageCompleted {
+        stage: i64,
+    },
     BudgetExhausted {
         spent_micros: i64,
         limit_micros: i64,
@@ -346,6 +422,7 @@ pub enum IssueEventBodyDto {
 impl From<IssueEventBody> for IssueEventBodyDto {
     fn from(body: IssueEventBody) -> Self {
         match body {
+            IssueEventBody::StageCompleted { stage } => Self::StageCompleted { stage },
             IssueEventBody::BudgetExhausted {
                 spent_micros,
                 limit_micros,
@@ -534,6 +611,12 @@ pub struct CreateIssueRequest {
     /// In Progress.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// Open it as a step of that issue's number. One level only.
+    #[serde(default)]
+    pub parent: Option<i64>,
+    /// Which barrier under the parent. Ignored without one.
+    #[serde(default)]
+    pub stage: Option<i64>,
 }
 
 /// Sparse patch: a field the body leaves out is left alone.
@@ -554,6 +637,11 @@ pub struct UpdateIssueRequest {
     pub blocked_reason: Option<Option<String>>,
     #[serde(default)]
     pub cancelled: Option<bool>,
+    /// Re-parent by number; `0` detaches. Absent leaves the parent alone.
+    #[serde(default)]
+    pub parent: Option<i64>,
+    #[serde(default)]
+    pub stage: Option<i64>,
 }
 
 /// One drag-and-drop: where the card lands, plus that column's full
@@ -728,13 +816,15 @@ async fn list_issues(
     Path(project_id): Path<String>,
 ) -> Result<Json<ListResponse<IssueDto>>> {
     let id = parse_project_id(&project_id)?;
-    let items = state
+    let board = state
         .project_manager
         .list_issues(&id)
         .await
-        .map_err(project_err)?
-        .into_iter()
-        .map(IssueDto::from)
+        .map_err(project_err)?;
+    let items = board
+        .iter()
+        .cloned()
+        .map(|row| IssueDto::on_board(row, &board))
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
@@ -770,11 +860,13 @@ async fn create_issue(
                 status: req.status.unwrap_or(IssueStatusDto::Backlog).into(),
                 priority: req.priority.unwrap_or_default().into(),
                 assignee: parse_assignee(req.assignee)?,
+                parent: req.parent,
+                stage: req.stage.unwrap_or(0),
             },
         )
         .await
         .map_err(project_err)?;
-    Ok((StatusCode::CREATED, Json(IssueDto::from(row))))
+    Ok((StatusCode::CREATED, Json(on_board(&state, &id, row).await?)))
 }
 
 #[utoipa::path(
@@ -801,7 +893,7 @@ async fn get_issue(
         .get_issue(&id, number)
         .await
         .map_err(project_err)?;
-    Ok(Json(IssueDto::from(row)))
+    Ok(Json(on_board(&state, &id, row).await?))
 }
 
 #[utoipa::path(
@@ -827,6 +919,21 @@ async fn update_issue(
     Json(req): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueDto>> {
     let id = parse_project_id(&project_id)?;
+    // The wire addresses a parent by number, like every other reference on
+    // this surface; the store wants an id. `0` detaches, which is the one
+    // number no issue has.
+    let parent = match req.parent {
+        None => None,
+        Some(0) => Some(None),
+        Some(number) => Some(Some(
+            state
+                .project_manager
+                .get_issue(&id, number)
+                .await
+                .map_err(project_err)?
+                .id,
+        )),
+    };
     let row = state
         .project_manager
         .update_issue(
@@ -840,11 +947,13 @@ async fn update_issue(
                 assignee: req.assignee.map(parse_assignee).transpose()?,
                 blocked_reason: req.blocked_reason,
                 cancelled: req.cancelled,
+                parent,
+                stage: req.stage,
             },
         )
         .await
         .map_err(project_err)?;
-    Ok(Json(IssueDto::from(row)))
+    Ok(Json(on_board(&state, &id, row).await?))
 }
 
 #[utoipa::path(
@@ -881,7 +990,7 @@ async fn move_issue(
         )
         .await
         .map_err(project_err)?;
-    Ok(Json(IssueDto::from(row)))
+    Ok(Json(on_board(&state, &id, row).await?))
 }
 
 #[utoipa::path(

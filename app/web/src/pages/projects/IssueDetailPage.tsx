@@ -58,6 +58,7 @@ const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   assigned: 'assigned',
   retry: 'retry',
   comment: 'comment',
+  stage_barrier: 'stage barrier',
 };
 
 function RunRow({

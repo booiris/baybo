@@ -309,6 +309,16 @@ const ADD_COLUMNS: &[AddColumn] = &[
     },
     AddColumn {
         table: "issues",
+        column: "parent_issue_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
+        column: "stage",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    AddColumn {
+        table: "issues",
         column: "branch",
         definition: "TEXT",
     },
@@ -1341,6 +1351,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- renumbers the whole target column in one transaction.
                     position       INTEGER NOT NULL,
                     blocked_reason TEXT,
+                    -- Sub-issues, one level deep. `stage` is the barrier a
+                    -- child belongs to under its parent; it is 0 and
+                    -- meaningless on a top-level issue.
+                    parent_issue_id TEXT,
+                    stage          INTEGER NOT NULL DEFAULT 0,
                     -- The branch this issue's work landed on. NULL until it
                     -- has a commit: worktree and branch are separate ideas,
                     -- and a research issue that produced a report and no
@@ -1460,7 +1475,12 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          -- Serves the budget gate: one board's run sessions, which the
          -- spend query joins `cost_records` against.
          CREATE INDEX IF NOT EXISTS idx_issue_runs_project_session
-             ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;",
+             ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;
+         -- Serves the stage barrier and the card's progress ring: one
+         -- parent's children, in stage order.
+         CREATE INDEX IF NOT EXISTS idx_issues_children
+             ON issues(parent_issue_id, stage, position)
+             WHERE parent_issue_id IS NOT NULL;",
     )
     .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
 

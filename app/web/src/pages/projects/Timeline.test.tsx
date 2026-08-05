@@ -19,6 +19,7 @@ const ISSUE: Issue = {
   priority: 'none',
   assignee: 'dev-1',
   position: 0,
+  stage: 0,
   created_at_ms: 0,
   updated_at_ms: 0,
 };

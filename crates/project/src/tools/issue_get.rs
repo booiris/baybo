@@ -155,6 +155,9 @@ fn narrate(body: &IssueEventBody) -> String {
         IssueEventBody::WorktreeKept { reason } => {
             format!("left the worktree in place: {reason}")
         }
+        IssueEventBody::StageCompleted { stage } => {
+            format!("stage {stage} finished — every step in it is done")
+        }
         IssueEventBody::BudgetExhausted {
             spent_micros,
             limit_micros,

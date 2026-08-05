@@ -98,6 +98,8 @@ fn new_issue(title: &str) -> NewIssueRequest {
         status: IssueStatus::Backlog,
         priority: IssuePriority::None,
         assignee: None,
+        parent: None,
+        stage: 0,
     }
 }
 
@@ -1625,5 +1627,295 @@ async fn a_board_with_no_ceiling_is_never_held() {
     assert_eq!(
         f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
         RunStatus::Queued
+    );
+}
+
+/// The barrier: a stage opens exactly once, when the last step in it
+/// finishes, and it wakes whoever is on the parent.
+#[tokio::test]
+async fn finishing_a_stage_wakes_the_parent_once() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Stages"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+
+    let parent = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(lead.clone()),
+                status: IssueStatus::Todo,
+                ..new_issue("ship the thing")
+            },
+        )
+        .await
+        .expect("parent");
+    for (title, stage) in [("design", 0), ("review the design", 0), ("build", 1)] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    parent: Some(parent.number),
+                    stage,
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{title}: {e}"));
+    }
+    f.dispatched.lock().clear();
+
+    // The first step of stage 0 finishing is not the stage finishing.
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
+        .await
+        .expect("finish #2");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "stage 0 still has a step left"
+    );
+
+    f.manager
+        .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Done, &[3, 2])
+        .await
+        .expect("finish #3");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "stage 0 emptied, so the parent woke"
+    );
+    assert_eq!(f.dispatched.lock()[0].number, parent.number);
+    assert_eq!(f.dispatched.lock()[0].trigger, RunTrigger::StageBarrier);
+    assert!(
+        f.manager
+            .timeline(&p.id, parent.number)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::StageCompleted { stage: 0 }
+            )),
+        "and the parent's card says which stage opened"
+    );
+
+    // Re-saving a Done step must not wake it again. The parent's run has
+    // to be settled first, or the dedupe index would refuse the second
+    // enqueue and hide a barrier that fires on every save.
+    f.manager
+        .cancel_run(&p.id, parent.number)
+        .await
+        .expect("settle the parent's run");
+    f.dispatched.lock().clear();
+    f.manager
+        .update_issue(
+            &p.id,
+            3,
+            IssueActor::User,
+            IssueUpdate {
+                title: Some("review the design (again)".into()),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("retitle");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "the barrier fires on the transition into Done, not on every save of a Done step"
+    );
+}
+
+/// A cancelled step must not hold its stage open — cancelling is how an
+/// operator unblocks a barrier on work nobody is going to do.
+#[tokio::test]
+async fn a_cancelled_step_opens_its_stage() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Cancelling"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    let parent = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(lead),
+                status: IssueStatus::Todo,
+                ..new_issue("parent")
+            },
+        )
+        .await
+        .expect("parent");
+    for title in ["will happen", "will not"] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    parent: Some(parent.number),
+                    stage: 0,
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("child");
+    }
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
+        .await
+        .expect("finish #2");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .update_issue(
+            &p.id,
+            3,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("cancel #3");
+    assert_eq!(f.dispatched.lock().len(), 1, "the stage opened");
+    assert_eq!(f.dispatched.lock()[0].trigger, RunTrigger::StageBarrier);
+}
+
+/// Sub-issues are one level deep, and that is enforced in both directions.
+#[tokio::test]
+async fn sub_issues_do_not_nest() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Flat"))
+        .await
+        .expect("p");
+    let parent = f
+        .manager
+        .create_issue(&p.id, IssueActor::User, new_issue("parent"))
+        .await
+        .expect("parent");
+    let child = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                parent: Some(parent.number),
+                ..new_issue("child")
+            },
+        )
+        .await
+        .expect("child");
+
+    // A step cannot be given steps.
+    let refused = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                parent: Some(child.number),
+                ..new_issue("grandchild")
+            },
+        )
+        .await
+        .expect_err("a step cannot have steps");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    // …and a card that already has steps cannot become one.
+    let refused = f
+        .manager
+        .update_issue(
+            &p.id,
+            parent.number,
+            IssueActor::User,
+            IssueUpdate {
+                parent: Some(Some(child.id.clone())),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect_err("a parent cannot become a child");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+
+    // Nor can an issue be its own step.
+    let refused = f
+        .manager
+        .update_issue(
+            &p.id,
+            child.number,
+            IssueActor::User,
+            IssueUpdate {
+                parent: Some(Some(child.id.clone())),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect_err("self-parenting");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+}
+
+/// A parent id from another board must not resolve — `IssueUpdate::parent`
+/// carries a ULID, so the scope check is the only thing between a request
+/// and somebody else's card.
+#[tokio::test]
+async fn a_parent_from_another_board_does_not_resolve() {
+    let f = fixture().await;
+    let mine = f
+        .manager
+        .create_project(new_project("mine"))
+        .await
+        .expect("p");
+    let theirs = f
+        .manager
+        .create_project(new_project("theirs"))
+        .await
+        .expect("p");
+    let outsider = f
+        .manager
+        .create_issue(&theirs.id, IssueActor::User, new_issue("their card"))
+        .await
+        .expect("their issue");
+    f.manager
+        .create_issue(&mine.id, IssueActor::User, new_issue("my card"))
+        .await
+        .expect("my issue");
+
+    let refused = f
+        .manager
+        .update_issue(
+            &mine.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                parent: Some(Some(outsider.id)),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect_err("another board's card is not a parent here");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
     );
 }

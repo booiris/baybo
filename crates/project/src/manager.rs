@@ -101,6 +101,10 @@ pub struct NewIssueRequest {
     pub status: IssueStatus,
     pub priority: IssuePriority,
     pub assignee: Option<AgentProfileId>,
+    /// The issue this one is a step of, by its number on this board.
+    pub parent: Option<i64>,
+    /// Which barrier under that parent. Ignored without a parent.
+    pub stage: i64,
 }
 
 pub struct ProjectManager {
@@ -914,6 +918,10 @@ impl ProjectManager {
             self.validate_assignee(project, assignee).await?;
         }
         self.validate_staffing(new.status, new.assignee.as_ref())?;
+        let parent = match new.parent {
+            Some(number) => Some(self.validate_parent(project, number, None).await?),
+            None => None,
+        };
         let issue = self
             .store
             .create_issue(&NewIssue {
@@ -924,6 +932,8 @@ impl ProjectManager {
                 status: new.status,
                 priority: new.priority,
                 assignee: new.assignee,
+                parent_issue_id: parent.as_ref().map(|p| p.id.clone()),
+                stage: if parent.is_some() { new.stage } else { 0 },
                 created_at: chrono::Utc::now(),
             })
             .await?;
@@ -956,6 +966,11 @@ impl ProjectManager {
         self.writable_project(project).await?;
         if update.is_empty() {
             return Err(ProjectError::invalid("update", "sets no field"));
+        }
+        if let Some(Some(parent_id)) = update.parent.as_ref() {
+            let parent = self.issue_by_id(project, parent_id).await?;
+            let child = self.get_issue(project, number).await?;
+            self.validate_parent_row(&parent, Some(&child)).await?;
         }
         if let Some(next) = update.assignee.as_ref() {
             if let Some(assignee) = next.as_ref() {
@@ -994,10 +1009,66 @@ impl ProjectManager {
         let after = self.get_issue(project, number).await?;
         self.events.board_changed(project, Some(number));
         self.record_diff(&before, &after, actor.clone()).await;
-        self.reclaim_if_finished(&before, &after, actor).await;
+        self.reclaim_if_finished(&before, &after, actor.clone())
+            .await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
+        self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)
+    }
+
+    /// Wake a parent when one of its stages just emptied.
+    ///
+    /// Only on the *transition* into a finished state, and only for a child:
+    /// re-saving a Done sub-issue must not wake the parent again, and an
+    /// ordinary card has no parent to wake.
+    ///
+    /// The wake goes through the same ledger as everything else — record,
+    /// then dispatch — so a barrier that fires while the process dies is a
+    /// run the boot sweep finds rather than a stage that silently never
+    /// opened.
+    async fn check_stage_barrier(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
+        let finished =
+            |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
+        if finished(before) || !finished(after) {
+            return;
+        }
+        let Some(parent_id) = after.parent_issue_id.clone() else {
+            return;
+        };
+        let children = match self.store.list_children(&parent_id).await {
+            Ok(children) => children,
+            Err(e) => {
+                tracing::error!(issue = after.number, error = %e, "could not read a parent's children");
+                return;
+            }
+        };
+        if !crate::stage_complete(&children, after.stage) {
+            return;
+        }
+        // The parent is addressed by number like everything else, so the
+        // barrier reads it back rather than carrying a half-row around.
+        let parent = match self.store.list_issues(&after.project_id).await {
+            Ok(issues) => issues.into_iter().find(|issue| issue.id == parent_id),
+            Err(e) => {
+                tracing::error!(issue = after.number, error = %e, "could not read the parent issue");
+                return;
+            }
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        self.record(
+            &parent,
+            actor,
+            IssueEventBody::StageCompleted { stage: after.stage },
+        )
+        .await;
+        // Nobody on the parent means nobody to wake. The event above still
+        // lands, so the operator sees the stage opened and can staff it.
+        if parent.assignee.is_some() {
+            self.enqueue(&parent, RunTrigger::StageBarrier).await;
+        }
     }
 
     /// Move an issue into `status`, with `ordered_numbers` giving that
@@ -1031,10 +1102,83 @@ impl ProjectManager {
         }
         let after = self.get_issue(project, number).await?;
         self.record_diff(&before, &after, actor.clone()).await;
-        self.reclaim_if_finished(&before, &after, actor).await;
+        self.reclaim_if_finished(&before, &after, actor.clone())
+            .await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
+        self.check_stage_barrier(&before, &after, actor).await;
         Ok(after)
+    }
+
+    /// One issue's sub-issues, by stage then position.
+    pub async fn children(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueRow>> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.store.list_children(&issue.id).await?)
+    }
+
+    /// Resolve and check a proposed parent.
+    ///
+    /// Three refusals, all of which would otherwise produce a board nobody
+    /// can read: a parent on another project (or missing), an issue made a
+    /// step of itself, and a second level of nesting — either because the
+    /// proposed parent is already a child, or because the issue being
+    /// re-parented has children of its own. One level is a decision, and
+    /// this is where it is kept.
+    async fn validate_parent(
+        &self,
+        project: &ProjectId,
+        parent_number: i64,
+        child: Option<&IssueRow>,
+    ) -> Result<IssueRow> {
+        let parent = self.get_issue(project, parent_number).await?;
+        self.validate_parent_row(&parent, child).await?;
+        Ok(parent)
+    }
+
+    async fn validate_parent_row(&self, parent: &IssueRow, child: Option<&IssueRow>) -> Result<()> {
+        if let Some(child) = child {
+            if child.id == parent.id {
+                return Err(ProjectError::invalid(
+                    "parent",
+                    "an issue cannot be a step of itself",
+                ));
+            }
+            if !self.store.list_children(&child.id).await?.is_empty() {
+                return Err(ProjectError::invalid(
+                    "parent",
+                    format!(
+                        "#{} has sub-issues of its own, and sub-issues are one level deep",
+                        child.number
+                    ),
+                ));
+            }
+        }
+        if parent.parent_issue_id.is_some() {
+            return Err(ProjectError::invalid(
+                "parent",
+                format!(
+                    "#{} is already a sub-issue, and sub-issues are one level deep",
+                    parent.number
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// This board's issue with that ULID.
+    ///
+    /// Scoped on purpose: `IssueUpdate::parent` carries an id, so without
+    /// this a caller could make one board's card a step of another's. The
+    /// lookup is by list rather than by a store method because the scope
+    /// *is* the check — a `get_by_id` would be the thing that lets it
+    /// through.
+    pub async fn issue_by_id(&self, project: &ProjectId, id: &IssueId) -> Result<IssueRow> {
+        self.store
+            .list_issues(project)
+            .await?
+            .into_iter()
+            .find(|issue| &issue.id == id)
+            .ok_or_else(|| ProjectError::invalid("parent", format!("no issue {id} on this board")))
     }
 
     /// An assignee has to be an agent on *this* board that can actually run.

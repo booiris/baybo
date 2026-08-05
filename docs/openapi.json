@@ -4644,6 +4644,7 @@
                           "status",
                           "priority",
                           "position",
+                          "stage",
                           "created_at_ms",
                           "updated_at_ms"
                         ],
@@ -4689,6 +4690,14 @@
                             "format": "int64",
                             "description": "The human address, unique within its project: `#3`."
                           },
+                          "parent": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+                          },
                           "position": {
                             "type": "integer",
                             "format": "int64",
@@ -4700,8 +4709,24 @@
                           "project_id": {
                             "type": "string"
                           },
+                          "stage": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Which barrier under that parent. `0` and meaningless without one."
+                          },
                           "status": {
                             "$ref": "#/components/schemas/IssueStatusDto"
+                          },
+                          "sub_issues": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/SubIssueProgress",
+                                "description": "This card's own steps, if it has any: how many are done out of how\nmany still meant to happen. Cancelled steps leave both counts, so a\ncard whose last steps were called off reads finished rather than\nstuck."
+                              }
+                            ]
                           },
                           "title": {
                             "type": "string"
@@ -7618,6 +7643,14 @@
           "description": {
             "type": "string"
           },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Open it as a step of that issue's number. One level only."
+          },
           "priority": {
             "oneOf": [
               {
@@ -7627,6 +7660,14 @@
                 "$ref": "#/components/schemas/IssuePriorityDto"
               }
             ]
+          },
+          "stage": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Which barrier under the parent. Ignored without one."
           },
           "status": {
             "oneOf": [
@@ -8132,6 +8173,7 @@
           "status",
           "priority",
           "position",
+          "stage",
           "created_at_ms",
           "updated_at_ms"
         ],
@@ -8177,6 +8219,14 @@
             "format": "int64",
             "description": "The human address, unique within its project: `#3`."
           },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The issue this one is a step of, by its number on this board.\nAbsent on a top-level card."
+          },
           "position": {
             "type": "integer",
             "format": "int64",
@@ -8188,8 +8238,24 @@
           "project_id": {
             "type": "string"
           },
+          "stage": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Which barrier under that parent. `0` and meaningless without one."
+          },
           "status": {
             "$ref": "#/components/schemas/IssueStatusDto"
+          },
+          "sub_issues": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubIssueProgress",
+                "description": "This card's own steps, if it has any: how many are done out of how\nmany still meant to happen. Cancelled steps leave both counts, so a\ncard whose last steps were called off reads finished rather than\nstuck."
+              }
+            ]
           },
           "title": {
             "type": "string"
@@ -8413,6 +8479,25 @@
               },
               "reason": {
                 "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stage_completed"
+                ]
+              },
+              "stage": {
+                "type": "integer",
+                "format": "int64"
               }
             }
           },
@@ -9360,7 +9445,8 @@
           "started",
           "assigned",
           "retry",
-          "comment"
+          "comment",
+          "stage_barrier"
         ]
       },
       "SessionKind": {
@@ -9621,6 +9707,24 @@
           },
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "SubIssueProgress": {
+        "type": "object",
+        "description": "A parent card's progress ring.",
+        "required": [
+          "done",
+          "total"
+        ],
+        "properties": {
+          "done": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -10038,6 +10142,14 @@
               "null"
             ]
           },
+          "parent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Re-parent by number; `0` detaches. Absent leaves the parent alone."
+          },
           "priority": {
             "oneOf": [
               {
@@ -10047,6 +10159,13 @@
                 "$ref": "#/components/schemas/IssuePriorityDto"
               }
             ]
+          },
+          "stage": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           },
           "title": {
             "type": [

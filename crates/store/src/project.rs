@@ -169,6 +169,14 @@ pub struct IssueRow {
     /// UI can key "show a branch" on this field alone rather than on a
     /// second has-commits flag that could disagree with it.
     pub branch: Option<String>,
+    /// The issue this one is a sub-issue of. One level only: a child
+    /// cannot itself be a parent, so a board is a list of cards and their
+    /// steps rather than a tree nobody can read at a glance.
+    pub parent_issue_id: Option<IssueId>,
+    /// Which barrier this child belongs to under its parent. Stage `N`
+    /// starts when every non-cancelled child of stage `N-1` is Done.
+    /// Meaningless — and always `0` — on an issue with no parent.
+    pub stage: i64,
     /// The terminal negative. A cancelled issue keeps its row, its number
     /// and its history; it just stops counting as live work.
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -184,6 +192,9 @@ pub struct IssueUpdate {
     pub title: Option<String>,
     pub description: Option<String>,
     pub priority: Option<IssuePriority>,
+    /// `Some(None)` detaches from the parent; `None` leaves it alone.
+    pub parent: Option<Option<IssueId>>,
+    pub stage: Option<i64>,
     /// `Some(None)` unassigns; `None` leaves the assignee alone.
     pub assignee: Option<Option<AgentProfileId>>,
     pub blocked_reason: Option<Option<String>>,
@@ -197,6 +208,8 @@ impl IssueUpdate {
         self.title.is_none()
             && self.description.is_none()
             && self.priority.is_none()
+            && self.parent.is_none()
+            && self.stage.is_none()
             && self.assignee.is_none()
             && self.blocked_reason.is_none()
             && self.cancelled.is_none()
@@ -213,6 +226,9 @@ pub struct NewIssue {
     pub status: IssueStatus,
     pub priority: IssuePriority,
     pub assignee: Option<AgentProfileId>,
+    /// The issue this one is a step of, if it is one.
+    pub parent_issue_id: Option<IssueId>,
+    pub stage: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -298,6 +314,11 @@ pub enum IssueEventBody {
     WorktreeKept {
         reason: String,
     },
+    /// Every non-cancelled child in one of this issue's stages reached
+    /// Done, so its assignee was woken to drive the next one.
+    StageCompleted {
+        stage: i64,
+    },
     /// The run was recorded but not started: this project has spent its
     /// budget for the day. The row stays queued, so the work is not lost —
     /// it starts as soon as the board has headroom again.
@@ -330,6 +351,7 @@ impl IssueEventBody {
             IssueEventBody::Cancelled => "cancelled",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
+            IssueEventBody::StageCompleted { .. } => "stage_completed",
             IssueEventBody::BudgetExhausted { .. } => "budget_exhausted",
             IssueEventBody::BudgetRestored { .. } => "budget_restored",
         }
@@ -389,6 +411,9 @@ pub trait ProjectStore: Send + Sync {
         project: &ProjectId,
         since: DateTime<Utc>,
     ) -> Result<baybo_model::MicroUsd>;
+
+    /// One issue's direct children, by stage then position.
+    async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>>;
 
     /// Move a just-recorded run to `Held`: the board is over budget, so it
     /// was recorded but must not start. Guarded on `Queued`, so a run the
@@ -515,6 +540,9 @@ pub enum RunTrigger {
     Retry,
     /// Somebody commented on live work that nobody was reading.
     Comment,
+    /// Every child in one of this issue's stages finished, so its assignee
+    /// was woken to drive the next one.
+    StageBarrier,
 }
 
 impl RunTrigger {
@@ -524,6 +552,7 @@ impl RunTrigger {
             RunTrigger::Assigned => "assigned",
             RunTrigger::Retry => "retry",
             RunTrigger::Comment => "comment",
+            RunTrigger::StageBarrier => "stage_barrier",
         }
     }
 
@@ -533,6 +562,7 @@ impl RunTrigger {
             "assigned" => Some(RunTrigger::Assigned),
             "retry" => Some(RunTrigger::Retry),
             "comment" => Some(RunTrigger::Comment),
+            "stage_barrier" => Some(RunTrigger::StageBarrier),
             _ => None,
         }
     }

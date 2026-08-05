@@ -46,6 +46,11 @@ struct Params {
     blocked: Option<String>,
     #[serde(default)]
     cancelled: Option<bool>,
+    /// The issue this one is a step of, by number; `0` detaches it.
+    #[serde(default)]
+    parent: Option<i64>,
+    #[serde(default)]
+    stage: Option<i64>,
 }
 
 impl IssueUpdateTool {
@@ -106,6 +111,8 @@ Two of these do more than edit a row:
                 "assignee": { "type": "string", "description": format!("An `@handle` from the team, or `{UNASSIGN}` to unassign.") },
                 "blocked": { "type": "string", "description": "Why it is blocked; an empty string unblocks it." },
                 "cancelled": { "type": "boolean", "description": "Cancel (or un-cancel) the issue." },
+                "parent": { "type": "integer", "description": "Make this a sub-issue of that issue's number; `0` detaches it. One level only." },
+                "stage": { "type": "integer", "description": "Which barrier under the parent. Stage N starts when every step of stage N-1 is done." },
             },
             "required": ["number"],
         })
@@ -132,9 +139,25 @@ Two of these do more than edit a row:
             Some(raw) => Some(Some(resolve_handle(&self.manager, &project, raw).await?)),
         };
         let status = p.status.as_deref().map(parse_status).transpose()?;
+        // The model addresses the parent by number, like everything else on
+        // the board; the store wants an id. Resolving here rather than
+        // widening the tool's vocabulary keeps ULIDs out of the schema.
+        let parent = match p.parent {
+            None => None,
+            Some(0) => Some(None),
+            Some(number) => Some(Some(
+                self.manager
+                    .get_issue(&project, number)
+                    .await
+                    .map_err(project_err)?
+                    .id,
+            )),
+        };
         let update = IssueUpdate {
             title: p.title,
             description: p.description,
+            parent,
+            stage: p.stage,
             priority: p.priority.as_deref().map(parse_priority).transpose()?,
             assignee,
             // An all-whitespace reason is an unblock, which the manager

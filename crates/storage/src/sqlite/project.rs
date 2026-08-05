@@ -84,7 +84,8 @@ const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micr
      archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
-     assignee, position, blocked_reason, branch, cancelled_at, created_at, updated_at";
+     assignee, position, blocked_reason, branch, parent_issue_id, stage, cancelled_at, \
+     created_at, updated_at";
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
@@ -187,6 +188,8 @@ type RawIssue = (
     i64,
     Option<String>,
     Option<String>,
+    Option<String>,
+    i64,
     Option<i64>,
     i64,
     i64,
@@ -221,6 +224,8 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
     ))
 }
 
@@ -266,6 +271,8 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         position,
         blocked_reason,
         branch,
+        parent_issue_id,
+        stage,
         cancelled_at,
         created_at,
         updated_at,
@@ -290,6 +297,8 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         position,
         blocked_reason,
         branch,
+        parent_issue_id: parent_issue_id.map(IssueId::from),
+        stage,
         cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
         created_at: ts("issues.created_at", created_at)?,
         updated_at: ts("issues.updated_at", updated_at)?,
@@ -477,6 +486,11 @@ impl ProjectStore for SqliteProjectStore {
         let status = new.status.as_str();
         let priority = new.priority.as_str();
         let assignee = new.assignee.as_ref().map(|a| a.as_str().to_string());
+        let parent_issue_id = new
+            .parent_issue_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        let stage = new.stage;
         let created_at = super::time::to_us(new.created_at);
         let raw = self
             .pool
@@ -500,9 +514,9 @@ impl ProjectStore for SqliteProjectStore {
                 )?;
                 tx.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, \
-                     priority, assignee, position, blocked_reason, cancelled_at, created_at, \
-                     updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?10)",
+                     priority, assignee, position, blocked_reason, parent_issue_id, stage, \
+                     cancelled_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, NULL, ?12, ?12)",
                     rusqlite::params![
                         id,
                         project,
@@ -513,6 +527,8 @@ impl ProjectStore for SqliteProjectStore {
                         priority,
                         assignee,
                         position,
+                        parent_issue_id,
+                        stage,
                         created_at
                     ],
                 )?;
@@ -563,6 +579,17 @@ impl ProjectStore for SqliteProjectStore {
                     Some(false) => (true, None),
                     None => (false, None),
                 };
+                let (set_parent, parent) = match &update.parent {
+                    Some(value) => (true, value.as_ref().map(|id| id.as_str().to_string())),
+                    None => (false, None),
+                };
+                // Detaching from a parent resets the stage: a stage number
+                // on a top-level issue is a barrier under a parent that is
+                // no longer there, and the next reader would honour it.
+                let stage = match (&update.parent, update.stage) {
+                    (Some(None), _) => Some(0),
+                    (_, stage) => stage,
+                };
                 Ok(conn.execute(
                     "UPDATE issues SET \
                        title          = COALESCE(?3, title), \
@@ -571,6 +598,8 @@ impl ProjectStore for SqliteProjectStore {
                        assignee       = CASE WHEN ?6 THEN ?7 ELSE assignee END, \
                        blocked_reason = CASE WHEN ?8 THEN ?9 ELSE blocked_reason END, \
                        cancelled_at   = CASE WHEN ?10 THEN ?11 ELSE cancelled_at END, \
+                       parent_issue_id = CASE WHEN ?13 THEN ?14 ELSE parent_issue_id END, \
+                       stage          = COALESCE(?15, stage), \
                        updated_at     = ?12 \
                      WHERE project_id = ?1 AND number = ?2",
                     rusqlite::params![
@@ -585,12 +614,32 @@ impl ProjectStore for SqliteProjectStore {
                         blocked,
                         set_cancelled,
                         cancelled,
-                        now
+                        now,
+                        set_parent,
+                        parent,
+                        stage
                     ],
                 )?)
             })
             .await?;
         Ok(affected > 0)
+    }
+
+    async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>> {
+        let parent = parent.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("issues.children", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {ISSUE_COLUMNS} FROM issues WHERE parent_issue_id = ?1 \
+                     ORDER BY stage, position, number"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![parent], read_raw_issue)?
+                    .collect::<rusqlite::Result<Vec<RawIssue>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(issue_from_raw).collect()
     }
 
     async fn move_issue(
@@ -1015,6 +1064,8 @@ mod tests {
             status,
             priority: IssuePriority::None,
             assignee: None,
+            parent_issue_id: None,
+            stage: 0,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1635,6 +1686,8 @@ mod tests {
             status: IssueStatus::Backlog,
             priority: IssuePriority::None,
             assignee: Some(AgentProfileId::parse("dev-1").unwrap()),
+            parent_issue_id: None,
+            stage: 0,
             created_at: chrono::Utc::now(),
         };
         let ours = store.create_issue(&issue(&mine, "ours")).await.unwrap();

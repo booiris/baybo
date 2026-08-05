@@ -35,6 +35,11 @@ struct Params {
     priority: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
+    /// Make it a step of this issue's number.
+    #[serde(default)]
+    parent: Option<i64>,
+    #[serde(default)]
+    stage: i64,
 }
 
 #[async_trait]
@@ -59,6 +64,8 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                 "status": status_schema("Which column it opens in. Defaults to `backlog`."),
                 "priority": priority_schema("Informs triage; it never reorders the board on its own."),
                 "assignee": { "type": "string", "description": "An `@handle` from this project's team." },
+                "parent": { "type": "integer", "description": "Open it as a step of that issue's number. One level only — a step cannot have steps." },
+                "stage": { "type": "integer", "description": "Which barrier under the parent (default 0). Stage N starts when every step of stage N-1 is done." },
             },
             "required": ["title"],
         })
@@ -104,6 +111,8 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                         .transpose()?
                         .unwrap_or(IssuePriority::None),
                     assignee,
+                    parent: p.parent,
+                    stage: p.stage,
                 },
             )
             .await

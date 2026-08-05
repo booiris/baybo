@@ -2053,7 +2053,17 @@ export interface components {
              */
             assignee?: string | null;
             description?: string;
+            /**
+             * Format: int64
+             * @description Open it as a step of that issue's number. One level only.
+             */
+            parent?: number | null;
             priority?: null | components["schemas"]["IssuePriorityDto"];
+            /**
+             * Format: int64
+             * @description Which barrier under the parent. Ignored without one.
+             */
+            stage?: number | null;
             status?: null | components["schemas"]["IssueStatusDto"];
             title: string;
         };
@@ -2309,12 +2319,24 @@ export interface components {
             number: number;
             /**
              * Format: int64
+             * @description The issue this one is a step of, by its number on this board.
+             *     Absent on a top-level card.
+             */
+            parent?: number | null;
+            /**
+             * Format: int64
              * @description Rank within the column, dense and ascending.
              */
             position: number;
             priority: components["schemas"]["IssuePriorityDto"];
             project_id: string;
+            /**
+             * Format: int64
+             * @description Which barrier under that parent. `0` and meaningless without one.
+             */
+            stage: number;
             status: components["schemas"]["IssueStatusDto"];
+            sub_issues?: null | components["schemas"]["SubIssueProgress"];
             title: string;
             /** Format: int64 */
             updated_at_ms: number;
@@ -2375,6 +2397,11 @@ export interface components {
             /** @enum {string} */
             kind: "worktree_kept";
             reason: string;
+        } | {
+            /** @enum {string} */
+            kind: "stage_completed";
+            /** Format: int64 */
+            stage: number;
         } | {
             /** @enum {string} */
             kind: "budget_exhausted";
@@ -2812,7 +2839,7 @@ export interface components {
          * @description Why a run was started.
          * @enum {string}
          */
-        RunTriggerDto: "started" | "assigned" | "retry" | "comment";
+        RunTriggerDto: "started" | "assigned" | "retry" | "comment" | "stage_barrier";
         /**
          * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
@@ -2956,6 +2983,13 @@ export interface components {
             sessions: number;
             turns_in_flight: number;
             version: string;
+        };
+        /** @description A parent card's progress ring. */
+        SubIssueProgress: {
+            /** Format: int64 */
+            done: number;
+            /** Format: int64 */
+            total: number;
         };
         /**
          * @description One member of a project's team.
@@ -3125,7 +3159,14 @@ export interface components {
             blocked_reason?: string | null;
             cancelled?: boolean | null;
             description?: string | null;
+            /**
+             * Format: int64
+             * @description Re-parent by number; `0` detaches. Absent leaves the parent alone.
+             */
+            parent?: number | null;
             priority?: null | components["schemas"]["IssuePriorityDto"];
+            /** Format: int64 */
+            stage?: number | null;
             title?: string | null;
         };
         /**
@@ -6826,12 +6867,24 @@ export interface operations {
                             number: number;
                             /**
                              * Format: int64
+                             * @description The issue this one is a step of, by its number on this board.
+                             *     Absent on a top-level card.
+                             */
+                            parent?: number | null;
+                            /**
+                             * Format: int64
                              * @description Rank within the column, dense and ascending.
                              */
                             position: number;
                             priority: components["schemas"]["IssuePriorityDto"];
                             project_id: string;
+                            /**
+                             * Format: int64
+                             * @description Which barrier under that parent. `0` and meaningless without one.
+                             */
+                            stage: number;
                             status: components["schemas"]["IssueStatusDto"];
+                            sub_issues?: null | components["schemas"]["SubIssueProgress"];
                             title: string;
                             /** Format: int64 */
                             updated_at_ms: number;

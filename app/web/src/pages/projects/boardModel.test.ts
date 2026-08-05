@@ -31,6 +31,7 @@ function issue(number: number, overrides: Partial<Issue> = {}): Issue {
     status: 'backlog',
     priority: 'none',
     position: number,
+    stage: 0,
     created_at_ms: 0,
     updated_at_ms: 0,
     ...overrides,

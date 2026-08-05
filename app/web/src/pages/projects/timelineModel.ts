@@ -69,6 +69,8 @@ export function describeEvent(body: IssueEventBody): string | null {
       // git's own reason, because it is the actionable part: the operator
       // has to commit or discard before the tree can go.
       return `kept the worktree — ${body.reason}`;
+    case 'stage_completed':
+      return `stage ${body.stage} finished — every step in it is done`;
     case 'budget_exhausted':
       return `held the run — ${usd(body.spent_micros)} of the ${usd(
         body.limit_micros,

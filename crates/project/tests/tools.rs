@@ -117,6 +117,8 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
                 status: baybo_store::project::IssueStatus::Backlog,
                 priority: baybo_store::project::IssuePriority::None,
                 assignee: None,
+                parent: None,
+                stage: 0,
             },
         )
         .await
