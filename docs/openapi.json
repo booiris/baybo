@@ -4911,6 +4911,151 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/runs/cancel": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The run is stopping, or was never started and is now cancelled"
+          },
+          "400": {
+            "description": "Nothing is running on this issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/runs/retry": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "retry_run",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "The new run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueRunDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The issue has nobody on it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run is already in flight, or the project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/runs": {
       "get": {
         "tags": [
@@ -7509,6 +7654,70 @@
           "low",
           "none"
         ]
+      },
+      "IssueRunDto": {
+        "type": "object",
+        "description": "One execution of an issue.",
+        "required": [
+          "number",
+          "attempt",
+          "agent_id",
+          "status",
+          "trigger",
+          "created_at_ms"
+        ],
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "attempt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "1 for an issue's first run, incrementing thereafter — how the\nexecution log addresses it."
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The issue this ran, by its per-project number."
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The session the run executed in. Present once claimed; it is what\nthe trace viewer opens."
+          },
+          "settled_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "started_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatusDto"
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/RunTriggerDto"
+          }
+        }
       },
       "IssueStatusDto": {
         "type": "string",

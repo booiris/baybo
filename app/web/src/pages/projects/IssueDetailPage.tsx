@@ -5,12 +5,14 @@ import { RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
 import { useAdminClient, useAuth } from '../../api/auth';
 import { Button } from '../../components/Button';
 import {
+  cancelRun,
   fetchAgents,
   fetchIssue,
   fetchIssueRuns,
   fetchIssues,
   moveIssue,
   patchIssue,
+  retryRun,
 } from './api';
 import {
   COLUMNS,
@@ -50,8 +52,17 @@ const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   retry: 'retry',
 };
 
-function RunRow({ run }: { run: IssueRun }) {
+function RunRow({
+  run,
+  onCancel,
+  busy,
+}: {
+  run: IssueRun;
+  onCancel: () => void;
+  busy: boolean;
+}) {
   const duration = runDuration(run, Date.now());
+  const live = run.status === 'queued' || run.status === 'running';
   return (
     <li className="flex items-center gap-2 py-1.5 border-b border-black/15 last:border-0 font-mono text-[0.62rem]">
       <span className="font-bold">#{run.attempt}</span>
@@ -60,14 +71,23 @@ function RunRow({ run }: { run: IssueRun }) {
         {run.status}
       </span>
       {duration != null ? <span className="text-ink-soft">{duration}</span> : null}
-      {run.session_id != null ? (
-        <a
-          className="ml-auto text-info underline"
-          href={`#/traces/${encodeURIComponent(run.session_id)}`}
-        >
-          transcript
-        </a>
-      ) : null}
+      <span className="ml-auto flex items-center gap-2">
+        {live ? (
+          <button
+            type="button"
+            className="text-err underline cursor-pointer disabled:opacity-50"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            stop
+          </button>
+        ) : null}
+        {run.session_id != null ? (
+          <a className="text-info underline" href={`#/traces/${encodeURIComponent(run.session_id)}`}>
+            transcript
+          </a>
+        ) : null}
+      </span>
     </li>
   );
 }
@@ -217,6 +237,40 @@ export function IssueDetailPage() {
     },
     [client, logout, number, projectId],
   );
+
+  const stopRun = useCallback(async () => {
+    setSaving(true);
+    const outcome = await cancelRun(client, projectId, number);
+    setSaving(false);
+    if (outcome.kind === 'unauthorized') {
+      logout();
+      return;
+    }
+    if (outcome.kind === 'failed') {
+      setError(outcome.message);
+      return;
+    }
+    setError(null);
+    // The row settles on the server — for a run that was executing, only
+    // once its turn actually stops. The board frame brings the result.
+    setRefreshKey((key) => key + 1);
+  }, [client, logout, number, projectId]);
+
+  const runAgain = useCallback(async () => {
+    setSaving(true);
+    const outcome = await retryRun(client, projectId, number);
+    setSaving(false);
+    if (outcome.kind === 'unauthorized') {
+      logout();
+      return;
+    }
+    if (outcome.kind === 'failed') {
+      setError(outcome.message);
+      return;
+    }
+    setError(null);
+    setRefreshKey((key) => key + 1);
+  }, [client, logout, number, projectId]);
 
   if (loading) {
     return (
@@ -370,6 +424,21 @@ export function IssueDetailPage() {
 
           <section className="border-2 border-black rounded-md bg-surface p-3">
             <h2 className={railLabel}>Execution log</h2>
+            {runs.some((run) => run.status === 'queued' || run.status === 'running') ? null : (
+              <button
+                type="button"
+                className="mt-1 font-mono text-[0.66rem] font-bold underline cursor-pointer disabled:opacity-50"
+                disabled={saving || issue.assignee == null}
+                title={
+                  issue.assignee == null ? 'Assign someone before running this' : undefined
+                }
+                onClick={() => {
+                  void runAgain();
+                }}
+              >
+                {runs.length === 0 ? 'Run it now' : 'Run it again'}
+              </button>
+            )}
             {runs.length === 0 ? (
               <p className="mt-2 font-mono text-[0.62rem] text-ink-soft leading-snug">
                 No runs yet — this card starts working when it reaches In Progress with an
@@ -378,7 +447,14 @@ export function IssueDetailPage() {
             ) : (
               <ul className="mt-2 flex flex-col">
                 {runs.map((run) => (
-                  <RunRow key={run.attempt} run={run} />
+                  <RunRow
+                    key={run.attempt}
+                    run={run}
+                    busy={saving}
+                    onCancel={() => {
+                      void stopRun();
+                    }}
+                  />
                 ))}
               </ul>
             )}

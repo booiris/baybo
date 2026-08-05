@@ -222,3 +222,41 @@ export async function moveIssue(
     return { kind: 'failed', message: networkMessage(e) };
   }
 }
+
+export async function cancelRun(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+): Promise<Outcome<null>> {
+  try {
+    const { error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/runs/cancel',
+      { params: { path: { project_id: projectId, number } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function retryRun(
+  client: AdminClient,
+  projectId: string,
+  number: number,
+): Promise<Outcome<IssueRun>> {
+  try {
+    const { data, error, response } = await client.POST(
+      '/v1/projects/{project_id}/issues/{number}/runs/retry',
+      { params: { path: { project_id: projectId, number } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}

@@ -445,6 +445,93 @@ async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     assert_eq!(log["items"].as_array().expect("items").len(), 0);
 }
 
+#[tokio::test]
+async fn a_run_can_be_stopped_and_started_again() {
+    let (router, tg) = router().await;
+    let now = chrono::Utc::now();
+    tg.deps
+        .stores
+        .agent_profile
+        .create(&baybo_store::AgentProfileRow {
+            id: baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed agent");
+    let p = open_project(&router, "control").await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues"),
+        json!({ "title": "runaway", "status": "in_progress", "assignee": "dev-1" }),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // While a run is in flight, a retry is refused rather than putting a
+    // second agent on the same card.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/retry"),
+        json!({}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    // Nothing has claimed the run in this harness (no router), so it is
+    // still queued — cancelling settles it outright.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/cancel"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let log = get(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(log["items"][0]["status"], "cancelled");
+    // …and the board stops calling the card busy.
+    let active = get(&router, &format!("/v1/projects/{p}/runs"), StatusCode::OK).await;
+    assert_eq!(active["items"].as_array().expect("items").len(), 0);
+
+    // With the slot free, it can run again — as a retry, so the log says
+    // where the second attempt came from.
+    let retried = post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/retry"),
+        json!({}),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(retried["attempt"], 2);
+    assert_eq!(retried["trigger"], "retry");
+
+    // Cancelling when nothing is running is a caller mistake, not a no-op.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/cancel"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/runs/cancel"),
+        json!({}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
 async fn request(

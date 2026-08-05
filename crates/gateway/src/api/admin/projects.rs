@@ -35,6 +35,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(move_issue))
         .routes(routes!(list_issue_runs))
         .routes(routes!(list_active_runs))
+        .routes(routes!(cancel_run))
+        .routes(routes!(retry_run))
 }
 
 /// Map the domain's error onto a status once, for every handler here.
@@ -746,4 +748,81 @@ async fn list_active_runs(
         .map(IssueRunDto::from)
         .collect();
     Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues/{number}/runs/cancel",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    responses(
+        (status = 204, description = "The run is stopping, or was never started and is now cancelled"),
+        (status = 400, description = "Nothing is running on this issue", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+    )
+)]
+async fn cancel_run(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+) -> Result<StatusCode> {
+    let id = parse_project_id(&project_id)?;
+    let Some(session) = state
+        .project_manager
+        .cancel_run(&id, number)
+        .await
+        .map_err(project_err)?
+    else {
+        // It never started; the manager settled it.
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    // A run that is executing stops the way `/stop` stops a reply — the
+    // waiter watching that turn is what settles the ledger row, so the two
+    // never race to record an outcome.
+    let turns = state
+        .turn_lifecycle
+        .list_active_chat_turns_by_session(&session)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("issue run turns: {e}")))?;
+    for turn in turns {
+        state
+            .turn_lifecycle
+            .cancel(&turn.id, baybo_turn::CancelReason::OperatorCancel, vec![])
+            .await
+            .map_err(|e| GatewayError::Internal(format!("cancel issue run: {e}")))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues/{number}/runs/retry",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    responses(
+        (status = 201, description = "The new run", body = IssueRunDto),
+        (status = 400, description = "The issue has nobody on it", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+        (status = 409, description = "A run is already in flight, or the project is archived", body = ErrorBody),
+    )
+)]
+async fn retry_run(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+) -> Result<(StatusCode, Json<IssueRunDto>)> {
+    let id = parse_project_id(&project_id)?;
+    let run = state
+        .project_manager
+        .retry_run(&id, number)
+        .await
+        .map_err(project_err)?;
+    Ok((StatusCode::CREATED, Json(IssueRunDto::from(run))))
 }

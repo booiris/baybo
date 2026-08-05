@@ -1016,6 +1016,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/runs/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/runs/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["retry_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/runs": {
         parameters: {
             query?: never;
@@ -2185,6 +2217,35 @@ export interface components {
         };
         /** @enum {string} */
         IssuePriorityDto: "urgent" | "high" | "medium" | "low" | "none";
+        /** @description One execution of an issue. */
+        IssueRunDto: {
+            agent_id: string;
+            /**
+             * Format: int64
+             * @description 1 for an issue's first run, incrementing thereafter — how the
+             *     execution log addresses it.
+             */
+            attempt: number;
+            /** Format: int64 */
+            created_at_ms: number;
+            error?: string | null;
+            /**
+             * Format: int64
+             * @description The issue this ran, by its per-project number.
+             */
+            number: number;
+            /**
+             * @description The session the run executed in. Present once claimed; it is what
+             *     the trace viewer opens.
+             */
+            session_id?: string | null;
+            /** Format: int64 */
+            settled_at_ms?: number | null;
+            /** Format: int64 */
+            started_at_ms?: number | null;
+            status: components["schemas"]["RunStatusDto"];
+            trigger: components["schemas"]["RunTriggerDto"];
+        };
         /**
          * @description Which column a card sits in. Entering `in_progress` is what will start
          *     an agent once execution lands, which is why the set is fixed.
@@ -6676,6 +6737,117 @@ export interface operations {
             };
             /** @description Unknown project or issue */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The run is stopping, or was never started and is now cancelled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Nothing is running on this issue */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    retry_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new run */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueRunDto"];
+                };
+            };
+            /** @description The issue has nobody on it */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A run is already in flight, or the project is archived */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

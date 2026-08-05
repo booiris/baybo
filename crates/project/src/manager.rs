@@ -14,7 +14,7 @@ use baybo_model::{AgentFramework, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHAR
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
     IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow,
-    ProjectStore, ProjectUpdate,
+    ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 
@@ -124,6 +124,59 @@ impl ProjectManager {
     pub async fn list_runs(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueRunRow>> {
         let issue = self.get_issue(project, number).await?;
         Ok(self.store.list_runs(&issue.id).await?)
+    }
+
+    /// Stop an issue's run.
+    ///
+    /// A run that never started is settled here and now — there is nothing
+    /// to interrupt. A run already executing is *not* settled here: its
+    /// session is returned so the caller can cancel the live turn, and the
+    /// waiter watching that turn settles the row with `Cancelled`. Settling
+    /// it from both ends would race, and the waiter is the one that knows
+    /// whether the turn actually stopped.
+    pub async fn cancel_run(
+        &self,
+        project: &ProjectId,
+        number: i64,
+    ) -> Result<Option<baybo_model::SessionId>> {
+        let issue = self.get_issue(project, number).await?;
+        let live = self
+            .store
+            .list_runs(&issue.id)
+            .await?
+            .into_iter()
+            .find(|run| !run.status.is_settled());
+        let Some(run) = live else {
+            return Err(ProjectError::invalid(
+                "run",
+                "nothing is running on this issue",
+            ));
+        };
+        match run.session_id {
+            Some(session) => Ok(Some(session)),
+            None => {
+                self.store
+                    .settle_run(&run.id, RunStatus::Cancelled, None)
+                    .await?;
+                self.events.run_changed(project, number);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run an issue again. Refused while one is already in flight — the
+    /// same dedupe guard a drag hits, surfaced as a conflict rather than a
+    /// silent second agent.
+    pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
+        self.writable_project(project).await?;
+        let issue = self.get_issue(project, number).await?;
+        let entry = ledger_entry(&issue, RunTrigger::Retry).ok_or_else(|| {
+            ProjectError::invalid("assignee", "an issue with nobody on it cannot be run")
+        })?;
+        let run = self.store.enqueue_run(&entry).await?;
+        self.events.run_changed(project, number);
+        (self.dispatch)(run.clone());
+        Ok(run)
     }
 
     /// The unfinished runs of one board — which cards are working.
