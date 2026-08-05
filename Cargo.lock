@@ -368,6 +368,7 @@ dependencies = [
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
+ "baybo-project",
  "baybo-sandbox",
  "baybo-security",
  "baybo-session",

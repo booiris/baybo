@@ -60,6 +60,7 @@ import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ToastStack, useToasts } from './Toasts';
+import { useBoardStream } from './useBoardStream';
 
 const PRIORITY_MARK: Record<Issue['priority'], { glyph: string; tone: string } | null> = {
   urgent: { glyph: '▲▲', tone: 'text-err' },
@@ -141,18 +142,16 @@ export function ProjectBoardPage() {
     };
   }, [client, logout, projectId, refreshKey, showCancelled]);
 
-  // No board frame on the wire yet, so a working card is kept honest by a
-  // slow poll — and only while something is actually running. An idle
-  // board makes no requests.
-  useEffect(() => {
-    if (activeRuns.length === 0) return;
-    const timer = window.setInterval(() => {
+  // The board refetches when the server says this project changed —
+  // including changes nobody on this page made, which is how a lead's own
+  // card appears while you watch.
+  useBoardStream(
+    projectId,
+    null,
+    useCallback(() => {
       setRefreshKey((key) => key + 1);
-    }, 4000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [activeRuns.length]);
+    }, []),
+  );
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),

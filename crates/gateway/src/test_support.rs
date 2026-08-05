@@ -238,7 +238,10 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()),
-        // No executor yet: runs are recorded and wait for one.
+        Arc::new(crate::project_events::GatewayProjectEvents::new(
+            Arc::clone(&channel_registry),
+        )),
+        // The test harness has no router, so a recorded run waits.
         baybo_project::no_dispatch(),
     ));
 

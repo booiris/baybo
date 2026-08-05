@@ -256,6 +256,9 @@ pub struct Router {
     /// The board's store, so a run can claim and settle its ledger row.
     /// `None` in assemblies with no board (the TUI's embedded runtime).
     project_store: Option<Arc<dyn baybo_store::project::ProjectStore>>,
+    /// Board push hook, so a run's settle reaches whoever is watching the
+    /// card. `None` alongside `project_store`.
+    project_events: Option<Arc<dyn baybo_project::ProjectEvents>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
@@ -288,6 +291,7 @@ pub struct RouterConfig {
     /// no board.
     pub issue_run_rx: Option<mpsc::Receiver<issue::IssueRunEvent>>,
     pub project_store: Option<Arc<dyn baybo_store::project::ProjectStore>>,
+    pub project_events: Option<Arc<dyn baybo_project::ProjectEvents>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,
@@ -315,6 +319,7 @@ impl Router {
             cron_trigger_rx,
             issue_run_rx,
             project_store,
+            project_events,
             actor_parent_token,
             rate_limit,
             workspace,
@@ -333,6 +338,7 @@ impl Router {
             cron_trigger_rx: Some(cron_trigger_rx),
             issue_run_rx,
             project_store,
+            project_events,
             actor_parent_token,
             workspace,
         }

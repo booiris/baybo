@@ -16,8 +16,9 @@
 use std::sync::Arc;
 
 use baybo_model::{
-    AgentBinding, AgentProfileId, ChannelType, IssueRunId, Session, SessionId, TriggerSource, User,
+    AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, User,
 };
+use baybo_project::ProjectEvents;
 use baybo_store::project::{IssueRunRow, ProjectStore, RunStatus};
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::broadcast;
@@ -53,7 +54,14 @@ impl Router {
             Ok(session) => session,
             Err(e) => {
                 warn!(%run_id, error = %e, "could not open the issue's session");
-                settle(&store, &run_id, RunStatus::Failed, Some(&e.to_string())).await;
+                settle(
+                    &store,
+                    self.project_events.as_ref(),
+                    &event.run,
+                    RunStatus::Failed,
+                    Some(&e.to_string()),
+                )
+                .await;
                 return;
             }
         };
@@ -78,11 +86,12 @@ impl Router {
         // the terminal event is published from inside the run's own turn, so
         // a subscription opened afterwards can miss a fast failure entirely.
         let waiter = IssueRunWaiter {
-            run_id: run_id.clone(),
+            run: event.run.clone(),
             session_id: session.id.clone(),
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             store: Arc::clone(&store),
+            events: self.project_events.clone(),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
@@ -178,29 +187,50 @@ fn binding_for(agent: &AgentProfileId) -> AgentBinding {
 
 async fn settle(
     store: &Arc<dyn ProjectStore>,
-    run_id: &IssueRunId,
+    events: Option<&Arc<dyn ProjectEvents>>,
+    run: &IssueRunRow,
     status: RunStatus,
     error: Option<&str>,
 ) {
-    if let Err(e) = store.settle_run(run_id, status, error).await {
-        warn!(%run_id, error = %e, "could not settle run; the boot sweep will retry it");
+    match store.settle_run(&run.id, status, error).await {
+        // Announce only a settle that actually landed: a replay of an
+        // already-settled run changed nothing and has nothing to say.
+        Ok(true) => {
+            if let Some(events) = events {
+                events.run_changed(&run.project_id, run.number);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            let run_id = &run.id;
+            warn!(%run_id, error = %e, "could not settle run; the boot sweep will retry it");
+        }
     }
 }
 
 /// Watches one run's turn and settles its ledger row.
 struct IssueRunWaiter {
-    run_id: IssueRunId,
+    run: IssueRunRow,
     session_id: SessionId,
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
     store: Arc<dyn ProjectStore>,
+    events: Option<Arc<dyn ProjectEvents>>,
 }
 
 impl IssueRunWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
         let (status, error) = self.await_run(actor_token).await;
-        info!(run_id = %self.run_id, ?status, "issue run settled");
-        settle(&self.store, &self.run_id, status, error.as_deref()).await;
+        let run_id = &self.run.id;
+        info!(%run_id, ?status, "issue run settled");
+        settle(
+            &self.store,
+            self.events.as_ref(),
+            &self.run,
+            status,
+            error.as_deref(),
+        )
+        .await;
     }
 
     async fn await_run(&mut self, actor_token: CancellationToken) -> (RunStatus, Option<String>) {
@@ -216,7 +246,7 @@ impl IssueRunWaiter {
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
-                            run_id = %self.run_id,
+                            run_id = %self.run.id,
                             skipped = n,
                             "issue waiter lagged on the lifecycle bus; reconciling via store"
                         );
@@ -263,7 +293,7 @@ impl IssueRunWaiter {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
             Err(e) => {
-                warn!(run_id = %self.run_id, error = %e, "could not reconcile run via store");
+                warn!(run_id = %self.run.id, error = %e, "could not reconcile run via store");
                 return None;
             }
         };

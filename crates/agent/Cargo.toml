@@ -24,6 +24,7 @@ baybo-cost = { workspace = true }
 baybo-security = { workspace = true }
 baybo-sandbox = { workspace = true }
 baybo-store = { workspace = true }
+baybo-project = { workspace = true }
 baybo-storage = { workspace = true }
 baybo-channels = { workspace = true }
 dashmap = { workspace = true }

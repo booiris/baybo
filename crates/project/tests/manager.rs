@@ -56,6 +56,7 @@ async fn fixture() -> Fixture {
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
             paths.clone(),
+            Arc::new(baybo_project::NoopProjectEvents),
             {
                 let seen = Arc::clone(&dispatched);
                 Arc::new(move |run| seen.lock().push(run))

@@ -19,6 +19,7 @@ use baybo_store::project::{
 use baybo_workspace::WorkspacePaths;
 
 use crate::error::{ProjectError, Result};
+use crate::events::ProjectEvents;
 use crate::runs::{Transition, ledger_entry, triggers_run};
 
 /// Upper bound on an issue title (chars, after trim). Long enough for a
@@ -51,6 +52,8 @@ pub struct ProjectManager {
     store: Arc<dyn ProjectStore>,
     agents: Arc<dyn AgentProfileStore>,
     paths: WorkspacePaths,
+    /// Where a board change is announced to whoever is watching it.
+    events: Arc<dyn ProjectEvents>,
     /// Where a recorded run is announced. The ledger row is written first
     /// and this only nudges — a send that fails, or a receiver that died,
     /// costs a delay until the next boot sweep, never a lost run.
@@ -73,12 +76,14 @@ impl ProjectManager {
         store: Arc<dyn ProjectStore>,
         agents: Arc<dyn AgentProfileStore>,
         paths: WorkspacePaths,
+        events: Arc<dyn ProjectEvents>,
         dispatch: RunDispatch,
     ) -> Self {
         Self {
             store,
             agents,
             paths,
+            events,
             dispatch,
         }
     }
@@ -98,7 +103,10 @@ impl ProjectManager {
             return;
         };
         match self.store.enqueue_run(&entry).await {
-            Ok(run) => (self.dispatch)(run),
+            Ok(run) => {
+                self.events.run_changed(&issue.project_id, issue.number);
+                (self.dispatch)(run);
+            }
             Err(baybo_store::StorageError::Conflict(reason)) => {
                 tracing::debug!(
                     issue = issue.number,
@@ -173,6 +181,7 @@ impl ProjectManager {
             updated_at: now,
         };
         self.store.create_project(&row).await?;
+        self.events.project_changed(&row.id);
         Ok(row)
     }
 
@@ -237,6 +246,7 @@ impl ProjectManager {
             description: update.description.trim().to_owned(),
         };
         self.store.update_project(id, &update).await?;
+        self.events.project_changed(id);
         self.get_project(id).await
     }
 
@@ -246,6 +256,7 @@ impl ProjectManager {
         if !self.store.set_project_archived(id, archived).await? {
             return Err(ProjectError::NoSuchProject(id.clone()));
         }
+        self.events.project_changed(id);
         self.get_project(id).await
     }
 
@@ -291,6 +302,7 @@ impl ProjectManager {
                 created_at: chrono::Utc::now(),
             })
             .await?;
+        self.events.board_changed(project, Some(issue.number));
         self.dispatch_if_triggered(Transition::created(&issue), &issue)
             .await;
         Ok(issue)
@@ -341,6 +353,7 @@ impl ProjectManager {
             });
         }
         let after = self.get_issue(project, number).await?;
+        self.events.board_changed(project, Some(number));
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         Ok(after)

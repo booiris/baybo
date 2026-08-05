@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { RiArrowLeftLine, RiLoader4Line } from 'react-icons/ri';
 
@@ -24,6 +24,7 @@ import {
   type IssuePriority,
   type IssueStatus,
 } from './boardModel';
+import { useBoardStream } from './useBoardStream';
 
 const PRIORITY_LABEL: Record<IssuePriority, string> = {
   urgent: 'Urgent',
@@ -90,11 +91,15 @@ export function IssueDetailPage() {
   const [issue, setIssue] = useState<Issue | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [runs, setRuns] = useState<IssueRun[]>([]);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
+  /// What the server last said the prose was — the yardstick for "has the
+  /// operator touched this?".
+  const serverProse = useRef({ title: '', description: '' });
 
   useEffect(() => {
     let canceled = false;
@@ -117,8 +122,17 @@ export function IssueDetailPage() {
         return;
       }
       setIssue(outcome.value);
-      setTitle(outcome.value.title);
-      setDescription(outcome.value.description);
+      // Reseed the prose only when the operator has not touched it. A
+      // refetch triggered by a run finishing must not overwrite a
+      // description someone is halfway through typing.
+      setTitle((current) => (current === serverProse.current.title ? outcome.value.title : current));
+      setDescription((current) =>
+        current === serverProse.current.description ? outcome.value.description : current,
+      );
+      serverProse.current = {
+        title: outcome.value.title,
+        description: outcome.value.description,
+      };
       setError(null);
       setLoading(false);
     }
@@ -126,7 +140,16 @@ export function IssueDetailPage() {
     return () => {
       canceled = true;
     };
-  }, [client, logout, number, projectId]);
+  }, [client, logout, number, projectId, refreshKey]);
+
+  // A run starting or settling elsewhere still changes this page.
+  useBoardStream(
+    projectId,
+    number,
+    useCallback(() => {
+      setRefreshKey((key) => key + 1);
+    }, []),
+  );
 
   const apply = useCallback(
     async (body: Parameters<typeof patchIssue>[3]) => {
@@ -145,6 +168,10 @@ export function IssueDetailPage() {
       setIssue(outcome.value);
       setTitle(outcome.value.title);
       setDescription(outcome.value.description);
+      serverProse.current = {
+        title: outcome.value.title,
+        description: outcome.value.description,
+      };
     },
     [client, logout, number, projectId],
   );

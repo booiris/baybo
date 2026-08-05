@@ -52,6 +52,8 @@ type InboundKind =
   | 'session_updated'
   | 'session_activity'
   // deck frames — no deck UI here; the native deck shell consumes them
+  // board invalidations — the projects pages consume them
+  | 'project_changed'
   | 'deck_card_data'
   | 'deck_changed'
   | 'ping'

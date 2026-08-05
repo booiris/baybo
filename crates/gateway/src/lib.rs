@@ -28,6 +28,7 @@ pub mod device;
 pub mod error;
 pub mod installer;
 pub mod log_buffer;
+pub mod project_events;
 pub mod push;
 pub mod relay;
 pub mod reload;

@@ -629,6 +629,9 @@ pub async fn build_managers(
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+        Arc::new(baybo_gateway::project_events::GatewayProjectEvents::new(
+            Arc::clone(&channels_registry),
+        )),
         issue_dispatch,
     ));
 
@@ -1109,6 +1112,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_trigger_rx,
         issue_run_rx: graph.issue_run_rx.take(),
         project_store: Some(graph.stores.project.clone()),
+        project_events: Some(Arc::new(
+            baybo_gateway::project_events::GatewayProjectEvents::new(Arc::clone(
+                &graph.channels_registry,
+            )),
+        )),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });

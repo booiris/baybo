@@ -6,10 +6,12 @@
 //! `baybo-storage` implements it.
 
 mod error;
+mod events;
 mod manager;
 mod runs;
 
 pub use error::{ProjectError, Result};
+pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
     MAX_ISSUE_TITLE_CHARS, NewIssueRequest, NewProject, ProjectManager, RunDispatch, no_dispatch,
     validate_workdir,
