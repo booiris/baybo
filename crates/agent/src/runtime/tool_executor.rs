@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,39 @@ fn sandbox_readable_paths(
     agent: &baybo_model::AgentProfileId,
 ) -> Vec<PathBuf> {
     vec![agent.skills_dir(paths)]
+}
+
+/// Whether a **resolved** worktree path may be bound read-write.
+///
+/// Named rather than inlined because it is a security rule, and a security
+/// rule that only exists inside a closure is one nothing can assert. The
+/// worktree lives under the work dir, which the running session's own shell
+/// may write — so an agent can delete its checkout and leave a symlink in
+/// its place. Canonicalising and then demanding containment is what makes
+/// that swap inert: a link to `/` resolves to `/`, which is not under the
+/// work dir, so nothing is bound.
+fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
+    if resolved.starts_with(work_dir) {
+        Ok(())
+    } else {
+        Err("it is no longer inside the work directory".to_owned())
+    }
+}
+
+/// Whether a **resolved** project repository may be bound read-write.
+///
+/// Containment cannot be the test here — a project's repository is a
+/// user-chosen path outside the workspace by design, and that is the
+/// feature. What it must never be is a directory whose writable bind would
+/// swallow the read-only system layer or baybo's own workspace.
+fn admits_repo(resolved: &Path, workspace_root: &Path) -> Result<(), String> {
+    if let Some(why) = baybo_sandbox::args::writable_bind_refusal(resolved) {
+        return Err(why);
+    }
+    if workspace_root.starts_with(resolved) {
+        return Err("it contains baybo's own workspace".to_owned());
+    }
+    Ok(())
 }
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -449,10 +482,56 @@ impl ToolExecutor {
             }
         };
         let root = worktree::worktree_root(&self.workspace_paths, project_id, *number);
-        root.is_dir().then(|| Checkout {
-            root,
-            repo: PathBuf::from(project.workdir),
-        })
+
+        // Resolve both paths and re-check them on every call, because this
+        // runs on behalf of a session whose own shell can write inside
+        // `work/`. An agent that replaces its worktree directory with a
+        // symlink would otherwise have the next tool call bind the link's
+        // target read-write — and `/` is a valid target. Canonicalising and
+        // then demanding containment is what makes the swap inert: the
+        // resolved path either still lands under the work dir or it is not
+        // bound at all.
+        let work_dir = self.workspace_root.clone();
+        let root = self.bindable(&root, |p| admits_worktree(p, &work_dir))?;
+        // The repository is a user-chosen path outside the workspace by
+        // design, so containment cannot be the test. What it must never be
+        // is a directory whose writable bind would swallow the read-only
+        // system layer, or baybo's own workspace.
+        let workspace_root = self.workspace_paths.root().to_path_buf();
+        let repo = self.bindable(Path::new(&project.workdir), |p| {
+            admits_repo(p, &workspace_root)
+        })?;
+        Some(Checkout { root, repo })
+    }
+
+    /// Canonicalise a path and apply `admit`, logging and refusing rather
+    /// than binding anything the check does not accept.
+    fn bindable(
+        &self,
+        path: &Path,
+        admit: impl Fn(&Path) -> Result<(), String>,
+    ) -> Option<PathBuf> {
+        let resolved = match path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "checkout path does not resolve");
+                return None;
+            }
+        };
+        if !resolved.is_dir() {
+            debug!(path = %resolved.display(), "checkout path is not a directory");
+            return None;
+        }
+        if let Err(why) = admit(&resolved) {
+            tracing::warn!(
+                requested = %path.display(),
+                resolved = %resolved.display(),
+                reason = %why,
+                "refusing to bind a checkout path into the sandbox"
+            );
+            return None;
+        }
+        Some(resolved)
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
@@ -993,6 +1072,41 @@ impl ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    use super::{admits_repo, admits_worktree};
+    use std::path::Path;
+
+    /// The escape this guard exists to close: an issue run's own shell can
+    /// write inside `work/`, so it can delete its checkout and leave a
+    /// symlink behind. The path is resolved on every call, so what must be
+    /// rejected is the *target* — and `/` is a legal target.
+    #[test]
+    fn a_worktree_that_resolves_outside_the_work_dir_is_not_bound() {
+        let work = Path::new("/ws/work");
+        assert!(admits_worktree(Path::new("/ws/work/projects/p/4"), work).is_ok());
+        for escaped in ["/", "/etc", "/ws", "/home/u"] {
+            assert!(
+                admits_worktree(Path::new(escaped), work).is_err(),
+                "a worktree resolving to {escaped} must not be bound"
+            );
+        }
+    }
+
+    /// A repository is outside the workspace by design, so the rule is not
+    /// containment — it is that the bind must not swallow the read-only
+    /// system layer or baybo's own state.
+    #[test]
+    fn a_repository_may_be_anywhere_except_over_the_system_or_the_workspace() {
+        let ws = Path::new("/home/u/.baybo");
+        assert!(admits_repo(Path::new("/data/kanban"), ws).is_ok());
+        assert!(admits_repo(Path::new("/home/u/code/app"), ws).is_ok());
+        for bad in ["/", "/usr", "/etc", "/home/u/.baybo", "/home/u"] {
+            assert!(
+                admits_repo(Path::new(bad), ws).is_err(),
+                "{bad} must not be bindable as a repository"
+            );
+        }
+    }
+
     /// The sandbox binds the caller's own skill directory and no other
     /// agent's. Nothing downstream fails if the wrong one is bound — the
     /// session simply gains read access to skills its scope does not admit —

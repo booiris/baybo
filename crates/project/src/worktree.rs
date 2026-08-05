@@ -23,11 +23,6 @@ use baybo_workspace::WorkspacePaths;
 
 use crate::error::{ProjectError, Result};
 
-/// Identity used for the synthetic first commit below. Only ever applied
-/// with `-c`, so the repository's own config is left untouched.
-const BOOTSTRAP_NAME: &str = "baybo";
-const BOOTSTRAP_EMAIL: &str = "baybo@localhost";
-
 /// Where a run executes, and what it must be able to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
@@ -111,27 +106,14 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
     }
 
     // A project created without a workdir is `git init`ed and has no
-    // commits at all — and that is the *default* shape, not an edge case.
-    // `git worktree add` cannot branch off an unborn HEAD, so give the
-    // repository a root commit to branch from.
-    if !has_commit(repo).await? {
-        git(
-            repo,
-            &[
-                "-c",
-                &format!("user.name={BOOTSTRAP_NAME}"),
-                "-c",
-                &format!("user.email={BOOTSTRAP_EMAIL}"),
-                "commit",
-                "--allow-empty",
-                "--quiet",
-                "-m",
-                "Initial commit",
-            ],
-        )
-        .await?;
-    }
-
+    // commits at all — the *default* shape, not an edge case. Git infers
+    // `--orphan` there and cuts the worktree anyway, which is why nothing
+    // here manufactures a root commit first: doing that would have run
+    // `git commit` against the project's own index, and `--allow-empty`
+    // only *permits* an empty commit — it does not force one, so any work
+    // the user had staged would have been swept into a commit they did not
+    // make, authored by us.
+    //
     // Reuse the branch if it is already there — a reopened issue whose
     // worktree was reclaimed keeps its history rather than colliding.
     let existing = branch_exists(repo, branch).await?;
@@ -144,15 +126,17 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
     if existing {
         args.push(branch);
     }
-    git(repo, &args).await?;
+    if git(repo, &args).await.is_err() {
+        // The usual cause is an admin directory left behind by an earlier
+        // attempt whose checkout is gone — a crash mid-add, or a `worktree
+        // remove` that deleted the tree and then failed. Git refuses the
+        // path until that record is pruned, which would otherwise wedge the
+        // issue for good; prune and try once more so the retry button and
+        // the boot sweep can actually recover it.
+        git(repo, &["worktree", "prune"]).await?;
+        git(repo, &args).await?;
+    }
     Ok(checkout)
-}
-
-async fn has_commit(repo: &Path) -> Result<bool> {
-    Ok(run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .await?
-        .status
-        .success())
 }
 
 async fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
@@ -293,6 +277,62 @@ mod tests {
             .await
             .expect("second must adopt, not fail or reset");
         assert!(root.join("scratch.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn the_bootstrap_never_sweeps_up_work_the_user_had_staged() {
+        // The repo has staged content and no commits — the shape where an
+        // "--allow-empty" bootstrap commit would silently author the user's
+        // work-in-progress as ours.
+        let repo = fresh_repo().await;
+        tokio::fs::write(repo.path().join("wip.txt"), b"secret")
+            .await
+            .expect("write");
+        git(repo.path(), &["add", "wip.txt"])
+            .await
+            .expect("stage it");
+
+        ensure(repo.path(), &repo.path().join("wt").join("1"), "issue/1-x")
+            .await
+            .expect("worktree");
+
+        let log = run(repo.path(), &["log", "--all", "--oneline"])
+            .await
+            .expect("log");
+        assert!(
+            String::from_utf8_lossy(&log.stdout).trim().is_empty(),
+            "opening a checkout must not commit anything: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+        let staged = run(repo.path(), &["diff", "--cached", "--name-only"])
+            .await
+            .expect("diff");
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout).trim(),
+            "wip.txt",
+            "the user's index must be exactly as they left it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worktree_whose_directory_vanished_can_be_cut_again() {
+        // A crash between `git worktree add` and the run leaves git's admin
+        // record pointing at a directory that is gone. Git refuses to reuse
+        // the path until that is pruned, which would wedge the issue for
+        // good — retry included.
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("3");
+        ensure(repo.path(), &root, "issue/3-x")
+            .await
+            .expect("first");
+        tokio::fs::remove_dir_all(&root)
+            .await
+            .expect("lose the tree");
+
+        ensure(repo.path(), &root, "issue/3-x")
+            .await
+            .expect("a lost worktree must be recoverable, not permanent");
+        assert!(root.join(".git").exists());
     }
 
     #[tokio::test]

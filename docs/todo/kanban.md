@@ -338,6 +338,34 @@ announces which of these will happen before sending.
   worktree. Persona/memory write tiers carry over verbatim from the
   multi-project spec (own persona + project-shared `PROJECT.md`/memory +
   `personas/USER.md`; audited commits on the per-project git lock).
+- **Known gaps in the shipped worktree layer** (adversarial review,
+  2026-08-05 — the escape it found is fixed; these are not):
+  - **A run still cannot commit.** `resolve_env` sets `HOME` to the
+    sandbox root (`<workspace>/work`), nothing writes a `.gitconfig`
+    there, and no `GIT_AUTHOR_*`/`GIT_COMMITTER_*` reach the child — so
+    `git commit` inside the worktree dies with "Please tell me who you
+    are". The plumbing is right and the identity is missing. Attributing
+    commits to the assignee agent is the obvious fix and has not been
+    done.
+  - **The Bash tool description still says the cwd is
+    `<workspace>/work`.** `Tool::description()` takes only `&self` and is
+    pre-rendered at construction, so it structurally cannot mention the
+    checkout. The model is told something false about where it is.
+  - **`prepare_checkout` runs `git worktree add` inline on the router's
+    `select!` loop**, which also serves every user message and agent
+    response. A slow checkout is head-of-line blocking for the whole
+    process.
+  - **`work/projects/` collides with a project literally named
+    "Projects"** — `materialise_workdir` puts an auto-created repo at
+    `work/<slug>`, and `slugify("Projects") == "projects"`.
+  - **A retitle between runs strands the previous branch.** The branch is
+    looked up by a name recomputed from the *current* title, so renaming
+    an issue makes the next run cut a second branch and leave the first
+    one's commits behind.
+  - `git worktree remove` (Phase 3) needs care: it refuses on a dirty
+    tree, exits **255 after already deleting the checkout** when
+    `.git/worktrees` is not writable, keeps the branch, and `prune`
+    reports failure on stderr while **exiting 0**.
 - **No merge machinery**: the platform never merges. The assignee merges
   when asked (an ordinary comment-triggered run in its worktree) or the
   user merges in a terminal. Worktree reclamation runs when an issue

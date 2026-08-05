@@ -14,6 +14,34 @@ const BWRAP_RO_ROOTS: &[&str] = &[
     "/run/systemd/resolve",
 ];
 
+/// Why this path must never be handed to [`SandboxSpec::writable_paths`],
+/// or `None` if it is safe to bind.
+///
+/// A writable bind is emitted *after* the read-only FHS layer, and bwrap is
+/// last-wins, so binding `/usr` — or anything containing it — silently
+/// re-mounts the system read-write; the macOS profile has the same shape
+/// under last-match-wins. The whole filesystem root is the extreme case of
+/// the same mistake.
+///
+/// Callers must **canonicalise before asking**. The path a caller holds can
+/// be a symlink, and a symlink whose target changes between two tool calls
+/// is precisely how a directory the agent legitimately owns turns into a
+/// bind of somewhere it does not.
+pub fn writable_bind_refusal(path: &Path) -> Option<String> {
+    if path.parent().is_none() {
+        return Some("it is the filesystem root".to_owned());
+    }
+    for root in BWRAP_RO_ROOTS {
+        if Path::new(root).starts_with(path) {
+            return Some(format!(
+                "it contains the read-only system directory {root}, which a writable \
+                 bind would silently re-mount read-write"
+            ));
+        }
+    }
+    None
+}
+
 pub fn build_bwrap_argv(
     spec: &SandboxSpec,
     workspace_symlink_mount: Option<&WorkspaceSymlinkMount>,
@@ -1238,6 +1266,28 @@ mod tests {
     // `SandboxAdapter::with_permissive_filesystem`), so the test above —
     // which rides `FilesystemPolicy::default()` — proves nothing about
     // what a real run gets. These two cover the branch that ships.
+    #[test]
+    fn a_writable_bind_is_refused_where_it_would_outrank_the_read_only_system() {
+        // The bind loop is emitted after the RO FHS layer and bwrap is
+        // last-wins, so these paths would silently re-mount the system
+        // read-write. Reachable in practice: the caller resolves a symlink
+        // an agent controls, so the answer has to be no rather than
+        // "callers won't do that".
+        for bad in ["/", "/usr", "/etc"] {
+            assert!(
+                writable_bind_refusal(Path::new(bad)).is_some(),
+                "{bad} must never be bindable read-write"
+            );
+        }
+        // …while an ordinary checkout is fine.
+        for ok in ["/data/checkout", "/home/u/code/app"] {
+            assert!(
+                writable_bind_refusal(Path::new(ok)).is_none(),
+                "{ok} is a legitimate checkout"
+            );
+        }
+    }
+
     #[test]
     fn bwrap_permissive_binds_writable_paths_rw() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/ws");
