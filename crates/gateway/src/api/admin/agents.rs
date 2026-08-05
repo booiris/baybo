@@ -449,6 +449,12 @@ async fn create_agent(
         framework: req.framework.into(),
         llm,
         builtin: false,
+        // `POST /v1/agents` opens a global chat persona. A project's team is
+        // staffed through its own board (`/v1/projects/{pid}/agents`), which
+        // is the only surface that mints a handle.
+        team: None,
+        hired_by: None,
+        deleted_at: None,
         created_at: now,
         updated_at: now,
     };

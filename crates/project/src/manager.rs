@@ -519,7 +519,7 @@ impl ProjectManager {
         self.writable_project(project).await?;
         let title = validate_issue_title(&new.title)?;
         if let Some(assignee) = new.assignee.as_ref() {
-            self.validate_assignee(assignee).await?;
+            self.validate_assignee(project, assignee).await?;
         }
         self.validate_staffing(new.status, new.assignee.as_ref())?;
         let issue = self
@@ -567,7 +567,7 @@ impl ProjectManager {
         }
         if let Some(next) = update.assignee.as_ref() {
             if let Some(assignee) = next.as_ref() {
-                self.validate_assignee(assignee).await?;
+                self.validate_assignee(project, assignee).await?;
             }
             // Checked against the column the issue is actually in: dropping
             // the assignee of in-flight work recreates exactly the zombie
@@ -645,18 +645,45 @@ impl ProjectManager {
         Ok(after)
     }
 
-    /// An assignee has to be an agent that exists and can actually run.
+    /// An assignee has to be an agent on *this* board that can actually run.
     ///
-    /// External claude/codex profiles are refused: a top-level session
-    /// cannot be bound to a non-baybo framework today — the external
-    /// backend exists only inside the subagent spawner — so assigning one
-    /// would produce a card that can never start.
-    async fn validate_assignee(&self, assignee: &AgentProfileId) -> Result<()> {
+    /// Three refusals, each for work that could never happen:
+    ///
+    /// - **Not on the team.** A global chat persona has no handle here, is
+    ///   absent from the team strip, and cannot be mentioned — assigning one
+    ///   produces a card addressed to somebody the board cannot name.
+    /// - **Removed.** Its row survives so the timeline can still say what it
+    ///   did, which is exactly why the tombstone has to be checked here: a
+    ///   `get` that resolves is not a member who can be given new work.
+    /// - **External framework.** A top-level session cannot be bound to a
+    ///   non-baybo framework today — the external backend exists only inside
+    ///   the subagent spawner — so the card could never start.
+    async fn validate_assignee(
+        &self,
+        project: &ProjectId,
+        assignee: &AgentProfileId,
+    ) -> Result<()> {
         let profile = self
             .agents
             .get(assignee)
             .await?
             .ok_or_else(|| ProjectError::invalid("assignee", format!("no agent {assignee}")))?;
+        let on_this_board = profile
+            .team
+            .as_ref()
+            .is_some_and(|team| &team.project_id == project);
+        if !on_this_board {
+            return Err(ProjectError::invalid(
+                "assignee",
+                format!("{assignee} is not on this project's team"),
+            ));
+        }
+        if profile.deleted_at.is_some() {
+            return Err(ProjectError::invalid(
+                "assignee",
+                format!("{assignee} was removed from this project's team"),
+            ));
+        }
         if profile.framework != AgentFramework::Baybo {
             return Err(ProjectError::invalid(
                 "assignee",

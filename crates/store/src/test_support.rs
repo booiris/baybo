@@ -42,8 +42,34 @@ impl MemoryAgentProfileStore {
 #[async_trait]
 impl AgentProfileStore for MemoryAgentProfileStore {
     async fn list(&self) -> Result<Vec<AgentProfileRow>> {
-        let mut rows: Vec<AgentProfileRow> = self.rows.lock().values().cloned().collect();
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| row.team.is_none())
+            .cloned()
+            .collect();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(rows)
+    }
+
+    async fn list_team(&self, project: &baybo_model::ProjectId) -> Result<Vec<AgentProfileRow>> {
+        let mut rows: Vec<AgentProfileRow> = self
+            .rows
+            .lock()
+            .values()
+            .filter(|row| {
+                row.deleted_at.is_none()
+                    && row.team.as_ref().is_some_and(|t| &t.project_id == project)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.team
+                .as_ref()
+                .map(|t| &t.handle)
+                .cmp(&b.team.as_ref().map(|t| &t.handle))
+        });
         Ok(rows)
     }
 
@@ -85,7 +111,23 @@ impl AgentProfileStore for MemoryAgentProfileStore {
     }
 
     async fn delete(&self, id: &AgentProfileId) -> Result<bool> {
-        Ok(self.rows.lock().remove(id).is_some())
+        let mut rows = self.rows.lock();
+        if rows.get(id).is_some_and(|row| row.team.is_some()) {
+            return Ok(false);
+        }
+        Ok(rows.remove(id).is_some())
+    }
+
+    async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool> {
+        let mut rows = self.rows.lock();
+        let Some(row) = rows.get_mut(id) else {
+            return Ok(false);
+        };
+        if row.team.is_none() || row.deleted_at.is_some() {
+            return Ok(false);
+        }
+        row.deleted_at = Some(chrono::Utc::now());
+        Ok(true)
     }
 }
 
@@ -101,6 +143,9 @@ pub fn agent_profile_row(id: &AgentProfileId) -> AgentProfileRow {
         framework: baybo_model::AgentFramework::Baybo,
         llm: None,
         builtin: false,
+        team: None,
+        hired_by: None,
+        deleted_at: None,
         created_at: now,
         updated_at: now,
     }

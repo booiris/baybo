@@ -31,6 +31,33 @@ async fn open_project(router: &axum::Router, name: &str) -> String {
     created["id"].as_str().expect("id").to_owned()
 }
 
+/// Put a runnable agent on a board's team. Assignment is roster-scoped, so
+/// the profile has to name the project it is being assigned inside.
+async fn seed_teammate(tg: &baybo_gateway::test_support::TestGateway, project: &str, handle: &str) {
+    let now = chrono::Utc::now();
+    tg.deps
+        .stores
+        .agent_profile
+        .create(&baybo_store::AgentProfileRow {
+            id: baybo_model::AgentProfileId::parse(handle).expect("agent id"),
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            team: Some(baybo_model::TeamMembership {
+                project_id: baybo_model::ProjectId::parse(project.to_owned()).expect("project id"),
+                handle: baybo_model::AgentHandle::parse(handle).expect("handle"),
+            }),
+            hired_by: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed agent");
+}
+
 async fn open_issue(router: &axum::Router, project: &str, title: &str) -> i64 {
     let created = post(
         router,
@@ -382,25 +409,9 @@ async fn in_progress_is_refused_without_an_assignee() {
 #[tokio::test]
 async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
     let (router, tg) = router().await;
-    // An agent that can actually host a run.
-    let now = chrono::Utc::now();
-    tg.deps
-        .stores
-        .agent_profile
-        .create(&baybo_store::AgentProfileRow {
-            id: baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
-            description: String::new(),
-            avatar_blob_id: None,
-            framework: baybo_model::AgentFramework::Baybo,
-            llm: None,
-            builtin: false,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("seed agent");
-
     let p = open_project(&router, "runs").await;
+    // An agent on this board that can actually host a run.
+    seed_teammate(&tg, &p, "dev-1").await;
     post(
         &router,
         &format!("/v1/projects/{p}/issues"),
@@ -448,23 +459,8 @@ async fn a_started_card_shows_a_run_on_the_board_and_in_its_log() {
 #[tokio::test]
 async fn a_run_can_be_stopped_and_started_again() {
     let (router, tg) = router().await;
-    let now = chrono::Utc::now();
-    tg.deps
-        .stores
-        .agent_profile
-        .create(&baybo_store::AgentProfileRow {
-            id: baybo_model::AgentProfileId::parse("dev-1").expect("agent id"),
-            description: String::new(),
-            avatar_blob_id: None,
-            framework: baybo_model::AgentFramework::Baybo,
-            llm: None,
-            builtin: false,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("seed agent");
     let p = open_project(&router, "control").await;
+    seed_teammate(&tg, &p, "dev-1").await;
     post(
         &router,
         &format!("/v1/projects/{p}/issues"),

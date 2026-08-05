@@ -33,6 +33,11 @@ pub const MAX_AGENT_PROFILE_NAME_CHARS: usize = 64;
 /// becomes a directory name under the workspace `personas/` tree.
 pub const MAX_AGENT_PROFILE_ID_CHARS: usize = 64;
 
+/// Upper bound on an [`AgentHandle`]. Short on purpose: a handle is typed
+/// into comments and read off card faces, so it competes for the same room
+/// as the text around it.
+pub const MAX_AGENT_HANDLE_CHARS: usize = 32;
+
 /// An id that failed the [`AgentProfileId`] grammar. Carries the rejected
 /// value so operator-facing errors can name it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -186,6 +191,116 @@ impl<'de> Deserialize<'de> for AgentProfileId {
         let raw = String::deserialize(deserializer)?;
         Self::parse(raw).map_err(serde::de::Error::custom)
     }
+}
+
+/// A handle that failed the [`AgentHandle`] grammar.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid agent handle {value:?}: {reason}")]
+pub struct InvalidAgentHandle {
+    pub value: String,
+    pub reason: &'static str,
+}
+
+/// What a project agent is called on its board: `@lead`, `@dev-1`.
+///
+/// Deliberately not the profile id. The id is a ULID that names a directory
+/// on disk; the handle is what a person types into a comment, so it is
+/// short, lowercase, and readable. It is also **immutable and permanently
+/// reserved within its project** — a timeline entry saying "@dev-1 moved
+/// this" has to keep meaning the same agent after that agent is removed,
+/// which it cannot if the handle is ever reissued.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct AgentHandle(String);
+
+impl AgentHandle {
+    /// Validate `value` against the handle grammar:
+    /// `[a-z][a-z0-9-]{0,31}`, no trailing dash.
+    ///
+    /// Narrower than the id grammar in every direction — no uppercase, no
+    /// dots, no underscores — because a handle is read aloud and typed from
+    /// memory. Two handles that differ only in case would be one name to
+    /// every reader and two to the index.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidAgentHandle> {
+        let value = value.into();
+        let reject = |reason| InvalidAgentHandle {
+            value: value.clone(),
+            reason,
+        };
+        let mut chars = value.chars();
+        let Some(first) = chars.next() else {
+            return Err(reject("empty"));
+        };
+        if !first.is_ascii_lowercase() {
+            return Err(reject("must start with a lowercase ASCII letter"));
+        }
+        if !chars
+            .clone()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(reject(
+                "may contain only lowercase ASCII letters, digits and '-'",
+            ));
+        }
+        if value.ends_with('-') {
+            return Err(reject("must not end with '-'"));
+        }
+        if value.chars().count() > MAX_AGENT_HANDLE_CHARS {
+            return Err(reject("longer than 32 characters"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Reduce a display name to handle shape, or `None` if nothing usable
+    /// survives. Not infallible on purpose: a name of pure punctuation has
+    /// no handle, and inventing one (`agent-01J…`) would produce exactly the
+    /// unreadable identifier the handle exists to avoid — the caller should
+    /// ask for a different name instead.
+    pub fn derive(name: &str) -> Option<Self> {
+        let mut slug = String::with_capacity(name.len());
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                slug.extend(ch.to_lowercase());
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+        }
+        let slug = slug.trim_matches('-');
+        // A leading digit survives slugification but not the grammar, so
+        // truncate first and let `parse` be the single judge.
+        let slug: String = slug.chars().take(MAX_AGENT_HANDLE_CHARS).collect();
+        Self::parse(slug.trim_end_matches('-').to_owned()).ok()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentHandle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An agent's place on a project team: which board, and the handle it
+/// answers to there.
+///
+/// One field rather than two nullable columns' worth of `Option`, because
+/// the two facts are never independent — an agent with a board but no
+/// handle cannot be mentioned, and a handle with no board is scoped to
+/// nothing. `None` on the profile means a global agent, which has neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamMembership {
+    pub project_id: crate::ProjectId,
+    pub handle: AgentHandle,
 }
 
 /// What a new session is bound to at creation: which agent, and which
@@ -352,6 +467,73 @@ mod tests {
     #[test]
     fn builtin_id_matches_const() {
         assert_eq!(AgentProfileId::builtin().as_str(), BUILTIN_AGENT_PROFILE_ID);
+    }
+
+    #[test]
+    fn handle_grammar_is_narrower_than_the_id_grammar() {
+        for good in ["lead", "dev-1", "a", &"a".repeat(MAX_AGENT_HANDLE_CHARS)] {
+            assert!(
+                AgentHandle::parse(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+        for bad in [
+            "",
+            "Lead",  // an id may be mixed-case; a handle may not
+            "dev_1", // nor may it use the id grammar's '_' and '.'
+            "dev.1",
+            "1dev",
+            "-lead",
+            "lead-",
+            "has space",
+            "naïve",
+            &"a".repeat(MAX_AGENT_HANDLE_CHARS + 1),
+        ] {
+            assert!(
+                AgentHandle::parse(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn handles_derive_from_display_names() {
+        let derive = |name: &str| AgentHandle::derive(name).map(|h| h.as_str().to_owned());
+        assert_eq!(derive("Lead"), Some("lead".to_owned()));
+        assert_eq!(
+            derive("  Test Engineer  "),
+            Some("test-engineer".to_owned())
+        );
+        assert_eq!(derive("dev_1"), Some("dev-1".to_owned()));
+        // Truncation must not leave the trailing dash the grammar refuses.
+        let long = derive(&format!("{} tail", "a".repeat(MAX_AGENT_HANDLE_CHARS - 1)));
+        assert_eq!(long, Some("a".repeat(MAX_AGENT_HANDLE_CHARS - 1)));
+        // Nothing usable is `None`, not an invented identifier: the point of
+        // a handle is that a person can read it.
+        assert_eq!(derive("!!!"), None);
+        assert_eq!(derive("42"), None, "a handle cannot start with a digit");
+    }
+
+    #[test]
+    fn every_derived_handle_passes_the_grammar() {
+        for name in ["Lead", "Dev 1", "QA/Test", "a-----b", "Ünïcödé name"] {
+            if let Some(handle) = AgentHandle::derive(name) {
+                AgentHandle::parse(handle.as_str())
+                    .unwrap_or_else(|e| panic!("derive({name:?}) produced an invalid handle: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn handle_round_trips_as_a_transparent_string() {
+        let handle = AgentHandle::parse("dev-1").unwrap();
+        let s = serde_json::to_string(&handle).unwrap();
+        assert_eq!(s, "\"dev-1\"");
+        assert_eq!(serde_json::from_str::<AgentHandle>(&s).unwrap(), handle);
+        assert!(
+            serde_json::from_str::<AgentHandle>("\"Dev 1\"").is_err(),
+            "deserialize must enforce the grammar too"
+        );
     }
 
     #[test]

@@ -283,6 +283,26 @@ fn migrate_turn_entity_rename(conn: &mut rusqlite::Connection) -> anyhow::Result
 /// Columns added after their `CREATE TABLE` shipped.
 const ADD_COLUMNS: &[AddColumn] = &[
     AddColumn {
+        table: "agent_profiles",
+        column: "project_id",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "handle",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "hired_by",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "agent_profiles",
+        column: "deleted_at",
+        definition: "INTEGER",
+    },
+    AddColumn {
         table: "issues",
         column: "branch",
         definition: "TEXT",
@@ -1179,6 +1199,16 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     framework       TEXT NOT NULL,
                     llm             TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
+                    -- A project team member. Both NULL for a global agent;
+                    -- both set for a teammate. Nothing sets one alone —
+                    -- see `TeamMembership`.
+                    project_id      TEXT,
+                    handle          TEXT,
+                    -- Which agent hired this one. NULL is the operator.
+                    hired_by        TEXT,
+                    -- Removed from its team. The row stays: issues, runs and
+                    -- timeline entries all name agents by id.
+                    deleted_at      INTEGER,
                     created_at      INTEGER NOT NULL,
                     updated_at      INTEGER NOT NULL
                 );
@@ -1407,7 +1437,17 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              WHERE source_event_id IS NOT NULL;
          -- Serves the chat-list base query (channel scope + newest-first).
          CREATE INDEX IF NOT EXISTS idx_sessions_channel_active
-             ON sessions(channel, last_active DESC);",
+             ON sessions(channel, last_active DESC);
+         -- A handle is unique within its board and stays reserved after the
+         -- agent is removed: reissuing it would silently repoint every
+         -- timeline entry that already said '@dev-1'. Hence no
+         -- `deleted_at IS NULL` here.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_handle
+             ON agent_profiles(project_id, handle) WHERE project_id IS NOT NULL;
+         -- Serves the board's roster read.
+         CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
+             ON agent_profiles(project_id)
+             WHERE project_id IS NOT NULL AND deleted_at IS NULL;",
     )
     .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
 
@@ -1730,6 +1770,57 @@ mod tests {
         })
         .await
         .expect("migration interact");
+    }
+
+    /// A database written before the team columns existed must still open,
+    /// and must come out with the handle index. The ordering is the hazard:
+    /// `idx_agent_profiles_handle` names two columns that only exist after
+    /// the `ADD_COLUMNS` loop, so a batch-time `CREATE INDEX` would fail
+    /// here and nowhere else — a fresh DB never notices.
+    #[tokio::test]
+    async fn a_pre_team_database_migrates_and_gains_the_handle_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE agent_profiles (
+                     id             TEXT PRIMARY KEY,
+                     description    TEXT NOT NULL,
+                     avatar_blob_id TEXT,
+                     framework      TEXT NOT NULL,
+                     llm            TEXT,
+                     builtin        INTEGER NOT NULL DEFAULT 0,
+                     created_at     INTEGER NOT NULL,
+                     updated_at     INTEGER NOT NULL
+                 );
+                 INSERT INTO agent_profiles
+                     (id, description, framework, created_at, updated_at)
+                     VALUES ('01JOLD', 'a persona from before', 'baybo', 1, 1);",
+            )
+            .expect("seed the pre-migration shape");
+        }
+
+        let pool = SqlitePool::open(&path).await.expect("open must migrate");
+        pool.interact("test.assert_migrated", |conn| {
+            let indexed: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_agent_profiles_handle'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(indexed, 1, "the handle index must exist after migration");
+            // The pre-existing row survived and reads as a global agent.
+            let (project_id, handle): (Option<String>, Option<String>) = conn.query_row(
+                "SELECT project_id, handle FROM agent_profiles WHERE id = '01JOLD'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((project_id, handle), (None, None));
+            Ok(())
+        })
+        .await
+        .expect("assert interact");
     }
 
     /// A migration naming a missing table is a programming error in

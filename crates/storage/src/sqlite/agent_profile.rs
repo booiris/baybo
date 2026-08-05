@@ -1,7 +1,10 @@
 //! sqlite implementation of [`AgentProfileStore`].
 
 use async_trait::async_trait;
-use baybo_model::{AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName};
+use baybo_model::{
+    AgentFramework, AgentHandle, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName, ProjectId,
+    TeamMembership,
+};
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
@@ -15,7 +18,8 @@ const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
     "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.";
 
 const SELECT_COLS: &str = "id, description, avatar_blob_id, framework, \
-                           llm, builtin, created_at, updated_at";
+                           llm, builtin, project_id, handle, hired_by, \
+                           deleted_at, created_at, updated_at";
 
 pub struct SqliteAgentProfileStore {
     pool: SqlitePool,
@@ -59,10 +63,10 @@ fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
 /// constraint, else a generic internal error. Same message-sniff as the
 /// device store.
 ///
-/// The only constraint left on the table is `PRIMARY KEY(id)`, and ids are
-/// freshly-minted ULIDs, so this is a backstop rather than a path anything
-/// reaches — the name `UNIQUE` went away with the column, since a name now
-/// lives in a file the agent may rewrite to anything at any time.
+/// Two constraints reach this. `PRIMARY KEY(id)` is a backstop nothing
+/// hits, since ids are freshly-minted ULIDs. `idx_agent_profiles_handle` is
+/// live: two hires racing for `@dev-1` is exactly what it exists to refuse,
+/// and the loser must see a conflict rather than an internal error.
 fn write_conflict_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     let msg = e.to_string();
     if msg.contains("constraint") || msg.contains("UNIQUE") {
@@ -83,6 +87,10 @@ type RawProfileRow = (
     String,
     Option<String>,
     i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
     i64,
     i64,
 );
@@ -97,6 +105,10 @@ fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -108,6 +120,10 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         framework_raw,
         llm,
         builtin_col,
+        project_id,
+        handle,
+        hired_by,
+        deleted_at_us,
         created_at_us,
         updated_at_us,
     ) = raw;
@@ -116,16 +132,32 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
             "agent_profiles.framework: unknown value {framework_raw:?}"
         ))
     })?;
-    let created_at = super::time::from_us(created_at_us).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "agent_profiles.created_at out of range: {created_at_us}"
-        ))
-    })?;
-    let updated_at = super::time::from_us(updated_at_us).ok_or_else(|| {
-        StorageError::Storage(format!(
-            "agent_profiles.updated_at out of range: {updated_at_us}"
-        ))
-    })?;
+    let stamp = |column: &str, us: i64| {
+        super::time::from_us(us)
+            .ok_or_else(|| StorageError::Storage(format!("{column} out of range: {us}")))
+    };
+    let created_at = stamp("agent_profiles.created_at", created_at_us)?;
+    let updated_at = stamp("agent_profiles.updated_at", updated_at_us)?;
+    let deleted_at = deleted_at_us
+        .map(|us| stamp("agent_profiles.deleted_at", us))
+        .transpose()?;
+    // Both columns or neither: the pair is what `TeamMembership` means, and
+    // a half-written membership is an agent the roster shows and nobody can
+    // mention, or one that is mentionable and belongs to no board.
+    let team = match (project_id, handle) {
+        (Some(project_id), Some(handle)) => Some(TeamMembership {
+            project_id: ProjectId::parse(project_id)
+                .map_err(|e| StorageError::Storage(e.to_string()))?,
+            handle: AgentHandle::parse(handle).map_err(|e| StorageError::Storage(e.to_string()))?,
+        }),
+        (None, None) => None,
+        (project_id, handle) => {
+            return Err(StorageError::Storage(format!(
+                "agent_profiles: half a team membership (project_id={project_id:?}, \
+                 handle={handle:?})"
+            )));
+        }
+    };
     Ok(AgentProfileRow {
         // A stored id that fails the grammar is a hard error, not a warn:
         // this id names the profile's persona directory, and every consumer
@@ -136,6 +168,12 @@ fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
         framework,
         llm: llm.map(LlmEntryName::from),
         builtin: builtin_col != 0,
+        team,
+        hired_by: hired_by
+            .map(AgentProfileId::parse)
+            .transpose()
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
+        deleted_at,
         created_at,
         updated_at,
     })
@@ -148,11 +186,34 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .pool
             .interact("agent_profiles.list", move |conn| {
                 let mut stmt = conn.prepare(&format!(
+                    // The scope filter is in the statement so no caller can
+                    // forget it and leak somebody's teammate into the global
+                    // roster. Team members leave through their board.
                     "SELECT {SELECT_COLS} FROM agent_profiles \
+                     WHERE project_id IS NULL \
                      ORDER BY builtin DESC, id"
                 ))?;
                 let raws = stmt
                     .query_map([], read_raw_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(row_from_raw).collect()
+    }
+
+    async fn list_team(&self, project: &ProjectId) -> Result<Vec<AgentProfileRow>> {
+        let project = project.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("agent_profiles.list_team", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SELECT_COLS} FROM agent_profiles \
+                     WHERE project_id = ?1 AND deleted_at IS NULL \
+                     ORDER BY handle"
+                ))?;
+                let raws = stmt
+                    .query_map(rusqlite::params![project], read_raw_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(raws)
             })
@@ -183,6 +244,9 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let avatar_blob_id = row.avatar_blob_id.clone();
         let framework = row.framework.as_str();
         let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
+        let project_id = row.team.as_ref().map(|t| t.project_id.as_str().to_string());
+        let handle = row.team.as_ref().map(|t| t.handle.as_str().to_string());
+        let hired_by = row.hired_by.as_ref().map(|id| id.as_str().to_string());
         let created_at = super::time::to_us(row.created_at);
         let updated_at = super::time::to_us(row.updated_at);
         // The write error has to survive the closure as data: `Conflict` is a
@@ -190,19 +254,23 @@ impl AgentProfileStore for SqliteAgentProfileStore {
         let outcome = self
             .pool
             .interact("agent_profiles.create", move |conn| {
-                // `builtin` is deliberately not in the column list: the schema
-                // DEFAULT 0 fills it, so the seed stays the only writer of 1.
+                // Neither `builtin` nor `deleted_at` is in the column list:
+                // the schema default fills the first (so the seed stays the
+                // only writer of 1) and an agent is never born removed.
                 match conn.execute(
                     "INSERT INTO agent_profiles \
                      (id, description, avatar_blob_id, framework, \
-                      llm, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      llm, project_id, handle, hired_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         id,
                         description,
                         avatar_blob_id,
                         framework,
                         llm,
+                        project_id,
+                        handle,
+                        hired_by,
                         created_at,
                         updated_at,
                     ],
@@ -292,8 +360,30 @@ impl AgentProfileStore for SqliteAgentProfileStore {
             .pool
             .interact("agent_profiles.delete", move |conn| {
                 Ok(conn.execute(
-                    "DELETE FROM agent_profiles WHERE id = ?1 AND builtin = 0",
+                    // The team guard is structural for the same reason the
+                    // builtin one is: a row an issue's `assignee` points at
+                    // must not be reachable by the global delete path.
+                    "DELETE FROM agent_profiles \
+                     WHERE id = ?1 AND builtin = 0 AND project_id IS NULL",
                     rusqlite::params![id],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn remove_from_team(&self, id: &AgentProfileId) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("agent_profiles.remove_from_team", move |conn| {
+                Ok(conn.execute(
+                    // `deleted_at IS NULL` keeps the stamp honest: a second
+                    // removal must not rewrite when the agent actually left.
+                    "UPDATE agent_profiles SET deleted_at = ?2, updated_at = ?2 \
+                     WHERE id = ?1 AND project_id IS NOT NULL AND deleted_at IS NULL",
+                    rusqlite::params![id, now],
                 )?)
             })
             .await?;
@@ -327,8 +417,26 @@ mod tests {
             framework: AgentFramework::Claude,
             llm: Some(LlmEntryName::from("primary")),
             builtin: false,
+            team: None,
+            hired_by: None,
+            deleted_at: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn project(name: &str) -> ProjectId {
+        ProjectId::parse(name.to_owned()).expect("valid project id")
+    }
+
+    fn team_row(project: &ProjectId, handle: &str) -> AgentProfileRow {
+        AgentProfileRow {
+            framework: AgentFramework::Baybo,
+            team: Some(TeamMembership {
+                project_id: project.clone(),
+                handle: AgentHandle::parse(handle.to_owned()).expect("valid handle"),
+            }),
+            ..custom_row()
         }
     }
 
@@ -518,6 +626,127 @@ mod tests {
                 .set_avatar(&AgentProfileId::parse("missing").expect("valid id"), None)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// The two rosters are disjoint by construction. A teammate leaking
+    /// into `list()` would offer it as a chat persona and as a subagent on
+    /// every other board; a global agent leaking into `list_team()` would
+    /// make it assignable to work it has no handle for.
+    #[tokio::test]
+    async fn the_global_roster_and_a_team_roster_never_overlap() {
+        let store = open_store().await;
+        let alpha = project("alpha");
+        let beta = project("beta");
+        let global = custom_row();
+        store.create(&global).await.unwrap();
+        store.create(&team_row(&alpha, "lead")).await.unwrap();
+        store.create(&team_row(&alpha, "dev-1")).await.unwrap();
+        store.create(&team_row(&beta, "lead")).await.unwrap();
+
+        let global_ids: Vec<AgentProfileId> = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(global_ids, vec![AgentProfileId::builtin(), global.id]);
+
+        let handles: Vec<String> = store
+            .list_team(&alpha)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r.team.map(|t| t.handle.as_str().to_owned()))
+            .collect();
+        assert_eq!(handles, vec!["dev-1", "lead"], "ordered by handle");
+    }
+
+    /// One board's `@lead` and another's are different agents, so the
+    /// uniqueness that matters is per project, not global.
+    #[tokio::test]
+    async fn a_handle_is_unique_within_its_board_and_stays_reserved() {
+        let store = open_store().await;
+        let alpha = project("alpha");
+        store.create(&team_row(&alpha, "lead")).await.unwrap();
+
+        let clash = store.create(&team_row(&alpha, "lead")).await;
+        assert!(
+            matches!(clash, Err(StorageError::Conflict(_))),
+            "a duplicate handle is a conflict, not an internal error: {clash:?}"
+        );
+
+        // …and removal does not free it. A timeline entry that says
+        // '@lead did this' must not come to mean somebody else.
+        let leaving = store.list_team(&alpha).await.unwrap()[0].id.clone();
+        assert!(store.remove_from_team(&leaving).await.unwrap());
+        assert!(matches!(
+            store.create(&team_row(&alpha, "lead")).await,
+            Err(StorageError::Conflict(_))
+        ));
+    }
+
+    /// Removal is a tombstone, not a delete: the row is what lets a card,
+    /// a run and every timeline entry still say who did the work.
+    #[tokio::test]
+    async fn a_removed_teammate_leaves_the_roster_and_stays_resolvable() {
+        let store = open_store().await;
+        let alpha = project("alpha");
+        let row = team_row(&alpha, "dev-1");
+        store.create(&row).await.unwrap();
+
+        assert!(store.remove_from_team(&row.id).await.unwrap());
+        assert!(store.list_team(&alpha).await.unwrap().is_empty());
+        let back = store.get(&row.id).await.unwrap().expect("row survives");
+        assert!(back.deleted_at.is_some());
+        assert_eq!(
+            back.team.clone().map(|t| t.handle.as_str().to_owned()),
+            Some("dev-1".to_owned())
+        );
+
+        // Removing twice must not rewrite when the agent actually left.
+        assert!(!store.remove_from_team(&row.id).await.unwrap());
+        let again = store.get(&row.id).await.unwrap().expect("row survives");
+        assert_eq!(again.deleted_at, back.deleted_at);
+    }
+
+    /// The delete path is for global agents only. A teammate reached by it
+    /// would strand every issue whose `assignee` names it.
+    #[tokio::test]
+    async fn delete_refuses_a_team_member() {
+        let store = open_store().await;
+        let row = team_row(&project("alpha"), "dev-1");
+        store.create(&row).await.unwrap();
+
+        assert!(!store.delete(&row.id).await.unwrap());
+        assert!(store.get(&row.id).await.unwrap().is_some());
+        // A removed one is still not deletable — the row is the record.
+        assert!(store.remove_from_team(&row.id).await.unwrap());
+        assert!(!store.delete(&row.id).await.unwrap());
+        assert!(store.get(&row.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_hire_records_who_hired_it() {
+        let store = open_store().await;
+        let alpha = project("alpha");
+        let lead = team_row(&alpha, "lead");
+        store.create(&lead).await.unwrap();
+        let hire = AgentProfileRow {
+            hired_by: Some(lead.id.clone()),
+            ..team_row(&alpha, "dev-1")
+        };
+        store.create(&hire).await.unwrap();
+
+        assert_eq!(
+            store.get(&hire.id).await.unwrap().unwrap().hired_by,
+            Some(lead.id.clone())
+        );
+        assert_eq!(
+            store.get(&lead.id).await.unwrap().unwrap().hired_by,
+            None,
+            "the operator's own creations name nobody"
         );
     }
 

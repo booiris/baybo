@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use baybo_model::{AgentFramework, AgentProfileId};
+use baybo_model::{AgentFramework, AgentHandle, AgentProfileId, ProjectId, TeamMembership};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{
     IssueActor, IssuePriority, IssueRunRow, IssueStatus, IssueUpdate, ProjectUpdate, RunStatus,
@@ -22,9 +22,15 @@ struct Fixture {
     _workspace: tempfile::TempDir,
 }
 
-/// Seed an agent that can actually take work, and one that cannot.
-async fn seed_agent(f: &Fixture, id: &str, framework: AgentFramework) -> AgentProfileId {
-    let id = AgentProfileId::parse(id).expect("agent id");
+/// Put an agent on a project's team. Assignees have to be teammates, so
+/// every fixture that assigns work goes through here.
+async fn seed_agent(
+    f: &Fixture,
+    project: &ProjectId,
+    handle: &str,
+    framework: AgentFramework,
+) -> AgentProfileId {
+    let id = AgentProfileId::parse(handle).expect("agent id");
     let now = chrono::Utc::now();
     f.agents
         .create(&baybo_store::AgentProfileRow {
@@ -34,6 +40,12 @@ async fn seed_agent(f: &Fixture, id: &str, framework: AgentFramework) -> AgentPr
             framework,
             llm: None,
             builtin: false,
+            team: Some(TeamMembership {
+                project_id: project.clone(),
+                handle: AgentHandle::parse(handle).expect("agent handle"),
+            }),
+            hired_by: None,
+            deleted_at: None,
             created_at: now,
             updated_at: now,
         })
@@ -419,7 +431,7 @@ async fn a_move_must_name_the_issue_it_moves() {
 async fn in_progress_needs_somebody_on_it() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
     f.manager
         .create_issue(&p.id, IssueActor::User, new_issue("unclaimed"))
         .await
@@ -486,7 +498,7 @@ async fn in_progress_needs_somebody_on_it() {
 async fn an_assignee_must_exist_and_must_be_able_to_run() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
-    let external = seed_agent(&f, "codex-1", AgentFramework::Codex).await;
+    let external = seed_agent(&f, &p.id, "codex-1", AgentFramework::Codex).await;
 
     let ghost = AgentProfileId::parse("nobody").expect("id");
     let refused = f
@@ -523,11 +535,99 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
     );
 }
 
+/// The roster is the assignable set. A global chat persona is a real,
+/// runnable baybo agent — and still not assignable here, because it has no
+/// handle on this board and appears in none of its surfaces.
+#[tokio::test]
+async fn an_assignee_must_be_on_this_board() {
+    let f = fixture().await;
+    let mine = f
+        .manager
+        .create_project(new_project("mine"))
+        .await
+        .expect("p");
+    let theirs = f
+        .manager
+        .create_project(new_project("theirs"))
+        .await
+        .expect("p");
+
+    let global = AgentProfileId::parse("global-1").expect("id");
+    let now = chrono::Utc::now();
+    f.agents
+        .create(&baybo_store::AgentProfileRow {
+            id: global.clone(),
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            team: None,
+            hired_by: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed global agent");
+    let outsider = seed_agent(&f, &theirs.id, "dev-1", AgentFramework::Baybo).await;
+
+    for (assignee, why) in [
+        (global, "a global agent is on nobody's team"),
+        (outsider, "another board's teammate is not on this one"),
+    ] {
+        let refused = f
+            .manager
+            .create_issue(
+                &mine.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    assignee: Some(assignee),
+                    ..new_issue("to an outsider")
+                },
+            )
+            .await
+            .expect_err(why);
+        assert!(matches!(refused, ProjectError::Invalid { .. }), "{why}");
+    }
+}
+
+/// A removed teammate still resolves — that is what keeps the timeline
+/// readable — so "the row exists" is not the question the assign path asks.
+#[tokio::test]
+async fn a_removed_teammate_takes_no_new_work() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    assert!(f.agents.remove_from_team(&dev).await.expect("remove"));
+
+    let refused = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                ..new_issue("to somebody who left")
+            },
+        )
+        .await
+        .expect_err("a removed teammate cannot be assigned");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        f.agents.get(&dev).await.expect("get").is_some(),
+        "the row survives so past work can still name it"
+    );
+}
+
 #[tokio::test]
 async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
     f.manager
         .create_issue(
             &p.id,
@@ -579,8 +679,8 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
 async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
-    let other = seed_agent(&f, "dev-2", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
 
     // Straight into In Progress at creation: one edge.
     f.manager
@@ -628,7 +728,7 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
 async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
     f.manager
         .create_issue(
             &p.id,
@@ -662,7 +762,7 @@ async fn the_board_writes_its_own_history() {
         .create_project(new_project("Trail"))
         .await
         .expect("create");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
 
     let issue = f
         .manager
@@ -762,7 +862,7 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
         .create_project(new_project("Wake"))
         .await
         .expect("create");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
 
     let parked = f
         .manager
@@ -821,7 +921,7 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
         .create_project(new_project("Coalesce"))
         .await
         .expect("create");
-    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
     let issue = f
         .manager
         .create_issue(
