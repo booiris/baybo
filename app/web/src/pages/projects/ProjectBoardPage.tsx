@@ -62,6 +62,7 @@ import { writeLastProjectId } from './lastProject';
 import { CreateIssueModal } from './CreateIssueModal';
 import { ProjectSwitcher } from './ProjectSwitcher';
 import { ActivityDrawer } from './ActivityDrawer';
+import { LeadPanel } from './LeadPanel';
 import { BoardFilterBar } from './BoardFilterBar';
 import { boardFilterParams, filterBoard, parseBoardFilter } from './boardFilter';
 import type { BoardFilter } from './boardFilter';
@@ -100,7 +101,9 @@ export function ProjectBoardPage() {
   // The filter lives in the URL so the board→detail→back loop and a reload
   // keep it, and so a narrowed board is a link somebody can send.
   const filter = useMemo(() => parseBoardFilter(params), [params]);
-  const [showActivity, setShowActivity] = useState(false);
+  // One right-hand slot, so the two panels are mutually exclusive — the
+  // spec's rule, and the board would have no room for both anyway.
+  const [rightPanel, setRightPanel] = useState<'activity' | 'lead' | null>(null);
 
   // The board dnd-kit shows mid-drag is already mutated by `onDragOver`, so
   // a rollback needs the board as it was before the drag started.
@@ -333,12 +336,24 @@ export function ProjectBoardPage() {
         <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
-            aria-pressed={showActivity}
+            aria-pressed={rightPanel === 'lead'}
             onClick={() => {
-              setShowActivity((open) => !open);
+              setRightPanel((open) => (open === 'lead' ? null : 'lead'));
             }}
             className={`border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
-              showActivity ? 'bg-brand text-ink' : 'bg-surface'
+              rightPanel === 'lead' ? 'bg-brand text-ink' : 'bg-surface'
+            }`}
+          >
+            Chat with lead
+          </button>
+          <button
+            type="button"
+            aria-pressed={rightPanel === 'activity'}
+            onClick={() => {
+              setRightPanel((open) => (open === 'activity' ? null : 'activity'));
+            }}
+            className={`border-2 border-black rounded-md px-2 py-0.5 font-mono text-[0.62rem] font-bold uppercase tracking-wider ${
+              rightPanel === 'activity' ? 'bg-brand text-ink' : 'bg-surface'
             }`}
           >
             Activity
@@ -395,16 +410,28 @@ export function ProjectBoardPage() {
           {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
         </DragOverlay>
       </DndContext>
-      {showActivity ? (
+      {rightPanel === 'activity' ? (
         <ActivityDrawer
           projectId={projectId}
           // The feed refetches on the same signal the board does, so an
           // entry and the card it describes appear together.
           refreshKey={refreshKey}
           onClose={() => {
-            setShowActivity(false);
+            setRightPanel(null);
           }}
           onOpenIssue={openIssue}
+        />
+      ) : null}
+      {rightPanel === 'lead' ? (
+        <LeadPanel
+          projectId={projectId}
+          readOnly={archived}
+          onClose={() => {
+            setRightPanel(null);
+          }}
+          onBoardChanged={() => {
+            setRefreshKey((key) => key + 1);
+          }}
         />
       ) : null}
       </div>

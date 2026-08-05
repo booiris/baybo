@@ -28,6 +28,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_team, hire_agent))
         .routes(routes!(remove_agent))
+        .routes(routes!(list_lead_conversations, open_lead_conversation))
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────
@@ -223,4 +224,131 @@ async fn remove_agent(
         .await
         .map_err(project_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── The lead's planning conversations ───────────────────────────────────
+
+/// One conversation with a board's lead.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LeadConversationDto {
+    /// The session id. Everything else — history, live traffic, sending —
+    /// goes through the ordinary chat transport, which scopes by channel
+    /// and is happy to carry a board's session; only the chat *list*
+    /// filters these out, which is the point.
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub last_active_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/lead/conversations",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, description = "This board's conversations with its lead, most recently active first", body = inline(ListResponse<LeadConversationDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn list_lead_conversations(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ListResponse<LeadConversationDto>>> {
+    let id = parse_project_id(&project_id)?;
+    state
+        .project_manager
+        .get_project(&id)
+        .await
+        .map_err(project_err)?;
+    let items = state
+        .session_manager
+        .list_project_conversations(id.as_str())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("list lead conversations: {e}")))?
+        .into_iter()
+        .map(|session| LeadConversationDto {
+            session_id: session.id.as_str().to_owned(),
+            title: session.title,
+            last_active_ms: session.last_active.timestamp_millis(),
+            created_at_ms: session.created_at.timestamp_millis(),
+        })
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/lead/conversations",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 201, description = "A fresh conversation with the lead", body = LeadConversationDto),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project, or it has no lead", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
+    )
+)]
+async fn open_lead_conversation(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<(StatusCode, Json<LeadConversationDto>)> {
+    let id = parse_project_id(&project_id)?;
+    let project = state
+        .project_manager
+        .get_project(&id)
+        .await
+        .map_err(project_err)?;
+    if project.archived_at.is_some() {
+        return Err(GatewayError::Conflict(format!(
+            "project {id} is archived and takes no new work"
+        )));
+    }
+    // Bound to the lead, not to the built-in: the conversation has to run
+    // on the coordinator's soul and memory partition, and its tool calls
+    // are recorded on the board as the lead's.
+    let lead = state
+        .project_manager
+        .team(&id)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .find(|row| {
+            row.team
+                .as_ref()
+                .is_some_and(|team| team.handle.as_str() == baybo_project::LEAD_HANDLE)
+        })
+        .ok_or_else(|| GatewayError::NotFound(format!("project {id} has no lead")))?;
+
+    let channel = baybo_model::ChannelType::owner();
+    let session = state
+        .session_manager
+        .create_bound_session_with_trigger(
+            baybo_model::User {
+                id: crate::auth::OWNER_USER_ID.to_owned(),
+                name: None,
+                channel: channel.clone(),
+            },
+            channel,
+            baybo_model::TriggerSource::Project {
+                project_id: id.clone(),
+            },
+            Some(baybo_model::AgentBinding {
+                agent_id: lead.id.clone(),
+                framework: lead.framework,
+            }),
+        )
+        .await
+        .map_err(|e| GatewayError::Internal(format!("open a lead conversation: {e}")))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(LeadConversationDto {
+            session_id: session.id.as_str().to_owned(),
+            title: session.title,
+            last_active_ms: session.last_active.timestamp_millis(),
+            created_at_ms: session.created_at.timestamp_millis(),
+        }),
+    ))
 }

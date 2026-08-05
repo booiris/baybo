@@ -5848,6 +5848,160 @@
         }
       }
     },
+    "/v1/projects/{project_id}/lead/conversations": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_lead_conversations",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This board's conversations with its lead, most recently active first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One conversation with a board's lead.",
+                        "required": [
+                          "session_id",
+                          "last_active_ms",
+                          "created_at_ms"
+                        ],
+                        "properties": {
+                          "created_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "last_active_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "session_id": {
+                            "type": "string",
+                            "description": "The session id. Everything else — history, live traffic, sending —\ngoes through the ordinary chat transport, which scopes by channel\nand is happy to carry a board's session; only the chat *list*\nfilters these out, which is the point."
+                          },
+                          "title": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "open_lead_conversation",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "A fresh conversation with the lead",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadConversationDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project, or it has no lead",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The project is archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/runs": {
       "get": {
         "tags": [
@@ -9007,6 +9161,35 @@
           "review",
           "done"
         ]
+      },
+      "LeadConversationDto": {
+        "type": "object",
+        "description": "One conversation with a board's lead.",
+        "required": [
+          "session_id",
+          "last_active_ms",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_active_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "The session id. Everything else — history, live traffic, sending —\ngoes through the ordinary chat transport, which scopes by channel\nand is happy to carry a board's session; only the chat *list*\nfilters these out, which is the point."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "ListResponse_SlashCommandEntry": {
         "type": "object",

@@ -1,5 +1,5 @@
 import type { AdminClient } from '../../api/client';
-import type { components } from '../../api/schema';
+import type { components, paths } from '../../api/schema';
 import type { Agent, Issue, IssueRun, IssueStatus, Project } from './boardModel';
 import type { IssueEvent } from './timelineModel';
 
@@ -400,6 +400,82 @@ export async function resolveApproval(
     if (error !== undefined) return failure(response.status, error.error);
     if (!response.ok) return failure(response.status, undefined);
     return { kind: 'ok', value: null };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export type LeadConversation =
+  paths['/v1/projects/{project_id}/lead/conversations']['get']['responses'][200]['content']['application/json']['items'][number];
+
+export async function fetchLeadConversations(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<LeadConversation[]>> {
+  try {
+    const { data, error, response } = await client.GET(
+      '/v1/projects/{project_id}/lead/conversations',
+      { params: { path: { project_id: projectId } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data.items };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+export async function openLeadConversation(
+  client: AdminClient,
+  projectId: string,
+): Promise<Outcome<LeadConversation>> {
+  try {
+    const { data, error, response } = await client.POST(
+      '/v1/projects/{project_id}/lead/conversations',
+      { params: { path: { project_id: projectId } } },
+    );
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return { kind: 'ok', value: data };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+/** One transcript row the panel renders. */
+export type LeadTurn = { id: string; kind: string; role: string; text: string; at: string };
+
+/**
+ * One conversation's newest page.
+ *
+ * The ordinary chat sync endpoint: it scopes by channel, not by whether a
+ * session is on the chat *list*, so a board's thread reads through it
+ * unchanged. Nothing here re-implements the transcript — `rows` is already
+ * the flattened shape the chat client renders.
+ */
+export async function fetchLeadMessages(
+  client: AdminClient,
+  sessionId: string,
+): Promise<Outcome<LeadTurn[]>> {
+  try {
+    const { data, error, response } = await client.GET('/v1/chat/sessions/{session_id}/sync', {
+      params: { path: { session_id: sessionId }, query: {} },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error !== undefined) return failure(response.status, error.error);
+    if (!response.ok) return failure(response.status, undefined);
+    return {
+      kind: 'ok',
+      value: data.rows.map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        role: row.role,
+        text: row.text,
+        at: row.created_at,
+      })),
+    };
   } catch (e) {
     return { kind: 'failed', message: networkMessage(e) };
   }

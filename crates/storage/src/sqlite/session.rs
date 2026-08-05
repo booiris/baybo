@@ -613,6 +613,29 @@ impl SessionStore for SqliteSessionStore {
         Ok(ids.into_iter().map(SessionId::from).collect())
     }
 
+    async fn list_project_conversations(&self, project_id: &str) -> Result<Vec<Session>> {
+        let project_id = project_id.to_string();
+        let rows = self
+            .pool
+            .interact("sessions.list_project_conversations", move |conn| {
+                // Both halves are required: the trigger kind pins it to a
+                // planning conversation, so an issue *run*'s session — which
+                // carries the same `project_id` — is not returned here.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {SESSION_LIST_COLUMNS} FROM sessions \
+                     WHERE json_extract(data, '$.trigger.kind') = 'project' \
+                       AND json_extract(data, '$.trigger.project_id') = ?1 \
+                     ORDER BY last_active DESC"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project_id], read_session_list_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(decode_session_list_rows(rows))
+    }
+
     async fn list_all(&self) -> Result<Vec<Session>> {
         // Project the flat `hidden` column — `set_hidden` writes there
         // directly without rewriting the JSON `data` blob, so trusting

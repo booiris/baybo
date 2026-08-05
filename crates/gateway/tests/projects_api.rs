@@ -863,3 +863,109 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
         baybo_model::ApprovalDecision::Approve
     );
 }
+
+/// The lead's planning conversations: a board-scoped session that runs as
+/// the lead and stays off the chat surface.
+#[tokio::test]
+async fn a_board_opens_conversations_with_its_lead() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "planning").await;
+
+    let empty = get(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(empty["items"].as_array().expect("items").len(), 0);
+
+    let opened = post(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        json!({}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let sid = opened["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    // The prefix is how a reader tells a board's thread from a chat at a
+    // glance in logs and the trace viewer.
+    assert!(sid.starts_with("board-"), "{sid}");
+
+    let listed = get(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(listed["items"].as_array().expect("items").len(), 1);
+    assert_eq!(listed["items"][0]["session_id"], sid);
+
+    // A second conversation is a second thread, not a replacement — the
+    // panel keeps history.
+    post(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        json!({}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let listed = get(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(listed["items"].as_array().expect("items").len(), 2);
+
+    // …and none of them is in the chat list. A board's conversations live
+    // on the board.
+    let chats = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let ids: Vec<&str> = chats["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|s| s["session_id"].as_str())
+        .collect();
+    assert!(!ids.contains(&sid.as_str()), "{ids:?}");
+
+    // Another board's conversations are its own.
+    let other = open_project(&router, "elsewhere").await;
+    let theirs = get(
+        &router,
+        &format!("/v1/projects/{other}/lead/conversations"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(theirs["items"].as_array().expect("items").len(), 0);
+
+    get(
+        &router,
+        "/v1/projects/01JGHOSTGHOSTGHOSTGHOSTGH/lead/conversations",
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// An archived board is read-only, so it does not open new conversations.
+#[tokio::test]
+async fn an_archived_board_opens_no_new_conversation() {
+    let (router, _tg) = router().await;
+    let p = open_project(&router, "shelved").await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/archive"),
+        json!({ "archived": true }),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &router,
+        &format!("/v1/projects/{p}/lead/conversations"),
+        json!({}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+}

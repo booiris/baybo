@@ -130,6 +130,16 @@ pub enum TriggerSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
     },
+    /// The lead's planning conversation for one board.
+    ///
+    /// A board-scoped session that is not an issue: the operator talks to
+    /// the coordinator here and it turns conclusions into cards through the
+    /// same tools a run uses. Like an issue's session it is invisible to
+    /// the chat surface — a board's conversations live on the board — which
+    /// is why it counts as a project session below.
+    Project {
+        project_id: crate::ProjectId,
+    },
     /// The session an issue's work happens in. One per issue, reused by
     /// every run of it — so a follow-up run sees what the last one did —
     /// and never listed in the chat surface: a board's conversations live
@@ -149,7 +159,23 @@ impl TriggerSource {
         match self {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
-            TriggerSource::Issue { .. } => TriggerKind::Issue,
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => TriggerKind::Issue,
+        }
+    }
+
+    /// The board this session belongs to, if it belongs to one.
+    ///
+    /// Deliberately separate from [`Self::issue`] rather than a widening of
+    /// it: `issue()` answers "which **card**", which is what the approval
+    /// gate needs to know where to write, and a planning conversation has
+    /// no card. This answers "which **board**", which is what decides
+    /// whether the board's tools are visible and what they are scoped to.
+    pub fn project(&self) -> Option<&crate::ProjectId> {
+        match self {
+            TriggerSource::Project { project_id } | TriggerSource::Issue { project_id, .. } => {
+                Some(project_id)
+            }
+            _ => None,
         }
     }
 
@@ -177,7 +203,10 @@ impl TriggerSource {
     /// never listed in the chat surface, never pushed, and never fed to the
     /// dream pass: their conversation belongs to an issue.
     pub fn is_project_session(&self) -> bool {
-        matches!(self, TriggerSource::Issue { .. })
+        matches!(
+            self,
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. }
+        )
     }
 
     /// The conversation that created this session's cron job, if any. Used
