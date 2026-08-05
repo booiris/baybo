@@ -87,6 +87,7 @@ fn new_project(name: &str) -> NewProject {
         name: name.to_owned(),
         description: String::new(),
         workdir: None,
+        daily_budget: None,
     }
 }
 
@@ -671,6 +672,7 @@ async fn an_archived_project_is_read_only() {
             ProjectUpdate {
                 name: "renamed".into(),
                 description: String::new(),
+                daily_budget: None,
             },
         )
         .await
@@ -1413,5 +1415,215 @@ async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
     assert!(
         kinds.contains(&"worktree_kept"),
         "and the operator is told why rather than left to notice: {kinds:?}"
+    );
+}
+
+/// The gate's shape: the run is **recorded** and then held, so an
+/// exhausted board owes work rather than dropping it.
+#[tokio::test]
+async fn a_board_over_budget_records_the_work_it_is_not_doing() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            // Zero is how an operator pauses a board without archiving it.
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Skint")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("work nobody can afford")
+            },
+        )
+        .await
+        .expect("create");
+
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "nothing was started against an exhausted budget"
+    );
+    let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1, "but the run was recorded");
+    assert_eq!(runs[0].status, RunStatus::Held);
+    assert!(
+        !runs[0].status.is_settled(),
+        "a held run holds the issue's dedupe slot"
+    );
+
+    // And the card says why, in figures.
+    let timeline = f.manager.timeline(&project.id, 1).await.expect("timeline");
+    let held = timeline
+        .iter()
+        .find_map(|e| match &e.body {
+            baybo_store::project::IssueEventBody::BudgetExhausted {
+                spent_micros,
+                limit_micros,
+            } => Some((*spent_micros, *limit_micros)),
+            _ => None,
+        })
+        .expect("the timeline says the run was held");
+    assert_eq!(held, (0, 0));
+}
+
+/// Raising the ceiling starts what it was blocking, without the operator
+/// touching each card.
+#[tokio::test]
+async fn a_raised_budget_releases_what_it_was_holding() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Thawing")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("waiting on money")
+            },
+        )
+        .await
+        .expect("create");
+    assert!(f.dispatched.lock().is_empty());
+
+    f.manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+            },
+        )
+        .await
+        .expect("raise the ceiling");
+
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "the held run started once there was room"
+    );
+    let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+    assert_eq!(runs[0].status, RunStatus::Queued);
+    assert!(
+        f.manager
+            .timeline(&project.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::BudgetRestored { .. }
+            )),
+        "and the card says it was released"
+    );
+}
+
+/// A negative ceiling is a caller mistake, not a board to be silently
+/// paused.
+#[tokio::test]
+async fn a_negative_budget_is_refused() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Negative"))
+        .await
+        .expect("p");
+    let refused = f
+        .manager
+        .update_project(
+            &project.id,
+            ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(-1)),
+            },
+        )
+        .await
+        .expect_err("a negative ceiling means nothing");
+    assert!(
+        matches!(refused, ProjectError::Invalid { .. }),
+        "{refused:?}"
+    );
+}
+
+/// The boot sweep must not start held runs as if they were orphans, and
+/// must re-evaluate them against the budget it finds.
+#[tokio::test]
+async fn the_boot_sweep_leaves_a_hold_held_while_the_board_is_still_broke() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Still Skint")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("held across a restart")
+            },
+        )
+        .await
+        .expect("create");
+    f.dispatched.lock().clear();
+
+    let resumed = f.manager.resume_unsettled_runs().await.expect("sweep");
+    assert_eq!(resumed, 0, "a hold is not an orphan to roll forward");
+    assert!(f.dispatched.lock().is_empty());
+    let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+    assert_eq!(runs[0].status, RunStatus::Held);
+}
+
+/// No ceiling is the default, and it must cost nothing and gate nothing.
+#[tokio::test]
+async fn a_board_with_no_ceiling_is_never_held() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Unlimited"))
+        .await
+        .expect("p");
+    assert_eq!(project.daily_budget, None);
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("free rein")
+            },
+        )
+        .await
+        .expect("create");
+    assert_eq!(f.dispatched.lock().len(), 1);
+    assert_eq!(
+        f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued
     );
 }

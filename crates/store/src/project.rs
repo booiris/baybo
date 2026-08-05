@@ -120,6 +120,10 @@ pub struct ProjectRow {
     /// under `work/<name>/` at create time rather than left `NULL`, so no
     /// later reader has to handle a project with nowhere to work.
     pub workdir: String,
+    /// How much this project's agents may spend per UTC day. `None` is no
+    /// ceiling — the default, because a board that stops working against a
+    /// limit nobody chose is a board whose silence nobody can explain.
+    pub daily_budget: Option<baybo_model::MicroUsd>,
     /// Soft archive. There is no hard delete in any production path.
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -133,6 +137,8 @@ pub struct ProjectRow {
 pub struct ProjectUpdate {
     pub name: String,
     pub description: String,
+    /// Full-replace like the rest of this struct: `None` clears the ceiling.
+    pub daily_budget: Option<baybo_model::MicroUsd>,
 }
 
 /// One row of `issues`.
@@ -292,6 +298,19 @@ pub enum IssueEventBody {
     WorktreeKept {
         reason: String,
     },
+    /// The run was recorded but not started: this project has spent its
+    /// budget for the day. The row stays queued, so the work is not lost —
+    /// it starts as soon as the board has headroom again.
+    BudgetExhausted {
+        /// Micro-USD spent today, and the ceiling it reached.
+        spent_micros: i64,
+        limit_micros: i64,
+    },
+    /// A held run was released and started.
+    BudgetRestored {
+        spent_micros: i64,
+        limit_micros: i64,
+    },
 }
 
 impl IssueEventBody {
@@ -311,6 +330,8 @@ impl IssueEventBody {
             IssueEventBody::Cancelled => "cancelled",
             IssueEventBody::WorktreeReclaimed { .. } => "worktree_reclaimed",
             IssueEventBody::WorktreeKept { .. } => "worktree_kept",
+            IssueEventBody::BudgetExhausted { .. } => "budget_exhausted",
+            IssueEventBody::BudgetRestored { .. } => "budget_restored",
         }
     }
 }
@@ -354,6 +375,33 @@ pub trait ProjectStore: Send + Sync {
 
     /// Rename / re-describe. `Ok(false)` if no row matched.
     async fn update_project(&self, id: &ProjectId, update: &ProjectUpdate) -> Result<bool>;
+
+    /// This project's LLM spend since `since`, summed across every session
+    /// its runs have used.
+    ///
+    /// The join lives on this port rather than on the cost store because
+    /// "what has this board spent" is a project question — the cost store
+    /// knows sessions, and only `issue_runs` knows which sessions belong to
+    /// which board. Both tables are in one database, so it is one statement
+    /// rather than a fan-out.
+    async fn spend_since(
+        &self,
+        project: &ProjectId,
+        since: DateTime<Utc>,
+    ) -> Result<baybo_model::MicroUsd>;
+
+    /// Move a just-recorded run to `Held`: the board is over budget, so it
+    /// was recorded but must not start. Guarded on `Queued`, so a run the
+    /// router already claimed is never pulled back out from under it.
+    /// `Ok(false)` if it had already moved on.
+    async fn hold_run(&self, id: &IssueRunId) -> Result<bool>;
+
+    /// One project's held runs, oldest first — the work waiting on budget.
+    async fn held_runs(&self, project: &ProjectId) -> Result<Vec<IssueRunRow>>;
+
+    /// Move a held run back to `Queued` so it can be dispatched. Guarded on
+    /// `Held`, so two concurrent releases start it once.
+    async fn release_run(&self, id: &IssueRunId) -> Result<bool>;
 
     /// Stamp or clear `archived_at`. `Ok(false)` if no row matched.
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
@@ -495,6 +543,11 @@ impl RunTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    /// Recorded but deliberately not started: the project has spent its
+    /// budget for the day. A state, not an error — the row holds the
+    /// issue's dedupe slot and starts the moment the board has headroom,
+    /// so nothing is lost and nothing is silently dropped.
+    Held,
     Queued,
     Running,
     Done,
@@ -505,6 +558,7 @@ pub enum RunStatus {
 impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            RunStatus::Held => "held",
             RunStatus::Queued => "queued",
             RunStatus::Running => "running",
             RunStatus::Done => "done",
@@ -515,6 +569,7 @@ impl RunStatus {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "held" => Some(RunStatus::Held),
             "queued" => Some(RunStatus::Queued),
             "running" => Some(RunStatus::Running),
             "done" => Some(RunStatus::Done),

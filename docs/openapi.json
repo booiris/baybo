@@ -4031,6 +4031,14 @@
                             "type": "integer",
                             "format": "int64"
                           },
+                          "daily_budget_micros": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "format": "int64",
+                            "description": "Daily spend ceiling in micro-USD. Absent means no limit."
+                          },
                           "description": {
                             "type": "string"
                           },
@@ -7642,6 +7650,14 @@
           "name"
         ],
         "properties": {
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
+          },
           "description": {
             "type": "string"
           },
@@ -8399,6 +8415,54 @@
                 "type": "string"
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_micros",
+              "limit_micros",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "budget_exhausted"
+                ]
+              },
+              "limit_micros": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_micros": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "spent_micros",
+              "limit_micros",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "budget_restored"
+                ]
+              },
+              "limit_micros": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "spent_micros": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
           }
         ],
         "description": "What one timeline entry says.\n\nA mirror of the store's `IssueEventBody` rather than the type itself,\nlike every other enum on this surface. Tagged on `kind`, so the client\ngets a discriminated union it can exhaustively switch on — the whole\nreason this is not a free-form payload."
@@ -9135,6 +9199,14 @@
             "type": "integer",
             "format": "int64"
           },
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD. Absent means no limit."
+          },
           "description": {
             "type": "string"
           },
@@ -9273,6 +9345,7 @@
         "type": "string",
         "description": "Where a run is. `queued` and `running` are the unfinished states — a\ncard showing either is a card being worked.",
         "enum": [
+          "held",
           "queued",
           "running",
           "done",
@@ -10063,6 +10136,14 @@
           "name"
         ],
         "properties": {
+          "daily_budget_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;\n`0` pauses the board's agents without archiving it. Integer, never a\nfloat — a budget compared with rounding error is a budget that\ndisagrees with the ledger it is measured against."
+          },
           "description": {
             "type": "string"
           },

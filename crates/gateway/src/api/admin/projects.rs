@@ -95,6 +95,9 @@ pub struct ProjectDto {
     pub description: String,
     /// Absolute path to the git repository this project's agents work in.
     pub workdir: String,
+    /// Daily spend ceiling in micro-USD. Absent means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_budget_micros: Option<i64>,
     /// Present only while the project sits in the archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_ms: Option<i64>,
@@ -109,6 +112,7 @@ impl From<ProjectRow> for ProjectDto {
             name: row.name,
             description: row.description,
             workdir: row.workdir,
+            daily_budget_micros: row.daily_budget.map(baybo_model::MicroUsd::into_micros),
             archived_at_ms: row.archived_at.map(|t| t.timestamp_millis()),
             created_at_ms: row.created_at.timestamp_millis(),
             updated_at_ms: row.updated_at.timestamp_millis(),
@@ -241,6 +245,9 @@ impl From<IssueRow> for IssueDto {
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatusDto {
+    /// Recorded but not started: the project is over its daily budget. It
+    /// starts by itself once the board has headroom.
+    Held,
     Queued,
     Running,
     Done,
@@ -251,6 +258,7 @@ pub enum RunStatusDto {
 impl From<RunStatus> for RunStatusDto {
     fn from(status: RunStatus) -> Self {
         match status {
+            RunStatus::Held => Self::Held,
             RunStatus::Queued => Self::Queued,
             RunStatus::Running => Self::Running,
             RunStatus::Done => Self::Done,
@@ -325,11 +333,33 @@ pub enum IssueEventBodyDto {
     WorktreeKept {
         reason: String,
     },
+    BudgetExhausted {
+        spent_micros: i64,
+        limit_micros: i64,
+    },
+    BudgetRestored {
+        spent_micros: i64,
+        limit_micros: i64,
+    },
 }
 
 impl From<IssueEventBody> for IssueEventBodyDto {
     fn from(body: IssueEventBody) -> Self {
         match body {
+            IssueEventBody::BudgetExhausted {
+                spent_micros,
+                limit_micros,
+            } => Self::BudgetExhausted {
+                spent_micros,
+                limit_micros,
+            },
+            IssueEventBody::BudgetRestored {
+                spent_micros,
+                limit_micros,
+            } => Self::BudgetRestored {
+                spent_micros,
+                limit_micros,
+            },
             IssueEventBody::Comment { text } => Self::Comment { text },
             IssueEventBody::Opened => Self::Opened,
             IssueEventBody::Moved { from, to } => Self::Moved {
@@ -457,6 +487,12 @@ pub struct CreateProjectRequest {
     /// creates one under the workspace's `work/` directory instead.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+    /// `0` pauses the board's agents without archiving it. Integer, never a
+    /// float — a budget compared with rounding error is a budget that
+    /// disagrees with the ledger it is measured against.
+    #[serde(default)]
+    pub daily_budget_micros: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -464,6 +500,12 @@ pub struct UpdateProjectRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+    /// `0` pauses the board's agents without archiving it. Integer, never a
+    /// float — a budget compared with rounding error is a budget that
+    /// disagrees with the ledger it is measured against.
+    #[serde(default)]
+    pub daily_budget_micros: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -572,6 +614,9 @@ async fn create_project(
             name: req.name,
             description: req.description,
             workdir: req.workdir,
+            daily_budget: req
+                .daily_budget_micros
+                .map(baybo_model::MicroUsd::from_micros),
         })
         .await
         .map_err(project_err)?;
@@ -629,6 +674,9 @@ async fn update_project(
             ProjectUpdate {
                 name: req.name,
                 description: req.description,
+                daily_budget: req
+                    .daily_budget_micros
+                    .map(baybo_model::MicroUsd::from_micros),
             },
         )
         .await

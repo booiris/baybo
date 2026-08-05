@@ -27,6 +27,11 @@ export function actorLabel(event: IssueEvent): string {
  *
  * Returns `null` for a comment: a comment is not narrated, it is shown.
  */
+/** Micro-USD as the dollars a reader thinks in. */
+function usd(micros: number): string {
+  return `$${(micros / 1_000_000).toFixed(2)}`;
+}
+
 export function describeEvent(body: IssueEventBody): string | null {
   switch (body.kind) {
     case 'comment':
@@ -64,6 +69,14 @@ export function describeEvent(body: IssueEventBody): string | null {
       // git's own reason, because it is the actionable part: the operator
       // has to commit or discard before the tree can go.
       return `kept the worktree — ${body.reason}`;
+    case 'budget_exhausted':
+      return `held the run — ${usd(body.spent_micros)} of the ${usd(
+        body.limit_micros,
+      )} daily budget is spent`;
+    case 'budget_restored':
+      return `started the held run — ${usd(body.spent_micros)} of ${usd(
+        body.limit_micros,
+      )} spent today`;
   }
 }
 
@@ -79,6 +92,12 @@ export function describeEvent(body: IssueEventBody): string | null {
  * a person who believes an agent is reading them will wait for an answer
  * nobody is sending.
  */
+/**
+ * The run states that are over. Derived here rather than listed at each
+ * call site, so a new unsettled state cannot be quietly read as finished.
+ */
+const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
+
 export function commentHint(
   issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
   runs: { status: RunStatus }[],
@@ -93,7 +112,12 @@ export function commentHint(
   if (issue.status === 'backlog' || issue.status === 'done') {
     return `Records only — @${assignee} is not working on this right now.`;
   }
-  const live = runs.find((run) => run.status === 'queued' || run.status === 'running');
+  const live = runs.find((run) => !SETTLED.has(run.status));
+  if (live?.status === 'held') {
+    // A held run has not assembled its brief either, so this lands in it —
+    // the wait is on the board's budget, not on the comment.
+    return `@${assignee} will read this when the held run starts — the project is over its daily budget.`;
+  }
   if (live?.status === 'queued') {
     return `@${assignee} will read this when the queued run starts.`;
   }

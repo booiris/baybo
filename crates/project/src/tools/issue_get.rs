@@ -155,5 +155,29 @@ fn narrate(body: &IssueEventBody) -> String {
         IssueEventBody::WorktreeKept { reason } => {
             format!("left the worktree in place: {reason}")
         }
+        IssueEventBody::BudgetExhausted {
+            spent_micros,
+            limit_micros,
+        } => format!(
+            "held the run: the project has spent {} of its {} daily budget",
+            usd(*spent_micros),
+            usd(*limit_micros)
+        ),
+        IssueEventBody::BudgetRestored {
+            spent_micros,
+            limit_micros,
+        } => format!(
+            "started the held run: {} of {} spent today",
+            usd(*spent_micros),
+            usd(*limit_micros)
+        ),
     }
+}
+
+/// Micro-USD as the dollars a reader thinks in.
+fn usd(micros: i64) -> String {
+    format!(
+        "${:.2}",
+        micros as f64 / baybo_model::MicroUsd::PER_USD as f64
+    )
 }

@@ -89,6 +89,7 @@ impl Fixture {
                 name: name.to_owned(),
                 description: String::new(),
                 workdir: None,
+                daily_budget: None,
             })
             .await
             .expect("create project");

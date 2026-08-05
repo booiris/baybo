@@ -43,6 +43,9 @@ const PRIORITY_LABEL: Record<IssuePriority, string> = {
 const railLabel = 'font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft';
 
 const RUN_TONE: Record<IssueRun['status'], string> = {
+  // Held is not a failure and not progress: the work is recorded and
+  // waiting on budget, so it reads as a warning rather than an error.
+  held: 'border-warn/50 bg-warn/12 text-warn',
   queued: 'border-black/35 bg-canvas text-ink-soft',
   running: 'border-black bg-brand/40 text-ink',
   done: 'border-ok/50 bg-ok/15 text-ok',

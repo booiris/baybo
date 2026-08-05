@@ -22,10 +22,10 @@ use baybo_store::project::{
 };
 use baybo_workspace::WorkspacePaths;
 
-use crate::CommentDelivery;
 use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
 use crate::runs::{Transition, ledger_entry, triggers_run};
+use crate::{CommentDelivery, Headroom};
 
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
@@ -86,6 +86,10 @@ pub struct NewProject {
     /// one": the manager materialises `work/<slug>` and initialises it, so
     /// starting a project never requires having a repo first.
     pub workdir: Option<String>,
+    /// Daily spend ceiling. `None` is no ceiling — a board should work out
+    /// of the box, and a limit the operator did not choose is a board that
+    /// stops for a reason nobody can explain.
+    pub daily_budget: Option<baybo_model::MicroUsd>,
 }
 
 /// What a caller supplies to open an issue. Status is where the card
@@ -150,25 +154,141 @@ impl ProjectManager {
         let Some(trigger) = triggers_run(transition) else {
             return;
         };
-        let Some(entry) = ledger_entry(issue, trigger) else {
-            return;
-        };
-        match self.store.enqueue_run(&entry).await {
-            Ok(run) => {
-                self.events.run_changed(&issue.project_id, issue.number);
-                (self.dispatch)(run);
-            }
+        self.enqueue(issue, trigger).await;
+    }
+
+    /// Record a run and start it, unless the board has spent its budget.
+    ///
+    /// The single enqueue path — a drag, a comment, a retry and a tool call
+    /// all arrive here, so the gate cannot be forgotten on one of them.
+    ///
+    /// The order is deliberate: **the row is written before the budget is
+    /// consulted**, so an exhausted board records work it owes rather than
+    /// dropping it. The run lands `Held`, holds the issue's dedupe slot, and
+    /// starts the moment there is headroom again. A refused write means the
+    /// issue already has a run in flight — the dedupe guard doing its job,
+    /// not a failure the caller should see.
+    async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
+        let entry = ledger_entry(issue, trigger)?;
+        let run = match self.store.enqueue_run(&entry).await {
+            Ok(run) => run,
             Err(baybo_store::StorageError::Conflict(reason)) => {
                 tracing::debug!(
                     issue = issue.number,
                     %reason,
                     "issue already has a run in flight; not starting a second"
                 );
+                return None;
             }
             Err(e) => {
                 tracing::error!(issue = issue.number, error = %e, "could not record issue run");
+                return None;
+            }
+        };
+        self.events.run_changed(&issue.project_id, issue.number);
+
+        let headroom = self.headroom(&issue.project_id).await;
+        if let (true, Some((spent_micros, limit_micros))) =
+            (headroom.is_exhausted(), headroom.figures())
+        {
+            if let Err(e) = self.store.hold_run(&run.id).await {
+                // The hold failed, so the run is still `Queued` and will be
+                // started. Overspending by one run beats stranding it.
+                tracing::error!(issue = issue.number, error = %e, "could not hold a run over budget");
+            } else {
+                self.record(
+                    issue,
+                    IssueActor::User,
+                    IssueEventBody::BudgetExhausted {
+                        spent_micros,
+                        limit_micros,
+                    },
+                )
+                .await;
+                return Some(run);
             }
         }
+        (self.dispatch)(run.clone());
+        Some(run)
+    }
+
+    /// This project's spend against its ceiling, for today.
+    ///
+    /// Fails **open**: a board that cannot be measured keeps working. The
+    /// alternative is a storage hiccup silently pausing every project, which
+    /// looks exactly like the product being broken.
+    async fn headroom(&self, project: &ProjectId) -> Headroom {
+        let limit = match self.store.get_project(project).await {
+            Ok(Some(row)) => row.daily_budget,
+            Ok(None) => return Headroom::Unlimited,
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not read the project's budget");
+                return Headroom::Unlimited;
+            }
+        };
+        // No ceiling means no query. The common case costs nothing.
+        if limit.is_none() {
+            return Headroom::Unlimited;
+        }
+        match self
+            .store
+            .spend_since(project, crate::day_start(chrono::Utc::now()))
+            .await
+        {
+            Ok(spent) => crate::headroom(limit, spent),
+            Err(e) => {
+                tracing::error!(%project, error = %e, "could not read the project's spend");
+                Headroom::Unlimited
+            }
+        }
+    }
+
+    /// Start whatever this board is holding, if it has room again.
+    ///
+    /// Released by activity on the board rather than by a clock: any
+    /// enqueue, a budget change, and the boot sweep all pass through here.
+    /// A daily ceiling that rolls over while nothing is happening needs no
+    /// timer — the first thing that happens next releases the hold, and if
+    /// nothing happens, nothing needed releasing.
+    pub async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
+        let headroom = self.headroom(project).await;
+        let Some((spent_micros, limit_micros)) = headroom.figures() else {
+            // No ceiling at all: release everything, with nothing to report
+            // against.
+            return self.release_all(project, None).await;
+        };
+        if headroom.is_exhausted() {
+            return Ok(0);
+        }
+        self.release_all(project, Some((spent_micros, limit_micros)))
+            .await
+    }
+
+    async fn release_all(&self, project: &ProjectId, figures: Option<(i64, i64)>) -> Result<usize> {
+        let held = self.store.held_runs(project).await?;
+        let mut released = 0;
+        for run in held {
+            if !self.store.release_run(&run.id).await? {
+                continue;
+            }
+            released += 1;
+            self.events.run_changed(project, run.number);
+            if let (Some((spent_micros, limit_micros)), Ok(issue)) =
+                (figures, self.get_issue(project, run.number).await)
+            {
+                self.record(
+                    &issue,
+                    IssueActor::User,
+                    IssueEventBody::BudgetRestored {
+                        spent_micros,
+                        limit_micros,
+                    },
+                )
+                .await;
+            }
+            (self.dispatch)(run);
+        }
+        Ok(released)
     }
 
     /// Append to an issue's timeline, and tell whoever is watching.
@@ -289,24 +409,7 @@ impl ProjectManager {
         self.events.timeline_changed(project, number);
 
         if self.delivery_for(&issue).await == CommentDelivery::Wake {
-            // Same ledger discipline as a drag: the row is written before
-            // anything is told about it, and a refused enqueue means
-            // somebody started work in the gap — which is the dedupe guard
-            // working, not an error the commenter should see.
-            if let Some(ledger) = crate::runs::ledger_entry(&issue, RunTrigger::Comment) {
-                match self.store.enqueue_run(&ledger).await {
-                    Ok(run) => {
-                        self.events.run_changed(project, number);
-                        (self.dispatch)(run);
-                    }
-                    Err(baybo_store::StorageError::Conflict(reason)) => {
-                        tracing::debug!(issue = number, %reason, "a run started while the comment was being written");
-                    }
-                    Err(e) => {
-                        tracing::error!(issue = number, error = %e, "comment could not start a run");
-                    }
-                }
-            }
+            self.enqueue(&issue, RunTrigger::Comment).await;
         }
         Ok(entry)
     }
@@ -398,13 +501,15 @@ impl ProjectManager {
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
-        let entry = ledger_entry(&issue, RunTrigger::Retry).ok_or_else(|| {
-            ProjectError::invalid("assignee", "an issue with nobody on it cannot be run")
-        })?;
-        let run = self.store.enqueue_run(&entry).await?;
-        self.events.run_changed(project, number);
-        (self.dispatch)(run.clone());
-        Ok(run)
+        if issue.assignee.is_none() {
+            return Err(ProjectError::invalid(
+                "assignee",
+                "an issue with nobody on it cannot be run",
+            ));
+        }
+        self.enqueue(&issue, RunTrigger::Retry)
+            .await
+            .ok_or_else(|| ProjectError::Conflict("this issue already has a run".to_owned()))
     }
 
     /// The unfinished runs of one board — which cards are working.
@@ -418,9 +523,21 @@ impl ProjectManager {
     /// actor died with the process is work that never finished.
     pub async fn resume_unsettled_runs(&self) -> Result<usize> {
         let resumed = self.store.requeue_unsettled().await?;
-        let count = resumed.len();
+        let mut count = resumed.len();
         for run in resumed {
             (self.dispatch)(run);
+        }
+        // Held runs are not "orphaned" — they were never started on purpose
+        // — so the sweep above leaves them alone. Boot is the one moment
+        // guaranteed to happen after a budget rolls over, so re-evaluating
+        // them here is what keeps a hold from outliving its day.
+        for project in self.store.list_projects(false).await? {
+            match self.release_held_runs(&project.id).await {
+                Ok(released) => count += released,
+                Err(e) => {
+                    tracing::error!(project = %project.id, error = %e, "could not release held runs")
+                }
+            }
         }
         Ok(count)
     }
@@ -465,6 +582,7 @@ impl ProjectManager {
             name,
             description: new.description.trim().to_owned(),
             workdir,
+            daily_budget: new.daily_budget,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -744,9 +862,15 @@ impl ProjectManager {
         let update = ProjectUpdate {
             name: validate_name(&update.name)?,
             description: update.description.trim().to_owned(),
+            daily_budget: validate_budget(update.daily_budget)?,
         };
         self.store.update_project(id, &update).await?;
         self.events.project_changed(id);
+        // A raised ceiling should start the work it was blocking, without
+        // the operator having to touch each card.
+        if let Err(e) = self.release_held_runs(id).await {
+            tracing::error!(project = %id, error = %e, "could not release held runs after a budget change");
+        }
         self.get_project(id).await
     }
 
@@ -1006,6 +1130,20 @@ fn validate_name(name: &str) -> Result<String> {
         ));
     }
     Ok(trimmed.to_owned())
+}
+
+/// A ceiling has to be something a board can actually spend against.
+///
+/// Negative is refused rather than clamped: it is a caller mistake, and
+/// clamping it to zero would silently pause every board on that project.
+fn validate_budget(budget: Option<baybo_model::MicroUsd>) -> Result<Option<baybo_model::MicroUsd>> {
+    if budget.is_some_and(|b| b.into_micros() < 0) {
+        return Err(ProjectError::invalid(
+            "daily_budget",
+            "must not be negative — use 0 to pause the board, or leave it unset for no limit",
+        ));
+    }
+    Ok(budget)
 }
 
 fn validate_agent_name(name: &str) -> Result<String> {

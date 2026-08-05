@@ -2058,6 +2058,14 @@ export interface components {
             title: string;
         };
         CreateProjectRequest: {
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+             *     `0` pauses the board's agents without archiving it. Integer, never a
+             *     float — a budget compared with rounding error is a budget that
+             *     disagrees with the ledger it is measured against.
+             */
+            daily_budget_micros?: number | null;
             description?: string;
             name: string;
             /**
@@ -2367,6 +2375,20 @@ export interface components {
             /** @enum {string} */
             kind: "worktree_kept";
             reason: string;
+        } | {
+            /** @enum {string} */
+            kind: "budget_exhausted";
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            spent_micros: number;
+        } | {
+            /** @enum {string} */
+            kind: "budget_restored";
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            spent_micros: number;
         };
         /** @description One entry on an issue's timeline. */
         IssueEventDto: {
@@ -2704,6 +2726,11 @@ export interface components {
             archived_at_ms?: number | null;
             /** Format: int64 */
             created_at_ms: number;
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD. Absent means no limit.
+             */
+            daily_budget_micros?: number | null;
             description: string;
             id: string;
             name: string;
@@ -2780,7 +2807,7 @@ export interface components {
          *     card showing either is a card being worked.
          * @enum {string}
          */
-        RunStatusDto: "queued" | "running" | "done" | "failed" | "cancelled";
+        RunStatusDto: "held" | "queued" | "running" | "done" | "failed" | "cancelled";
         /**
          * @description Why a run was started.
          * @enum {string}
@@ -3136,6 +3163,14 @@ export interface components {
             supports_vision?: boolean | null;
         };
         UpdateProjectRequest: {
+            /**
+             * Format: int64
+             * @description Daily spend ceiling in micro-USD (USD × 10^6). Omit for no limit;
+             *     `0` pauses the board's agents without archiving it. Integer, never a
+             *     float — a budget compared with rounding error is a budget that
+             *     disagrees with the ledger it is measured against.
+             */
+            daily_budget_micros?: number | null;
             description?: string;
             name: string;
         };
@@ -6343,6 +6378,11 @@ export interface operations {
                             archived_at_ms?: number | null;
                             /** Format: int64 */
                             created_at_ms: number;
+                            /**
+                             * Format: int64
+                             * @description Daily spend ceiling in micro-USD. Absent means no limit.
+                             */
+                            daily_budget_micros?: number | null;
                             description: string;
                             id: string;
                             name: string;

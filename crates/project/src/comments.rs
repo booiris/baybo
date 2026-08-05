@@ -46,7 +46,9 @@ pub fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) -> Commen
         return CommentDelivery::RecordOnly;
     }
     match live_run {
-        Some(RunStatus::Queued) => CommentDelivery::WaitsForQueuedRun,
+        // A held run has not assembled its brief either — it is waiting on
+        // the board's budget, not on work — so the comment lands in it.
+        Some(RunStatus::Held | RunStatus::Queued) => CommentDelivery::WaitsForQueuedRun,
         Some(RunStatus::Running) => CommentDelivery::AfterCurrentRun,
         // A settled run is history; the issue is idle again.
         _ => CommentDelivery::Wake,

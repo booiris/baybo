@@ -89,6 +89,7 @@ describe('commentHint', () => {
   const live = [{ status: 'running' as const }];
   const queued = [{ status: 'queued' as const }];
   const settled = [{ status: 'done' as const }];
+  const held = [{ status: 'held' as const }];
 
   it('says record-only when nobody is on the issue', () => {
     expect(commentHint({ status: 'in_progress', assignee: null }, [])).toContain(
@@ -123,6 +124,15 @@ describe('commentHint', () => {
     expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, live)).toContain(
       'when that run finishes',
     );
+  });
+
+  it('says a held run will read it, and why it has not started', () => {
+    // A held run has not assembled its brief either — the wait is on the
+    // board's budget, not on the comment. Mirrors `comment_delivery`,
+    // which folds Held in with Queued for the same reason.
+    const hint = commentHint({ status: 'in_progress', assignee: 'dev-1' }, held);
+    expect(hint).toContain('held run starts');
+    expect(hint).toContain('daily budget');
   });
 });
 

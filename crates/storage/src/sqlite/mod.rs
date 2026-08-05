@@ -303,6 +303,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
         definition: "INTEGER",
     },
     AddColumn {
+        table: "projects",
+        column: "daily_budget_micros",
+        definition: "INTEGER",
+    },
+    AddColumn {
         table: "issues",
         column: "branch",
         definition: "TEXT",
@@ -1305,6 +1310,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     description TEXT    NOT NULL DEFAULT '',
                     -- Absolute path to the git repo the team works in.
                     workdir     TEXT    NOT NULL,
+                    -- Micro-USD this board's agents may spend per UTC day.
+                    -- NULL is no ceiling. INTEGER, never REAL — see
+                    -- `cost_records.cost_usd`.
+                    daily_budget_micros INTEGER,
                     archived_at INTEGER,
                     created_at  INTEGER NOT NULL,
                     updated_at  INTEGER NOT NULL
@@ -1447,7 +1456,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          -- Serves the board's roster read.
          CREATE INDEX IF NOT EXISTS idx_agent_profiles_team
              ON agent_profiles(project_id)
-             WHERE project_id IS NOT NULL AND deleted_at IS NULL;",
+             WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+         -- Serves the budget gate: one board's run sessions, which the
+         -- spend query joins `cost_records` against.
+         CREATE INDEX IF NOT EXISTS idx_issue_runs_project_session
+             ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;",
     )
     .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
 
