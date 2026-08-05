@@ -581,9 +581,7 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
-    // --- Kanban projects (docs/todo/kanban.md). Board CRUD only for now;
-    // the execution pipeline that turns a card into an agent run lands on
-    // this same manager.
+    // --- Kanban projects (docs/todo/kanban.md).
     // The board's runs reach the router over a channel, so `baybo-project`
     // never depends on the agent runtime. The ledger row is already written
     // by the time anything is sent here — a full queue or a dead receiver
@@ -662,6 +660,13 @@ pub async fn build_managers(
         )),
         issue_dispatch,
     ));
+    // The board's own tools. Scoped to a project by the calling session's
+    // trigger rather than by a parameter, so they are absent from every
+    // other session's tool list and refuse the call outright if one ever
+    // reaches them anyway.
+    for (tool, manifest) in baybo_project::tools::agent_tools(Arc::clone(&project_manager)) {
+        tool_registry.register(tool, manifest);
+    }
 
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the

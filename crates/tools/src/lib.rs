@@ -202,6 +202,11 @@ pub enum ToolTriggerScope {
     /// (`TriggerSource::Cron { conversation: true }`). Used by `report_nothing`,
     /// which can only suppress a recurring fire's own notification.
     CronFire,
+    /// Visible only in a session that belongs to a project board. Used by
+    /// the `Issue*` tools and `ProjectAgentCreate`: outside a board there
+    /// is no project for them to name, so offering them would be offering
+    /// an action that can only fail.
+    ProjectBoard,
 }
 
 impl ToolTriggerScope {
@@ -210,6 +215,7 @@ impl ToolTriggerScope {
         match self {
             ToolTriggerScope::Any => true,
             ToolTriggerScope::CronFire => trigger.is_cron_conversation(),
+            ToolTriggerScope::ProjectBoard => trigger.is_project_session(),
         }
     }
 }

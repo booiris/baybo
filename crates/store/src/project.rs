@@ -77,6 +77,16 @@ pub enum IssuePriority {
 }
 
 impl IssuePriority {
+    /// Most urgent first — the order a triage read wants, and the single
+    /// source for every enum-valued schema and picker.
+    pub const ALL: [IssuePriority; 5] = [
+        IssuePriority::Urgent,
+        IssuePriority::High,
+        IssuePriority::Medium,
+        IssuePriority::Low,
+        IssuePriority::None,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             IssuePriority::Urgent => "urgent",

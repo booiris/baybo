@@ -11,6 +11,7 @@ mod events;
 mod manager;
 mod runs;
 mod timeline;
+pub mod tools;
 pub mod worktree;
 
 pub use comments::{CommentDelivery, comment_delivery};

@@ -9,9 +9,13 @@ doctest = false
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
 baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "process"] }
 tracing = { workspace = true }
@@ -19,5 +23,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 parking_lot = { workspace = true }
 baybo-storage = { workspace = true }
+baybo-tools = { workspace = true, features = ["test-support"] }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
