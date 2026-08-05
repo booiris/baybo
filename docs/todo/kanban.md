@@ -123,8 +123,12 @@ existing git repo.
   struck-through and are filterable out.
 - **Drag**: `@dnd-kit` multi-container (first such usage in `app/web`;
   `QueuePanel`/`SessionSidebar` are the existing single-list precedents).
-  Same-column reorder = fractional `position`. Cross-column drop = status
-  change. **Dropping into In Progress with an agent assignee enqueues a
+  Cross-column drop = status change. Ordering is a **dense integer rank
+  renumbered per move**, not a fractional position: the move request
+  carries the destination column's full new order and the store rewrites
+  it in one transaction, closing the source column's gap in the same
+  statement run. This follows `SessionFolderStore::reorder`, which is the
+  house precedent, and it has no drift to compact later. **Dropping into In Progress with an agent assignee enqueues a
   run** — no confirm dialog (multica's choice too); a toast reports
   "queued for @handle". Dropping an unassigned issue into In Progress
   bounces with a toast asking for an assignee. **Dragging a card out of
@@ -290,10 +294,18 @@ announces which of these will happen before sending.
 
 ## Phasing (PR sequence, each a draft)
 
-1. **Entities + board.** `projects`/`issues` tables, REST CRUD + move,
-   per-project numbering, Projects rail entry, board page with dnd,
-   detail-page skeleton (no runs, no git). The board works as a manual
-   tracker.
+1. **Entities + board.** ✅ **Shipped** (`crates/project`, `/v1/projects/*`,
+   `app/web/src/pages/projects/`). `projects`/`issues` tables, REST CRUD +
+   move, per-project numbering, Projects rail entry, board page with dnd,
+   detail-page skeleton. The board works as a manual tracker.
+
+   Two fields the spec lists were deliberately **left out until the phase
+   that reads them**, so nothing ships as a decorative column (the
+   `workdir`-was-never-read lesson from the multi-project branch):
+   `assignee_agent_id` waits for Phase 4's team, and the daily budget
+   waits for Phase 4's gate. `parent_issue_id`/`stage` wait for Phase 4's
+   barriers, and `branch` for Phase 2's worktrees. `blocked_reason` and
+   `cancelled_at` are here now because a user can set them today.
 2. **Execution.** `issue_runs` + trigger predicate + ledger, per-issue
    sessions, worktree/branch creation, timeline events + WS deltas,
    execution log + transcript links, comment delivery (wake/interject).
