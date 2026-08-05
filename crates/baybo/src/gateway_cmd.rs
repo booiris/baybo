@@ -532,6 +532,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         channel_control,
         bot_reconciler: Arc::clone(&bot_reconciler),
         deck_manager: Arc::clone(&graph.deck_manager),
+        project_manager: Arc::clone(&graph.project_manager),
         workspace_paths: Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root().to_path_buf(),
         )),

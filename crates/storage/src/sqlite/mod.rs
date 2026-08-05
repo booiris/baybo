@@ -7,6 +7,7 @@ mod cost;
 mod cron;
 mod deck;
 mod device;
+mod project;
 mod search;
 mod secret;
 mod session;
@@ -26,6 +27,7 @@ pub use cost::SqliteCostStore;
 pub use cron::SqliteCronStore;
 pub use deck::SqliteDeckCardStore;
 pub use device::SqliteDeviceStore;
+pub use project::SqliteProjectStore;
 pub use search::SqliteMessageSearchStore;
 pub use secret::SqliteSecretStore;
 pub use session::SqliteSessionStore;
@@ -1246,7 +1248,53 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     fetched_at INTEGER NOT NULL,
                     error      TEXT,
                     PRIMARY KEY (card_id, seq)
-                );",
+                );
+
+                -- Kanban projects (docs/todo/kanban.md). The id is also the
+                -- project's directory name under workspace/projects/, which
+                -- is why ProjectId carries a grammar rather than being
+                -- opaque. archived_at is the soft-archive recycle bin (the
+                -- cron_jobs pattern); there is no hard delete.
+                CREATE TABLE IF NOT EXISTS projects (
+                    id          TEXT    PRIMARY KEY,
+                    name        TEXT    NOT NULL,
+                    description TEXT    NOT NULL DEFAULT '',
+                    -- Absolute path to the git repo the team works in.
+                    workdir     TEXT    NOT NULL,
+                    archived_at INTEGER,
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL
+                );
+
+                -- One card on one board. `number` is the human address and
+                -- is per-project, assigned inside the insert transaction;
+                -- the unique index below is the backstop that turns a race
+                -- into a constraint trip rather than two issues called #3.
+                -- The ULID `id` is what child tables (runs, events) will
+                -- reference — the REST surface never addresses by it, so a
+                -- request cannot name an issue without naming its project.
+                CREATE TABLE IF NOT EXISTS issues (
+                    id             TEXT    PRIMARY KEY,
+                    project_id     TEXT    NOT NULL,
+                    number         INTEGER NOT NULL,
+                    title          TEXT    NOT NULL,
+                    description    TEXT    NOT NULL DEFAULT '',
+                    status         TEXT    NOT NULL,
+                    priority       TEXT    NOT NULL DEFAULT 'none',
+                    -- Dense rank within (project_id, status); a move
+                    -- renumbers the whole target column in one transaction.
+                    position       INTEGER NOT NULL,
+                    blocked_reason TEXT,
+                    cancelled_at   INTEGER,
+                    created_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_number
+                    ON issues(project_id, number);
+                -- Serves the board's only read: one project's cards,
+                -- column by column, in order.
+                CREATE INDEX IF NOT EXISTS idx_issues_board
+                    ON issues(project_id, status, position);",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 

@@ -124,6 +124,8 @@ pub struct GatewayDeps {
     /// Deck card manager (`/v1/deck/*`). Built by the runtime alongside
     /// the other managers; its boot/shutdown are driven by the caller.
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Kanban projects and their boards (`/v1/projects/*`).
+    pub project_manager: Arc<baybo_project::ProjectManager>,
     /// Workspace addresses, so admin handlers resolve workspace-relative
     /// files (an agent's `SOUL.md`, its skills folder) through the same
     /// source of truth as the runtime.
@@ -167,6 +169,8 @@ pub struct AdminState {
     pub secret_vault: Arc<SecretVault>,
     /// Deck card manager (`/v1/deck/*` — docs/modules/deck.md).
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Kanban projects and their boards (`/v1/projects/*` — docs/todo/kanban.md).
+    pub project_manager: Arc<baybo_project::ProjectManager>,
     /// Workspace addresses. The agents surface resolves an agent's `SOUL.md`
     /// and its private skills folder through these.
     pub workspace_paths: Arc<baybo_workspace::WorkspacePaths>,
@@ -189,7 +193,14 @@ pub struct ChannelState {
 }
 
 impl AdminState {
-    pub(crate) fn from_deps(deps: &GatewayDeps) -> Self {
+    /// Build the admin surface's state from the boot graph.
+    ///
+    /// Public so tests assemble it the way production does. Every
+    /// integration test used to hand-copy this initializer, which meant a
+    /// new field broke eight files and — worse — let a test's state
+    /// silently drift from the server's. Overrides ride struct-update
+    /// syntax.
+    pub fn from_deps(deps: &GatewayDeps) -> Self {
         let query_api = Arc::new(baybo_query::QueryApi::new(
             deps.session_manager.store(),
             Arc::clone(&deps.turn_lifecycle),
@@ -219,6 +230,7 @@ impl AdminState {
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
             deck_manager: Arc::clone(&deps.deck_manager),
+            project_manager: Arc::clone(&deps.project_manager),
             workspace_paths: Arc::clone(&deps.workspace_paths),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }

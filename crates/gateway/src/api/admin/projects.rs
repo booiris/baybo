@@ -1,0 +1,584 @@
+//! `/v1/projects/*` — kanban projects and the issues on their boards
+//! (docs/todo/kanban.md).
+//!
+//! An issue is addressed as `(project, number)` everywhere on this surface.
+//! Its ULID exists for child tables to reference, and is deliberately not a
+//! route parameter: a request that could name an issue without naming its
+//! project would be a request that can reach across boards.
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use baybo_model::ProjectId;
+use baybo_project::{NewIssueRequest, NewProject, ProjectError};
+use baybo_store::project::{
+    IssuePriority, IssueRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
+};
+
+use crate::api::dto::{ErrorBody, ListResponse};
+use crate::server::AdminState;
+use crate::{GatewayError, Result};
+
+pub fn routes() -> OpenApiRouter<AdminState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_projects, create_project))
+        .routes(routes!(get_project, update_project))
+        .routes(routes!(set_project_archived))
+        .routes(routes!(list_issues, create_issue))
+        .routes(routes!(get_issue, update_issue))
+        .routes(routes!(move_issue))
+}
+
+/// Map the domain's error onto a status once, for every handler here.
+fn project_err(e: ProjectError) -> GatewayError {
+    match e {
+        ProjectError::NoSuchProject(id) => GatewayError::NotFound(format!("project {id}")),
+        ProjectError::NoSuchIssue { project, number } => {
+            GatewayError::NotFound(format!("project {project} issue #{number}"))
+        }
+        ProjectError::Invalid { .. } => GatewayError::BadRequest(e.to_string()),
+        ProjectError::Conflict(reason) => GatewayError::Conflict(reason),
+        // Archived is a state the caller can fix, not a server failure: the
+        // board is still there, it just isn't taking writes.
+        ProjectError::Archived(_) => GatewayError::Conflict(e.to_string()),
+        ProjectError::Storage(e) => GatewayError::Internal(format!("project storage: {e}")),
+        ProjectError::Workdir(e) => GatewayError::Internal(format!("project workdir: {e}")),
+    }
+}
+
+/// Parse a path segment into a [`ProjectId`], running the same grammar the
+/// filesystem depends on rather than trusting the URL.
+fn parse_project_id(raw: &str) -> Result<ProjectId> {
+    ProjectId::parse(raw).map_err(|e| GatewayError::BadRequest(e.to_string()))
+}
+
+/// Deserialize a clearable optional field.
+///
+/// Plain `Option<Option<T>>` cannot express "explicitly null": serde folds
+/// both a missing key and a `null` into the outer `None`. Wrapping the
+/// parsed value in `Some` restores the distinction the patch semantics
+/// need — absent leaves the field alone, `null` clears it.
+fn double_option<'de, T, D>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
+// ── DTOs ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectDto {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Absolute path to the git repository this project's agents work in.
+    pub workdir: String,
+    /// Present only while the project sits in the archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl From<ProjectRow> for ProjectDto {
+    fn from(row: ProjectRow) -> Self {
+        Self {
+            id: row.id.to_string(),
+            name: row.name,
+            description: row.description,
+            workdir: row.workdir,
+            archived_at_ms: row.archived_at.map(|t| t.timestamp_millis()),
+            created_at_ms: row.created_at.timestamp_millis(),
+            updated_at_ms: row.updated_at.timestamp_millis(),
+        }
+    }
+}
+
+/// Which column a card sits in. Entering `in_progress` is what will start
+/// an agent once execution lands, which is why the set is fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueStatusDto {
+    Backlog,
+    Todo,
+    InProgress,
+    Review,
+    Done,
+}
+
+impl From<IssueStatus> for IssueStatusDto {
+    fn from(status: IssueStatus) -> Self {
+        match status {
+            IssueStatus::Backlog => Self::Backlog,
+            IssueStatus::Todo => Self::Todo,
+            IssueStatus::InProgress => Self::InProgress,
+            IssueStatus::Review => Self::Review,
+            IssueStatus::Done => Self::Done,
+        }
+    }
+}
+
+impl From<IssueStatusDto> for IssueStatus {
+    fn from(status: IssueStatusDto) -> Self {
+        match status {
+            IssueStatusDto::Backlog => Self::Backlog,
+            IssueStatusDto::Todo => Self::Todo,
+            IssueStatusDto::InProgress => Self::InProgress,
+            IssueStatusDto::Review => Self::Review,
+            IssueStatusDto::Done => Self::Done,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuePriorityDto {
+    Urgent,
+    High,
+    Medium,
+    Low,
+    #[default]
+    None,
+}
+
+impl From<IssuePriority> for IssuePriorityDto {
+    fn from(priority: IssuePriority) -> Self {
+        match priority {
+            IssuePriority::Urgent => Self::Urgent,
+            IssuePriority::High => Self::High,
+            IssuePriority::Medium => Self::Medium,
+            IssuePriority::Low => Self::Low,
+            IssuePriority::None => Self::None,
+        }
+    }
+}
+
+impl From<IssuePriorityDto> for IssuePriority {
+    fn from(priority: IssuePriorityDto) -> Self {
+        match priority {
+            IssuePriorityDto::Urgent => Self::Urgent,
+            IssuePriorityDto::High => Self::High,
+            IssuePriorityDto::Medium => Self::Medium,
+            IssuePriorityDto::Low => Self::Low,
+            IssuePriorityDto::None => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueDto {
+    /// The human address, unique within its project: `#3`.
+    pub number: i64,
+    pub project_id: String,
+    pub title: String,
+    pub description: String,
+    pub status: IssueStatusDto,
+    pub priority: IssuePriorityDto,
+    /// Rank within the column, dense and ascending.
+    pub position: i64,
+    /// Why work stopped. A badge on the card — blocked work stays in
+    /// whichever column it was in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Present once the issue is cancelled. The row is never deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl From<IssueRow> for IssueDto {
+    fn from(row: IssueRow) -> Self {
+        Self {
+            number: row.number,
+            project_id: row.project_id.to_string(),
+            title: row.title,
+            description: row.description,
+            status: row.status.into(),
+            priority: row.priority.into(),
+            position: row.position,
+            blocked_reason: row.blocked_reason,
+            cancelled_at_ms: row.cancelled_at.map(|t| t.timestamp_millis()),
+            created_at_ms: row.created_at.timestamp_millis(),
+            updated_at_ms: row.updated_at.timestamp_millis(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateProjectRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Absolute path to an existing git repository. Omit it and the server
+    /// creates one under the workspace's `work/` directory instead.
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateProjectRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetArchivedRequest {
+    pub archived: bool,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct ListProjectsQuery {
+    /// Fold the archive back into the listing.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateIssueRequest {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// Which column the card opens in. Defaults to the backlog.
+    #[serde(default)]
+    pub status: Option<IssueStatusDto>,
+    #[serde(default)]
+    pub priority: Option<IssuePriorityDto>,
+}
+
+/// Sparse patch: a field the body leaves out is left alone.
+/// `blocked_reason` is doubly optional — an explicit `null` clears the
+/// block, an absent key leaves it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateIssueRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub priority: Option<IssuePriorityDto>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub blocked_reason: Option<Option<String>>,
+    #[serde(default)]
+    pub cancelled: Option<bool>,
+}
+
+/// One drag-and-drop: where the card lands, plus that column's full
+/// contents in their new order.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveIssueRequest {
+    pub status: IssueStatusDto,
+    /// Every issue number in the destination column, in order, including
+    /// the one being moved.
+    pub ordered_numbers: Vec<i64>,
+}
+
+// ── Projects ────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/projects",
+    tag = "projects",
+    params(ListProjectsQuery),
+    responses(
+        (status = 200, description = "Projects, most recently touched first", body = inline(ListResponse<ProjectDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_projects(
+    State(state): State<AdminState>,
+    Query(query): Query<ListProjectsQuery>,
+) -> Result<Json<ListResponse<ProjectDto>>> {
+    let items = state
+        .project_manager
+        .list_projects(query.include_archived)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(ProjectDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects",
+    tag = "projects",
+    request_body = CreateProjectRequest,
+    responses(
+        (status = 201, description = "The new project", body = ProjectDto),
+        (status = 400, description = "Blank name, or a workdir that is relative, not a repo, or overlaps the workspace", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn create_project(
+    State(state): State<AdminState>,
+    Json(req): Json<CreateProjectRequest>,
+) -> Result<(StatusCode, Json<ProjectDto>)> {
+    let row = state
+        .project_manager
+        .create_project(NewProject {
+            name: req.name,
+            description: req.description,
+            workdir: req.workdir,
+        })
+        .await
+        .map_err(project_err)?;
+    Ok((StatusCode::CREATED, Json(ProjectDto::from(row))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, description = "The project", body = ProjectDto),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn get_project(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .get_project(&id)
+        .await
+        .map_err(project_err)?;
+    Ok(Json(ProjectDto::from(row)))
+}
+
+#[utoipa::path(
+    put,
+    path = "/projects/{project_id}",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    request_body = UpdateProjectRequest,
+    responses(
+        (status = 200, description = "The edited project", body = ProjectDto),
+        (status = 400, description = "Blank name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
+    )
+)]
+async fn update_project(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<UpdateProjectRequest>,
+) -> Result<Json<ProjectDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .update_project(
+            &id,
+            ProjectUpdate {
+                name: req.name,
+                description: req.description,
+            },
+        )
+        .await
+        .map_err(project_err)?;
+    Ok(Json(ProjectDto::from(row)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/archive",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    request_body = SetArchivedRequest,
+    responses(
+        (status = 200, description = "The project, archived or restored", body = ProjectDto),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn set_project_archived(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<SetArchivedRequest>,
+) -> Result<Json<ProjectDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .set_project_archived(&id, req.archived)
+        .await
+        .map_err(project_err)?;
+    Ok(Json(ProjectDto::from(row)))
+}
+
+// ── Issues ──────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/issues",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, description = "The whole board, column by column, in order", body = inline(ListResponse<IssueDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+    )
+)]
+async fn list_issues(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ListResponse<IssueDto>>> {
+    let id = parse_project_id(&project_id)?;
+    let items = state
+        .project_manager
+        .list_issues(&id)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(IssueDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project id")),
+    request_body = CreateIssueRequest,
+    responses(
+        (status = 201, description = "The new issue, numbered and placed", body = IssueDto),
+        (status = 400, description = "Blank title", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
+    )
+)]
+async fn create_issue(
+    State(state): State<AdminState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateIssueRequest>,
+) -> Result<(StatusCode, Json<IssueDto>)> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .create_issue(
+            &id,
+            NewIssueRequest {
+                title: req.title,
+                description: req.description,
+                status: req.status.unwrap_or(IssueStatusDto::Backlog).into(),
+                priority: req.priority.unwrap_or_default().into(),
+            },
+        )
+        .await
+        .map_err(project_err)?;
+    Ok((StatusCode::CREATED, Json(IssueDto::from(row))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/issues/{number}",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    responses(
+        (status = 200, description = "The issue", body = IssueDto),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+    )
+)]
+async fn get_issue(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+) -> Result<Json<IssueDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .get_issue(&id, number)
+        .await
+        .map_err(project_err)?;
+    Ok(Json(IssueDto::from(row)))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/projects/{project_id}/issues/{number}",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    request_body = UpdateIssueRequest,
+    responses(
+        (status = 200, description = "The edited issue; omitted fields are unchanged", body = IssueDto),
+        (status = 400, description = "Blank title, or a body that sets no field", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
+    )
+)]
+async fn update_issue(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+    Json(req): Json<UpdateIssueRequest>,
+) -> Result<Json<IssueDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .update_issue(
+            &id,
+            number,
+            IssueUpdate {
+                title: req.title,
+                description: req.description,
+                priority: req.priority.map(IssuePriority::from),
+                blocked_reason: req.blocked_reason,
+                cancelled: req.cancelled,
+            },
+        )
+        .await
+        .map_err(project_err)?;
+    Ok(Json(IssueDto::from(row)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues/{number}/move",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    request_body = MoveIssueRequest,
+    responses(
+        (status = 200, description = "The moved issue, in its new column and place", body = IssueDto),
+        (status = 400, description = "The destination's contents don't include the moved issue", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+        (status = 409, description = "The project is archived", body = ErrorBody),
+    )
+)]
+async fn move_issue(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+    Json(req): Json<MoveIssueRequest>,
+) -> Result<Json<IssueDto>> {
+    let id = parse_project_id(&project_id)?;
+    let row = state
+        .project_manager
+        .move_issue(&id, number, req.status.into(), &req.ordered_numbers)
+        .await
+        .map_err(project_err)?;
+    Ok(Json(IssueDto::from(row)))
+}

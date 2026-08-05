@@ -11,6 +11,7 @@ pub mod cron;
 pub mod deck;
 pub mod llm;
 pub mod logs;
+pub mod projects;
 pub mod push;
 pub mod skills;
 pub mod status;
@@ -127,7 +128,8 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(llm::routes())
         .merge(logs::routes())
         .merge(agents::routes())
-        .merge(deck::routes());
+        .merge(deck::routes())
+        .merge(projects::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())
         .nest("/v1", v1)
         .split_for_parts();

@@ -90,40 +90,7 @@ async fn router_with_seed() -> (axum::Router, Arc<baybo_gateway::log_buffer::Log
 
     use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
-    let state = baybo_gateway::server::AdminState {
-        // Per-test workspace, from the same tempdir the deps were built
-        // with: the agents surface writes identity files under it, so a
-        // shared path would leak one test's persona into the next.
-        workspace_paths: std::sync::Arc::clone(&tg.deps.workspace_paths),
-        config: Arc::clone(&tg.deps.config),
-        config_path: tg.deps.config_path.clone(),
-        session_manager: Arc::clone(&tg.deps.session_manager),
-        turn_lifecycle: Arc::clone(&tg.deps.turn_lifecycle),
-        cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
-        trace_store: tg.deps.stores.trace.clone(),
-        cost_store: tg.deps.stores.cost.clone(),
-        message_search: tg.deps.stores.message_search.clone(),
-        query_api: Arc::new(baybo_query::QueryApi::new(
-            tg.deps.session_manager.store(),
-            Arc::clone(&tg.deps.turn_lifecycle),
-            tg.deps.stores.trace.clone(),
-            tg.deps.stores.cost.clone(),
-        )),
-        skill_registry: Arc::clone(&tg.deps.skill_registry),
-        tool_registry: Arc::clone(&tg.deps.tool_registry),
-        channel_registry: Arc::clone(&tg.deps.channel_registry),
-        llm_pool: tg.deps.llm_pool.clone(),
-        supervisor: tg.deps.supervisor.clone(),
-        config_reloader: tg.deps.config_reloader.clone(),
-        log_buffer: Arc::clone(&tg.deps.log_buffer),
-        channel_bot_store: tg.deps.stores.channel_bot.clone(),
-        agent_profile_store: tg.deps.stores.agent_profile.clone(),
-        blob_store: tg.deps.stores.blob.clone(),
-        channel_control: Arc::clone(&tg.deps.channel_control),
-        secret_vault: Arc::clone(&tg.deps.secret_vault),
-        deck_manager: Arc::clone(&tg.deps.deck_manager),
-        bind_display: tg.deps.runtime_config.admin_bind.to_string(),
-    };
+    let state = baybo_gateway::server::AdminState::from_deps(&tg.deps);
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     let admin_router = admin_router
         .with_state(state)

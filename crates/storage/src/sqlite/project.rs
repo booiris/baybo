@@ -1,0 +1,765 @@
+//! sqlite implementation of [`ProjectStore`].
+
+use async_trait::async_trait;
+use baybo_model::{IssueId, ProjectId};
+use rusqlite::OptionalExtension;
+
+use super::SqlitePool;
+use baybo_store::StorageError;
+use baybo_store::project::{
+    IssuePriority, IssueRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow, ProjectStore,
+    ProjectUpdate, Result,
+};
+
+pub struct SqliteProjectStore {
+    pool: SqlitePool,
+}
+
+impl SqliteProjectStore {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+const PROJECT_COLUMNS: &str = "id, name, description, workdir, archived_at, created_at, updated_at";
+
+const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
+     position, blocked_reason, cancelled_at, created_at, updated_at";
+
+/// Raw project tuple, in `PROJECT_COLUMNS` order. Timestamps are µs.
+type RawProject = (String, String, String, String, Option<i64>, i64, i64);
+
+/// Raw issue tuple, in `ISSUE_COLUMNS` order.
+type RawIssue = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<i64>,
+    i64,
+    i64,
+);
+
+fn read_raw_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProject> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+    ))
+}
+
+fn ts(column: &str, us: i64) -> Result<chrono::DateTime<chrono::Utc>> {
+    super::time::from_us(us)
+        .ok_or_else(|| StorageError::Storage(format!("{column} out of range: {us}")))
+}
+
+fn ts_opt(column: &str, us: Option<i64>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    match us {
+        Some(us) => Ok(Some(ts(column, us)?)),
+        None => Ok(None),
+    }
+}
+
+fn project_from_raw(raw: RawProject) -> Result<ProjectRow> {
+    let (id, name, description, workdir, archived_at, created_at, updated_at) = raw;
+    Ok(ProjectRow {
+        // A stored id runs the grammar again on the way out: the row is the
+        // source of a directory name, and a hand-edited DB is still a way in.
+        id: ProjectId::parse(id).map_err(|e| StorageError::Storage(e.to_string()))?,
+        name,
+        description,
+        workdir,
+        archived_at: ts_opt("projects.archived_at", archived_at)?,
+        created_at: ts("projects.created_at", created_at)?,
+        updated_at: ts("projects.updated_at", updated_at)?,
+    })
+}
+
+fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
+    let (
+        id,
+        project_id,
+        number,
+        title,
+        description,
+        status,
+        priority,
+        position,
+        blocked_reason,
+        cancelled_at,
+        created_at,
+        updated_at,
+    ) = raw;
+    Ok(IssueRow {
+        id: IssueId::from(id),
+        project_id: ProjectId::parse(project_id)
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
+        number,
+        title,
+        description,
+        status: IssueStatus::parse(&status)
+            .ok_or_else(|| StorageError::Storage(format!("issues.status unknown: {status}")))?,
+        priority: IssuePriority::parse(&priority)
+            .ok_or_else(|| StorageError::Storage(format!("issues.priority unknown: {priority}")))?,
+        position,
+        blocked_reason,
+        cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
+        created_at: ts("issues.created_at", created_at)?,
+        updated_at: ts("issues.updated_at", updated_at)?,
+    })
+}
+
+#[async_trait]
+impl ProjectStore for SqliteProjectStore {
+    async fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectRow>> {
+        let raws = self
+            .pool
+            .interact("projects.list", move |conn| {
+                let sql = format!(
+                    "SELECT {PROJECT_COLUMNS} FROM projects {} ORDER BY updated_at DESC, id",
+                    if include_archived {
+                        ""
+                    } else {
+                        "WHERE archived_at IS NULL"
+                    }
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let raws = stmt
+                    .query_map([], read_raw_project)?
+                    .collect::<rusqlite::Result<Vec<RawProject>>>()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(project_from_raw).collect()
+    }
+
+    async fn get_project(&self, id: &ProjectId) -> Result<Option<ProjectRow>> {
+        let id = id.as_str().to_string();
+        let raw = self
+            .pool
+            .interact("projects.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
+                        rusqlite::params![id],
+                        read_raw_project,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        raw.map(project_from_raw).transpose()
+    }
+
+    async fn create_project(&self, row: &ProjectRow) -> Result<()> {
+        let id = row.id.as_str().to_string();
+        let name = row.name.clone();
+        let description = row.description.clone();
+        let workdir = row.workdir.clone();
+        let created_at = super::time::to_us(row.created_at);
+        let updated_at = super::time::to_us(row.updated_at);
+        self.pool
+            .interact("projects.create", move |conn| {
+                conn.execute(
+                    "INSERT INTO projects \
+                     (id, name, description, workdir, archived_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                    rusqlite::params![id, name, description, workdir, created_at, updated_at],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_project(&self, id: &ProjectId, update: &ProjectUpdate) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let name = update.name.clone();
+        let description = update.description.clone();
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("projects.update", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE projects SET name = ?2, description = ?3, updated_at = ?4 \
+                     WHERE id = ?1",
+                    rusqlite::params![id, name, description, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let now = super::time::now_us();
+        let stamp = archived.then_some(now);
+        let affected = self
+            .pool
+            .interact("projects.set_archived", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE projects SET archived_at = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, stamp, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn list_issues(&self, project: &ProjectId) -> Result<Vec<IssueRow>> {
+        let project = project.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("issues.list", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {ISSUE_COLUMNS} FROM issues WHERE project_id = ?1 \
+                     ORDER BY status, position, number"
+                ))?;
+                let raws = stmt
+                    .query_map(rusqlite::params![project], read_raw_issue)?
+                    .collect::<rusqlite::Result<Vec<RawIssue>>>()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(issue_from_raw).collect()
+    }
+
+    async fn get_issue(&self, project: &ProjectId, number: i64) -> Result<Option<IssueRow>> {
+        let project = project.as_str().to_string();
+        let raw = self
+            .pool
+            .interact("issues.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!(
+                            "SELECT {ISSUE_COLUMNS} FROM issues \
+                             WHERE project_id = ?1 AND number = ?2"
+                        ),
+                        rusqlite::params![project, number],
+                        read_raw_issue,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        raw.map(issue_from_raw).transpose()
+    }
+
+    async fn create_issue(&self, new: &NewIssue) -> Result<IssueRow> {
+        let id = new.id.as_str().to_string();
+        let project = new.project_id.as_str().to_string();
+        let title = new.title.clone();
+        let description = new.description.clone();
+        let status = new.status.as_str();
+        let priority = new.priority.as_str();
+        let created_at = super::time::to_us(new.created_at);
+        let raw = self
+            .pool
+            .interact("issues.create", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // Both derived values are read inside the transaction that
+                // writes them: computed outside, two concurrent creates would
+                // pick the same number and the second would trip the unique
+                // index instead of getting the next one.
+                let number: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE project_id = ?1",
+                    rusqlite::params![project],
+                    |row| row.get(0),
+                )?;
+                let position: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM issues \
+                     WHERE project_id = ?1 AND status = ?2",
+                    rusqlite::params![project, status],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO issues (id, project_id, number, title, description, status, \
+                     priority, position, blocked_reason, cancelled_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
+                    rusqlite::params![
+                        id,
+                        project,
+                        number,
+                        title,
+                        description,
+                        status,
+                        priority,
+                        position,
+                        created_at
+                    ],
+                )?;
+                let raw = tx.query_row(
+                    &format!(
+                        "SELECT {ISSUE_COLUMNS} FROM issues WHERE project_id = ?1 AND number = ?2"
+                    ),
+                    rusqlite::params![project, number],
+                    read_raw_issue,
+                )?;
+                tx.commit()?;
+                Ok(raw)
+            })
+            .await?;
+        issue_from_raw(raw)
+    }
+
+    async fn update_issue(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        update: &IssueUpdate,
+    ) -> Result<bool> {
+        let project = project.as_str().to_string();
+        let update = update.clone();
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("issues.update", move |conn| {
+                // COALESCE(?, column) leaves an unset field alone, so a
+                // sparse patch never clobbers a field the caller didn't name.
+                // `blocked_reason` and `cancelled_at` are clearable, so they
+                // take a flag beside the value rather than relying on NULL to
+                // mean "unset" — NULL is a value they can legitimately take.
+                let title = update.title.clone();
+                let description = update.description.clone();
+                let priority = update.priority.map(|p| p.as_str());
+                let (set_blocked, blocked) = match &update.blocked_reason {
+                    Some(value) => (true, value.clone()),
+                    None => (false, None),
+                };
+                let (set_cancelled, cancelled) = match update.cancelled {
+                    Some(true) => (true, Some(now)),
+                    Some(false) => (true, None),
+                    None => (false, None),
+                };
+                Ok(conn.execute(
+                    "UPDATE issues SET \
+                       title          = COALESCE(?3, title), \
+                       description    = COALESCE(?4, description), \
+                       priority       = COALESCE(?5, priority), \
+                       blocked_reason = CASE WHEN ?6 THEN ?7 ELSE blocked_reason END, \
+                       cancelled_at   = CASE WHEN ?8 THEN ?9 ELSE cancelled_at END, \
+                       updated_at     = ?10 \
+                     WHERE project_id = ?1 AND number = ?2",
+                    rusqlite::params![
+                        project,
+                        number,
+                        title,
+                        description,
+                        priority,
+                        set_blocked,
+                        blocked,
+                        set_cancelled,
+                        cancelled,
+                        now
+                    ],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn move_issue(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        status: IssueStatus,
+        ordered_numbers: &[i64],
+    ) -> Result<bool> {
+        let project = project.as_str().to_string();
+        let status = status.as_str();
+        let ordered: Vec<i64> = ordered_numbers.to_vec();
+        let now = super::time::now_us();
+        self.pool
+            .interact("issues.move", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let moved = tx.execute(
+                    "UPDATE issues SET status = ?3, updated_at = ?4 \
+                     WHERE project_id = ?1 AND number = ?2",
+                    rusqlite::params![project, number, status, now],
+                )?;
+                if moved == 0 {
+                    drop(tx);
+                    return Ok(false);
+                }
+                // Renumber the destination column densely. Every UPDATE is
+                // scoped to (project, status), so a number from another
+                // project — or from a column the caller mis-read — updates
+                // nothing instead of being adopted into this column.
+                for (index, target) in ordered.iter().enumerate() {
+                    tx.execute(
+                        "UPDATE issues SET position = ?3 \
+                         WHERE project_id = ?1 AND number = ?2 AND status = ?4",
+                        rusqlite::params![project, target, index as i64, status],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn store() -> (tempfile::TempDir, SqliteProjectStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        (dir, SqliteProjectStore::new(pool))
+    }
+
+    fn project(id: &str, name: &str) -> ProjectRow {
+        let now = chrono::Utc::now();
+        ProjectRow {
+            id: ProjectId::parse(id).unwrap(),
+            name: name.to_owned(),
+            description: String::new(),
+            workdir: format!("/tmp/{id}"),
+            archived_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn new_issue(project: &ProjectId, title: &str, status: IssueStatus) -> NewIssue {
+        NewIssue {
+            id: IssueId::generate(),
+            project_id: project.clone(),
+            title: title.to_owned(),
+            description: String::new(),
+            status,
+            priority: IssuePriority::None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn projects_round_trip_and_archive_hides() {
+        let (_dir, store) = store().await;
+        let a = project("proj-a", "A");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&project("proj-b", "B")).await.unwrap();
+
+        assert_eq!(store.list_projects(false).await.unwrap().len(), 2);
+        let fetched = store.get_project(&a.id).await.unwrap().unwrap();
+        assert_eq!(fetched.name, "A");
+        assert_eq!(fetched.workdir, "/tmp/proj-a");
+
+        assert!(
+            store
+                .update_project(
+                    &a.id,
+                    &ProjectUpdate {
+                        name: "Alpha".into(),
+                        description: "the first".into(),
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        let fetched = store.get_project(&a.id).await.unwrap().unwrap();
+        assert_eq!(fetched.name, "Alpha");
+        assert_eq!(fetched.description, "the first");
+
+        assert!(store.set_project_archived(&a.id, true).await.unwrap());
+        assert_eq!(
+            store.list_projects(false).await.unwrap().len(),
+            1,
+            "an archived project leaves the default listing"
+        );
+        assert_eq!(
+            store.list_projects(true).await.unwrap().len(),
+            2,
+            "…and comes back when the recycle bin is asked for"
+        );
+        assert!(
+            store
+                .get_project(&a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_some(),
+            "the row itself is never removed"
+        );
+
+        // An unknown id reports no row rather than erroring.
+        let ghost = ProjectId::parse("ghost").unwrap();
+        assert!(!store.set_project_archived(&ghost, true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn issue_numbers_are_per_project_and_sequential() {
+        let (_dir, store) = store().await;
+        let a = project("proj-a", "A");
+        let b = project("proj-b", "B");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+
+        let a1 = store
+            .create_issue(&new_issue(&a.id, "first", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let a2 = store
+            .create_issue(&new_issue(&a.id, "second", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let b1 = store
+            .create_issue(&new_issue(&b.id, "elsewhere", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        assert_eq!((a1.number, a2.number), (1, 2));
+        assert_eq!(b1.number, 1, "numbering restarts inside each project");
+        assert_eq!(
+            (a1.position, a2.position),
+            (0, 1),
+            "a new card lands at the tail of its column"
+        );
+
+        // Addressing is (project, number): b's #1 is not a's #1.
+        assert_eq!(
+            store.get_issue(&a.id, 1).await.unwrap().unwrap().title,
+            "first"
+        );
+        assert_eq!(
+            store.get_issue(&b.id, 1).await.unwrap().unwrap().title,
+            "elsewhere"
+        );
+        assert!(store.get_issue(&a.id, 99).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_never_collide_on_a_number() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = std::sync::Arc::clone(&store);
+            let pid = p.id.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .create_issue(&new_issue(
+                        &pid,
+                        &format!("issue {i}"),
+                        IssueStatus::Backlog,
+                    ))
+                    .await
+            }));
+        }
+        let mut numbers = Vec::new();
+        for handle in handles {
+            numbers.push(handle.await.unwrap().unwrap().number);
+        }
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (1..=16).collect::<Vec<_>>(),
+            "sixteen racing creates take sixteen distinct numbers"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_changes_column_and_renumbers_it() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        for title in ["a", "b", "c"] {
+            store
+                .create_issue(&new_issue(&p.id, title, IssueStatus::Backlog))
+                .await
+                .unwrap();
+        }
+        // Card #3 jumps to Todo; Backlog closes ranks behind it.
+        assert!(
+            store
+                .move_issue(&p.id, 3, IssueStatus::Todo, &[3])
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .move_issue(&p.id, 1, IssueStatus::Backlog, &[2, 1])
+                .await
+                .unwrap()
+        );
+
+        let issues = store.list_issues(&p.id).await.unwrap();
+        let by_number = |n: i64| issues.iter().find(|i| i.number == n).unwrap();
+        assert_eq!(by_number(3).status, IssueStatus::Todo);
+        assert_eq!(by_number(3).position, 0);
+        assert_eq!(by_number(2).position, 0);
+        assert_eq!(by_number(1).position, 1);
+
+        // A number from another column cannot be renumbered into this one.
+        assert!(
+            store
+                .move_issue(&p.id, 2, IssueStatus::Backlog, &[2, 3])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_issue(&p.id, 3).await.unwrap().unwrap().status,
+            IssueStatus::Todo,
+            "#3 stayed in Todo despite being named in a Backlog reorder"
+        );
+
+        assert!(
+            !store
+                .move_issue(&p.id, 99, IssueStatus::Done, &[])
+                .await
+                .unwrap(),
+            "an unknown issue reports no row moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_update_leaves_unnamed_fields_alone() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        store
+            .create_issue(&new_issue(&p.id, "original", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .update_issue(
+                    &p.id,
+                    1,
+                    &IssueUpdate {
+                        description: Some("filled in".into()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        let issue = store.get_issue(&p.id, 1).await.unwrap().unwrap();
+        assert_eq!(
+            issue.title, "original",
+            "a patch that named no title kept it"
+        );
+        assert_eq!(issue.description, "filled in");
+
+        // Blocking, then clearing the block: `Some(None)` is a real value,
+        // distinct from `None` meaning "leave it".
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    blocked_reason: Some(Some("waiting on tmux".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_issue(&p.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .blocked_reason
+                .as_deref(),
+            Some("waiting on tmux")
+        );
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    title: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let issue = store.get_issue(&p.id, 1).await.unwrap().unwrap();
+        assert_eq!(issue.title, "renamed");
+        assert_eq!(
+            issue.blocked_reason.as_deref(),
+            Some("waiting on tmux"),
+            "an unrelated patch did not clear the block"
+        );
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    blocked_reason: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_issue(&p.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .blocked_reason
+                .is_none()
+        );
+
+        // Cancel is the terminal negative: the row stays, stamped.
+        store
+            .update_issue(
+                &p.id,
+                1,
+                &IssueUpdate {
+                    cancelled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_issue(&p.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .cancelled_at
+                .is_some()
+        );
+        assert!(
+            !store
+                .update_issue(&p.id, 99, &IssueUpdate::default())
+                .await
+                .unwrap()
+        );
+    }
+}

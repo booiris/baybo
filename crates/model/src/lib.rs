@@ -13,6 +13,7 @@ mod message;
 mod model_tier;
 mod money;
 mod pricing;
+mod project;
 mod security_types;
 mod session;
 pub mod spawn_protocol;
@@ -46,6 +47,9 @@ pub use message::{
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
+pub use project::{
+    InvalidProjectValue, IssueId, MAX_PROJECT_ID_CHARS, MAX_PROJECT_NAME_CHARS, ProjectId,
+};
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundNotificationDelivery, BackgroundNotificationGroup, BackgroundNotificationState,

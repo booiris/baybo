@@ -323,6 +323,7 @@ dependencies = [
  "baybo-memory",
  "baybo-model",
  "baybo-pairing",
+ "baybo-project",
  "baybo-sandbox",
  "baybo-security",
  "baybo-setup",
@@ -661,6 +662,7 @@ dependencies = [
  "baybo-llm",
  "baybo-model",
  "baybo-pairing",
+ "baybo-project",
  "baybo-query",
  "baybo-security",
  "baybo-session",
@@ -861,6 +863,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "baybo-project"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "baybo-model",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-workspace",
+ "chrono",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

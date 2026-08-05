@@ -169,6 +169,10 @@ pub struct ManagerGraph {
     /// Deck card manager (`/v1/deck/*` + the DeckCard* tools). Boot and
     /// shutdown are the gateway entrypoint's responsibility.
     pub deck_manager: Arc<baybo_deck::DeckManager>,
+    /// Kanban projects and their boards (`/v1/projects/*`). One per
+    /// process: later phases hang the run ledger's wake signal off it, and
+    /// a second instance would raise signals nobody is listening for.
+    pub project_manager: Arc<baybo_project::ProjectManager>,
     /// Cloneable bundle of every sqlite-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
@@ -574,6 +578,14 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // --- Kanban projects (docs/todo/kanban.md). Board CRUD only for now;
+    // the execution pipeline that turns a card into an agent run lands on
+    // this same manager.
+    let project_manager = Arc::new(baybo_project::ProjectManager::new(
+        stores.project.clone(),
+        baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+    ));
+
     // --- security gateway + tool executor
     // Tool-output spill now lives in `baybo-context` (resolved from the
     // session's workspace handle); the gateway only does scan + sanitize.
@@ -759,6 +771,7 @@ pub async fn build_managers(
         channels_registry,
         secret_vault,
         deck_manager,
+        project_manager,
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
