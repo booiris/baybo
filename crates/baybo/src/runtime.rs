@@ -754,6 +754,7 @@ pub async fn build_managers(
         virtual_reads,
         background_jobs,
         background_control,
+        Some(stores.project.clone()),
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and

@@ -371,6 +371,17 @@ pub struct ToolContext {
     /// else, so the tool no-ops on a user reply, a one-shot fire, or any
     /// ordinary turn. See [`NotifySilence`].
     pub notify_silence: Option<NotifySilence>,
+    /// The checkout this session owns, when it is a kanban issue's run: the
+    /// git worktree cut for that issue. Shell commands default their cwd to
+    /// it, so an unqualified `git status` describes the project the card is
+    /// about rather than baybo's own work directory. `None` for every
+    /// ordinary session, which keeps the existing default.
+    ///
+    /// Only the worktree appears here. The project *repository* also has to
+    /// be writable for a commit to work (see `baybo_project::worktree`), but
+    /// that is a sandbox concern and never a cwd, so it stops at the
+    /// executor.
+    pub checkout_root: Option<PathBuf>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -417,6 +428,7 @@ impl ToolContext {
             background_jobs: None,
             background_control: None,
             notify_silence: None,
+            checkout_root: None,
         }
     }
 }

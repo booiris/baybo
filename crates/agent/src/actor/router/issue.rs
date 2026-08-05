@@ -13,12 +13,13 @@
 //! own. And nothing is dispatched to a channel: an issue's audience is its
 //! card.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use baybo_model::{
     AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, User,
 };
-use baybo_project::ProjectEvents;
+use baybo_project::{ProjectEvents, worktree};
 use baybo_store::project::{IssueRunRow, ProjectStore, RunStatus};
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::broadcast;
@@ -82,6 +83,24 @@ impl Router {
             }
         }
 
+        // The worktree the run works in, made once the row is ours. A
+        // repository that cannot host one fails the run with a reason on
+        // the card, which is the only place anybody would look — an agent
+        // handed a session with nowhere to work would instead spend a turn
+        // discovering that for itself.
+        if let Err(e) = self.prepare_checkout(&event).await {
+            warn!(%run_id, error = %e, "could not open the issue's checkout");
+            settle(
+                &store,
+                self.project_events.as_ref(),
+                &event.run,
+                RunStatus::Failed,
+                Some(&e.to_string()),
+            )
+            .await;
+            return;
+        }
+
         // Subscribed before the trigger is sent, and this is load-bearing:
         // the terminal event is published from inside the run's own turn, so
         // a subscription opened afterwards can miss a fast failure entirely.
@@ -128,6 +147,31 @@ impl Router {
         }
 
         tokio::spawn(waiter.run(actor_token));
+    }
+
+    /// Cut the issue's worktree if this is its first run.
+    ///
+    /// Idempotent, so a retry or a boot-swept run re-enters the tree the
+    /// last attempt left rather than starting from a clean one — half-done
+    /// work belongs to the card, not to the attempt.
+    async fn prepare_checkout(&self, event: &IssueRunEvent) -> anyhow::Result<()> {
+        let store = self
+            .project_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project store"))?;
+        let project_id = &event.run.project_id;
+        let issue = store
+            .get_issue(project_id, event.run.number)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
+        let project = store
+            .get_project(project_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("the issue's project is gone"))?;
+        let root = worktree::worktree_root(&self.workspace, project_id, issue.number);
+        let branch = worktree::branch_name(issue.number, &issue.title);
+        worktree::ensure(Path::new(&project.workdir), &root, &branch).await?;
+        Ok(())
     }
 
     /// The issue's session — reused across its runs, minted on the first.

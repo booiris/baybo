@@ -271,28 +271,60 @@ announces which of these will happen before sending.
   external assignee is refused at enqueue with that reason, and giving
   external agents a top-level leg is its own piece of work.
 - **A run cannot reach the project's repository yet** (verified on master,
-  2026-08-05). Two independent reasons, both of which the worktree work
-  has to fix before isolation is even the question:
-  1. Bash's default cwd is `ToolContext::workspace_root` — the *workspace*
-     root. An unqualified `git status` in a run therefore runs against
-     baybo's own tree, and succeeds, which is the failure mode that hides
-     longest.
-  2. The workdir is not bound into the sandbox. `SandboxSpec::
-     writable_paths` is honoured **only inside the `FilesystemPolicy::
-     Workspace` arm** of the bwrap arg builder, and the agent layer only
-     ever builds `FilesystemPolicy::Permissive`
-     (`with_permissive_filesystem`). So under bwrap the checkout is
-     *absent* (ENOENT), not read-only. Docker binds `writable_paths`
-     outside the policy match, so it works there — which is exactly how a
-     hole like this stays hidden.
+  2026-08-05). Three independent guards, each sufficient on its own, and
+  all three have to be answered before isolation is even the question:
+  1. **Bash's default cwd is somewhere else.** It is
+     `ToolContext::workspace_root`, which the runtime sets to
+     `<workspace>/work` — not the workspace root, and not the project
+     (`crates/baybo/src/runtime.rs:681,750`). An unqualified `git status`
+     in a run therefore executes in baybo's work dir, which is not a
+     repository, and the model gets "not a git repository" for a project
+     that plainly is one.
+  2. **Bash's own jail forbids the spec's worktree location.**
+     `require_within_work_dir` rejects any absolute cwd *or command
+     argument* that is inside `<workspace>` but outside `<workspace>/work`
+     (`crates/tools/src/builtin/bash/mod.rs:1332`). The location this doc
+     originally named — `<workspace>/projects/<pid>/worktrees/…` — is
+     exactly such a path, so it would be refused before the sandbox is
+     ever consulted. Worktrees therefore live under
+     `<workspace>/work/projects/<pid>/<number>-<slug>`, which is also
+     where `materialise_workdir` already puts an auto-created project
+     repo (`crates/project/src/manager.rs:249`).
+  3. **A workdir outside `$HOME` is absent from the sandbox.**
+     `SandboxAdapter::build_spec` hard-codes `writable_paths: Vec::new()`
+     (`crates/agent/src/runtime/sandbox.rs:166`), so the field is dead in
+     production under *either* policy — and the bwrap `Permissive` arm
+     would not have honoured it anyway, since the `writable_paths` loop
+     exists only in the `Workspace` arm (`crates/sandbox/src/args.rs:73`).
+     The actual RW surface a run gets is `extra_root` (= `$HOME`) plus
+     `<workspace>/work`, minus the denylist's masking tmpfs. So a project
+     pointed at `~/code/foo` already works by accident, and one pointed
+     at `/data/foo` is *absent* (ENOENT), not read-only. Docker binds
+     `writable_paths` outside the policy match
+     (`crates/sandbox/src/args.rs:306`), which is exactly how a hole like
+     this stays hidden.
 
-  The trap when fixing it: all three existing `writable_paths` tests build
-  their spec with a helper whose default policy is `Workspace`, so they
-  exercise a branch production never takes. A new test must assert against
-  `Permissive`, and must be shown to fail with the fix reverted.
+  The trap when fixing (3): all three existing `writable_paths` tests
+  build their spec with a helper whose default policy is `Workspace`, so
+  they exercise a branch production never takes. A new test must assert
+  against `Permissive`, and must be shown to fail with the fix reverted.
+
+  And the part that makes this urgent rather than merely broken: under
+  the default `permission: auto`, a sandboxed command that fails is
+  handed to a post-fail LLM judge, and a `sandbox_related + safe` verdict
+  **re-runs the identical command on the host with the sandbox off and
+  nobody asked** (`SandboxEscapeDecision::Run` →
+  `run_unsandboxed_wrapped`, `crates/tools/src/builtin/bash/mod.rs`).
+  An ENOENT on the project checkout is exactly the shape of failure that
+  reads as sandbox-related. So the honest description of today's
+  behaviour is not "the run cannot reach the repository" — it is "the
+  run fails inside the sandbox and may then reach the repository with no
+  sandbox at all." Binding the checkout properly is what stops the
+  escape hatch from being the mechanism by which project work happens.
 
 - **Worktree per issue**: created lazily at first run under
-  `<workspace>/projects/<pid>/worktrees/<number>-<slug>`, branch
+  `<workspace>/work/projects/<pid>/<number>-<slug>` (moved under `work/`
+  for the reason in guard 2 above), branch
   `issue/<number>-<slug>` off the repo's default branch. **Worktree and
   branch are separate ideas**: the worktree is the execution sandbox and
   every run gets one regardless of task kind; the branch is the

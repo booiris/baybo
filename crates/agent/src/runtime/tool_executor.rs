@@ -22,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use baybo_project::worktree::{self, Checkout};
+use baybo_store::project::ProjectStore;
+
 use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
@@ -350,6 +353,12 @@ pub struct ToolExecutor {
     /// Control surface for the `JobList` / `JobStop` tools. Wired like
     /// [`Self::background_jobs`] (same runtime component implements both).
     background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
+    /// Board store, consulted only to find the checkout of a session whose
+    /// trigger is an issue. Resolved per call rather than held on the
+    /// session, because a session's issue is stable but the project's
+    /// workdir is a row a user can edit. `None` ⇒ no board wired (argv-mode
+    /// boots, tests), and issue sessions then behave like ordinary ones.
+    project_store: Option<Arc<dyn ProjectStore>>,
 }
 
 impl ToolExecutor {
@@ -365,6 +374,7 @@ impl ToolExecutor {
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
         background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
+        project_store: Option<Arc<dyn ProjectStore>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -377,6 +387,7 @@ impl ToolExecutor {
             virtual_reads,
             background_jobs,
             background_control,
+            project_store,
         }
     }
 
@@ -411,6 +422,37 @@ impl ToolExecutor {
                 debug!(error = %e, "sanitize_tool_event_payload: sanitize_stream_fragment failed");
             }
         }
+    }
+
+    /// The checkout backing an issue session, or `None` for every other
+    /// session.
+    ///
+    /// Reports only a worktree that is already on disk. Creating it is the
+    /// run dispatcher's job, done once when the run starts and settled as a
+    /// run failure if it cannot be done; a tool call is the wrong place to
+    /// discover that a checkout is missing and much the wrong place to
+    /// shell out to `git` to make one.
+    async fn issue_checkout(&self, trigger: &baybo_model::TriggerSource) -> Option<Checkout> {
+        let baybo_model::TriggerSource::Issue {
+            project_id, number, ..
+        } = trigger
+        else {
+            return None;
+        };
+        let store = self.project_store.as_ref()?;
+        let project = match store.get_project(project_id).await {
+            Ok(Some(project)) => project,
+            Ok(None) => return None,
+            Err(e) => {
+                debug!(error = %e, "could not resolve the project behind an issue session");
+                return None;
+            }
+        };
+        let root = worktree::worktree_root(&self.workspace_paths, project_id, *number);
+        root.is_dir().then(|| Checkout {
+            root,
+            repo: PathBuf::from(project.workdir),
+        })
     }
 
     /// Validate that the tool's trust level permits execution with its declared capabilities.
@@ -675,6 +717,13 @@ impl ToolExecutor {
                     .is_some_and(|manifest| {
                         manifest.capabilities.contains(&ToolCapability::ExecCommand)
                     });
+                // The checkout this session owns, if it is an issue's. Both
+                // paths go to the sandbox: the worktree because that is
+                // where edits land, and the repository because a git
+                // worktree keeps neither its index nor its refs — a commit
+                // made in the worktree is written entirely under the
+                // repository's `.git`.
+                let checkout = self.issue_checkout(session_trigger).await;
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -686,6 +735,10 @@ impl ToolExecutor {
                         let denied =
                             default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
                         let skill_roots = sandbox_readable_paths(&self.workspace_paths, agent_id);
+                        let checkout_paths = checkout
+                            .as_ref()
+                            .map(|c| vec![c.root.clone(), c.repo.clone()])
+                            .unwrap_or_default();
                         Arc::new(
                             SandboxAdapter::new(
                                 Arc::clone(runner),
@@ -693,7 +746,8 @@ impl ToolExecutor {
                                 NetworkPolicy::All,
                             )
                             .with_permissive_filesystem(extra_root, denied)
-                            .with_readable_paths(skill_roots),
+                            .with_readable_paths(skill_roots)
+                            .with_writable_paths(checkout_paths),
                         ) as Arc<dyn ExecSandbox>
                     })
                 } else {
@@ -776,6 +830,7 @@ impl ToolExecutor {
                     background_jobs: self.background_jobs.clone(),
                     background_control: self.background_control.clone(),
                     notify_silence,
+                    checkout_root: checkout.map(|c| c.root),
                 };
 
                 // Reveal placeholders in the tool's arguments just

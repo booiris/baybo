@@ -695,10 +695,16 @@ impl Tool for BashTool {
         } else {
             None
         };
+        // An issue run defaults to the checkout it owns, so a bare
+        // `git status` / `cargo test` describes the project the card is
+        // about. Without this the command lands in `<workspace>/work`,
+        // which is not a repository at all — and the model is told the
+        // project it can plainly see is not one.
         let cwd_ref: Option<&Path> = p
             .cwd
             .as_deref()
             .or(inherited_cwd.as_deref())
+            .or(ctx.checkout_root.as_deref())
             .or(Some(ctx.workspace_root.as_path()));
 
         if is_file_tool_redirect(&command) {
@@ -4046,6 +4052,77 @@ mod tests {
         assert!(!f.exists(), "an aged-out file must be pruned");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_issue_runs_commands_in_its_checkout_by_default() {
+        // Without this, an unqualified `git status` runs in
+        // `<workspace>/work`, which is not a repository — so the model is
+        // told the project it can plainly see is not one.
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        let checkout = PathBuf::from("/tmp/work/projects/p/4");
+        ctx.checkout_root = Some(checkout.clone());
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git status" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(fake.calls()[0].cwd.as_ref(), Some(&checkout));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_cwd_still_beats_the_checkout() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+
+        BashTool::for_test()
+            .execute(
+                json!({ "command": "ls", "cwd": "/tmp/work/elsewhere" }),
+                &ctx,
+            )
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0].cwd.as_deref(),
+            Some(Path::new("/tmp/work/elsewhere")),
+            "the checkout is a default, not an override"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_checkout_still_defaults_to_the_work_dir() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let ctx = ctx_with(Some(sandbox));
+
+        BashTool::for_test()
+            .execute(json!({ "command": "ls" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            fake.calls()[0].cwd.as_deref(),
+            Some(ctx.workspace_root.as_path()),
+            "an ordinary session must be unchanged by the checkout default"
+        );
     }
 
     fn fake_with_response(

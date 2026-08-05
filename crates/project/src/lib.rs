@@ -9,6 +9,7 @@ mod error;
 mod events;
 mod manager;
 mod runs;
+pub mod worktree;
 
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
@@ -17,3 +18,4 @@ pub use manager::{
     validate_workdir,
 };
 pub use runs::{Transition, triggers_run};
+pub use worktree::Checkout;
