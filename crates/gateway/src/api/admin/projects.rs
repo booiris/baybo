@@ -262,6 +262,7 @@ pub enum RunTriggerDto {
     Started,
     Assigned,
     Retry,
+    Comment,
 }
 
 impl From<RunTrigger> for RunTriggerDto {
@@ -270,6 +271,7 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Started => Self::Started,
             RunTrigger::Assigned => Self::Assigned,
             RunTrigger::Retry => Self::Retry,
+            RunTrigger::Comment => Self::Comment,
         }
     }
 }

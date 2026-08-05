@@ -206,11 +206,21 @@ Two-pane route, no tabs (multica's shape):
 ### Comment semantics
 
 A comment on an issue in Todo / In Progress / Review is **delivered to the
-assignee**: if a run is active it is injected mid-turn (existing
-interjection machinery); if a run is **queued**, the comment simply lands
-in the brief that run will assemble when it starts — merged, never a
-second run (multica's coalescing for free); if idle it enqueues a run. In
-Backlog / Done a comment just records. On an **unassigned** issue the chip
+assignee**: if a run is **queued**, the comment simply lands in the brief
+that run will assemble when it starts — merged, never a second run
+(multica's coalescing for free); if idle it enqueues a run. In Backlog /
+Done a comment just records.
+
+**Mid-turn injection is not what shipped** (2026-08-05). A run executes on
+a *one-shot* actor, and `build_oneshot_actor` deliberately does not
+register the handle with the supervisor ("one-shot sessions have no
+follow-up traffic"), so there is no mailbox anything can route to. Rather
+than change actor lifecycle to get it, a comment on a **running** issue
+records and a follow-up run is enqueued when the current one settles —
+the comment is never lost and never interrupts, and the composer says so
+("@dev-1 is mid-run — this is picked up when that run finishes"). Real
+injection is a latency improvement, not a missing capability, and it is
+the one thing that would want registering issue actors. On an **unassigned** issue the chip
 degrades to record-only and suggests @mentioning a teammate — an @mention
 assigns and then follows the assign-trigger rule below. The composer chip
 announces which of these will happen before sending.

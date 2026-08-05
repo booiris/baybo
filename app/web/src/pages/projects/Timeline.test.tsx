@@ -38,7 +38,7 @@ function entry(body: IssueEventBody, agent?: string): IssueEvent {
 
 function renderTimeline(events: IssueEvent[], onComment = vi.fn(), busy = false) {
   render(
-    <Timeline events={events} issue={ISSUE} onComment={onComment} busy={busy} />,
+    <Timeline events={events} issue={ISSUE} runs={[]} onComment={onComment} busy={busy} />,
   );
   return onComment;
 }
@@ -90,6 +90,6 @@ describe('Timeline', () => {
     // The expensive failure is silent: someone comments believing an agent
     // will read it, and waits for an answer nobody is going to send.
     renderTimeline([]);
-    expect(screen.getByText(/not built yet/)).toBeInTheDocument();
+    expect(screen.getByText(/Starts a run/)).toBeInTheDocument();
   });
 });

@@ -19,6 +19,7 @@ use baybo_store::project::{
 };
 use baybo_workspace::WorkspacePaths;
 
+use crate::CommentDelivery;
 use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
 use crate::runs::{Transition, ledger_entry, triggers_run};
@@ -156,11 +157,12 @@ impl ProjectManager {
         }
     }
 
-    /// Say something on an issue.
+    /// Say something on an issue, and reach whoever should hear it.
     ///
-    /// Recording is all this does. Whether the comment also *wakes* the
-    /// assignee is the caller's next question and a separate decision — see
-    /// [`Self::comment_delivery`].
+    /// The comment always lands on the timeline; what else happens is
+    /// [`crate::comment_delivery`]'s decision. Recording comes first in
+    /// every branch, so a wake that fails is a comment that is still there
+    /// to be read rather than one that was never said.
     pub async fn comment(
         &self,
         project: &ProjectId,
@@ -187,7 +189,59 @@ impl ProjectManager {
             })
             .await?;
         self.events.timeline_changed(project, number);
+
+        if self.delivery_for(&issue).await == CommentDelivery::Wake {
+            // Same ledger discipline as a drag: the row is written before
+            // anything is told about it, and a refused enqueue means
+            // somebody started work in the gap — which is the dedupe guard
+            // working, not an error the commenter should see.
+            if let Some(ledger) = crate::runs::ledger_entry(&issue, RunTrigger::Comment) {
+                match self.store.enqueue_run(&ledger).await {
+                    Ok(run) => {
+                        self.events.run_changed(project, number);
+                        (self.dispatch)(run);
+                    }
+                    Err(baybo_store::StorageError::Conflict(reason)) => {
+                        tracing::debug!(issue = number, %reason, "a run started while the comment was being written");
+                    }
+                    Err(e) => {
+                        tracing::error!(issue = number, error = %e, "comment could not start a run");
+                    }
+                }
+            }
+        }
         Ok(entry)
+    }
+
+    /// What this comment will do besides being recorded.
+    ///
+    /// Public so the composer can say it before the comment is sent: the
+    /// difference between "somebody will read this" and "this is a note for
+    /// later" is invisible in a text box, and a person who expects the first
+    /// and gets the second waits for an answer nobody is sending.
+    pub async fn comment_delivery(
+        &self,
+        project: &ProjectId,
+        number: i64,
+    ) -> Result<CommentDelivery> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.delivery_for(&issue).await)
+    }
+
+    async fn delivery_for(&self, issue: &IssueRow) -> CommentDelivery {
+        let live = match self.store.list_runs(&issue.id).await {
+            Ok(runs) => runs
+                .into_iter()
+                .find(|run| !run.status.is_settled())
+                .map(|run| run.status),
+            Err(e) => {
+                // Fail towards doing nothing: a spurious wake starts an
+                // agent on work nobody asked it to redo.
+                tracing::error!(issue = issue.number, error = %e, "could not read runs for comment delivery");
+                return CommentDelivery::RecordOnly;
+            }
+        };
+        crate::comment_delivery(issue, live)
     }
 
     /// One issue's timeline, oldest first.

@@ -21,7 +21,8 @@ use baybo_model::{
 };
 use baybo_project::{ProjectEvents, worktree};
 use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, ProjectStore, RunStatus,
+    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, NewIssueRun, ProjectStore, RunStatus,
+    RunTrigger,
 };
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::broadcast;
@@ -248,6 +249,65 @@ fn binding_for(agent: &AgentProfileId) -> AgentBinding {
     }
 }
 
+/// Start a follow-up run if anybody said anything while this one was
+/// executing.
+///
+/// A comment that arrives mid-run is past the point where its brief was
+/// assembled, and a one-shot actor has no mailbox anybody can reach — so
+/// the comment waits here rather than being lost. This terminates: the
+/// follow-up only looks at comments newer than its own predecessor's
+/// start, so a quiet issue stops after one.
+async fn follow_up_on_comments(
+    store: &Arc<dyn ProjectStore>,
+    events: Option<&Arc<dyn ProjectEvents>>,
+    run: &IssueRunRow,
+) {
+    let said = match store.events_since(&run.issue_id, run.created_at).await {
+        Ok(events) => events
+            .into_iter()
+            .any(|e| matches!(e.body, IssueEventBody::Comment { .. })),
+        Err(e) => {
+            warn!(run = %run.id, error = %e, "could not check for comments left during the run");
+            return;
+        }
+    };
+    if !said {
+        return;
+    }
+    // Re-read the issue: it may have been cancelled, unassigned or dragged
+    // out of live work while the run was going, and each of those means
+    // nobody should be woken.
+    let issue = match store.get_issue(&run.project_id, run.number).await {
+        Ok(Some(issue)) => issue,
+        _ => return,
+    };
+    if baybo_project::comment_delivery(&issue, None) != baybo_project::CommentDelivery::Wake {
+        return;
+    }
+    let Some(agent_id) = issue.assignee.clone() else {
+        return;
+    };
+    let entry = NewIssueRun {
+        id: baybo_model::IssueRunId::generate(),
+        issue_id: issue.id.clone(),
+        project_id: issue.project_id.clone(),
+        number: issue.number,
+        agent_id,
+        trigger: RunTrigger::Comment,
+    };
+    match store.enqueue_run(&entry).await {
+        Ok(next) => {
+            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up");
+            if let Some(events) = events {
+                events.run_changed(&issue.project_id, issue.number);
+            }
+        }
+        Err(e) => {
+            warn!(run = %run.id, error = %e, "could not queue the follow-up run");
+        }
+    }
+}
+
 async fn settle(
     store: &Arc<dyn ProjectStore>,
     events: Option<&Arc<dyn ProjectEvents>>,
@@ -275,6 +335,9 @@ async fn settle(
                 },
             )
             .await;
+            // Only after the row is settled: the per-issue live index would
+            // refuse the follow-up while this run still holds the slot.
+            follow_up_on_comments(store, events, run).await;
         }
         Ok(false) => {}
         Err(e) => {

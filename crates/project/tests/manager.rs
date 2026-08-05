@@ -751,3 +751,110 @@ async fn an_empty_comment_is_refused_rather_than_recorded() {
         "only the opening entry — the refusal wrote nothing"
     );
 }
+
+#[tokio::test]
+async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_not() {
+    // The board's promise: saying something to somebody who is on the job
+    // gets you an agent. Saying something into the backlog gets you a note.
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Wake"))
+        .await
+        .expect("create");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+
+    let parked = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                ..new_issue("Later")
+            },
+        )
+        .await
+        .expect("create parked");
+    f.manager
+        .comment(&project.id, parked.number, IssueActor::User, "some day")
+        .await
+        .expect("comment");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a comment in Backlog wakes nobody"
+    );
+
+    let live = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Todo,
+                assignee: Some(dev.clone()),
+                ..new_issue("Now")
+            },
+        )
+        .await
+        .expect("create live");
+    f.manager
+        .comment(&project.id, live.number, IssueActor::User, "have a look")
+        .await
+        .expect("comment");
+
+    let runs = f.dispatched.lock().clone();
+    assert_eq!(runs.len(), 1, "exactly one run, on the live card");
+    assert_eq!(runs[0].number, live.number);
+    assert_eq!(runs[0].trigger, RunTrigger::Comment);
+    assert_eq!(runs[0].agent_id, dev);
+}
+
+#[tokio::test]
+async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
+    // The queued run assembles its brief when it starts, so it reads this
+    // itself. A second run would be two agents on one card — and the
+    // dedupe index would refuse it, losing the wake entirely.
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Coalesce"))
+        .await
+        .expect("create");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("Working")
+            },
+        )
+        .await
+        .expect("create");
+    // Creating it in In Progress already queued a run.
+    assert_eq!(f.dispatched.lock().len(), 1);
+
+    for text in ["also this", "and this"] {
+        f.manager
+            .comment(&project.id, issue.number, IssueActor::User, text)
+            .await
+            .expect("comment");
+    }
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "two comments on a queued run are still one run"
+    );
+    assert_eq!(
+        f.manager
+            .comment_delivery(&project.id, issue.number)
+            .await
+            .expect("delivery"),
+        baybo_project::CommentDelivery::WaitsForQueuedRun,
+        "and the composer is told exactly that"
+    );
+}

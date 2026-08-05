@@ -602,7 +602,10 @@ pub async fn build_managers(
                 // left while the run was queued is part of what it should
                 // work on.
                 let brief = match store.get_issue(&run.project_id, run.number).await {
-                    Ok(Some(issue)) => issue_brief(&issue),
+                    Ok(Some(issue)) => {
+                        let said = comments_since_previous_run(&store, &run).await;
+                        issue_brief(&issue, &said)
+                    }
                     Ok(None) => {
                         tracing::warn!(run = %run.id, "issue is gone; not running it");
                         return;
@@ -1174,13 +1177,65 @@ pub fn force_exit_watchdog(budget: std::time::Duration) {
     });
 }
 
-/// What an issue's assignee is asked to work on: its title, and its
-/// description when it has one. Assembled here rather than in the router so
-/// the execution path never has to know an issue's shape.
-fn issue_brief(issue: &baybo_store::project::IssueRow) -> String {
-    if issue.description.trim().is_empty() {
+/// What an issue's assignee is asked to work on: its title, its description
+/// when it has one, and anything said on the card since the previous run.
+/// Assembled here rather than in the router so the execution path never has
+/// to know an issue's shape.
+fn issue_brief(issue: &baybo_store::project::IssueRow, said: &[String]) -> String {
+    let mut brief = if issue.description.trim().is_empty() {
         issue.title.clone()
     } else {
         format!("{}\n\n{}", issue.title, issue.description)
+    };
+    if !said.is_empty() {
+        // Last, and labelled: the comments are the newest instruction on
+        // the card, and a reader that treats them as part of the original
+        // description would weight them as background.
+        brief.push_str("\n\nSaid since your last run:\n");
+        for comment in said {
+            brief.push_str(&format!("- {comment}\n"));
+        }
+    }
+    brief
+}
+
+/// Comments left on the card since the previous run started — the delta a
+/// follow-up run is being asked to take account of.
+///
+/// Bounded by the previous run rather than by this one: this run's own row
+/// was written when the comment triggered it, so bounding by its own clock
+/// would filter out the very thing it exists to read. With no previous run
+/// this is every comment, which is right for a first run.
+async fn comments_since_previous_run(
+    store: &Arc<dyn baybo_store::project::ProjectStore>,
+    run: &baybo_store::project::IssueRunRow,
+) -> Vec<String> {
+    let previous = match store.list_runs(&run.issue_id).await {
+        Ok(runs) => runs
+            .into_iter()
+            .filter(|candidate| candidate.id != run.id)
+            .map(|candidate| candidate.created_at)
+            .max(),
+        Err(e) => {
+            tracing::warn!(run = %run.id, error = %e, "could not read prior runs for the brief");
+            return Vec::new();
+        }
+    };
+    let events = match previous {
+        Some(since) => store.events_since(&run.issue_id, since).await,
+        None => store.list_events(&run.issue_id).await,
+    };
+    match events {
+        Ok(events) => events
+            .into_iter()
+            .filter_map(|event| match event.body {
+                baybo_store::project::IssueEventBody::Comment { text } => Some(text),
+                _ => None,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(run = %run.id, error = %e, "could not read comments for the brief");
+            Vec::new()
+        }
     }
 }

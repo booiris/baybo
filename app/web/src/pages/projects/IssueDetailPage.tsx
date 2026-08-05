@@ -54,6 +54,7 @@ const RUN_TRIGGER_LABEL: Record<IssueRun['trigger'], string> = {
   started: 'started',
   assigned: 'assigned',
   retry: 'retry',
+  comment: 'comment',
 };
 
 function RunRow({
@@ -395,6 +396,7 @@ export function IssueDetailPage() {
           <Timeline
             events={events}
             issue={issue}
+            runs={runs}
             busy={saving}
             onComment={(text) => {
               void comment(text);

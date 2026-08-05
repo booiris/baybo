@@ -431,6 +431,8 @@ pub enum RunTrigger {
     Assigned,
     /// A retry of a settled run.
     Retry,
+    /// Somebody commented on live work that nobody was reading.
+    Comment,
 }
 
 impl RunTrigger {
@@ -439,6 +441,7 @@ impl RunTrigger {
             RunTrigger::Started => "started",
             RunTrigger::Assigned => "assigned",
             RunTrigger::Retry => "retry",
+            RunTrigger::Comment => "comment",
         }
     }
 
@@ -447,6 +450,7 @@ impl RunTrigger {
             "started" => Some(RunTrigger::Started),
             "assigned" => Some(RunTrigger::Assigned),
             "retry" => Some(RunTrigger::Retry),
+            "comment" => Some(RunTrigger::Comment),
             _ => None,
         }
     }

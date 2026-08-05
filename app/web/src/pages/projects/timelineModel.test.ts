@@ -70,20 +70,45 @@ describe('actorLabel', () => {
 });
 
 describe('commentHint', () => {
+  // Mirrors `comment_delivery` in crates/project — the same four branches,
+  // asserted here so the two cannot drift silently.
+  const live = [{ status: 'running' as const }];
+  const queued = [{ status: 'queued' as const }];
+  const settled = [{ status: 'done' as const }];
+
   it('says record-only when nobody is on the issue', () => {
-    expect(commentHint({ status: 'in_progress', assignee: null })).toContain('nobody is assigned');
+    expect(commentHint({ status: 'in_progress', assignee: null }, [])).toContain(
+      'nobody is assigned',
+    );
   });
 
-  it('says record-only for parked work even when it has an assignee', () => {
-    expect(commentHint({ status: 'backlog', assignee: 'dev-1' })).toContain('not working on this');
-    expect(commentHint({ status: 'done', assignee: 'dev-1' })).toContain('not working on this');
+  it('says record-only for parked or cancelled work even with an assignee', () => {
+    expect(commentHint({ status: 'backlog', assignee: 'dev-1' }, [])).toContain(
+      'not working on this',
+    );
+    expect(commentHint({ status: 'done', assignee: 'dev-1' }, [])).toContain('not working on this');
+    expect(
+      commentHint({ status: 'in_progress', assignee: 'dev-1', cancelled_at_ms: 1 }, []),
+    ).toContain('cancelled');
   });
 
-  it('does not promise a wake that is not built', () => {
-    // The honest failure here is the expensive one: a person who believes
-    // they are talking to an agent waits for an answer nobody will send.
-    const hint = commentHint({ status: 'in_progress', assignee: 'dev-1' });
-    expect(hint).toContain('not built yet');
+  it('promises a run when the assignee is on live work and nothing is reading', () => {
+    expect(commentHint({ status: 'todo', assignee: 'dev-1' }, [])).toBe(
+      'Starts a run: @dev-1 will read this now.',
+    );
+    // A settled run leaves the issue idle again.
+    expect(commentHint({ status: 'review', assignee: 'dev-1' }, settled)).toContain('Starts a run');
+  });
+
+  it('distinguishes a queued run from one already going', () => {
+    // The two differ in when the comment is read, and that is exactly what
+    // somebody about to press send wants to know.
+    expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, queued)).toContain(
+      'when the queued run starts',
+    );
+    expect(commentHint({ status: 'in_progress', assignee: 'dev-1' }, live)).toContain(
+      'when that run finishes',
+    );
   });
 });
 

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 
 import { Button } from '../../components/Button';
-import type { Issue } from './boardModel';
+import type { Issue, IssueRun } from './boardModel';
 import {
   actorLabel,
   commentHint,
@@ -52,11 +52,13 @@ function Comment({ event, now }: { event: IssueEvent; now: number }) {
 export function Timeline({
   events,
   issue,
+  runs,
   onComment,
   busy,
 }: {
   events: IssueEvent[];
   issue: Issue;
+  runs: IssueRun[];
   onComment: (text: string) => void;
   busy: boolean;
 }) {
@@ -117,7 +119,7 @@ export function Timeline({
           </Button>
           {/* What sending will do, before it is sent — the two outcomes look
               identical in the composer otherwise. */}
-          <span className="font-mono text-[0.66rem] text-ink-soft">{commentHint(issue)}</span>
+          <span className="font-mono text-[0.66rem] text-ink-soft">{commentHint(issue, runs)}</span>
         </div>
       </div>
     </section>

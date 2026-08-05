@@ -1,6 +1,6 @@
 import type { components } from '../../api/schema';
 
-import { COLUMN_LABEL } from './boardModel';
+import { COLUMN_LABEL, type IssueStatus, type RunStatus } from './boardModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
 export type IssueEventBody = components['schemas']['IssueEventBodyDto'];
@@ -62,26 +62,37 @@ export function describeEvent(body: IssueEventBody): string | null {
 /**
  * What sending a comment will do, stated before it is sent.
  *
- * The rule is the spec's: a comment on live work reaches the assignee, a
- * comment on an unassigned issue or on work that is parked only records.
- * The hint exists because those look identical in the composer, and a
- * person who believes they are talking to an agent when they are talking
- * to a log will wait for an answer that is never coming.
+ * A deliberate mirror of `comment_delivery` in `crates/project`: the
+ * composer has to say what will happen *before* the request, so it cannot
+ * ask the server. The two must agree, and the pair of test suites is what
+ * holds them together — if the rule changes on one side, change it here.
  *
- * Delivery itself is not built yet, so today every branch records. The
- * hint says so rather than promising a wake that will not happen.
+ * The hint exists because these outcomes look identical in a text box, and
+ * a person who believes an agent is reading them will wait for an answer
+ * nobody is sending.
  */
-export function commentHint(issue: {
-  status: components['schemas']['IssueDto']['status'];
-  assignee?: string | null;
-}): string {
-  if (issue.assignee == null) {
+export function commentHint(
+  issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
+  runs: { status: RunStatus }[],
+): string {
+  const assignee = issue.assignee;
+  if (assignee == null) {
     return 'Records only — nobody is assigned to this issue yet.';
   }
-  if (issue.status === 'backlog' || issue.status === 'done') {
-    return `Records only — @${issue.assignee} is not working on this right now.`;
+  if (issue.cancelled_at_ms != null) {
+    return 'Records only — this issue is cancelled.';
   }
-  return `Records for now. Waking @${issue.assignee} on comment is not built yet.`;
+  if (issue.status === 'backlog' || issue.status === 'done') {
+    return `Records only — @${assignee} is not working on this right now.`;
+  }
+  const live = runs.find((run) => run.status === 'queued' || run.status === 'running');
+  if (live?.status === 'queued') {
+    return `@${assignee} will read this when the queued run starts.`;
+  }
+  if (live?.status === 'running') {
+    return `@${assignee} is mid-run — this is picked up when that run finishes.`;
+  }
+  return `Starts a run: @${assignee} will read this now.`;
 }
 
 /** Short clock for a timeline row: today shows a time, older shows a date. */
