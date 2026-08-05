@@ -363,6 +363,7 @@ mod background_eligible_tests {
                 origin_session_id: None,
                 conversation,
                 job_title: None,
+                project_id: None,
             },
             None,
         )

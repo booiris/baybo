@@ -8032,6 +8032,13 @@
               "null"
             ]
           },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Point this job at a board: its fires run as that project's lead and\ncan open issues on it. Absent is an ordinary job.\n\nSet once, at creation. Re-pointing a live job is deliberately not\noffered — its past fires filed cards on the old board, so its\nexecution history would describe work on a board it no longer\ntouches."
+          },
           "schedule": {
             "type": "string"
           },

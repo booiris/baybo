@@ -177,6 +177,8 @@ pub struct IssueRow {
     /// starts when every non-cancelled child of stage `N-1` is Done.
     /// Meaningless — and always `0` — on an issue with no parent.
     pub stage: i64,
+    /// What opened this card. See [`NewIssue::source_key`].
+    pub source_key: Option<String>,
     /// The terminal negative. A cancelled issue keeps its row, its number
     /// and its history; it just stops counting as live work.
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -229,6 +231,14 @@ pub struct NewIssue {
     /// The issue this one is a step of, if it is one.
     pub parent_issue_id: Option<IssueId>,
     pub stage: i64,
+    /// What opened this card, for a caller that must not open it twice.
+    ///
+    /// A partial unique index makes one **live** card per key per board
+    /// structural, so a daily job cannot lay down 365 copies of the same
+    /// card — and the key is released when the card is finished or
+    /// cancelled, so next month's occurrence legitimately gets a new one.
+    /// `None` for anything a person or an ordinary run created.
+    pub source_key: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -472,6 +482,15 @@ pub trait ProjectStore: Send + Sync {
         before: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<IssueEventRow>>;
+
+    /// The live card opened under `source_key` on this board, if there is
+    /// one. Mirrors the partial unique index exactly, so a caller that
+    /// checks and a caller that races see the same answer.
+    async fn live_issue_by_source_key(
+        &self,
+        project: &ProjectId,
+        source_key: &str,
+    ) -> Result<Option<IssueRow>>;
 
     /// One issue's direct children, by stage then position.
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>>;

@@ -1038,6 +1038,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
                     origin_session_id: None,
                     conversation,
                     job_title: Some("Morning brief".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -1117,6 +1118,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
             prompt: "brief me".into(),
             timezone: "UTC".into(),
             origin_session_id: None,
+            project_id: None,
         })
         .await
         .expect("create cron job");
@@ -1135,6 +1137,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
                 origin_session_id: None,
                 conversation: true,
                 job_title: Some("the name it was fired under".into()),
+                project_id: None,
             },
         )
         .await
@@ -1213,6 +1216,7 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
                 origin_session_id: None,
                 conversation: true,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -1869,6 +1873,7 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
                     origin_session_id: None,
                     conversation,
                     job_title: Some("Morning brief".into()),
+                    project_id: None,
                 },
             )
             .await
@@ -2076,6 +2081,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
             prompt: "weekly digest".into(),
             timezone: "UTC".into(),
             origin_session_id: None,
+            project_id: None,
         })
         .await
         .expect("create cron job");
@@ -2091,6 +2097,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
                 origin_session_id: None,
                 conversation: true,
                 job_title: Some("Weekly digest".into()),
+                project_id: None,
             },
         )
         .await
@@ -2186,6 +2193,7 @@ async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
         prompt: "brief me".into(),
         timezone: "UTC".into(),
         origin_session_id: None,
+        project_id: None,
     };
 
     // A legacy `http` job (same owner pool as the phone) and a private `tui` job.

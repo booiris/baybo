@@ -119,10 +119,12 @@ async fn every_board_tool_is_scoped_to_its_own_session() {
                 assignee: None,
                 parent: None,
                 stage: 0,
+                source_key: None,
             },
         )
         .await
-        .expect("their issue");
+        .expect("their issue")
+        .into_issue();
 
     let ctx = f.ctx(&mine, &lead);
     // Nothing on the other board is visible…
@@ -587,10 +589,12 @@ mod approvals {
                     assignee: Some(lead.clone()),
                     parent: None,
                     stage: 0,
+                    source_key: None,
                 },
             )
             .await
-            .expect("issue");
+            .expect("issue")
+            .into_issue();
 
         let asked: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let gate = baybo_project::TimelineApprovalGate::new(
@@ -856,4 +860,167 @@ async fn a_parent_row_carries_its_progress_and_open_stages() {
         .expect("the step still in backlog");
     assert_eq!(child["parent"], 1);
     assert_eq!(child["stage"], 1);
+}
+
+/// A scheduled check must not lay down one card per fire.
+mod dedupe {
+    use super::*;
+    use baybo_model::TriggerSource;
+
+    /// A context that looks like a cron fire pointed at a board.
+    fn fire_ctx(
+        f: &Fixture,
+        project: &ProjectId,
+        agent: &baybo_model::AgentProfileId,
+        job: &str,
+    ) -> ToolContext {
+        ToolContext {
+            session_trigger: TriggerSource::Cron {
+                cron_job_id: job.to_owned(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: Some("nightly check".to_owned()),
+                project_id: Some(project.clone()),
+            },
+            agent_id: agent.clone(),
+            workspace_paths: f.paths.clone(),
+            ..ToolContext::for_test()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_daily_check_keeps_one_open_card_without_being_asked() {
+        let f = fixture().await;
+        let (project, lead) = f.open("Nightly").await;
+        let ctx = fire_ctx(&f, &project, &lead, "cj-1");
+
+        // No `key` at all — the naive reminder. Omitting it has to be the
+        // safe behaviour, or the feature ships a footgun as its default.
+        let first = f
+            .call("IssueCreate", &ctx, json!({ "title": "the build is red" }))
+            .await;
+        assert_eq!(first["number"], 1);
+        assert!(first.get("already_open").is_none());
+
+        let second = f
+            .call("IssueCreate", &ctx, json!({ "title": "the build is red" }))
+            .await;
+        assert_eq!(second["number"], 1, "the same card, not a second one");
+        assert_eq!(second["already_open"], true);
+        assert_eq!(
+            f.manager.list_issues(&project).await.expect("issues").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_card_releases_its_key_for_the_next_occurrence() {
+        let f = fixture().await;
+        let (project, lead) = f.open("Recurring").await;
+        let ctx = fire_ctx(&f, &project, &lead, "cj-1");
+        f.call(
+            "IssueCreate",
+            &ctx,
+            json!({ "title": "this month's failure" }),
+        )
+        .await;
+        f.call(
+            "IssueUpdate",
+            &ctx,
+            json!({ "number": 1, "status": "done" }),
+        )
+        .await;
+
+        // Next month's failure is genuinely new work.
+        let next = f
+            .call(
+                "IssueCreate",
+                &ctx,
+                json!({ "title": "next month's failure" }),
+            )
+            .await;
+        assert_eq!(next["number"], 2);
+        assert!(next.get("already_open").is_none());
+
+        // …and cancelling releases it too.
+        f.call(
+            "IssueUpdate",
+            &ctx,
+            json!({ "number": 2, "cancelled": true }),
+        )
+        .await;
+        let third = f
+            .call("IssueCreate", &ctx, json!({ "title": "and again" }))
+            .await;
+        assert_eq!(third["number"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_suffix_lets_one_check_file_several_cards() {
+        let f = fixture().await;
+        let (project, lead) = f.open("Several").await;
+        let ctx = fire_ctx(&f, &project, &lead, "cj-1");
+        for suffix in ["parser", "lexer"] {
+            f.call(
+                "IssueCreate",
+                &ctx,
+                json!({ "title": format!("{suffix} is failing"), "key": suffix }),
+            )
+            .await;
+        }
+        assert_eq!(
+            f.manager.list_issues(&project).await.expect("issues").len(),
+            2
+        );
+        // And each one still dedupes against itself.
+        let again = f
+            .call(
+                "IssueCreate",
+                &ctx,
+                json!({ "title": "parser is failing", "key": "parser" }),
+            )
+            .await;
+        assert_eq!(again["already_open"], true);
+    }
+
+    #[tokio::test]
+    async fn two_jobs_on_one_board_do_not_collide() {
+        let f = fixture().await;
+        let (project, lead) = f.open("Two Jobs").await;
+        // The key is namespaced by job id server-side, so a model cannot
+        // make one job's card block another's — or collide with a card a
+        // person opened.
+        f.call(
+            "IssueCreate",
+            &fire_ctx(&f, &project, &lead, "cj-1"),
+            json!({ "title": "from job one" }),
+        )
+        .await;
+        let second = f
+            .call(
+                "IssueCreate",
+                &fire_ctx(&f, &project, &lead, "cj-2"),
+                json!({ "title": "from job two" }),
+            )
+            .await;
+        assert_eq!(second["number"], 2);
+        assert!(second.get("already_open").is_none());
+    }
+
+    /// An issue run opening a card is doing it once, on purpose. A key
+    /// there would silently refuse the second one.
+    #[tokio::test]
+    async fn an_ordinary_run_gets_no_key_and_so_never_dedupes() {
+        let f = fixture().await;
+        let (project, lead) = f.open("Runs").await;
+        let ctx = f.ctx(&project, &lead);
+        for _ in 0..2 {
+            f.call("IssueCreate", &ctx, json!({ "title": "same title" }))
+                .await;
+        }
+        assert_eq!(
+            f.manager.list_issues(&project).await.expect("issues").len(),
+            2
+        );
+    }
 }

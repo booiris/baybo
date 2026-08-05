@@ -69,20 +69,21 @@ pub fn agent_tools(manager: Arc<ProjectManager>) -> Vec<(Arc<dyn Tool>, ToolMani
 
 /// Which board this call is allowed to touch.
 ///
+/// Reads `project()`, so it covers all three board-scoped sessions — an
+/// issue's run, the lead's planning conversation, and a cron fire pointed
+/// at a board — with one rule and no per-caller branch.
+///
 /// Fails closed. A session with no project has no board these tools could
 /// mean, and the registry already keeps them out of such a session's tool
 /// list — so reaching this branch means the scope check is the only thing
 /// standing between a stray call and somebody else's data.
 fn scope(ctx: &ToolContext) -> Result<ProjectId, ToolError> {
-    ctx.session_trigger
-        .issue()
-        .map(|(project_id, _, _)| project_id.clone())
-        .ok_or_else(|| {
-            ToolError::Execution(
-                "this session does not belong to a project board, so there is no board to act on"
-                    .to_owned(),
-            )
-        })
+    ctx.session_trigger.project().cloned().ok_or_else(|| {
+        ToolError::Execution(
+            "this session does not belong to a project board, so there is no board to act on"
+                .to_owned(),
+        )
+    })
 }
 
 /// Who the timeline records for this call. Always the calling agent — a
@@ -131,6 +132,30 @@ fn handle_of(team: &[baybo_store::AgentProfileRow], id: &AgentProfileId) -> Stri
         // A removed teammate is not on the roster but is still named by the
         // work it did, so the id is the honest answer rather than a blank.
         .unwrap_or_else(|| id.as_str().to_owned())
+}
+
+/// Namespace prefix for a card opened by a cron fire.
+const CRON_SOURCE_KEY_PREFIX: &str = "cron:";
+
+/// Turn a caller-supplied dedupe suffix into the stored key.
+///
+/// The model supplies at most a suffix and the server namespaces it by job
+/// id, so two properties fall out and both matter: a job can neither
+/// collide with another job's cards nor with anything a person opened, and
+/// **omitting the suffix gives the safe behaviour** — one live card per job
+/// — so the naive daily reminder cannot duplicate itself even if the model
+/// never thinks about it.
+///
+/// `None` outside a board-bound cron fire: an issue run opening a card is
+/// doing it once, on purpose, and a key there would silently refuse the
+/// second one.
+fn source_key(ctx: &ToolContext, suffix: Option<&str>) -> Option<String> {
+    let job = ctx.session_trigger.cron_job_id()?;
+    ctx.session_trigger.project()?;
+    Some(match suffix.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(suffix) => format!("{CRON_SOURCE_KEY_PREFIX}{job}:{suffix}"),
+        None => format!("{CRON_SOURCE_KEY_PREFIX}{job}"),
+    })
 }
 
 fn status_schema(description: &str) -> Value {

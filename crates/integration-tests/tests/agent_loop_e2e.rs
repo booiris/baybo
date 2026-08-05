@@ -2547,6 +2547,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         // dispatches out through the channel (what this test asserts on).
         conversation: true,
         job_title: Some("Demo".into()),
+        project_id: None,
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
@@ -2668,6 +2669,7 @@ async fn recurring_fire_that_reports_nothing_notifies_no_one() {
         origin_session_id: None,
         conversation: true,
         job_title: Some("Watcher".into()),
+        project_id: None,
     };
     let fire_session_id = session.id.clone();
 
@@ -2793,6 +2795,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -2820,6 +2823,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -2950,6 +2954,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         )
         .await
@@ -2976,6 +2981,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,
@@ -3099,6 +3105,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
         origin_session_id: None,
         conversation: true,
         job_title: Some("News".into()),
+        project_id: None,
     };
     let session_id = session.id.clone();
     let mut harness = AgentTestHarness::builder().session(session).build();
@@ -3192,6 +3199,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         next_trigger_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        project_id: None,
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
         pinned: false,

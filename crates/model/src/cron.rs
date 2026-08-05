@@ -114,6 +114,15 @@ pub struct CronJob {
     pub next_trigger_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The board this job files work on, if it was pointed at one.
+    ///
+    /// Rides the `data` blob rather than a flat column: it is authored at
+    /// creation and never written by a fire, so it round-trips safely
+    /// through `save_if_unchanged` and survives `record_fire`, which
+    /// stamps only its own four fields onto the stored blob. Nothing
+    /// queries on it, so there is no index to justify a column either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<crate::ProjectId>,
     /// Session where this cron job was created (for traceability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<SessionId>,
@@ -396,6 +405,14 @@ pub struct CronExecution {
     /// lineage plumbing for subagents and maintenance.
     #[serde(default)]
     pub origin_session_id: Option<SessionId>,
+    /// The board this fire files work on, snapshotted from the job.
+    ///
+    /// Snapshotted rather than read live off the job row for the same
+    /// reason `prompt` and `title` are: the boot re-dispatch rebuilds a
+    /// `CronTriggerEvent` from this row alone, and a fire must run against
+    /// the board it was scheduled for even if the job has since changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<crate::ProjectId>,
 
     // ── Delivery ledger (one-shot result → origin conversation) ──
     /// The isolated session this fire ran in. Stamped when the fire's turn
@@ -455,6 +472,7 @@ impl CronExecution {
             channel: job.channel.clone(),
             title: job.title.clone(),
             timezone: job.timezone.clone(),
+            project_id: job.project_id.clone(),
             schedule: job.schedule.clone(),
             prompt: job.prompt.clone(),
             scheduled_fire_time,
@@ -537,6 +555,7 @@ mod tests {
             next_trigger_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
@@ -577,6 +596,7 @@ mod tests {
             schedule: CronSchedule::cron("0 9 * * *"),
             prompt: "push news".to_string(),
             timezone: "Asia/Shanghai".to_string(),
+            project_id: None,
             status: CronStatus::Enabled,
             last_triggered_at: None,
             next_trigger_at: Some(Utc::now()),
@@ -617,6 +637,7 @@ mod tests {
             next_trigger_at: Some(fire_at),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,

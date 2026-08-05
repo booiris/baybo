@@ -40,6 +40,10 @@ struct Params {
     parent: Option<i64>,
     #[serde(default)]
     stage: i64,
+    /// Distinguishes several cards filed by one scheduled check. Ignored
+    /// outside one.
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[async_trait]
@@ -66,6 +70,7 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                 "assignee": { "type": "string", "description": "An `@handle` from this project's team." },
                 "parent": { "type": "integer", "description": "Open it as a step of that issue's number. One level only — a step cannot have steps." },
                 "stage": { "type": "integer", "description": "Which barrier under the parent (default 0). Stage N starts when every step of stage N-1 is done." },
+                "key": { "type": "string", "description": "Only inside a scheduled check: distinguishes several cards this check files. Omit it and the check keeps one open card, which is what you want for a recurring finding." },
             },
             "required": ["title"],
         })
@@ -113,11 +118,20 @@ Putting an issue straight into `in_progress` with an assignee starts that agent 
                     assignee,
                     parent: p.parent,
                     stage: p.stage,
+                    source_key: super::source_key(ctx, p.key.as_deref()),
                 },
             )
             .await
             .map_err(project_err)?;
         let team = self.manager.team(&project).await.map_err(exec_err)?;
-        Ok(ToolOutput::Json(render_issue(&issue, &team)))
+        let mut out = render_issue(issue.issue(), &team);
+        if let (Value::Object(map), false) = (&mut out, issue.was_created()) {
+            // Said rather than silently returning the card: a scheduled
+            // check that files the same finding every day should be told
+            // its card is already open, so it comments instead of
+            // wondering why the number did not move.
+            map.insert("already_open".into(), json!(true));
+        }
+        Ok(ToolOutput::Json(out))
     }
 }

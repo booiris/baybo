@@ -234,6 +234,13 @@ impl Tool for CronCreateTool {
                 prompt: p.prompt,
                 timezone,
                 origin_session_id: Some(origin_session(ctx)),
+                // Inherited from the calling session, never a parameter —
+                // exactly like `origin_session` above, and for the same
+                // reason: a model may no more choose which board a job
+                // files work on than it may choose which board a tool call
+                // touches. A job scheduled from inside a board belongs to
+                // that board; one scheduled from a chat belongs to none.
+                project_id: ctx.session_trigger.project().cloned(),
             })
             .await
             .map_err(cron_tool_error)?;
@@ -777,6 +784,7 @@ mod tests {
                 prompt: "news".to_string(),
                 timezone: "UTC".to_string(),
                 origin_session_id: None,
+                project_id: None,
             })
             .await
             .expect("job creates")
@@ -835,6 +843,7 @@ mod tests {
                 prompt: "news".to_string(),
                 timezone: timezone.to_string(),
                 origin_session_id: None,
+                project_id: None,
             })
             .await
             .expect("job creates")
@@ -1094,6 +1103,7 @@ mod tests {
                 origin_session_id: Some("sess-user".into()),
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "sess-user");
@@ -1114,6 +1124,7 @@ mod tests {
                 origin_session_id: Some("sess-somewhere-else".into()),
                 conversation: true,
                 job_title: Some("Daily news".into()),
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-daily-news");
@@ -1131,6 +1142,7 @@ mod tests {
                 origin_session_id: None,
                 conversation: false,
                 job_title: None,
+                project_id: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-fire-2");

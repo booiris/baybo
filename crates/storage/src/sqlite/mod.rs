@@ -319,6 +319,11 @@ const ADD_COLUMNS: &[AddColumn] = &[
     },
     AddColumn {
         table: "issues",
+        column: "source_key",
+        definition: "TEXT",
+    },
+    AddColumn {
+        table: "issues",
         column: "branch",
         definition: "TEXT",
     },
@@ -1356,6 +1361,10 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- meaningless on a top-level issue.
                     parent_issue_id TEXT,
                     stage          INTEGER NOT NULL DEFAULT 0,
+                    -- What opened this card, for callers that must not open
+                    -- it twice. Namespaced server-side; NULL for anything a
+                    -- person or an ordinary run created.
+                    source_key     TEXT,
                     -- The branch this issue's work landed on. NULL until it
                     -- has a commit: worktree and branch are separate ideas,
                     -- and a research issue that produced a report and no
@@ -1478,6 +1487,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
              ON issue_runs(project_id, session_id) WHERE session_id IS NOT NULL;
          -- Serves the stage barrier and the card's progress ring: one
          -- parent's children, in stage order.
+         -- One LIVE card per key per board. The card leaves the index when
+         -- it is finished or cancelled, which is the whole design: this
+         -- month's build failure gets a fresh card, and this month's does
+         -- not get thirty.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_source_key
+             ON issues(project_id, source_key)
+             WHERE source_key IS NOT NULL AND cancelled_at IS NULL AND status <> 'done';
          CREATE INDEX IF NOT EXISTS idx_issues_children
              ON issues(parent_issue_id, stage, position)
              WHERE parent_issue_id IS NOT NULL;",

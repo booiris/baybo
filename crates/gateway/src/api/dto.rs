@@ -469,6 +469,15 @@ pub struct CreateCronRequest {
     pub timezone: String,
     #[serde(default)]
     pub origin_session_id: Option<String>,
+    /// Point this job at a board: its fires run as that project's lead and
+    /// can open issues on it. Absent is an ordinary job.
+    ///
+    /// Set once, at creation. Re-pointing a live job is deliberately not
+    /// offered — its past fires filed cards on the old board, so its
+    /// execution history would describe work on a board it no longer
+    /// touches.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.

@@ -102,6 +102,7 @@ mod tests {
             branch: None,
             parent_issue_id: Some(IssueId::generate()),
             stage,
+            source_key: None,
             cancelled_at: cancelled.then_some(now),
             created_at: now,
             updated_at: now,

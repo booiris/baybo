@@ -428,6 +428,7 @@ mod tests {
             origin_session_id: None,
             conversation,
             job_title: None,
+            project_id: None,
         };
 
         // A recurring fire (its own conversation) sees it; an ordinary session
@@ -500,6 +501,7 @@ mod tests {
             origin_session_id: None,
             conversation: true,
             job_title: None,
+            project_id: None,
         }));
     }
 }

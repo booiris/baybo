@@ -2094,6 +2094,16 @@ export interface components {
         CreateCronRequest: {
             channel?: null | components["schemas"]["ChannelType"];
             origin_session_id?: string | null;
+            /**
+             * @description Point this job at a board: its fires run as that project's lead and
+             *     can open issues on it. Absent is an ordinary job.
+             *
+             *     Set once, at creation. Re-pointing a live job is deliberately not
+             *     offered — its past fires filed cards on the old board, so its
+             *     execution history would describe work on a board it no longer
+             *     touches.
+             */
+            project_id?: string | null;
             schedule: string;
             text: string;
             /**

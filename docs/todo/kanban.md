@@ -528,45 +528,36 @@ announces which of these will happen before sending.
      from that set always reads as an idle team. Nothing ranks or promotes:
      auto-ordering and auto-promotion are both forbidden above.
 
-   - **Cron→issue creation.** ❌ **Designed, not built.** The design is
-     sound and anchor-checked; it is simply six crates wide. Its shape:
+   - **Cron→issue creation.** ✅ A job can be pointed at a board
+     (`project_id` on the job, riding the `data` blob), the execution
+     snapshots it so the boot re-dispatch rebuilds a bound fire, and the
+     fire's `TriggerSource::Cron` carries it. `project()` — not `issue()`,
+     not `is_project_session()` — is what makes the board's tools visible
+     and scoped, so a bound fire stays an ordinary cron conversation:
+     listed, pushable, and still able to call `report_nothing`. The fire
+     runs as the board's **lead**, or its cards would be signed with a raw
+     ULID and written into the wrong memory partition.
 
-     1. `TriggerSource::Cron` gains `project_id: Option<ProjectId>`
-        (serde-default, so no migration), plus a **new** `project()`
-        accessor covering both `Issue` and bound `Cron`.
-        `ToolTriggerScope::ProjectBoard` and `tools::scope()` then read
-        `project()` — the board still comes from the session trigger, so no
-        tool gains a `project_id` parameter and the Phase 4 security
-        property is untouched. Do **not** widen `issue()` (the approval
-        gate resolves a *card* through it) or `is_project_session()` (it is
-        what keeps a session out of the chat list and out of push — a bound
-        fire's conversation must stay listed and pushable).
-     2. The binding rides the `data` blob on `cron_jobs`, is snapshotted
-        onto `CronExecution` (so the boot re-dispatch rebuilds it), and is
-        stamped onto the fire's trigger at mint. The fire binds to the
-        project's **lead**, or its timeline entries render as raw ULIDs and
-        it runs on the wrong persona and memory partition.
-     3. `issues.source_key` plus a partial unique index on
-        `(project_id, source_key) WHERE source_key IS NOT NULL AND
-        cancelled_at IS NULL AND status <> 'done'` is the structural answer
-        to "a daily job opens 365 identical cards" — and the card leaves the
-        index when it is finished, so next month's failure gets a fresh one.
-        `IssueCreate` takes at most a *suffix* and the server namespaces it
-        by job id; **omitting it gives the safe behaviour**, so the naive
-        reminder cannot duplicate itself.
-     4. `CronCreate` gains no `project_id`: it inherits from the calling
-        session like `origin_session` does, so an issue run cannot schedule
-        work onto a neighbouring board. Only the operator names a board, on
-        `POST /v1/cron`, validated in the handler rather than by growing a
-        `ProjectStore` dependency inside `baybo-cron`.
+     `issues.source_key` under a partial unique index
+     (`WHERE source_key IS NOT NULL AND cancelled_at IS NULL AND status <>
+     'done'`) is the structural answer to "a daily job opens 365 identical
+     cards": one live card per key per board, and the key is released when
+     the card is finished or cancelled, so next month's occurrence gets a
+     fresh one. `IssueCreate` takes at most a *suffix* and the server
+     namespaces it by job id — so a job can collide with neither another
+     job nor anything a person opened, and **omitting it gives the safe
+     behaviour**, which is what stops the naive reminder duplicating
+     itself. `CronCreate` inherits its board from the calling session like
+     `origin_session` does, so an issue run cannot schedule work onto a
+     neighbouring board; only `POST /v1/cron` names one, validated in the
+     handler rather than by growing `baybo-cron` a `ProjectStore`.
 
-     Two things the review said to drop from the original design: the
-     archived-board check at mint (`writable_project` already refuses every
-     board write with a readable error, and the router's `project_store` is
-     `Option` and `None` in the TUI runtime) and the standing-card lookup at
-     mint (same dependency, and the dedupe already reports the existing card
-     one tool call later). Rebinding a job to a different board is refused
-     on purpose: its past fires filed cards on the old board.
+     Not done, deliberately: a board-naming line in the fire's prompt
+     framing (the tools are board-scoped, so the fire discovers its board
+     through `IssueList` and needs no framing to find it), and re-pointing
+     a live job at a different board (its past fires filed cards on the old
+     one, so its execution history would describe work on a board it no
+     longer touches).
 
 ## Defaults chosen without a grill question (veto anytime)
 

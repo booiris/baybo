@@ -917,11 +917,18 @@ async fn create_issue(
                 assignee: parse_assignee(req.assignee)?,
                 parent: req.parent,
                 stage: req.stage.unwrap_or(0),
+                // The operator opening a card is opening it once, on
+                // purpose. Dedupe keys are namespaced per scheduled job and
+                // exist only there.
+                source_key: None,
             },
         )
         .await
         .map_err(project_err)?;
-    Ok((StatusCode::CREATED, Json(on_board(&state, &id, row).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(on_board(&state, &id, row.into_issue()).await?),
+    ))
 }
 
 #[utoipa::path(

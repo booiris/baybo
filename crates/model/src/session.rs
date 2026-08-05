@@ -129,6 +129,18 @@ pub enum TriggerSource {
         /// before it existed; those group only while their turn is alive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
+        /// The board this fire files work on, snapshotted from the job.
+        ///
+        /// Serde-defaulted like `conversation`, so every session row
+        /// persisted before this existed deserializes unbound with no
+        /// migration. It is what makes the board's tools visible to the
+        /// fire (see [`Self::project`]) and — unlike a planning
+        /// conversation — it deliberately does **not** make the session a
+        /// project session: a bound fire is still an ordinary cron
+        /// conversation, so it stays listed, pushable, and able to call
+        /// `report_nothing`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<crate::ProjectId>,
     },
     /// The lead's planning conversation for one board.
     ///
@@ -175,7 +187,8 @@ impl TriggerSource {
             TriggerSource::Project { project_id } | TriggerSource::Issue { project_id, .. } => {
                 Some(project_id)
             }
-            _ => None,
+            TriggerSource::Cron { project_id, .. } => project_id.as_ref(),
+            TriggerSource::User => None,
         }
     }
 
@@ -943,6 +956,7 @@ mod tests {
             origin_session_id: Some(SessionId::from("sess-origin")),
             conversation: true,
             job_title: Some("Morning brief".into()),
+            project_id: None,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();
@@ -983,6 +997,7 @@ mod tests {
             origin_session_id: None,
             conversation: true,
             job_title: Some("每日晨报".into()),
+            project_id: None,
         };
         let back: TriggerSource =
             serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();

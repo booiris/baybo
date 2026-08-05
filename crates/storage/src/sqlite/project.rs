@@ -84,8 +84,8 @@ const PROJECT_COLUMNS: &str = "id, name, description, workdir, daily_budget_micr
      archived_at, created_at, updated_at";
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
-     assignee, position, blocked_reason, branch, parent_issue_id, stage, cancelled_at, \
-     created_at, updated_at";
+     assignee, position, blocked_reason, branch, parent_issue_id, stage, source_key, \
+     cancelled_at, created_at, updated_at";
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
      status, attempt, error, created_at, started_at, settled_at";
@@ -190,6 +190,7 @@ type RawIssue = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
     Option<i64>,
     i64,
     i64,
@@ -226,6 +227,7 @@ fn read_raw_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawIssue> {
         row.get(13)?,
         row.get(14)?,
         row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -273,6 +275,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         branch,
         parent_issue_id,
         stage,
+        source_key,
         cancelled_at,
         created_at,
         updated_at,
@@ -299,6 +302,7 @@ fn issue_from_raw(raw: RawIssue) -> Result<IssueRow> {
         branch,
         parent_issue_id: parent_issue_id.map(IssueId::from),
         stage,
+        source_key,
         cancelled_at: ts_opt("issues.cancelled_at", cancelled_at)?,
         created_at: ts("issues.created_at", created_at)?,
         updated_at: ts("issues.updated_at", updated_at)?,
@@ -491,6 +495,7 @@ impl ProjectStore for SqliteProjectStore {
             .as_ref()
             .map(|id| id.as_str().to_string());
         let stage = new.stage;
+        let source_key = new.source_key.clone();
         let created_at = super::time::to_us(new.created_at);
         let raw = self
             .pool
@@ -515,8 +520,9 @@ impl ProjectStore for SqliteProjectStore {
                 tx.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, \
                      priority, assignee, position, blocked_reason, parent_issue_id, stage, \
-                     cancelled_at, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, NULL, ?12, ?12)",
+                     source_key, cancelled_at, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?13, NULL, \
+                             ?12, ?12)",
                     rusqlite::params![
                         id,
                         project,
@@ -529,7 +535,8 @@ impl ProjectStore for SqliteProjectStore {
                         position,
                         parent_issue_id,
                         stage,
-                        created_at
+                        created_at,
+                        source_key
                     ],
                 )?;
                 let raw = tx.query_row(
@@ -764,6 +771,37 @@ impl ProjectStore for SqliteProjectStore {
             })
             .await?;
         raws.into_iter().map(event_from_raw).collect()
+    }
+
+    async fn live_issue_by_source_key(
+        &self,
+        project: &ProjectId,
+        source_key: &str,
+    ) -> Result<Option<IssueRow>> {
+        let project = project.as_str().to_string();
+        let source_key = source_key.to_string();
+        let done = IssueStatus::Done.as_str();
+        let raw = self
+            .pool
+            .interact("issues.by_source_key", move |conn| {
+                // The WHERE clause mirrors `idx_issues_source_key` exactly.
+                // A check that admitted a finished card would report a
+                // duplicate the index would happily allow, which is worse
+                // than no check: the caller would decline to open work.
+                Ok(conn
+                    .query_row(
+                        &format!(
+                            "SELECT {ISSUE_COLUMNS} FROM issues \
+                             WHERE project_id = ?1 AND source_key = ?2 \
+                               AND cancelled_at IS NULL AND status <> ?3"
+                        ),
+                        rusqlite::params![project, source_key, done],
+                        read_raw_issue,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        raw.map(issue_from_raw).transpose()
     }
 
     async fn list_children(&self, parent: &IssueId) -> Result<Vec<IssueRow>> {
@@ -1207,6 +1245,7 @@ mod tests {
             assignee: None,
             parent_issue_id: None,
             stage: 0,
+            source_key: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -1829,6 +1868,7 @@ mod tests {
             assignee: Some(AgentProfileId::parse("dev-1").unwrap()),
             parent_issue_id: None,
             stage: 0,
+            source_key: None,
             created_at: chrono::Utc::now(),
         };
         let ours = store.create_issue(&issue(&mine, "ours")).await.unwrap();

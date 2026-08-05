@@ -116,6 +116,7 @@ fn new_issue(title: &str) -> NewIssueRequest {
         assignee: None,
         parent: None,
         stage: 0,
+        source_key: None,
     }
 }
 
@@ -234,7 +235,8 @@ async fn the_lead_can_be_assigned_work() {
             },
         )
         .await
-        .expect("the lead can take work");
+        .expect("the lead can take work")
+        .into_issue();
     assert_eq!(issue.assignee, Some(lead));
     assert_eq!(f.dispatched.lock().len(), 1, "and starting it runs");
 }
@@ -435,7 +437,8 @@ async fn the_lead_cannot_be_removed_and_neither_can_a_busy_agent() {
             },
         )
         .await
-        .expect("start work");
+        .expect("start work")
+        .into_issue();
 
     let refused = f
         .manager
@@ -670,7 +673,8 @@ async fn an_archived_project_is_read_only() {
     f.manager
         .create_issue(&project.id, IssueActor::User, new_issue("before"))
         .await
-        .expect("create issue");
+        .expect("create issue")
+        .into_issue();
     f.manager
         .set_project_archived(&project.id, true)
         .await
@@ -709,7 +713,8 @@ async fn an_archived_project_is_read_only() {
     f.manager
         .create_issue(&project.id, IssueActor::User, new_issue("after restore"))
         .await
-        .expect("writable again");
+        .expect("writable again")
+        .into_issue();
 }
 
 #[tokio::test]
@@ -720,7 +725,8 @@ async fn issues_answer_only_within_their_own_project() {
     f.manager
         .create_issue(&a.id, IssueActor::User, new_issue("a's first"))
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
 
     // Both projects have a #1, and each one only has its own.
     let refused = f
@@ -746,7 +752,8 @@ async fn a_patch_that_sets_nothing_is_refused() {
     f.manager
         .create_issue(&p.id, IssueActor::User, new_issue("something"))
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
 
     let refused = f
         .manager
@@ -780,7 +787,8 @@ async fn a_move_must_name_the_issue_it_moves() {
         f.manager
             .create_issue(&p.id, IssueActor::User, new_issue(title))
             .await
-            .expect("issue");
+            .expect("issue")
+            .into_issue();
     }
 
     // `ordered_numbers` is the destination column's new contents, so a list
@@ -809,7 +817,8 @@ async fn in_progress_needs_somebody_on_it() {
     f.manager
         .create_issue(&p.id, IssueActor::User, new_issue("unclaimed"))
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
 
     // The board would otherwise claim work is under way that nobody is doing.
     let refused = f
@@ -1012,7 +1021,8 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
             },
         )
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
     assert!(
         f.dispatched.lock().is_empty(),
         "an issue created in the backlog starts nothing"
@@ -1068,7 +1078,8 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
             },
         )
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
     assert_eq!(
         f.dispatched.lock().len(),
         1,
@@ -1114,7 +1125,8 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
             },
         )
         .await
-        .expect("issue");
+        .expect("issue")
+        .into_issue();
     f.dispatched.lock().clear();
 
     // Nothing settled the run — the process died. Boot finds it.
@@ -1142,7 +1154,8 @@ async fn the_board_writes_its_own_history() {
         .manager
         .create_issue(&project.id, IssueActor::User, new_issue("Wire it"))
         .await
-        .expect("create issue");
+        .expect("create issue")
+        .into_issue();
     f.manager
         .update_issue(
             &project.id,
@@ -1207,7 +1220,8 @@ async fn an_empty_comment_is_refused_rather_than_recorded() {
         .manager
         .create_issue(&project.id, IssueActor::User, new_issue("Nothing to say"))
         .await
-        .expect("create issue");
+        .expect("create issue")
+        .into_issue();
 
     let err = f
         .manager
@@ -1249,7 +1263,8 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
             },
         )
         .await
-        .expect("create parked");
+        .expect("create parked")
+        .into_issue();
     f.manager
         .comment(&project.id, parked.number, IssueActor::User, "some day")
         .await
@@ -1271,7 +1286,8 @@ async fn a_comment_on_live_work_starts_a_run_and_a_comment_on_parked_work_does_n
             },
         )
         .await
-        .expect("create live");
+        .expect("create live")
+        .into_issue();
     f.manager
         .comment(&project.id, live.number, IssueActor::User, "have a look")
         .await
@@ -1308,7 +1324,8 @@ async fn a_comment_while_a_run_is_queued_does_not_start_a_second() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     // Creating it in In Progress already queued a run.
     assert_eq!(f.dispatched.lock().len(), 1);
 
@@ -1348,7 +1365,8 @@ async fn finishing_an_issue_gives_its_worktree_back_and_says_so() {
         .manager
         .create_issue(&project.id, IssueActor::User, new_issue("Do it"))
         .await
-        .expect("create issue");
+        .expect("create issue")
+        .into_issue();
 
     let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
     let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
@@ -1398,7 +1416,8 @@ async fn a_worktree_holding_uncommitted_work_survives_being_finished() {
         .manager
         .create_issue(&project.id, IssueActor::User, new_issue("Half done"))
         .await
-        .expect("create issue");
+        .expect("create issue")
+        .into_issue();
     let root = baybo_project::worktree::worktree_root(&f.paths, &project.id, issue.number);
     let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
     baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch)
@@ -1463,7 +1482,8 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
 
     assert!(
         f.dispatched.lock().is_empty(),
@@ -1517,7 +1537,8 @@ async fn a_raised_budget_releases_what_it_was_holding() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     assert!(f.dispatched.lock().is_empty());
 
     f.manager
@@ -1606,7 +1627,8 @@ async fn the_boot_sweep_leaves_a_hold_held_while_the_board_is_still_broke() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     f.dispatched.lock().clear();
 
     let resumed = f.manager.resume_unsettled_runs().await.expect("sweep");
@@ -1638,7 +1660,8 @@ async fn a_board_with_no_ceiling_is_never_held() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     assert_eq!(f.dispatched.lock().len(), 1);
     assert_eq!(
         f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
@@ -1670,7 +1693,8 @@ async fn finishing_a_stage_wakes_the_parent_once() {
             },
         )
         .await
-        .expect("parent");
+        .expect("parent")
+        .into_issue();
     for (title, stage) in [("design", 0), ("review the design", 0), ("build", 1)] {
         f.manager
             .create_issue(
@@ -1683,7 +1707,8 @@ async fn finishing_a_stage_wakes_the_parent_once() {
                 },
             )
             .await
-            .unwrap_or_else(|e| panic!("{title}: {e}"));
+            .unwrap_or_else(|e| panic!("{title}: {e}"))
+            .into_issue();
     }
     f.dispatched.lock().clear();
 
@@ -1770,7 +1795,8 @@ async fn a_cancelled_step_opens_its_stage() {
             },
         )
         .await
-        .expect("parent");
+        .expect("parent")
+        .into_issue();
     for title in ["will happen", "will not"] {
         f.manager
             .create_issue(
@@ -1783,7 +1809,8 @@ async fn a_cancelled_step_opens_its_stage() {
                 },
             )
             .await
-            .expect("child");
+            .expect("child")
+            .into_issue();
     }
     f.manager
         .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
@@ -1820,7 +1847,8 @@ async fn sub_issues_do_not_nest() {
         .manager
         .create_issue(&p.id, IssueActor::User, new_issue("parent"))
         .await
-        .expect("parent");
+        .expect("parent")
+        .into_issue();
     let child = f
         .manager
         .create_issue(
@@ -1832,7 +1860,8 @@ async fn sub_issues_do_not_nest() {
             },
         )
         .await
-        .expect("child");
+        .expect("child")
+        .into_issue();
 
     // A step cannot be given steps.
     let refused = f
@@ -1911,11 +1940,13 @@ async fn a_parent_from_another_board_does_not_resolve() {
         .manager
         .create_issue(&theirs.id, IssueActor::User, new_issue("their card"))
         .await
-        .expect("their issue");
+        .expect("their issue")
+        .into_issue();
     f.manager
         .create_issue(&mine.id, IssueActor::User, new_issue("my card"))
         .await
-        .expect("my issue");
+        .expect("my issue")
+        .into_issue();
 
     let refused = f
         .manager
@@ -1955,7 +1986,8 @@ async fn a_move_must_name_its_whole_destination_column() {
         f.manager
             .create_issue(&p.id, IssueActor::User, new_issue(title))
             .await
-            .expect("issue");
+            .expect("issue")
+            .into_issue();
     }
     // #2 is cancelled — still in Backlog, still holding rank 1, and exactly
     // the kind of card a board hides.
@@ -2031,7 +2063,8 @@ async fn a_cross_column_move_names_the_destination_plus_the_card() {
         f.manager
             .create_issue(&p.id, IssueActor::User, new_issue(title))
             .await
-            .expect("issue");
+            .expect("issue")
+            .into_issue();
     }
     f.manager
         .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
@@ -2093,7 +2126,8 @@ async fn the_attention_count_is_what_only_the_operator_can_clear() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     let counts = f.manager.attention(&[]).await.expect("attention");
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].1.held, 1);
@@ -2141,7 +2175,8 @@ async fn a_failed_run_stops_counting_once_somebody_acts_on_it() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
         .id
         .clone();
@@ -2227,7 +2262,8 @@ async fn an_archived_board_asks_for_nothing() {
             },
         )
         .await
-        .expect("create");
+        .expect("create")
+        .into_issue();
     assert_eq!(f.manager.attention(&[]).await.expect("attention").len(), 1);
 
     f.manager

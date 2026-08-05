@@ -119,6 +119,43 @@ pub struct NewIssueRequest {
     pub parent: Option<i64>,
     /// Which barrier under that parent. Ignored without a parent.
     pub stage: i64,
+    /// What is opening this card, for a caller that must not open it
+    /// twice. See [`Opened`].
+    pub source_key: Option<String>,
+}
+
+/// What happened when a card was opened.
+///
+/// An enum rather than a bool or a second method: a caller that passes no
+/// `source_key` can never see `AlreadyOpen`, but the compiler still makes
+/// every call site say what it does with it — which is the point, because
+/// the two outcomes read identically in a log line.
+#[derive(Debug, Clone)]
+pub enum Opened {
+    Created(IssueRow),
+    /// A live card already exists under this key. Nothing was written: no
+    /// row, no timeline entry, no run. A daily check must not lay 365
+    /// "already open" notes on one card.
+    AlreadyOpen(IssueRow),
+}
+
+impl Opened {
+    /// The card, however it was arrived at.
+    pub fn issue(&self) -> &IssueRow {
+        match self {
+            Opened::Created(issue) | Opened::AlreadyOpen(issue) => issue,
+        }
+    }
+
+    pub fn into_issue(self) -> IssueRow {
+        match self {
+            Opened::Created(issue) | Opened::AlreadyOpen(issue) => issue,
+        }
+    }
+
+    pub fn was_created(&self) -> bool {
+        matches!(self, Opened::Created(_))
+    }
 }
 
 pub struct ProjectManager {
@@ -948,7 +985,7 @@ impl ProjectManager {
         project: &ProjectId,
         actor: IssueActor,
         new: NewIssueRequest,
-    ) -> Result<IssueRow> {
+    ) -> Result<Opened> {
         self.writable_project(project).await?;
         let title = validate_issue_title(&new.title)?;
         if let Some(assignee) = new.assignee.as_ref() {
@@ -959,6 +996,16 @@ impl ProjectManager {
             Some(number) => Some(self.validate_parent(project, number, None).await?),
             None => None,
         };
+        // Checked before the write and enforced by the index behind it. The
+        // check alone would race; the index alone would surface as an
+        // opaque conflict the caller could not distinguish from a real
+        // failure. Both, so the common case answers with the standing card
+        // and a race still cannot produce two.
+        if let Some(key) = new.source_key.as_deref()
+            && let Some(standing) = self.store.live_issue_by_source_key(project, key).await?
+        {
+            return Ok(Opened::AlreadyOpen(standing));
+        }
         let issue = self
             .store
             .create_issue(&NewIssue {
@@ -971,9 +1018,17 @@ impl ProjectManager {
                 assignee: new.assignee,
                 parent_issue_id: parent.as_ref().map(|p| p.id.clone()),
                 stage: if parent.is_some() { new.stage } else { 0 },
+                source_key: new.source_key,
                 created_at: chrono::Utc::now(),
             })
-            .await?;
+            .await
+            .map_err(|e| match e {
+                // The index won a race with the check above. Reporting the
+                // standing card is the same answer the check would have
+                // given a moment earlier.
+                baybo_store::StorageError::Conflict(reason) => ProjectError::Conflict(reason),
+                other => other.into(),
+            })?;
         self.events.board_changed(project, Some(issue.number));
         self.record(&issue, actor.clone(), IssueEventBody::Opened)
             .await;
@@ -990,7 +1045,7 @@ impl ProjectManager {
         }
         self.dispatch_if_triggered(Transition::created(&issue), &issue)
             .await;
-        Ok(issue)
+        Ok(Opened::Created(issue))
     }
 
     pub async fn update_issue(

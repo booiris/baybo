@@ -112,6 +112,23 @@ async fn create_cron(
     State(state): State<AdminState>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJob>)> {
+    // Validated here rather than inside `baybo-cron`: this is the only
+    // caller that can name a board (the tool inherits its own), so giving
+    // the cron crate a `ProjectStore` dependency would be paying for a
+    // check exactly one path needs.
+    let project_id = match req.project_id.as_deref() {
+        None => None,
+        Some(raw) => {
+            let id = baybo_model::ProjectId::parse(raw)
+                .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+            state
+                .project_manager
+                .get_project(&id)
+                .await
+                .map_err(|_| GatewayError::NotFound(format!("project {id}")))?;
+            Some(id)
+        }
+    };
     let schedule = CronSchedule::cron(&req.schedule);
     let channel: ChannelTypeModel = req
         .channel
@@ -127,6 +144,7 @@ async fn create_cron(
             prompt: req.text,
             timezone: req.timezone,
             origin_session_id: req.origin_session_id.map(Into::into),
+            project_id,
         })
         .await
         .map_err(cron_err)?;

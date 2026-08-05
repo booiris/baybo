@@ -3673,6 +3673,7 @@ mod session_end_gate_tests {
                 origin_session_id: None,
                 conversation: true,
                 job_title: None,
+                project_id: None,
             },
             None,
         );

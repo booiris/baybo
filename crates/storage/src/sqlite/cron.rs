@@ -820,6 +820,7 @@ mod tests {
             next_trigger_at: Some(future_dt()),
             created_at: now,
             updated_at: now,
+            project_id: None,
             origin_session_id: None,
             deleted_at: None,
             pinned: false,
