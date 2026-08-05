@@ -107,6 +107,11 @@ pub enum AgentMessage {
         run_id: baybo_model::IssueRunId,
         number: i64,
         brief: String,
+        /// The worktree cut for this issue. Carried to the model because
+        /// the Bash tool's description is rendered once per process and
+        /// names the workspace work dir — nothing else would tell the run
+        /// where it actually is.
+        checkout: String,
     },
     /// A one-shot cron fire finished, and its result belongs in **this**
     /// conversation (the one that scheduled the turn). Handled at a turn
@@ -481,9 +486,13 @@ impl AgentActor {
                 run_id,
                 number,
                 brief,
+                checkout,
             } => {
                 debug!(session_id = %session_id, %run_id, number, "received issue run");
-                if let Err(e) = self.dispatch_issue_run(&run_id, number, &brief).await {
+                if let Err(e) = self
+                    .dispatch_issue_run(&run_id, number, &brief, &checkout)
+                    .await
+                {
                     // A cancelled run is not a failed one — the operator
                     // asked for it to stop, and the waiter records that.
                     if is_turn_cancelled(&e) {
@@ -673,6 +682,7 @@ impl AgentActor {
         run_id: &baybo_model::IssueRunId,
         number: i64,
         brief: &str,
+        checkout: &str,
     ) -> anyhow::Result<()> {
         let turn_input = TurnInput::IssueRun {
             run_id: run_id.clone(),
@@ -680,7 +690,7 @@ impl AgentActor {
         };
         self.volatile
             .agent_loop
-            .append_issue_brief(number, brief)
+            .append_issue_brief(number, checkout, brief)
             .await?;
         self.run_agent_loop(turn_input, None, None, None, None, None)
             .await?;

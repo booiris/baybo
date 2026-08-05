@@ -13,7 +13,7 @@
 //! own. And nothing is dispatched to a channel: an issue's audience is its
 //! card.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use baybo_model::{
@@ -88,18 +88,21 @@ impl Router {
         // the card, which is the only place anybody would look — an agent
         // handed a session with nowhere to work would instead spend a turn
         // discovering that for itself.
-        if let Err(e) = self.prepare_checkout(&event).await {
-            warn!(%run_id, error = %e, "could not open the issue's checkout");
-            settle(
-                &store,
-                self.project_events.as_ref(),
-                &event.run,
-                RunStatus::Failed,
-                Some(&e.to_string()),
-            )
-            .await;
-            return;
-        }
+        let checkout = match self.prepare_checkout(&event).await {
+            Ok(root) => root,
+            Err(e) => {
+                warn!(%run_id, error = %e, "could not open the issue's checkout");
+                settle(
+                    &store,
+                    self.project_events.as_ref(),
+                    &event.run,
+                    RunStatus::Failed,
+                    Some(&e.to_string()),
+                )
+                .await;
+                return;
+            }
+        };
 
         // Subscribed before the trigger is sent, and this is load-bearing:
         // the terminal event is published from inside the run's own turn, so
@@ -128,6 +131,7 @@ impl Router {
             run_id: run_id.clone(),
             number: event.run.number,
             brief: event.brief.clone(),
+            checkout: checkout.to_string_lossy().into_owned(),
         };
         match mailbox.send(trigger).await {
             Ok(()) => {
@@ -154,7 +158,7 @@ impl Router {
     /// Idempotent, so a retry or a boot-swept run re-enters the tree the
     /// last attempt left rather than starting from a clean one — half-done
     /// work belongs to the card, not to the attempt.
-    async fn prepare_checkout(&self, event: &IssueRunEvent) -> anyhow::Result<()> {
+    async fn prepare_checkout(&self, event: &IssueRunEvent) -> anyhow::Result<PathBuf> {
         let store = self
             .project_store
             .as_ref()
@@ -171,7 +175,8 @@ impl Router {
         let root = worktree::worktree_root(&self.workspace, project_id, issue.number);
         let branch = worktree::branch_name(issue.number, &issue.title);
         worktree::ensure(Path::new(&project.workdir), &root, &branch).await?;
-        Ok(())
+        worktree::ensure_commit_identity(&self.workspace.work_dir()).await?;
+        Ok(root)
     }
 
     /// The issue's session — reused across its runs, minted on the first.

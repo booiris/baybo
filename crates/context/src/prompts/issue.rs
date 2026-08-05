@@ -17,9 +17,28 @@ decide."#;
 
 const INSTRUCTION_LABEL: &str = "The issue:";
 
+/// Where the run works, stated because nothing else tells it.
+///
+/// The Bash tool's description is rendered once at construction and names
+/// the workspace work directory for every session — it structurally cannot
+/// mention a per-run checkout. So without this the model is told its
+/// commands land somewhere they do not, and would reasonably `cd` its way
+/// out of the tree that was cut for it.
+const CHECKOUT_BODY: &str = r#"Your checkout for this issue is:
+
+  {{checkout}}
+
+Commands run there by default and your branch is already checked out, so
+work in place: no `cd`, and no clone. Other issues have their own
+checkouts of the same repository — treat anything outside this one as
+somebody else's."#;
+
 /// Frame an issue's brief for the run that will execute it.
-pub fn frame_issue_brief(number: i64, brief: &str) -> String {
-    format!("{ISSUE_TAG_PREFIX}{number}] {FRAMING_BODY}\n\n{INSTRUCTION_LABEL}\n{brief}")
+pub fn frame_issue_brief(number: i64, checkout: &str, brief: &str) -> String {
+    let where_it_works = CHECKOUT_BODY.replace("{{checkout}}", checkout);
+    format!(
+        "{ISSUE_TAG_PREFIX}{number}] {FRAMING_BODY}\n\n{where_it_works}\n\n{INSTRUCTION_LABEL}\n{brief}"
+    )
 }
 
 #[cfg(test)]
@@ -28,11 +47,18 @@ mod tests {
 
     #[test]
     fn the_frame_names_the_card_and_keeps_the_brief_last() {
-        let framed = frame_issue_brief(7, "Fix the reconnect storm");
+        let framed = frame_issue_brief(7, "/ws/work/projects/p/7", "Fix the reconnect storm");
         assert!(framed.starts_with("[issue #7]"), "{framed}");
         assert!(
             framed.ends_with("The issue:\nFix the reconnect storm"),
             "the instruction is the tail, so a reader knows where framing ends: {framed}"
+        );
+        // The run is told where it is, because nothing else tells it: the
+        // Bash description is rendered per process and names the workspace
+        // work dir for every session.
+        assert!(
+            framed.contains("/ws/work/projects/p/7"),
+            "the framing must name the checkout: {framed}"
         );
     }
 }

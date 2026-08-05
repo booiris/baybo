@@ -80,6 +80,44 @@ pub fn branch_name(number: i64, title: &str) -> String {
 /// Enough of the title to recognise the branch, short enough to type.
 const MAX_SLUG_CHARS: usize = 40;
 
+/// Give sandboxed git commands somebody to be.
+///
+/// Without this a run can edit its worktree and stage files and then dies
+/// on `git commit` with "Please tell me who you are" — the plumbing all
+/// works and the identity is simply absent. Git resolves the committer
+/// from env, then the repository's config, then `$HOME/.gitconfig`, and
+/// inside the sandbox `HOME` is the work directory (`resolve_env` in
+/// `baybo-sandbox`), so a file here is the one place that reaches every
+/// git command without touching the user's own repository.
+///
+/// Never overwritten. It is an ordinary git config file in a directory the
+/// user can open, so once it exists it is theirs to edit.
+///
+/// The identity is baybo's rather than the running agent's. Per-agent
+/// attribution wants `GIT_AUTHOR_*` in the child env, and the Bash tool's
+/// env channel is also the exact-match redaction list for injected
+/// secrets — putting an agent id through it would scrub that id out of
+/// every command's output. Splitting those two uses is the follow-up; a
+/// wrong-but-present committer beats a run that cannot commit.
+pub async fn ensure_commit_identity(work_dir: &Path) -> Result<()> {
+    const IDENTITY: &str = r#"# Written by baybo so agent runs can commit. Yours to edit.
+[user]
+	name = baybo
+	email = baybo@localhost
+"#;
+    let file = work_dir.join(".gitconfig");
+    if file.exists() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(work_dir).await.map_err(|e| {
+        ProjectError::Workdir(anyhow::anyhow!("create {}: {e}", work_dir.display()))
+    })?;
+    tokio::fs::write(&file, IDENTITY)
+        .await
+        .map_err(|e| ProjectError::Workdir(anyhow::anyhow!("write {}: {e}", file.display())))?;
+    Ok(())
+}
+
 /// Open the issue's checkout, creating the worktree on first use.
 ///
 /// Idempotent: an existing worktree at `root` is adopted as-is rather
@@ -277,6 +315,77 @@ mod tests {
             .await
             .expect("second must adopt, not fail or reset");
         assert!(root.join("scratch.txt").exists());
+    }
+
+    /// Run git the way the sandbox does: `HOME` is the work directory, and
+    /// nothing inherited from the developer's own shell is allowed to
+    /// supply an identity the product would not have.
+    async fn git_as_a_run(dir: &Path, work_dir: &Path, args: &[&str]) -> std::process::Output {
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("HOME", work_dir)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .output()
+            .await
+            .expect("spawn git")
+    }
+
+    #[tokio::test]
+    async fn a_run_can_commit_without_anyone_telling_it_who_it_is() {
+        // The whole worktree layer is plumbing until this passes: an agent
+        // edits files, stages them, and commits — with no identity of its
+        // own anywhere, exactly as a run has none.
+        let repo = fresh_repo().await;
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let root = repo.path().join("wt").join("5");
+        ensure(repo.path(), &root, "issue/5-x")
+            .await
+            .expect("worktree");
+        ensure_commit_identity(work_dir.path())
+            .await
+            .expect("identity");
+
+        tokio::fs::write(root.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        let add = git_as_a_run(&root, work_dir.path(), &["add", "."]).await;
+        assert!(add.status.success(), "git add must work");
+        let commit = git_as_a_run(&root, work_dir.path(), &["commit", "-m", "done"]).await;
+        assert!(
+            commit.status.success(),
+            "a run must be able to commit: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+
+        let who = git_as_a_run(&root, work_dir.path(), &["log", "-1", "--format=%an <%ae>"]).await;
+        assert_eq!(
+            String::from_utf8_lossy(&who.stdout).trim(),
+            "baybo <baybo@localhost>",
+            "and the commit must be plainly machine-made"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_the_user_has_edited_is_left_alone() {
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let file = work_dir.path().join(".gitconfig");
+        tokio::fs::write(&file, b"[user]\n\tname = mine\n")
+            .await
+            .expect("write");
+        ensure_commit_identity(work_dir.path())
+            .await
+            .expect("identity");
+        assert_eq!(
+            tokio::fs::read_to_string(&file).await.expect("read"),
+            "[user]\n\tname = mine\n"
+        );
     }
 
     #[tokio::test]

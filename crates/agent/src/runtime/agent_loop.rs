@@ -2209,9 +2209,14 @@ impl AgentLoop {
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
     /// Append a board issue's brief as the run's input row.
-    pub async fn append_issue_brief(&mut self, number: i64, brief: &str) -> anyhow::Result<()> {
+    pub async fn append_issue_brief(
+        &mut self,
+        number: i64,
+        checkout: &str,
+        brief: &str,
+    ) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
-        let framed = baybo_context::prompts::issue::frame_issue_brief(number, brief);
+        let framed = baybo_context::prompts::issue::frame_issue_brief(number, checkout, brief);
         let msg = ChatMessage::issue_brief(vec![ContentBlock::Text(framed)]);
         self.context_manager.append(&msg).await;
         Ok(())

@@ -4633,6 +4633,7 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
             run_id: run_id.clone(),
             number: 7,
             brief: "Fix the WS reconnect storm\n\nThe timer never clears.".into(),
+            checkout: "/ws/work/projects/p/7".into(),
         })
         .await
         .expect("mailbox accepts the run");
@@ -4659,6 +4660,14 @@ async fn an_issue_run_executes_as_its_own_kind_of_turn() {
     assert!(
         framed.contains("Fix the WS reconnect storm"),
         "carries the brief: {framed}"
+    );
+    // …and says where the work happens. Nothing else does: the Bash tool's
+    // description is rendered once per process and names the workspace work
+    // directory for every session, so without this the model is told its
+    // commands land somewhere they do not.
+    assert!(
+        framed.contains("/ws/work/projects/p/7"),
+        "the run must be told its checkout: {framed}"
     );
 
     // …and the turn is recorded as a run, which is what the waiter keys on

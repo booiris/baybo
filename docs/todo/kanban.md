@@ -340,17 +340,18 @@ announces which of these will happen before sending.
   `personas/USER.md`; audited commits on the per-project git lock).
 - **Known gaps in the shipped worktree layer** (adversarial review,
   2026-08-05 — the escape it found is fixed; these are not):
-  - **A run still cannot commit.** `resolve_env` sets `HOME` to the
-    sandbox root (`<workspace>/work`), nothing writes a `.gitconfig`
-    there, and no `GIT_AUTHOR_*`/`GIT_COMMITTER_*` reach the child — so
-    `git commit` inside the worktree dies with "Please tell me who you
-    are". The plumbing is right and the identity is missing. Attributing
-    commits to the assignee agent is the obvious fix and has not been
-    done.
-  - **The Bash tool description still says the cwd is
-    `<workspace>/work`.** `Tool::description()` takes only `&self` and is
-    pre-rendered at construction, so it structurally cannot mention the
-    checkout. The model is told something false about where it is.
+  - ~~A run cannot commit~~ **fixed**: `<workspace>/work/.gitconfig` is
+    written on first run and is `$HOME/.gitconfig` inside the sandbox, so
+    git has a committer. Still **not per-agent** — attribution wants
+    `GIT_AUTHOR_*` in the child env, and the Bash tool's env channel is
+    also the exact-match redaction list for injected secrets, so an agent
+    id put through it would be scrubbed out of every command's output.
+    Splitting those two uses is the follow-up.
+  - ~~The Bash description says the cwd is `work/`~~ **worked around**:
+    it still does (`Tool::description()` takes only `&self` and is
+    pre-rendered per process), but the issue brief now names the checkout
+    and says commands run there, so the run is told the truth by the more
+    specific and more recent text.
   - **`prepare_checkout` runs `git worktree add` inline on the router's
     `select!` loop**, which also serves every user message and agent
     response. A slow checkout is head-of-line blocking for the whole
