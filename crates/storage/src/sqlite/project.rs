@@ -1,14 +1,14 @@
 //! sqlite implementation of [`ProjectStore`].
 
 use async_trait::async_trait;
-use baybo_model::{AgentProfileId, IssueId, ProjectId};
+use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
 use rusqlite::OptionalExtension;
 
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow, ProjectStore,
-    ProjectUpdate, Result,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
+    ProjectRow, ProjectStore, ProjectUpdate, Result, RunStatus, RunTrigger,
 };
 
 pub struct SqliteProjectStore {
@@ -25,6 +25,82 @@ const PROJECT_COLUMNS: &str = "id, name, description, workdir, archived_at, crea
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, priority, \
      assignee, position, blocked_reason, cancelled_at, created_at, updated_at";
+
+const RUN_COLUMNS: &str = "id, issue_id, project_id, number, agent_id, session_id, trigger, \
+     status, attempt, error, created_at, started_at, settled_at";
+
+/// Raw run tuple, in `RUN_COLUMNS` order.
+type RawRun = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    Option<String>,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn read_raw_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRun> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+    ))
+}
+
+fn run_from_raw(raw: RawRun) -> Result<IssueRunRow> {
+    let (
+        id,
+        issue_id,
+        project_id,
+        number,
+        agent_id,
+        session_id,
+        trigger,
+        status,
+        attempt,
+        error,
+        created_at,
+        started_at,
+        settled_at,
+    ) = raw;
+    Ok(IssueRunRow {
+        id: IssueRunId::from(id),
+        issue_id: IssueId::from(issue_id),
+        project_id: ProjectId::parse(project_id)
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
+        number,
+        agent_id: AgentProfileId::parse(agent_id)
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
+        session_id: session_id.map(SessionId::from),
+        trigger: RunTrigger::parse(&trigger).ok_or_else(|| {
+            StorageError::Storage(format!("issue_runs.trigger unknown: {trigger}"))
+        })?,
+        status: RunStatus::parse(&status)
+            .ok_or_else(|| StorageError::Storage(format!("issue_runs.status unknown: {status}")))?,
+        attempt,
+        error,
+        created_at: ts("issue_runs.created_at", created_at)?,
+        started_at: ts_opt("issue_runs.started_at", started_at)?,
+        settled_at: ts_opt("issue_runs.settled_at", settled_at)?,
+    })
+}
 
 /// Raw project tuple, in `PROJECT_COLUMNS` order. Timestamps are µs.
 type RawProject = (String, String, String, String, Option<i64>, i64, i64);
@@ -474,6 +550,178 @@ impl ProjectStore for SqliteProjectStore {
             })
             .await
     }
+
+    async fn enqueue_run(&self, new: &NewIssueRun) -> Result<IssueRunRow> {
+        let id = new.id.as_str().to_string();
+        let issue_id = new.issue_id.as_str().to_string();
+        let project = new.project_id.as_str().to_string();
+        let number = new.number;
+        let agent = new.agent_id.as_str().to_string();
+        let trigger = new.trigger.as_str();
+        let now = super::time::now_us();
+        let outcome = self
+            .pool
+            .interact("issue_runs.enqueue", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let attempt: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(attempt), 0) + 1 FROM issue_runs WHERE issue_id = ?1",
+                    rusqlite::params![issue_id],
+                    |row| row.get(0),
+                )?;
+                // The live index rejects a second unfinished run. Returned as
+                // data rather than an error because a non-Internal
+                // StorageError cannot be built inside this closure.
+                if let Err(e) = tx.execute(
+                    "INSERT INTO issue_runs (id, issue_id, project_id, number, agent_id, \
+                     session_id, trigger, status, attempt, error, created_at, started_at, \
+                     settled_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'queued', ?7, NULL, ?8, NULL, NULL)",
+                    rusqlite::params![id, issue_id, project, number, agent, trigger, attempt, now],
+                ) {
+                    drop(tx);
+                    return Ok(Err(e.to_string()));
+                }
+                let raw = tx.query_row(
+                    &format!("SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"),
+                    rusqlite::params![id],
+                    read_raw_run,
+                )?;
+                tx.commit()?;
+                Ok(Ok(raw))
+            })
+            .await?;
+        match outcome {
+            Ok(raw) => run_from_raw(raw),
+            Err(reason) => Err(StorageError::Conflict(format!(
+                "issue already has a run in flight: {reason}"
+            ))),
+        }
+    }
+
+    async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>> {
+        let issue = issue.as_str().to_string();
+        let raws = self
+            .pool
+            .interact("issue_runs.list", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_COLUMNS} FROM issue_runs WHERE issue_id = ?1 \
+                     ORDER BY attempt DESC"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![issue], read_raw_run)?
+                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(run_from_raw).collect()
+    }
+
+    async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>> {
+        let id = id.as_str().to_string();
+        let raw = self
+            .pool
+            .interact("issue_runs.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!("SELECT {RUN_COLUMNS} FROM issue_runs WHERE id = ?1"),
+                        rusqlite::params![id],
+                        read_raw_run,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        raw.map(run_from_raw).transpose()
+    }
+
+    async fn unsettled_runs(&self) -> Result<Vec<IssueRunRow>> {
+        let raws = self
+            .pool
+            .interact("issue_runs.unsettled", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {RUN_COLUMNS} FROM issue_runs WHERE settled_at IS NULL \
+                     ORDER BY created_at"
+                ))?;
+                Ok(stmt
+                    .query_map([], read_raw_run)?
+                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(run_from_raw).collect()
+    }
+
+    async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let session = session.as_str().to_string();
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("issue_runs.claim", move |conn| {
+                // Scoped to `queued`, so two dispatches of the same row
+                // resolve into one execution rather than two.
+                Ok(conn.execute(
+                    "UPDATE issue_runs SET status = 'running', session_id = ?2, started_at = ?3 \
+                     WHERE id = ?1 AND status = 'queued'",
+                    rusqlite::params![id, session, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn settle_run(
+        &self,
+        id: &IssueRunId,
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let id = id.as_str().to_string();
+        let status = status.as_str();
+        let error = error.map(str::to_owned);
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("issue_runs.settle", move |conn| {
+                // `settled_at IS NULL` is what makes the boot re-drive safe
+                // to replay: a second settle of the same run touches nothing.
+                Ok(conn.execute(
+                    "UPDATE issue_runs SET status = ?2, error = ?3, settled_at = ?4 \
+                     WHERE id = ?1 AND settled_at IS NULL",
+                    rusqlite::params![id, status, error, now],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
+        let raws = self
+            .pool
+            .interact("issue_runs.requeue", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // A `running` row whose actor died with the process is work
+                // that never finished. Returning it to `queued` — and
+                // dropping the dead session — is what lets the sweep hand it
+                // back out without the claim being refused.
+                tx.execute(
+                    "UPDATE issue_runs SET status = 'queued', session_id = NULL, \
+                     started_at = NULL WHERE settled_at IS NULL AND status = 'running'",
+                    [],
+                )?;
+                let raws = {
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT {RUN_COLUMNS} FROM issue_runs WHERE settled_at IS NULL \
+                         ORDER BY created_at"
+                    ))?;
+                    stmt.query_map([], read_raw_run)?
+                        .collect::<rusqlite::Result<Vec<RawRun>>>()?
+                };
+                tx.commit()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(run_from_raw).collect()
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +744,17 @@ mod tests {
             archived_at: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn new_run(issue: &IssueRow) -> NewIssueRun {
+        NewIssueRun {
+            id: IssueRunId::generate(),
+            issue_id: issue.id.clone(),
+            project_id: issue.project_id.clone(),
+            number: issue.number,
+            agent_id: AgentProfileId::parse("dev-1").unwrap(),
+            trigger: RunTrigger::Started,
         }
     }
 
@@ -727,6 +986,111 @@ mod tests {
             vec![(1, 0), (3, 1), (4, 2)],
             "the survivors keep their order and take consecutive ranks"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_is_recorded_before_anything_is_dispatched() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "work", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        assert_eq!(run.status, RunStatus::Queued);
+        assert_eq!(run.attempt, 1);
+        assert!(run.session_id.is_none(), "a queued run has no session yet");
+
+        // The dedupe guard is the index, not a check-then-write: a second
+        // unfinished run for the same issue cannot exist.
+        let refused = store
+            .enqueue_run(&new_run(&issue))
+            .await
+            .expect_err("an issue holds one run at a time");
+        assert!(matches!(refused, StorageError::Conflict(_)), "{refused:?}");
+
+        // Claim, then settle. Both are scoped, so a replay is a no-op.
+        let session = SessionId::from("issue-1");
+        assert!(store.claim_run(&run.id, &session).await.unwrap());
+        assert!(
+            !store.claim_run(&run.id, &session).await.unwrap(),
+            "a claimed run cannot be claimed again — that is how a double dispatch collapses"
+        );
+        let claimed = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert_eq!(claimed.session_id, Some(session));
+        assert!(claimed.started_at.is_some());
+
+        assert!(
+            store
+                .settle_run(&run.id, RunStatus::Done, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .settle_run(&run.id, RunStatus::Failed, Some("late"))
+                .await
+                .unwrap(),
+            "a settled run stays settled, so the boot re-drive can replay freely"
+        );
+        let settled = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(settled.status, RunStatus::Done);
+        assert!(settled.error.is_none());
+
+        // …and the slot is free again.
+        let second = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        assert_eq!(second.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn the_boot_sweep_returns_orphaned_runs_to_the_queue() {
+        let (_dir, store) = store().await;
+        let p = project("proj-a", "A");
+        store.create_project(&p).await.unwrap();
+        let one = store
+            .create_issue(&new_issue(&p.id, "one", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let two = store
+            .create_issue(&new_issue(&p.id, "two", IssueStatus::Backlog))
+            .await
+            .unwrap();
+        let three = store
+            .create_issue(&new_issue(&p.id, "three", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        // One never started, one died mid-flight, one finished before the crash.
+        let queued = store.enqueue_run(&new_run(&one)).await.unwrap();
+        let running = store.enqueue_run(&new_run(&two)).await.unwrap();
+        store
+            .claim_run(&running.id, &SessionId::from("issue-2"))
+            .await
+            .unwrap();
+        let done = store.enqueue_run(&new_run(&three)).await.unwrap();
+        store
+            .settle_run(&done.id, RunStatus::Done, None)
+            .await
+            .unwrap();
+
+        let resumed = store.requeue_unsettled().await.unwrap();
+        let ids: Vec<&str> = resumed.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![queued.id.as_str(), running.id.as_str()],
+            "both unfinished runs come back, the settled one does not"
+        );
+        assert!(resumed.iter().all(|r| r.status == RunStatus::Queued));
+        assert!(
+            resumed.iter().all(|r| r.session_id.is_none()),
+            "the dead session is dropped, or the re-claim would be refused"
+        );
+
+        // The sweep is idempotent — booting twice is not a double dispatch.
+        assert_eq!(store.requeue_unsettled().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

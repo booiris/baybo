@@ -42,8 +42,8 @@ pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use message_search::{MessageSearchStore, SearchHit, SearchScope};
 pub use project::{
-    IssuePriority, IssueRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow, ProjectStore,
-    ProjectUpdate,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
+    ProjectRow, ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
 };
 pub use secret::{SecretStore, StoreIdentity};
 pub use session::{DreamCandidate, SessionMessageAppendOutcome, SessionStore, StoredMessage};

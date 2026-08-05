@@ -13,12 +13,13 @@ use std::sync::Arc;
 use baybo_model::{AgentFramework, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId};
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow, ProjectStore,
-    ProjectUpdate,
+    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow,
+    ProjectStore, ProjectUpdate,
 };
 use baybo_workspace::WorkspacePaths;
 
 use crate::error::{ProjectError, Result};
+use crate::runs::{Transition, ledger_entry, triggers_run};
 
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
@@ -50,6 +51,21 @@ pub struct ProjectManager {
     store: Arc<dyn ProjectStore>,
     agents: Arc<dyn AgentProfileStore>,
     paths: WorkspacePaths,
+    /// Where a recorded run is announced. The ledger row is written first
+    /// and this only nudges — a send that fails, or a receiver that died,
+    /// costs a delay until the next boot sweep, never a lost run.
+    dispatch: RunDispatch,
+}
+
+/// The seam between recording a run and executing it. A channel rather
+/// than a direct call: the executor lives in the agent runtime, which this
+/// crate must not depend on.
+pub type RunDispatch = Arc<dyn Fn(IssueRunRow) + Send + Sync>;
+
+/// A dispatcher that records runs and starts nothing — the shape a
+/// headless assembly and every store-level test wants.
+pub fn no_dispatch() -> RunDispatch {
+    Arc::new(|_run| {})
 }
 
 impl ProjectManager {
@@ -57,12 +73,61 @@ impl ProjectManager {
         store: Arc<dyn ProjectStore>,
         agents: Arc<dyn AgentProfileStore>,
         paths: WorkspacePaths,
+        dispatch: RunDispatch,
     ) -> Self {
         Self {
             store,
             agents,
             paths,
+            dispatch,
         }
+    }
+
+    /// Record a run if this transition starts one, then announce it.
+    ///
+    /// Record-before-deliver: the row exists before anything can act on
+    /// it, so a crash between the two is a run the boot sweep finds rather
+    /// than work that silently never happened. A refused enqueue means the
+    /// issue already has a run in flight — the dedupe guard doing its job,
+    /// not a failure the caller should see.
+    async fn dispatch_if_triggered(&self, transition: Transition, issue: &IssueRow) {
+        let Some(trigger) = triggers_run(transition) else {
+            return;
+        };
+        let Some(entry) = ledger_entry(issue, trigger) else {
+            return;
+        };
+        match self.store.enqueue_run(&entry).await {
+            Ok(run) => (self.dispatch)(run),
+            Err(baybo_store::StorageError::Conflict(reason)) => {
+                tracing::debug!(
+                    issue = issue.number,
+                    %reason,
+                    "issue already has a run in flight; not starting a second"
+                );
+            }
+            Err(e) => {
+                tracing::error!(issue = issue.number, error = %e, "could not record issue run");
+            }
+        }
+    }
+
+    /// Every run of one issue, newest first.
+    pub async fn list_runs(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueRunRow>> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.store.list_runs(&issue.id).await?)
+    }
+
+    /// Return orphaned runs to the queue and hand each back for dispatch.
+    /// Called once at boot, before live traffic: a `running` row whose
+    /// actor died with the process is work that never finished.
+    pub async fn resume_unsettled_runs(&self) -> Result<usize> {
+        let resumed = self.store.requeue_unsettled().await?;
+        let count = resumed.len();
+        for run in resumed {
+            (self.dispatch)(run);
+        }
+        Ok(count)
     }
 
     pub async fn create_project(&self, new: NewProject) -> Result<ProjectRow> {
@@ -207,7 +272,7 @@ impl ProjectManager {
             self.validate_assignee(assignee).await?;
         }
         self.validate_staffing(new.status, new.assignee.as_ref())?;
-        Ok(self
+        let issue = self
             .store
             .create_issue(&NewIssue {
                 id: IssueId::generate(),
@@ -219,7 +284,10 @@ impl ProjectManager {
                 assignee: new.assignee,
                 created_at: chrono::Utc::now(),
             })
-            .await?)
+            .await?;
+        self.dispatch_if_triggered(Transition::created(&issue), &issue)
+            .await;
+        Ok(issue)
     }
 
     pub async fn update_issue(
@@ -259,13 +327,17 @@ impl ProjectManager {
             }),
             ..update
         };
+        let before = self.get_issue(project, number).await?;
         if !self.store.update_issue(project, number, &update).await? {
             return Err(ProjectError::NoSuchIssue {
                 project: project.clone(),
                 number,
             });
         }
-        self.get_issue(project, number).await
+        let after = self.get_issue(project, number).await?;
+        self.dispatch_if_triggered(Transition::between(&before, &after), &after)
+            .await;
+        Ok(after)
     }
 
     /// Move an issue into `status`, with `ordered_numbers` giving that
@@ -284,8 +356,8 @@ impl ProjectManager {
                 "must contain the moved issue — it is the destination column's new contents",
             ));
         }
-        let issue = self.get_issue(project, number).await?;
-        self.validate_staffing(status, issue.assignee.as_ref())?;
+        let before = self.get_issue(project, number).await?;
+        self.validate_staffing(status, before.assignee.as_ref())?;
         if !self
             .store
             .move_issue(project, number, status, ordered_numbers)
@@ -296,7 +368,10 @@ impl ProjectManager {
                 number,
             });
         }
-        self.get_issue(project, number).await
+        let after = self.get_issue(project, number).await?;
+        self.dispatch_if_triggered(Transition::between(&before, &after), &after)
+            .await;
+        Ok(after)
     }
 
     /// An assignee has to be an agent that exists and can actually run.

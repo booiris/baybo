@@ -6,11 +6,16 @@ use std::sync::Arc;
 
 use baybo_model::{AgentFramework, AgentProfileId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
-use baybo_store::project::{IssuePriority, IssueStatus, IssueUpdate, ProjectUpdate};
+use baybo_store::project::{
+    IssuePriority, IssueRunRow, IssueStatus, IssueUpdate, ProjectUpdate, RunStatus, RunTrigger,
+};
 use baybo_workspace::WorkspacePaths;
 
 struct Fixture {
     manager: ProjectManager,
+    /// Every run the manager announced, in order — what an executor would
+    /// have been handed.
+    dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
     agents: Arc<dyn baybo_store::AgentProfileStore>,
     paths: WorkspacePaths,
     _workspace: tempfile::TempDir,
@@ -45,13 +50,19 @@ async fn fixture() -> Fixture {
     let store = baybo_storage::Store::open(workspace.path().join("storage.db"))
         .await
         .expect("store");
+    let dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>> = Arc::default();
     Fixture {
         manager: ProjectManager::new(
             Arc::clone(&store.project),
             Arc::clone(&store.agent_profile),
             paths.clone(),
+            {
+                let seen = Arc::clone(&dispatched);
+                Arc::new(move |run| seen.lock().push(run))
+            },
         ),
         agents: Arc::clone(&store.agent_profile),
+        dispatched,
         paths,
         _workspace: workspace,
     }
@@ -503,4 +514,128 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
         matches!(refused, ProjectError::Invalid { .. }),
         "{refused:?}"
     );
+}
+
+#[tokio::test]
+async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                ..new_issue("do the thing")
+            },
+        )
+        .await
+        .expect("issue");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "an issue created in the backlog starts nothing"
+    );
+
+    f.manager
+        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .await
+        .expect("start");
+
+    // The row exists before anything could have acted on it — that is what
+    // makes a crash here recoverable rather than a run that never happened.
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Queued);
+    assert_eq!(runs[0].trigger, RunTrigger::Started);
+    assert_eq!(runs[0].agent_id, dev);
+
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1, "and exactly one run was handed out");
+    assert_eq!(announced[0].id, runs[0].id);
+
+    // Dragging within the column, or out of it, starts nothing more — and
+    // in particular leaving the column does not stop the run.
+    f.manager
+        .move_issue(&p.id, 1, IssueStatus::Review, &[1])
+        .await
+        .expect("move out");
+    assert_eq!(f.dispatched.lock().len(), 1);
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued,
+        "the run outlives the column it was started from"
+    );
+}
+
+#[tokio::test]
+async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, "dev-2", AgentFramework::Baybo).await;
+
+    // Straight into In Progress at creation: one edge.
+    f.manager
+        .create_issue(
+            &p.id,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("starts immediately")
+            },
+        )
+        .await
+        .expect("issue");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "creation into the column starts work"
+    );
+
+    // Reassigning while a run is in flight does not start a second one:
+    // the dedupe guard is a unique index, so it holds even though nothing
+    // here checked first.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueUpdate {
+                assignee: Some(Some(other)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reassign");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "an issue holds one run at a time"
+    );
+    assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+#[tokio::test]
+async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+    f.dispatched.lock().clear();
+
+    // Nothing settled the run — the process died. Boot finds it.
+    let resumed = f.manager.resume_unsettled_runs().await.expect("boot sweep");
+    assert_eq!(resumed, 1);
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1, "and hands it back out to be executed");
+    assert_eq!(announced[0].status, RunStatus::Queued);
 }

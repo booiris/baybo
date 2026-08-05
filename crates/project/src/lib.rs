@@ -7,8 +7,11 @@
 
 mod error;
 mod manager;
+mod runs;
 
 pub use error::{ProjectError, Result};
 pub use manager::{
-    MAX_ISSUE_TITLE_CHARS, NewIssueRequest, NewProject, ProjectManager, validate_workdir,
+    MAX_ISSUE_TITLE_CHARS, NewIssueRequest, NewProject, ProjectManager, RunDispatch, no_dispatch,
+    validate_workdir,
 };
+pub use runs::{Transition, triggers_run};

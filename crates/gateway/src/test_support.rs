@@ -238,6 +238,8 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()),
+        // No executor yet: runs are recorded and wait for one.
+        baybo_project::no_dispatch(),
     ));
 
     let deps = GatewayDeps {

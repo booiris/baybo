@@ -11,7 +11,7 @@
 //! the session-data-is-core rule in `CLAUDE.md` covers them too.
 
 use async_trait::async_trait;
-use baybo_model::{AgentProfileId, IssueId, ProjectId};
+use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -246,4 +246,148 @@ pub trait ProjectStore: Send + Sync {
         status: IssueStatus,
         ordered_numbers: &[i64],
     ) -> Result<bool>;
+
+    /// Record a run before anything is dispatched — the ledger's whole
+    /// point. The attempt number is assigned inside the insert, and the
+    /// per-issue live index rejects a second unfinished run with
+    /// [`StorageError::Conflict`], which callers read as "already working
+    /// on it" rather than a failure.
+    async fn enqueue_run(&self, new: &NewIssueRun) -> Result<IssueRunRow>;
+
+    /// Every run of one issue, newest first — the execution log.
+    async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;
+
+    async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
+
+    /// Every unfinished run, oldest first. The boot sweep's scan.
+    async fn unsettled_runs(&self) -> Result<Vec<IssueRunRow>>;
+
+    /// Claim a queued run: stamp it `running` with the session it will
+    /// execute in. `Ok(false)` if it is no longer queued — which is how a
+    /// double dispatch resolves into one execution.
+    async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool>;
+
+    /// Settle a run. Terminal and idempotent: a replay of the same outcome
+    /// is a no-op, so the boot re-drive can never double-settle.
+    /// `Ok(false)` if it was already settled.
+    async fn settle_run(
+        &self,
+        id: &IssueRunId,
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> Result<bool>;
+
+    /// Return every unsettled run to `queued`, clearing the session it was
+    /// claimed with. Run once at boot: a `running` row whose actor died
+    /// with the process is work that never finished, not work in flight.
+    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>>;
+}
+
+/// What caused a run to be enqueued. Shown verbatim in the execution log,
+/// so the operator can tell "I dragged this" from "the comment I left woke
+/// it" without opening the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTrigger {
+    /// The issue entered In Progress — a drag, a REST move, an agent tool.
+    Started,
+    /// An agent was put on an issue already in In Progress.
+    Assigned,
+    /// A retry of a settled run.
+    Retry,
+}
+
+impl RunTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunTrigger::Started => "started",
+            RunTrigger::Assigned => "assigned",
+            RunTrigger::Retry => "retry",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "started" => Some(RunTrigger::Started),
+            "assigned" => Some(RunTrigger::Assigned),
+            "retry" => Some(RunTrigger::Retry),
+            _ => None,
+        }
+    }
+}
+
+/// Where a run is. `Queued` and `Running` are the unsettled states — the
+/// ones the boot sweep re-drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Queued => "queued",
+            RunStatus::Running => "running",
+            RunStatus::Done => "done",
+            RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(RunStatus::Queued),
+            "running" => Some(RunStatus::Running),
+            "done" => Some(RunStatus::Done),
+            "failed" => Some(RunStatus::Failed),
+            "cancelled" => Some(RunStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether this run is finished. Unsettled runs hold the per-issue
+    /// dedupe slot and are what the boot sweep picks up.
+    pub fn is_settled(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled
+        )
+    }
+}
+
+/// One row of `issue_runs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRunRow {
+    pub id: IssueRunId,
+    pub issue_id: IssueId,
+    pub project_id: ProjectId,
+    /// The issue's human address, denormalised so the execution log and the
+    /// boot sweep don't have to join.
+    pub number: i64,
+    pub agent_id: AgentProfileId,
+    /// Minted when the run is claimed; `None` while it is still queued.
+    pub session_id: Option<SessionId>,
+    pub trigger: RunTrigger,
+    pub status: RunStatus,
+    /// 1 for an issue's first run, incrementing thereafter.
+    pub attempt: i64,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+/// A run to enqueue. Attempt and timestamps are the store's to assign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIssueRun {
+    pub id: IssueRunId,
+    pub issue_id: IssueId,
+    pub project_id: ProjectId,
+    pub number: i64,
+    pub agent_id: AgentProfileId,
+    pub trigger: RunTrigger,
 }

@@ -1306,7 +1306,42 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- Serves the board's only read: one project's cards,
                 -- column by column, in order.
                 CREATE INDEX IF NOT EXISTS idx_issues_board
-                    ON issues(project_id, status, position);",
+                    ON issues(project_id, status, position);
+
+                -- One execution of one issue by its assignee. The row IS the
+                -- delivery ledger entry: it is written before anything is
+                -- dispatched, stamped on resolution, and re-driven at boot,
+                -- so a crash anywhere in between leaves work that resumes
+                -- rather than a card that shimmers forever.
+                CREATE TABLE IF NOT EXISTS issue_runs (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    agent_id   TEXT    NOT NULL,
+                    -- Minted when the run is claimed, so a queued run has
+                    -- none yet.
+                    session_id TEXT,
+                    trigger    TEXT    NOT NULL,
+                    status     TEXT    NOT NULL,
+                    attempt    INTEGER NOT NULL,
+                    error      TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    settled_at INTEGER
+                );
+                -- The dedupe guard, structural rather than checked: an issue
+                -- may hold at most one unfinished run. Two drags racing trip
+                -- the constraint instead of starting the same work twice —
+                -- and it is what lets the waiter treat 'the newest terminal
+                -- turn' as unambiguously its own.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live
+                    ON issue_runs(issue_id) WHERE settled_at IS NULL;
+                -- Serves the boot re-drive and the per-issue execution log.
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_unsettled
+                    ON issue_runs(created_at) WHERE settled_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_issue_runs_log
+                    ON issue_runs(issue_id, created_at DESC);",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 

@@ -585,6 +585,8 @@ pub async fn build_managers(
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
+        // No executor yet: runs are recorded and wait for one.
+        baybo_project::no_dispatch(),
     ));
 
     // --- security gateway + tool executor

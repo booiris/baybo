@@ -163,6 +163,50 @@ impl From<IssueId> for String {
     }
 }
 
+/// Server-generated identifier for one execution of an issue. Opaque; the
+/// UI addresses a run by its attempt number within its issue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IssueRunId(String);
+
+impl IssueRunId {
+    pub fn generate() -> Self {
+        Self(Ulid::new().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for IssueRunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for IssueRunId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for IssueRunId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<IssueRunId> for String {
+    fn from(value: IssueRunId) -> Self {
+        value.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
