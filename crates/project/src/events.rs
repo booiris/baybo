@@ -16,6 +16,12 @@ pub trait ProjectEvents: Send + Sync + 'static {
 
     /// One issue's run state advanced — queued, started, settled.
     fn run_changed(&self, project: &ProjectId, issue: i64);
+
+    /// One issue gained a timeline entry — a comment, or a system note.
+    /// Separate from [`Self::board_changed`] because it moves no card: a
+    /// board watching for it would refetch every column to learn that
+    /// somebody said something on one.
+    fn timeline_changed(&self, project: &ProjectId, issue: i64);
 }
 
 /// A hook that announces nothing. What a headless assembly and every
@@ -26,4 +32,5 @@ impl ProjectEvents for NoopProjectEvents {
     fn project_changed(&self, _project: &ProjectId) {}
     fn board_changed(&self, _project: &ProjectId, _issue: Option<i64>) {}
     fn run_changed(&self, _project: &ProjectId, _issue: i64) {}
+    fn timeline_changed(&self, _project: &ProjectId, _issue: i64) {}
 }

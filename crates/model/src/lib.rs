@@ -48,8 +48,8 @@ pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
 pub use project::{
-    InvalidProjectValue, IssueId, IssueRunId, MAX_PROJECT_ID_CHARS, MAX_PROJECT_NAME_CHARS,
-    ProjectId,
+    InvalidProjectValue, IssueEventId, IssueId, IssueRunId, MAX_PROJECT_ID_CHARS,
+    MAX_PROJECT_NAME_CHARS, ProjectId,
 };
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{

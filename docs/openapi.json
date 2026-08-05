@@ -4680,6 +4680,201 @@
         }
       }
     },
+    "/v1/projects/{project_id}/issues/{number}/comments": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "create_comment",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewCommentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The recorded comment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueEventDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty comment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/issues/{number}/events": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_issue_events",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "number",
+            "in": "path",
+            "description": "Issue number within the project",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This issue's timeline, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "allOf": [
+                          {
+                            "description": "The typed body: `kind` plus that kind's own fields."
+                          },
+                          {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "number",
+                              "actor",
+                              "actor_is_agent",
+                              "created_at_ms"
+                            ],
+                            "properties": {
+                              "actor": {
+                                "type": "string",
+                                "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+                              },
+                              "actor_is_agent": {
+                                "type": "boolean"
+                              },
+                              "created_at_ms": {
+                                "type": "integer",
+                                "format": "int64"
+                              },
+                              "id": {
+                                "type": "string"
+                              },
+                              "number": {
+                                "type": "integer",
+                                "format": "int64"
+                              }
+                            }
+                          }
+                        ],
+                        "description": "One entry on an issue's timeline.\n\nThe body is flattened, so an entry is one object with a `kind` field\nrather than a wrapper around a payload — the client switches on `kind`\nto pick a renderer and reads the rest off the same object."
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown project or issue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/projects/{project_id}/issues/{number}/move": {
       "post": {
         "tags": [
@@ -7645,6 +7840,44 @@
           }
         }
       },
+      "IssueEventDto": {
+        "allOf": [
+          {
+            "description": "The typed body: `kind` plus that kind's own fields."
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "number",
+              "actor",
+              "actor_is_agent",
+              "created_at_ms"
+            ],
+            "properties": {
+              "actor": {
+                "type": "string",
+                "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
+              },
+              "actor_is_agent": {
+                "type": "boolean"
+              },
+              "created_at_ms": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "id": {
+                "type": "string"
+              },
+              "number": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        ],
+        "description": "One entry on an issue's timeline.\n\nThe body is flattened, so an entry is one object with a `kind` field\nrather than a wrapper around a payload — the client switches on `kind`\nto pick a renderer and reads the rest off the same object."
+      },
       "IssuePriorityDto": {
         "type": "string",
         "enum": [
@@ -8303,6 +8536,18 @@
             "type": "boolean"
           },
           "written_to": {
+            "type": "string"
+          }
+        }
+      },
+      "NewCommentBody": {
+        "type": "object",
+        "description": "A comment being posted.",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
             "type": "string"
           }
         }

@@ -11,8 +11,9 @@
 //! the session-data-is-core rule in `CLAUDE.md` covers them too.
 
 use async_trait::async_trait;
-use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId};
+use baybo_model::{AgentProfileId, IssueEventId, IssueId, IssueRunId, ProjectId, SessionId};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::StorageError;
 
@@ -21,7 +22,8 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// Which column an issue sits in. The set is fixed: entering
 /// [`IssueStatus::InProgress`] is the single execution trigger, so a
 /// user-definable column would be a user-definable trigger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IssueStatus {
     Backlog,
     Todo,
@@ -192,6 +194,119 @@ pub struct NewIssue {
     pub created_at: DateTime<Utc>,
 }
 
+/// Who did the thing a timeline entry records.
+///
+/// Two kinds and no more: the operator working the board, and one of the
+/// project's agents. A string here would let a caller invent a third.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueActor {
+    User,
+    Agent(AgentProfileId),
+}
+
+impl IssueActor {
+    /// Storage form. Agents are prefixed rather than stored bare so the
+    /// two cases stay distinguishable even if an agent is ever named
+    /// `user`.
+    pub fn to_storage(&self) -> String {
+        match self {
+            IssueActor::User => "user".to_owned(),
+            IssueActor::Agent(id) => format!("agent:{}", id.as_str()),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(IssueActor::User),
+            other => other
+                .strip_prefix("agent:")
+                .and_then(|id| AgentProfileId::parse(id.to_owned()).ok())
+                .map(IssueActor::Agent),
+        }
+    }
+}
+
+/// What one timeline entry says.
+///
+/// A tagged enum rather than a `kind` string beside a free-form payload:
+/// every reader — the detail page, the activity feed, the brief assembled
+/// for the next run — has to agree on what a "run settled" entry carries,
+/// and the place to write that down once is here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssueEventBody {
+    /// Said by a person or an agent. The only entry a human writes.
+    Comment {
+        text: String,
+    },
+    Opened,
+    Moved {
+        from: IssueStatus,
+        to: IssueStatus,
+    },
+    Assigned {
+        from: Option<AgentProfileId>,
+        to: Option<AgentProfileId>,
+    },
+    RunStarted {
+        run_id: IssueRunId,
+        attempt: i64,
+        trigger: RunTrigger,
+    },
+    RunSettled {
+        run_id: IssueRunId,
+        attempt: i64,
+        status: RunStatus,
+        error: Option<String>,
+    },
+    Blocked {
+        reason: String,
+    },
+    Unblocked,
+    Cancelled,
+}
+
+impl IssueEventBody {
+    /// Discriminator persisted alongside the body so a query can filter by
+    /// kind without parsing every row's JSON. Derived from the variant, so
+    /// the column can never disagree with the payload it sits next to.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IssueEventBody::Comment { .. } => "comment",
+            IssueEventBody::Opened => "opened",
+            IssueEventBody::Moved { .. } => "moved",
+            IssueEventBody::Assigned { .. } => "assigned",
+            IssueEventBody::RunStarted { .. } => "run_started",
+            IssueEventBody::RunSettled { .. } => "run_settled",
+            IssueEventBody::Blocked { .. } => "blocked",
+            IssueEventBody::Unblocked => "unblocked",
+            IssueEventBody::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One entry on an issue's timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueEventRow {
+    pub id: IssueEventId,
+    pub issue_id: IssueId,
+    pub project_id: ProjectId,
+    pub number: i64,
+    pub actor: IssueActor,
+    pub body: IssueEventBody,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What a caller supplies to append to a timeline.
+#[derive(Debug, Clone)]
+pub struct NewIssueEvent {
+    pub issue_id: IssueId,
+    pub project_id: ProjectId,
+    pub number: i64,
+    pub actor: IssueActor,
+    pub body: IssueEventBody,
+}
+
 #[async_trait]
 pub trait ProjectStore: Send + Sync {
     /// Every project, newest activity first. `include_archived` folds the
@@ -254,6 +369,23 @@ pub trait ProjectStore: Send + Sync {
     /// on it" rather than a failure.
     async fn enqueue_run(&self, new: &NewIssueRun) -> Result<IssueRunRow>;
 
+    /// Append to an issue's timeline. Returns the stored row so a caller
+    /// can announce exactly what a reader will fetch.
+    async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow>;
+
+    /// One issue's timeline, oldest first — reading order, and the order
+    /// the next run's brief wants its delta in.
+    async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>>;
+
+    /// The timeline entries added to an issue after `since`, oldest first.
+    /// This is the "what happened while you were away" a follow-up run's
+    /// brief is built from, rather than replaying the whole history.
+    async fn events_since(
+        &self,
+        issue: &IssueId,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<IssueEventRow>>;
+
     /// Every run of one issue, newest first — the execution log.
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>>;
 
@@ -290,7 +422,8 @@ pub trait ProjectStore: Send + Sync {
 /// What caused a run to be enqueued. Shown verbatim in the execution log,
 /// so the operator can tell "I dragged this" from "the comment I left woke
 /// it" without opening the transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunTrigger {
     /// The issue entered In Progress — a drag, a REST move, an agent tool.
     Started,
@@ -321,7 +454,8 @@ impl RunTrigger {
 
 /// Where a run is. `Queued` and `Running` are the unsettled states — the
 /// ones the boot sweep re-drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Queued,
     Running,

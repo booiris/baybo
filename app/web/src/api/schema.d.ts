@@ -984,6 +984,38 @@ export interface paths {
         patch: operations["update_issue"];
         trace?: never;
     };
+    "/v1/projects/{project_id}/issues/{number}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_comment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/issues/{number}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_issue_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/issues/{number}/move": {
         parameters: {
             query?: never;
@@ -2215,6 +2247,26 @@ export interface components {
             /** Format: int64 */
             updated_at_ms: number;
         };
+        /**
+         * @description One entry on an issue's timeline.
+         *
+         *     The body is flattened, so an entry is one object with a `kind` field
+         *     rather than a wrapper around a payload — the client switches on `kind`
+         *     to pick a renderer and reads the rest off the same object.
+         */
+        IssueEventDto: unknown & {
+            /**
+             * @description `"user"`, or the agent's id. Which of the two it is comes from
+             *     [`Self::actor_is_agent`] rather than from parsing this.
+             */
+            actor: string;
+            actor_is_agent: boolean;
+            /** Format: int64 */
+            created_at_ms: number;
+            id: string;
+            /** Format: int64 */
+            number: number;
+        };
         /** @enum {string} */
         IssuePriorityDto: "urgent" | "high" | "medium" | "low" | "none";
         /** @description One execution of an issue. */
@@ -2523,6 +2575,10 @@ export interface components {
             path: string;
             requires_restart: boolean;
             written_to: string;
+        };
+        /** @description A comment being posted. */
+        NewCommentBody: {
+            text: string;
         };
         ProjectDto: {
             /**
@@ -6599,6 +6655,120 @@ export interface operations {
             };
             /** @description The project is archived */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_comment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewCommentBody"];
+            };
+        };
+        responses: {
+            /** @description The recorded comment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueEventDto"];
+                };
+            };
+            /** @description Empty comment */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_issue_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                project_id: string;
+                /** @description Issue number within the project */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This issue's timeline, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: (unknown & {
+                            /**
+                             * @description `"user"`, or the agent's id. Which of the two it is comes from
+                             *     [`Self::actor_is_agent`] rather than from parsing this.
+                             */
+                            actor: string;
+                            actor_is_agent: boolean;
+                            /** Format: int64 */
+                            created_at_ms: number;
+                            id: string;
+                            /** Format: int64 */
+                            number: number;
+                        })[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown project or issue */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

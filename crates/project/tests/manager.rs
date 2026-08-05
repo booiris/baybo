@@ -7,7 +7,8 @@ use std::sync::Arc;
 use baybo_model::{AgentFramework, AgentProfileId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{
-    IssuePriority, IssueRunRow, IssueStatus, IssueUpdate, ProjectUpdate, RunStatus, RunTrigger,
+    IssueActor, IssuePriority, IssueRunRow, IssueStatus, IssueUpdate, ProjectUpdate, RunStatus,
+    RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 
@@ -282,7 +283,7 @@ async fn an_archived_project_is_read_only() {
         .await
         .expect("create");
     f.manager
-        .create_issue(&project.id, new_issue("before"))
+        .create_issue(&project.id, IssueActor::User, new_issue("before"))
         .await
         .expect("create issue");
     f.manager
@@ -292,7 +293,7 @@ async fn an_archived_project_is_read_only() {
 
     let refused = f
         .manager
-        .create_issue(&project.id, new_issue("after"))
+        .create_issue(&project.id, IssueActor::User, new_issue("after"))
         .await
         .expect_err("an archived board takes no new work");
     assert!(matches!(refused, ProjectError::Archived(_)), "{refused:?}");
@@ -320,7 +321,7 @@ async fn an_archived_project_is_read_only() {
         .await
         .expect("restore");
     f.manager
-        .create_issue(&project.id, new_issue("after restore"))
+        .create_issue(&project.id, IssueActor::User, new_issue("after restore"))
         .await
         .expect("writable again");
 }
@@ -331,7 +332,7 @@ async fn issues_answer_only_within_their_own_project() {
     let a = f.manager.create_project(new_project("a")).await.expect("a");
     let b = f.manager.create_project(new_project("b")).await.expect("b");
     f.manager
-        .create_issue(&a.id, new_issue("a's first"))
+        .create_issue(&a.id, IssueActor::User, new_issue("a's first"))
         .await
         .expect("issue");
 
@@ -357,13 +358,13 @@ async fn a_patch_that_sets_nothing_is_refused() {
     let f = fixture().await;
     let p = f.manager.create_project(new_project("p")).await.expect("p");
     f.manager
-        .create_issue(&p.id, new_issue("something"))
+        .create_issue(&p.id, IssueActor::User, new_issue("something"))
         .await
         .expect("issue");
 
     let refused = f
         .manager
-        .update_issue(&p.id, 1, IssueUpdate::default())
+        .update_issue(&p.id, 1, IssueActor::User, IssueUpdate::default())
         .await
         .expect_err("an empty patch is a caller mistake, not a no-op write");
     assert!(matches!(refused, ProjectError::Invalid { .. }));
@@ -374,6 +375,7 @@ async fn a_patch_that_sets_nothing_is_refused() {
         .update_issue(
             &p.id,
             1,
+            IssueActor::User,
             IssueUpdate {
                 blocked_reason: Some(Some("   ".into())),
                 ..Default::default()
@@ -390,7 +392,7 @@ async fn a_move_must_name_the_issue_it_moves() {
     let p = f.manager.create_project(new_project("p")).await.expect("p");
     for title in ["one", "two"] {
         f.manager
-            .create_issue(&p.id, new_issue(title))
+            .create_issue(&p.id, IssueActor::User, new_issue(title))
             .await
             .expect("issue");
     }
@@ -399,14 +401,14 @@ async fn a_move_must_name_the_issue_it_moves() {
     // that omits the moved card would leave it unplaced.
     let refused = f
         .manager
-        .move_issue(&p.id, 1, IssueStatus::Todo, &[2])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[2])
         .await
         .expect_err("the moved issue must appear in its destination");
     assert!(matches!(refused, ProjectError::Invalid { .. }));
 
     let moved = f
         .manager
-        .move_issue(&p.id, 1, IssueStatus::Todo, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
         .await
         .expect("move");
     assert_eq!(moved.status, IssueStatus::Todo);
@@ -419,14 +421,14 @@ async fn in_progress_needs_somebody_on_it() {
     let p = f.manager.create_project(new_project("p")).await.expect("p");
     let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
     f.manager
-        .create_issue(&p.id, new_issue("unclaimed"))
+        .create_issue(&p.id, IssueActor::User, new_issue("unclaimed"))
         .await
         .expect("issue");
 
     // The board would otherwise claim work is under way that nobody is doing.
     let refused = f
         .manager
-        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::InProgress, &[1])
         .await
         .expect_err("an unassigned card cannot start");
     assert!(
@@ -436,7 +438,7 @@ async fn in_progress_needs_somebody_on_it() {
 
     // Every other column is free to be unassigned.
     f.manager
-        .move_issue(&p.id, 1, IssueStatus::Todo, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
         .await
         .expect("todo takes unassigned work");
 
@@ -445,6 +447,7 @@ async fn in_progress_needs_somebody_on_it() {
         .update_issue(
             &p.id,
             1,
+            IssueActor::User,
             IssueUpdate {
                 assignee: Some(Some(dev.clone())),
                 ..Default::default()
@@ -454,7 +457,7 @@ async fn in_progress_needs_somebody_on_it() {
         .expect("assign");
     let moved = f
         .manager
-        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::InProgress, &[1])
         .await
         .expect("assigned work starts");
     assert_eq!(moved.assignee.as_ref(), Some(&dev));
@@ -465,6 +468,7 @@ async fn in_progress_needs_somebody_on_it() {
         .update_issue(
             &p.id,
             1,
+            IssueActor::User,
             IssueUpdate {
                 assignee: Some(None),
                 ..Default::default()
@@ -489,6 +493,7 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
         .manager
         .create_issue(
             &p.id,
+            IssueActor::User,
             NewIssueRequest {
                 assignee: Some(ghost),
                 ..new_issue("to a ghost")
@@ -504,6 +509,7 @@ async fn an_assignee_must_exist_and_must_be_able_to_run() {
         .manager
         .create_issue(
             &p.id,
+            IssueActor::User,
             NewIssueRequest {
                 assignee: Some(external),
                 ..new_issue("to codex")
@@ -525,6 +531,7 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
     f.manager
         .create_issue(
             &p.id,
+            IssueActor::User,
             NewIssueRequest {
                 assignee: Some(dev.clone()),
                 ..new_issue("do the thing")
@@ -538,7 +545,7 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
     );
 
     f.manager
-        .move_issue(&p.id, 1, IssueStatus::InProgress, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::InProgress, &[1])
         .await
         .expect("start");
 
@@ -557,7 +564,7 @@ async fn a_card_reaching_in_progress_records_a_run_before_anything_starts() {
     // Dragging within the column, or out of it, starts nothing more — and
     // in particular leaving the column does not stop the run.
     f.manager
-        .move_issue(&p.id, 1, IssueStatus::Review, &[1])
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Review, &[1])
         .await
         .expect("move out");
     assert_eq!(f.dispatched.lock().len(), 1);
@@ -579,6 +586,7 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
     f.manager
         .create_issue(
             &p.id,
+            IssueActor::User,
             NewIssueRequest {
                 status: IssueStatus::InProgress,
                 assignee: Some(dev.clone()),
@@ -600,6 +608,7 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
         .update_issue(
             &p.id,
             1,
+            IssueActor::User,
             IssueUpdate {
                 assignee: Some(Some(other)),
                 ..Default::default()
@@ -623,6 +632,7 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     f.manager
         .create_issue(
             &p.id,
+            IssueActor::User,
             NewIssueRequest {
                 status: IssueStatus::InProgress,
                 assignee: Some(dev),
@@ -639,4 +649,105 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     let announced = f.dispatched.lock().clone();
     assert_eq!(announced.len(), 1, "and hands it back out to be executed");
     assert_eq!(announced[0].status, RunStatus::Queued);
+}
+
+#[tokio::test]
+async fn the_board_writes_its_own_history() {
+    // The end-to-end claim of the timeline: work the operator does through
+    // the board leaves a readable trail without anybody being asked to
+    // write one.
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Trail"))
+        .await
+        .expect("create");
+    let dev = seed_agent(&f, "dev-1", AgentFramework::Baybo).await;
+
+    let issue = f
+        .manager
+        .create_issue(&project.id, IssueActor::User, new_issue("Wire it"))
+        .await
+        .expect("create issue");
+    f.manager
+        .update_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(dev.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("assign");
+    f.manager
+        .move_issue(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            IssueStatus::InProgress,
+            &[issue.number],
+        )
+        .await
+        .expect("move");
+    f.manager
+        .comment(
+            &project.id,
+            issue.number,
+            IssueActor::User,
+            "  check the reconnect path  ",
+        )
+        .await
+        .expect("comment");
+
+    let timeline = f
+        .manager
+        .timeline(&project.id, issue.number)
+        .await
+        .expect("timeline");
+    assert_eq!(
+        timeline.iter().map(|e| e.body.kind()).collect::<Vec<_>>(),
+        vec!["opened", "assigned", "moved", "comment"],
+        "oldest first, and every board action left a mark: {timeline:?}"
+    );
+    assert!(
+        matches!(
+            &timeline[3].body,
+            baybo_store::project::IssueEventBody::Comment { text } if text == "check the reconnect path"
+        ),
+        "a comment is stored trimmed: {:?}",
+        timeline[3].body
+    );
+}
+
+#[tokio::test]
+async fn an_empty_comment_is_refused_rather_than_recorded() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(new_project("Quiet"))
+        .await
+        .expect("create");
+    let issue = f
+        .manager
+        .create_issue(&project.id, IssueActor::User, new_issue("Nothing to say"))
+        .await
+        .expect("create issue");
+
+    let err = f
+        .manager
+        .comment(&project.id, issue.number, IssueActor::User, "   \n  ")
+        .await
+        .expect_err("whitespace is not a comment");
+    assert!(matches!(err, ProjectError::Invalid { .. }), "{err:?}");
+    assert_eq!(
+        f.manager
+            .timeline(&project.id, issue.number)
+            .await
+            .expect("timeline")
+            .len(),
+        1,
+        "only the opening entry — the refusal wrote nothing"
+    );
 }

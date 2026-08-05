@@ -157,7 +157,7 @@ export interface WireApprovalCard {
 }
 
 /** Mirror of Rust `ProjectChangeScope` — which plane of a project changed. */
-export type ProjectChangeScope = 'project' | 'board' | 'run';
+export type ProjectChangeScope = 'project' | 'board' | 'run' | 'timeline';
 
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }

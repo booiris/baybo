@@ -163,6 +163,35 @@ impl From<IssueId> for String {
     }
 }
 
+/// Server-generated identifier for one timeline entry. Opaque, and ULID so
+/// entries written in the same microsecond still have a stable order to
+/// break the tie on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IssueEventId(String);
+
+impl IssueEventId {
+    pub fn generate() -> Self {
+        Self(Ulid::new().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for IssueEventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for IssueEventId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Server-generated identifier for one execution of an issue. Opaque; the
 /// UI addresses a run by its attempt number within its issue.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

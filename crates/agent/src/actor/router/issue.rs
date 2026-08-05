@@ -20,7 +20,9 @@ use baybo_model::{
     AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, User,
 };
 use baybo_project::{ProjectEvents, worktree};
-use baybo_store::project::{IssueRunRow, ProjectStore, RunStatus};
+use baybo_store::project::{
+    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, ProjectStore, RunStatus,
+};
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -103,6 +105,18 @@ impl Router {
                 return;
             }
         };
+
+        record(
+            &store,
+            self.project_events.as_ref(),
+            &event.run,
+            IssueEventBody::RunStarted {
+                run_id: event.run.id.clone(),
+                attempt: event.run.attempt,
+                trigger: event.run.trigger,
+            },
+        )
+        .await;
 
         // Subscribed before the trigger is sent, and this is load-bearing:
         // the terminal event is published from inside the run's own turn, so
@@ -243,16 +257,60 @@ async fn settle(
 ) {
     match store.settle_run(&run.id, status, error).await {
         // Announce only a settle that actually landed: a replay of an
-        // already-settled run changed nothing and has nothing to say.
+        // already-settled run changed nothing and has nothing to say —
+        // and must not put a second entry on the timeline either.
         Ok(true) => {
             if let Some(events) = events {
                 events.run_changed(&run.project_id, run.number);
             }
+            record(
+                store,
+                events,
+                run,
+                IssueEventBody::RunSettled {
+                    run_id: run.id.clone(),
+                    attempt: run.attempt,
+                    status,
+                    error: error.map(str::to_owned),
+                },
+            )
+            .await;
         }
         Ok(false) => {}
         Err(e) => {
             let run_id = &run.id;
             warn!(%run_id, error = %e, "could not settle run; the boot sweep will retry it");
+        }
+    }
+}
+
+/// Put a run's lifecycle on the issue's timeline, attributed to the agent
+/// doing the work rather than to the operator who dragged the card.
+///
+/// Best-effort, like every other timeline write: a run that executed and
+/// whose note did not land is far better than the reverse.
+async fn record(
+    store: &Arc<dyn ProjectStore>,
+    events: Option<&Arc<dyn ProjectEvents>>,
+    run: &IssueRunRow,
+    body: IssueEventBody,
+) {
+    let entry = NewIssueEvent {
+        issue_id: run.issue_id.clone(),
+        project_id: run.project_id.clone(),
+        number: run.number,
+        actor: IssueActor::Agent(run.agent_id.clone()),
+        body,
+    };
+    match store.append_event(&entry).await {
+        Ok(_) => {
+            if let Some(events) = events {
+                events.timeline_changed(&run.project_id, run.number);
+            }
+        }
+        Err(e) => {
+            let run_id = &run.id;
+            warn!(%run_id, error = %e, "could not record a run's timeline entry");
         }
     }
 }

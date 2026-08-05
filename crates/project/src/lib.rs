@@ -9,6 +9,7 @@ mod error;
 mod events;
 mod manager;
 mod runs;
+mod timeline;
 pub mod worktree;
 
 pub use error::{ProjectError, Result};
@@ -18,4 +19,5 @@ pub use manager::{
     validate_workdir,
 };
 pub use runs::{Transition, triggers_run};
+pub use timeline::diff_events;
 pub use worktree::Checkout;

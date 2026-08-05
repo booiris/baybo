@@ -13,8 +13,9 @@ use std::sync::Arc;
 use baybo_model::{AgentFramework, AgentProfileId, IssueId, MAX_PROJECT_NAME_CHARS, ProjectId};
 use baybo_store::AgentProfileStore;
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, ProjectRow,
-    ProjectStore, ProjectUpdate, RunStatus, RunTrigger,
+    IssueActor, IssueEventBody, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, NewIssue, NewIssueEvent, ProjectRow, ProjectStore, ProjectUpdate, RunStatus,
+    RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
 
@@ -118,6 +119,81 @@ impl ProjectManager {
                 tracing::error!(issue = issue.number, error = %e, "could not record issue run");
             }
         }
+    }
+
+    /// Append to an issue's timeline, and tell whoever is watching.
+    ///
+    /// A failed append is logged and swallowed. The timeline is a record of
+    /// work, not a gate on it: losing the note that a card moved is bad,
+    /// and refusing the move because the note could not be written is
+    /// worse.
+    async fn record(&self, issue: &IssueRow, actor: IssueActor, body: IssueEventBody) {
+        let entry = NewIssueEvent {
+            issue_id: issue.id.clone(),
+            project_id: issue.project_id.clone(),
+            number: issue.number,
+            actor,
+            body,
+        };
+        match self.store.append_event(&entry).await {
+            Ok(_) => self
+                .events
+                .timeline_changed(&issue.project_id, issue.number),
+            Err(e) => {
+                tracing::error!(
+                    issue = issue.number,
+                    error = %e,
+                    "could not record a timeline entry; the change itself stands"
+                );
+            }
+        }
+    }
+
+    /// Record whatever this edit is worth saying, if anything.
+    async fn record_diff(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
+        for body in crate::timeline::diff_events(before, after) {
+            self.record(after, actor.clone(), body).await;
+        }
+    }
+
+    /// Say something on an issue.
+    ///
+    /// Recording is all this does. Whether the comment also *wakes* the
+    /// assignee is the caller's next question and a separate decision — see
+    /// [`Self::comment_delivery`].
+    pub async fn comment(
+        &self,
+        project: &ProjectId,
+        number: i64,
+        actor: IssueActor,
+        text: &str,
+    ) -> Result<IssueEventRow> {
+        self.writable_project(project).await?;
+        let issue = self.get_issue(project, number).await?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(ProjectError::invalid("text", "a comment cannot be empty"));
+        }
+        let entry = self
+            .store
+            .append_event(&NewIssueEvent {
+                issue_id: issue.id.clone(),
+                project_id: project.clone(),
+                number,
+                actor,
+                body: IssueEventBody::Comment {
+                    text: text.to_owned(),
+                },
+            })
+            .await?;
+        self.events.timeline_changed(project, number);
+        Ok(entry)
+    }
+
+    /// One issue's timeline, oldest first.
+    pub async fn timeline(&self, project: &ProjectId, number: i64) -> Result<Vec<IssueEventRow>> {
+        let issue = self.get_issue(project, number).await?;
+        Ok(self.store.list_events(&issue.id).await?)
     }
 
     /// Every run of one issue, newest first.
@@ -334,6 +410,7 @@ impl ProjectManager {
     pub async fn create_issue(
         &self,
         project: &ProjectId,
+        actor: IssueActor,
         new: NewIssueRequest,
     ) -> Result<IssueRow> {
         self.writable_project(project).await?;
@@ -356,6 +433,19 @@ impl ProjectManager {
             })
             .await?;
         self.events.board_changed(project, Some(issue.number));
+        self.record(&issue, actor.clone(), IssueEventBody::Opened)
+            .await;
+        if let Some(assignee) = issue.assignee.clone() {
+            self.record(
+                &issue,
+                actor,
+                IssueEventBody::Assigned {
+                    from: None,
+                    to: Some(assignee),
+                },
+            )
+            .await;
+        }
         self.dispatch_if_triggered(Transition::created(&issue), &issue)
             .await;
         Ok(issue)
@@ -365,6 +455,7 @@ impl ProjectManager {
         &self,
         project: &ProjectId,
         number: i64,
+        actor: IssueActor,
         update: IssueUpdate,
     ) -> Result<IssueRow> {
         self.writable_project(project).await?;
@@ -407,6 +498,7 @@ impl ProjectManager {
         }
         let after = self.get_issue(project, number).await?;
         self.events.board_changed(project, Some(number));
+        self.record_diff(&before, &after, actor).await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         Ok(after)
@@ -418,6 +510,7 @@ impl ProjectManager {
         &self,
         project: &ProjectId,
         number: i64,
+        actor: IssueActor,
         status: IssueStatus,
         ordered_numbers: &[i64],
     ) -> Result<IssueRow> {
@@ -441,6 +534,7 @@ impl ProjectManager {
             });
         }
         let after = self.get_issue(project, number).await?;
+        self.record_diff(&before, &after, actor).await;
         self.dispatch_if_triggered(Transition::between(&before, &after), &after)
             .await;
         Ok(after)

@@ -1341,7 +1341,31 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_issue_runs_unsettled
                     ON issue_runs(created_at) WHERE settled_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_issue_runs_log
-                    ON issue_runs(issue_id, created_at DESC);",
+                    ON issue_runs(issue_id, created_at DESC);
+                -- The issue timeline: comments and system events in one
+                -- stream, because a reader wants them interleaved and a
+                -- second table would only have to be merged back.
+                CREATE TABLE IF NOT EXISTS issue_events (
+                    id         TEXT    PRIMARY KEY,
+                    issue_id   TEXT    NOT NULL,
+                    project_id TEXT    NOT NULL,
+                    number     INTEGER NOT NULL,
+                    -- 'user' or 'agent:<id>'.
+                    actor      TEXT    NOT NULL,
+                    -- Derived from `body`, stored so a filter by kind does
+                    -- not have to parse every row's JSON.
+                    kind       TEXT    NOT NULL,
+                    body       TEXT    NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                -- Reading order for one issue, and the range scan a
+                -- follow-up run's brief uses to take only the delta.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_timeline
+                    ON issue_events(issue_id, created_at);
+                -- The project-wide activity feed, derived from this same
+                -- table rather than stored a second time.
+                CREATE INDEX IF NOT EXISTS idx_issue_events_feed
+                    ON issue_events(project_id, created_at DESC);",
     )
     .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 

@@ -49,4 +49,8 @@ impl baybo_project::ProjectEvents for GatewayProjectEvents {
     fn run_changed(&self, project: &ProjectId, issue: i64) {
         self.emit(project, ProjectChangeScope::Run, Some(issue));
     }
+
+    fn timeline_changed(&self, project: &ProjectId, issue: i64) {
+        self.emit(project, ProjectChangeScope::Timeline, Some(issue));
+    }
 }

@@ -110,6 +110,11 @@ pub enum ProjectChangeScope {
     Board,
     /// One issue's execution state — a run was queued, started, settled.
     Run,
+    /// One issue's timeline gained an entry — a comment, or a system note.
+    /// Distinct from [`Self::Board`] because no card moved: a board that
+    /// refetched every column to learn somebody said something would be
+    /// doing the most expensive thing for the least reason.
+    Timeline,
 }
 
 /// Reference to a media payload that travels alongside a [`Message`].

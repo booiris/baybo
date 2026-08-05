@@ -17,8 +17,8 @@ use utoipa_axum::routes;
 use baybo_model::{AgentProfileId, ProjectId};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError};
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate,
-    RunStatus, RunTrigger,
+    IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
+    ProjectRow, ProjectUpdate, RunStatus, RunTrigger,
 };
 
 use crate::api::dto::{ErrorBody, ListResponse};
@@ -34,6 +34,8 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_issue, update_issue))
         .routes(routes!(move_issue))
         .routes(routes!(list_issue_runs))
+        .routes(routes!(list_issue_events))
+        .routes(routes!(create_comment))
         .routes(routes!(list_active_runs))
         .routes(routes!(cancel_run))
         .routes(routes!(retry_run))
@@ -270,6 +272,51 @@ impl From<RunTrigger> for RunTriggerDto {
             RunTrigger::Retry => Self::Retry,
         }
     }
+}
+
+/// One entry on an issue's timeline.
+///
+/// The body is flattened, so an entry is one object with a `kind` field
+/// rather than a wrapper around a payload — the client switches on `kind`
+/// to pick a renderer and reads the rest off the same object.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueEventDto {
+    pub id: String,
+    pub number: i64,
+    /// `"user"`, or the agent's id. Which of the two it is comes from
+    /// [`Self::actor_is_agent`] rather than from parsing this.
+    pub actor: String,
+    pub actor_is_agent: bool,
+    /// The typed body: `kind` plus that kind's own fields.
+    #[serde(flatten)]
+    pub body: serde_json::Value,
+    pub created_at_ms: i64,
+}
+
+impl From<IssueEventRow> for IssueEventDto {
+    fn from(row: IssueEventRow) -> Self {
+        let (actor, actor_is_agent) = match &row.actor {
+            IssueActor::User => ("user".to_owned(), false),
+            IssueActor::Agent(id) => (id.to_string(), true),
+        };
+        Self {
+            id: row.id.as_str().to_owned(),
+            number: row.number,
+            actor,
+            actor_is_agent,
+            // Infallible in practice: the body was deserialized from this
+            // same representation on the way out of the store. `null` keeps
+            // the surrounding entry renderable if that ever stops holding.
+            body: serde_json::to_value(&row.body).unwrap_or(serde_json::Value::Null),
+            created_at_ms: row.created_at.timestamp_millis(),
+        }
+    }
+}
+
+/// A comment being posted.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct NewCommentBody {
+    pub text: String,
 }
 
 /// One execution of an issue.
@@ -580,6 +627,7 @@ async fn create_issue(
         .project_manager
         .create_issue(
             &id,
+            IssueActor::User,
             NewIssueRequest {
                 title: req.title,
                 description: req.description,
@@ -648,6 +696,7 @@ async fn update_issue(
         .update_issue(
             &id,
             number,
+            IssueActor::User,
             IssueUpdate {
                 title: req.title,
                 description: req.description,
@@ -687,7 +736,13 @@ async fn move_issue(
     let id = parse_project_id(&project_id)?;
     let row = state
         .project_manager
-        .move_issue(&id, number, req.status.into(), &req.ordered_numbers)
+        .move_issue(
+            &id,
+            number,
+            IssueActor::User,
+            req.status.into(),
+            &req.ordered_numbers,
+        )
         .await
         .map_err(project_err)?;
     Ok(Json(IssueDto::from(row)))
@@ -721,6 +776,66 @@ async fn list_issue_runs(
         .map(IssueRunDto::from)
         .collect();
     Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/issues/{number}/events",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    responses(
+        (status = 200, description = "This issue's timeline, oldest first", body = inline(ListResponse<IssueEventDto>)),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+    )
+)]
+async fn list_issue_events(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+) -> Result<Json<ListResponse<IssueEventDto>>> {
+    let id = parse_project_id(&project_id)?;
+    let items = state
+        .project_manager
+        .timeline(&id, number)
+        .await
+        .map_err(project_err)?
+        .into_iter()
+        .map(IssueEventDto::from)
+        .collect();
+    Ok(Json(ListResponse::new(items)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/issues/{number}/comments",
+    tag = "projects",
+    params(
+        ("project_id" = String, Path, description = "Project id"),
+        ("number" = i64, Path, description = "Issue number within the project"),
+    ),
+    request_body = NewCommentBody,
+    responses(
+        (status = 200, description = "The recorded comment", body = IssueEventDto),
+        (status = 400, description = "Empty comment", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue", body = ErrorBody),
+    )
+)]
+async fn create_comment(
+    State(state): State<AdminState>,
+    Path((project_id, number)): Path<(String, i64)>,
+    Json(req): Json<NewCommentBody>,
+) -> Result<Json<IssueEventDto>> {
+    let id = parse_project_id(&project_id)?;
+    let entry = state
+        .project_manager
+        .comment(&id, number, IssueActor::User, &req.text)
+        .await
+        .map_err(project_err)?;
+    Ok(Json(IssueEventDto::from(entry)))
 }
 
 #[utoipa::path(

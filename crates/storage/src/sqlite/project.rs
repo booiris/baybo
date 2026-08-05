@@ -7,8 +7,9 @@ use rusqlite::OptionalExtension;
 use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::project::{
-    IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate, NewIssue, NewIssueRun,
-    ProjectRow, ProjectStore, ProjectUpdate, Result, RunStatus, RunTrigger,
+    IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus, IssueUpdate,
+    NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectStore, ProjectUpdate, Result,
+    RunStatus, RunTrigger,
 };
 
 pub struct SqliteProjectStore {
@@ -19,6 +20,64 @@ impl SqliteProjectStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// One issue's timeline, oldest first, optionally only what landed
+    /// strictly after `since_us`. Both readers want the same ordering and
+    /// the same row mapping; the only difference is the bound.
+    async fn events_query(
+        &self,
+        issue_id: String,
+        since_us: Option<i64>,
+    ) -> Result<Vec<IssueEventRow>> {
+        let raws = self
+            .pool
+            .interact("issue_events.list", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {EVENT_COLUMNS} FROM issue_events WHERE issue_id = ?1 \
+                     AND (?2 IS NULL OR created_at > ?2) ORDER BY created_at, id"
+                ))?;
+                Ok(stmt
+                    .query_map(rusqlite::params![issue_id, since_us], read_raw_event)?
+                    .collect::<rusqlite::Result<Vec<RawEvent>>>()?)
+            })
+            .await?;
+        raws.into_iter().map(event_from_raw).collect()
+    }
+}
+
+const EVENT_COLUMNS: &str = "id, issue_id, project_id, number, actor, body, created_at";
+
+/// Raw event tuple, in `EVENT_COLUMNS` order. `kind` is deliberately not
+/// read back: it is derived from `body`, so reading it would invite the two
+/// to disagree.
+type RawEvent = (String, String, String, i64, String, String, i64);
+
+fn read_raw_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn event_from_raw(raw: RawEvent) -> Result<IssueEventRow> {
+    let (id, issue_id, project_id, number, actor, body, created_at) = raw;
+    Ok(IssueEventRow {
+        id: baybo_model::IssueEventId::from(id),
+        issue_id: IssueId::from(issue_id),
+        project_id: ProjectId::parse(project_id)
+            .map_err(|e| StorageError::Storage(e.to_string()))?,
+        number,
+        actor: IssueActor::parse(&actor)
+            .ok_or_else(|| StorageError::Storage(format!("issue_events.actor unknown: {actor}")))?,
+        body: serde_json::from_str(&body)
+            .map_err(|e| StorageError::Storage(format!("issue_events.body unreadable: {e}")))?,
+        created_at: ts("issue_events.created_at", created_at)?,
+    })
 }
 
 const PROJECT_COLUMNS: &str = "id, name, description, workdir, archived_at, created_at, updated_at";
@@ -599,6 +658,51 @@ impl ProjectStore for SqliteProjectStore {
         }
     }
 
+    async fn append_event(&self, new: &NewIssueEvent) -> Result<IssueEventRow> {
+        let row = IssueEventRow {
+            id: baybo_model::IssueEventId::generate(),
+            issue_id: new.issue_id.clone(),
+            project_id: new.project_id.clone(),
+            number: new.number,
+            actor: new.actor.clone(),
+            body: new.body.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        let id = row.id.as_str().to_string();
+        let issue_id = row.issue_id.as_str().to_string();
+        let project = row.project_id.as_str().to_string();
+        let number = row.number;
+        let actor = row.actor.to_storage();
+        let kind = row.body.kind();
+        let body = serde_json::to_string(&row.body)
+            .map_err(|e| StorageError::Storage(format!("serialize issue event: {e}")))?;
+        let created = super::time::to_us(row.created_at);
+        self.pool
+            .interact("issue_events.append", move |conn| {
+                conn.execute(
+                    "INSERT INTO issue_events (id, issue_id, project_id, number, actor, kind, \
+                     body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![id, issue_id, project, number, actor, kind, body, created],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(row)
+    }
+
+    async fn list_events(&self, issue: &IssueId) -> Result<Vec<IssueEventRow>> {
+        self.events_query(issue.as_str().to_string(), None).await
+    }
+
+    async fn events_since(
+        &self,
+        issue: &IssueId,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<IssueEventRow>> {
+        self.events_query(issue.as_str().to_string(), Some(super::time::to_us(since)))
+            .await
+    }
+
     async fn list_runs(&self, issue: &IssueId) -> Result<Vec<IssueRunRow>> {
         let issue = issue.as_str().to_string();
         let raws = self
@@ -744,6 +848,7 @@ impl ProjectStore for SqliteProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_store::project::IssueEventBody;
 
     async fn store() -> (tempfile::TempDir, SqliteProjectStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -786,6 +891,154 @@ mod tests {
             assignee: None,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    fn event(issue: &IssueRow, actor: IssueActor, body: IssueEventBody) -> NewIssueEvent {
+        NewIssueEvent {
+            issue_id: issue.id.clone(),
+            project_id: issue.project_id.clone(),
+            number: issue.number,
+            actor,
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeline_reads_back_in_the_order_it_was_written() {
+        let (_dir, store) = store().await;
+        let p = project("proj-t", "T");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "Wire it", IssueStatus::Backlog))
+            .await
+            .unwrap();
+
+        let bodies = [
+            IssueEventBody::Opened,
+            IssueEventBody::Comment {
+                text: "start with the store".into(),
+            },
+            IssueEventBody::Moved {
+                from: IssueStatus::Backlog,
+                to: IssueStatus::InProgress,
+            },
+        ];
+        for body in &bodies {
+            store
+                .append_event(&event(&issue, IssueActor::User, body.clone()))
+                .await
+                .unwrap();
+        }
+
+        let timeline = store.list_events(&issue.id).await.unwrap();
+        assert_eq!(
+            timeline.iter().map(|e| e.body.clone()).collect::<Vec<_>>(),
+            bodies,
+            "oldest first — reading order, not newest-first like the run log"
+        );
+        assert!(timeline.iter().all(|e| e.actor == IssueActor::User));
+    }
+
+    #[tokio::test]
+    async fn a_typed_body_survives_the_round_trip_whole() {
+        // The payload is JSON in one column, so this is the test that a
+        // reader gets back exactly the variant a writer stored — every
+        // field, including the ones that are only sometimes there.
+        let (_dir, store) = store().await;
+        let p = project("proj-b", "B");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "Round trip", IssueStatus::Todo))
+            .await
+            .unwrap();
+        let agent = AgentProfileId::parse("dev-1".to_owned()).unwrap();
+        let run = IssueRunId::generate();
+        let bodies = [
+            IssueEventBody::Assigned {
+                from: None,
+                to: Some(agent.clone()),
+            },
+            IssueEventBody::RunStarted {
+                run_id: run.clone(),
+                attempt: 2,
+                trigger: RunTrigger::Retry,
+            },
+            IssueEventBody::RunSettled {
+                run_id: run,
+                attempt: 2,
+                status: RunStatus::Failed,
+                error: Some("the model gave up".into()),
+            },
+            IssueEventBody::Blocked {
+                reason: "waiting on tmux".into(),
+            },
+        ];
+        for body in &bodies {
+            store
+                .append_event(&event(
+                    &issue,
+                    IssueActor::Agent(agent.clone()),
+                    body.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let timeline = store.list_events(&issue.id).await.unwrap();
+        assert_eq!(
+            timeline.iter().map(|e| e.body.clone()).collect::<Vec<_>>(),
+            bodies
+        );
+        assert_eq!(
+            timeline[0].actor,
+            IssueActor::Agent(agent),
+            "an agent actor round-trips as that agent, not as the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_delta_since_a_moment_excludes_what_came_before_it() {
+        // What a follow-up run's brief is built from: everything said since
+        // the last run started, and nothing it already read.
+        let (_dir, store) = store().await;
+        let p = project("proj-d", "D");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "Delta", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        let first = store
+            .append_event(&event(
+                &issue,
+                IssueActor::User,
+                IssueEventBody::Comment {
+                    text: "before".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let later = store
+            .append_event(&event(
+                &issue,
+                IssueActor::User,
+                IssueEventBody::Comment {
+                    text: "after".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let delta = store
+            .events_since(&issue.id, first.created_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            delta.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![later.id],
+            "strictly after: the marker event itself was already read"
+        );
+        assert_eq!(store.list_events(&issue.id).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
