@@ -131,7 +131,9 @@ pub async fn ensure_commit_identity(work_dir: &Path) -> Result<()> {
 ///
 /// Idempotent: an existing worktree at `root` is adopted as-is rather
 /// than recreated, so a follow-up run continues where the last one
-/// stopped and an interrupted run leaves nothing to repair.
+/// stopped and an interrupted run leaves nothing to repair. `branch` is
+/// therefore only ever used to *create* — an adopted tree keeps whatever
+/// branch it is already on, which is what makes a retitle harmless.
 pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> {
     if !repo.join(".git").exists() {
         return Err(ProjectError::Workdir(anyhow::anyhow!(
@@ -184,6 +186,28 @@ pub async fn ensure(repo: &Path, root: &Path, branch: &str) -> Result<Checkout> 
         git(repo, &args).await?;
     }
     Ok(checkout)
+}
+
+/// The branch an existing worktree is actually on.
+///
+/// Authoritative in a way [`branch_name`] is not: that one is recomputed
+/// from the issue's *current* title, and a title is editable. Renaming an
+/// issue between runs would otherwise make the next run cut a second
+/// branch and strand the first one's commits — so once a worktree exists,
+/// it is asked rather than guessed. `None` when there is no worktree, or
+/// when its HEAD is unborn (a fresh orphan checkout has no ref yet).
+pub async fn branch_of(root: &Path) -> Option<String> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let out = run(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
 /// What happened when an issue's worktree was reclaimed.
@@ -706,6 +730,31 @@ mod tests {
                 .expect("second"),
             Reclaimed::Absent
         );
+    }
+
+    #[tokio::test]
+    async fn a_retitled_issue_keeps_the_branch_its_worktree_is_on() {
+        // The branch name is derived from the title, and titles are
+        // editable. Recomputing it after a rename would make the next run
+        // cut a second branch and strand the first one's commits — so once
+        // a worktree exists, it is asked rather than guessed.
+        let repo = repo_with_commit().await;
+        let root = repo.path().join("wt").join("10");
+        let first = branch_name(10, "Wire the board");
+        ensure(repo.path(), &root, &first).await.expect("cut");
+
+        let renamed = branch_name(10, "Wire the board properly");
+        assert_ne!(renamed, first, "the rename does change what a guess says");
+        assert_eq!(
+            branch_of(&root).await.as_deref(),
+            Some(first.as_str()),
+            "but the tree still knows what it is really on"
+        );
+
+        // …and adopting it again keeps that branch rather than switching.
+        ensure(repo.path(), &root, &renamed).await.expect("adopt");
+        assert_eq!(branch_of(&root).await.as_deref(), Some(first.as_str()));
+        assert!(!branch_exists(repo.path(), &renamed).await.expect("check"));
     }
 
     #[tokio::test]

@@ -593,19 +593,18 @@ pub async fn build_managers(
         let store = stores.project.clone();
         let tx = issue_run_tx.clone();
         let owner = baybo_model::ChannelType::owner();
+        let paths = baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf());
         Arc::new(move |run: baybo_store::project::IssueRunRow| {
             let store = Arc::clone(&store);
             let tx = tx.clone();
             let owner = owner.clone();
+            let paths = paths.clone();
             tokio::spawn(async move {
                 // The brief is read at dispatch, not at enqueue: a comment
                 // left while the run was queued is part of what it should
                 // work on.
-                let brief = match store.get_issue(&run.project_id, run.number).await {
-                    Ok(Some(issue)) => {
-                        let said = comments_since_previous_run(&store, &run).await;
-                        issue_brief(&issue, &said)
-                    }
+                let issue = match store.get_issue(&run.project_id, run.number).await {
+                    Ok(Some(issue)) => issue,
                     Ok(None) => {
                         tracing::warn!(run = %run.id, "issue is gone; not running it");
                         return;
@@ -615,9 +614,35 @@ pub async fn build_managers(
                         return;
                     }
                 };
+                let said = comments_since_previous_run(&store, &run).await;
+                let brief = issue_brief(&issue, &said);
+
+                // Cutting the worktree happens here, on this spawned task,
+                // and not in the router: `git worktree add` shells out, and
+                // the router's handler is awaited on the `select!` loop that
+                // also serves every user message and agent response.
+                let checkout = match prepare_checkout(&store, &paths, &issue).await {
+                    Ok(root) => root,
+                    Err(e) => {
+                        tracing::warn!(run = %run.id, error = %e, "could not open the issue's checkout");
+                        // Settle here too: nothing downstream will ever see
+                        // this run, so nothing downstream can settle it, and
+                        // a card that shimmers forever is the alternative.
+                        let _ = store
+                            .settle_run(
+                                &run.id,
+                                baybo_store::project::RunStatus::Failed,
+                                Some(&e.to_string()),
+                            )
+                            .await;
+                        return;
+                    }
+                };
+
                 let event = baybo_agent::router::IssueRunEvent {
                     run,
                     brief,
+                    checkout,
                     user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
                     channel: owner,
                 };
@@ -1197,6 +1222,28 @@ fn issue_brief(issue: &baybo_store::project::IssueRow, said: &[String]) -> Strin
         }
     }
     brief
+}
+
+/// Cut the issue's worktree if this is its first run, and make sure git
+/// has an identity to commit as.
+///
+/// Idempotent, so a retry or a boot-swept run re-enters the tree the last
+/// attempt left rather than starting from a clean one — half-done work
+/// belongs to the card, not to the attempt.
+async fn prepare_checkout(
+    store: &Arc<dyn baybo_store::project::ProjectStore>,
+    paths: &baybo_workspace::WorkspacePaths,
+    issue: &baybo_store::project::IssueRow,
+) -> anyhow::Result<std::path::PathBuf> {
+    let project = store
+        .get_project(&issue.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the issue's project is gone"))?;
+    let root = baybo_project::worktree::worktree_root(paths, &issue.project_id, issue.number);
+    let branch = baybo_project::worktree::branch_name(issue.number, &issue.title);
+    baybo_project::worktree::ensure(std::path::Path::new(&project.workdir), &root, &branch).await?;
+    baybo_project::worktree::ensure_commit_identity(&paths.work_dir()).await?;
+    Ok(root)
 }
 
 /// Comments left on the card since the previous run started — the delta a

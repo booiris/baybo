@@ -362,17 +362,17 @@ announces which of these will happen before sending.
     pre-rendered per process), but the issue brief now names the checkout
     and says commands run there, so the run is told the truth by the more
     specific and more recent text.
-  - **`prepare_checkout` runs `git worktree add` inline on the router's
-    `select!` loop**, which also serves every user message and agent
-    response. A slow checkout is head-of-line blocking for the whole
-    process.
+  - ~~`prepare_checkout` runs on the router's `select!` loop~~ **fixed**:
+    the worktree is cut in the run dispatcher, which is already a spawned
+    task, and the checkout path rides on `IssueRunEvent`. The router
+    shells out to nothing.
   - ~~`work/projects/` collides with a project named "Projects"~~
     **fixed**: worktrees live under `work/.worktrees/`, and a slug cannot
     contain a dot.
-  - **A retitle between runs strands the previous branch.** The branch is
-    looked up by a name recomputed from the *current* title, so renaming
-    an issue makes the next run cut a second branch and leave the first
-    one's commits behind.
+  - ~~A retitle between runs strands the previous branch~~ **fixed**: an
+    existing worktree is asked what branch it is on (`worktree::branch_of`)
+    rather than having the name recomputed from the current title. The
+    derived name is now only ever used to *create*.
   - ~~`git worktree remove` needs care~~ **handled**: a dirty tree comes
     back as `Reclaimed::Kept` with git's reason for the timeline; the
     255-after-deleting case is detected by re-checking the directory and

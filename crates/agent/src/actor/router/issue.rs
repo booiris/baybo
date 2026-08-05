@@ -41,6 +41,14 @@ pub struct IssueRunEvent {
     /// description, assembled by the caller so this module never has to
     /// know the issue's shape.
     pub brief: String,
+    /// The worktree this run works in, already cut by the dispatcher.
+    ///
+    /// Prepared there rather than here on purpose: `git worktree add`
+    /// shells out, and this handler is awaited directly on the router's
+    /// `select!` loop — the same loop that serves every user message and
+    /// every agent response. A slow checkout must not be head-of-line
+    /// blocking for the whole process.
+    pub checkout: PathBuf,
     /// Who the run belongs to, for session ownership.
     pub user_id: String,
     pub channel: ChannelType,
@@ -86,26 +94,7 @@ impl Router {
             }
         }
 
-        // The worktree the run works in, made once the row is ours. A
-        // repository that cannot host one fails the run with a reason on
-        // the card, which is the only place anybody would look — an agent
-        // handed a session with nowhere to work would instead spend a turn
-        // discovering that for itself.
-        let checkout = match self.prepare_checkout(&event).await {
-            Ok(root) => root,
-            Err(e) => {
-                warn!(%run_id, error = %e, "could not open the issue's checkout");
-                settle(
-                    &store,
-                    self.project_events.as_ref(),
-                    &event.run,
-                    RunStatus::Failed,
-                    Some(&e.to_string()),
-                )
-                .await;
-                return;
-            }
-        };
+        let checkout = event.checkout.clone();
 
         record(
             &store,
@@ -124,6 +113,7 @@ impl Router {
         // a subscription opened afterwards can miss a fast failure entirely.
         let waiter = IssueRunWaiter {
             run: event.run.clone(),
+            checkout: checkout.clone(),
             session_id: session.id.clone(),
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
@@ -166,32 +156,6 @@ impl Router {
         }
 
         tokio::spawn(waiter.run(actor_token));
-    }
-
-    /// Cut the issue's worktree if this is its first run.
-    ///
-    /// Idempotent, so a retry or a boot-swept run re-enters the tree the
-    /// last attempt left rather than starting from a clean one — half-done
-    /// work belongs to the card, not to the attempt.
-    async fn prepare_checkout(&self, event: &IssueRunEvent) -> anyhow::Result<PathBuf> {
-        let store = self
-            .project_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no project store"))?;
-        let project_id = &event.run.project_id;
-        let issue = store
-            .get_issue(project_id, event.run.number)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
-        let project = store
-            .get_project(project_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("the issue's project is gone"))?;
-        let root = worktree::worktree_root(&self.workspace, project_id, issue.number);
-        let branch = worktree::branch_name(issue.number, &issue.title);
-        worktree::ensure(Path::new(&project.workdir), &root, &branch).await?;
-        worktree::ensure_commit_identity(&self.workspace.work_dir()).await?;
-        Ok(root)
     }
 
     /// The issue's session — reused across its runs, minted on the first.
@@ -319,6 +283,7 @@ async fn follow_up_on_comments(
 async fn surface_branch(
     store: &Arc<dyn ProjectStore>,
     events: Option<&Arc<dyn ProjectEvents>>,
+    checkout: &Path,
     run: &IssueRunRow,
 ) {
     let (Ok(Some(issue)), Ok(Some(project))) = (
@@ -330,7 +295,11 @@ async fn surface_branch(
     if issue.branch.is_some() {
         return;
     }
-    let branch = worktree::branch_name(issue.number, &issue.title);
+    // The worktree's own branch. Recomputing it from the title would
+    // record the wrong name for an issue renamed since its first run.
+    let Some(branch) = worktree::branch_of(checkout).await else {
+        return;
+    };
     if worktree::commits_ahead(Path::new(&project.workdir), &branch).await == 0 {
         return;
     }
@@ -372,10 +341,6 @@ async fn settle(
                 },
             )
             .await;
-            // Only after the row is settled: the per-issue live index would
-            // refuse the follow-up while this run still holds the slot.
-            follow_up_on_comments(store, events, run).await;
-            surface_branch(store, events, run).await;
         }
         Ok(false) => {}
         Err(e) => {
@@ -419,6 +384,9 @@ async fn record(
 /// Watches one run's turn and settles its ledger row.
 struct IssueRunWaiter {
     run: IssueRunRow,
+    /// The worktree this run worked in — asked for its branch once the run
+    /// is over, because that is the authoritative name.
+    checkout: PathBuf,
     session_id: SessionId,
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
@@ -439,6 +407,14 @@ impl IssueRunWaiter {
             error.as_deref(),
         )
         .await;
+
+        // After the row is settled, not before: the per-issue live index
+        // would refuse a follow-up while this run still held the slot.
+        // Only here, and not in `settle` itself — the two early-failure
+        // settles above never started anything, so there is no branch to
+        // surface and nothing that could have been said mid-run.
+        follow_up_on_comments(&self.store, self.events.as_ref(), &self.run).await;
+        surface_branch(&self.store, self.events.as_ref(), &self.checkout, &self.run).await;
     }
 
     async fn await_run(&mut self, actor_token: CancellationToken) -> (RunStatus, Option<String>) {

@@ -176,7 +176,13 @@ impl ProjectManager {
             return;
         };
         let root = crate::worktree::worktree_root(&self.paths, &after.project_id, after.number);
-        let branch = crate::worktree::branch_name(after.number, &after.title);
+        // The tree's own branch, not the one this issue's *current* title
+        // implies: a retitle between the run and the reclamation would
+        // otherwise delete-or-keep the wrong ref, or none at all.
+        let branch = match crate::worktree::branch_of(&root).await {
+            Some(branch) => branch,
+            None => crate::worktree::branch_name(after.number, &after.title),
+        };
         match crate::worktree::reclaim(Path::new(&project.workdir), &root, &branch).await {
             Ok(crate::worktree::Reclaimed::Removed { branch_deleted }) => {
                 self.record(
