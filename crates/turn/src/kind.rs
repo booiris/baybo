@@ -25,6 +25,8 @@ pub enum TurnInputKind {
     Compact,
     Spawned,
     SubagentNotification,
+    /// One execution of a board issue by its assignee.
+    IssueRun,
 }
 
 impl TurnInputKind {
@@ -74,6 +76,13 @@ pub enum TurnInput {
     SubagentNotification {
         content: Vec<ContentBlock>,
     },
+    /// One execution of a board issue. The run id rides in the payload so
+    /// a session hosting several runs can still say which turn belongs to
+    /// which — the reconcile path has no other way to tell them apart.
+    IssueRun {
+        run_id: baybo_model::IssueRunId,
+        brief: Vec<ContentBlock>,
+    },
 }
 
 impl TurnInput {
@@ -85,6 +94,7 @@ impl TurnInput {
             TurnInput::Compact => TurnInputKind::Compact,
             TurnInput::Spawned { .. } => TurnInputKind::Spawned,
             TurnInput::SubagentNotification { .. } => TurnInputKind::SubagentNotification,
+            TurnInput::IssueRun { .. } => TurnInputKind::IssueRun,
         }
     }
 }

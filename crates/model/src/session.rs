@@ -130,6 +130,17 @@ pub enum TriggerSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_title: Option<String>,
     },
+    /// The session an issue's work happens in. One per issue, reused by
+    /// every run of it — so a follow-up run sees what the last one did —
+    /// and never listed in the chat surface: a board's conversations live
+    /// on the board.
+    Issue {
+        project_id: crate::ProjectId,
+        issue_id: crate::IssueId,
+        /// The issue's human address, so a reader does not need a join to
+        /// say which card this belongs to.
+        number: i64,
+    },
 }
 
 impl TriggerSource {
@@ -138,15 +149,35 @@ impl TriggerSource {
         match self {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
+            TriggerSource::Issue { .. } => TriggerKind::Issue,
         }
     }
 
     /// The cron job this session fired for, or `None` for a user session.
     pub fn cron_job_id(&self) -> Option<&str> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron { cron_job_id, .. } => Some(cron_job_id),
+            _ => None,
         }
+    }
+
+    /// The issue this session works on, if it is an issue session.
+    pub fn issue(&self) -> Option<(&crate::ProjectId, &crate::IssueId, i64)> {
+        match self {
+            TriggerSource::Issue {
+                project_id,
+                issue_id,
+                number,
+            } => Some((project_id, issue_id, *number)),
+            _ => None,
+        }
+    }
+
+    /// Whether this session belongs to a project board. Such sessions are
+    /// never listed in the chat surface, never pushed, and never fed to the
+    /// dream pass: their conversation belongs to an issue.
+    pub fn is_project_session(&self) -> bool {
+        matches!(self, TriggerSource::Issue { .. })
     }
 
     /// The conversation that created this session's cron job, if any. Used
@@ -154,10 +185,10 @@ impl TriggerSource {
     /// fire) and as the delivery target of a one-shot fire's result.
     pub fn cron_origin_session_id(&self) -> Option<&SessionId> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron {
                 origin_session_id, ..
             } => origin_session_id.as_ref(),
+            _ => None,
         }
     }
 
@@ -173,8 +204,8 @@ impl TriggerSource {
     /// job's live title when the job still exists.
     pub fn cron_job_title(&self) -> Option<&str> {
         match self {
-            TriggerSource::User => None,
             TriggerSource::Cron { job_title, .. } => job_title.as_deref(),
+            _ => None,
         }
     }
 }
@@ -190,6 +221,8 @@ pub enum TriggerKind {
     User,
     Cron,
     Spawned,
+    /// Work on a project board. See docs/todo/kanban.md.
+    Issue,
 }
 /// Direct parent relationship for sessions spawned from another session.
 ///

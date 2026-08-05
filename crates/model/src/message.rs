@@ -238,6 +238,11 @@ pub enum MessageSource {
     /// (`baybo_context::prompts::interjection`). See
     /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
+    /// A board issue's brief, framed at run time: synthesized by the agent
+    /// and hidden from chat surfaces, but tracked distinctly so a card's
+    /// work log can tell "this is the instruction" from "this is what the
+    /// agent said about it".
+    IssueBrief,
     /// A cron job's fire-time framed prompt: synthesized by the agent and
     /// hidden from the chat transcript, but tracked distinctly so operator
     /// surfaces identify a fire by provenance rather than by sniffing the
@@ -307,6 +312,7 @@ impl MessageSource {
             MessageSource::User => "user",
             MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
+            MessageSource::IssueBrief => "issue_brief",
             MessageSource::CronNotification => "cron_notification",
             MessageSource::RecalledMemory => "recalled_memory",
             MessageSource::SystemPromptUpdate => "system_prompt_update",
@@ -323,6 +329,7 @@ impl std::str::FromStr for MessageSource {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "user" => Ok(MessageSource::User),
+            "issue_brief" => Ok(MessageSource::IssueBrief),
             "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
             "cron_notification" => Ok(MessageSource::CronNotification),
@@ -391,6 +398,16 @@ impl ChatMessage {
     /// `baybo_context::prompts::cron::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
     /// the operator cron inbox can locate it by provenance instead of sniffing
     /// the `[cron:<id>]` framing tag, while the chat transcript still hides it.
+    /// A board issue's brief, as the run reads it.
+    pub fn issue_brief(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::IssueBrief,
+        }
+    }
+
     pub fn cron_fire(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,
@@ -783,6 +800,7 @@ mod tests {
                 MessageSource::User
                 | MessageSource::UserInterjection
                 | MessageSource::Cron
+                | MessageSource::IssueBrief
                 | MessageSource::CronNotification
                 | MessageSource::RecalledMemory
                 | MessageSource::SystemPromptUpdate
@@ -792,6 +810,7 @@ mod tests {
             }
         }
         vec![
+            MessageSource::IssueBrief,
             MessageSource::User,
             MessageSource::UserInterjection,
             MessageSource::Cron,

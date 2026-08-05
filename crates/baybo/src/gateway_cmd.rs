@@ -509,6 +509,22 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    // Board runs that never finished: a `running` row whose actor died with
+    // the process is work that was recorded and then interrupted, so boot
+    // returns it to the queue and hands it back out. Idempotent — a settled
+    // run is never picked up, and a re-claim of one already in flight is
+    // refused by the claim itself.
+    {
+        let projects = Arc::clone(&graph.project_manager);
+        task_tracker.track(tokio::spawn(async move {
+            match projects.resume_unsettled_runs().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(runs = n, "resumed issue runs interrupted by shutdown"),
+                Err(e) => tracing::warn!(error = %e, "could not resume interrupted issue runs"),
+            }
+        }));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),

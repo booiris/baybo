@@ -75,6 +75,7 @@ export type MessageSource =
   | 'user'
   | 'user_interjection'
   | 'cron'
+  | 'issue_brief'
   | 'cron_notification'
   | 'recalled_memory'
   | 'system_prompt_update'

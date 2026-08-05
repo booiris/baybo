@@ -1302,6 +1302,8 @@ mod tests {
                 turn_lifecycle: Arc::clone(&turn_lifecycle),
                 cron_store: Arc::clone(&cron_store) as Arc<dyn CronStore>,
                 cron_trigger_rx,
+                issue_run_rx: None,
+                project_store: None,
                 actor_parent_token: CancellationToken::new(),
                 rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
             });

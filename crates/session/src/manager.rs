@@ -189,6 +189,7 @@ impl SessionManager {
         let prefix = match &trigger {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
+            TriggerSource::Issue { .. } => "issue-",
         };
         let id = if prefix.is_empty() {
             SessionId::new()

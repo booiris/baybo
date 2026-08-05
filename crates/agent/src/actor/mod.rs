@@ -99,6 +99,15 @@ pub enum AgentMessage {
         /// [`BuiltinFireContext`]. `None` for every job a user created.
         builtin: Option<BuiltinFireContext>,
     },
+    /// One execution of a board issue. Runs in the issue's own session, so
+    /// a follow-up run sees what the last one did. Nothing is dispatched to
+    /// a channel: the outcome is reported onto the card by the waiter that
+    /// watches this turn's terminal edge.
+    IssueRun {
+        run_id: baybo_model::IssueRunId,
+        number: i64,
+        brief: String,
+    },
     /// A one-shot cron fire finished, and its result belongs in **this**
     /// conversation (the one that scheduled the turn). Handled at a turn
     /// boundary with **no inference**: the actor appends the framed result as
@@ -167,6 +176,7 @@ impl mailbox::Prioritized for AgentMessage {
             AgentMessage::UserInput(_)
             | AgentMessage::UserInputBatch(_)
             | AgentMessage::CronTrigger { .. }
+            | AgentMessage::IssueRun { .. }
             | AgentMessage::SubagentSpawned { .. }
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
             // Same tier as a finished background job: both are autonomous
@@ -467,6 +477,22 @@ impl AgentActor {
                     }
                 }
             }
+            AgentMessage::IssueRun {
+                run_id,
+                number,
+                brief,
+            } => {
+                debug!(session_id = %session_id, %run_id, number, "received issue run");
+                if let Err(e) = self.dispatch_issue_run(&run_id, number, &brief).await {
+                    // A cancelled run is not a failed one — the operator
+                    // asked for it to stop, and the waiter records that.
+                    if is_turn_cancelled(&e) {
+                        info!(session_id = %session_id, %run_id, "issue run cancelled");
+                    } else {
+                        error!(session_id = %session_id, %run_id, error = %e, "issue run failed");
+                    }
+                }
+            }
             AgentMessage::CronTrigger {
                 job_id,
                 title,
@@ -639,6 +665,28 @@ impl AgentActor {
     /// invisible, so nothing goes out here: its result is picked up off this
     /// turn's terminal lifecycle edge (by the router's cron waiter) and
     /// delivered into the conversation that scheduled it.
+    /// Run an issue's brief as one turn. No channel dispatch: an issue's
+    /// audience is its card, and the run's outcome is recorded by the
+    /// waiter off this turn's terminal lifecycle edge.
+    async fn dispatch_issue_run(
+        &mut self,
+        run_id: &baybo_model::IssueRunId,
+        number: i64,
+        brief: &str,
+    ) -> anyhow::Result<()> {
+        let turn_input = TurnInput::IssueRun {
+            run_id: run_id.clone(),
+            brief: vec![baybo_model::ContentBlock::Text(brief.to_string())],
+        };
+        self.volatile
+            .agent_loop
+            .append_issue_brief(number, brief)
+            .await?;
+        self.run_agent_loop(turn_input, None, None, None, None, None)
+            .await?;
+        Ok(())
+    }
+
     async fn dispatch_cron_prompt(
         &mut self,
         prompt: &str,

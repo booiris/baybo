@@ -7991,7 +7991,8 @@
         "enum": [
           "user",
           "cron",
-          "subagent"
+          "subagent",
+          "issue"
         ]
       },
       "SetAgentAvatarRequest": {
@@ -8418,7 +8419,8 @@
           "cron_notification",
           "compact",
           "spawned",
-          "subagent_notification"
+          "subagent_notification",
+          "issue_run"
         ]
       },
       "TurnOrigin": {
@@ -8427,7 +8429,8 @@
         "enum": [
           "user",
           "cron",
-          "spawned"
+          "spawned",
+          "issue"
         ]
       },
       "TurnStatus": {

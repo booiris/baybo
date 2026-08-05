@@ -178,6 +178,9 @@ pub enum SessionKind {
     /// Subagent spawned by another session — its trigger is inherited
     /// from the root, but `lineage.kind == Subagent` wins for display.
     Subagent,
+    /// Work on a project board. Browsable in the trace viewer; never in
+    /// the chat surface.
+    Issue,
 }
 
 fn derive_session_kind(session: &Session) -> SessionKind {
@@ -190,6 +193,7 @@ fn derive_session_kind(session: &Session) -> SessionKind {
     }
     match session.trigger {
         baybo_model::TriggerSource::Cron { .. } => SessionKind::Cron,
+        baybo_model::TriggerSource::Issue { .. } => SessionKind::Issue,
         baybo_model::TriggerSource::User => SessionKind::User,
     }
 }

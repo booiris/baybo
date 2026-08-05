@@ -419,6 +419,10 @@ fn memory_recall_query(input: &TurnInput) -> Option<Vec<ContentBlock>> {
     match input {
         TurnInput::UserChat { content } => Some(content.clone()),
         TurnInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
+        // An issue run recalls: the brief is the assignee's instruction,
+        // and prior work on the same repository is exactly the context
+        // that keeps a second run from repeating the first.
+        TurnInput::IssueRun { brief, .. } => Some(brief.clone()),
         TurnInput::Compact
         | TurnInput::Spawned { .. }
         | TurnInput::SubagentNotification { .. }
@@ -460,6 +464,11 @@ fn is_subagent(session: &Session) -> bool {
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
+        // An issue's session belongs to a board, not to a person: its
+        // transcript is the card's work log, and consolidating it into the
+        // assignee's long-term memory would file project work as personal
+        // history.
+        TriggerSource::Issue { .. } => false,
     };
     user_trigger && !is_subagent(session)
 }
@@ -2199,6 +2208,15 @@ impl AgentLoop {
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
+    /// Append a board issue's brief as the run's input row.
+    pub async fn append_issue_brief(&mut self, number: i64, brief: &str) -> anyhow::Result<()> {
+        self.context_manager.ensure_seeded().await;
+        let framed = baybo_context::prompts::issue::frame_issue_brief(number, brief);
+        let msg = ChatMessage::issue_brief(vec![ContentBlock::Text(framed)]);
+        self.context_manager.append(&msg).await;
+        Ok(())
+    }
+
     pub async fn append_cron_fire(
         &mut self,
         turn_id: &str,

@@ -32,6 +32,10 @@ async fn build_router_with_seeded_turns(sessions: &[(&str, TriggerKind, usize)])
                 TriggerKind::Cron => TurnInput::Cron {
                     action_payload: serde_json::json!({}),
                 },
+                TriggerKind::Issue => TurnInput::IssueRun {
+                    run_id: baybo_model::IssueRunId::generate(),
+                    brief: vec![ContentBlock::Text("work".into())],
+                },
                 TriggerKind::Spawned => TurnInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },

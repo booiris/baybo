@@ -2515,7 +2515,7 @@ export interface components {
          *     label for the trace browser list view.
          * @enum {string}
          */
-        SessionKind: "user" | "cron" | "subagent";
+        SessionKind: "user" | "cron" | "subagent" | "issue";
         /** @description Request body for `PUT /v1/agents/{agent_id}/avatar`. */
         SetAgentAvatarRequest: {
             /**
@@ -2714,13 +2714,13 @@ export interface components {
          * @description Wire mirror of [`baybo_turn::TurnInputKind`] — what payload fed the turn.
          * @enum {string}
          */
-        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification";
+        TurnInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification" | "issue_run";
         /**
          * @description Wire mirror of a turn's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
          * @enum {string}
          */
-        TurnOrigin: "user" | "cron" | "spawned";
+        TurnOrigin: "user" | "cron" | "spawned" | "issue";
         /**
          * @description Wire mirror of [`baybo_turn::TurnStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);

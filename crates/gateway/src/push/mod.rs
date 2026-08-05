@@ -590,6 +590,16 @@ impl PushDispatcher {
         // delivery pushes (as a `CronNotification`). Pushing here as well would
         // buzz the phone twice for one scheduled task, with the deep link
         // pointing at a session the user cannot even open.
+        // An issue run is board work, not a message to the operator: the
+        // card shows its state, and buzzing a phone for every run of every
+        // issue is exactly the noise a board exists to absorb.
+        if session.trigger.is_project_session() {
+            tracing::debug!(
+                session = %ev.session_id,
+                "push: issue runs report on their card; not pushing"
+            );
+            return;
+        }
         if ev.kind == TurnInputKind::Cron && !session.trigger.is_cron_conversation() {
             tracing::debug!(
                 session = %ev.session_id,

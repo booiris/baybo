@@ -608,6 +608,7 @@ pub enum TurnInputKind {
     Compact,
     Spawned,
     SubagentNotification,
+    IssueRun,
 }
 
 impl From<baybo_turn::TurnInputKind> for TurnInputKind {
@@ -619,6 +620,7 @@ impl From<baybo_turn::TurnInputKind> for TurnInputKind {
             baybo_turn::TurnInputKind::Compact => Self::Compact,
             baybo_turn::TurnInputKind::Spawned => Self::Spawned,
             baybo_turn::TurnInputKind::SubagentNotification => Self::SubagentNotification,
+            baybo_turn::TurnInputKind::IssueRun => Self::IssueRun,
         }
     }
 }
@@ -631,6 +633,7 @@ pub enum TurnOrigin {
     User,
     Cron,
     Spawned,
+    Issue,
 }
 
 impl From<baybo_model::TriggerKind> for TurnOrigin {
@@ -639,6 +642,7 @@ impl From<baybo_model::TriggerKind> for TurnOrigin {
             baybo_model::TriggerKind::User => Self::User,
             baybo_model::TriggerKind::Cron => Self::Cron,
             baybo_model::TriggerKind::Spawned => Self::Spawned,
+            baybo_model::TriggerKind::Issue => Self::Issue,
         }
     }
 }
@@ -923,6 +927,7 @@ pub enum SessionKind {
     User,
     Cron,
     Subagent,
+    Issue,
 }
 
 impl From<baybo_query::SessionKind> for SessionKind {
@@ -931,6 +936,7 @@ impl From<baybo_query::SessionKind> for SessionKind {
             baybo_query::SessionKind::User => Self::User,
             baybo_query::SessionKind::Cron => Self::Cron,
             baybo_query::SessionKind::Subagent => Self::Subagent,
+            baybo_query::SessionKind::Issue => Self::Issue,
         }
     }
 }
@@ -941,6 +947,7 @@ impl From<SessionKind> for baybo_query::SessionKind {
             SessionKind::User => Self::User,
             SessionKind::Cron => Self::Cron,
             SessionKind::Subagent => Self::Subagent,
+            SessionKind::Issue => Self::Issue,
         }
     }
 }

@@ -2747,6 +2747,12 @@ pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &Channel
 /// A recurring fire's session *is* the notification, so it is listed and
 /// replyable like any other conversation.
 pub(crate) fn is_hidden_cron_session(session: &Session) -> bool {
+    if session.trigger.is_project_session() {
+        // A board's conversations belong to the board. An issue's session
+        // is reachable through its card and its transcript, never through
+        // the chat list — kanban and chat stay separate worlds.
+        return true;
+    }
     matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
 }
 

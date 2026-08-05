@@ -91,6 +91,7 @@ pub(super) fn rehydrate_message(
         MessageSource::User => ChatMessage::user(content),
         MessageSource::UserInterjection => ChatMessage::user_interjection(content),
         MessageSource::Cron => ChatMessage::cron_fire(content),
+        MessageSource::IssueBrief => ChatMessage::issue_brief(content),
         MessageSource::CronNotification => ChatMessage::cron_notification(content),
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::SystemPromptUpdate => ChatMessage::system_prompt_update(content),
@@ -297,6 +298,7 @@ impl SessionStore for SqliteSessionStore {
             baybo_model::TriggerKind::User => "user",
             baybo_model::TriggerKind::Cron => "cron",
             baybo_model::TriggerKind::Spawned => "spawned",
+            baybo_model::TriggerKind::Issue => "issue",
         };
         let parent_session = session
             .lineage
@@ -1405,6 +1407,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.created_at >= ?1 AND m.created_at < ?2 \
                          AND m.compaction_inserted = 0 \
                          AND m.source IN ({HUMAN_SOURCES_SQL}) \
@@ -1418,6 +1421,7 @@ impl SessionStore for SqliteSessionStore {
                        FROM session_messages m \
                        JOIN sessions s ON s.id = m.session_id \
                        WHERE s.dreamed_through_ordinal IS NOT NULL \
+                         AND s.trigger_kind != 'issue' \
                          AND m.ordinal > s.dreamed_through_ordinal \
                          AND m.compaction_inserted = 0 \
                        GROUP BY m.session_id \

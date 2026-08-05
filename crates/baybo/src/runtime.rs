@@ -195,6 +195,9 @@ pub struct ManagerGraph {
     /// `wire_router` twice panics loudly instead of silently handing
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
+    /// Recorded issue runs waiting to execute. A one-shot like
+    /// `cron_trigger_rx` — [`wire_router`] consumes it.
+    pub issue_run_rx: Option<mpsc::Receiver<baybo_agent::router::IssueRunEvent>>,
 
     /// Late-set slot for the actor-backed subagent spawner. The
     /// `spawn_subagent` tool holds a clone (taken at build time, before the
@@ -581,12 +584,52 @@ pub async fn build_managers(
     // --- Kanban projects (docs/todo/kanban.md). Board CRUD only for now;
     // the execution pipeline that turns a card into an agent run lands on
     // this same manager.
+    // The board's runs reach the router over a channel, so `baybo-project`
+    // never depends on the agent runtime. The ledger row is already written
+    // by the time anything is sent here — a full queue or a dead receiver
+    // costs a delay until the next boot sweep, never a lost run.
+    let (issue_run_tx, issue_run_rx) = mpsc::channel(64);
+    let issue_dispatch = {
+        let store = stores.project.clone();
+        let tx = issue_run_tx.clone();
+        let owner = baybo_model::ChannelType::owner();
+        Arc::new(move |run: baybo_store::project::IssueRunRow| {
+            let store = Arc::clone(&store);
+            let tx = tx.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                // The brief is read at dispatch, not at enqueue: a comment
+                // left while the run was queued is part of what it should
+                // work on.
+                let brief = match store.get_issue(&run.project_id, run.number).await {
+                    Ok(Some(issue)) => issue_brief(&issue),
+                    Ok(None) => {
+                        tracing::warn!(run = %run.id, "issue is gone; not running it");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(run = %run.id, error = %e, "could not read issue for run");
+                        return;
+                    }
+                };
+                let event = baybo_agent::router::IssueRunEvent {
+                    run,
+                    brief,
+                    user_id: baybo_gateway::auth::OWNER_USER_ID.to_string(),
+                    channel: owner,
+                };
+                if let Err(e) = tx.send(event).await {
+                    tracing::warn!(error = %e, "issue run could not reach the router");
+                }
+            });
+        }) as baybo_project::RunDispatch
+    };
+
     let project_manager = Arc::new(baybo_project::ProjectManager::new(
         stores.project.clone(),
         stores.agent_profile.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_paths.root().to_path_buf()),
-        // No executor yet: runs are recorded and wait for one.
-        baybo_project::no_dispatch(),
+        issue_dispatch,
     ));
 
     // --- security gateway + tool executor
@@ -778,6 +821,7 @@ pub async fn build_managers(
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
+        issue_run_rx: Some(issue_run_rx),
         subagent_spawner_slot,
         actor_parent_token,
         subagent_dispatch_limiter,
@@ -1063,6 +1107,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         turn_lifecycle: Arc::clone(&graph.turn_lifecycle),
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
+        issue_run_rx: graph.issue_run_rx.take(),
+        project_store: Some(graph.stores.project.clone()),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });
@@ -1117,4 +1163,15 @@ pub fn force_exit_watchdog(budget: std::time::Duration) {
         baybo_tools::builtin::bash::reap_tracked_process_groups();
         std::process::exit(0);
     });
+}
+
+/// What an issue's assignee is asked to work on: its title, and its
+/// description when it has one. Assembled here rather than in the router so
+/// the execution path never has to know an issue's shape.
+fn issue_brief(issue: &baybo_store::project::IssueRow) -> String {
+    if issue.description.trim().is_empty() {
+        issue.title.clone()
+    } else {
+        format!("{}\n\n{}", issue.title, issue.description)
+    }
 }

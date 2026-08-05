@@ -4603,3 +4603,80 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         cancelled.thinking
     );
 }
+
+#[tokio::test]
+async fn an_issue_run_executes_as_its_own_kind_of_turn() {
+    // A run happens in a session rooted at the issue, and `TurnLifecycle`
+    // only admits `TurnInput::IssueRun` under such a session — so this is
+    // also the check that the two agree.
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Issue {
+        project_id: baybo_model::ProjectId::parse("proj-a").expect("project id"),
+        issue_id: baybo_model::IssueId::from("issue-1"),
+        number: 7,
+    };
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    // An issue run is dispatched non-streaming, like a cron fire.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "Cleared the reconnect storm and added a regression test.".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    let run_id = baybo_model::IssueRunId::generate();
+    harness
+        .mailbox
+        .send(AgentMessage::IssueRun {
+            run_id: run_id.clone(),
+            number: 7,
+            brief: "Fix the WS reconnect storm\n\nThe timer never clears.".into(),
+        })
+        .await
+        .expect("mailbox accepts the run");
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // The brief reached the model framed as board work, not as something a
+    // person just typed.
+    let requests = harness.stub_llm.captured_requests();
+    let framed = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .filter(|m| matches!(m.role, Role::User))
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains("[issue #7]"))
+        .expect("a user turn carrying the issue framing");
+    assert!(
+        framed.contains("not a message from a person"),
+        "the run must not read as a chat turn: {framed}"
+    );
+    assert!(
+        framed.contains("Fix the WS reconnect storm"),
+        "carries the brief: {framed}"
+    );
+
+    // …and the turn is recorded as a run, which is what the waiter keys on
+    // to settle the ledger row.
+    let turns = harness
+        .turn_lifecycle
+        .list_by_session(&harness.session.id, None)
+        .await
+        .expect("turns");
+    let run_turn = turns
+        .iter()
+        .find(|t| t.input_kind() == baybo_turn::TurnInputKind::IssueRun)
+        .expect("the run opened a turn of its own kind");
+    assert!(
+        run_turn.is_terminal(),
+        "and it finished, so the waiter has an edge to settle on: {:?}",
+        run_turn.status
+    );
+
+    harness.shutdown().await;
+}
