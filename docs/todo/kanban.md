@@ -270,6 +270,27 @@ announces which of these will happen before sending.
   and the external backend exists only inside the subagent spawner. An
   external assignee is refused at enqueue with that reason, and giving
   external agents a top-level leg is its own piece of work.
+- **A run cannot reach the project's repository yet** (verified on master,
+  2026-08-05). Two independent reasons, both of which the worktree work
+  has to fix before isolation is even the question:
+  1. Bash's default cwd is `ToolContext::workspace_root` — the *workspace*
+     root. An unqualified `git status` in a run therefore runs against
+     baybo's own tree, and succeeds, which is the failure mode that hides
+     longest.
+  2. The workdir is not bound into the sandbox. `SandboxSpec::
+     writable_paths` is honoured **only inside the `FilesystemPolicy::
+     Workspace` arm** of the bwrap arg builder, and the agent layer only
+     ever builds `FilesystemPolicy::Permissive`
+     (`with_permissive_filesystem`). So under bwrap the checkout is
+     *absent* (ENOENT), not read-only. Docker binds `writable_paths`
+     outside the policy match, so it works there — which is exactly how a
+     hole like this stays hidden.
+
+  The trap when fixing it: all three existing `writable_paths` tests build
+  their spec with a helper whose default policy is `Workspace`, so they
+  exercise a branch production never takes. A new test must assert against
+  `Permissive`, and must be shown to fail with the fix reverted.
+
 - **Worktree per issue**: created lazily at first run under
   `<workspace>/projects/<pid>/worktrees/<number>-<slug>`, branch
   `issue/<number>-<slug>` off the repo's default branch. **Worktree and
