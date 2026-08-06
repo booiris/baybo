@@ -182,6 +182,36 @@ describe('applySyncReplace — the page\'s in-flight answer is the reply, not a 
     const work = rows.find((r) => r.kind === 'work');
     expect((work?.steps ?? []).map((s) => s.kind)).toEqual(['tool', 'prose']);
   });
+
+  // The live final `Frame::Message` can go missing (reconnect, `Frame::Gap`),
+  // leaving a `streaming` bubble on screen for a turn that has already ended.
+  // The next REPLACE page carries the server's finished reply, so re-overlaying
+  // the local partial rendered the same answer twice — the complete row then a
+  // truncated prefix of it — and the overlaid row stayed `streaming`, so it
+  // doubled again on every later REPLACE. `applySyncMerge` folds the persisted
+  // final into the bubble for this same case; in REPLACE the page already has
+  // it, so the fold is a drop.
+  it('drops a stale streaming partial when the turn has ended and the page has the reply', () => {
+    const prev = [userRow('summarize this'), streamingReply('here is the first')];
+    const page = [
+      userRow('summarize this'),
+      { key: 'row-s1-m4', role: 'assistant', text: 'here is the first point, and the second' } as TranscriptRow,
+    ];
+    const rows = applySyncReplace(prev, page, new Set(), null);
+    expect(rows.map((r) => `${r.role}:${r.text}`)).toEqual([
+      'user:summarize this',
+      'assistant:here is the first point, and the second',
+    ]);
+  });
+
+  it('still overlays the partial while the turn is genuinely running', () => {
+    const prev = [userRow('summarize this'), streamingReply('here is the first')];
+    const page = [userRow('summarize this')];
+    const rows = applySyncReplace(prev, page, new Set(), ACTIVE);
+    const tail = rows[rows.length - 1];
+    expect(tail.streaming).toBe(true);
+    expect(tail.text).toBe('here is the first');
+  });
 });
 
 describe('bundleAnswer — one judgement, two consumers', () => {
