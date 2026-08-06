@@ -323,6 +323,7 @@ dependencies = [
  "baybo-memory",
  "baybo-model",
  "baybo-pairing",
+ "baybo-process",
  "baybo-sandbox",
  "baybo-security",
  "baybo-setup",
@@ -367,6 +368,7 @@ dependencies = [
  "baybo-llm",
  "baybo-memory",
  "baybo-model",
+ "baybo-process",
  "baybo-sandbox",
  "baybo-security",
  "baybo-session",
@@ -405,6 +407,7 @@ dependencies = [
  "anyhow",
  "baybo-memory",
  "baybo-model",
+ "baybo-process",
  "chrono",
  "clap",
  "futures",
@@ -422,6 +425,7 @@ name = "baybo-bench-swe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "baybo-process",
  "chrono",
  "clap",
  "futures",
@@ -493,6 +497,7 @@ dependencies = [
  "baybo-memory",
  "baybo-model",
  "baybo-pairing",
+ "baybo-process",
  "baybo-query",
  "baybo-security",
  "baybo-session",
@@ -617,6 +622,7 @@ dependencies = [
  "async-trait",
  "base64",
  "baybo-model",
+ "baybo-process",
  "baybo-security",
  "baybo-storage",
  "baybo-store",
@@ -661,6 +667,7 @@ dependencies = [
  "baybo-llm",
  "baybo-model",
  "baybo-pairing",
+ "baybo-process",
  "baybo-query",
  "baybo-security",
  "baybo-session",
@@ -864,6 +871,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "baybo-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "baybo-query"
 version = "0.1.0"
 dependencies = [
@@ -890,6 +910,7 @@ name = "baybo-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "baybo-process",
  "libc",
  "serde",
  "tempfile",
@@ -959,6 +980,7 @@ dependencies = [
  "baybo-gateway",
  "baybo-llm",
  "baybo-model",
+ "baybo-process",
  "baybo-security",
  "baybo-storage",
  "baybo-store",
@@ -1119,6 +1141,7 @@ dependencies = [
  "base64",
  "baybo-llm",
  "baybo-model",
+ "baybo-process",
  "baybo-security",
  "baybo-session",
  "baybo-storage",

@@ -93,20 +93,18 @@ pub trait DetachedChild: Send {
 /// [`DetachedChild`] over a plain `tokio::process::Child` — bwrap (and the
 /// container-less backends). The Docker backend uses its own type that also
 /// removes the container on kill.
-pub struct TokioDetachedChild(pub tokio::process::Child);
+pub struct TokioDetachedChild(pub baybo_process::ManagedChild);
 
 #[async_trait]
 impl DetachedChild for TokioDetachedChild {
     fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.0
-            .stdout
-            .take()
+            .take_stdout()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.0
-            .stderr
-            .take()
+            .take_stderr()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     async fn wait(&mut self) -> i32 {
@@ -136,10 +134,12 @@ impl DetachedChild for TokioDetachedChild {
 /// `BackendNotExecutable`, `Io`, and other non-`BackendMissing` errors
 /// are returned immediately and do not trigger fallback — they signal
 /// a real problem with the chosen backend rather than its absence.
-pub fn current_platform_runner() -> Result<Arc<dyn SandboxRunner>, SandboxError> {
+pub fn current_platform_runner(
+    process_manager: Arc<baybo_process::ProcessManager>,
+) -> Result<Arc<dyn SandboxRunner>, SandboxError> {
     #[cfg(all(target_os = "linux", feature = "linux"))]
     {
-        match bwrap::BwrapRunner::discover() {
+        match bwrap::BwrapRunner::discover(Arc::clone(&process_manager)) {
             Ok(r) => return Ok(Arc::new(r)),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {
                 tracing::warn!("bwrap not usable; trying docker fallback");
@@ -149,7 +149,7 @@ pub fn current_platform_runner() -> Result<Arc<dyn SandboxRunner>, SandboxError>
     }
     #[cfg(all(target_os = "macos", feature = "macos"))]
     {
-        match sandbox_exec::SandboxExecRunner::discover() {
+        match sandbox_exec::SandboxExecRunner::discover(Arc::clone(&process_manager)) {
             Ok(r) => return Ok(Arc::new(r)),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {
                 tracing::warn!("sandbox-exec not usable; trying docker fallback");
@@ -159,7 +159,7 @@ pub fn current_platform_runner() -> Result<Arc<dyn SandboxRunner>, SandboxError>
     }
     #[cfg(feature = "docker")]
     {
-        match docker::DockerRunner::discover() {
+        match docker::DockerRunner::discover(process_manager) {
             Ok(r) => {
                 tracing::info!("using docker as the sandbox backend");
                 return Ok(Arc::new(r));
@@ -172,9 +172,10 @@ pub fn current_platform_runner() -> Result<Arc<dyn SandboxRunner>, SandboxError>
 }
 
 pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
+    let process_manager = baybo_process::ProcessManager::transient();
     #[cfg(all(target_os = "linux", feature = "linux"))]
     {
-        match bwrap::BwrapRunner::probe().await {
+        match bwrap::BwrapRunner::probe(Arc::clone(&process_manager)).await {
             Ok(a) => return Ok(a),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {}
             Err(e) => return Err(e),
@@ -182,7 +183,7 @@ pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
     }
     #[cfg(all(target_os = "macos", feature = "macos"))]
     {
-        match sandbox_exec::SandboxExecRunner::probe().await {
+        match sandbox_exec::SandboxExecRunner::probe(Arc::clone(&process_manager)).await {
             Ok(a) => return Ok(a),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {}
             Err(e) => return Err(e),
@@ -190,7 +191,7 @@ pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
     }
     #[cfg(feature = "docker")]
     {
-        match docker::DockerRunner::probe().await {
+        match docker::DockerRunner::probe(process_manager).await {
             Ok(a) => return Ok(a),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {}
             Err(e) => return Err(e),

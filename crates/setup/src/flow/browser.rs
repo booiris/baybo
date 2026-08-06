@@ -62,13 +62,17 @@ async fn probe_docker_for_prompt() -> Option<bool> {
     }
     use std::process::Stdio;
     use tokio::process::Command;
-    let probe = Command::new("docker")
+    let process_manager = baybo_process::ProcessManager::transient();
+    let mut command = Command::new("docker");
+    command
         .arg("info")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .status();
+        .stdin(Stdio::null());
+    let mut child = process_manager
+        .spawn(&mut command, "setup-probe:docker")
+        .ok()?;
+    let probe = child.wait();
     match tokio::time::timeout(Duration::from_secs(3), probe).await {
         Ok(Ok(status)) if status.success() => Some(true),
         Ok(Ok(_)) => Some(false),

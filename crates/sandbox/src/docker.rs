@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -33,6 +33,7 @@ pub const DEFAULT_IMAGE: &str = "debian:stable-slim";
 /// docker daemon. Selected by `current_platform_runner()` when the
 /// native backend (bwrap on Linux, sandbox-exec on macOS) is missing.
 pub struct DockerRunner {
+    process_manager: Arc<baybo_process::ProcessManager>,
     binary: PathBuf,
     image: String,
     /// Set by `warm()`. When present, every `run()` uses this digest
@@ -49,13 +50,18 @@ impl DockerRunner {
     /// having permission to talk to its socket). Without it, every
     /// ExecCommand call would fail at the first `docker run` instead
     /// of at startup.
-    pub fn discover() -> Result<Self, SandboxError> {
+    pub fn discover(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<Self, SandboxError> {
         let binary = locate_binary("docker")?;
-        let probe = std::process::Command::new(&binary)
+        let mut command = std::process::Command::new(&binary);
+        command
             .args(["info", "--format", "{{.ServerVersion}}"])
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
+            .stderr(Stdio::piped());
+        let probe = process_manager
+            .spawn_std(&mut command, "sandbox-probe:docker-info")
+            .and_then(baybo_process::ManagedStdChild::wait_with_output)
             .map_err(SandboxError::Io)?;
         if !probe.status.success() {
             let message = String::from_utf8_lossy(&probe.stderr).trim().to_string();
@@ -69,6 +75,7 @@ impl DockerRunner {
             });
         }
         Ok(Self {
+            process_manager,
             binary,
             image: DEFAULT_IMAGE.into(),
             pinned_image: OnceLock::new(),
@@ -81,9 +88,20 @@ impl DockerRunner {
         self
     }
 
-    pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
+    pub async fn probe(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<SandboxAvailability, SandboxError> {
         let binary = locate_binary("docker")?;
-        let out = Command::new(&binary).arg("--version").output().await?;
+        let mut command = Command::new(&binary);
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = process_manager
+            .spawn(&mut command, "sandbox-probe:docker-version")?
+            .wait_with_output()
+            .await?;
         Ok(SandboxAvailability {
             backend: Backend::Docker,
             binary_path: binary,
@@ -115,7 +133,8 @@ impl DockerRunner {
     }
 
     async fn image_is_local(&self) -> Result<bool, SandboxError> {
-        let out = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args([
                 "image",
                 "inspect",
@@ -124,20 +143,27 @@ impl DockerRunner {
                 self.image.as_str(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(SandboxError::Io)?;
+            .stderr(Stdio::null());
+        let mut child = self
+            .process_manager
+            .spawn(&mut command, "sandbox:docker-image-inspect")?;
+        let out = child.wait().await?;
         Ok(out.success())
     }
 
     async fn pull_image(&self) -> Result<(), SandboxError> {
         tracing::info!(image = %self.image, "pulling sandbox container image (one-time per gateway boot)");
-        let out = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(["pull", self.image.as_str()])
-            .output()
-            .await
-            .map_err(SandboxError::Io)?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = self
+            .process_manager
+            .spawn(&mut command, "sandbox:docker-pull")?
+            .wait_with_output()
+            .await?;
         if !out.status.success() {
             return Err(SandboxError::BackendFailure {
                 status: out.status.code(),
@@ -152,7 +178,8 @@ impl DockerRunner {
         // use the first entry — there is exactly one for an image
         // pulled from a single registry, and any of them is a valid
         // digest reference for `docker run`.
-        let out = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args([
                 "image",
                 "inspect",
@@ -160,9 +187,14 @@ impl DockerRunner {
                 "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}",
                 self.image.as_str(),
             ])
-            .output()
-            .await
-            .map_err(SandboxError::Io)?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = self
+            .process_manager
+            .spawn(&mut command, "sandbox:docker-digest")?
+            .wait_with_output()
+            .await?;
         if !out.status.success() {
             return Err(SandboxError::BackendFailure {
                 status: out.status.code(),
@@ -193,14 +225,20 @@ impl DockerRunner {
 /// cancellation that drops `run()`'s future leaves the workload
 /// running and still writing into the workspace bind.
 struct ContainerCleanupGuard {
+    process_manager: Arc<baybo_process::ProcessManager>,
     binary: PathBuf,
     name: String,
     armed: bool,
 }
 
 impl ContainerCleanupGuard {
-    fn new(binary: PathBuf, name: String) -> Self {
+    fn new(
+        process_manager: Arc<baybo_process::ProcessManager>,
+        binary: PathBuf,
+        name: String,
+    ) -> Self {
         Self {
+            process_manager,
             binary,
             name,
             armed: true,
@@ -224,14 +262,20 @@ impl Drop for ContainerCleanupGuard {
         // and any failure is just logged via stderr being /dev/null.
         let binary = std::mem::take(&mut self.binary);
         let name = std::mem::take(&mut self.name);
+        let process_manager = Arc::clone(&self.process_manager);
         let _ = std::thread::Builder::new()
             .name("baybo-sandbox-docker-cleanup".into())
             .spawn(move || {
-                let _ = std::process::Command::new(&binary)
+                let mut command = std::process::Command::new(&binary);
+                command
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                    .stderr(Stdio::null());
+                if let Ok(mut child) =
+                    process_manager.spawn_std(&mut command, "sandbox:docker-cleanup")
+                {
+                    let _ = child.wait();
+                }
             });
     }
 }
@@ -269,8 +313,7 @@ impl SandboxRunner for DockerRunner {
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
@@ -282,13 +325,17 @@ impl SandboxRunner for DockerRunner {
         // outer timeout or a select! cancellation upstream — fires a
         // `docker rm -f` against the daemon. Disarmed only on the
         // success path where `--rm` already removed the container.
-        let mut cleanup = ContainerCleanupGuard::new(self.binary.clone(), container_name.clone());
+        let mut cleanup = ContainerCleanupGuard::new(
+            Arc::clone(&self.process_manager),
+            self.binary.clone(),
+            container_name.clone(),
+        );
 
         let started = Instant::now();
-        let mut child = cmd.spawn()?;
+        let mut child = self.process_manager.spawn(&mut cmd, "sandbox:docker-run")?;
 
         if let StdinSource::Bytes(bytes) = &spec.stdin
-            && let Some(mut stdin) = child.stdin.take()
+            && let Some(mut stdin) = child.take_stdin()
         {
             let bytes = bytes.clone();
             tokio::spawn(async move {
@@ -356,8 +403,7 @@ impl SandboxRunner for DockerRunner {
         let mut cmd = Command::new(&self.binary);
         cmd.args(&argv)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
@@ -368,10 +414,16 @@ impl SandboxRunner for DockerRunner {
         // once the container is gone — removed by `--rm` on a clean exit, or by
         // an explicit awaited `docker rm -f` when `start_kill` SIGKILLed the
         // client (which would otherwise orphan the daemon-side container).
-        let cleanup = ContainerCleanupGuard::new(self.binary.clone(), container_name.clone());
-        let mut child = cmd.spawn()?;
+        let cleanup = ContainerCleanupGuard::new(
+            Arc::clone(&self.process_manager),
+            self.binary.clone(),
+            container_name.clone(),
+        );
+        let mut child = self
+            .process_manager
+            .spawn(&mut cmd, "sandbox:docker-detached")?;
         if let StdinSource::Bytes(bytes) = &spec.stdin
-            && let Some(mut stdin) = child.stdin.take()
+            && let Some(mut stdin) = child.take_stdin()
         {
             let bytes = bytes.clone();
             tokio::spawn(async move {
@@ -380,6 +432,7 @@ impl SandboxRunner for DockerRunner {
         }
         Ok(Box::new(DockerDetachedChild {
             child,
+            process_manager: Arc::clone(&self.process_manager),
             binary: self.binary.clone(),
             container_name,
             cleanup,
@@ -402,7 +455,8 @@ impl SandboxRunner for DockerRunner {
 /// name (SIGKILL of the `docker run` client orphans it); on a clean exit
 /// `--rm` already removed it, so the drop guard is disarmed.
 struct DockerDetachedChild {
-    child: tokio::process::Child,
+    child: baybo_process::ManagedChild,
+    process_manager: Arc<baybo_process::ProcessManager>,
     binary: PathBuf,
     container_name: String,
     cleanup: ContainerCleanupGuard,
@@ -415,14 +469,12 @@ struct DockerDetachedChild {
 impl crate::DetachedChild for DockerDetachedChild {
     fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stderr
-            .take()
+            .take_stderr()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     async fn wait(&mut self) -> i32 {
@@ -438,12 +490,17 @@ impl crate::DetachedChild for DockerDetachedChild {
             // daemon-side container outlives it. Remove it explicitly and
             // AWAIT the `rm` so a caller that proceeds straight to shutdown
             // can't race a detached cleanup into an orphaned container.
-            let _ = Command::new(&self.binary)
+            let mut command = Command::new(&self.binary);
+            command
                 .args(["rm", "-f", &self.container_name])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+                .stderr(Stdio::null());
+            if let Ok(mut child) = self
+                .process_manager
+                .spawn(&mut command, "sandbox:docker-cleanup")
+            {
+                let _ = child.wait().await;
+            }
         }
         // Removed just above (on kill) or by `--rm` (clean exit) — no
         // drop-time `rm` needed.
@@ -482,13 +539,11 @@ mod detached_tests {
     /// unavailable (the test then skips). Pre-pulls busybox so the run isn't
     /// at the mercy of a mid-test pull.
     async fn runner_or_skip() -> Option<DockerRunner> {
-        let runner = DockerRunner::discover().ok()?.with_image("busybox:latest");
-        let pulled = Command::new("docker")
-            .args(["pull", "busybox:latest"])
-            .output()
-            .await
-            .ok()?;
-        pulled.status.success().then_some(runner)
+        let runner = DockerRunner::discover(baybo_process::ProcessManager::transient())
+            .ok()?
+            .with_image("busybox:latest");
+        runner.pull_image().await.ok()?;
+        Some(runner)
     }
 
     fn spec(cmd: &str) -> SandboxSpec {

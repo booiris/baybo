@@ -24,8 +24,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// Spawn the channel's bundled sidecar in registration mode, drive the
 /// stdin/stdout JSON exchange, and return the credentials it emits.
 ///
-/// `timeout` is the overall deadline; on expiry the subprocess is
-/// SIGKILLed via `kill_on_drop(true)`.
+/// `timeout` is the overall deadline; on expiry the managed process group is
+/// killed when the child guard is dropped.
 pub async fn run_registration(
     runtime: &SidecarRuntime,
     channel_type: &ChannelType,
@@ -42,7 +42,13 @@ pub async fn run_registration(
     let mut cmd = Command::new(bun_binary());
     cmd.arg(bundle);
     scrubbed_env(&mut cmd);
-    drive(cmd, prompter, timeout).await
+    drive(
+        baybo_process::ProcessManager::transient(),
+        cmd,
+        prompter,
+        timeout,
+    )
+    .await
 }
 
 fn bun_binary() -> PathBuf {
@@ -52,25 +58,23 @@ fn bun_binary() -> PathBuf {
 }
 
 async fn drive(
+    process_manager: std::sync::Arc<baybo_process::ProcessManager>,
     mut cmd: Command,
     prompter: &mut dyn ChannelPrompter,
     timeout: Duration,
 ) -> Result<RegistrationResult> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
+        .stderr(Stdio::inherit());
 
-    let mut child = cmd
-        .spawn()
+    let mut child = process_manager
+        .spawn(&mut cmd, "channel-registration")
         .map_err(|e| SetupError::Channel(format!("spawn registration subprocess: {e}")))?;
     let stdin = child
-        .stdin
-        .take()
+        .take_stdin()
         .ok_or_else(|| SetupError::Channel("child stdin was piped but missing".into()))?;
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| SetupError::Channel("child stdout was piped but missing".into()))?;
 
     let result = tokio::time::timeout(timeout, pump(stdout, stdin, prompter))
@@ -250,9 +254,14 @@ mod tests {
                printf '{"type":"result","bot_id":"123","token":"tok"}\n'"#,
         );
         let mut prompter = FakePrompter::new(["secret"]);
-        let out = drive(cmd, &mut prompter, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let out = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.bot_id, "123");
         assert_eq!(out.token, "tok");
     }
@@ -261,9 +270,14 @@ mod tests {
     async fn sidecar_error_surfaces() {
         let cmd = bash(r#"printf '{"type":"error","message":"user cancelled"}\n'"#);
         let mut prompter = FakePrompter::new(Vec::<&str>::new());
-        let err = drive(cmd, &mut prompter, Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let err = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("user cancelled"), "got: {err}");
     }
 
@@ -271,9 +285,14 @@ mod tests {
     async fn closes_without_result_is_error() {
         let cmd = bash(r#"exit 0"#);
         let mut prompter = FakePrompter::new(Vec::<&str>::new());
-        let err = drive(cmd, &mut prompter, Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let err = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("without emitting"), "got: {err}");
     }
 
@@ -284,9 +303,14 @@ mod tests {
             MAX_FRAME_BYTES + 1
         ));
         let mut prompter = FakePrompter::new(Vec::<&str>::new());
-        let err = drive(cmd, &mut prompter, Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let err = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 
@@ -294,9 +318,14 @@ mod tests {
     async fn timeout_kills_subprocess() {
         let cmd = bash(r#"sleep 30"#);
         let mut prompter = FakePrompter::new(Vec::<&str>::new());
-        let err = drive(cmd, &mut prompter, Duration::from_millis(200))
-            .await
-            .unwrap_err();
+        let err = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {err}");
     }
 
@@ -304,9 +333,14 @@ mod tests {
     async fn non_zero_exit_after_result_does_not_fail() {
         let cmd = bash(r#"printf '{"type":"result","bot_id":"b","token":"t"}\n'; exit 7"#);
         let mut prompter = FakePrompter::new(Vec::<&str>::new());
-        let out = drive(cmd, &mut prompter, Duration::from_secs(5))
-            .await
-            .expect("post-result exit status must not invalidate the captured result");
+        let out = drive(
+            baybo_process::ProcessManager::transient(),
+            cmd,
+            &mut prompter,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("post-result exit status must not invalidate the captured result");
         assert_eq!(out.bot_id, "b");
         assert_eq!(out.token, "t");
     }

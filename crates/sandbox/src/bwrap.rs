@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use crate::error::SandboxError;
 use crate::spec::{Backend, ResourceLimits, SandboxOutput, SandboxSpec, StdinSource};
 
 pub struct BwrapRunner {
+    process_manager: Arc<baybo_process::ProcessManager>,
     binary: PathBuf,
     /// `systemd-run` binary path when the host actually has a working
     /// user systemd manager; `None` means we run bwrap directly without
@@ -26,9 +28,11 @@ pub struct BwrapRunner {
 }
 
 impl BwrapRunner {
-    pub fn discover() -> Result<Self, SandboxError> {
+    pub fn discover(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<Self, SandboxError> {
         let binary = locate_binary("bwrap")?;
-        let systemd_run = probe_systemd_run();
+        let systemd_run = probe_systemd_run(&process_manager);
         match &systemd_run {
             Some(p) => tracing::info!(
                 path = %p.display(),
@@ -39,14 +43,26 @@ impl BwrapRunner {
             ),
         }
         Ok(Self {
+            process_manager,
             binary,
             systemd_run,
         })
     }
 
-    pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
+    pub async fn probe(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<SandboxAvailability, SandboxError> {
         let binary = locate_binary("bwrap")?;
-        let out = Command::new(&binary).arg("--version").output().await?;
+        let mut command = Command::new(&binary);
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = process_manager
+            .spawn(&mut command, "sandbox-probe:bwrap")?
+            .wait_with_output()
+            .await?;
         Ok(SandboxAvailability {
             backend: Backend::Bwrap,
             binary_path: binary,
@@ -68,14 +84,17 @@ impl BwrapRunner {
 /// configurations (no user manager, dbus session unreachable, missing
 /// XDG_RUNTIME_DIR) still ship the binary and only fail at the unit
 /// activation step.
-fn probe_systemd_run() -> Option<PathBuf> {
+fn probe_systemd_run(process_manager: &Arc<baybo_process::ProcessManager>) -> Option<PathBuf> {
     let bin = locate_binary("systemd-run").ok()?;
-    let out = std::process::Command::new(&bin)
+    let mut command = std::process::Command::new(&bin);
+    command
         .args(["--user", "--quiet", "--scope", "--", "/bin/true"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    let mut child = process_manager
+        .spawn_std(&mut command, "sandbox-probe:systemd-run")
         .ok()?;
+    let out = child.wait().ok()?;
     out.success().then_some(bin)
 }
 
@@ -162,9 +181,7 @@ impl BwrapRunner {
                 c
             }
         };
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
@@ -175,12 +192,12 @@ impl BwrapRunner {
 
     /// Validate + spawn the child, wiring `Bytes` stdin via a writer task.
     /// The shared spawn path for `run` and `spawn_detached`.
-    fn spawn_child(&self, spec: &SandboxSpec) -> Result<tokio::process::Child, SandboxError> {
+    fn spawn_child(&self, spec: &SandboxSpec) -> Result<baybo_process::ManagedChild, SandboxError> {
         validate_spec(spec, self.systemd_run.is_some())?;
         let mut cmd = self.build_command(spec);
-        let mut child = cmd.spawn()?;
+        let mut child = self.process_manager.spawn(&mut cmd, "sandbox:bwrap")?;
         if let StdinSource::Bytes(bytes) = &spec.stdin
-            && let Some(mut stdin) = child.stdin.take()
+            && let Some(mut stdin) = child.take_stdin()
         {
             let bytes = bytes.clone();
             tokio::spawn(async move {

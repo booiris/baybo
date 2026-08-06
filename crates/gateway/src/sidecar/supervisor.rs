@@ -249,7 +249,7 @@ impl SidecarSupervisor {
 
             let started = Instant::now();
             let mut handle = handle;
-            let stdout_task = handle.child_mut().stdout.take().map(|out| {
+            let stdout_task = handle.take_stdout().map(|out| {
                 tokio::spawn(drain_pipe(
                     out,
                     Arc::clone(&self.log_buffer),
@@ -259,7 +259,7 @@ impl SidecarSupervisor {
                     LogLevel::Info,
                 ))
             });
-            let stderr_task = handle.child_mut().stderr.take().map(|err| {
+            let stderr_task = handle.take_stderr().map(|err| {
                 tokio::spawn(drain_pipe(
                     err,
                     Arc::clone(&self.log_buffer),
@@ -271,15 +271,15 @@ impl SidecarSupervisor {
             });
             tokio::select! {
                 _ = shutdown.wait() => {
-                    if let Err(e) = handle.child_mut().start_kill() {
+                    if let Err(e) = handle.start_kill() {
                         tracing::debug!(%channel_type, pid, error = %e, "start_kill failed");
                     }
-                    let _ = handle.child_mut().wait().await;
+                    let _ = handle.wait().await;
                     tracing::info!(%channel_type, pid, "sidecar stopped on shutdown");
                     join_pipe_readers(stdout_task, stderr_task).await;
                     return;
                 }
-                status = handle.child_mut().wait() => {
+                status = handle.wait() => {
                     match status {
                         Ok(s) => tracing::warn!(
                             %channel_type,

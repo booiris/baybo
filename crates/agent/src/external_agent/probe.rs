@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdout};
 
 use super::{ExternalAgentError, Result};
 
@@ -67,13 +67,21 @@ pub(crate) fn resolve_binary(
 
 /// Exec the binary to catch "exists but broken" (wrong arch, libc
 /// mismatch, corrupt download).
-pub(crate) fn check_binary_runs(binary: &PathBuf, binary_name: &str) -> Result<()> {
+pub(crate) fn check_binary_runs(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    binary: &PathBuf,
+    binary_name: &str,
+) -> Result<()> {
     // ETXTBSY (errno 26): kernel rejects exec while any writable fd
     // is open against the inode. Hits when an editor / installer just
     // wrote the binary, and concurrent test fixtures racing on shims.
     let mut attempts = 0;
     let output = loop {
-        match run_with_timeout(Command::new(binary).arg("--version"), VERSION_CHECK_TIMEOUT) {
+        match run_with_timeout(
+            process_manager,
+            Command::new(binary).arg("--version"),
+            VERSION_CHECK_TIMEOUT,
+        ) {
             Ok(out) => break out,
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
                 attempts += 1;
@@ -108,14 +116,17 @@ pub(crate) fn check_binary_runs(binary: &PathBuf, binary_name: &str) -> Result<(
     Ok(())
 }
 
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
+fn run_with_timeout(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
     // Synchronous (probe runs sync inside `probe_and_build`); tokio
     // timeout would force async up the chain for one shell-out.
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()?;
+        .stdin(std::process::Stdio::null());
+    let mut child = process_manager.spawn_std(cmd, "external-agent-version")?;
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(50);
     loop {
@@ -167,13 +178,13 @@ pub(crate) async fn ensure_workspace_dir(dir: &Path, agent_name: &str) -> Result
 /// emit a `Transient` error if either is missing. Both stream parsers
 /// need both halves with the same failure shape.
 pub(crate) fn take_child_io(
-    child: &mut Child,
+    child: &mut baybo_process::ManagedChild,
     agent_name: &str,
 ) -> Result<(ChildStdout, ChildStderr)> {
-    let stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.take_stdout().ok_or_else(|| {
         ExternalAgentError::Transient(format!("{agent_name}: stdout not captured"))
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
+    let stderr = child.take_stderr().ok_or_else(|| {
         ExternalAgentError::Transient(format!("{agent_name}: stderr not captured"))
     })?;
     Ok((stdout, stderr))
@@ -208,7 +219,7 @@ pub(crate) fn spawn_stderr_tee(
 /// parsers used to inline. Returns `Ok(())` when reap succeeds with
 /// a 0 status, `Err` otherwise.
 pub(crate) async fn reap_after_stream_close(
-    child: &mut Child,
+    child: &mut baybo_process::ManagedChild,
     agent_name: &str,
     stderr_buf: &Arc<Mutex<String>>,
 ) -> Result<()> {

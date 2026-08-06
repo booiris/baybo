@@ -144,6 +144,7 @@ impl ExternalAgentRegistry {
 /// between this crate and `baybo-config` since the two don't depend on
 /// each other.
 pub fn build_registry<'a, I>(
+    process_manager: Arc<baybo_process::ProcessManager>,
     entries: I,
     proxy: Option<baybo_security::http::ProxySettings>,
 ) -> ExternalAgentRegistry
@@ -160,14 +161,18 @@ where
             continue;
         }
         let result: Result<Arc<dyn ExternalAgent>> = match kind {
-            ExternalAgentKind::Claude => {
-                claude_cli::ClaudeCliAgent::probe_and_build(binary_path, proxy.clone())
-                    .map(|a| a as Arc<dyn ExternalAgent>)
-            }
-            ExternalAgentKind::Codex => {
-                codex_cli::CodexCliAgent::probe_and_build(binary_path, proxy.clone())
-                    .map(|a| a as Arc<dyn ExternalAgent>)
-            }
+            ExternalAgentKind::Claude => claude_cli::ClaudeCliAgent::probe_and_build(
+                Arc::clone(&process_manager),
+                binary_path,
+                proxy.clone(),
+            )
+            .map(|a| a as Arc<dyn ExternalAgent>),
+            ExternalAgentKind::Codex => codex_cli::CodexCliAgent::probe_and_build(
+                Arc::clone(&process_manager),
+                binary_path,
+                proxy.clone(),
+            )
+            .map(|a| a as Arc<dyn ExternalAgent>),
         };
         match result {
             Ok(agent) => {

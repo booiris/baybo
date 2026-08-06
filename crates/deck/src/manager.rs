@@ -28,7 +28,7 @@ use crate::bundle::{
 };
 use crate::error::{DeckError, Result};
 use crate::host::DeckHost;
-use crate::service::{EmitSink, SNAPSHOT_MAX_BYTES, StrikeRecorder, spawn_service};
+use crate::service::{EmitSink, RunningService, SNAPSHOT_MAX_BYTES, StrikeRecorder, spawn_service};
 use crate::spec::CardSpec;
 use crate::supervisor::{DeckSupervisor, QuarantineSink};
 
@@ -143,6 +143,7 @@ pub struct BundleFiles {
 /// `from_config` convention).
 pub struct DeckManagerConfig {
     pub store: Arc<dyn DeckCardStore>,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
     pub vault: Arc<SecretVault>,
     pub events: Arc<dyn DeckEvents>,
     /// Shared blob store (the same one chat attachments use). Deck-produced
@@ -213,6 +214,7 @@ pub struct DeckManager {
     blob: Arc<dyn BlobStore>,
     deck_root: PathBuf,
     scratch_root: PathBuf,
+    process_manager: Arc<baybo_process::ProcessManager>,
     host: Arc<DeckHost>,
     supervisor: Arc<DeckSupervisor>,
     /// Compiled admission contracts keyed by (card_id → (spec_hash, spec)).
@@ -226,6 +228,7 @@ impl DeckManager {
     pub fn from_config(config: DeckManagerConfig) -> Arc<Self> {
         let DeckManagerConfig {
             store,
+            process_manager,
             vault,
             events,
             blob,
@@ -237,6 +240,7 @@ impl DeckManager {
         // install/boot, not a silent CRUD-only degradation.
         let host = Arc::new(DeckHost::new(
             vault,
+            Arc::clone(&process_manager),
             scratch_root.clone(),
             blob.clone(),
             &deck_root,
@@ -251,6 +255,7 @@ impl DeckManager {
                 store: store.clone(),
                 events: events.clone(),
             }),
+            Arc::clone(&process_manager),
             scratch_root.clone(),
         ));
 
@@ -260,6 +265,7 @@ impl DeckManager {
             blob,
             deck_root,
             scratch_root,
+            process_manager,
             host,
             supervisor,
             spec_cache: Mutex::new(HashMap::new()),
@@ -735,7 +741,7 @@ impl DeckManager {
     /// fails the caller.
     async fn reap_card_runtime(&self, card_id: &str) {
         let socks = self.host.tmux_dir(card_id);
-        kill_tmux_servers(&socks).await;
+        kill_tmux_servers(&self.process_manager, &socks).await;
         remove_residue_dir(&socks);
         remove_residue_dir(&self.scratch_root.join(card_id));
     }
@@ -763,7 +769,7 @@ impl DeckManager {
             }
         }
         for dir in stale_orphan_dirs(self.host.tmux_socks_root(), &existing) {
-            kill_tmux_servers(&dir).await;
+            kill_tmux_servers(&self.process_manager, &dir).await;
             remove_residue_dir(&dir);
         }
         for dir in stale_orphan_dirs(&self.scratch_root, &existing) {
@@ -778,7 +784,16 @@ impl DeckManager {
     /// deck operation, matching the tracing-based provenance model.
     async fn commit_bundle(&self, card_id: &str, title: &str, event: &str, detail: &str) {
         let _guard = self.git_lock.lock().await;
-        match crate::repo::commit_card(&self.deck_root, card_id, title, event, detail).await {
+        match crate::repo::commit_card(
+            &self.process_manager,
+            &self.deck_root,
+            card_id,
+            title,
+            event,
+            detail,
+        )
+        .await
+        {
             Ok(Some(sha)) => tracing::debug!(
                 target: "deck::provenance",
                 card = %card_id, event = %event, %sha, "deck bundle committed"
@@ -970,6 +985,7 @@ impl DeckManager {
                 bundle_dir: bundle.dir.clone(),
                 scratch_dir: self.scratch_root.join(gate_id),
                 emit_interval: Duration::from_secs(bundle.emit_interval_secs()),
+                process_manager: Arc::clone(&self.process_manager),
             },
             self.host.clone(),
             Arc::new(DiscardEmits),
@@ -983,11 +999,14 @@ impl DeckManager {
             .params
             .clone()
             .unwrap_or(Value::Null);
-        let outcome = running
-            .handle
-            .call(&bundle.manifest.refresh.op, params)
-            .await;
-        let _ = running.kill.send(()).await;
+        let RunningService {
+            handle,
+            mut exited,
+            kill,
+        } = running;
+        let outcome = handle.call(&bundle.manifest.refresh.op, params).await;
+        let _ = kill.send(()).await;
+        let _ = (&mut exited).await;
         outcome.map_err(|e| DeckError::DryRun(format!("refresh op failed: {e}")))
     }
 }
@@ -998,7 +1017,7 @@ impl DeckManager {
 /// symlink stance, a planted `x.sock -> /tmp/tmux-<uid>/default` must not
 /// aim `kill-server` at the user's own server. Each kill is bounded by
 /// [`TMUX_KILL_TIMEOUT`]; a timeout is logged and the sweep continues.
-async fn kill_tmux_servers(socks: &Path) {
+async fn kill_tmux_servers(process_manager: &Arc<baybo_process::ProcessManager>, socks: &Path) {
     let Ok(entries) = std::fs::read_dir(socks) else {
         return;
     };
@@ -1011,11 +1030,16 @@ async fn kill_tmux_servers(socks: &Path) {
         kill.arg("-S")
             .arg(&path)
             .arg("kill-server")
-            .kill_on_drop(true);
-        if tokio::time::timeout(TMUX_KILL_TIMEOUT, kill.output())
-            .await
-            .is_err()
-        {
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let timed_out = match process_manager.spawn(&mut kill, "deck-tmux-reap") {
+            Ok(mut child) => tokio::time::timeout(TMUX_KILL_TIMEOUT, child.wait())
+                .await
+                .is_err(),
+            Err(_) => false,
+        };
+        if timed_out {
             tracing::warn!(sock = %path.display(), "deck: tmux kill-server timed out; continuing");
         }
     }

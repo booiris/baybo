@@ -46,6 +46,7 @@ baybo-config = { workspace = true }
 baybo-cli = { workspace = true }
 baybo-gateway = { workspace = true }
 baybo-pairing = { workspace = true }
+baybo-process = { workspace = true }
 baybo-setup = { workspace = true }
 baybo-tui = { workspace = true }
 tokio = { workspace = true }

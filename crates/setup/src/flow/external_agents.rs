@@ -87,12 +87,16 @@ fn detect_on_path() -> Vec<Detected> {
 
 fn probe(kind: ExternalAgentKind) -> Option<String> {
     match kind {
-        ExternalAgentKind::Claude => ClaudeCliAgent::probe_and_build(None, None)
-            .ok()
-            .map(|a| a.binary_path().display().to_string()),
-        ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None, None)
-            .ok()
-            .map(|a| a.binary_path().display().to_string()),
+        ExternalAgentKind::Claude => {
+            ClaudeCliAgent::probe_and_build(baybo_process::ProcessManager::transient(), None, None)
+                .ok()
+                .map(|a| a.binary_path().display().to_string())
+        }
+        ExternalAgentKind::Codex => {
+            CodexCliAgent::probe_and_build(baybo_process::ProcessManager::transient(), None, None)
+                .ok()
+                .map(|a| a.binary_path().display().to_string())
+        }
     }
 }
 

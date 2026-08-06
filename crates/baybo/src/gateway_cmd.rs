@@ -575,6 +575,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             .collect();
         if !channel_only.is_empty() {
             let spawner = ChannelSpawner::new(
+                Arc::clone(&graph.process_manager),
                 channel_url.clone(),
                 channel_tokens.clone(),
                 boot::proxy_settings(&config),
@@ -649,7 +650,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.trigger();
     }
 
-    runtime::force_exit_watchdog(runtime_cfg.shutdown_grace);
+    runtime::force_exit_watchdog(
+        Arc::clone(&graph.process_manager),
+        runtime_cfg.shutdown_grace,
+    );
 
     graph.shutdown().await;
     task_tracker.shutdown().await;

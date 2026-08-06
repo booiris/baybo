@@ -232,11 +232,19 @@ fn probe(
 ) -> std::result::Result<String, ExternalAgentError> {
     match kind {
         ExternalAgentKind::Claude => {
-            let agent = ClaudeCliAgent::probe_and_build(binary_path, None)?;
+            let agent = ClaudeCliAgent::probe_and_build(
+                baybo_process::ProcessManager::transient(),
+                binary_path,
+                None,
+            )?;
             Ok(agent.binary_path().display().to_string())
         }
         ExternalAgentKind::Codex => {
-            let agent = CodexCliAgent::probe_and_build(binary_path, None)?;
+            let agent = CodexCliAgent::probe_and_build(
+                baybo_process::ProcessManager::transient(),
+                binary_path,
+                None,
+            )?;
             Ok(agent.binary_path().display().to_string())
         }
     }

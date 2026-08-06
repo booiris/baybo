@@ -24,6 +24,7 @@ docker = []
 test-support = []
 
 [dependencies]
+baybo-process = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

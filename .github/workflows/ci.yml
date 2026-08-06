@@ -90,6 +90,7 @@ jobs:
         # Master writes the cache, a PR only restores it — see the `on:` note.
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: scripts/check-managed-process-spawns.sh
       - run: cargo fmt --all --check
 
   clippy:

@@ -47,7 +47,7 @@ registered at runtime — not just `baybo-tools::builtin`.
 registers the implemented set with `TrustLevel::Trusted` manifests declaring their
 capabilities (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). No LLM handle is
 threaded through the constructor or the
-`default_tools(blob_store, workspace_paths, proxy, permission)`
+`default_tools(DefaultToolsConfig { blob_store, process_manager, workspace_paths, proxy, permission, builtin_memory })`
 factory; `WebFetch`'s prompt-driven extraction reads its LLM from the per-call
 `ToolContext::lite_llm` slot the agent layer binds at tool-call time. `workspace_paths`
 is forwarded to `Edit` (and `Write`/`Bash`) so the `personas/` write guard binds to

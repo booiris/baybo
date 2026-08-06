@@ -63,6 +63,7 @@ const TMUX_SOCKS_SUBDIR: &str = "tmux-socks";
 
 pub(crate) struct DeckHost {
     vault: Arc<SecretVault>,
+    process_manager: Arc<baybo_process::ProcessManager>,
     /// Scratch root for exec working dirs (per card).
     scratch_root: PathBuf,
     /// Shared blob store — the same one chat attachments use. Deck blobs are
@@ -76,12 +77,14 @@ pub(crate) struct DeckHost {
 impl DeckHost {
     pub fn new(
         vault: Arc<SecretVault>,
+        process_manager: Arc<baybo_process::ProcessManager>,
         scratch_root: PathBuf,
         blob: Arc<dyn BlobStore>,
         deck_root: &Path,
     ) -> Self {
         Self {
             vault,
+            process_manager,
             scratch_root,
             blob,
             tmux_socks_root: deck_root.join(TMUX_SOCKS_SUBDIR),
@@ -448,9 +451,11 @@ impl HostServices for DeckHost {
             .env(DECK_TMUX_DIR_ENV, self.tmux_dir(card_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let child = command.spawn().map_err(|e| format!("exec: {e}"))?;
+            .stderr(Stdio::piped());
+        let child = self
+            .process_manager
+            .spawn(&mut command, format!("deck-exec:{card_id}"))
+            .map_err(|e| format!("exec: {e}"))?;
         let out = match tokio::time::timeout(EXEC_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(format!("exec: {e}")),

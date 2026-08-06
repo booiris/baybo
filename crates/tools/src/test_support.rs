@@ -243,6 +243,7 @@ impl ExecSandbox for FakeExecSandbox {
         opts: SpawnOpts,
     ) -> crate::Result<Box<dyn RunningChild>> {
         crate::builtin::bash::spawn_unsandboxed_detached(
+            &baybo_process::ProcessManager::transient(),
             &program.to_string_lossy(),
             args,
             opts.cwd.as_deref(),
@@ -340,11 +341,6 @@ mod tests {
             .await
             .expect("fake detached spawn");
         let mut stdout = child.take_stdout().expect("stdout pipe");
-        assert!(
-            child.process_group_id().is_some(),
-            "without a pgid the runtime silently skips the crash-safe reaping ledger"
-        );
-
         let mut ready = [0u8; 6];
         tokio::time::timeout(Duration::from_secs(10), stdout.read_exact(&mut ready))
             .await

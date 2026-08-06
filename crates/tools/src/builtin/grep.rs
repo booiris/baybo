@@ -13,7 +13,7 @@
 //! non-sensitive `/tmp/work` and leak the secret line.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -47,7 +47,20 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-pub struct GrepTool;
+pub struct GrepTool {
+    process_manager: Arc<baybo_process::ProcessManager>,
+}
+
+impl GrepTool {
+    pub fn new(process_manager: Arc<baybo_process::ProcessManager>) -> Self {
+        Self { process_manager }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self::new(baybo_process::ProcessManager::transient())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Params {
@@ -138,12 +151,16 @@ impl Tool for GrepTool {
             }
         }
 
-        run_rg(&p, ctx).await
+        run_rg(&self.process_manager, &p, ctx).await
     }
 }
 
-async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-    let cap = rg::capture(ctx, rg::MAX_STDOUT_BYTES, |cmd| {
+async fn run_rg(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    p: &Params,
+    ctx: &ToolContext,
+) -> crate::Result<ToolOutput> {
+    let cap = rg::capture(process_manager, ctx, rg::MAX_STDOUT_BYTES, |cmd| {
         cmd.arg("--hidden")
             .arg(format!("--max-filesize={MAX_FILE_BYTES}"));
 
@@ -326,7 +343,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GrepTool
+        let out = GrepTool::for_test()
             .execute(json!({ "pattern": "needle", "path": dir.path() }), &ctx())
             .await
             .unwrap();
@@ -339,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_relative_path() {
-        let err = GrepTool
+        let err = GrepTool::for_test()
             .execute(json!({ "pattern": "x", "path": "relative/dir" }), &ctx())
             .await
             .unwrap_err();
@@ -351,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_path() {
-        let err = GrepTool
+        let err = GrepTool::for_test()
             .execute(json!({ "pattern": "x" }), &ctx())
             .await
             .unwrap_err();
@@ -375,7 +392,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GrepTool
+        let out = GrepTool::for_test()
             .execute(
                 json!({
                     "pattern": "needle",
@@ -404,7 +421,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GrepTool
+        let out = GrepTool::for_test()
             .execute(
                 json!({
                     "pattern": "needle",
@@ -443,7 +460,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GrepTool
+        let out = GrepTool::for_test()
             .execute(
                 json!({
                     "pattern": "needle",

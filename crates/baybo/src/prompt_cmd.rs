@@ -292,7 +292,7 @@ async fn run_in_process(
     // can't wedge the exit. The turn is already finished by here, so the
     // happy-path teardown completes well inside the budget.
     shutdown.trigger();
-    force_exit_watchdog(TEARDOWN_BUDGET);
+    force_exit_watchdog(Arc::clone(&graph.process_manager), TEARDOWN_BUDGET);
     graph.shutdown().await;
     drop(graph);
 

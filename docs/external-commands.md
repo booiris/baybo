@@ -5,6 +5,12 @@ them — required vs optional, where they're invoked, and what each is for — t
 covers how the benchmark harnesses (which run the real agent *inside* disposable
 task containers) provide or skip each one.
 
+All runtime children are spawned through `baybo-process`: each gets a dedicated
+process group, an owned guard, process-wide graceful/forced shutdown, and a
+token-validated crash ledger. Domain supervisors keep restart/protocol policy;
+the process layer guarantees that losing a future or handle cannot orphan the
+child tree. Fully-awaited workspace bootstrap git calls remain leaf-local.
+
 ## Inventory
 
 | Command | Status | Invoked by | Purpose |

@@ -9,7 +9,7 @@ Bottom-up along the dependency graph:
 1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
 2. [turn.md](turn.md) → [cron.md](cron.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md)
-4. [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [task.md](task.md) → [context.md](context.md)
+4. [process.md](process.md) → [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [task.md](task.md) → [context.md](context.md)
 5. [trace.md](trace.md)
 6. [storage.md](storage.md) → [janitor.md](janitor.md) → [pairing.md](pairing.md) → [deck.md](deck.md) → [agent.md](agent.md) → [setup.md](setup.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
 
@@ -28,6 +28,7 @@ Bottom-up along the dependency graph:
 
 ### Capability and Governance Layer
 
+- **[process](process.md)** — Unified Unix subprocess ownership: process groups, managed child guards, bounded shutdown, force-exit reaping, and token-validated crash ledgers. Runtime code may not call raw `Command::spawn` outside this crate.
 - **llm** — LLM provider wrapping and response parsing. Subscription/OAuth flavoured providers documented in [`llm-openai-subscription.md`](llm-openai-subscription.md).
 - **tools** — Tool abstraction, registration, capability declarations, runtime routing. The `mcp` submodule ships an MCP client (config in `<workspace>/.mcp.json`, OAuth via rmcp) that surfaces every server's tools to the agent loop as `<server>/<tool>`; the `McpReconciler` keeps the registry in sync without a gateway restart.
 - **[sandbox](sandbox.md)** — OS-native per-invocation isolation for tools declaring `ToolCapability::ExecCommand`. `bwrap` on Linux, `sandbox-exec` on macOS, `docker` as a cross-platform fallback when the native backend is unavailable; the `ToolExecutor` injects a `SandboxAdapter` into `ToolContext.sandbox` when available. If Baybo detects an outer container/sandbox, Bash silently skips the inner sandbox; if no backend is available on a non-container host, Bash warns before running without it. Filesystem-scoped to the workspace; network gated all-or-nothing on the manifest's `Http` capability.

@@ -21,7 +21,7 @@
 //! management (restart policy, back-off, plugin manifest loading, …)
 //! is the supervisor's turn ([`crate::sidecar::SidecarSupervisor`]).
 
-use tokio::process::{Child, Command};
+use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::auth::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TokenHandle, generate_token,
@@ -76,6 +76,7 @@ pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
 /// to clone — every field is already a small value.
 #[derive(Clone)]
 pub struct ChannelSpawner {
+    process_manager: std::sync::Arc<baybo_process::ProcessManager>,
     url: String,
     tokens: ChannelTokenTable,
     /// Egress proxy injected into each sidecar's env. `env_clear` below
@@ -86,11 +87,17 @@ pub struct ChannelSpawner {
 
 impl ChannelSpawner {
     pub fn new(
+        process_manager: std::sync::Arc<baybo_process::ProcessManager>,
         url: String,
         tokens: ChannelTokenTable,
         proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Self {
-        Self { url, tokens, proxy }
+        Self {
+            process_manager,
+            url,
+            tokens,
+            proxy,
+        }
     }
 
     pub fn url(&self) -> &str {
@@ -104,10 +111,8 @@ impl ChannelSpawner {
     /// `channel_type` the child can claim in its `Register` frame —
     /// the handshake rejects any mismatch so a compromised sidecar
     /// can't impersonate another channel and steal its bot secrets.
-    /// The returned [`ChildHandle`] revokes the token on drop; the
-    /// child itself is *not* auto-killed (callers own process
-    /// lifecycle — the supervisor applies its own restart / kill
-    /// policy).
+    /// The returned [`ChildHandle`] revokes the token and kills the whole
+    /// process group on drop. The supervisor still owns restart policy.
     ///
     /// The child's environment is scrubbed to [`SIDECAR_ENV_ALLOWLIST`]
     /// plus the two channel env vars before exec, so the operator's
@@ -142,7 +147,10 @@ impl ChannelSpawner {
         cmd.env(ENV_CHANNEL_URL, &self.url);
         cmd.env(ENV_CHANNEL_TOKEN, &token);
 
-        let child = cmd.spawn().map_err(GatewayError::Io)?;
+        let child = self
+            .process_manager
+            .spawn(&mut cmd, format!("channel-sidecar:{label}"))
+            .map_err(GatewayError::Io)?;
         let pid = match child.id() {
             Some(p) => p,
             None => {
@@ -181,15 +189,27 @@ impl ChannelSpawner {
 /// dropped, the token is revoked in the gateway's table so later
 /// connections presenting it are rejected.
 pub struct ChildHandle {
-    child: Child,
+    child: baybo_process::ManagedChild,
     _token: TokenHandle,
     label: String,
     pid: u32,
 }
 
 impl ChildHandle {
-    pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.take_stdout()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.take_stderr()
+    }
+
+    pub fn start_kill(&mut self) -> std::io::Result<()> {
+        self.child.start_kill()
+    }
+
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
     }
 
     pub fn label(&self) -> &str {
@@ -243,6 +263,7 @@ mod tests {
 
         let tokens = ChannelTokenTable::new();
         let spawner = ChannelSpawner::new(
+            baybo_process::ProcessManager::transient(),
             "ws://127.0.0.1:1/v1/channel-ws".to_owned(),
             tokens.clone(),
             None,
@@ -251,12 +272,12 @@ mod tests {
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdout(std::process::Stdio::piped());
         let mut handle = spawner.spawn(cmd, "test", "test-channel").unwrap();
-        let stdout = handle.child_mut().stdout.take().expect("piped stdout");
+        let stdout = handle.take_stdout().expect("piped stdout");
         let mut buf = Vec::new();
         use tokio::io::AsyncReadExt;
         let mut stdout = stdout;
         stdout.read_to_end(&mut buf).await.unwrap();
-        let _ = handle.child_mut().wait().await;
+        let _ = handle.wait().await;
 
         let env_dump = String::from_utf8_lossy(&buf);
         assert!(
@@ -276,6 +297,7 @@ mod tests {
         // `true` exits zero immediately — enough to sample its PID.
         let tokens = ChannelTokenTable::new();
         let spawner = ChannelSpawner::new(
+            baybo_process::ProcessManager::transient(),
             "ws://127.0.0.1:1/v1/channel-ws".to_owned(),
             tokens.clone(),
             None,

@@ -79,6 +79,7 @@ pub struct McpReconciler {
     workspace_root: PathBuf,
     registry: Arc<ToolRegistry>,
     vault: Arc<SecretVault>,
+    process_manager: Arc<baybo_process::ProcessManager>,
     blob_store: Option<Arc<dyn BlobStore>>,
     embedded: Vec<EmbeddedMcpServer>,
     /// Egress proxy applied to HTTP MCP transports and injected into stdio
@@ -90,24 +91,28 @@ pub struct McpReconciler {
     backoff: Mutex<HashMap<String, EmbeddedBackoff>>,
 }
 
+pub struct McpReconcilerConfig {
+    pub workspace_root: PathBuf,
+    pub registry: Arc<ToolRegistry>,
+    pub vault: Arc<SecretVault>,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
+    pub blob_store: Option<Arc<dyn BlobStore>>,
+    pub embedded: Vec<EmbeddedMcpServer>,
+    pub cancel: CancellationToken,
+    pub proxy: Option<baybo_security::http::ProxySettings>,
+}
+
 impl McpReconciler {
-    pub fn new(
-        workspace_root: PathBuf,
-        registry: Arc<ToolRegistry>,
-        vault: Arc<SecretVault>,
-        blob_store: Option<Arc<dyn BlobStore>>,
-        embedded: Vec<EmbeddedMcpServer>,
-        cancel: CancellationToken,
-        proxy: Option<baybo_security::http::ProxySettings>,
-    ) -> Arc<Self> {
+    pub fn from_config(config: McpReconcilerConfig) -> Arc<Self> {
         Arc::new(Self {
-            workspace_root,
-            registry,
-            vault,
-            blob_store,
-            embedded,
-            proxy,
-            cancel,
+            workspace_root: config.workspace_root,
+            registry: config.registry,
+            vault: config.vault,
+            process_manager: config.process_manager,
+            blob_store: config.blob_store,
+            embedded: config.embedded,
+            proxy: config.proxy,
+            cancel: config.cancel,
             notify: Arc::new(Notify::new()),
             state: Mutex::new(HashMap::new()),
             backoff: Mutex::new(HashMap::new()),
@@ -307,7 +312,7 @@ impl McpReconciler {
         self.state.lock().keys().cloned().collect()
     }
 
-    pub fn spawn(self: &Arc<Self>) -> JoinHandle<()> {
+    pub fn start(self: &Arc<Self>) -> JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             // Initial pass at startup.
@@ -373,8 +378,14 @@ impl McpReconciler {
         // hand-edited `.mcp.json` could otherwise smuggle in an
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
-        let session =
-            connect_with_extra_env(entry, &self.vault, extra_env, self.proxy.as_ref()).await?;
+        let session = connect_with_extra_env(
+            entry,
+            &self.vault,
+            &self.process_manager,
+            extra_env,
+            self.proxy.as_ref(),
+        )
+        .await?;
         let resources = resource_access_for(entry, is_embedded);
         let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 
