@@ -40,7 +40,7 @@ use baybo_skills_assessor::SkillAssessor;
 use baybo_storage::Store;
 use baybo_tools::ToolRegistry;
 use baybo_tools::builtin::DefaultToolsConfig;
-use baybo_tools::mcp::{EmbeddedMcpServer, McpReconciler};
+use baybo_tools::mcp::{EmbeddedMcpServer, McpReconciler, McpRuntime};
 use baybo_trace::{SpanRecorder, TraceEventStream};
 use baybo_turn::TurnLifecycle;
 use regex::Regex;
@@ -120,6 +120,9 @@ pub async fn build_bot_registry_deps(
 /// The `cron_trigger_rx` is a one-shot — [`wire_router`] consumes it
 /// when attaching cron triggers to the router.
 pub struct ManagerGraph {
+    mcp_runtime: McpRuntime,
+    sandbox_runner: Option<Arc<dyn baybo_sandbox::SandboxRunner>>,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
     pub config: Arc<BayboConfig>,
     pub session_manager: Arc<SessionManager>,
     pub turn_lifecycle: Arc<TurnLifecycle>,
@@ -213,6 +216,24 @@ pub struct ManagerGraph {
     pub subagent_dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
 }
 
+// Leave the outer watchdog time to flush final output after manager teardown.
+const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl ManagerGraph {
+    pub async fn shutdown(&mut self, deadline: tokio::time::Instant) {
+        self.actor_parent_token.cancel();
+        let sandbox_runner = self.sandbox_runner.clone();
+        tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
+            if let Some(runner) = sandbox_runner {
+                runner.shutdown(deadline).await;
+            }
+        });
+        self.process_manager
+            .shutdown_all(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+    }
+}
+
 /// Resolve every domain manager, tying them together with the shared
 /// `shutdown` signal. Consumes the storage graph (`Store::open`) in the
 /// process — the caller keeps only the per-trait `Arc` handles returned
@@ -241,10 +262,17 @@ pub async fn build_managers(
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
     let workspace_root = workspace_paths.root().to_path_buf();
+    let process_manager =
+        baybo_process::ProcessManager::from_config(baybo_process::ProcessManagerConfig {
+            ledger_dir: Some(workspace_paths.state_dir().join("processes")),
+        });
     // Best-effort: warm the workspace-scoped uv python cache so the
     // first agent-issued `python …` call doesn't stall on a cold
     // cpython download. Runs detached; failure is logged and swallowed.
-    baybo_tools::builtin::bash::spawn_uv_python_prewarm(&workspace_paths);
+    baybo_tools::builtin::bash::spawn_uv_python_prewarm(
+        &workspace_paths,
+        Arc::clone(&process_manager),
+    );
     let skill_registry = {
         let reg = Arc::new(SkillRegistry::new());
         let builtins = reg.register_builtins();
@@ -417,6 +445,7 @@ pub async fn build_managers(
 
     let mut tool_registry = ToolRegistry::with_defaults(DefaultToolsConfig {
         blob_store: stores.blob.clone(),
+        process_manager: Arc::clone(&process_manager),
         workspace_paths: baybo_workspace::WorkspacePaths::new(workspace_root.clone()),
         proxy: tool_proxy,
         permission: Arc::clone(&bash_permission),
@@ -562,6 +591,7 @@ pub async fn build_managers(
     // re-gates) and shutdown are driven by the gateway entrypoint.
     let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
         store: stores.deck.clone(),
+        process_manager: Arc::clone(&process_manager),
         vault: Arc::clone(&secret_vault),
         events: Arc::new(baybo_gateway::deck_events::GatewayDeckEvents::new(
             Arc::clone(&channels_registry),
@@ -582,7 +612,12 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(config.permission).await?;
+    let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(
+        config.permission,
+        Arc::clone(&process_manager),
+    )
+    .await?;
+    let sandbox_runner = sandbox_boot.runner;
 
     // --- pluggable memory backend. Constructed here while
     // `tool_registry` is still mutable so the impl's `tools()` can be
@@ -636,26 +671,12 @@ pub async fn build_managers(
         )));
 
     let bg_output_dir = baybo_tools::builtin::bash::background_output_dir(&workspace_paths);
-    let bg_groups_dir = baybo_tools::builtin::bash::detached_group_dir(&bg_output_dir);
-
-    // Reap detached command groups this host orphaned across a hard kill
-    // (SIGKILL / OOM / crash) — those run neither the `ProcessGroupKiller`
-    // destructors nor the force-exit reap, so the on-disk ledger is the only
-    // record left. Verified against pid-group recycling before any SIGKILL.
-    // Also prune stale detached-command output files (the agent reads them
+    // Prune stale detached-command output files (the agent reads them
     // shortly after the completion notification, so a week's retention is
-    // generous). Off the boot path — blocking fs + a /proc scan.
+    // generous). Off the boot path because it uses blocking filesystem I/O.
     {
         let output_dir = bg_output_dir.clone();
-        let groups_dir = bg_groups_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let reaped = baybo_tools::builtin::bash::reap_persisted_detached_groups(&groups_dir);
-            if reaped > 0 {
-                info!(
-                    reaped,
-                    "reaped orphaned background command groups from a prior run"
-                );
-            }
             let pruned = baybo_tools::builtin::bash::prune_background_outputs(
                 &output_dir,
                 std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -672,7 +693,6 @@ pub async fn build_managers(
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
     let bg_manager = Arc::new(baybo_agent::BackgroundJobManager::new(
         Arc::clone(&bg_supervisor_slot),
-        bg_groups_dir,
         shutdown.cancellation_token(),
     ));
     let background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>> = Some(bg_manager.clone());
@@ -688,27 +708,12 @@ pub async fn build_managers(
         Arc::clone(&security_gateway),
         sandbox_root,
         workspace_paths.clone(),
-        sandbox_boot.runner,
+        sandbox_runner.clone(),
         sandbox_boot.bypass_reason,
         virtual_reads,
         background_jobs,
         background_control,
     ));
-
-    // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
-    // dynamically registers/unregisters MCP-discovered tools. Bridge the
-    // shared `ShutdownSignal` to a `CancellationToken` since the
-    // reconciler lives in `baybo-tools`, which doesn't depend on
-    // `baybo-agent`.
-    let mcp_cancel = CancellationToken::new();
-    {
-        let signal = shutdown.clone();
-        let cancel_on_shutdown = mcp_cancel.clone();
-        tokio::spawn(async move {
-            signal.wait().await;
-            cancel_on_shutdown.cancel();
-        });
-    }
 
     // --- per-actor parent token. The spawner factory derives each
     // actor's `actor_token` as a child of this; tripping it on
@@ -723,23 +728,29 @@ pub async fn build_managers(
             cancel_on_shutdown.cancel();
         });
     }
+    // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
+    // dynamically registers/unregisters MCP-discovered tools.
     // Browser MCP server: shipped as a zstd-embedded JS bundle, run
     // by the gateway as a stdio MCP child. The reconciler spawns it
     // alongside any user-configured `.mcp.json` entries; if the bundle
     // failed to materialise (`SidecarRuntime::install` Err), the
     // embedded list is empty and only user entries get connected.
-    let mcp_reconciler = McpReconciler::new(
-        workspace_root.clone(),
-        Arc::clone(&tool_registry),
-        Arc::clone(&secret_vault),
-        Some(stores.blob.clone()),
-        embedded_mcp_servers,
-        mcp_cancel,
-        proxy.clone(),
-    );
-    mcp_reconciler.spawn();
+    let mcp_reconciler =
+        McpReconciler::from_config(baybo_tools::mcp::reconciler::McpReconcilerConfig {
+            workspace_root: workspace_root.clone(),
+            registry: Arc::clone(&tool_registry),
+            vault: Arc::clone(&secret_vault),
+            process_manager: Arc::clone(&process_manager),
+            blob_store: Some(stores.blob.clone()),
+            embedded: embedded_mcp_servers,
+            proxy: proxy.clone(),
+        });
+    let mcp_runtime = mcp_reconciler.start();
 
     Ok(ManagerGraph {
+        mcp_runtime,
+        sandbox_runner,
+        process_manager,
         config,
         session_manager,
         turn_lifecycle,
@@ -1004,10 +1015,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // Note what that grants: these run their own tool loops with
     // approvals bypassed, so they sidestep baybo's sandbox + approval
     // gate. `external_agents.<kind>.enabled = false` withholds one.
-    let external_agents = Arc::new(baybo_agent::external_agent::build_registry(
-        graph.config.external_agents.boot_entries(),
-        boot::proxy_settings(&graph.config),
-    ));
+    let external_agents = Arc::new(
+        baybo_agent::external_agent::build_registry(
+            Arc::clone(&graph.process_manager),
+            graph.config.external_agents.boot_entries(),
+            boot::proxy_settings(&graph.config),
+        )
+        .await,
+    );
 
     // Actor-backed subagent spawner: the `spawn_subagent` tool calls it
     // directly via the slot wired at build time. Built here — after the
@@ -1087,18 +1102,21 @@ pub fn install_signal_handler(tracker: &mut TaskTracker, shutdown: ShutdownSigna
 /// Start an OS thread that force-exits the process if the runtime fails
 /// to unwind within `budget`. A blocking tool call that won't yield on
 /// shutdown can otherwise stall the tokio drop indefinitely.
-pub fn force_exit_watchdog(budget: std::time::Duration) {
+pub fn force_exit_watchdog(
+    process_manager: Arc<baybo_process::ProcessManager>,
+    budget: std::time::Duration,
+) {
     std::thread::spawn(move || {
         std::thread::sleep(budget);
         eprintln!(
             "baybo: graceful shutdown exceeded {}s, force-exiting",
             budget.as_secs()
         );
-        // `process::exit` runs no destructors, so the `ProcessGroupKiller`
-        // guards that reap detached `Bash` command trees never fire. Reap
-        // them explicitly or they orphan to init and leak until the next
-        // reboot.
-        baybo_tools::builtin::bash::reap_tracked_process_groups();
+        process_manager.kill_all_now();
         std::process::exit(0);
     });
+}
+
+pub(crate) fn manager_shutdown_deadline(budget: std::time::Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN)
 }

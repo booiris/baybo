@@ -225,6 +225,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
 
     let deck_manager = baybo_deck::DeckManager::from_config(baybo_deck::DeckManagerConfig {
         store: stores.deck.clone(),
+        process_manager: baybo_process::ProcessManager::transient(),
         vault: Arc::clone(&secret_vault),
         events: Arc::new(crate::deck_events::GatewayDeckEvents::new(Arc::clone(
             &channel_registry,

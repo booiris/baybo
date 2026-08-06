@@ -9,12 +9,12 @@ use baybo_security::SecretVault;
 use baybo_store::BlobStore;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::ResourceAccess;
 use crate::mcp::config::{McpFile, McpServerEntry, McpTransportConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
+use crate::mcp::runtime::McpRuntime;
 use crate::mcp::transport::{McpServerSession, connect_with_extra_env};
 use crate::{Tool, ToolRegistry};
 
@@ -79,6 +79,7 @@ pub struct McpReconciler {
     workspace_root: PathBuf,
     registry: Arc<ToolRegistry>,
     vault: Arc<SecretVault>,
+    process_manager: Arc<baybo_process::ProcessManager>,
     blob_store: Option<Arc<dyn BlobStore>>,
     embedded: Vec<EmbeddedMcpServer>,
     /// Egress proxy applied to HTTP MCP transports and injected into stdio
@@ -90,24 +91,27 @@ pub struct McpReconciler {
     backoff: Mutex<HashMap<String, EmbeddedBackoff>>,
 }
 
+pub struct McpReconcilerConfig {
+    pub workspace_root: PathBuf,
+    pub registry: Arc<ToolRegistry>,
+    pub vault: Arc<SecretVault>,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
+    pub blob_store: Option<Arc<dyn BlobStore>>,
+    pub embedded: Vec<EmbeddedMcpServer>,
+    pub proxy: Option<baybo_security::http::ProxySettings>,
+}
+
 impl McpReconciler {
-    pub fn new(
-        workspace_root: PathBuf,
-        registry: Arc<ToolRegistry>,
-        vault: Arc<SecretVault>,
-        blob_store: Option<Arc<dyn BlobStore>>,
-        embedded: Vec<EmbeddedMcpServer>,
-        cancel: CancellationToken,
-        proxy: Option<baybo_security::http::ProxySettings>,
-    ) -> Arc<Self> {
+    pub fn from_config(config: McpReconcilerConfig) -> Arc<Self> {
         Arc::new(Self {
-            workspace_root,
-            registry,
-            vault,
-            blob_store,
-            embedded,
-            proxy,
-            cancel,
+            workspace_root: config.workspace_root,
+            registry: config.registry,
+            vault: config.vault,
+            process_manager: config.process_manager,
+            blob_store: config.blob_store,
+            embedded: config.embedded,
+            proxy: config.proxy,
+            cancel: CancellationToken::new(),
             notify: Arc::new(Notify::new()),
             state: Mutex::new(HashMap::new()),
             backoff: Mutex::new(HashMap::new()),
@@ -307,21 +311,26 @@ impl McpReconciler {
         self.state.lock().keys().cloned().collect()
     }
 
-    pub fn spawn(self: &Arc<Self>) -> JoinHandle<()> {
+    pub fn start(self: &Arc<Self>) -> McpRuntime {
+        let cancel = self.cancel.clone();
         let this = Arc::clone(self);
-        tokio::spawn(async move {
-            // Initial pass at startup.
-            let _ = Arc::clone(&this).tick().await;
+        let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
+                    _ = this.cancel.cancelled() => break,
+                    _ = Arc::clone(&this).tick() => {}
+                }
+                tokio::select! {
+                    biased;
                     _ = this.cancel.cancelled() => break,
                     _ = tokio::time::sleep(TICK_INTERVAL) => {}
                     _ = this.notify.notified() => {}
                 }
-                let _ = Arc::clone(&this).tick().await;
             }
             this.shutdown().await;
-        })
+        });
+        McpRuntime::new(cancel, task)
     }
 
     pub async fn shutdown(self: Arc<Self>) {
@@ -337,9 +346,7 @@ impl McpReconciler {
         for n in &names {
             self.registry.unregister_for_source(n);
         }
-        for s in sessions {
-            s.shutdown().await;
-        }
+        futures::future::join_all(sessions.into_iter().map(McpServerSession::shutdown)).await;
     }
 
     async fn disconnect_server(self: &Arc<Self>, name: &str) {
@@ -373,8 +380,14 @@ impl McpReconciler {
         // hand-edited `.mcp.json` could otherwise smuggle in an
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
-        let session =
-            connect_with_extra_env(entry, &self.vault, extra_env, self.proxy.as_ref()).await?;
+        let session = connect_with_extra_env(
+            entry,
+            &self.vault,
+            &self.process_manager,
+            extra_env,
+            self.proxy.as_ref(),
+        )
+        .await?;
         let resources = resource_access_for(entry, is_embedded);
         let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 

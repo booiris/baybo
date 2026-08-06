@@ -39,12 +39,14 @@ pub(crate) trait QuarantineSink: Send + Sync + 'static {
 struct ServiceEntry {
     slot: Arc<Mutex<Option<ServiceHandle>>>,
     cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 pub(crate) struct DeckSupervisor {
     host: Arc<dyn HostServices>,
     emit_sink: Arc<dyn EmitSink>,
     quarantine: Arc<dyn QuarantineSink>,
+    process_manager: Arc<baybo_process::ProcessManager>,
     /// Per-card scratch dirs live under here.
     scratch_root: PathBuf,
     services: Mutex<HashMap<String, ServiceEntry>>,
@@ -55,12 +57,14 @@ impl DeckSupervisor {
         host: Arc<dyn HostServices>,
         emit_sink: Arc<dyn EmitSink>,
         quarantine: Arc<dyn QuarantineSink>,
+        process_manager: Arc<baybo_process::ProcessManager>,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             host,
             emit_sink,
             quarantine,
+            process_manager,
             scratch_root,
             services: Mutex::new(HashMap::new()),
         }
@@ -73,25 +77,21 @@ impl DeckSupervisor {
 
         let slot: Arc<Mutex<Option<ServiceHandle>>> = Arc::new(Mutex::new(None));
         let cancel = CancellationToken::new();
-        self.services.lock().insert(
-            card_id.to_string(),
-            ServiceEntry {
-                slot: slot.clone(),
-                cancel: cancel.clone(),
-            },
-        );
-
         let host = self.host.clone();
         let emit_sink = self.emit_sink.clone();
         let quarantine = self.quarantine.clone();
         let scratch_dir = self.scratch_root.join(card_id);
+        let process_manager = Arc::clone(&self.process_manager);
         let card_id = card_id.to_string();
+        let service_id = card_id.clone();
+        let task_slot = Arc::clone(&slot);
+        let task_cancel = cancel.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let strikes = Arc::new(StrikeRecorder::default());
             let mut backoff = BACKOFF_MIN;
             loop {
-                if cancel.is_cancelled() {
+                if task_cancel.is_cancelled() {
                     break;
                 }
                 let cfg = SpawnConfig {
@@ -102,6 +102,7 @@ impl DeckSupervisor {
                     bundle_dir: bundle_dir.clone(),
                     scratch_dir: scratch_dir.clone(),
                     emit_interval,
+                    process_manager: Arc::clone(&process_manager),
                 };
                 let started = Instant::now();
                 let spawn =
@@ -109,21 +110,22 @@ impl DeckSupervisor {
                 let crashed = match spawn {
                     Ok(RunningService {
                         handle,
-                        exited,
+                        mut exited,
                         kill,
                     }) => {
-                        *slot.lock() = Some(handle);
+                        *task_slot.lock() = Some(handle);
                         let died = tokio::select! {
-                            code = exited => {
+                            code = &mut exited => {
                                 tracing::warn!(card = %card_id, code = ?code, "deck service exited");
                                 true
                             }
-                            _ = cancel.cancelled() => {
+                            _ = task_cancel.cancelled() => {
                                 let _ = kill.send(()).await;
+                                let _ = exited.await;
                                 false
                             }
                         };
-                        *slot.lock() = None;
+                        *task_slot.lock() = None;
                         died
                     }
                     Err(e) => {
@@ -145,11 +147,14 @@ impl DeckSupervisor {
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = cancel.cancelled() => break,
+                    _ = task_cancel.cancelled() => break,
                 }
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         });
+        self.services
+            .lock()
+            .insert(service_id, ServiceEntry { slot, cancel, task });
     }
 
     /// Stop one card's loop and kill its process. Idempotent.
@@ -157,6 +162,7 @@ impl DeckSupervisor {
         let entry = self.services.lock().remove(card_id);
         if let Some(entry) = entry {
             entry.cancel.cancel();
+            let _ = entry.task.await;
         }
     }
 
@@ -167,6 +173,7 @@ impl DeckSupervisor {
         };
         for e in entries {
             e.cancel.cancel();
+            let _ = e.task.await;
         }
     }
 

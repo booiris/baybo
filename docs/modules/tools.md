@@ -47,7 +47,7 @@ registered at runtime — not just `baybo-tools::builtin`.
 registers the implemented set with `TrustLevel::Trusted` manifests declaring their
 capabilities (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). No LLM handle is
 threaded through the constructor or the
-`default_tools(blob_store, workspace_paths, proxy, permission)`
+`default_tools(DefaultToolsConfig { blob_store, process_manager, workspace_paths, proxy, permission, builtin_memory })`
 factory; `WebFetch`'s prompt-driven extraction reads its LLM from the per-call
 `ToolContext::lite_llm` slot the agent layer binds at tool-call time. `workspace_paths`
 is forwarded to `Edit` (and `Write`/`Bash`) so the `personas/` write guard binds to
@@ -137,7 +137,11 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   OAuth client_id), and connects/disconnects accordingly. Connections
   are torn down + re-established when the identity hash changes;
   `register_dynamic` / `unregister_for_source` keep the registry in
-  sync. Cancelled via the shared shutdown signal.
+  sync. `start` returns an `McpRuntime` handle that owns cancellation and the
+  reconciler task; `ManagerGraph` retains that handle. Shutdown cancels an
+  in-flight tick, closes all sessions concurrently, and awaits the task only
+  until the runtime-wide deadline so a hung exchange cannot prevent the
+  process-manager sweep.
 - **OAuth** — the `oauth` submodule (`baybo_tools::mcp::oauth`) drives
   OAuth 2.1 + PKCE + Dynamic Client Registration via rmcp's
   `OAuthState`. The flow runs **inline inside `baybo mcp add`** for HTTP

@@ -26,6 +26,11 @@ What the crate provides:
   startup"). The `bootstrap` module exports the `SandboxAvailability` struct
   that `probe()` returns; the function itself sits at the crate root.
 
+Every backend receives the runtime's `baybo-process::ProcessManager`; bwrap,
+sandbox-exec, and the local Docker CLI are therefore owned as process groups and
+participate in graceful shutdown, forced shutdown, and crash recovery. Docker's
+daemon-side container cleanup remains an additional backend responsibility.
+
 What gets wrapped:
 
 - Tools whose manifest declares `baybo_tools::ToolCapability::ExecCommand`.

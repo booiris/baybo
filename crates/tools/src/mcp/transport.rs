@@ -1,26 +1,31 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use baybo_security::SecretVault;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::model::Tool as RmcpTool;
-use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::service::{Peer, RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage};
+use rmcp::transport::Transport;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::auth::{AuthClient, AuthorizationManager, CredentialStore, OAuthClientConfig};
-use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{ChildStderr, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
 use crate::mcp::error::{McpError, McpResult};
 use crate::mcp::log_line::SidecarLogLine;
 use crate::mcp::vault_keys;
+
+// The browser sidecar owns a 25-second Docker cleanup deadline.
+const STDIO_CHILD_SHUTDOWN_GRACE: Duration = Duration::from_secs(27);
 
 pub struct McpServerSession {
     running: RunningService<RoleClient, ()>,
@@ -44,9 +49,10 @@ impl McpServerSession {
 pub async fn connect(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
+    process_manager: &Arc<baybo_process::ProcessManager>,
     proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
-    connect_with_extra_env(entry, vault, &HashMap::new(), proxy).await
+    connect_with_extra_env(entry, vault, process_manager, &HashMap::new(), proxy).await
 }
 
 /// Build a `reqwest::Client` for an HTTP MCP transport, honoring the optional
@@ -68,12 +74,22 @@ fn proxied_http_client(
 pub async fn connect_with_extra_env(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
+    process_manager: &Arc<baybo_process::ProcessManager>,
     extra_env: &HashMap<String, String>,
     proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
     let running = match &entry.transport {
         McpTransportConfig::Stdio { command, args } => {
-            connect_stdio(&entry.name, command, args, vault, extra_env, proxy).await?
+            connect_stdio(
+                &entry.name,
+                command,
+                args,
+                vault,
+                process_manager,
+                extra_env,
+                proxy,
+            )
+            .await?
         }
         McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault, proxy).await?,
     };
@@ -92,16 +108,13 @@ async fn connect_stdio(
     command: &str,
     args: &[String],
     vault: &Arc<SecretVault>,
+    process_manager: &Arc<baybo_process::ProcessManager>,
     extra_env: &HashMap<String, String>,
     proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
     let mut tokio_cmd = Command::new(command);
-    // Stdio is configured on the rmcp builder below, not here:
-    // `TokioChildProcessBuilder::spawn` overwrites the command's
-    // stdin/stdout/stderr with its own values, so anything set on
-    // `tokio_cmd` would be silently clobbered.
     tokio_cmd.args(args).env_clear();
     for var in ["PATH", "HOME", "LANG", "TZ", "TMPDIR"] {
         if let Ok(value) = std::env::var(var) {
@@ -130,22 +143,66 @@ async fn connect_stdio(
         tokio_cmd.env(k, v);
     }
 
-    // rmcp's child builder defaults stderr to `Stdio::inherit()`, which
-    // would dump the server's diagnostics straight onto the gateway's
-    // terminal (and never capture them anywhere). Force `piped` and pump
-    // the captured stream into tracing so the lines land in the gateway
-    // log file / admin LogBuffer instead of the operator's TTY.
-    let (process, stderr) = TokioChildProcess::builder(tokio_cmd)
-        .stderr(Stdio::piped())
-        .spawn()
+    tokio_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process_manager
+        .spawn(&mut tokio_cmd, format!("mcp:{server_name}"))
         .map_err(|e| McpError::Transport(format!("spawn '{command}': {e}")))?;
+    let stdin = child
+        .take_stdin()
+        .ok_or_else(|| McpError::Transport("mcp child stdin pipe missing".into()))?;
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| McpError::Transport("mcp child stdout pipe missing".into()))?;
+    let stderr = child.take_stderr();
     if let Some(stderr) = stderr {
         drain_mcp_stderr(server_name.to_owned(), stderr);
     }
 
-    ().serve(process)
+    ().serve(ManagedChildTransport::new(child, stdout, stdin))
         .await
         .map_err(|e| McpError::Connection(e.to_string()))
+}
+
+struct ManagedChildTransport {
+    child: baybo_process::ManagedChild,
+    transport: AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>,
+}
+
+impl ManagedChildTransport {
+    fn new(child: baybo_process::ManagedChild, stdout: ChildStdout, stdin: ChildStdin) -> Self {
+        Self {
+            child,
+            transport: AsyncRwTransport::new_client(stdout, stdin),
+        }
+    }
+}
+
+impl Transport<RoleClient> for ManagedChildTransport {
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.transport.send(item)
+    }
+
+    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+        self.transport.receive()
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        let transport_result = self.transport.close().await;
+        let child_result = self
+            .child
+            .shutdown(STDIO_CHILD_SHUTDOWN_GRACE)
+            .await
+            .map(|_| ());
+        transport_result.and(child_result)
+    }
 }
 
 /// Per-spawn budget on how many stderr lines a stdio MCP server may emit

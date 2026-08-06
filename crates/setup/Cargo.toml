@@ -7,6 +7,7 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
+baybo-process = { workspace = true }
 baybo-agent = { workspace = true }
 baybo-channels = { workspace = true }
 baybo-config = { workspace = true }

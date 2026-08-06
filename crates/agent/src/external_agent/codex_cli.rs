@@ -31,7 +31,7 @@ use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent}
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use super::probe::{
     KILL_GRACE, check_binary_runs, ensure_workspace_dir, reap_after_stream_close, resolve_binary,
@@ -58,6 +58,7 @@ const CODEX_TOOL_FILE_CHANGE: &str = "codex_file_change";
 #[derive(Debug)]
 pub struct CodexCliAgent {
     binary_path: PathBuf,
+    process_manager: Arc<baybo_process::ProcessManager>,
     /// `--model <NAME>` override. Empty = let codex pick from its
     /// own config (`~/.codex/`).
     model: String,
@@ -69,7 +70,8 @@ pub struct CodexCliAgent {
 impl CodexCliAgent {
     /// Resolve the binary + run `codex --version`. Same fail-fast
     /// shape as claude_cli.
-    pub fn probe_and_build(
+    pub async fn probe_and_build(
+        process_manager: Arc<baybo_process::ProcessManager>,
         binary_path: Option<&str>,
         proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Result<Arc<Self>> {
@@ -78,9 +80,15 @@ impl CodexCliAgent {
             ExternalAgentKind::Codex.binary_name(),
             INSTALL_HINT,
         )?;
-        check_binary_runs(&resolved, ExternalAgentKind::Codex.binary_name())?;
+        check_binary_runs(
+            &process_manager,
+            &resolved,
+            ExternalAgentKind::Codex.binary_name(),
+        )
+        .await?;
         Ok(Arc::new(Self {
             binary_path: resolved,
+            process_manager,
             model: String::new(),
             proxy,
         }))
@@ -122,7 +130,7 @@ impl CodexCliAgent {
         workspace_dir: &Path,
         resume_id: Option<&str>,
         prompt: &str,
-    ) -> Result<Child> {
+    ) -> Result<baybo_process::ManagedChild> {
         let mut cmd = Command::new(&self.binary_path);
         // Global flags must come BEFORE the `resume` subcommand.
         cmd.arg("exec")
@@ -144,25 +152,26 @@ impl CodexCliAgent {
         cmd.current_dir(workspace_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(std::process::Stdio::piped());
         if let Some(proxy) = &self.proxy {
             for (k, v) in proxy.env_vars() {
                 cmd.env(k, v);
             }
         }
 
-        cmd.spawn().map_err(|e| {
-            ExternalAgentError::Config(format!(
-                "codex: failed to spawn `{}`: {e}",
-                self.binary_path.display()
-            ))
-        })
+        self.process_manager
+            .spawn(&mut cmd, "external-agent:codex")
+            .map_err(|e| {
+                ExternalAgentError::Config(format!(
+                    "codex: failed to spawn `{}`: {e}",
+                    self.binary_path.display()
+                ))
+            })
     }
 }
 
 fn spawn_stream_parser(
-    mut child: Child,
+    mut child: baybo_process::ManagedChild,
     cancel: tokio_util::sync::CancellationToken,
     timeout: Duration,
     is_fresh_session: bool,
@@ -479,18 +488,28 @@ mod tests {
     use super::*;
     use crate::external_agent::probe::test_helpers::fake_binary;
 
-    #[test]
-    fn probe_succeeds_with_working_binary() {
+    #[tokio::test]
+    async fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_binary("codex", "codex 0.42.0");
-        let agent = CodexCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
-            .expect("probe should succeed");
+        let agent = CodexCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some(bin.to_str().unwrap()),
+            None,
+        )
+        .await
+        .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Codex);
     }
 
-    #[test]
-    fn probe_fails_when_binary_path_missing() {
-        let err = CodexCliAgent::probe_and_build(Some("/nonexistent/codex-binary-xyzzy"), None)
-            .expect_err("expected error for missing binary path");
+    #[tokio::test]
+    async fn probe_fails_when_binary_path_missing() {
+        let err = CodexCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some("/nonexistent/codex-binary-xyzzy"),
+            None,
+        )
+        .await
+        .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {
                 assert!(msg.contains("does not exist"), "msg: {msg}");

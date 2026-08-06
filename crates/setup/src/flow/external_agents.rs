@@ -22,7 +22,7 @@ pub async fn configure_external_agents_step<P: Prompter>(
     prompter: &mut P,
     config: &mut BayboConfig,
 ) -> Result<ExternalAgentsStepOutcome> {
-    select_and_apply(prompter, config, detect_on_path())
+    select_and_apply(prompter, config, detect_on_path().await)
 }
 
 /// Core split out of [`configure_external_agents_step`] so it can be
@@ -72,10 +72,10 @@ struct Detected {
     binary_path: String,
 }
 
-fn detect_on_path() -> Vec<Detected> {
+async fn detect_on_path() -> Vec<Detected> {
     let mut out = Vec::new();
     for kind in ExternalAgentKind::ALL.iter().copied() {
-        if let Some(path) = probe(kind) {
+        if let Some(path) = probe(kind).await {
             out.push(Detected {
                 kind,
                 binary_path: path,
@@ -85,14 +85,20 @@ fn detect_on_path() -> Vec<Detected> {
     out
 }
 
-fn probe(kind: ExternalAgentKind) -> Option<String> {
+async fn probe(kind: ExternalAgentKind) -> Option<String> {
     match kind {
-        ExternalAgentKind::Claude => ClaudeCliAgent::probe_and_build(None, None)
-            .ok()
-            .map(|a| a.binary_path().display().to_string()),
-        ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None, None)
-            .ok()
-            .map(|a| a.binary_path().display().to_string()),
+        ExternalAgentKind::Claude => {
+            ClaudeCliAgent::probe_and_build(baybo_process::ProcessManager::transient(), None, None)
+                .await
+                .ok()
+                .map(|a| a.binary_path().display().to_string())
+        }
+        ExternalAgentKind::Codex => {
+            CodexCliAgent::probe_and_build(baybo_process::ProcessManager::transient(), None, None)
+                .await
+                .ok()
+                .map(|a| a.binary_path().display().to_string())
+        }
     }
 }
 

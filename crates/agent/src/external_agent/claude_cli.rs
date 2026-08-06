@@ -16,7 +16,7 @@ use baybo_llm::TokenUsage;
 use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use super::probe::{
     KILL_GRACE, check_binary_runs, ensure_workspace_dir, reap_after_stream_close, resolve_binary,
@@ -40,6 +40,7 @@ const INSTALL_HINT: &str = "Install Claude Code (npm install -g @anthropic-ai/cl
 #[derive(Debug)]
 pub struct ClaudeCliAgent {
     binary_path: PathBuf,
+    process_manager: Arc<baybo_process::ProcessManager>,
     model: String,
     /// Egress proxy injected into the child's env so the external CLI's
     /// own LLM calls route through it. `None` = inherit the parent env.
@@ -52,7 +53,8 @@ impl ClaudeCliAgent {
     /// executes. Failure surfaces as `ExternalAgentError::Config`
     /// with operator-actionable text — callers (the boot path) use
     /// this for fail-fast registration.
-    pub fn probe_and_build(
+    pub async fn probe_and_build(
+        process_manager: Arc<baybo_process::ProcessManager>,
         binary_path: Option<&str>,
         proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Result<Arc<Self>> {
@@ -61,9 +63,15 @@ impl ClaudeCliAgent {
             ExternalAgentKind::Claude.binary_name(),
             INSTALL_HINT,
         )?;
-        check_binary_runs(&resolved, ExternalAgentKind::Claude.binary_name())?;
+        check_binary_runs(
+            &process_manager,
+            &resolved,
+            ExternalAgentKind::Claude.binary_name(),
+        )
+        .await?;
         Ok(Arc::new(Self {
             binary_path: resolved,
+            process_manager,
             model: DEFAULT_MODEL_FLAG.to_string(),
             proxy,
         }))
@@ -107,7 +115,7 @@ impl ClaudeCliAgent {
         workspace_dir: &Path,
         resume_id: Option<&str>,
         prompt: &str,
-    ) -> Result<Child> {
+    ) -> Result<baybo_process::ManagedChild> {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("-p")
             .arg("--output-format")
@@ -127,24 +135,25 @@ impl ClaudeCliAgent {
         cmd.current_dir(workspace_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(std::process::Stdio::piped());
         if let Some(proxy) = &self.proxy {
             for (k, v) in proxy.env_vars() {
                 cmd.env(k, v);
             }
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            ExternalAgentError::Config(format!(
-                "claude: failed to spawn `{}`: {e}",
-                self.binary_path.display()
-            ))
-        })?;
+        let mut child = self
+            .process_manager
+            .spawn(&mut cmd, "external-agent:claude")
+            .map_err(|e| {
+                ExternalAgentError::Config(format!(
+                    "claude: failed to spawn `{}`: {e}",
+                    self.binary_path.display()
+                ))
+            })?;
         // claude reads stdin to EOF before starting its agent loop.
         let mut stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| ExternalAgentError::Transient("claude: stdin not captured".into()))?;
         stdin
             .write_all(prompt.as_bytes())
@@ -156,7 +165,7 @@ impl ClaudeCliAgent {
 }
 
 fn spawn_stream_parser(
-    mut child: Child,
+    mut child: baybo_process::ManagedChild,
     cancel: tokio_util::sync::CancellationToken,
     timeout: std::time::Duration,
     is_fresh_session: bool,
@@ -628,18 +637,28 @@ mod tests {
         (dir, bin)
     }
 
-    #[test]
-    fn probe_succeeds_with_working_binary() {
+    #[tokio::test]
+    async fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_claude("claude 1.2.3");
-        let agent = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
-            .expect("probe should succeed");
+        let agent = ClaudeCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some(bin.to_str().unwrap()),
+            None,
+        )
+        .await
+        .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Claude);
     }
 
-    #[test]
-    fn probe_fails_when_binary_path_missing() {
-        let err = ClaudeCliAgent::probe_and_build(Some("/nonexistent/claude-binary-xyzzy"), None)
-            .expect_err("expected error for missing binary path");
+    #[tokio::test]
+    async fn probe_fails_when_binary_path_missing() {
+        let err = ClaudeCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some("/nonexistent/claude-binary-xyzzy"),
+            None,
+        )
+        .await
+        .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {
                 assert!(msg.contains("does not exist"), "msg: {msg}");
@@ -649,10 +668,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_rejects_relative_binary_path() {
-        let err = ClaudeCliAgent::probe_and_build(Some("./claude"), None)
-            .expect_err("expected error for relative binary path");
+    #[tokio::test]
+    async fn probe_rejects_relative_binary_path() {
+        let err = ClaudeCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some("./claude"),
+            None,
+        )
+        .await
+        .expect_err("expected error for relative binary path");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("absolute"), "msg: {msg}");
@@ -662,8 +686,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_fails_when_binary_prints_nothing() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_prints_nothing() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
@@ -671,8 +695,13 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
-            .expect_err("must fail");
+        let err = ClaudeCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some(bin.to_str().unwrap()),
+            None,
+        )
+        .await
+        .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("printed nothing"), "msg: {msg}")
@@ -681,8 +710,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_fails_when_binary_exits_nonzero() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_exits_nonzero() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\necho 'oops' >&2\nexit 7\n").unwrap();
@@ -690,8 +719,13 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
-            .expect_err("must fail");
+        let err = ClaudeCliAgent::probe_and_build(
+            baybo_process::ProcessManager::transient(),
+            Some(bin.to_str().unwrap()),
+            None,
+        )
+        .await
+        .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("exited"), "msg: {msg}");

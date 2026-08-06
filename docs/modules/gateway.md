@@ -131,6 +131,12 @@ The flavours of token that end up in the table:
   TCP carries no kernel-attested peer credential and the token's
   uniqueness + same-UID-only delivery already cover the threat
   model.
+
+`ChannelSpawner` also receives the shared `ProcessManager`. Its `ChildHandle`
+owns both the capability token and a managed process-group guard: dropping it
+revokes authentication and kills the sidecar tree, while the sidecar supervisor
+still owns restart/backoff and explicitly waits after a stop.
+
 For runtimes whose WebSocket client cannot set custom headers (any
 WHATWG `WebSocket`, browser-style clients) the listener also accepts
 `?token=<hex>` on the upgrade URL. The auth middleware strips the

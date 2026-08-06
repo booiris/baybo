@@ -29,6 +29,7 @@ macos = []
 test-support = ["baybo-llm/test-support"]
 
 [dependencies]
+baybo-process = { workspace = true }
 baybo-agent = { workspace = true }
 baybo-channels = { workspace = true }
 # Cron-fire prompt reverse-parser for the admin chat panel.

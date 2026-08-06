@@ -575,6 +575,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             .collect();
         if !channel_only.is_empty() {
             let spawner = ChannelSpawner::new(
+                Arc::clone(&graph.process_manager),
                 channel_url.clone(),
                 channel_tokens.clone(),
                 boot::proxy_settings(&config),
@@ -621,33 +622,42 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     let admin_shutdown = shutdown.clone();
     let channel_shutdown = shutdown.clone();
     let router_shutdown = shutdown.clone();
-    tokio::select! {
+    let run_result = tokio::select! {
         res = server.run(admin_shutdown) => {
-            if let Err(e) = res {
+            res.map_err(|e| {
                 tracing::error!(error = %e, "admin gateway server exited with error");
-                shutdown.trigger();
-                return Err(anyhow::anyhow!("gateway server error: {e}"));
-            }
+                anyhow::anyhow!("gateway server error: {e}")
+            })
         }
         res = channel_server.run(channel_shutdown) => {
-            if let Err(e) = res {
+            res.map_err(|e| {
                 tracing::error!(error = %e, "channel gateway server exited with error");
-                shutdown.trigger();
-                return Err(anyhow::anyhow!("channel server error: {e}"));
-            }
+                anyhow::anyhow!("channel server error: {e}")
+            })
         }
         _ = run_handle.router.run(run_handle.incoming_rx, run_handle.response_rx) => {
             tracing::info!("router exited before server; triggering shutdown");
             shutdown.trigger();
+            Ok(())
         }
         _ = router_shutdown.wait() => {
             tracing::info!("shutdown signal received, stopping gateway");
+            Ok(())
         }
+    };
+
+    if !shutdown.is_shutdown() {
+        shutdown.trigger();
     }
 
-    runtime::force_exit_watchdog(runtime_cfg.shutdown_grace);
+    let manager_shutdown_deadline = runtime::manager_shutdown_deadline(runtime_cfg.shutdown_grace);
+    runtime::force_exit_watchdog(
+        Arc::clone(&graph.process_manager),
+        runtime_cfg.shutdown_grace,
+    );
 
+    graph.shutdown(manager_shutdown_deadline).await;
     task_tracker.shutdown().await;
     tracing::info!("gateway shutdown complete");
-    Ok(())
+    run_result
 }

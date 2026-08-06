@@ -28,6 +28,7 @@ ts-export = ["dep:ts-rs"]
 [dependencies]
 baybo-llm = { workspace = true }
 baybo-model = { workspace = true }
+baybo-process = { workspace = true }
 baybo-security = { workspace = true }
 baybo-session = { workspace = true }
 baybo-storage = { workspace = true }

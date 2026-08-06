@@ -254,7 +254,7 @@ pub mod flow {
     pub fn configure_llm_step(...) -> Result<LlmStepOutcome>;
     pub fn configure_channel_step(...) -> Result<ChannelStepOutcome>;
     pub fn configure_browser_step(...) -> Result<BrowserStepOutcome>;
-    pub fn configure_external_agents_step(...) -> Result<ExternalAgentsStepOutcome>;
+    pub async fn configure_external_agents_step(...) -> Result<ExternalAgentsStepOutcome>;
     pub fn run_registration(...) -> Result<RegistrationResult>;  // sidecar driver
 }
 

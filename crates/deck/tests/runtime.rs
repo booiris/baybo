@@ -75,6 +75,7 @@ async fn harness() -> Harness {
     let events = Arc::new(RecordingEvents::default());
     let manager = DeckManager::from_config(DeckManagerConfig {
         store: store.clone(),
+        process_manager: baybo_process::ProcessManager::transient(),
         vault,
         events: events.clone(),
         blob: blob.clone(),

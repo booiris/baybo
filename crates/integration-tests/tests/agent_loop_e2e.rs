@@ -1345,11 +1345,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
         .await
         .expect("seed stderr");
     let killed = CancellationToken::new();
-    let manager = BackgroundJobManager::new(
-        supervisor_slot,
-        temp.path().join("groups"),
-        shutdown.clone(),
-    );
+    let manager = BackgroundJobManager::new(supervisor_slot, shutdown.clone());
 
     let handle = manager
         .detach_command(DetachedCommand {

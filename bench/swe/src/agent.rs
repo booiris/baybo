@@ -139,30 +139,35 @@ pub struct RunOpts<'a> {
 
 /// Whether a Docker image is already present locally.
 pub async fn image_exists(docker_bin: &str, image_key: &str) -> bool {
-    Command::new(docker_bin)
+    let process_manager = baybo_process::ProcessManager::transient();
+    let mut command = Command::new(docker_bin);
+    command
         .args(["image", "inspect", image_key])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    let Ok(mut child) = process_manager.spawn(&mut command, "bench-swe:docker-image-inspect")
+    else {
+        return false;
+    };
+    child.wait().await.map(|s| s.success()).unwrap_or(false)
 }
 
 /// Pull an image (e.g. a prebuilt `swebench/...` Hub image), streaming progress.
 /// Returns whether it succeeded. A local-build image name (no Hub counterpart)
 /// will fail here — the caller then points the user at `prepare_images`.
 pub async fn pull_image(docker_bin: &str, image_key: &str) -> bool {
-    Command::new(docker_bin)
+    let process_manager = baybo_process::ProcessManager::transient();
+    let mut command = Command::new(docker_bin);
+    command
         .args(["pull", image_key])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::inherit());
+    let Ok(mut child) = process_manager.spawn(&mut command, "bench-swe:docker-pull") else {
+        return false;
+    };
+    child.wait().await.map(|s| s.success()).unwrap_or(false)
 }
 
 /// Run one instance end-to-end. Tears the container down by default; never
@@ -513,14 +518,21 @@ async fn docker_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> Result<St
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
+        .stderr(Stdio::piped());
+    let out = baybo_process::ProcessManager::transient()
+        .spawn(
+            &mut cmd,
+            format!(
+                "bench-swe:docker-{}",
+                args.first().copied().unwrap_or("command")
+            ),
+        )
+        .with_context(|| format!("spawn `{bin} {}`", args.first().copied().unwrap_or("")))?
+        .wait_with_output()
         .await
-        .with_context(|| format!("spawn `{bin} {}`", args.first().copied().unwrap_or("")))?;
+        .context("wait for docker command")?;
     if !out.status.success() {
         bail!(
             "`{bin} {}` failed ({}): {}",
@@ -535,17 +547,17 @@ async fn docker_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> Result<St
 /// `docker` with text piped to the child's stdin (used to write the config).
 async fn docker_with_stdin(bin: &str, args: &[&str], stdin_data: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = baybo_process::ProcessManager::transient()
+        .spawn(&mut command, "bench-swe:docker-stdin")
         .with_context(|| format!("spawn `{bin} {}`", args.first().copied().unwrap_or("")))?;
     child
-        .stdin
-        .take()
+        .take_stdin()
         .context("child stdin missing")?
         .write_all(stdin_data.as_bytes())
         .await
@@ -570,13 +582,16 @@ async fn docker_capture(
     args: &[&str],
     hard_timeout: Duration,
 ) -> Result<(String, String, bool)> {
-    let fut = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
+        .stderr(Stdio::piped());
+    let fut = baybo_process::ProcessManager::transient()
+        .spawn(&mut command, "bench-swe:docker-prompt")
+        .context("spawn docker exec (baybo prompt)")?
+        .wait_with_output();
     match tokio::time::timeout(hard_timeout, fut).await {
         Ok(res) => {
             let out = res.context("run docker exec (baybo prompt)")?;
