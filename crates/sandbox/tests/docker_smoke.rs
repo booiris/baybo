@@ -43,7 +43,9 @@ async fn echo_through_docker() {
         return;
     }
     let runner: Arc<dyn SandboxRunner> = Arc::new(
-        DockerRunner::discover(baybo_process::ProcessManager::transient()).expect("docker runner"),
+        DockerRunner::discover(baybo_process::ProcessManager::transient())
+            .await
+            .expect("docker runner"),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner
@@ -84,8 +86,9 @@ async fn timeout_force_removes_container() {
         eprintln!("skipping: docker daemon not reachable");
         return;
     }
-    let runner =
-        DockerRunner::discover(baybo_process::ProcessManager::transient()).expect("docker runner");
+    let runner = DockerRunner::discover(baybo_process::ProcessManager::transient())
+        .await
+        .expect("docker runner");
     runner.warm().await.expect("warm-up (image pull) succeeds");
     let runner: Arc<dyn SandboxRunner> = Arc::new(runner);
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -144,8 +147,9 @@ async fn external_future_drop_force_removes_container() {
         eprintln!("skipping: docker daemon not reachable");
         return;
     }
-    let runner =
-        DockerRunner::discover(baybo_process::ProcessManager::transient()).expect("docker runner");
+    let runner = DockerRunner::discover(baybo_process::ProcessManager::transient())
+        .await
+        .expect("docker runner");
     runner.warm().await.expect("warm-up (image pull) succeeds");
     let runner: Arc<dyn SandboxRunner> = Arc::new(runner);
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -201,7 +205,9 @@ async fn network_none_blocks_dns() {
         return;
     }
     let runner: Arc<dyn SandboxRunner> = Arc::new(
-        DockerRunner::discover(baybo_process::ProcessManager::transient()).expect("docker runner"),
+        DockerRunner::discover(baybo_process::ProcessManager::transient())
+            .await
+            .expect("docker runner"),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner
@@ -244,7 +250,9 @@ async fn detached_start_kill_then_wait_removes_container() {
         return;
     }
     let runner: Arc<dyn SandboxRunner> = Arc::new(
-        DockerRunner::discover(baybo_process::ProcessManager::transient()).expect("docker runner"),
+        DockerRunner::discover(baybo_process::ProcessManager::transient())
+            .await
+            .expect("docker runner"),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let marker = tmp.path().join("post-kill-marker");

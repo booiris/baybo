@@ -53,7 +53,7 @@ impl ClaudeCliAgent {
     /// executes. Failure surfaces as `ExternalAgentError::Config`
     /// with operator-actionable text — callers (the boot path) use
     /// this for fail-fast registration.
-    pub fn probe_and_build(
+    pub async fn probe_and_build(
         process_manager: Arc<baybo_process::ProcessManager>,
         binary_path: Option<&str>,
         proxy: Option<baybo_security::http::ProxySettings>,
@@ -67,7 +67,8 @@ impl ClaudeCliAgent {
             &process_manager,
             &resolved,
             ExternalAgentKind::Claude.binary_name(),
-        )?;
+        )
+        .await?;
         Ok(Arc::new(Self {
             binary_path: resolved,
             process_manager,
@@ -636,25 +637,27 @@ mod tests {
         (dir, bin)
     }
 
-    #[test]
-    fn probe_succeeds_with_working_binary() {
+    #[tokio::test]
+    async fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_claude("claude 1.2.3");
         let agent = ClaudeCliAgent::probe_and_build(
             baybo_process::ProcessManager::transient(),
             Some(bin.to_str().unwrap()),
             None,
         )
+        .await
         .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Claude);
     }
 
-    #[test]
-    fn probe_fails_when_binary_path_missing() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_path_missing() {
         let err = ClaudeCliAgent::probe_and_build(
             baybo_process::ProcessManager::transient(),
             Some("/nonexistent/claude-binary-xyzzy"),
             None,
         )
+        .await
         .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {
@@ -665,13 +668,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_rejects_relative_binary_path() {
+    #[tokio::test]
+    async fn probe_rejects_relative_binary_path() {
         let err = ClaudeCliAgent::probe_and_build(
             baybo_process::ProcessManager::transient(),
             Some("./claude"),
             None,
         )
+        .await
         .expect_err("expected error for relative binary path");
         match err {
             ExternalAgentError::Config(msg) => {
@@ -682,8 +686,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_fails_when_binary_prints_nothing() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_prints_nothing() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
@@ -696,6 +700,7 @@ mod tests {
             Some(bin.to_str().unwrap()),
             None,
         )
+        .await
         .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
@@ -705,8 +710,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn probe_fails_when_binary_exits_nonzero() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_exits_nonzero() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\necho 'oops' >&2\nexit 7\n").unwrap();
@@ -719,6 +724,7 @@ mod tests {
             Some(bin.to_str().unwrap()),
             None,
         )
+        .await
         .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {

@@ -29,6 +29,10 @@ pub trait SandboxRunner: Send + Sync {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError>;
     fn backend(&self) -> Backend;
 
+    /// Drain backend-owned cleanup work before the process manager performs
+    /// its final sweep. Backends without daemon-side resources are no-ops.
+    async fn shutdown(&self, _deadline: tokio::time::Instant) {}
+
     /// Spawn the command **detached**: return a live [`DetachedChild`]
     /// immediately instead of running it to completion. The caller owns the
     /// foreground wait, timeout, and output streaming — used by the agent's
@@ -134,12 +138,12 @@ impl DetachedChild for TokioDetachedChild {
 /// `BackendNotExecutable`, `Io`, and other non-`BackendMissing` errors
 /// are returned immediately and do not trigger fallback — they signal
 /// a real problem with the chosen backend rather than its absence.
-pub fn current_platform_runner(
+pub async fn current_platform_runner(
     process_manager: Arc<baybo_process::ProcessManager>,
 ) -> Result<Arc<dyn SandboxRunner>, SandboxError> {
     #[cfg(all(target_os = "linux", feature = "linux"))]
     {
-        match bwrap::BwrapRunner::discover(Arc::clone(&process_manager)) {
+        match bwrap::BwrapRunner::discover(Arc::clone(&process_manager)).await {
             Ok(r) => return Ok(Arc::new(r)),
             Err(SandboxError::BackendMissing { .. } | SandboxError::BackendUnreachable { .. }) => {
                 tracing::warn!("bwrap not usable; trying docker fallback");
@@ -159,7 +163,7 @@ pub fn current_platform_runner(
     }
     #[cfg(feature = "docker")]
     {
-        match docker::DockerRunner::discover(process_manager) {
+        match docker::DockerRunner::discover(process_manager).await {
             Ok(r) => {
                 tracing::info!("using docker as the sandbox backend");
                 return Ok(Arc::new(r));

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child as StdChild, Command as StdCommand, ExitStatus, Output};
+use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,29 +75,6 @@ impl ProcessManager {
         let pgid = pid as i32;
         self.register(pgid, &label, &token);
         Ok(ManagedChild {
-            child: Some(child),
-            registration: Registration {
-                manager: Arc::clone(self),
-                pgid,
-                armed: true,
-            },
-        })
-    }
-
-    pub fn spawn_std(
-        self: &Arc<Self>,
-        command: &mut StdCommand,
-        label: impl Into<String>,
-    ) -> io::Result<ManagedStdChild> {
-        use std::os::unix::process::CommandExt;
-
-        let label = label.into();
-        let token = next_token();
-        command.env(PROCESS_TOKEN_ENV, &token).process_group(0);
-        let child = command.spawn()?;
-        let pgid = child.id() as i32;
-        self.register(pgid, &label, &token);
-        Ok(ManagedStdChild {
             child: Some(child),
             registration: Registration {
                 manager: Arc::clone(self),
@@ -273,70 +250,6 @@ impl Drop for ManagedChild {
             signal_group(self.registration.pgid, libc::SIGKILL);
             if let Some(child) = self.child.as_mut() {
                 let _ = child.start_kill();
-            }
-            self.registration.disarm();
-        }
-    }
-}
-
-pub struct ManagedStdChild {
-    child: Option<StdChild>,
-    registration: Registration,
-}
-
-impl ManagedStdChild {
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = match self.child.as_mut() {
-            Some(child) => child.try_wait()?,
-            None => return Err(io::Error::other("child already consumed")),
-        };
-        if status.is_some() {
-            self.finish();
-        }
-        Ok(status)
-    }
-
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let result = match self.child.as_mut() {
-            Some(child) => child.wait(),
-            None => Err(io::Error::other("child already consumed")),
-        };
-        self.finish();
-        result
-    }
-
-    pub fn wait_with_output(mut self) -> io::Result<Output> {
-        let Some(child) = self.child.take() else {
-            return Err(io::Error::other("child already consumed"));
-        };
-        let result = child.wait_with_output();
-        self.finish();
-        result
-    }
-
-    pub fn kill(&mut self) -> io::Result<()> {
-        signal_group(self.registration.pgid, libc::SIGKILL);
-        match self.child.as_mut() {
-            Some(child) => child.kill(),
-            None => Ok(()),
-        }
-    }
-
-    fn finish(&mut self) {
-        if self.registration.armed {
-            signal_group(self.registration.pgid, libc::SIGKILL);
-            self.registration.disarm();
-        }
-    }
-}
-
-impl Drop for ManagedStdChild {
-    fn drop(&mut self) {
-        if self.registration.armed {
-            signal_group(self.registration.pgid, libc::SIGKILL);
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
             }
             self.registration.disarm();
         }

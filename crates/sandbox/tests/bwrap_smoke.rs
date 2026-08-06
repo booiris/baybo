@@ -26,7 +26,9 @@ async fn echo_through_bwrap() {
     // Construct the bwrap runner directly so the docker fallback in
     // `current_platform_runner()` can't shadow what this test exercises.
     let runner: Arc<dyn SandboxRunner> = Arc::new(
-        BwrapRunner::discover(baybo_process::ProcessManager::transient()).expect("bwrap runner"),
+        BwrapRunner::discover(baybo_process::ProcessManager::transient())
+            .await
+            .expect("bwrap runner"),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner

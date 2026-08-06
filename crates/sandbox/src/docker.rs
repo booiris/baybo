@@ -7,8 +7,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::SandboxRunner;
 use crate::args::build_docker_argv;
@@ -29,11 +32,113 @@ use crate::spec::{Backend, ResourceLimits, SandboxOutput, SandboxSpec, StdinSour
 /// trusted execution base.
 pub const DEFAULT_IMAGE: &str = "debian:stable-slim";
 
+struct DockerCleanupRequest {
+    binary: PathBuf,
+    container_name: String,
+}
+
+/// `ContainerCleanupGuard::drop` cannot await Docker, so it hands daemon-side
+/// cleanup to this task. The runtime retains and drains the task before the
+/// process-manager sweep instead of detaching a thread or subprocess.
+struct DockerCleanupSupervisor {
+    sender: Mutex<Option<mpsc::UnboundedSender<DockerCleanupRequest>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl DockerCleanupSupervisor {
+    fn start(process_manager: Arc<baybo_process::ProcessManager>) -> Arc<Self> {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<DockerCleanupRequest>();
+        let task = tokio::spawn(async move {
+            let mut jobs = JoinSet::new();
+            loop {
+                tokio::select! {
+                    request = receiver.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        let process_manager = Arc::clone(&process_manager);
+                        jobs.spawn(async move {
+                            cleanup_container(process_manager, request).await;
+                        });
+                    }
+                    result = jobs.join_next(), if !jobs.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            tracing::warn!(%error, "docker cleanup task failed");
+                        }
+                    }
+                }
+            }
+            while let Some(result) = jobs.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "docker cleanup task failed");
+                }
+            }
+        });
+        Arc::new(Self {
+            sender: Mutex::new(Some(sender)),
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    fn sender(&self) -> std::io::Result<mpsc::UnboundedSender<DockerCleanupRequest>> {
+        self.sender.lock().clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "docker cleanup supervisor is shutting down",
+            )
+        })
+    }
+
+    async fn shutdown(&self, deadline: tokio::time::Instant) {
+        self.sender.lock().take();
+        let task = self.task.lock().take();
+        let Some(mut task) = task else {
+            return;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "docker cleanup supervisor failed"),
+            Err(_) => {
+                tracing::warn!("docker cleanup supervisor exceeded shutdown deadline; aborting");
+                task.abort();
+            }
+        }
+    }
+}
+
+async fn cleanup_container(
+    process_manager: Arc<baybo_process::ProcessManager>,
+    request: DockerCleanupRequest,
+) {
+    let mut command = Command::new(&request.binary);
+    command
+        .args(["rm", "-f", &request.container_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match process_manager.spawn(&mut command, "sandbox:docker-cleanup") {
+        Ok(mut child) => {
+            if let Err(error) = child.wait().await {
+                tracing::warn!(
+                    %error,
+                    container = %request.container_name,
+                    "docker container cleanup failed"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            container = %request.container_name,
+            "failed to spawn docker container cleanup"
+        ),
+    }
+}
+
 /// Cross-platform sandbox backend that delegates isolation to the
 /// docker daemon. Selected by `current_platform_runner()` when the
 /// native backend (bwrap on Linux, sandbox-exec on macOS) is missing.
 pub struct DockerRunner {
     process_manager: Arc<baybo_process::ProcessManager>,
+    cleanup: Arc<DockerCleanupSupervisor>,
     binary: PathBuf,
     image: String,
     /// Set by `warm()`. When present, every `run()` uses this digest
@@ -50,18 +155,19 @@ impl DockerRunner {
     /// having permission to talk to its socket). Without it, every
     /// ExecCommand call would fail at the first `docker run` instead
     /// of at startup.
-    pub fn discover(
+    pub async fn discover(
         process_manager: Arc<baybo_process::ProcessManager>,
     ) -> Result<Self, SandboxError> {
         let binary = locate_binary("docker")?;
-        let mut command = std::process::Command::new(&binary);
+        let mut command = Command::new(&binary);
         command
             .args(["info", "--format", "{{.ServerVersion}}"])
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let probe = process_manager
-            .spawn_std(&mut command, "sandbox-probe:docker-info")
-            .and_then(baybo_process::ManagedStdChild::wait_with_output)
+            .spawn(&mut command, "sandbox-probe:docker-info")?
+            .wait_with_output()
+            .await
             .map_err(SandboxError::Io)?;
         if !probe.status.success() {
             let message = String::from_utf8_lossy(&probe.stderr).trim().to_string();
@@ -75,6 +181,7 @@ impl DockerRunner {
             });
         }
         Ok(Self {
+            cleanup: DockerCleanupSupervisor::start(Arc::clone(&process_manager)),
             process_manager,
             binary,
             image: DEFAULT_IMAGE.into(),
@@ -220,12 +327,12 @@ impl DockerRunner {
 
 /// RAII guard that force-removes a daemon-side container on drop
 /// unless explicitly disarmed. The local docker CLI is killed by
-/// `kill_on_drop`, but dockerd-managed containers live independently
+/// its managed process guard, but dockerd-managed containers live independently
 /// of our process tree — without this, an outer timeout or upstream
 /// cancellation that drops `run()`'s future leaves the workload
 /// running and still writing into the workspace bind.
 struct ContainerCleanupGuard {
-    process_manager: Arc<baybo_process::ProcessManager>,
+    sender: Option<mpsc::UnboundedSender<DockerCleanupRequest>>,
     binary: PathBuf,
     name: String,
     armed: bool,
@@ -233,12 +340,12 @@ struct ContainerCleanupGuard {
 
 impl ContainerCleanupGuard {
     fn new(
-        process_manager: Arc<baybo_process::ProcessManager>,
+        sender: mpsc::UnboundedSender<DockerCleanupRequest>,
         binary: PathBuf,
         name: String,
     ) -> Self {
         Self {
-            process_manager,
+            sender: Some(sender),
             binary,
             name,
             armed: true,
@@ -247,6 +354,7 @@ impl ContainerCleanupGuard {
 
     fn disarm(&mut self) {
         self.armed = false;
+        self.sender.take();
     }
 }
 
@@ -255,28 +363,20 @@ impl Drop for ContainerCleanupGuard {
         if !self.armed {
             return;
         }
-        // Detach onto a std thread: Drop may run on a tokio runtime
-        // worker (the future was cancelled mid-await), and we don't
-        // want to block that worker on a docker rm subprocess. The
-        // call is fire-and-forget by design — best-effort cleanup
-        // and any failure is just logged via stderr being /dev/null.
         let binary = std::mem::take(&mut self.binary);
-        let name = std::mem::take(&mut self.name);
-        let process_manager = Arc::clone(&self.process_manager);
-        let _ = std::thread::Builder::new()
-            .name("baybo-sandbox-docker-cleanup".into())
-            .spawn(move || {
-                let mut command = std::process::Command::new(&binary);
-                command
-                    .args(["rm", "-f", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                if let Ok(mut child) =
-                    process_manager.spawn_std(&mut command, "sandbox:docker-cleanup")
-                {
-                    let _ = child.wait();
-                }
-            });
+        let container_name = std::mem::take(&mut self.name);
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        if sender
+            .send(DockerCleanupRequest {
+                binary,
+                container_name: container_name.clone(),
+            })
+            .is_err()
+        {
+            tracing::warn!(%container_name, "docker cleanup supervisor is unavailable");
+        }
     }
 }
 
@@ -326,7 +426,7 @@ impl SandboxRunner for DockerRunner {
         // `docker rm -f` against the daemon. Disarmed only on the
         // success path where `--rm` already removed the container.
         let mut cleanup = ContainerCleanupGuard::new(
-            Arc::clone(&self.process_manager),
+            self.cleanup.sender()?,
             self.binary.clone(),
             container_name.clone(),
         );
@@ -415,7 +515,7 @@ impl SandboxRunner for DockerRunner {
         // an explicit awaited `docker rm -f` when `start_kill` SIGKILLed the
         // client (which would otherwise orphan the daemon-side container).
         let cleanup = ContainerCleanupGuard::new(
-            Arc::clone(&self.process_manager),
+            self.cleanup.sender()?,
             self.binary.clone(),
             container_name.clone(),
         );
@@ -442,6 +542,10 @@ impl SandboxRunner for DockerRunner {
 
     fn backend(&self) -> Backend {
         Backend::Docker
+    }
+
+    async fn shutdown(&self, deadline: tokio::time::Instant) {
+        self.cleanup.shutdown(deadline).await;
     }
 
     fn default_resource_limits(&self) -> ResourceLimits {
@@ -532,6 +636,7 @@ mod detached_tests {
     use super::*;
     use crate::spec::{EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, StdinSource};
     use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -540,6 +645,7 @@ mod detached_tests {
     /// at the mercy of a mid-test pull.
     async fn runner_or_skip() -> Option<DockerRunner> {
         let runner = DockerRunner::discover(baybo_process::ProcessManager::transient())
+            .await
             .ok()?
             .with_image("busybox:latest");
         runner.pull_image().await.ok()?;
@@ -562,6 +668,38 @@ mod detached_tests {
             resource_limits: ResourceLimits::unlimited(),
             filesystem_policy: FilesystemPolicy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_supervisor_drains_requests_from_dropped_guards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("docker");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s' \"$3\" > \"${0}.marker\"\n")
+            .expect("write fake docker");
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("make fake docker executable");
+
+        let process_manager = baybo_process::ProcessManager::transient();
+        let supervisor = DockerCleanupSupervisor::start(Arc::clone(&process_manager));
+        let guard = ContainerCleanupGuard::new(
+            supervisor.sender().expect("cleanup sender"),
+            binary.clone(),
+            "container-under-test".into(),
+        );
+        drop(guard);
+
+        supervisor
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+
+        let cleaned = std::fs::read_to_string(format!("{}.marker", binary.display()))
+            .expect("fake docker recorded cleanup");
+        assert_eq!(cleaned, "container-under-test");
+        assert!(supervisor.sender().is_err());
+        assert_eq!(process_manager.tracked_len(), 0);
     }
 
     #[tokio::test]

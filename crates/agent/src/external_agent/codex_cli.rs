@@ -70,7 +70,7 @@ pub struct CodexCliAgent {
 impl CodexCliAgent {
     /// Resolve the binary + run `codex --version`. Same fail-fast
     /// shape as claude_cli.
-    pub fn probe_and_build(
+    pub async fn probe_and_build(
         process_manager: Arc<baybo_process::ProcessManager>,
         binary_path: Option<&str>,
         proxy: Option<baybo_security::http::ProxySettings>,
@@ -84,7 +84,8 @@ impl CodexCliAgent {
             &process_manager,
             &resolved,
             ExternalAgentKind::Codex.binary_name(),
-        )?;
+        )
+        .await?;
         Ok(Arc::new(Self {
             binary_path: resolved,
             process_manager,
@@ -487,25 +488,27 @@ mod tests {
     use super::*;
     use crate::external_agent::probe::test_helpers::fake_binary;
 
-    #[test]
-    fn probe_succeeds_with_working_binary() {
+    #[tokio::test]
+    async fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_binary("codex", "codex 0.42.0");
         let agent = CodexCliAgent::probe_and_build(
             baybo_process::ProcessManager::transient(),
             Some(bin.to_str().unwrap()),
             None,
         )
+        .await
         .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Codex);
     }
 
-    #[test]
-    fn probe_fails_when_binary_path_missing() {
+    #[tokio::test]
+    async fn probe_fails_when_binary_path_missing() {
         let err = CodexCliAgent::probe_and_build(
             baybo_process::ProcessManager::transient(),
             Some("/nonexistent/codex-binary-xyzzy"),
             None,
         )
+        .await
         .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {

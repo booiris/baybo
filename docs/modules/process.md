@@ -3,13 +3,11 @@
 ## Overview
 
 `baybo-process` is the only crate allowed to call `Command::spawn` for runtime
-subprocesses. It turns every child into an owned process group and returns a
-guard whose lifecycle is explicit:
-
-- `ManagedChild` for `tokio::process::Command`;
-- `ManagedStdChild` for the few synchronous probes that cannot be made async;
-- `ProcessManager` for registration, graceful process-wide shutdown, forced
-  shutdown, and crash recovery.
+subprocesses. It turns every Tokio child into an owned process group and returns
+a `ManagedChild` guard with an explicit lifecycle. `ProcessManager` owns
+registration, graceful process-wide shutdown, forced shutdown, and crash
+recovery. There is no parallel `std::process::Child` ownership path; probes are
+async so every live runtime child has the same guard and cancellation behavior.
 
 The runtime creates one manager at boot and injects it into Bash/rg, MCP stdio
 servers, sandbox backends, Deck, channel sidecars, and external CLI agents.
@@ -25,7 +23,7 @@ runtime manager.
 
 An owner must call `wait`, `wait_with_output`, or `shutdown`. Each terminal path
 reaps the leader and kills any unclaimed descendants before unregistering the
-group. Dropping either child guard is the non-async backstop: it kills the whole
+group. Dropping the child guard is the non-async backstop: it kills the whole
 group and removes its ledger record. Runtime shutdown uses one deadline across
 MCP protocol cleanup and `ProcessManager::shutdown_all`; a stuck reconciler is
 aborted at that deadline so it cannot prevent the process sweep. The manager
@@ -43,8 +41,11 @@ from targeting an unrelated process. Recovery uses `/proc` on Linux and
 `ProcessManager` owns OS process lifetime, not business restart policy or
 protocol cleanup. MCP still closes JSON-RPC, the Deck supervisor still applies
 backoff/quarantine, the sidecar supervisor still restarts crashed bundles, and
-Docker still removes daemon-side containers. Those owners hold a
-`ManagedChild`, so abandoning a task or future cannot abandon its process tree.
+Docker still removes daemon-side containers. Docker drop guards enqueue removal
+onto a sandbox-owned cleanup supervisor because `Drop` cannot await; runtime
+shutdown drains that supervisor before the process sweep. Every command it runs
+still uses `ManagedChild`, so abandoning a task or future cannot abandon its
+process tree.
 
 `scripts/check-managed-process-spawns.sh` is a CI guard: raw `.spawn()` and
 `kill_on_drop` calls outside this crate fail the build. Fully-awaited leaf

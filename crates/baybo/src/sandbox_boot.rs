@@ -33,7 +33,7 @@ pub(crate) async fn resolve_sandbox_runner(
     }
 
     let sandbox_required = permission != baybo_config::PermissionPolicy::Free;
-    match baybo_sandbox::current_platform_runner(process_manager) {
+    match baybo_sandbox::current_platform_runner(process_manager).await {
         Ok(runner) => match runner.warm().await {
             Ok(()) => {
                 info!(backend = ?runner.backend(), "OS sandbox ready");

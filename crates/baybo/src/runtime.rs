@@ -121,6 +121,7 @@ pub async fn build_bot_registry_deps(
 /// when attaching cron triggers to the router.
 pub struct ManagerGraph {
     mcp_runtime: McpRuntime,
+    sandbox_runner: Option<Arc<dyn baybo_sandbox::SandboxRunner>>,
     pub process_manager: Arc<baybo_process::ProcessManager>,
     pub config: Arc<BayboConfig>,
     pub session_manager: Arc<SessionManager>,
@@ -251,7 +252,13 @@ impl ManagerGraph {
     pub async fn shutdown(&mut self, budget: std::time::Duration) {
         let deadline =
             tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN);
-        self.mcp_runtime.shutdown(deadline).await;
+        self.actor_parent_token.cancel();
+        let sandbox_runner = self.sandbox_runner.clone();
+        tokio::join!(self.mcp_runtime.shutdown(deadline), async move {
+            if let Some(runner) = sandbox_runner {
+                runner.shutdown(deadline).await;
+            }
+        });
         self.process_manager
             .shutdown_all(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
@@ -641,6 +648,7 @@ pub async fn build_managers(
         Arc::clone(&process_manager),
     )
     .await?;
+    let sandbox_runner = sandbox_boot.runner;
 
     // --- pluggable memory backend. Constructed here while
     // `tool_registry` is still mutable so the impl's `tools()` can be
@@ -731,7 +739,7 @@ pub async fn build_managers(
         Arc::clone(&security_gateway),
         sandbox_root,
         workspace_paths.clone(),
-        sandbox_boot.runner,
+        sandbox_runner.clone(),
         sandbox_boot.bypass_reason,
         virtual_reads,
         background_jobs,
@@ -778,6 +786,7 @@ pub async fn build_managers(
 
     Ok(ManagerGraph {
         mcp_runtime,
+        sandbox_runner,
         process_manager,
         config,
         session_manager,
@@ -1043,11 +1052,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // Note what that grants: these run their own tool loops with
     // approvals bypassed, so they sidestep baybo's sandbox + approval
     // gate. `external_agents.<kind>.enabled = false` withholds one.
-    let external_agents = Arc::new(baybo_agent::external_agent::build_registry(
-        Arc::clone(&graph.process_manager),
-        graph.config.external_agents.boot_entries(),
-        boot::proxy_settings(&graph.config),
-    ));
+    let external_agents = Arc::new(
+        baybo_agent::external_agent::build_registry(
+            Arc::clone(&graph.process_manager),
+            graph.config.external_agents.boot_entries(),
+            boot::proxy_settings(&graph.config),
+        )
+        .await,
+    );
 
     // Actor-backed subagent spawner: the `spawn_subagent` tool calls it
     // directly via the slot wired at build time. Built here — after the

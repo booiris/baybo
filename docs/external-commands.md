@@ -9,7 +9,10 @@ All runtime children are spawned through `baybo-process`: each gets a dedicated
 process group, an owned guard, process-wide graceful/forced shutdown, and a
 token-validated crash ledger. Domain supervisors keep restart/protocol policy;
 the process layer guarantees that losing a future or handle cannot orphan the
-child tree. Fully-awaited workspace bootstrap git calls remain leaf-local.
+child tree. Runtime probes are async and use the same managed child type. Docker
+container cleanup that originates in `Drop` is queued to a sandbox-owned async
+supervisor and drained before the process sweep. Fully-awaited workspace
+bootstrap git calls remain leaf-local.
 
 ## Inventory
 

@@ -28,11 +28,11 @@ pub struct BwrapRunner {
 }
 
 impl BwrapRunner {
-    pub fn discover(
+    pub async fn discover(
         process_manager: Arc<baybo_process::ProcessManager>,
     ) -> Result<Self, SandboxError> {
         let binary = locate_binary("bwrap")?;
-        let systemd_run = probe_systemd_run(&process_manager);
+        let systemd_run = probe_systemd_run(&process_manager).await;
         match &systemd_run {
             Some(p) => tracing::info!(
                 path = %p.display(),
@@ -84,17 +84,19 @@ impl BwrapRunner {
 /// configurations (no user manager, dbus session unreachable, missing
 /// XDG_RUNTIME_DIR) still ship the binary and only fail at the unit
 /// activation step.
-fn probe_systemd_run(process_manager: &Arc<baybo_process::ProcessManager>) -> Option<PathBuf> {
+async fn probe_systemd_run(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+) -> Option<PathBuf> {
     let bin = locate_binary("systemd-run").ok()?;
-    let mut command = std::process::Command::new(&bin);
+    let mut command = Command::new(&bin);
     command
         .args(["--user", "--quiet", "--scope", "--", "/bin/true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = process_manager
-        .spawn_std(&mut command, "sandbox-probe:systemd-run")
+        .spawn(&mut command, "sandbox-probe:systemd-run")
         .ok()?;
-    let out = child.wait().ok()?;
+    let out = child.wait().await.ok()?;
     out.success().then_some(bin)
 }
 

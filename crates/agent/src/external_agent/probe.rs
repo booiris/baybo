@@ -6,13 +6,12 @@
 //! that don't vary.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use super::{ExternalAgentError, Result};
 
@@ -67,7 +66,7 @@ pub(crate) fn resolve_binary(
 
 /// Exec the binary to catch "exists but broken" (wrong arch, libc
 /// mismatch, corrupt download).
-pub(crate) fn check_binary_runs(
+pub(crate) async fn check_binary_runs(
     process_manager: &Arc<baybo_process::ProcessManager>,
     binary: &PathBuf,
     binary_name: &str,
@@ -81,11 +80,13 @@ pub(crate) fn check_binary_runs(
             process_manager,
             Command::new(binary).arg("--version"),
             VERSION_CHECK_TIMEOUT,
-        ) {
+        )
+        .await
+        {
             Ok(out) => break out,
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
                 attempts += 1;
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
             Err(e) => {
@@ -116,34 +117,21 @@ pub(crate) fn check_binary_runs(
     Ok(())
 }
 
-fn run_with_timeout(
+async fn run_with_timeout(
     process_manager: &Arc<baybo_process::ProcessManager>,
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    // Synchronous (probe runs sync inside `probe_and_build`); tokio
-    // timeout would force async up the chain for one shell-out.
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null());
-    let mut child = process_manager.spawn_std(cmd, "external-agent-version")?;
-    let start = std::time::Instant::now();
-    let poll_interval = Duration::from_millis(50);
-    loop {
-        match child.try_wait()? {
-            Some(_) => return child.wait_with_output(),
-            None => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("did not exit within {timeout:?}"),
-                    ));
-                }
-                std::thread::sleep(poll_interval);
-            }
-        }
+    let child = process_manager.spawn(cmd, "external-agent-version")?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("did not exit within {timeout:?}"),
+        )),
     }
 }
 
@@ -241,6 +229,36 @@ pub(crate) async fn reap_after_stream_close(
             let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn version_probe_timeout_reaps_the_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("slow-version");
+        std::fs::write(&binary, "#!/bin/sh\nsleep 60\n").expect("write fake binary");
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("fake binary metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("make fake binary executable");
+
+        let process_manager = baybo_process::ProcessManager::transient();
+        let error = run_with_timeout(
+            &process_manager,
+            Command::new(binary).arg("--version"),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("probe should time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(process_manager.tracked_len(), 0);
     }
 }
 

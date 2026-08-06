@@ -143,7 +143,7 @@ impl ExternalAgentRegistry {
 /// Tuple form `(kind, enabled, binary_path)` is the lingua franca
 /// between this crate and `baybo-config` since the two don't depend on
 /// each other.
-pub fn build_registry<'a, I>(
+pub async fn build_registry<'a, I>(
     process_manager: Arc<baybo_process::ProcessManager>,
     entries: I,
     proxy: Option<baybo_security::http::ProxySettings>,
@@ -166,12 +166,14 @@ where
                 binary_path,
                 proxy.clone(),
             )
+            .await
             .map(|a| a as Arc<dyn ExternalAgent>),
             ExternalAgentKind::Codex => codex_cli::CodexCliAgent::probe_and_build(
                 Arc::clone(&process_manager),
                 binary_path,
                 proxy.clone(),
             )
+            .await
             .map(|a| a as Arc<dyn ExternalAgent>),
         };
         match result {
