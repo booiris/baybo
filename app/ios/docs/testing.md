@@ -43,16 +43,28 @@ can see:
 
 ### `app/ios/web/`
 
-vitest + jsdom, mostly over the pure reducers. Mounting `<Transcript>` was tried
-and rejected: jsdom reports `scrollHeight` as 0, so every follow/pin/jump branch
-degenerates — the transcript is tested through its extracted reducers, and the
-simulator demo flags (see [Headless UI verification](#headless-ui-verification))
-cover what a reducer test cannot.
+vitest + jsdom, mostly over the pure reducers. Bare jsdom cannot say anything
+about the scroll model — `scrollHeight` is 0 and `getBoundingClientRect` is all
+zeros, so every follow/pin/anchor branch degenerates to a no-op — so most of the
+transcript is tested through its extracted reducers, with the simulator demo
+flags (see [Headless UI verification](#headless-ui-verification)) covering what a
+reducer test cannot.
 
-A **small presentational component with no scrollHeight/follow/pin dependency is
-fine to render**, though: `app/ios/web/src/WorkBlock.test.tsx` mounts
-`WorkBlockView` (React Testing Library) for its active/closed/toggle wiring — do
-NOT extend this to `<Transcript>`.
+`app/ios/web/src/transcriptScroll.test.tsx` is the one suite that mounts
+`<Transcript>`, and it does so **under a fake layout**: it stubs
+`document.scrollingElement`, the document's `scrollTop`/`scrollHeight`/
+`clientHeight`, and a per-row `getBoundingClientRect` derived from the row's
+index. That is enough to exercise the arithmetic — a prepend's
+`prevScrollTop + (scrollHeight - prevScrollHeight)`, a REPLACE's
+`top - anchor.top` — for real, which is what the whole scroll half of the
+component is. It exists because that half had no test and shipped a bug: a
+rebased `sync_page` discarded the history a reader had scrolled up for and
+slammed them to the newest edge. It is **not** a WKWebView — momentum,
+rubber-band overscroll and the UI-process scroll thread stay device-only.
+
+A **small presentational component is fine to render** the plain way:
+`app/ios/web/src/WorkBlock.test.tsx` mounts `WorkBlockView` (React Testing
+Library) for its active/closed/toggle wiring, with no layout stubs at all.
 
 `pnpm lint` (eslint, mirroring `app/web` — strict-boolean-expressions /
 no-unnecessary-condition / react-hooks, with a suppression baseline for the

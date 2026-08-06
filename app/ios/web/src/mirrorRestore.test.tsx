@@ -9,10 +9,11 @@ import type { PersistedState, Row, WorkRow, WorkStep } from "./types";
 
 /// The mirror seam, end to end: what `persistState` writes, through the JSON the
 /// file actually holds, through `sanitizeRestoredRows`, into the label
-/// `WorkBlockView` paints. `<Transcript>` itself is deliberately not mounted —
-/// jsdom reports `scrollHeight` as 0, which degenerates every follow/pin branch
-/// (see docs/testing.md "web/") — so this joins the two halves at the row model,
-/// which is where they actually meet (`Transcript.tsx:2431`).
+/// `WorkBlockView` paints. `<Transcript>` itself is not mounted here: the seam
+/// under test is the row model, which is where the two halves actually meet
+/// (`Transcript.tsx:2431`), and mounting it costs the fake layout
+/// `transcriptScroll.test.tsx` stands up (jsdom has none — see
+/// docs/testing.md "web/") for nothing this suite would read.
 ///
 /// It exists because the regression it pins lived in NEITHER half. `rows.test.ts`
 /// pinned the restore's blanket `startedAt` strip as correct; `WorkBlock.test.tsx`

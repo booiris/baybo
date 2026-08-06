@@ -25,6 +25,7 @@ import {
   restStepToWork,
   restoreImageDims,
   rowOrdinal,
+  rowsAboveFloor,
   sameTurnWorkIndex,
   sanitizeRestoredRows,
   splitForFirstPaint,
@@ -555,12 +556,28 @@ describe("hasUntimedWork — the mirror we broke, and can only rebuild from the 
     expect(hasUntimedWork([{ id: "w3", role: "work", active: false } as unknown as Row])).toBe(false);
   });
 
-  it("finds a broken block anywhere in the thread, not just at the tail", () => {
+  it("finds a broken block anywhere in the page the baseline will re-deliver", () => {
     const rows: Row[] = [
       work({ id: "w3", steps: [{ kind: "status", text: "reading" }] }),
       { id: "m91", role: "assistant", content: "done" },
       work({ id: "w95", steps: [tool()], elapsedMs: 4_000 }),
     ];
+    expect(hasUntimedWork(rows)).toBe(true);
+  });
+
+  // The window is load-bearing, not a shortcut. A non-repair REPLACE now KEEPS
+  // the rows above the page's floor, so a block older than the page would
+  // survive it, match again on the next open, and demote the cursor forever —
+  // a baseline REPLACE every single open, for a block no baseline can reach.
+  it("ignores one older than that page — nothing the baseline returns can re-time it", () => {
+    const rows: Row[] = [work({ id: "w3", steps: [{ kind: "status", text: "reading" }] })];
+    for (let i = 0; i < 60; i++) rows.push({ id: `m${100 + i}`, role: "assistant", content: "x" });
+    expect(hasUntimedWork(rows)).toBe(false);
+  });
+
+  it("still flags one that sits just inside the window", () => {
+    const rows: Row[] = [work({ id: "w3", steps: [{ kind: "status", text: "reading" }] })];
+    for (let i = 0; i < 40; i++) rows.push({ id: `m${100 + i}`, role: "assistant", content: "x" });
     expect(hasUntimedWork(rows)).toBe(true);
   });
 });
@@ -1215,6 +1232,57 @@ describe("mergeSyncPage — a page that lands late is placed, not piled on the e
     expect(mergeSyncPage(rendered, page, []).map((r) => r.id)).toEqual(["m100", "m103", "n7"]);
     // Which is exactly the condition the re-check keys on.
     expect(syncSince(100, rendered)).toBeNull();
+  });
+});
+
+describe("rowsAboveFloor — a rebase must not cost the reader the history they paged in", () => {
+  const none = new Set<string>();
+  const msg = (ordinal: number): Row => ({
+    id: `m${ordinal}`,
+    role: "assistant",
+    content: `r${ordinal}`,
+  });
+
+  it("keeps everything the page's window does not reach", () => {
+    const rows = [msg(10), msg(11), msg(12), msg(13)];
+    expect(rowsAboveFloor(rows, 12, none).map((r) => r.id)).toEqual(["m10", "m11"]);
+  });
+
+  it("keeps nothing when the page reaches below the thread's floor", () => {
+    expect(rowsAboveFloor([msg(10), msg(11)], 10, none)).toEqual([]);
+  });
+
+  it("keeps the whole thread when the page starts above all of it", () => {
+    expect(rowsAboveFloor([msg(10), msg(11)], 99, none).map((r) => r.id)).toEqual(["m10", "m11"]);
+  });
+
+  // The cut is by POSITION for exactly this: a notice carries no ordinal, so
+  // filtering on `ordinal < floor` would delete every one of them out of the
+  // half that survives.
+  it("carries an ordinal-less notice along with the neighbours it sits between", () => {
+    const rows: Row[] = [msg(10), { id: "n3", role: "notice", content: "stopped" }, msg(11), msg(12)];
+    expect(rowsAboveFloor(rows, 12, none).map((r) => r.id)).toEqual(["m10", "n3", "m11"]);
+  });
+
+  it("leaves an ordinal-less row BELOW the cut to the page, not to the head", () => {
+    const rows: Row[] = [msg(10), msg(12), { id: "n3", role: "notice", content: "stopped" }];
+    expect(rowsAboveFloor(rows, 12, none).map((r) => r.id)).toEqual(["m10"]);
+  });
+
+  // A work block is keyed `w<ordinal>` and counts as coverage just like a
+  // message — otherwise the cut would walk straight past a turn the page holds.
+  it("counts a work block's ordinal", () => {
+    const rows: Row[] = [msg(10), work({ id: "w11" }), msg(12)];
+    expect(rowsAboveFloor(rows, 11, none).map((r) => r.id)).toEqual(["m10"]);
+  });
+
+  it("drops a row the rebuild already carries, so no id can render twice", () => {
+    const rows: Row[] = [
+      { id: "pm-1", role: "user", content: "hi" },
+      msg(10),
+      msg(11),
+    ];
+    expect(rowsAboveFloor(rows, 11, new Set(["pm-1"])).map((r) => r.id)).toEqual(["m10"]);
   });
 });
 

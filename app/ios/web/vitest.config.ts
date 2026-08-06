@@ -5,9 +5,9 @@ import react from "@vitejs/plugin-react";
 // build target) stays free of test concerns. `jsdom` is NOT optional: the
 // reducer modules transitively import `bridge.ts`, which at MODULE SCOPE reads
 // `window.webkit` and registers window listeners, so `node` throws on import.
-// Most suites exercise pure reducers; the one render test (WorkBlock.test.tsx)
-// mounts that small presentational card — no scrollHeight/follow/pin, so it does
-// NOT hit the reason <Transcript> stays unrendered (see
+// Most suites exercise pure reducers; the render tests are WorkBlock.test.tsx
+// (a small presentational card, mounted as-is) and transcriptScroll.test.tsx
+// (<Transcript>, mounted under a fake layout of its own — jsdom has none, see
 // app/ios/docs/testing.md "web/"). `setup.ts` wires the jest-dom matchers and
 // per-test unmount.
 export default defineConfig({
