@@ -220,13 +220,23 @@ struct McpRuntime {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+// Leave the outer watchdog time to flush final output after manager teardown.
+const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl McpRuntime {
-    async fn shutdown(&mut self) {
+    async fn shutdown(&mut self, deadline: tokio::time::Instant) {
         self.cancel.cancel();
-        if let Some(task) = self.task.take()
-            && let Err(error) = task.await
-        {
-            tracing::warn!(%error, "mcp reconciler shutdown task failed");
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "mcp reconciler shutdown task failed"),
+                Err(_) => {
+                    tracing::warn!(
+                        "mcp reconciler exceeded the runtime shutdown deadline; aborting"
+                    );
+                    task.abort();
+                }
+            }
         }
     }
 }
@@ -238,10 +248,12 @@ impl Drop for McpRuntime {
 }
 
 impl ManagerGraph {
-    pub async fn shutdown(&mut self) {
-        self.mcp_runtime.shutdown().await;
+    pub async fn shutdown(&mut self, budget: std::time::Duration) {
+        let deadline =
+            tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN);
+        self.mcp_runtime.shutdown(deadline).await;
         self.process_manager
-            .shutdown_all(std::time::Duration::from_secs(3))
+            .shutdown_all(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
     }
 }
@@ -1148,9 +1160,30 @@ mod tests {
             task: Some(task),
         };
 
-        runtime.shutdown().await;
+        runtime
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
 
         cleaned_rx.await.expect("cleanup task completed");
+        assert!(runtime.task.is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_shutdown_aborts_a_task_at_the_deadline() {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending());
+        let mut runtime = McpRuntime {
+            cancel,
+            task: Some(task),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.shutdown(tokio::time::Instant::now()),
+        )
+        .await
+        .expect("shutdown returned after aborting the stuck task");
+
         assert!(runtime.task.is_none());
     }
 

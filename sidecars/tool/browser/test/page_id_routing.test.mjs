@@ -101,7 +101,10 @@ function startSidecar() {
     return { child, send, nextResponse, stderr: () => stderrBuf };
 }
 
-function waitForExit(child, timeoutMs = 10_000) {
+// Production cleanup may use its full 25-second shutdown deadline.
+const SIDECAR_EXIT_TIMEOUT_MS = 30_000;
+
+function waitForExit(child, timeoutMs = SIDECAR_EXIT_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
         const timeout = setTimeout(
             () => reject(new Error("timed out waiting for sidecar exit")),

@@ -137,8 +137,10 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   OAuth client_id), and connects/disconnects accordingly. Connections
   are torn down + re-established when the identity hash changes;
   `register_dynamic` / `unregister_for_source` keep the registry in
-  sync. Its task handle is owned by `ManagerGraph`; shutdown cancels and
-  awaits it before the runtime exits so stdio children are reaped.
+  sync. Its task handle is owned by `ManagerGraph`; shutdown cancels an
+  in-flight tick, closes all sessions concurrently, and awaits the task only
+  until the runtime-wide deadline so a hung exchange cannot prevent the
+  process-manager sweep.
 - **OAuth** — the `oauth` submodule (`baybo_tools::mcp::oauth`) drives
   OAuth 2.1 + PKCE + Dynamic Client Registration via rmcp's
   `OAuthState`. The flow runs **inline inside `baybo mcp add`** for HTTP

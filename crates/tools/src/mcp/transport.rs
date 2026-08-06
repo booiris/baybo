@@ -24,6 +24,9 @@ use crate::mcp::error::{McpError, McpResult};
 use crate::mcp::log_line::SidecarLogLine;
 use crate::mcp::vault_keys;
 
+// The browser sidecar owns a 25-second Docker cleanup deadline.
+const STDIO_CHILD_SHUTDOWN_GRACE: Duration = Duration::from_secs(27);
+
 pub struct McpServerSession {
     running: RunningService<RoleClient, ()>,
     tools: Vec<RmcpTool>,
@@ -192,11 +195,13 @@ impl Transport<RoleClient> for ManagedChildTransport {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        self.transport.close().await?;
-        self.child
-            .shutdown(Duration::from_secs(3))
+        let transport_result = self.transport.close().await;
+        let child_result = self
+            .child
+            .shutdown(STDIO_CHILD_SHUTDOWN_GRACE)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        transport_result.and(child_result)
     }
 }
 

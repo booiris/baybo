@@ -26,9 +26,11 @@ runtime manager.
 An owner must call `wait`, `wait_with_output`, or `shutdown`. Each terminal path
 reaps the leader and kills any unclaimed descendants before unregistering the
 group. Dropping either child guard is the non-async backstop: it kills the whole
-group and removes its ledger record. `ProcessManager::shutdown_all` sends
-`SIGTERM`, waits for a bounded grace period, then sends `SIGKILL`; the force-exit
-watchdog calls `kill_all_now` before `process::exit`.
+group and removes its ledger record. Runtime shutdown uses one deadline across
+MCP protocol cleanup and `ProcessManager::shutdown_all`; a stuck reconciler is
+aborted at that deadline so it cannot prevent the process sweep. The manager
+sends `SIGTERM`, waits for the remaining grace period, then sends `SIGKILL`; the
+force-exit watchdog calls `kill_all_now` before `process::exit`.
 
 If Baybo dies without running destructors (SIGKILL, OOM, abort), ledger records
 survive. The next manager validates the unique token against a live member's

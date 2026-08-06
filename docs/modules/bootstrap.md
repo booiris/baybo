@@ -87,7 +87,7 @@ runtime::build_managers(config, config_path, shutdown, leak_detector, embedded_m
   │   ── Store::open at <workspace>/state/storage.db
   │   ── SessionManager / TurnLifecycle / CronScheduler / SecurityGateway
   │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / BillableLlm / CostManager
-  │   ── McpReconciler::spawn (owned by ManagerGraph and drained on shutdown)
+  │   ── McpReconciler::start (owned by ManagerGraph and deadline-bounded on shutdown)
   │
   ▼
 runtime::wire_router(&mut graph)

@@ -655,7 +655,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         runtime_cfg.shutdown_grace,
     );
 
-    graph.shutdown().await;
+    graph.shutdown(runtime_cfg.shutdown_grace).await;
     task_tracker.shutdown().await;
     tracing::info!("gateway shutdown complete");
     run_result

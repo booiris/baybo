@@ -315,15 +315,18 @@ impl McpReconciler {
     pub fn start(self: &Arc<Self>) -> JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            // Initial pass at startup.
-            let _ = Arc::clone(&this).tick().await;
             loop {
                 tokio::select! {
+                    biased;
+                    _ = this.cancel.cancelled() => break,
+                    _ = Arc::clone(&this).tick() => {}
+                }
+                tokio::select! {
+                    biased;
                     _ = this.cancel.cancelled() => break,
                     _ = tokio::time::sleep(TICK_INTERVAL) => {}
                     _ = this.notify.notified() => {}
                 }
-                let _ = Arc::clone(&this).tick().await;
             }
             this.shutdown().await;
         })
@@ -342,9 +345,7 @@ impl McpReconciler {
         for n in &names {
             self.registry.unregister_for_source(n);
         }
-        for s in sessions {
-            s.shutdown().await;
-        }
+        futures::future::join_all(sessions.into_iter().map(McpServerSession::shutdown)).await;
     }
 
     async fn disconnect_server(self: &Arc<Self>, name: &str) {
