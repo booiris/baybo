@@ -49,13 +49,12 @@ group barrier, when present -------- timeout / complete
                          |
                          | no higher-priority mailbox work
                          v
-          append + dispatch completion reply
-                (bounded summary_text)
-                         |
-                         v
              build + append hidden prompt row
                          |
-                         | both appends succeeded
+                         | newly inserted (not a crash replay)
+                         v
+       persist + dispatch acknowledgement control event
+                         |
                          v
                   active_delivery
                     |
@@ -110,39 +109,55 @@ timer path even when no result is buffered yet.
 ### 3. Buffer-to-delivery durability boundary
 
 Once the mailbox has no queued user trigger or background completion, the actor
-takes the entire buffer as one batch. `baybo-context` builds both a public
-completion reply and the hidden `<background_results>` analysis prompt.
+takes the entire buffer as one batch. `baybo-context` builds both the
+user-facing acknowledgement and the hidden `<background_results>` analysis
+prompt.
 
 The ordering is load-bearing:
 
-1. Derive stable operation keys from the sorted handle IDs. The public reply
-   uses `background-notification:<batch-hash>:completion-reply`; the hidden
-   prompt uses `background-notification:<batch-hash>:prompt`.
-2. Atomically append the completion reply as an assistant row. It states that
-   background work finished and includes each result's `summary_text`, capped
-   by the same per-result limit used by the analysis prompt. A batch labels
-   each summary with its task.
-3. Dispatch that row as its own ordinal-stamped `AgentEvent::Message` only when
-   the idempotent append inserted it. A crash replay that finds the row does not
-   append or live-dispatch a second assistant bubble.
-4. Atomically append the hidden agent-context prompt to `session_messages`.
-   If either append fails, restore the untouched batch to `buffered_results`.
-5. If the prompt key already exists after a crash replay, recover its ordinal without
+1. Derive the batch's stable operation key from the sorted handle IDs:
+   `background-notification:<batch-hash>:prompt`.
+2. Atomically append the hidden agent-context prompt to `session_messages`.
+   If the append fails, restore the untouched batch to `buffered_results`.
+3. If the prompt key already exists after a crash replay, recover its ordinal without
    duplicating the row. If that historical row was superseded by compaction,
    re-anchor it under an operation-specific key first.
-6. Open `active_delivery` with `handle_ids`, frozen `content`,
+4. Only when step 2 **inserted** a new row, persist the acknowledgement as a
+   `NoticeInfo` control event anchored after the prompt row, and dispatch it as
+   an `AgentEvent::Notice` carrying that event's durable id. It is a bland
+   "work finished, reviewing it now" line with no result content.
+5. Open `active_delivery` with `handle_ids`, frozen `content`,
    `prompt_ordinal`, and `failed_attempts = 0`.
-7. Persist the single session-state transition: buffer emptied, delivery
+6. Persist the single session-state transition: buffer emptied, delivery
    opened.
-8. Only after that save succeeds, run the inference turn with the actor's
+7. Only after that save succeeds, run the inference turn with the actor's
    response channel as `delta_tx`.
 
-The completion reply is durable user-facing history, but the raw results still
-own analysed-report delivery until the hidden prompt append succeeds. From
-step 4 onward the prompt row is the durable copy of the result batch. The
+**The acknowledgement is a control event, not a transcript row.** It used to be
+an ordinary assistant row in `session_messages`, which put a fixed sentence into
+the model's own context as its last words — a template the model imitated,
+appending the acknowledgement verbatim to the end of its later answers, so the
+user saw the same line twice in a row. Instructing the model not to repeat it
+cannot fix that: the imitation carries into ordinary user turns, which never see
+the notification framing. `session_control_events` is the plane for exactly this
+— shown in the chat transcript, structurally incapable of reaching the model,
+with no filter for a future `session_messages` reader to forget.
+
+**The acknowledgement carries no idempotency key of its own**; it fires only on
+the prompt insert. One acknowledgement per analysis turn is precisely the rule,
+and the prompt row is already the durable record of "this batch is new", so a
+crash replay recovers it as `Existing` and stays quiet. A separate key hashed
+over the batch's handle set could not express that rule: a result joining the
+batch between a failed attempt and its retry changed the hash and produced a
+second acknowledgement for the same work.
+
+From step 2 onward the prompt row is the durable copy of the result batch, so
 raw results do not need to be re-buffered after an inference failure. A crash
 between the transcript append and the session-state save restores the raw batch
 on hydration, but its deterministic key resolves to the row already written.
+
+A control-event write is best-effort: if it fails, the acknowledgement is missing
+from a later reload, never the report.
 
 The inference turn retains the historical persisted/API kind
 `SubagentNotification` for compatibility, although its payload may describe
@@ -150,7 +165,7 @@ either subagents or commands.
 
 ### 4. Streaming analysis and delivery outcomes
 
-The completion reply itself runs no inference. The following parent-agent turn
+The acknowledgement itself runs no inference. The following parent-agent turn
 is fully streaming: model reasoning is emitted as `AgentEvent::Reasoning`, tool
 lifecycle and progress events use their normal variants, and answer prose is
 emitted as `AgentEvent::AnswerDelta`. Channel surfaces retain their own display
@@ -160,7 +175,7 @@ its working indicator instead of raw reasoning text.
 - Non-blank success: clear and persist `active_delivery`, then dispatch the
   canonical final `OutgoingMessage`.
 - Blank success: clear and persist the delivery, but suppress the final
-  message. The earlier completion reply remains visible.
+  message. The earlier acknowledgement remains visible.
 - Failure: increment `failed_attempts`, persist it, and leave the delivery
   active for the timer.
 
@@ -224,13 +239,13 @@ persist a just-cleared delivery ledger without rewriting `last_active`; an idle
 conversation must not jump to the top of the chat list merely because its
 in-memory actor was reaped.
 
-The synthetic completion reply, prompt, and re-anchor appends are idempotent
-around process crashes; the retry cue needs no key because it is never
-persisted. External dispatch is not in the same
-transaction: a crash after the completion-row insert but before its channel
-send leaves the durable row for history sync, while a crash after final-report
-channel delivery but before the active-ledger clear can duplicate that report
-on retry. The explicit 64-entry admission cap also remains: overflow evicts the
+The prompt and re-anchor appends are idempotent around process crashes; the
+retry cue needs no key because it is never persisted, and the acknowledgement
+needs none because it fires off the prompt insert. External dispatch is not in
+the same transaction: a crash after the acknowledgement's control-event insert
+but before its channel send leaves the durable event for history sync, while a
+crash after final-report channel delivery but before the active-ledger clear can
+duplicate that report on retry. The explicit 64-entry admission cap also remains: overflow evicts the
 oldest pending notification with a warning, while the authoritative child
 transcript or command output remains intact.
 
@@ -240,9 +255,12 @@ transcript or command output remains intact.
 - At most one `active_delivery` exists, but it may coexist with buffered/grouped
   results for later batches.
 - Raw results own analysed-report delivery before the hidden prompt append; the
-  prompt row and ledger own it afterward. The public completion reply is a
-  separate durable assistant row. Every crash-replayable synthetic append
-  carries a stable operation-scoped source-event key.
+  prompt row and ledger own it afterward. Every crash-replayable synthetic
+  append to `session_messages` carries a stable operation-scoped source-event
+  key.
+- Nothing this pipeline shows the user is also shown to the model as its own
+  words. The acknowledgement lives on `session_control_events`; only the
+  analysed report the model actually produced is a transcript row.
 - An active delivery always finishes or degrades before the next buffer drains.
 - Retry is append-only and forward-only; no transcript rollback occurs.
 - Mailbox priority is ordering, not preemption. `/stop` is the only hard

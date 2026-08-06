@@ -2261,20 +2261,6 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Append the public, non-LLM completion reply for a background batch.
-    /// The stable source-event id keeps crash replay from creating a second
-    /// assistant bubble.
-    pub async fn append_background_completion_reply_once(
-        &mut self,
-        content: Vec<ContentBlock>,
-        source_event_id: &str,
-    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
-        self.context_manager.ensure_seeded().await;
-        self.context_manager
-            .append_idempotent(source_event_id, &ChatMessage::assistant(content))
-            .await
-    }
-
     /// Append the crash-replayable hidden prompt that carries a background
     /// batch into its analysis turn. Existing rows are returned without
     /// duplicating the live context window.
