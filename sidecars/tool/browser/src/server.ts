@@ -226,6 +226,13 @@ const logger = createLogger("[browser-mcp]");
 const log = logger.info;
 const logDebug = logger.debug;
 
+function ignoreBrokenPipe(error: NodeJS.ErrnoException): void {
+  if (error.code !== "EPIPE") throw error;
+}
+
+process.stdout.on("error", ignoreBrokenPipe);
+process.stderr.on("error", ignoreBrokenPipe);
+
 const execFileAsync = promisify(execFile);
 
 /**
@@ -1443,6 +1450,44 @@ async function main(): Promise<void> {
 
   const realTransport = new StdioServerTransport();
   const transport = new GuardingTransport(realTransport, state);
+
+  let shuttingDown = false;
+  // Match the docker stop timeout (5s graceful + slack for `docker rm`) without
+  // letting a wedged daemon pin the gateway's own shutdown indefinitely.
+  const SHUTDOWN_TIMEOUT_MS = 25_000;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Quiesce any repair already in flight before snapshotting the container:
+    // otherwise it can publish a replacement after teardown has passed it.
+    watchdog?.stop();
+    log("shutting down");
+    const closes: Array<Promise<unknown>> = [
+      watchdog?.quiesce() ?? Promise.resolve(),
+      proxy.close().catch(() => undefined),
+      cddmClient.close().catch(() => undefined),
+      cddmServer.close().catch(() => undefined),
+    ];
+    if (dockerHandle) {
+      // dockerHandle.stop already swallows its own errors.
+      closes.push(dockerHandle.stop());
+    }
+    const deadline = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        log(`shutdown deadline hit after ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`);
+        resolve();
+      }, SHUTDOWN_TIMEOUT_MS).unref();
+    });
+    void Promise.race([Promise.allSettled(closes).then(() => undefined), deadline]).then(() => {
+      process.exit(0);
+    });
+  };
+  // SIGKILL and crashes cannot deliver a signal to the child, but they still
+  // close the gateway-owned side of this pipe.
+  process.stdin.once("end", shutdown);
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
   await proxy.connect(transport as unknown as StdioServerTransport);
 
   const chromeArgList = args.chromeArg !== undefined && args.chromeArg.length > 0 ? args.chromeArg.join(",") : "";
@@ -1483,7 +1528,6 @@ async function main(): Promise<void> {
     },
   };
 
-  let shuttingDown = false;
   let healer: BrowserHealer;
   if (mode === "docker" && dockerOpts && dockerHandle) {
     const opts = dockerOpts;
@@ -1532,44 +1576,6 @@ async function main(): Promise<void> {
   });
   watchdog.start();
 
-  // Cap shutdown at the docker stop timeout (5s graceful + slack for
-  // `docker rm`) so a hung container can't pin the gateway's reload
-  // forever, but give the in-flight `docker stop` a real chance to
-  // complete — the previous 50ms hard cutoff routinely exited before
-  // `docker stop` even sent SIGTERM, leaving the container running and
-  // the next-boot sweep responsible for cleanup.
-  const SHUTDOWN_TIMEOUT_MS = 25_000;
-  const shutdown = (): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    // Stop scheduling first, then wait out any tick already running: a docker
-    // repair can be mid-`spawnContainer` here, and exiting under it would
-    // orphan the container it is about to create. `quiesce` rides the same
-    // 25s deadline as the rest of teardown.
-    watchdog?.stop();
-    log("shutting down");
-    const closes: Array<Promise<unknown>> = [
-      watchdog?.quiesce() ?? Promise.resolve(),
-      proxy.close().catch(() => undefined),
-      cddmClient.close().catch(() => undefined),
-      cddmServer.close().catch(() => undefined),
-    ];
-    if (dockerHandle) {
-      // dockerHandle.stop already swallows its own errors.
-      closes.push(dockerHandle.stop());
-    }
-    const deadline = new Promise<void>((resolve) => {
-      setTimeout(() => {
-        log(`shutdown deadline hit after ${SHUTDOWN_TIMEOUT_MS}ms; forcing exit`);
-        resolve();
-      }, SHUTDOWN_TIMEOUT_MS).unref();
-    });
-    void Promise.race([Promise.allSettled(closes).then(() => undefined), deadline]).then(() => {
-      process.exit(0);
-    });
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 }
 
 main().catch((e: unknown) => {

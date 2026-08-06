@@ -120,6 +120,7 @@ pub async fn build_bot_registry_deps(
 /// The `cron_trigger_rx` is a one-shot — [`wire_router`] consumes it
 /// when attaching cron triggers to the router.
 pub struct ManagerGraph {
+    mcp_runtime: McpRuntime,
     pub config: Arc<BayboConfig>,
     pub session_manager: Arc<SessionManager>,
     pub turn_lifecycle: Arc<TurnLifecycle>,
@@ -211,6 +212,34 @@ pub struct ManagerGraph {
     /// `Arc`; otherwise the limiter on the tool and the one on the
     /// router could diverge silently.
     pub subagent_dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
+}
+
+struct McpRuntime {
+    cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl McpRuntime {
+    async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "mcp reconciler shutdown task failed");
+        }
+    }
+}
+
+impl Drop for McpRuntime {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl ManagerGraph {
+    pub async fn shutdown(&mut self) {
+        self.mcp_runtime.shutdown().await;
+    }
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -696,19 +725,8 @@ pub async fn build_managers(
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
-    // dynamically registers/unregisters MCP-discovered tools. Bridge the
-    // shared `ShutdownSignal` to a `CancellationToken` since the
-    // reconciler lives in `baybo-tools`, which doesn't depend on
-    // `baybo-agent`.
+    // dynamically registers/unregisters MCP-discovered tools.
     let mcp_cancel = CancellationToken::new();
-    {
-        let signal = shutdown.clone();
-        let cancel_on_shutdown = mcp_cancel.clone();
-        tokio::spawn(async move {
-            signal.wait().await;
-            cancel_on_shutdown.cancel();
-        });
-    }
 
     // --- per-actor parent token. The spawner factory derives each
     // actor's `actor_token` as a child of this; tripping it on
@@ -734,12 +752,16 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
         Some(stores.blob.clone()),
         embedded_mcp_servers,
-        mcp_cancel,
+        mcp_cancel.clone(),
         proxy.clone(),
     );
-    mcp_reconciler.spawn();
+    let mcp_runtime = McpRuntime {
+        cancel: mcp_cancel,
+        task: Some(mcp_reconciler.spawn()),
+    };
 
     Ok(ManagerGraph {
+        mcp_runtime,
         config,
         session_manager,
         turn_lifecycle,
@@ -1101,4 +1123,51 @@ pub fn force_exit_watchdog(budget: std::time::Duration) {
         baybo_tools::builtin::bash::reap_tracked_process_groups();
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_runtime_shutdown_waits_for_cleanup() {
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let (cleaned_tx, cleaned_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            worker_cancel.cancelled().await;
+            let _ = cleaned_tx.send(());
+        });
+        let mut runtime = McpRuntime {
+            cancel,
+            task: Some(task),
+        };
+
+        runtime.shutdown().await;
+
+        cleaned_rx.await.expect("cleanup task completed");
+        assert!(runtime.task.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_mcp_runtime_cancels_its_task() {
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            worker_cancel.cancelled().await;
+            let _ = cancelled_tx.send(());
+        });
+        let runtime = McpRuntime {
+            cancel,
+            task: Some(task),
+        };
+
+        drop(runtime);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("drop cancellation completed before timeout")
+            .expect("drop cancellation task completed");
+    }
 }

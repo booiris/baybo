@@ -293,6 +293,7 @@ async fn run_in_process(
     // happy-path teardown completes well inside the budget.
     shutdown.trigger();
     force_exit_watchdog(TEARDOWN_BUDGET);
+    graph.shutdown().await;
     drop(graph);
 
     let answer = answer?;

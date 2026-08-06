@@ -101,6 +101,19 @@ function startSidecar() {
     return { child, send, nextResponse, stderr: () => stderrBuf };
 }
 
+function waitForExit(child, timeoutMs = 10_000) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+            () => reject(new Error("timed out waiting for sidecar exit")),
+            timeoutMs,
+        );
+        child.once("exit", (code, signal) => {
+            clearTimeout(timeout);
+            resolve({ code, signal });
+        });
+    });
+}
+
 test("experimentalPageIdRouting is on; pageId surfaces on the right tools", async (t) => {
     const { child, send, nextResponse } = startSidecar();
     t.after(() => {
@@ -222,6 +235,34 @@ test("the CDDM flags the tab cap depends on are actually passed", async (t) => {
     );
     assert.match(log, /page_id_routing=on/);
     assert.match(log, /max_pages=\d+/, "the effective tab cap is reported at boot");
+});
+
+test("closed parent pipes shut down the sidecar without orphaning it", async (t) => {
+    const { child, send, nextResponse } = startSidecar();
+    t.after(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    });
+
+    send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "baybo-browser-test", version: "0.0.1" },
+        },
+    });
+    await nextResponse();
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    await nextResponse();
+
+    const exited = waitForExit(child);
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.stdin.end();
+    assert.deepEqual(await exited, { code: 0, signal: null });
 });
 
 
