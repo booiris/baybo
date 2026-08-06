@@ -19,7 +19,10 @@ process-group and drop guarantees.
 Every spawn creates a new Unix process group, injects a unique
 `BAYBO_PROCESS_TOKEN`, registers the group before returning, and writes a
 best-effort ledger row under `<workspace>/state/processes/` for the long-running
-runtime manager.
+runtime manager. The manager creates that directory once at construction;
+individual spawns only create their small row, and terminal paths unlink it.
+If the directory cannot be initialized, startup continues with in-memory
+tracking and logs that crash recovery is disabled for that runtime.
 
 An owner must call `wait`, `wait_with_output`, or `shutdown`. Each terminal path
 reaps the leader and kills any unclaimed descendants before unregistering the

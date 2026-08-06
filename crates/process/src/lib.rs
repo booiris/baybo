@@ -40,14 +40,23 @@ struct PersistedProcess {
 
 impl ProcessManager {
     pub fn from_config(config: ProcessManagerConfig) -> Arc<Self> {
-        if let Some(dir) = config.ledger_dir.as_deref() {
-            let reaped = reap_stale_ledger(dir);
+        let ledger_dir = config.ledger_dir.and_then(|dir| {
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                tracing::warn!(
+                    %error,
+                    path = %dir.display(),
+                    "failed to initialize process crash ledger; crash recovery is disabled"
+                );
+                return None;
+            }
+            let reaped = reap_stale_ledger(&dir);
             if reaped > 0 {
                 tracing::warn!(reaped, path = %dir.display(), "reaped process groups from a prior runtime");
             }
-        }
+            Some(dir)
+        });
         Arc::new(Self {
-            ledger_dir: config.ledger_dir,
+            ledger_dir,
             tracked: Mutex::new(BTreeMap::new()),
         })
     }
@@ -135,17 +144,37 @@ impl ProcessManager {
             label: label.to_string(),
             token: token.to_string(),
         };
-        if let Ok(json) = serde_json::to_vec(&record)
-            && std::fs::create_dir_all(dir).is_ok()
-        {
-            let _ = std::fs::write(ledger_path(dir, token), json);
+        let path = ledger_path(dir, token);
+        match serde_json::to_vec(&record) {
+            Ok(json) => {
+                if let Err(error) = std::fs::write(&path, json) {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "failed to write process crash ledger entry"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to serialize process crash ledger entry"
+            ),
         }
     }
 
     fn unregister(&self, pgid: i32) {
         let removed = self.tracked.lock().remove(&pgid);
         if let (Some(dir), Some(record)) = (self.ledger_dir.as_deref(), removed) {
-            let _ = std::fs::remove_file(ledger_path(dir, &record.token));
+            let path = ledger_path(dir, &record.token);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "failed to remove process crash ledger entry"
+                );
+            }
             tracing::debug!(pgid, label = %record.label, "process group released");
         }
     }
@@ -505,5 +534,31 @@ mod tests {
             manager.kill_all_now();
             panic!("grandchild {grandchild} survived crash-ledger reap");
         }
+    }
+
+    #[test]
+    fn configured_manager_creates_ledger_directory_at_construction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("nested").join("ledger");
+
+        let manager = ProcessManager::from_config(ProcessManagerConfig {
+            ledger_dir: Some(ledger.clone()),
+        });
+
+        assert!(ledger.is_dir());
+        assert_eq!(manager.ledger_dir.as_deref(), Some(ledger.as_path()));
+    }
+
+    #[test]
+    fn configured_manager_disables_ledger_when_directory_creation_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"occupied").expect("write blocking file");
+
+        let manager = ProcessManager::from_config(ProcessManagerConfig {
+            ledger_dir: Some(file.join("ledger")),
+        });
+
+        assert!(manager.ledger_dir.is_none());
     }
 }
