@@ -292,8 +292,9 @@ async fn run_in_process(
     // can't wedge the exit. The turn is already finished by here, so the
     // happy-path teardown completes well inside the budget.
     shutdown.trigger();
+    let manager_shutdown_deadline = crate::runtime::manager_shutdown_deadline(TEARDOWN_BUDGET);
     force_exit_watchdog(Arc::clone(&graph.process_manager), TEARDOWN_BUDGET);
-    graph.shutdown(TEARDOWN_BUDGET).await;
+    graph.shutdown(manager_shutdown_deadline).await;
     drop(graph);
 
     let answer = answer?;

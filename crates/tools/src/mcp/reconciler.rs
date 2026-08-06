@@ -9,12 +9,12 @@ use baybo_security::SecretVault;
 use baybo_store::BlobStore;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::ResourceAccess;
 use crate::mcp::config::{McpFile, McpServerEntry, McpTransportConfig};
 use crate::mcp::embedded::EmbeddedMcpServer;
+use crate::mcp::runtime::McpRuntime;
 use crate::mcp::transport::{McpServerSession, connect_with_extra_env};
 use crate::{Tool, ToolRegistry};
 
@@ -98,7 +98,6 @@ pub struct McpReconcilerConfig {
     pub process_manager: Arc<baybo_process::ProcessManager>,
     pub blob_store: Option<Arc<dyn BlobStore>>,
     pub embedded: Vec<EmbeddedMcpServer>,
-    pub cancel: CancellationToken,
     pub proxy: Option<baybo_security::http::ProxySettings>,
 }
 
@@ -112,7 +111,7 @@ impl McpReconciler {
             blob_store: config.blob_store,
             embedded: config.embedded,
             proxy: config.proxy,
-            cancel: config.cancel,
+            cancel: CancellationToken::new(),
             notify: Arc::new(Notify::new()),
             state: Mutex::new(HashMap::new()),
             backoff: Mutex::new(HashMap::new()),
@@ -312,9 +311,10 @@ impl McpReconciler {
         self.state.lock().keys().cloned().collect()
     }
 
-    pub fn start(self: &Arc<Self>) -> JoinHandle<()> {
+    pub fn start(self: &Arc<Self>) -> McpRuntime {
+        let cancel = self.cancel.clone();
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -329,7 +329,8 @@ impl McpReconciler {
                 }
             }
             this.shutdown().await;
-        })
+        });
+        McpRuntime::new(cancel, task)
     }
 
     pub async fn shutdown(self: Arc<Self>) {

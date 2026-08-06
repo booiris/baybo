@@ -137,7 +137,8 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   OAuth client_id), and connects/disconnects accordingly. Connections
   are torn down + re-established when the identity hash changes;
   `register_dynamic` / `unregister_for_source` keep the registry in
-  sync. Its task handle is owned by `ManagerGraph`; shutdown cancels an
+  sync. `start` returns an `McpRuntime` handle that owns cancellation and the
+  reconciler task; `ManagerGraph` retains that handle. Shutdown cancels an
   in-flight tick, closes all sessions concurrently, and awaits the task only
   until the runtime-wide deadline so a hung exchange cannot prevent the
   process-manager sweep.

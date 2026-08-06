@@ -650,12 +650,13 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         shutdown.trigger();
     }
 
+    let manager_shutdown_deadline = runtime::manager_shutdown_deadline(runtime_cfg.shutdown_grace);
     runtime::force_exit_watchdog(
         Arc::clone(&graph.process_manager),
         runtime_cfg.shutdown_grace,
     );
 
-    graph.shutdown(runtime_cfg.shutdown_grace).await;
+    graph.shutdown(manager_shutdown_deadline).await;
     task_tracker.shutdown().await;
     tracing::info!("gateway shutdown complete");
     run_result
