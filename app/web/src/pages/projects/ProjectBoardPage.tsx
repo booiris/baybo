@@ -411,99 +411,110 @@ export function ProjectBoardPage() {
         </div>
       ) : null}
 
-      <div className="flex-1 min-h-0 flex">
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCorners}
-        onDragStart={onDragStart}
-        onDragOver={onDragOver}
-        onDragEnd={(event) => {
-          void onDragEnd(event);
-        }}
-        onDragCancel={onDragCancel}
-      >
-        <div className="flex-1 min-h-0 flex gap-3 p-4 overflow-x-auto bg-surface">
-          {COLUMNS.map((status) => (
-            <BoardColumn
-              key={status}
-              status={status}
-              issues={view[status]}
-              total={liveCount(board[status])}
-              activeRuns={activeRuns}
-              team={team}
-              disabled={archived}
-              onOpen={openIssue}
-              onCreate={() => {
-                setCreateIn(status);
-              }}
-            />
-          ))}
-        </div>
-
-        <DragOverlay>
-          {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
-        </DragOverlay>
-      </DndContext>
-      {rightPanel === 'activity' ? (
-        <ActivityDrawer
-          projectId={projectId}
-          // The feed refetches on the same signal the board does, so an
-          // entry and the card it describes appear together.
-          refreshKey={refreshKey}
-          onClose={() => {
-            setRightPanel(null);
+      {/* The panels float over the board rather than sharing a row with
+          it: docking them would narrow every column the moment one opens,
+          so reading the activity feed would reflow the thing it is about.
+          This element is their positioning context, which is why the board
+          keeps its full width underneath. */}
+      <div className="relative flex-1 min-h-0 flex">
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCorners}
+          onDragStart={onDragStart}
+          onDragOver={onDragOver}
+          onDragEnd={(event) => {
+            void onDragEnd(event);
           }}
-          onOpenIssue={openIssue}
-        />
-      ) : null}
-      {profileOf !== null && rightPanel === null
-        ? (() => {
-            const agent = team.find((row) => row.id === profileOf);
-            return agent === undefined ? null : (
-              <AgentProfile
-                agent={agent}
-                team={team}
-                // Every card on the board, so a step assigned to this agent
-                // shows even when the filter hides it.
-                issues={Object.values(board).flat()}
+          onDragCancel={onDragCancel}
+        >
+          <div className="flex-1 min-h-0 flex gap-3 p-4 overflow-x-auto bg-surface">
+            {COLUMNS.map((status) => (
+              <BoardColumn
+                key={status}
+                status={status}
+                issues={view[status]}
+                total={liveCount(board[status])}
                 activeRuns={activeRuns}
-                readOnly={archived}
-                projectId={projectId}
-                onClose={() => {
-                  setProfileOf(null);
-                }}
-                onRemove={(row) => {
-                  setProfileOf(null);
-                  void removeAgent(client, projectId, row.id).then((outcome) => {
-                    if (outcome.kind === 'unauthorized') {
-                      logout();
-                      return;
-                    }
-                    pushToast(
-                      outcome.kind === 'ok' ? 'ok' : 'err',
-                      outcome.kind === 'ok'
-                        ? `@${row.handle} left the project`
-                        : outcome.message,
-                    );
-                    setRefreshKey((key) => key + 1);
-                  });
+                team={team}
+                disabled={archived}
+                onOpen={openIssue}
+                onCreate={() => {
+                  setCreateIn(status);
                 }}
               />
-            );
-          })()
-        : null}
-      {rightPanel === 'lead' ? (
-        <LeadPanel
-          projectId={projectId}
-          readOnly={archived}
-          onClose={() => {
-            setRightPanel(null);
-          }}
-          onBoardChanged={() => {
-            setRefreshKey((key) => key + 1);
-          }}
-        />
-      ) : null}
+            ))}
+          </div>
+
+          <DragOverlay>
+            {dragging !== null ? <IssueCard issue={dragging} team={team} overlay /> : null}
+          </DragOverlay>
+        </DndContext>
+        {rightPanel === 'activity' ? (
+          <FloatingPanel>
+            <ActivityDrawer
+              projectId={projectId}
+              // The feed refetches on the same signal the board does, so an
+              // entry and the card it describes appear together.
+              refreshKey={refreshKey}
+              onClose={() => {
+                setRightPanel(null);
+              }}
+              onOpenIssue={openIssue}
+            />
+          </FloatingPanel>
+        ) : null}
+        {profileOf !== null && rightPanel === null
+          ? (() => {
+              const agent = team.find((row) => row.id === profileOf);
+              return agent === undefined ? null : (
+                <FloatingPanel>
+                  <AgentProfile
+                    agent={agent}
+                    team={team}
+                    // Every card on the board, so a step assigned to this agent
+                    // shows even when the filter hides it.
+                    issues={Object.values(board).flat()}
+                    activeRuns={activeRuns}
+                    readOnly={archived}
+                    projectId={projectId}
+                    onClose={() => {
+                      setProfileOf(null);
+                    }}
+                    onRemove={(row) => {
+                      setProfileOf(null);
+                      void removeAgent(client, projectId, row.id).then((outcome) => {
+                        if (outcome.kind === 'unauthorized') {
+                          logout();
+                          return;
+                        }
+                        pushToast(
+                          outcome.kind === 'ok' ? 'ok' : 'err',
+                          outcome.kind === 'ok'
+                            ? `@${row.handle} left the project`
+                            : outcome.message,
+                        );
+                        setRefreshKey((key) => key + 1);
+                      });
+                    }}
+                  />
+                </FloatingPanel>
+              );
+            })()
+          : null}
+        {rightPanel === 'lead' ? (
+          <FloatingPanel>
+            <LeadPanel
+              projectId={projectId}
+              readOnly={archived}
+              onClose={() => {
+                setRightPanel(null);
+              }}
+              onBoardChanged={() => {
+                setRefreshKey((key) => key + 1);
+              }}
+            />
+          </FloatingPanel>
+        ) : null}
       </div>
 
       {showSettings && project !== null ? (
@@ -688,6 +699,22 @@ function SubIssueRing({ progress }: { progress: { done: number; total: number } 
         {done}/{total}
       </span>
     </div>
+  );
+}
+
+/**
+ * Holds a side panel over the board's right edge.
+ *
+ * No backdrop and no outside-click dismissal: these panels are read
+ * alongside the board — the activity feed's entries open cards, the lead's
+ * replies move them — so blocking the board would defeat the reason they
+ * are on this page at all. They close by their own button.
+ *
+ * Below the modal layer (`z-40`), which does take the screen.
+ */
+function FloatingPanel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="absolute inset-y-0 right-0 z-30 flex shadow-brutal">{children}</div>
   );
 }
 

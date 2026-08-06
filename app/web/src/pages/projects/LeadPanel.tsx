@@ -176,7 +176,7 @@ export function LeadPanel({
   }, [active, draft]);
 
   return (
-    <aside className="w-[360px] shrink-0 border-l-2 border-black bg-canvas flex flex-col min-h-0">
+    <aside className="w-[360px] border-l-2 border-black bg-canvas flex flex-col min-h-0">
       <header className="flex items-center gap-2 px-3 py-2 border-b-2 border-black shrink-0">
         <h2 className="font-mono text-[0.68rem] font-bold uppercase tracking-wider">@lead</h2>
         <select

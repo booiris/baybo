@@ -88,6 +88,12 @@ function stubClient() {
       if (path === '/v1/projects/{project_id}/agents') {
         return { data: { items: TEAM }, error: undefined, response: ok };
       }
+      if (path === '/v1/projects/{project_id}/feed') {
+        return { data: { items: [] }, error: undefined, response: ok };
+      }
+      if (path === '/v1/projects/attention') {
+        return { data: { items: [] }, error: undefined, response: ok };
+      }
       throw new Error(`unexpected GET ${path}`);
     }),
     POST: vi.fn(),
@@ -221,5 +227,25 @@ describe('ProjectBoardPage', () => {
     expect(await screen.findByText('Cancelled one')).toBeInTheDocument();
     // …and they still do not count as live work.
     expect(await screen.findByTitle('2 live')).toBeInTheDocument();
+  });
+
+  /**
+   * The panels sit over the board, not beside it. Docking one narrows every
+   * column the moment it opens — so reading the activity feed would reflow
+   * the thing it is about.
+   *
+   * jsdom has no layout, so what is checkable is the mechanism: the panel
+   * is inside an absolutely-positioned container and therefore out of the
+   * flow. That is exactly what a regression would undo.
+   */
+  it('floats a side panel over the board instead of docking it', async () => {
+    renderBoard();
+    await screen.findByText('Wire the board');
+    await userEvent.click(screen.getByRole('button', { name: 'Activity' }));
+
+    const panel = await screen.findByRole('complementary');
+    expect(panel.parentElement?.className).toContain('absolute');
+    // …and the board is still underneath it, at its own width.
+    expect(screen.getByText('Wire the board')).toBeInTheDocument();
   });
 });
