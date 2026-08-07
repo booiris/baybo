@@ -51,9 +51,20 @@ every door leads through it.
 
 Everything under `runs`/`comments`/`mentions`/`stages`/`budget`/`timeline` is a
 **pure rule module**: no store, no clock beyond an argument, unit-tested in
-place. That is deliberate — the web composer has to be able to say what sending
-a comment will do *before* the request, and the only way that promise stays true
-is if the composer and the manager read the same function.
+place. That is what lets every caller *in this process* — the manager, the six
+board tools, the REST routes — answer a question the same way without any of
+them carrying a copy of the rule.
+
+The web board is not one of those callers, and this is the seam to know about.
+A composer has to say what sending will do while the text is still being typed,
+so it cannot ask the server: `commentHint` and `mentionHint`/`mentionQuery` in
+`app/web/src/pages/projects/` are hand-written TypeScript mirrors of
+`comments::comment_delivery` and `mentions::assigns_to`. Nothing enforces the
+correspondence — not a generated binding, not a shared schema — only the two
+test suites, one per language, asserting the same cases. So widening
+`is_live_work` by one column, or adding a run state that reads as idle, is a
+change on both sides in the same commit; `cargo test` alone will be green with
+a board that wakes an agent while the composer still promises "Records only".
 
 ### The run ledger
 
@@ -63,16 +74,25 @@ delivery uses: a crash between recording and dispatch is a run the boot sweep
 finds, not work that silently never happened.
 
 ```
-Held ──(budget rolls over)──► Queued ──(claimed)──► Running ──► Done / Failed / Cancelled
-  │                              │                     │
-  └──────────── called off ──────┴─────────────────────┘   (card finished meanwhile)
+                       ┌──────(restart)───────┐
+                       ▼                      │
+Held ──(released)──► Queued ──(claimed)──► Running ──(settled)──► Done / Failed / Cancelled
+  │                    │                                              ▲
+  └────────────────────┴─────(cancelled, or called off)───────────────┘
 ```
+
+Nothing calls off a row that is *running*: the sweeps are the only callers, and
+a `running` row reaches them only after the boot re-drive has already returned
+it to `Queued`. It is still a run that started — the card carries `RunStarted`
+for it and the row still carries its session — which is why the call-off has
+two sentences and picks between them per row rather than per caller.
 
 `Held`, `Queued` and `Running` are the **unsettled** states, and a partial
 unique index makes at most one of them exist per issue. That index is the
-crate's single most load-bearing invariant: it is what lets the run waiter treat
-the terminal turn it sees as unambiguously its own, and what stops two agents
-sharing one worktree.
+crate's single most load-bearing invariant: it is what stops two agents sharing
+one worktree, and — with the waiter looking only at turns from its own row's
+enqueue onwards — what lets a run treat the terminal turn it sees as
+unambiguously its own.
 
 ### One enqueue path, three gates
 
@@ -85,9 +105,10 @@ tool all arrive there, and it asks three questions once each:
 2. **Dedupe** — the store's partial unique index. A refused write means the
    issue already has a run in flight; the caller sees `None`, which is the guard
    working, not a failure.
-3. **Budget** — `budget::headroom`. The row is written *before* the budget is
-   consulted, so an exhausted board records the work it owes as `Held` rather
-   than dropping it.
+3. **Budget** — `budget::headroom`. The headroom is measured before the write
+   (the hold release below needs it), but it never decides *whether* the row is
+   written — only what happens to it afterwards. So an exhausted board records
+   the work it owes as `Held` rather than dropping it.
 
 Two predicates, not one, because they answer different questions:
 
@@ -98,10 +119,12 @@ Two predicates, not one, because they answer different questions:
 - `runs::accepts_runs` asks about a **card**: does this issue take work at all?
 
 The distinction is not academic, and getting it wrong is the bug this crate has
-had twice. Only three of the doors into a run carry a transition; a released
-hold, a boot re-drive, a retry and a stage barrier arrive with nothing but a
-row. A cancellation rule enforced on the edge covers three doors and misses
-four — so it lives on the card, at the chokepoint.
+had twice. Only three of the doors into a run carry a transition — creating a
+card, editing one, moving one. A comment wake, a retry and a stage barrier
+arrive at `enqueue` with nothing but a row, and a released hold and a boot
+re-drive never reach `enqueue` at all. A cancellation rule enforced on the edge
+covers three doors and misses five — so it lives on the card, at the
+chokepoint, and each sweep asks it again for itself.
 
 The two **sweeps** that hand out rows recorded earlier (`release_holds` and
 `resume_unsettled_runs`) do not go through `enqueue`, so they ask the liveness
@@ -124,11 +147,14 @@ An exhausted board records work instead of dropping it. The held row shows on
 the card with figures (`BudgetExhausted`), and it starts the moment there is
 headroom again.
 
-Holds are released **by activity, not by a clock**: any enqueue, a budget
-change, and the boot sweep all pass through `release_holds`. A daily ceiling
-that rolls over while nothing is happening needs no timer — the first thing that
-happens next releases the hold, and if nothing happens, nothing needed
-releasing.
+Holds are released **by activity, not by a clock**. Three things reach
+`release_holds`: a budget change, the boot sweep, and every enqueue that gets
+past the liveness gate onto a card with somebody on it — which is every enqueue
+that was going to write anything. (An enqueue the liveness gate refuses
+releases nothing; the board's other holds wait for the next thing that happens
+on it.) A daily ceiling that rolls over while nothing is happening therefore
+needs no timer — the first thing that happens next releases the hold, and if
+nothing happens, nothing needed releasing.
 
 Inside `enqueue`, the release happens *before* the write, and it cannot move.
 On the board that actually needs releasing — the exhausted one — every card is
@@ -235,6 +261,28 @@ Session continuity is what makes a follow-up run see what the last one did.
 Because at most one run per issue is in flight, the waiter can treat the newest
 terminal turn at or after its own enqueue as unambiguously its own.
 
+**Which** session a run is handed is decided in exactly one place, and it is not
+here: `session_run_to_continue` in `baybo-agent`'s issue router picks the newest
+run of the *same agent* that ever got as far as executing, and `issue_session`
+mints a fresh session when there is none. A run's brief is a delta against that
+same run (`session_run_before`), never against a second rule spelled the same
+way: a brief bounded by a run whose session this one is *not* given would trim
+the card's conversation as "already read" against a transcript that does not
+contain it.
+
+"Ever got as far as executing" is itself one predicate with one home —
+`IssueRunRow::was_claimed()` in `baybo-store`, on the row it is about, in the
+crate `baybo-project` and `baybo-agent` both depend on (the router's `ever_ran`
+is that function under the router's own name). It reads the **session**, not
+`started_at`: the executor stamps both when it claims a run, but the boot sweep
+clears `started_at` and leaves the session, so only the session still answers
+for a run the process died in the middle of. This crate asks the same predicate
+for a different reason — a run being called off after a restart is told it was
+interrupted, not that it never started. A row that never claimed a session never
+opened a transcript and never touched the checkout, so none of the three
+questions — whose session this run continues, whose uncommitted changes are
+waiting in the tree it is handed, what its call-off says — counts it at all.
+
 No project session appears in the global chat list — issue runs and the lead's
 planning session alike.
 
@@ -278,6 +326,16 @@ Pending-ness is **derived**, never stored: a request with no matching resolution
 on the same `call_id` is still open. A `pending` flag would be a second copy of a
 fact the timeline already carries, and the two would eventually disagree.
 
+Nothing in this crate derives it, though — the two readers each derive it from
+what they can see. The board's attention badge counts the channel's **live
+approval queue**, passed into `attention()` because this crate must not know
+about channels and because the queue is the only thing that knows a prompt has
+already timed out. A card's "answer this" list is derived from the **timeline**
+in the client (`pendingApprovals` in
+`app/web/src/pages/projects/timelineModel.ts`), which is where the call ids are;
+it is a view rather than an authority, since the resolve endpoint answers from
+the queue and can refuse a prompt the timeline still lists.
+
 A prompt from an ordinary session passes straight through — the trigger lookup
 says it belongs to no issue.
 
@@ -319,8 +377,15 @@ signal would refetch every column to learn that somebody said something.
 - **A finished card takes no runs** — `stages::is_finished` is the one
   definition, and a row already recorded on such a card is called off rather
   than left unsettled.
-- **Archived is read-only**, enforced in `writable_project`, which every write
-  path starts with.
+- **Archived is read-only for a board's contents** — issues, comments, the
+  team, a retry — enforced in `writable_project`, which every one of those
+  writes starts with. Three families do not ask, and only the first two are by
+  design: the project row's own edits (`update_project`,
+  `set_project_archived`, or a board could never be unarchived), the operator's
+  bookkeeping (`mark_read`, `cancel_run`), and the writes that describe work
+  already under way — `record_event`, and the two sweeps, which never re-read
+  the project row, so a run recorded before the board was archived is still
+  handed out at boot.
 - **A timeline append never fails the thing it describes.** Losing the note that
   a card moved is bad; refusing the move because the note could not be written
   is worse.

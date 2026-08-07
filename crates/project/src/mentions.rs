@@ -1,8 +1,14 @@
 //! Who a comment is addressed to.
 //!
-//! Pure, like the other rule modules here. The composer has to say what
-//! sending will do *before* the request, so it reads the same rule the
-//! manager applies.
+//! Pure, like the other rule modules here: the manager and the agent-facing
+//! comment tool both reach [`assigns_to`], so a mention means one thing on
+//! the board however it arrives.
+//!
+//! The web composer cannot reach it — it says what sending will do while
+//! the sentence is still being typed. `mentionHint` and `mentionQuery` in
+//! `app/web/src/pages/projects/mentionModel.ts` re-implement this grammar
+//! and this rule in TypeScript, held to it by nothing but the two test
+//! suites, so a change here is a change there in the same commit.
 
 use baybo_model::AgentHandle;
 

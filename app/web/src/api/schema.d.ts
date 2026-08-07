@@ -7708,7 +7708,7 @@ export interface operations {
                     "application/json": components["schemas"]["IssueRunDto"];
                 };
             };
-            /** @description The issue has nobody on it */
+            /** @description The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again */
             400: {
                 headers: {
                     [name: string]: unknown;

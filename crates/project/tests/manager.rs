@@ -1458,6 +1458,116 @@ async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
     assert_eq!(f.dispatched.lock().len(), 1);
 }
 
+/// The sweep calls off two kinds of row and they are not the same story. A
+/// run an executor had already claimed carries a `RunStarted` entry on the
+/// card and a session that opens the transcript of the work it did; telling
+/// the operator, two lines below that entry, that the card was finished
+/// "before this run started" contradicts the card itself. A row nothing ever
+/// claimed really did never start, and still says so — the sentence is
+/// picked from the row, not from the call site, because one sweep hands out
+/// both.
+#[tokio::test]
+async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    for title in ["claimed", "never claimed"] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::InProgress,
+                    assignee: Some(dev.clone()),
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .expect("issue");
+    }
+
+    // #1's run was picked up the way the router picks one up: the claim
+    // stamps the session, and the card's `RunStarted` entry follows it.
+    let session = baybo_model::SessionId::from("issue-1-dev-1");
+    let claimed = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    assert!(
+        f.store
+            .claim_run(&claimed, &session)
+            .await
+            .expect("claim the run"),
+        "the executor took it"
+    );
+    // #2's was never claimed by anything.
+
+    // The process dies mid-run, and both cards are finished with while it is
+    // down: one cancelled, one dragged to Done.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel #1");
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
+        .await
+        .expect("finish #2");
+    f.dispatched.lock().clear();
+
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        0,
+        "neither card takes work any more"
+    );
+
+    let started = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    let unstarted = f.manager.list_runs(&p.id, 2).await.expect("runs").remove(0);
+    assert_eq!(started.status, RunStatus::Cancelled);
+    assert_eq!(unstarted.status, RunStatus::Cancelled);
+    assert_eq!(
+        started.session_id,
+        Some(session),
+        "the settled row still opens the transcript of the work that was done"
+    );
+
+    let started_reason = started.error.expect("the card says why");
+    let unstarted_reason = unstarted.error.expect("the card says why");
+    assert!(
+        !started_reason.contains("before this run started"),
+        "the card already says this run started: {started_reason}"
+    );
+    assert!(
+        started_reason.contains("interrupted"),
+        "and says what actually happened to it: {started_reason}"
+    );
+    assert!(
+        unstarted_reason.contains("before this run started"),
+        "a row nothing ever claimed never did start: {unstarted_reason}"
+    );
+
+    // The same sentence reaches the timeline, which is where the operator
+    // reads it — right under the `RunStarted` entry it has to agree with.
+    let told = f
+        .manager
+        .timeline(&p.id, 1)
+        .await
+        .expect("timeline")
+        .into_iter()
+        .find_map(|e| match e.body {
+            baybo_store::project::IssueEventBody::RunSettled { error, .. } => error,
+            _ => None,
+        })
+        .expect("the card says the run was called off");
+    assert_eq!(told, started_reason);
+}
+
 #[tokio::test]
 async fn the_board_writes_its_own_history() {
     // The end-to-end claim of the timeline: work the operator does through

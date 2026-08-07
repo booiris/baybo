@@ -27,14 +27,12 @@ pub mod worktree;
 // crate's own tests, and a promise nobody is holding is one that quietly
 // grows callers it was never designed for.
 pub use approvals::TimelineApprovalGate;
-pub use budget::Headroom;
 pub use comments::CommentDelivery;
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
-    BoardLoad, LEAD_HANDLE, MAX_FEED_PAGE, MAX_ISSUE_TITLE_CHARS, MAX_ROLE_CHARS, MAX_TEAM_AGENTS,
-    NewIssueRequest, NewProject, NewTeamMember, ProjectManager, RunDispatch, no_dispatch,
-    validate_workdir,
+    LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest, NewProject, NewTeamMember,
+    ProjectManager, RunDispatch, no_dispatch, validate_workdir,
 };
 pub use stages::progress;
 pub use worktree::Checkout;

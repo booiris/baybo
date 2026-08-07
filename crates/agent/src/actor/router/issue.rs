@@ -6,15 +6,16 @@
 //! turn, and settles the row with what happened.
 //!
 //! The shape is cron's one-shot fire (`cron.rs`), with two differences that
-//! matter. An issue keeps **one session per agent that works it**, so a
-//! follow-up sees what that same agent did last time — and an agent handed
-//! the card sees none of its predecessor's transcript, which is why the
-//! brief a handover is given is the whole conversation rather than a delta
-//! (`baybo::runtime::issue_brief`). That is safe only because at most one
+//! matter. An issue keeps **one session per agent that has run it**, so a
+//! follow-up sees what that same agent did last time — and an agent whose
+//! runs have not opened one sees none of the transcript, which is why the
+//! brief it is given is the whole conversation rather than a delta
+//! (`baybo::runtime::issue_brief`, bounded by [`session_run_before`] so the
+//! two answers cannot drift apart). That is safe only because at most one
 //! run per issue is ever in flight (a partial unique index enforces it),
-//! which is what lets the waiter treat the terminal turn it sees as
-//! unambiguously its own. And nothing is dispatched to a channel: an
-//! issue's audience is its card.
+//! which is what lets the waiter treat the terminal turn at or after its
+//! own enqueue as unambiguously its own. And nothing is dispatched to a
+//! channel: an issue's audience is its card.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,10 +198,9 @@ impl Router {
     ///
     /// Continuity is per agent, not per issue: an agent that already worked
     /// this card continues in the session it worked it in, however many
-    /// hands the card has passed through since. Newest run first
-    /// (`list_runs` orders by attempt), so the reasonable answer for a card
-    /// reassigned back and forth is the most recent of that agent's own
-    /// sessions.
+    /// hands the card has passed through since. Which run that is comes
+    /// from [`session_run_to_continue`] — the one rule for the question,
+    /// shared with the brief window.
     async fn issue_session(
         &self,
         store: &Arc<dyn ProjectStore>,
@@ -211,20 +211,17 @@ impl Router {
             .await?
             .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
 
-        let mut candidates: Vec<SessionId> = Vec::new();
-        for previous in store.list_runs(&issue.id).await? {
-            if let Some(id) = previous.session_id
-                && !candidates.contains(&id)
-            {
-                candidates.push(id);
-            }
-        }
-        for candidate in candidates {
-            if let Some(session) = self.session_manager.get(&candidate).await?
-                && session.state.agent_id_or_builtin() == event.run.agent_id
-            {
-                return Ok(session);
-            }
+        let runs = store.list_runs(&issue.id).await?;
+        // The binding check is the write-once guard, not the selection: the
+        // row's `session_id` is what says which session, and a session whose
+        // binding disagrees with the row is a broken pairing this run must
+        // not be handed into whatever the ledger says.
+        if let Some(previous) = session_run_to_continue(&event.run, &runs)
+            && let Some(id) = previous.session_id.as_ref()
+            && let Some(session) = self.session_manager.get(id).await?
+            && session.state.agent_id_or_builtin() == event.run.agent_id
+        {
+            return Ok(session);
         }
 
         let user = User {
@@ -246,6 +243,74 @@ impl Router {
             )
             .await?)
     }
+}
+
+/// Whether this run ever got as far as being picked up — the router's name
+/// for [`IssueRunRow::was_claimed`], which is where the rule lives.
+///
+/// It is spelled again here only because this crate's callers read better
+/// for it; `baybo-project` asks the same question of the same row to pick
+/// the sentence a called-off run settles with, and it cannot depend on
+/// `baybo-agent` without a cycle. One rule, one home, two names.
+///
+/// Note what it does **not** say. The executor claims the row before the
+/// actor is spawned, so a claimed run is one the card has announced as
+/// started — not necessarily one that opened a turn. A run whose trigger
+/// never reached its actor leaves a claimed row and an empty transcript,
+/// and callers that care about the transcript rather than the announcement
+/// are reading a slightly stronger fact than this answers.
+pub fn ever_ran(run: &IssueRunRow) -> bool {
+    run.was_claimed()
+}
+
+/// The run whose session this one is handed, if any — **the** rule for
+/// "has this agent worked this card before".
+///
+/// [`Router::issue_session`] hands the run into this row's session and
+/// mints a fresh one when there is none. `baybo`'s `brief_window` asks the
+/// same question through [`session_run_before`] to decide how much of the
+/// card's conversation this run has already read, and the two must agree:
+/// a brief bounded by a run whose session this one is *not* given trims the
+/// conversation as "already read" against a transcript that does not
+/// contain it. This function is the authority; the window follows it.
+///
+/// This run's own row is a candidate, which is what lets a run
+/// re-dispatched by the boot sweep resume the session it already claimed.
+fn session_run_to_continue<'a>(
+    run: &IssueRunRow,
+    runs: &'a [IssueRunRow],
+) -> Option<&'a IssueRunRow> {
+    newest_run_that_ran(&run.agent_id, runs.iter())
+}
+
+/// `session_run_to_continue`'s rule over the runs *before* this one — the
+/// run whose turn is already in the transcript this one opens, and so the
+/// point the card's conversation is a delta from.
+///
+/// This is what `baybo`'s `brief_window` reads. It is exported for that one
+/// caller: the window is not allowed a rule of its own.
+///
+/// Excludes this run's own row on purpose — bounding a brief by the clock
+/// of the run being briefed would filter out the very comment that started
+/// it.
+pub fn session_run_before<'a>(
+    run: &IssueRunRow,
+    runs: &'a [IssueRunRow],
+) -> Option<&'a IssueRunRow> {
+    newest_run_that_ran(
+        &run.agent_id,
+        runs.iter().filter(|candidate| candidate.id != run.id),
+    )
+}
+
+/// Newest by attempt rather than by clock: attempts are handed out in
+/// order by the store, under the same transaction that writes the row.
+fn newest_run_that_ran<'a>(
+    agent: &AgentProfileId,
+    runs: impl Iterator<Item = &'a IssueRunRow>,
+) -> Option<&'a IssueRunRow> {
+    runs.filter(|candidate| &candidate.agent_id == agent && ever_ran(candidate))
+        .max_by_key(|candidate| candidate.attempt)
 }
 
 fn binding_for(agent: &AgentProfileId) -> AgentBinding {
@@ -548,14 +613,27 @@ impl IssueRunWaiter {
         }
     }
 
-    /// The run's outcome from the store, or `None` if its turn has not
-    /// finished yet.
+    /// The run's outcome from the store, or `None` if this run has no
+    /// finished turn.
     ///
-    /// Takes the **newest** terminal issue turn, not the first: this
-    /// session hosts every run its agent has worked on this issue, so the
-    /// first one is that agent's first run forever. That is only
-    /// unambiguous because an issue holds at most one unfinished run at a
-    /// time.
+    /// Bounded at both ends. **Newest** terminal issue turn, not the first:
+    /// this session hosts every run its agent has worked on this issue, so
+    /// the first one is that agent's first run forever. And **at or after
+    /// this run's own enqueue**, because everything older belongs to a
+    /// previous run of the same card — settling on one of those would hand
+    /// this run its predecessor's outcome, `stopped_by_a_human` and all,
+    /// and a run wrongly reading as stopped-by-a-human drops the comment
+    /// waiting on the card. A run whose actor never opened a turn has
+    /// nothing in the window, and the caller settles it as having failed —
+    /// which is what happened.
+    ///
+    /// The turn is created inside the actor the claim spawns, so the row
+    /// this run is executing can only be older than its own turn; `>=`
+    /// rather than `>` because the two clocks are the same wall clock and a
+    /// turn opened in the same microsecond is still this run's.
+    ///
+    /// That there is exactly one candidate in that window is the dedupe
+    /// guard's doing: an issue holds at most one unfinished run at a time.
     async fn reconcile(&self) -> Option<RunOutcome> {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
@@ -567,7 +645,8 @@ impl IssueRunWaiter {
         turns
             .into_iter()
             .filter(|t| t.input_kind() == TurnInputKind::IssueRun && t.is_terminal())
-            .max_by_key(|t| t.started_at)
+            .filter(|t| t.created_at >= self.run.created_at)
+            .max_by_key(|t| t.created_at)
             .map(|t| RunOutcome {
                 stopped_by_a_human: stopped_by_a_human(&t.status),
                 ..RunOutcome::of(t.status.kind())
@@ -627,26 +706,41 @@ impl RunOutcome {
 ///
 /// The operator's Cancel button on the card reaches the turn as
 /// [`CancelReason::OperatorCancel`] (so does the CLI), and `/stop` inside
-/// the session as [`CancelReason::UserStopped`]. Every other reason is the
-/// run dying: an actor that panicked, a parent that went away, a process
-/// that was killed and swept at boot.
+/// the session as [`CancelReason::UserStopped`]. Every other reason is a
+/// run that stopped without anybody asking this run to stop: an actor that
+/// panicked, a parent that went away or was deleted, a subagent that timed
+/// out, a process killed and swept at boot. `UserPreempt` sits on that side
+/// too — it belongs to a chat turn superseded by the next message, which a
+/// one-shot issue actor has no path to.
 ///
-/// `ParentCancelled` reads as dying, and that is the deliberate side of a
-/// race: `TurnLifecycle::cancel` trips the token before it writes the row,
-/// so a body that unwinds inside that window stamps `ParentCancelled` over
-/// the operator's Cancel. Erring the other way would make every shutdown
-/// look like a Stop and drop the comment it was carrying; erring this way
-/// costs, in a race the operator can lose only by pressing Cancel at the
-/// instant the run was already finishing, one follow-up run they can stop
-/// again.
+/// Matched exhaustively rather than with `matches!`: this is a
+/// classification over another crate's enum, and a reason added there must
+/// break this build rather than default to "not a human" and quietly
+/// falsify the paragraph above.
+///
+/// `ParentCancelled` reads as not-a-human, and that is the deliberate side
+/// of a race: `TurnLifecycle::cancel` trips the token before it writes the
+/// row, and the run's own body settles the row `ParentCancelled` when it
+/// unwinds — whichever gets there first is the reason that sticks. The
+/// window is open on **every** press, not only on one that arrives as the
+/// run was finishing; how often the operator loses it is a function of what
+/// the body was awaiting, and it is often enough to see. Erring the other
+/// way would make every shutdown look like a Stop and drop the comment it
+/// was carrying; erring this way costs one follow-up run, visible on the
+/// card and stoppable again. Closing it for real needs the intended reason
+/// recorded before the token is tripped, which is `baybo-turn`'s to do.
 fn stopped_by_a_human(status: &TurnStatus) -> bool {
-    matches!(
-        status,
-        TurnStatus::Cancelled {
-            reason: CancelReason::OperatorCancel | CancelReason::UserStopped,
-            ..
-        }
-    )
+    let TurnStatus::Cancelled { reason, .. } = status else {
+        return false;
+    };
+    match reason {
+        CancelReason::OperatorCancel | CancelReason::UserStopped => true,
+        CancelReason::UserPreempt
+        | CancelReason::SystemCrash
+        | CancelReason::SubagentTimeout
+        | CancelReason::ParentCancelled
+        | CancelReason::ParentDeleted => false,
+    }
 }
 
 #[cfg(test)]
@@ -1223,15 +1317,227 @@ mod tests {
         let back = board.nth_dispatched(2);
         assert_eq!(back.agent_id, dev_1);
         assert_eq!(
-            harness
-                .router
-                .issue_session(&board.store, &run_event(&back))
-                .await
-                .expect("session")
-                .id,
+            window_and_session_agree(&board, &harness, &back).await.id,
             first_session.id,
             "an agent handed the card back continues in the session it already worked it in"
         );
+    }
+
+    /// The brief window and the session rule answer one question, and this
+    /// is where they are held to it.
+    ///
+    /// `issue_session` is the authority: it decides which session — and so
+    /// which transcript — this run is handed. `session_run_before` is what
+    /// `baybo`'s `brief_window` reads to decide how much of the card's
+    /// conversation the run has already seen. Either the run continues a
+    /// previous run's session, and the window is that run; or it does not,
+    /// and the window is the whole card. Anything else trims a conversation
+    /// as read against a transcript that does not contain it.
+    async fn window_and_session_agree(
+        board: &Board,
+        harness: &RouterHarness,
+        run: &IssueRunRow,
+    ) -> Session {
+        let runs = board.store.list_runs(&run.issue_id).await.expect("runs");
+        let session = harness
+            .router
+            .issue_session(&board.store, &run_event(run))
+            .await
+            .expect("session");
+        match session_run_before(run, &runs) {
+            Some(previous) => assert_eq!(
+                previous.session_id.as_ref(),
+                Some(&session.id),
+                "the window names a run whose session this one is not given"
+            ),
+            None => assert!(
+                runs.iter()
+                    .all(|other| other.session_id.as_ref() != Some(&session.id)),
+                "the window says this run has read nothing, and the router handed it a transcript that has"
+            ),
+        }
+        session
+    }
+
+    /// The narrower shape of the same disagreement: a *same-agent* run that
+    /// never claimed a session.
+    ///
+    /// The operator presses Cancel while the run is still queued, so the
+    /// manager settles the row where it stands and no executor ever claims
+    /// it. The card is still InProgress and still assigned, so the next
+    /// comment wakes the same agent again — into a session with nothing in
+    /// it, because there is no claimed session to continue. A window that
+    /// merely matched on `agent_id` would call that a follow-up and trim
+    /// the whole discussion that set the work up.
+    #[tokio::test]
+    async fn a_run_whose_predecessor_never_opened_a_session_starts_a_fresh_one() {
+        let (board, first) = board_with_in_progress_card().await;
+        let harness = router_for(&board);
+
+        assert!(
+            board
+                .projects
+                .cancel_run(&board.project.id, 1)
+                .await
+                .expect("cancel")
+                .is_none(),
+            "a queued run is settled where it stands; there is no session to stop"
+        );
+        board
+            .projects
+            .comment(
+                &board.project.id,
+                1,
+                IssueActor::User,
+                "start with the CSV path",
+            )
+            .await
+            .expect("comment");
+
+        let second = board.nth_dispatched(1);
+        assert_eq!(
+            second.agent_id, first.agent_id,
+            "the same agent is asked again"
+        );
+        let session = window_and_session_agree(&board, &harness, &second).await;
+        let runs = board.store.list_runs(&second.issue_id).await.expect("runs");
+        assert!(
+            session_run_before(&second, &runs).is_none(),
+            "there is no previous run for its brief to be a delta from"
+        );
+        assert_eq!(
+            harness
+                .router
+                .turn_lifecycle
+                .list_by_session(&session.id, None)
+                .await
+                .expect("turns")
+                .len(),
+            0,
+            "and the transcript it opens is empty"
+        );
+    }
+
+    /// A run settles on its own turn or on nothing.
+    ///
+    /// The session hosts every run its agent has worked on this card, so
+    /// the newest terminal turn in it is the *previous* run's until this
+    /// one opens its own. A run whose actor never got that far — the
+    /// mailbox send failed, so `handle_issue_run` cancels the token — has
+    /// to read as having failed. Inheriting instead means inheriting
+    /// `stopped_by_a_human` from an operator's Cancel that was aimed at a
+    /// run which has already ended, and the comment waiting on the card
+    /// then starts nothing.
+    #[tokio::test]
+    async fn a_run_whose_actor_never_opened_a_turn_does_not_inherit_the_last_ones_outcome() {
+        let (board, first) = mid_run().await;
+        let session = SessionId::from("sess-issue-1");
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
+
+        // Run #1's turn, stopped by the operator.
+        let stopped = lifecycle
+            .start_turn(
+                session.clone(),
+                baybo_model::TriggerKind::Issue,
+                baybo_turn::TurnInput::IssueRun {
+                    run_id: first.id.clone(),
+                    brief: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("turn");
+        lifecycle.start(&stopped.id).await.expect("start");
+        lifecycle
+            .cancel(&stopped.id, CancelReason::OperatorCancel, Vec::new())
+            .await
+            .expect("cancel");
+        board
+            .store
+            .settle_run(&first.id, RunStatus::Cancelled, None)
+            .await
+            .expect("settle");
+
+        // A comment then asks the same agent again, in the same session.
+        board
+            .projects
+            .comment(
+                &board.project.id,
+                1,
+                IssueActor::User,
+                "start with the CSV path",
+            )
+            .await
+            .expect("comment");
+        let second = board.nth_dispatched(1);
+        assert!(
+            stopped.created_at < second.created_at,
+            "the run being waited on has to be the newer of the two for this to mean anything"
+        );
+        board
+            .store
+            .claim_run(&second.id, &session)
+            .await
+            .expect("claim");
+        // And somebody says something else while run #2 is live, which is
+        // what the follow-up exists to carry.
+        board
+            .projects
+            .comment(
+                &board.project.id,
+                1,
+                IssueActor::User,
+                "also handle the empty case",
+            )
+            .await
+            .expect("comment");
+
+        let mut waiter = IssueRunWaiter {
+            run: second.clone(),
+            checkout: PathBuf::from("/tmp/does-not-matter"),
+            session_id: session.clone(),
+            terminal_rx: lifecycle.subscribe_lifecycle_events(),
+            lifecycle: Arc::clone(&lifecycle),
+            board: BoardWiring {
+                store: Arc::clone(&board.store),
+                events: Arc::new(baybo_project::NoopProjectEvents),
+                manager: Arc::clone(&board.projects),
+            },
+        };
+        assert_eq!(
+            waiter.reconcile().await,
+            None,
+            "run #1's ending is not run #2's outcome"
+        );
+
+        let actor_token = CancellationToken::new();
+        actor_token.cancel();
+        let outcome = waiter.await_run(actor_token).await;
+        assert_eq!(
+            outcome.status,
+            RunStatus::Failed,
+            "a run that produced nothing failed; it was not cancelled"
+        );
+        assert!(
+            !outcome.stopped_by_a_human,
+            "and nobody stopped it — the Cancel it would have inherited was aimed at run #1"
+        );
+
+        board
+            .store
+            .settle_run(&second.id, outcome.status, outcome.error.as_deref())
+            .await
+            .expect("settle");
+        follow_up_on_comments(&board.projects, &board.store, &second, &outcome).await;
+        let dispatched = board.dispatched.lock().clone();
+        assert_eq!(
+            dispatched.len(),
+            3,
+            "so the comment left during run #2 still starts something"
+        );
+        assert_eq!(dispatched[2].trigger, RunTrigger::Comment);
     }
 
     /// The continuity F4 exists for, unchanged by the handover rule: a run

@@ -16,7 +16,7 @@
 mod cron;
 mod issue;
 
-pub use issue::{BoardWiring, IssueRunEvent};
+pub use issue::{BoardWiring, IssueRunEvent, ever_ran, session_run_before};
 mod output;
 mod user_input;
 

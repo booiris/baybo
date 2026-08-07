@@ -1594,7 +1594,7 @@ async fn cancel_run(
     ),
     responses(
         (status = 201, description = "The new run", body = IssueRunDto),
-        (status = 400, description = "The issue has nobody on it", body = ErrorBody),
+        (status = 400, description = "The issue has nobody on it, or the board has finished with it: a cancelled card has to be reopened and a done one moved back before it runs again", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Unknown project or issue", body = ErrorBody),
         (status = 409, description = "A run is already in flight, or the project is archived", body = ErrorBody),
@@ -1604,6 +1604,11 @@ async fn retry_run(
     State(state): State<AdminState>,
     Path((project_id, number)): Path<(String, i64)>,
 ) -> Result<(StatusCode, Json<IssueRunDto>)> {
+    // Which cards can be retried is not this handler's question:
+    // `ProjectManager::retry_run` is the single place that decides, and the
+    // 400 above is that function's refusal set spelled for a client that
+    // reads it in `schema.d.ts` rather than in Rust. A refusal added there
+    // is a refusal missing from this description.
     let id = parse_project_id(&project_id)?;
     let run = state
         .project_manager

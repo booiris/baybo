@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 /// Whether a board can start more work right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Headroom {
+pub(crate) enum Headroom {
     /// No ceiling is set. The default, and the only state in which the
     /// gate costs nothing — no spend query runs.
     Unlimited,
@@ -25,13 +25,13 @@ pub enum Headroom {
 }
 
 impl Headroom {
-    pub fn is_exhausted(self) -> bool {
+    pub(crate) fn is_exhausted(self) -> bool {
         matches!(self, Headroom::Exhausted { .. })
     }
 
     /// `(spent, limit)` in micro-USD, for the timeline entry. `None` when
     /// there is no ceiling to report against.
-    pub fn figures(self) -> Option<(i64, i64)> {
+    pub(crate) fn figures(self) -> Option<(i64, i64)> {
         match self {
             Headroom::Unlimited => None,
             Headroom::Available { spent, limit } | Headroom::Exhausted { spent, limit } => {

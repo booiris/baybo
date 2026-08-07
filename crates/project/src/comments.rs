@@ -1,9 +1,18 @@
 //! What happens when somebody says something on an issue.
 //!
 //! Pure, like [`crate::runs::triggers_run`] and
-//! [`crate::timeline::diff_events`]: this is the product rule the composer
-//! promises and the manager carries out, and both have to read it the same
-//! way.
+//! [`crate::timeline::diff_events`]: one function, so the manager's own
+//! write path and the agent-facing `IssueComment` tool — which reports the
+//! delivery back to the model that commented — give the same answer.
+//!
+//! The web composer is **not** one of those callers. It says what a comment
+//! will do while it is still being typed, so it cannot ask the server:
+//! `commentHint` in `app/web/src/pages/projects/timelineModel.ts` is a
+//! hand-written mirror of [`comment_delivery`], and nothing but the two
+//! test suites holds the pair together. A change here — a new column that
+//! counts as live work, a run state that reads as idle — is a change there
+//! in the same commit, or the board wakes an agent while the composer is
+//! still promising "Records only".
 
 use baybo_store::project::{IssueRow, IssueStatus, RunStatus};
 

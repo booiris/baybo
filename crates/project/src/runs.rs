@@ -4,11 +4,15 @@
 //! They ask different questions and are deliberately not folded together.
 //! [`triggers_run`] asks about an **edge**: did this particular write start
 //! work? [`accepts_runs`] asks about a **card**: does this issue still take
-//! work at all? Only the first needs a transition, and only some of the
-//! doors into a run have one — a released hold, a boot re-drive, a retry
-//! and a stage barrier all arrive with nothing but a row. So the card-level
-//! rule cannot live here on the edge; it lives on the one path they all
-//! share, [`crate::ProjectManager::enqueue`], which asks it once.
+//! work at all? Only the first needs a transition, and only three of the
+//! doors into a run carry one: creating a card, editing one, moving one. A
+//! comment wake, a retry and a stage barrier arrive at
+//! [`crate::ProjectManager::enqueue`] with nothing but a row, and the two
+//! sweeps — a released hold and a boot re-drive — hand out rows recorded
+//! earlier without passing through it at all. So the card-level rule cannot
+//! live here on the edge: `enqueue` asks it once for everything that writes
+//! a row, and each sweep asks it again for itself, against the card as it is
+//! now.
 
 use baybo_model::{AgentProfileId, IssueRunId};
 use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
@@ -77,12 +81,12 @@ pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
 /// abandoned work.
 ///
 /// Asked of the card rather than of a write, because most of the doors into
-/// a run have no write to look at: a hold released when the budget rolls
-/// over, a row the boot sweep re-drives, a retry, and a parent woken by its
-/// last step were all recorded — or last looked at — while the card was
-/// still live. [`crate::ProjectManager::enqueue`] asks this once for all of
-/// them, and the two sweeps that hand out rows recorded earlier ask it
-/// again against the card as it is now.
+/// a run have no write to look at: a comment on live work, a retry, a parent
+/// woken by its last step, a hold released when the budget rolls over and a
+/// row the boot sweep re-drives were all recorded — or last looked at —
+/// while the card was still live. [`crate::ProjectManager::enqueue`] asks
+/// this once for all of them, and the two sweeps that hand out rows recorded
+/// earlier ask it again against the card as it is now.
 ///
 /// Reviving a cancelled card, or dragging a Done one back, is what makes it
 /// startable again.

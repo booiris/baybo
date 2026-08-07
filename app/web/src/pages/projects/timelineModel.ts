@@ -67,10 +67,22 @@ const DECISION_LABEL: Record<'approve' | 'approve_always' | 'deny', string> = {
 /**
  * The approvals still waiting on a person, oldest first.
  *
- * Derived from the timeline, never a stored flag: a request with no
- * matching resolution on the same `call_id` is open. Mirrors
- * `pending_approvals` in `crates/project` — one rule, so a card cannot
- * offer to answer a prompt the server already closed.
+ * Derived rather than stored, on both sides: a request with no matching
+ * resolution on the same `call_id` is open here, and the server keeps no
+ * pending flag on the card either. The timeline entry is also the only
+ * thing on the board carrying a call id, so this pass is how a card gets
+ * one to answer with at all.
+ *
+ * A view, not the authority. What the server answers from is the **parked
+ * session**, not the timeline: `POST …/issues/{n}/approvals/{call_id}`
+ * looks the call up in the live approval queue and resolves it only if the
+ * session it is parked in belongs to this card. So the two can disagree: a
+ * resolution whose timeline append was swallowed, or a restart that took
+ * the queue with it, leaves a prompt listed here that the server answers
+ * with a 404. Which is why `IssueDetailPage` never drops a prompt
+ * optimistically — it refetches, so the entry disappears only once the
+ * server's own resolution is on the timeline, and a refused click surfaces
+ * as an error with the prompt still standing.
  */
 export function pendingApprovals(
   events: IssueEvent[],

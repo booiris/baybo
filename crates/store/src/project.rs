@@ -806,8 +806,10 @@ pub struct IssueRunRow {
     /// boot sweep don't have to join.
     pub number: i64,
     pub agent_id: AgentProfileId,
-    /// The issue's session, stamped when the run is claimed. `None` on a
-    /// run that has never been claimed; a run the boot sweep returned to the
+    /// The session this run executes in — one per *agent* that works the
+    /// card, not one per card, minted on that agent's first run and reused
+    /// by its later ones. Stamped when the run is claimed, so `None` on a
+    /// run no executor has picked up; a run the boot sweep returned to the
     /// queue keeps the session it was already working in.
     pub session_id: Option<SessionId>,
     pub trigger: RunTrigger,
@@ -817,8 +819,44 @@ pub struct IssueRunRow {
     /// Why it failed, when it did.
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// When an executor claimed it. **Not** "did this run start" — see
+    /// [`Self::was_claimed`]: the boot sweep clears this when it returns an
+    /// interrupted run to the queue, on the assumption that the next claim
+    /// re-stamps it, so a run the sweep called off instead of re-driving
+    /// reads as never started in the execution log even though it ran.
     pub started_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
+}
+
+impl IssueRunRow {
+    /// Whether an executor ever picked this run up — which is the same
+    /// question as "does the card already say this run started?".
+    ///
+    /// **The one home for that question**, on the row it is about, in the
+    /// crate that owns the row. Both askers reach it here: `baybo-project`
+    /// picks the sentence a called-off run settles with, and `baybo-agent`
+    /// decides which run's session a follow-up continues and whose
+    /// uncommitted work is in the checkout it inherits (the issue router's
+    /// `ever_ran` is this function under the router's own name).
+    /// `baybo-project` cannot reach into `baybo-agent` — that is the
+    /// dependency cycle — so a second spelling on either side would be two
+    /// rules that only look like one.
+    ///
+    /// **The session answers it and `started_at` cannot**, which is the
+    /// part worth keeping. [`ProjectStore::claim_run`] stamps both in one
+    /// statement and the issue router writes the card's `RunStarted` entry
+    /// immediately after, so a row carrying a session is a row the timeline
+    /// has already announced. But only the session is durable:
+    /// [`ProjectStore::requeue_unsettled`] clears `started_at` when it
+    /// returns an interrupted run to the queue and deliberately leaves
+    /// `session_id` alone, so a run that worked for an hour before the
+    /// process died comes back with no start time and its transcript
+    /// intact. Reading `started_at` here would call that run one that never
+    /// started — which is the bug this exists to stop, not a simplification
+    /// waiting to be made.
+    pub fn was_claimed(&self) -> bool {
+        self.session_id.is_some()
+    }
 }
 
 /// A run to enqueue. Attempt and timestamps are the store's to assign.

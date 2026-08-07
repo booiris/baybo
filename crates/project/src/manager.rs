@@ -22,14 +22,15 @@ use baybo_store::project::{
 };
 use baybo_workspace::WorkspacePaths;
 
+use crate::CommentDelivery;
+use crate::budget::Headroom;
 use crate::error::{ProjectError, Result};
 use crate::events::ProjectEvents;
 use crate::runs::{Transition, ledger_entry, triggers_run};
-use crate::{CommentDelivery, Headroom};
 
 /// Upper bound on an issue title (chars, after trim). Long enough for a
 /// sentence, short enough that a card face can show it.
-pub const MAX_ISSUE_TITLE_CHARS: usize = 200;
+pub(crate) const MAX_ISSUE_TITLE_CHARS: usize = 200;
 
 /// The handle every project's coordinator answers to. Fixed rather than
 /// derived: `@lead` means the same thing on every board, and it is the one
@@ -53,15 +54,42 @@ pub const MAX_TEAM_AGENTS: usize = 16;
 
 /// Upper bound on a teammate's role line (chars, after trim). It seeds a
 /// SOUL and shows on a roster card, so it is a sentence, not a brief.
-pub const MAX_ROLE_CHARS: usize = 280;
+pub(crate) const MAX_ROLE_CHARS: usize = 280;
 
 /// Upper bound on one activity-feed page.
 pub const MAX_FEED_PAGE: usize = 100;
 
-/// Why a recorded run never happened: its card reached Done or was
-/// cancelled before the board got round to it. Read on the card, so it is a
-/// sentence rather than a code.
-const RUN_CALLED_OFF: &str = "the card was finished or cancelled before this run started";
+/// Why a recorded run was called off, when nothing had picked it up yet:
+/// its card reached Done or was cancelled before the board got round to it.
+/// Read on the card, so it is a sentence rather than a code.
+const RUN_CALLED_OFF_UNSTARTED: &str = "the card was finished or cancelled before this run started";
+
+/// The same call-off, on a run that **had** already started.
+///
+/// The boot sweep hands out rows an executor was in the middle of when the
+/// process died, and the card carries a `RunStarted` entry for each of
+/// them. Telling the operator two lines later that the run never started
+/// contradicts the entry directly above it — and the settled row still
+/// carries the session, which opens the transcript of the work that really
+/// was done.
+const RUN_CALLED_OFF_INTERRUPTED: &str =
+    "this run was interrupted, and the card was finished or cancelled before it could resume";
+
+/// Which of the two sentences is true of this row.
+///
+/// Derived from the row rather than chosen by the call site, because one
+/// call site hands out both kinds: the boot sweep returns a `queued` row
+/// nothing ever claimed and a `running` row that was half-done, and by the
+/// time either reaches here they look alike. [`IssueRunRow::was_claimed`]
+/// is the fact that separates them, and it is the same fact the card's
+/// `RunStarted` entry is written from.
+fn call_off_reason(run: &IssueRunRow) -> &'static str {
+    if run.was_claimed() {
+        RUN_CALLED_OFF_INTERRUPTED
+    } else {
+        RUN_CALLED_OFF_UNSTARTED
+    }
+}
 
 /// How many `-2`, `-3`, … suffixes to try when a derived handle is taken.
 ///
@@ -72,7 +100,7 @@ const MAX_HANDLE_ATTEMPTS: usize = 9;
 
 /// A board's capacity, as [`ProjectManager::board_load`] reports it.
 #[derive(Debug, Clone)]
-pub struct BoardLoad {
+pub(crate) struct BoardLoad {
     pub headroom: Headroom,
     /// Runs actually executing or queued to. What "who is free" means.
     pub working: Vec<IssueRunRow>,
@@ -234,12 +262,14 @@ impl ProjectManager {
     /// or — held, then never dispatched — sit unsettled holding the issue's
     /// dedupe slot against the day somebody revives the card.
     ///
-    /// The order of the other two is deliberate: **the row is written before
-    /// the budget is consulted**, so an exhausted board records work it owes
-    /// rather than dropping it. The run lands `Held`, holds the issue's
-    /// dedupe slot, and starts the moment there is headroom again. A refused
-    /// write means the issue already has a run in flight — the dedupe guard
-    /// doing its job, not a failure the caller should see.
+    /// The order of the other two is deliberate: **the budget never decides
+    /// whether the row is written**, only what happens to it afterwards. The
+    /// headroom is measured first (the release below needs it), the row lands
+    /// either way, and an exhausted board then holds it — so the work it owes
+    /// is recorded rather than dropped. The run lands `Held`, holds the
+    /// issue's dedupe slot, and starts the moment there is headroom again. A
+    /// refused write means the issue already has a run in flight — the dedupe
+    /// guard doing its job, not a failure the caller should see.
     ///
     /// Whatever the board is already holding is released **before** that
     /// write, and deliberately so. This is the third release site — with a
@@ -338,11 +368,17 @@ impl ProjectManager {
 
     /// Start whatever this board is holding, if it has room again.
     ///
-    /// Released by activity on the board rather than by a clock: any
-    /// enqueue, a budget change, and the boot sweep all pass through here.
-    /// A daily ceiling that rolls over while nothing is happening needs no
-    /// timer — the first thing that happens next releases the hold, and if
-    /// nothing happens, nothing needed releasing.
+    /// Released by activity on the board rather than by a clock. Three
+    /// things release: a budget change and the boot sweep call this, and
+    /// [`Self::enqueue`] calls [`Self::release_holds`] directly with the
+    /// headroom it has already measured — on every enqueue that gets past
+    /// the liveness gate onto a card with somebody on it, which is every
+    /// enqueue that was going to write anything. An enqueue the liveness
+    /// gate refuses releases nothing, and the board's other holds wait for
+    /// the next thing that happens on it. A daily ceiling that rolls over
+    /// while nothing is happening therefore needs no timer: the first thing
+    /// that happens next releases the hold, and if nothing happens, nothing
+    /// needed releasing.
     pub async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
         let headroom = self.headroom(project).await;
         self.release_holds(project, headroom).await
@@ -425,11 +461,14 @@ impl ProjectManager {
     ///
     /// Recorded like any other settlement rather than dropped quietly: a run
     /// the operator can see on the card has to end somewhere the operator
-    /// can see it end.
+    /// can see it end — in the words [`call_off_reason`] picks for the row
+    /// in hand, because a held run and an interrupted one are called off by
+    /// the same code and are not the same story.
     async fn call_off(&self, run: &IssueRunRow, issue: Option<&IssueRow>) {
+        let reason = call_off_reason(run);
         match self
             .store
-            .settle_run(&run.id, RunStatus::Cancelled, Some(RUN_CALLED_OFF))
+            .settle_run(&run.id, RunStatus::Cancelled, Some(reason))
             .await
         {
             Ok(true) => {}
@@ -449,7 +488,7 @@ impl ProjectManager {
                     run_id: run.id.clone(),
                     attempt: run.attempt,
                     status: RunStatus::Cancelled,
-                    error: Some(RUN_CALLED_OFF.to_owned()),
+                    error: Some(reason.to_owned()),
                 },
             )
             .await;
@@ -564,7 +603,7 @@ impl ProjectManager {
     /// Say something on an issue, and reach whoever should hear it.
     ///
     /// The comment always lands on the timeline; what else happens is
-    /// [`crate::comment_delivery`]'s decision. Recording comes first in
+    /// [`Self::comment_delivery`]'s decision. Recording comes first in
     /// every branch, so a wake that fails is a comment that is still there
     /// to be read rather than one that was never said.
     pub async fn comment(
@@ -689,10 +728,14 @@ impl ProjectManager {
 
     /// What this comment will do besides being recorded.
     ///
-    /// Public so the composer can say it before the comment is sent: the
-    /// difference between "somebody will read this" and "this is a note for
-    /// later" is invisible in a text box, and a person who expects the first
-    /// and gets the second waits for an answer nobody is sending.
+    /// Public for the `IssueComment` tool, which asks *before* it writes and
+    /// hands the answer back to the model: the difference between "somebody
+    /// will read this" and "this is a note for later" is invisible in the
+    /// act of commenting, and a caller that expects the first and gets the
+    /// second waits for an answer nobody is sending. The web composer says
+    /// the same thing from its own mirror of the rule rather than from here
+    /// — there is no route onto this method — which is the seam `comments.rs`
+    /// documents.
     pub async fn comment_delivery(
         &self,
         project: &ProjectId,
@@ -1507,7 +1550,7 @@ impl ProjectManager {
     /// `headroom` fails open, so a board that cannot be measured reports
     /// `Unlimited` — which is what the enqueue gate acts on too, so a
     /// reader is told the same story the gate believes.
-    pub async fn board_load(&self, project: &ProjectId) -> Result<BoardLoad> {
+    pub(crate) async fn board_load(&self, project: &ProjectId) -> Result<BoardLoad> {
         self.get_project(project).await?;
         let (held, working) = self
             .store
@@ -1785,9 +1828,22 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// Resolve a project and refuse if it is archived. Every write path
-    /// starts here, so "archived is read-only" is one rule in one place
-    /// rather than a check each endpoint has to remember.
+    /// Resolve a project and refuse if it is archived.
+    ///
+    /// Every write that changes what is *on* a board starts here — an
+    /// issue, a comment, the team, a retry — so "archived is read-only" is
+    /// one rule in one place rather than a check each endpoint has to
+    /// remember.
+    ///
+    /// Three kinds of write do not ask, and only the first two are by
+    /// design: the project row's own edits ([`Self::update_project`],
+    /// [`Self::set_project_archived`] — a board that could not be written
+    /// could not be unarchived either), the operator's own bookkeeping
+    /// ([`Self::mark_read`], [`Self::cancel_run`] — stopping work and
+    /// noting it was seen are not additions to the board), and the writes
+    /// that describe work already under way — [`Self::record_event`] and
+    /// the two sweeps, which settle or hand out rows recorded while the
+    /// board was still live and never re-read the project row.
     async fn writable_project(&self, id: &ProjectId) -> Result<ProjectRow> {
         let project = self.get_project(id).await?;
         if project.archived_at.is_some() {
