@@ -211,6 +211,11 @@ impl Router {
             .await?
             .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
 
+        // Before either branch, not only the minting one: a session opened
+        // while the agent was on baybo must not be handed a run the agent
+        // can no longer host.
+        let binding = self.binding_for(&event.run.agent_id).await?;
+
         let runs = store.list_runs(&issue.id).await?;
         // The binding check is the write-once guard, not the selection: the
         // row's `session_id` is what says which session, and a session whose
@@ -239,9 +244,43 @@ impl Router {
                     issue_id: issue.id.clone(),
                     number: issue.number,
                 },
-                Some(binding_for(&event.run.agent_id)),
+                Some(binding),
             )
             .await?)
+    }
+
+    /// The binding this run's session is opened with, read from the agent's
+    /// profile rather than assumed.
+    ///
+    /// Every other binding in the tree is built from the row — the lead's, the
+    /// chat leg's, cron's. This one used to name `Baybo` outright, which was
+    /// true only because [`baybo_project::can_host_a_session`] refuses anything
+    /// else at assign time. That answer expires: a profile's framework is
+    /// editable, and a row the boot sweep re-drives was recorded under whatever
+    /// the agent was then. So the fact is re-established here, at the last
+    /// moment before it is written into a session write-once.
+    ///
+    /// Refused rather than recorded, because a top-level session bound to an
+    /// external backend would still be executed by the internal loop — the card
+    /// would name an agent that never worked it. The run settles `Failed` with
+    /// this reason on its card, which is the visible half of the same refusal
+    /// the operator would have got from the assign form.
+    async fn binding_for(&self, agent: &AgentProfileId) -> anyhow::Result<AgentBinding> {
+        let profile = self
+            .agent_profiles
+            .get(agent)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent {agent} is gone"))?;
+        if !baybo_project::can_host_a_session(profile.framework) {
+            anyhow::bail!(
+                "{agent} runs on {}, which cannot yet host an issue's session",
+                profile.framework.as_str()
+            );
+        }
+        Ok(AgentBinding {
+            agent_id: agent.clone(),
+            framework: profile.framework,
+        })
     }
 }
 
@@ -311,13 +350,6 @@ fn newest_run_that_ran<'a>(
 ) -> Option<&'a IssueRunRow> {
     runs.filter(|candidate| &candidate.agent_id == agent && ever_ran(candidate))
         .max_by_key(|candidate| candidate.attempt)
-}
-
-fn binding_for(agent: &AgentProfileId) -> AgentBinding {
-    AgentBinding {
-        agent_id: agent.clone(),
-        framework: baybo_model::AgentFramework::Baybo,
-    }
 }
 
 /// Start a follow-up run if anybody said anything while this one was
@@ -1581,6 +1613,61 @@ mod tests {
                 .map(|s| s.id),
             Some(opened.id),
             "and it is a session the manager actually holds"
+        );
+    }
+
+    /// The binding is read, not assumed — and this is the path that needs it
+    /// to be. `enqueue` refuses a card whose agent has moved off baybo, but
+    /// the sweeps hand out rows recorded *earlier*, so a row written while
+    /// the agent was baybo arrives here after the flip having passed no gate
+    /// at all. Binding it `Baybo` anyway would run a codex agent's persona
+    /// on the internal loop and sign its name to the commits.
+    #[tokio::test]
+    async fn a_run_is_refused_a_session_its_agent_can_no_longer_host() {
+        let (board, run) = board_with_in_progress_card().await;
+        let harness = router_for(&board);
+        let agent = AgentProfileId::parse(HANDLE).expect("agent id");
+
+        let before = harness
+            .router
+            .binding_for(&agent)
+            .await
+            .expect("baybo hosts a session");
+        assert_eq!(before.framework, AgentFramework::Baybo);
+
+        board
+            .db
+            .agent_profile
+            .update(
+                &agent,
+                &baybo_store::AgentProfileUpdate {
+                    description: String::new(),
+                    framework: AgentFramework::Codex,
+                },
+            )
+            .await
+            .expect("the operator moves dev-1 to codex");
+
+        let refused = harness
+            .router
+            .issue_session(&board.store, &run_event(&run))
+            .await
+            .expect_err("codex cannot host an issue's session");
+        assert!(
+            refused
+                .to_string()
+                .contains("cannot yet host an issue's session"),
+            "and it says why, because this reason lands on the card: {refused}"
+        );
+        assert!(
+            board
+                .store
+                .list_runs(&run.issue_id)
+                .await
+                .expect("runs")
+                .iter()
+                .all(|row| row.session_id.is_none()),
+            "no session was minted for it"
         );
     }
 }

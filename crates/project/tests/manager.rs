@@ -1428,6 +1428,76 @@ async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
     assert_eq!(refusal(1).await, "an issue with nobody on it cannot be run");
 }
 
+/// A profile's framework is editable, so "checked when the card was
+/// assigned" is not the same fact as "true when the run starts". Only baybo
+/// can host a top-level session — the external backends live inside the
+/// subagent spawner — so a card whose agent has moved to codex since must
+/// stop recording runs, and say why rather than answering with the dedupe
+/// guard's sentence about a run that does not exist.
+#[tokio::test]
+async fn an_agent_that_moved_off_baybo_stops_getting_runs() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("assigned while it was still baybo")
+            },
+        )
+        .await
+        .expect("issue");
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "the assign started one, which is the state the flip has to survive"
+    );
+    f.manager
+        .cancel_run(&p.id, 1)
+        .await
+        .expect("free the card's slot");
+
+    f.agents
+        .update(
+            &dev,
+            &baybo_store::AgentProfileUpdate {
+                description: String::new(),
+                framework: AgentFramework::Codex,
+            },
+        )
+        .await
+        .expect("the operator moves dev-1 to codex");
+    f.dispatched.lock().clear();
+
+    match f.manager.retry_run(&p.id, 1).await {
+        Err(ProjectError::Invalid { reason, .. }) => assert_eq!(
+            reason,
+            "dev-1 runs on codex, which cannot yet host an issue's session — assign a baybo agent"
+        ),
+        other => panic!("a codex assignee should have been refused: {other:?}"),
+    }
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "and no second row was recorded"
+    );
+
+    // The quiet doors go through `enqueue`, which has no way to say a
+    // sentence — they must simply not start anything.
+    f.manager
+        .comment(&p.id, 1, IssueActor::User, "@dev-1 pick this back up")
+        .await
+        .expect("comment");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a wake must not start a run the executor would only fail"
+    );
+}
+
 /// The other half of `touching_the_held_card_itself_releases_it`: the press
 /// happened, the ceiling still refused, and what the operator is told is the
 /// budget rather than the row. "This issue already has a run" names a run

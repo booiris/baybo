@@ -89,6 +89,19 @@ const RUN_CALLED_OFF_INTERRUPTED: &str =
 const HELD_RUN_REFUSAL: &str =
     "this run is held — the project is over its daily budget, and starts as soon as there is room";
 
+/// Why an agent cannot be given, or handed, an issue's session.
+///
+/// One sentence for two askers: the assign-time refusal an operator reads in
+/// a form, and the run-time one that lands on the card when the framework
+/// changed after the card was assigned. They are the same fact, so a reword
+/// cannot leave them disagreeing about why the board will not run something.
+fn framework_refusal(agent: &AgentProfileId, framework: AgentFramework) -> String {
+    format!(
+        "{agent} runs on {}, which cannot yet host an issue's session — assign a baybo agent",
+        framework.as_str()
+    )
+}
+
 /// Which of the two sentences is true of this row.
 ///
 /// Derived from the row rather than chosen by the call site, because one
@@ -301,6 +314,19 @@ impl ProjectManager {
                 issue = issue.number,
                 ?trigger,
                 "the card is finished or cancelled; not starting a run on it"
+            );
+            return None;
+        }
+        // Re-asked here rather than trusted from assign time: this is the
+        // one gate whose answer expires, and every door that records a row
+        // comes through here. The sweeps that hand out rows recorded
+        // *earlier* do not, which is why the executor asks a third time
+        // before it binds a session.
+        if self.assignee_can_run(issue).await != Some(true) {
+            tracing::debug!(
+                issue = issue.number,
+                ?trigger,
+                "the assignee cannot host an issue's session; not starting a run"
             );
             return None;
         }
@@ -864,12 +890,17 @@ impl ProjectManager {
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
-        if issue.assignee.is_none() {
+        let Some(assignee) = issue.assignee.clone() else {
             return Err(ProjectError::invalid(
                 "assignee",
                 "an issue with nobody on it cannot be run",
             ));
-        }
+        };
+        // Asked here as well as at the chokepoint, for the same reason the
+        // card's own refusals are: `enqueue` can only answer `None`, which
+        // this method reads as the dedupe guard — so an operator whose agent
+        // has moved to codex would be told the card already has a run.
+        self.validate_assignee(project, &assignee).await?;
         if !crate::runs::accepts_runs(&issue) {
             return Err(ProjectError::invalid(
                 "issue",
@@ -1929,17 +1960,33 @@ impl ProjectManager {
                 format!("{assignee} was removed from this project's team"),
             ));
         }
-        if profile.framework != AgentFramework::Baybo {
+        if !crate::runs::can_host_a_session(profile.framework) {
             return Err(ProjectError::invalid(
                 "assignee",
-                format!(
-                    "{assignee} runs on {}, which cannot yet host an issue's session — \
-                     assign a baybo agent",
-                    profile.framework.as_str()
-                ),
+                framework_refusal(assignee, profile.framework),
             ));
         }
         Ok(())
+    }
+
+    /// The assignee's framework, re-read at the moment a run would start.
+    ///
+    /// [`Self::validate_assignee`] answered this when the card was assigned,
+    /// and that answer does not keep: a profile's framework is editable
+    /// (pinned only for builtins), so an agent given a card as baybo can be
+    /// on codex by the time a comment wakes it. `None` when the profile is
+    /// unreadable or gone — a caller that cannot establish the fact must not
+    /// assume the permissive half of it.
+    async fn assignee_can_run(&self, issue: &IssueRow) -> Option<bool> {
+        let assignee = issue.assignee.as_ref()?;
+        match self.agents.get(assignee).await {
+            Ok(Some(profile)) => Some(crate::runs::can_host_a_session(profile.framework)),
+            Ok(None) => Some(false),
+            Err(e) => {
+                tracing::error!(%assignee, error = %e, "could not read the assignee's framework");
+                None
+            }
+        }
     }
 
     /// In Progress means somebody is on it. A card in that column with no

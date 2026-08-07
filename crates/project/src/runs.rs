@@ -1,7 +1,7 @@
-//! The two predicates a run has to satisfy, and the ledger entry it
-//! becomes.
+//! The predicates a run has to satisfy, and the ledger entry it becomes.
 //!
-//! They ask different questions and are deliberately not folded together.
+//! Two are about the write and the card, and are deliberately not folded
+//! together.
 //! [`triggers_run`] asks about an **edge**: did this particular write start
 //! work? [`accepts_runs`] asks about a **card**: does this issue still take
 //! work at all? Only the first needs a transition, and only three of the
@@ -14,8 +14,13 @@
 //! live here on the edge: `enqueue` asks it once for everything that writes
 //! a row, and each sweep asks it again for itself, against the card as it is
 //! now.
+//!
+//! The third, [`can_host_a_session`], is about neither: it asks about the
+//! **assignee**, and it is the one predicate whose answer can change while a
+//! recorded run waits, which is why the executor asks it again rather than
+//! trusting the answer given when the card was assigned.
 
-use baybo_model::{AgentProfileId, IssueRunId};
+use baybo_model::{AgentFramework, AgentProfileId, IssueRunId};
 use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
 
 /// What a write did to an issue, in the only terms [`triggers_run`] cares
@@ -94,6 +99,30 @@ pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
 /// startable again.
 pub(crate) fn accepts_runs(issue: &IssueRow) -> bool {
     !crate::stages::is_finished(issue)
+}
+
+/// Whether an agent on this framework can host an issue's session.
+///
+/// A run is one turn in a **top-level** session bound to its assignee, and
+/// there is no code that would run an external one there. The registry that
+/// owns the `claude`/`codex` wrappers is a field of `SubagentSpawner` and
+/// nothing else in the tree holds it; the top-level actor never reads a
+/// framework at all. So this is an unimplemented path rather than a policy —
+/// which is exactly why it has to be refused rather than recorded. Binding a
+/// session to `codex` today changes one column and nothing else: the turn
+/// still runs on the internal loop, under that agent's persona, signing its
+/// name to the commits. Nothing errors, so nothing looks wrong.
+///
+/// Asked twice, and both times on purpose. `validate_assignee` asks it when
+/// the assignee is set, so the operator hears "assign a baybo agent" instead
+/// of watching a card sit there. The executor asks it again when the run
+/// actually starts, because the first answer does not stay true: a profile's
+/// framework is editable (`AgentProfileUpdate`, pinned only for builtins),
+/// and a row the boot sweep re-drives was recorded under whatever the agent
+/// was then. One rule, so the day a top-level session can host an external
+/// backend both askers change together.
+pub fn can_host_a_session(framework: AgentFramework) -> bool {
+    framework == AgentFramework::Baybo
 }
 
 impl Transition {

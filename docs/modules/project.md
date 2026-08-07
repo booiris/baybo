@@ -392,6 +392,19 @@ coordinator.
 - An assignee must be a live teammate of *this* board on the `baybo` framework.
   A global chat persona has no handle here; a removed one cannot take new work;
   an external `claude`/`codex` profile cannot host a top-level session.
+
+  The framework half is the one whose answer **expires**. A profile's framework
+  is editable — `update_agent` pins it only for builtins — so an agent given a
+  card as `baybo` can be on `codex` before its next run starts, and a row the
+  boot sweep re-drives was recorded under whatever it was then. So
+  `runs::can_host_a_session` is asked three times against one rule: by
+  `validate_assignee` when the card is assigned, by `enqueue` before it records
+  a row, and by the executor's `binding_for` before the answer is written into a
+  session write-once. The executor's is not belt-and-braces — the sweeps hand
+  out rows without passing through `enqueue`, so for those it is the only ask.
+  It refuses rather than records: a top-level session bound to an external
+  backend would still be run by the internal loop, so the card would name an
+  agent that never worked it and sign that agent's name to the commits.
 - An agent with a run in flight cannot be removed — the run reads its row, not
   the roster, so removing it would just hide who is doing what is happening.
 

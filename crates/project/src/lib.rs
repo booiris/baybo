@@ -34,5 +34,6 @@ pub use manager::{
     LEAD_HANDLE, MAX_FEED_PAGE, MAX_TEAM_AGENTS, NewIssueRequest, NewProject, NewTeamMember,
     ProjectManager, RunDispatch, no_dispatch, validate_workdir,
 };
+pub use runs::can_host_a_session;
 pub use stages::progress;
 pub use worktree::Checkout;
