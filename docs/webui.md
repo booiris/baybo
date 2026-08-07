@@ -16,6 +16,76 @@ The admin TCP listener serves an embedded React dashboard baked into the gateway
 - Admin API types are generated: `docs/openapi.json` is produced by `baybo-gateway` (utoipa) and kept in sync by `crates/gateway/tests/openapi_spec_sync.rs` (regen with `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync`). The web build runs `openapi-typescript` over that file (`pnpm --filter baybo-web gen:api`, wired into `pnpm --filter baybo-web build`) to emit `app/web/src/api/schema.d.ts`; the runtime client lives in `app/web/src/api/client.ts` (`openapi-fetch` with Bearer auth pre-applied). `utoipa` itself is only a dependency of `baybo-gateway` — domain crates stay framework-agnostic, and new HTTP-visible fields are added by editing the mirror DTOs in `crates/gateway/src/api/dto.rs`.
 - Design tokens (`--color-brand`, `--shadow-brutal*`, `--font-mono`, …) live in `app/web/src/index.css` under Tailwind v4's `@theme` block. Keep the heavy-border + offset-shadow aesthetic consistent when adding new components.
 
+## PWA
+
+The dashboard is an installable, offline-capable app: a web app manifest, an icon set, and a service worker that precaches the shell. What that buys is a standalone window (its own icon, no address bar, its own OS task-switcher entry) and a shell that paints without the gateway — the data behind it still needs a live `/v1`, so offline means "the app opens and tells you it can't reach the gateway", not "the app works".
+
+**Theme colour lives in two files and must match.** `<meta name="theme-color">` in `index.html` tints the browser tab; `theme_color` in the manifest tints the installed window's chrome, and is captured at install time (an already-installed app needs a reinstall to pick up a change). Neither can reference the other, nor the `index.css` token they copy — so the build compares them and fails on a mismatch rather than shipping an app whose title bar disagrees with its own tab.
+
+It is `--color-canvas` (`#faf6ec`), **not** the brand gold. Gold was the first choice and read as too much: the rail is the only gold surface and it is 48 px down the *left* edge, so a gold top bar sat above a page that is cream everywhere it touches. Canvas makes the chrome continuous with the header strip under it, which is what a theme colour is for. `background_color` is a third, separate thing — the splash behind the icon, white to match the icon's own background.
+
+**The static half** lives in `app/web/public/`, which Vite copies to the output root verbatim (and which `crates/gateway/build.rs` already watches, so an icon edit rebuilds the bundle). `manifest.webmanifest` is hand-written — one file, reviewable in a diff, no plugin config to read it through. `index.html` carries the `theme-color`, the icon links, and the `apple-mobile-web-app-*` pair Safari still reads instead of `display: standalone`.
+
+**Icons** are all derived from `assets/baybo.png` — the brand mark, and the same artwork the iOS app ships as its AppIcon, so the two apps look like one product. Regenerate them from the repo root:
+
+```bash
+# Normalize the source: flatten alpha and pull the near-white (254,254,254)
+# field to pure white, so a shrunk tile leaves no faint square on a white canvas.
+magick assets/baybo.png -alpha remove -alpha off -fuzz 3% -fill white -opaque white /tmp/src.png
+magick /tmp/src.png -fuzz 3% -trim +repage /tmp/mark.png
+
+cd app/web/public
+for n in 512 192; do magick /tmp/src.png -resize ${n}x${n} -strip -define png:compression-level=9 pwa-$n.png; done
+magick /tmp/src.png -resize 180x180 -strip -define png:compression-level=9 apple-touch-icon.png
+magick /tmp/src.png -resize 390x390 -background white -gravity center -extent 512x512 -strip -define png:compression-level=9 pwa-maskable-512.png
+
+# favicon.ico — three hand-tuned sizes, see below
+magick /tmp/mark.png -morphology Erode Disk:20 -resize 15x15 -background white -gravity center -extent 16x16 -strip /tmp/ico-16.png
+magick /tmp/mark.png -morphology Erode Disk:10 -resize 30x30 -background white -gravity center -extent 32x32 -strip /tmp/ico-32.png
+magick /tmp/mark.png -morphology Erode Disk:6  -resize 44x44 -background white -gravity center -extent 48x48 -strip /tmp/ico-48.png
+magick /tmp/ico-48.png /tmp/ico-32.png /tmp/ico-16.png favicon.ico
+
+# Grayscale palette: the mark is black on white and everything between is
+# antialiasing. Cuts the four PNGs 107 KB → 35 KB (they ride into the gateway
+# binary) at an RMSE of ~0.3%.
+for f in pwa-512 pwa-192 pwa-maskable-512 apple-touch-icon; do
+  magick $f.png -colorspace Gray -colors 64 -strip \
+    -define png:compression-level=9 -define png:compression-filter=5 $f.png
+done
+```
+
+Three of those numbers are not arbitrary:
+
+- **`-resize 390x390` for the maskable.** The platform crops a maskable icon to a circle/squircle and only the centred 80% circle is guaranteed to survive, so the mark's *diagonal* is the binding constraint — not its width. At 390 the mark measures 312×258, a half-diagonal of 202 against the 204.8 the safe circle allows. A straight 512 resize would put it at 266 and lose the antenna tips.
+- **`Erode Disk:N` before each favicon size.** The mark is line art whose strokes are ~14 px in a 1007 px source — under one pixel at 16, which downsamples to pale grey mush. Eroding thickens black against white by roughly the amount each size loses. The radii are eyeballed per size (20/10/6) because the right amount is a legibility judgement, not a ratio.
+- **Everything is opaque white.** iOS composites `apple-touch-icon` onto nothing and a transparent one comes out black; a transparent "any" icon disappears against a dark task switcher. `background_color` in the manifest is `#ffffff` to match — the splash screen draws the icon on it, and the app's cream canvas would frame it in a visible white square.
+
+**The service worker** is hand-rolled: `app/web/pwa/service-worker.js` (the source, with two placeholders) plus `app/web/pwa/plugin.ts` (a ~120-line Vite plugin that fills them in). `vite-plugin-pwa` was tried and reverted — it pulls workbox and, transitively, 249 packages into a workspace whose whole point is a dependency-light dashboard. Doing it here also lets the precache list be chosen against this gateway's real asset semantics instead of a glob.
+
+The plugin runs in `closeBundle` — the one hook that fires after Vite has copied `public/` — and scans the actual `dist/` tree, so `public/` assets are in the list. It precaches `.html`, `.js`, `.css`, `.woff2`, `.svg`, and `.webmanifest` (26 files today) and deliberately skips KaTeX's `.woff`/`.ttf` fallbacks: they are ~876 KB of the 1.03 MB font payload and no browser that can run this React 19 bundle will ever ask for them. The cache name carries a **content hash** of everything precached, never a timestamp — a rebuild that changed nothing must produce a byte-identical `sw.js`, or every `cargo build` would hand users a "new version" prompt for an identical bundle. Two build-time invariants guard the silent-failure modes: a placeholder that has nothing to substitute, and a precache list missing the shell / a script / a stylesheet, both fail the build.
+
+Runtime strategy:
+
+- **Documents** are network-first with a 4 s timeout, falling back to the precached `/index.html`. The gateway is usually a local process and the bundle it serves is the source of truth; the cache is the offline floor, not the fast path. The timeout bounds the offline-but-not-refused case (captive portal, dropped VPN) that would otherwise hang.
+- **Sub-resources** are cache-first. `/assets/*` is content-hashed so a hit can never be stale, and everything else rotates with the cache name on the next activation.
+- **Google Fonts** get their own cache that is *not* build-scoped — the same bytes across deploys, and re-downloading ~300 KB on every gateway upgrade is waste. The stylesheet `<link>` carries `crossorigin="anonymous"` for this: without it the response is opaque, and an opaque error would pin itself in the font cache forever with no way to tell it from a success. (Self-hosting Inter / Space Mono the way KaTeX's faces already are would remove the third party entirely; not done yet.)
+- `/v1/*`, `/healthz`, `/readyz` are never touched. A cached, bearer-scoped answer would be a stale lie.
+
+**Updates** never happen under a live page. The worker does not `skipWaiting()` on install, because a dashboard tab is usually mid-something — a streaming turn, a half-typed message. Instead `src/pwa/registerSW.ts` notices the waiting worker and `PwaUpdateBanner` offers a reload (bottom-**right**: the chat composer owns the bottom of the reading band). Two rules in `src/pwa/updates.ts` are the ones that break silently, and they carry the unit tests: a worker reaching `installed` is only an *update* if the page already had a controller (otherwise every first-time visitor is told the app is out of date), and `controllerchange` may only reload when the user asked for it (it also fires when a first worker `clients.claim()`s the page — reloading there is a flash on first visit, and a loop if anything re-registers). A long-lived tab re-checks hourly, and on tab focus at most every 5 minutes.
+
+**The gateway contract** (`crates/gateway/src/api/webui.rs`): any request whose last path segment carries an extension gets a 404, never the SPA fallback. That already protected a stale `<script src>` from being served HTML; with the PWA it also stops a `BAYBO_SKIP_WEBUI=1` build from answering `/sw.js` and `/manifest.webmanifest` with a page instead of admitting they aren't there. `/sw.js` rides the same `no-cache` branch as `index.html` and must: a cached worker script is a gateway upgrade the browser never notices. `mime_for` maps `webmanifest` to `application/manifest+json`, which Chrome and Firefox both require.
+
+**Operational gotchas:**
+
+- **Service workers need a secure context.** `http://127.0.0.1:8888` qualifies; `http://192.168.1.5:8888` does not, and neither the worker nor the install prompt appears there. The only signal is one `console.info` from `registerSW.ts` — nothing surfaces in the UI, by choice. Fixes, in order of effort: `ssh -L 8888:localhost:8888 <you>@<host>` and open the tunnelled `http://localhost:8888` (note the admin token is stored per origin, so the tunnelled URL asks for it again), or put the gateway behind an HTTPS reverse proxy (pass `Upgrade` through or the chat WebSocket dies).
+  `pwa/availability.ts` decides this in one place. Note the check order there: `ServiceWorkerContainer` is `[SecureContext]`, so an insecure origin has **no `navigator.serviceWorker` at all** — testing for the API first (as this did at first) reports "unsupported browser", a dead end, for what is really a fixable URL problem, and the `console.info` above never printed.
+- **There is no worker in `vite dev`** — `registerServiceWorker` returns early outside a production bundle, so HMR never fights a cache. To exercise it: `pnpm --filter baybo-web build && pnpm --filter baybo-web preview`, or build the gateway and open it on localhost.
+- **Install button.** `beforeinstallprompt` is Chromium-only; the rail shows an install icon when it fires and hides it again on `appinstalled`. Safari never fires it — installs go through Share → Add to Home Screen, and `canInstall` staying false is the normal state on iOS.
+- **Not** Web Push. The `web_push.*` records in the secret vault are the iOS app's *direct-mode APNs binding* (`crates/gateway/src/push/web.rs`), not W3C Web Push — there is no VAPID key, no `pushManager.subscribe`, and the worker has no `push` handler.
+- **No `shortcuts` and no `screenshots`, deliberately.** The jump-list entries (right-click the installed icon → Chat / Traces / Cron) were built and then cut — the dashboard's own rail is one click away from every one of them, so the manifest was carrying three routes and three 96×96 icons to save nothing.
+- **On `screenshots` specifically:** Chrome therefore uses its plain install dialog instead of the richer one, and DevTools → Application → Manifest says so with two warnings ("won't be available on desktop / on mobile"). They are expected; the images were built and then dropped. Anything that fills that field has to be captured against **mock data only** (`src/api/mock.ts`, reachable in dev via `?mock=true` with `/v1` proxied to a closed port) — these ship in the repo, ride into the gateway binary, and the browser shows them at install time, so a shot of a live instance would publish the owner's session titles and chat content.
+- The dashboard is laid out desktop-first (`md:` appears five times in the whole app), so an installed phone window opens and works but is not responsive.
+
 ## Trace viewer polling
 
 The per-session trace page (`app/web/src/pages/TraceSessionPage.tsx`) refreshes on a **two-tier, visibility-gated cadence** that stops entirely once nothing is live. There is **one** interval, not two: a tick bumps `refreshKey`, which refetches the overview and cascades into the step trees of every live turn. Its period is `POLL_ACTIVE_MS` (2s) when work is actually in flight — the selected turn is non-terminal, its tree holds a pending span, or **any nested subagent has a running turn** — and `POLL_TERMINAL_MS` (10s) when the only live thing is some other turn in the session. Both are skipped while the tab is hidden (`document.visibilityState !== 'visible'`), and when nothing is live no interval runs at all.

@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { serviceWorkerPlugin } from './pwa/plugin';
 
 // Dev-only: the admin TCP listener holds both `/v1/*` and the embedded
 // React bundle. When iterating on the UI via `npm run dev`, forward
@@ -12,7 +13,7 @@ import tailwindcss from '@tailwindcss/vite';
 const gatewayTarget = process.env.BAYBO_GATEWAY_URL ?? 'http://127.0.0.1:8888';
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), serviceWorkerPlugin()],
   server: {
     proxy: {
       // `ws: true` is required so the `/v1/channel-ws` upgrade used

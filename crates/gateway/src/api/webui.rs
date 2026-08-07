@@ -50,10 +50,13 @@ pub async fn serve(uri: Uri) -> Response {
         }
     }
 
-    // Missing hashed asset: return 404 rather than SPA-fallback so a
-    // stale `<script src>` never masquerades as HTML and trips the
-    // browser's strict-MIME guard.
-    if path.starts_with("assets/") {
+    // A request that names a file gets a 404, never the SPA fallback. Handing
+    // back `index.html` under someone else's name is how a stale
+    // `<script src>` masquerades as HTML and trips the browser's strict-MIME
+    // guard — and, since the PWA landed, how a bundle built with
+    // `BAYBO_SKIP_WEBUI=1` would answer `/sw.js` and `/manifest.webmanifest`
+    // with a page instead of admitting they aren't there.
+    if names_a_file(path) {
         return (StatusCode::NOT_FOUND, "asset not found").into_response();
     }
 
@@ -68,6 +71,15 @@ pub async fn serve(uri: Uri) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Whether the path's last segment carries an extension. SPA routes never do
+/// (the dashboard is a `HashRouter`, so every real navigation is `/`), and the
+/// build emits nothing extensionless.
+fn names_a_file(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.contains('.'))
 }
 
 fn lookup(path: &str) -> Result<Option<(&'static [u8], &'static str)>, &'static str> {
@@ -105,7 +117,8 @@ fn build_response(path: &str, bytes: &'static [u8], mime: &'static str) -> Respo
     // Hashed assets are fingerprinted — safe to cache forever. The
     // entry page must revalidate so rebuilds with a new bundle hash
     // take effect on the next load instead of waiting for the browser
-    // heuristic-cache to expire.
+    // heuristic-cache to expire. `/sw.js` rides that same branch, and must:
+    // a cached worker script is a gateway upgrade the browser never notices.
     let cache_control = if path.starts_with("assets/") {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
@@ -149,6 +162,27 @@ mod tests {
         let uri: Uri = "/assets/index-DEADBEEF.js".parse().expect("uri parses");
         let response = serve(uri).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The PWA's entry points sit at the root, not under `assets/`. A build
+    /// without a dashboard (`BAYBO_SKIP_WEBUI=1`) has neither, and answering
+    /// them with `index.html` would register a page as a service worker.
+    /// `robots.txt` stands in for them here because a locally-built `dist/`
+    /// really does embed `sw.js` and `manifest.webmanifest`.
+    #[tokio::test]
+    async fn missing_root_file_returns_404_not_html() {
+        let uri: Uri = "/robots.txt".parse().expect("uri parses");
+        let response = serve(uri).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn only_extensionless_paths_are_spa_routes() {
+        assert!(names_a_file("sw.js"));
+        assert!(names_a_file("manifest.webmanifest"));
+        assert!(names_a_file("assets/index-DEADBEEF.js"));
+        assert!(!names_a_file("chat"));
+        assert!(!names_a_file("traces/019826f0-1a2b-7c3d-8e4f-5a6b7c8d9e0f"));
     }
 
     #[tokio::test]

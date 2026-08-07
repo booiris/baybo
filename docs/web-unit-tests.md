@@ -1,6 +1,6 @@
 # Web unit tests (`app/web`)
 
-The dashboard's vitest suite — **31 files, 541 tests** — and the conventions that
+The dashboard's vitest suite — **34 files, 560 tests** — and the conventions that
 keep it fast, deterministic, and dependency-light. Read this before adding a
 `.test.ts` under `app/web/src`.
 
@@ -180,6 +180,9 @@ says `pass`, not `skipping`, before trusting it.
 | `pages/chat/QueuePanel.test.tsx` (8) · **render** | `QueuePanel.tsx` | `render` + `user-event`: empty-queue renders null, rows in order, send/delete callbacks, inline edit (save on Enter / revert on Esc), cancelled vs error pause banner + "Send remaining". |
 | `pages/chat/ImageLightbox.test.tsx` (10) · **render** | `ImageLightbox.tsx` | The viewer's view state and dismiss rules: fit floor + 8× ceiling (and the buttons disabling at each), toolbar/keyboard zoom, reset, double-click toggle, eased-jump vs 1:1-wheel (`View.animate`), Escape / close / backdrop-vs-image click, the download filename, and body-scroll lock ↔ restore. jsdom measures every box at 0, so the zoom **percentage** can never resolve — assertions read the `transform` the state produces instead. |
 | `pages/chat/AttachmentImage.test.tsx` (3) · **render** | `AttachmentImage.tsx` | The bearer-authorized blob fetch and its object URL reaching the `<img>`, the thumbnail opening `ImageLightbox` on that *same* URL with no second fetch, and the named-chip fallback on a failed fetch. |
+| `pwa/availability.test.ts` (5) | `pwa/availability.ts` — `pwaBlocker` | Why the PWA is inert, and the ordering that matters: `ServiceWorkerContainer` is `[SecureContext]`, so an insecure origin ALSO has no `navigator.serviceWorker` — checking the API first reported "unsupported" (a dead end) for every LAN-IP visit instead of "insecure origin" (fixable), and silenced the one log line that would have said so. |
+| `pwa/updates.test.ts` (7) | `pwa/updates.ts` — `ServiceWorkerUpdates` | The waiting-worker handoff, whose two rules fail silently and only in a real browser: an `installed` worker prompts only when the page already had a controller (else every first visit is told it is out of date), and `controllerchange` reloads only after the user accepted — it also fires when a first worker `clients.claim()`s the page. Plus snapshot identity, which `useSyncExternalStore` re-renders on. |
+| `pwa/install.test.ts` (5) | `pwa/install.ts` — `InstallPrompt` | The deferred `beforeinstallprompt` is spent exactly once (a second `prompt()` on the same event rejects in Chrome), the button withdraws on `appinstalled`, and repeat offers keep the snapshot identity. |
 | `pages/chatMarkdown.test.tsx` (14) · **render** | `ChatPage.tsx` — `MarkdownBody` | The math pipeline end to end (normalize → remark-math → rehype-katex → KaTeX): inline vs display, both delimiter styles, money left literal, a malformed formula colored from the palette instead of throwing, list/table structure intact, and the `katex.min.css` import itself. Also that `<ol start>` survives the component overrides — the marker counter reads it off the element, and jsdom computes no counters, so the attribute is the only half of that the suite can see. |
 
 ## Adding a test — the recipe
