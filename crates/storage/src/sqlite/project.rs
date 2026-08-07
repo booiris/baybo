@@ -471,9 +471,15 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("projects.set_archived", move |conn| {
+                // Scoped to the state it is asked to leave, so `affected`
+                // counts state changes rather than existing rows. A caller
+                // reads the difference as the edge and does the work a
+                // restore owes — which on a board that was never away would
+                // be work somebody else is already carrying.
                 Ok(conn.execute(
-                    "UPDATE projects SET archived_at = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, stamp, now],
+                    "UPDATE projects SET archived_at = ?2, updated_at = ?3 \
+                     WHERE id = ?1 AND (archived_at IS NOT NULL) <> ?4",
+                    rusqlite::params![id, stamp, now, archived],
                 )?)
             })
             .await?;
@@ -1118,22 +1124,6 @@ impl ProjectStore for SqliteProjectStore {
         raw.map(run_from_raw).transpose()
     }
 
-    async fn unsettled_runs(&self) -> Result<Vec<IssueRunRow>> {
-        let raws = self
-            .pool
-            .interact("issue_runs.unsettled", move |conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {RUN_COLUMNS} FROM issue_runs WHERE settled_at IS NULL \
-                     ORDER BY created_at"
-                ))?;
-                Ok(stmt
-                    .query_map([], read_raw_run)?
-                    .collect::<rusqlite::Result<Vec<RawRun>>>()?)
-            })
-            .await?;
-        raws.into_iter().map(run_from_raw).collect()
-    }
-
     async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool> {
         let id = id.as_str().to_string();
         let session = session.as_str().to_string();
@@ -1142,7 +1132,8 @@ impl ProjectStore for SqliteProjectStore {
             .pool
             .interact("issue_runs.claim", move |conn| {
                 // Scoped to `queued`, so two dispatches of the same row
-                // resolve into one execution rather than two.
+                // resolve into one execution rather than two — the
+                // execution, not the work each dispatcher did to get here.
                 Ok(conn.execute(
                     "UPDATE issue_runs SET status = 'running', session_id = ?2, started_at = ?3 \
                      WHERE id = ?1 AND status = 'queued'",
@@ -1166,8 +1157,11 @@ impl ProjectStore for SqliteProjectStore {
         let affected = self
             .pool
             .interact("issue_runs.settle", move |conn| {
-                // `settled_at IS NULL` is what makes the boot re-drive safe
-                // to replay: a second settle of the same run touches nothing.
+                // `settled_at IS NULL` is what makes a re-driven run safe to
+                // replay: a second settle of the same run touches nothing.
+                // It is *only* that — the statement is not scoped to an
+                // owner, so it settles a row somebody else has claimed just
+                // as readily.
                 Ok(conn.execute(
                     "UPDATE issue_runs SET status = ?2, error = ?3, settled_at = ?4 \
                      WHERE id = ?1 AND settled_at IS NULL",
@@ -1225,44 +1219,32 @@ impl ProjectStore for SqliteProjectStore {
         Ok(affected > 0)
     }
 
-    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>> {
-        let raws = self
-            .pool
+    async fn requeue_unsettled(&self) -> Result<()> {
+        self.pool
             .interact("issue_runs.requeue", move |conn| {
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // A `running` row whose actor died with the process is work
                 // that never finished, so it goes back to `queued` for the
-                // sweep to hand out again. The session it was claimed with
-                // stays: the resumed run is the same run, executed by the
-                // same agent, so it belongs in the same thread — and
-                // `claim_run` gates on the status alone, so a session already
-                // on the row cannot refuse the re-claim. Dropping it would
-                // start the resumed run from an empty transcript and take its
-                // spend out of `spend_since`.
-                tx.execute(
+                // caller to hand out again, board by board. The session it
+                // was claimed with stays: the resumed run is the same run,
+                // executed by the same agent, so it belongs in the same
+                // thread — and `claim_run` gates on the status alone, so a
+                // session already on the row cannot refuse the re-claim.
+                // Dropping it would start the resumed run from an empty
+                // transcript and take its spend out of `spend_since`.
+                //
+                // `held` is untouched for the same reason it is not an
+                // orphan: it was never started, so there is nothing to roll
+                // forward, and today's budget is the only thing that should
+                // decide whether it starts.
+                conn.execute(
                     "UPDATE issue_runs SET status = 'queued', started_at = NULL \
                      WHERE settled_at IS NULL AND status = 'running'",
                     [],
                 )?;
-                let raws = {
-                    // `held` is excluded on purpose: those runs were never
-                    // started, so they are not orphans to roll forward. The
-                    // manager re-evaluates them against today's budget right
-                    // after this sweep, which is the only thing that should
-                    // decide whether they start.
-                    let mut stmt = tx.prepare(&format!(
-                        "SELECT {RUN_COLUMNS} FROM issue_runs WHERE settled_at IS NULL \
-                         AND status != 'held' ORDER BY created_at"
-                    ))?;
-                    stmt.query_map([], read_raw_run)?
-                        .collect::<rusqlite::Result<Vec<RawRun>>>()?
-                };
-                tx.commit()?;
-                Ok(raws)
+                Ok(())
             })
             .await?;
-        raws.into_iter().map(run_from_raw).collect()
+        Ok(())
     }
 }
 
@@ -1502,6 +1484,39 @@ mod tests {
             1,
             "an archived project leaves the default listing"
         );
+        // `true` is the edge, not "the row is there": a caller hangs the
+        // work a restore owes on it, and a repeat owes nothing.
+        let shelved_at = store
+            .get_project(&a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .unwrap();
+        assert!(
+            !store.set_project_archived(&a.id, true).await.unwrap(),
+            "archiving a board that is already away moves nothing"
+        );
+        assert_eq!(
+            store
+                .get_project(&a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .unwrap(),
+            shelved_at,
+            "…and does not restamp it either"
+        );
+        assert!(
+            store.set_project_archived(&a.id, false).await.unwrap(),
+            "the way back is an edge too"
+        );
+        assert!(
+            !store.set_project_archived(&a.id, false).await.unwrap(),
+            "and restoring a board that never left moves nothing"
+        );
+        assert!(store.set_project_archived(&a.id, true).await.unwrap());
         assert_eq!(
             store.list_projects(true).await.unwrap().len(),
             2,
@@ -1713,7 +1728,8 @@ mod tests {
         assert!(store.claim_run(&run.id, &session).await.unwrap());
         assert!(
             !store.claim_run(&run.id, &session).await.unwrap(),
-            "a claimed run cannot be claimed again — that is how a double dispatch collapses"
+            "a claimed run cannot be claimed again — that is how two dispatches of one row \
+             collapse into one execution"
         );
         let claimed = store.get_run(&run.id).await.unwrap().unwrap();
         assert_eq!(claimed.status, RunStatus::Running);
@@ -1773,28 +1789,33 @@ mod tests {
             .await
             .unwrap();
 
-        let resumed = store.requeue_unsettled().await.unwrap();
-        let ids: Vec<&str> = resumed.iter().map(|r| r.id.as_str()).collect();
+        store.requeue_unsettled().await.unwrap();
+
+        // The sweep's whole product is the state it leaves: it hands nothing
+        // back, because who gets to *run* these is a per-board question the
+        // caller asks next, one `active_runs` at a time.
+        let swept = store.active_runs(&p.id).await.unwrap();
+        let ids: Vec<&str> = swept.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![queued.id.as_str(), running.id.as_str()],
-            "both unfinished runs come back, the settled one does not"
+            "both unfinished runs are still owed, the settled one is not"
         );
-        assert!(resumed.iter().all(|r| r.status == RunStatus::Queued));
+        assert!(swept.iter().all(|r| r.status == RunStatus::Queued));
         let session = SessionId::from("issue-2");
-        let swept = resumed.iter().find(|r| r.id == running.id).unwrap();
+        let orphan = swept.iter().find(|r| r.id == running.id).unwrap();
         assert_eq!(
-            swept.session_id,
+            orphan.session_id,
             Some(session.clone()),
             "the interrupted run keeps the session it was working in, so the \
              resumed run continues that transcript instead of opening a second"
         );
         assert!(
-            swept.started_at.is_none(),
+            orphan.started_at.is_none(),
             "it has not started again — `claim_run` re-stamps that"
         );
         assert!(
-            resumed
+            swept
                 .iter()
                 .find(|r| r.id == queued.id)
                 .unwrap()
@@ -1804,7 +1825,8 @@ mod tests {
         );
 
         // The sweep is idempotent — booting twice is not a double dispatch.
-        assert_eq!(store.requeue_unsettled().await.unwrap().len(), 2);
+        store.requeue_unsettled().await.unwrap();
+        assert_eq!(store.active_runs(&p.id).await.unwrap().len(), 2);
 
         // The worry the sweep used to null the session over: `claim_run`
         // gates on the status, so a session already on the row does not

@@ -139,7 +139,7 @@ impl Router {
         // the terminal event is published from inside the run's own turn, so
         // a subscription opened afterwards can miss a fast failure entirely.
         let waiter = IssueRunWaiter {
-            run: event.run.clone(),
+            enqueued: event.run.clone(),
             checkout: checkout.clone(),
             session_id: session.id.clone(),
             lifecycle: Arc::clone(&self.turn_lifecycle),
@@ -496,7 +496,13 @@ async fn record(
 
 /// Watches one run's turn and settles its ledger row.
 struct IssueRunWaiter {
-    run: IssueRunRow,
+    /// The run as it was **enqueued** — the row the dispatcher handed over,
+    /// cloned before `claim_run` stamped it. Its `status` therefore reads
+    /// `Queued` and its `started_at` is empty for the whole life of the
+    /// turn, however long that is. Only what never changes is read from it —
+    /// the ids, the number, the attempt, `created_at` — and what the settle
+    /// needs to know about how the run *ended* comes from the turn.
+    enqueued: IssueRunRow,
     /// The worktree this run worked in — asked for its branch once the run
     /// is over, because that is the authoritative name.
     checkout: PathBuf,
@@ -513,14 +519,14 @@ struct IssueRunWaiter {
 impl IssueRunWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
         let outcome = self.await_run(actor_token).await;
-        let run_id = &self.run.id;
+        let run_id = &self.enqueued.id;
         let status = outcome.status;
         info!(%run_id, ?status, "issue run settled");
         let store = &self.board.store;
         settle(
             store,
             &self.board.events,
-            &self.run,
+            &self.enqueued,
             status,
             outcome.error.as_deref(),
         )
@@ -536,8 +542,8 @@ impl IssueRunWaiter {
         // an overlap costs is a missing chip — but a follow-up run works in
         // this same worktree, and reading it while somebody else is in it
         // is a race that need not exist.
-        surface_branch(store, &self.board.events, &self.checkout, &self.run).await;
-        follow_up_on_comments(&self.board.manager, store, &self.run, &outcome).await;
+        surface_branch(store, &self.board.events, &self.checkout, &self.enqueued).await;
+        follow_up_on_comments(&self.board.manager, store, &self.enqueued, &outcome).await;
     }
 
     async fn await_run(&mut self, actor_token: CancellationToken) -> RunOutcome {
@@ -553,7 +559,7 @@ impl IssueRunWaiter {
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
-                            run_id = %self.run.id,
+                            run_id = %self.enqueued.id,
                             skipped = n,
                             "issue waiter lagged on the lifecycle bus; reconciling via store"
                         );
@@ -603,7 +609,7 @@ impl IssueRunWaiter {
             Ok(Some(turn)) => stopped_by_a_human(&turn.status),
             Ok(None) => false,
             Err(e) => {
-                warn!(run_id = %self.run.id, error = %e, "could not read why the run's turn was cancelled");
+                warn!(run_id = %self.enqueued.id, error = %e, "could not read why the run's turn was cancelled");
                 false
             }
         };
@@ -638,14 +644,14 @@ impl IssueRunWaiter {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
             Err(e) => {
-                warn!(run_id = %self.run.id, error = %e, "could not reconcile run via store");
+                warn!(run_id = %self.enqueued.id, error = %e, "could not reconcile run via store");
                 return None;
             }
         };
         turns
             .into_iter()
             .filter(|t| t.input_kind() == TurnInputKind::IssueRun && t.is_terminal())
-            .filter(|t| t.created_at >= self.run.created_at)
+            .filter(|t| t.created_at >= self.enqueued.created_at)
             .max_by_key(|t| t.created_at)
             .map(|t| RunOutcome {
                 stopped_by_a_human: stopped_by_a_human(&t.status),
@@ -1146,7 +1152,7 @@ mod tests {
             .expect("cancel");
 
         let waiter = IssueRunWaiter {
-            run: run.clone(),
+            enqueued: run.clone(),
             checkout: PathBuf::from("/tmp/does-not-matter"),
             session_id: session.clone(),
             terminal_rx: lifecycle.subscribe_lifecycle_events(),
@@ -1495,7 +1501,7 @@ mod tests {
             .expect("comment");
 
         let mut waiter = IssueRunWaiter {
-            run: second.clone(),
+            enqueued: second.clone(),
             checkout: PathBuf::from("/tmp/does-not-matter"),
             session_id: session.clone(),
             terminal_rx: lifecycle.subscribe_lifecycle_events(),

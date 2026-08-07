@@ -8,8 +8,9 @@
 //! doors into a run carry one: creating a card, editing one, moving one. A
 //! comment wake, a retry and a stage barrier arrive at
 //! [`crate::ProjectManager::enqueue`] with nothing but a row, and the two
-//! sweeps — a released hold and a boot re-drive — hand out rows recorded
-//! earlier without passing through it at all. So the card-level rule cannot
+//! sweeps — a released hold, and the re-drive a process start or a restored
+//! board runs — hand out rows recorded earlier without passing through it at
+//! all. So the card-level rule cannot
 //! live here on the edge: `enqueue` asks it once for everything that writes
 //! a row, and each sweep asks it again for itself, against the card as it is
 //! now.
@@ -83,7 +84,8 @@ pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
 /// Asked of the card rather than of a write, because most of the doors into
 /// a run have no write to look at: a comment on live work, a retry, a parent
 /// woken by its last step, a hold released when the budget rolls over and a
-/// row the boot sweep re-drives were all recorded — or last looked at —
+/// row a process start or a restore re-drives were all recorded — or last
+/// looked at —
 /// while the card was still live. [`crate::ProjectManager::enqueue`] asks
 /// this once for all of them, and the two sweeps that hand out rows recorded
 /// earlier ask it again against the card as it is now.

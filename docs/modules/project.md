@@ -57,14 +57,26 @@ them carrying a copy of the rule.
 
 The web board is not one of those callers, and this is the seam to know about.
 A composer has to say what sending will do while the text is still being typed,
-so it cannot ask the server: `commentHint` and `mentionHint`/`mentionQuery` in
-`app/web/src/pages/projects/` are hand-written TypeScript mirrors of
-`comments::comment_delivery` and `mentions::assigns_to`. Nothing enforces the
-correspondence — not a generated binding, not a shared schema — only the two
-test suites, one per language, asserting the same cases. So widening
-`is_live_work` by one column, or adding a run state that reads as idle, is a
-change on both sides in the same commit; `cargo test` alone will be green with
-a board that wakes an agent while the composer still promises "Records only".
+so it cannot ask the server. There are three hand-written TypeScript mirrors in
+`app/web/src/pages/projects/`: `commentHint` and `mentionHint`/`mentionQuery`
+mirror `comments::comment_delivery` and `mentions::assigns_to`, and
+`retryRejection` mirrors the card-level refusals `ProjectManager::retry_run`
+answers with, so a button knows whether the click would be rejected before it is
+sent. Nothing enforces the correspondence — not a generated binding, not a
+shared schema — only the two test suites, one per language, asserting the same
+cases, which for the refusals means asserting the **literal sentences**
+(`the_retry_refusals_say_exactly_what_the_button_predicts`): the button quotes
+them, so a reword on one side is a lie on the other. So widening `is_live_work`
+by one column, or adding a run state that reads as idle, is a change on both
+sides in the same commit; `cargo test` alone will be green with a board that
+wakes an agent while the composer still promises "Records only".
+
+One sentence over there is deliberately *not* a mirror. `HELD_RUN_NOTE` sits
+beside a **working** button: a press on a budget-held card goes through
+`enqueue`, which releases what the ceiling allows before it writes, so the press
+is what starts the run. `retry_run` reads the hold before and after and reports
+the start rather than the dedupe guard's conflict; only when the ceiling refuses
+again does it answer, with the budget as the reason.
 
 ### The run ledger
 
@@ -81,11 +93,13 @@ Held ──(released)──► Queued ──(claimed)──► Running ──(se
   └────────────────────┴─────(cancelled, or called off)───────────────┘
 ```
 
-Nothing calls off a row that is *running*: the sweeps are the only callers, and
-a `running` row reaches them only after the boot re-drive has already returned
-it to `Queued`. It is still a run that started — the card carries `RunStarted`
-for it and the row still carries its session — which is why the call-off has
-two sentences and picks between them per row rather than per caller.
+Nothing calls off a row that is *running*: the sweeps are the only callers and
+both filter by status first — `release_holds` sees only `Held` rows,
+`resume_project_runs` only `Queued` ones. A `Queued` row may still be one that
+ran, because the process-start requeue rolls an interrupted `Running` row back
+to `Queued` and leaves its session on it — the card carries `RunStarted` for it
+and the transcript exists — which is why the call-off has two sentences and
+picks between them per row rather than per caller.
 
 `Held`, `Queued` and `Running` are the **unsettled** states, and a partial
 unique index makes at most one of them exist per issue. That index is the
@@ -127,19 +141,86 @@ covers three doors and misses five — so it lives on the card, at the
 chokepoint, and each sweep asks it again for itself.
 
 The two **sweeps** that hand out rows recorded earlier (`release_holds` and
-`resume_unsettled_runs`) do not go through `enqueue`, so they ask the liveness
-question again themselves, against the card as it is *now*: a hold can outlive
-the write that recorded it by a day, and the process can be down for a week. A
-sweep that finds a row on a finished card **calls it off** — settles it
-`Cancelled`, with a timeline entry in the board's own name — rather than
-skipping it. Skipping would leave the row unsettled, and an unsettled row holds
-the issue's dedupe slot: revive the card later and every run on it would be
-refused with "this issue already has a run".
+`resume_project_runs`) do not go through `enqueue`, so they ask its gates again
+themselves, against the board and the card as they are *now*: a hold can outlive
+the write that recorded it by a day, and the process can be down for a week.
+`resume_project_runs` is where both are asked — **archived** once for the board,
+through `writable_project`, and **liveness** once per row, through `live_card` —
+and it is the entry point for both callers that hand a board its work back, the
+boot sweep and a restore.
+
+The two gates dispose of a row differently, and that difference is the rule.
+A row on a **finished card** is **called off** — settled `Cancelled`, with a
+timeline entry in the board's own name. Skipping it would leave it unsettled,
+and an unsettled row holds the issue's dedupe slot: revive the card later and
+every run on it would be refused with "this issue already has a run". A row on
+an **archived board** is **left exactly where it is**. Archiving is a shelf, not
+a judgement on the work — the card never stopped taking work, the board did —
+and a restore hands the same row back out rather than making the operator notice
+a called-off run and retry it. The slot it holds meanwhile blocks nothing,
+because every door that could enqueue against it is refused for the same reason
+the sweep is.
+
+At a **process start** the work is split in two. `requeue_unsettled` rolls every
+`running` row back to `Queued` in one statement and hands nothing back — an
+orphan is an orphan whatever board it is on, an archived one included, and
+rolling a row forward settles nothing. `resume_project_runs` then walks the
+boards, each reading its own unfinished rows, so runs go out per board in issue
+order, oldest card first, with no order promised across boards. Nothing
+downstream depends on which run starts first. That sweep is spawned *alongside*
+the server rather than before it (`gateway_cmd.rs`), so it races live traffic: a
+restore landing in the instant before the requeue commits finds its orphans
+still `Running`, skips them, and they wait for the next process start.
 
 `retry_run` is the one caller that refuses a finished card itself rather than
 letting `enqueue` do it silently. `enqueue` can only answer `None`, which
 `retry_run` reads as the dedupe guard, so the operator would be told the card
 already has a run when it has none and never will.
+
+### One dispatch per row — which is not guaranteed
+
+`claim_run` is scoped to
+`queued`, so two dispatches of one row collapse into one *execution* — but that
+is the claim, and the dispatcher does real work before it: it cuts the issue's
+worktree (`worktree::ensure`, a check-then-`git worktree add` that is not
+concurrency safe) and settles the row itself when that fails. Two dispatchers on
+one row therefore race on the checkout, and the loser settles `Failed` — which
+`settle_run` accepts, because it gates on `settled_at IS NULL` and not on
+status, even though the winner has since claimed the row and is executing it.
+The card would then show a git error while an agent is live, the winner's own
+settle would be a no-op, and the freed dedupe slot would let a comment wake or a
+retry put a second agent into the same worktree.
+
+The callers narrow this; none of them removes it.
+
+A **restore** is an edge — `set_project_archived`'s UPDATE is conditional on the
+state changing, so its `true` is the archived→live edge rather than "the row
+exists" — so it can only overlap a dispatcher that is mid-checkout right then.
+A **process start** is not an edge at all. The sweep comes up alongside the
+server (`gateway_cmd.rs` spawns it into the task tracker; the router is
+assembled after), and `resume_project_runs` hands out every `Queued` row
+`active_runs` returns with no filter on when the row was written. So a card
+filed into In Progress in the first seconds of a process — by an operator, by
+`issue_create`, by a cron-fired session — is dispatched by its own `enqueue` and
+again by the sweep, and the first dispatcher is still inside `get_issue` →
+`comments_for_brief` → `prepare_checkout`, which shells out to git. That window
+is 100 ms to seconds on a real repo, not microseconds.
+
+Two smaller shapes sit beside it: the restore one above, and the gap inside
+`resume_project_runs` between `set_project_archived` committing and `active_runs`
+reading — the board is writable across it, so a door into `enqueue` can write and
+dispatch a row the sweep's read then hands out again.
+
+Closing that means the row defending itself, and the cheap way is the failure
+path settling only a run **nobody has claimed**: a second store method whose
+`WHERE` carries `status = 'queued'` alongside `settled_at IS NULL`, called in
+place of `settle_run` at that one site in the dispatcher. The predicate has to
+be the status and not `session_id IS NULL` — a `queued` row keeps the session
+of the run it was rolled forward from, so an ownership test spelled that way
+would refuse to settle every resumed run whose checkout failed, and leave the
+card sitting queued with nobody on it and its dedupe slot held. Reordering the
+claim ahead of the checkout would work too, but the claim needs a session the
+router mints, so it is a real reordering rather than a `WHERE` clause.
 
 ### Holds and release
 
@@ -147,14 +228,22 @@ An exhausted board records work instead of dropping it. The held row shows on
 the card with figures (`BudgetExhausted`), and it starts the moment there is
 headroom again.
 
-Holds are released **by activity, not by a clock**. Three things reach
-`release_holds`: a budget change, the boot sweep, and every enqueue that gets
-past the liveness gate onto a card with somebody on it — which is every enqueue
-that was going to write anything. (An enqueue the liveness gate refuses
-releases nothing; the board's other holds wait for the next thing that happens
-on it.) A daily ceiling that rolls over while nothing is happening therefore
-needs no timer — the first thing that happens next releases the hold, and if
-nothing happens, nothing needed releasing.
+Holds are released **by activity, not by a clock**. Four things reach
+`release_holds`: a budget change, the boot sweep, a board coming back off the
+shelf, and every enqueue that gets past the liveness gate onto a card with
+somebody on it — which is every enqueue that was going to write anything. (An
+enqueue the liveness gate refuses releases nothing; the board's other holds wait
+for the next thing that happens on it.) A daily ceiling that rolls over while
+nothing is happening therefore needs no timer — the first thing that happens
+next releases the hold, and if nothing happens, nothing needed releasing.
+
+The restore is the same idiom applied to the other read-only state: a board
+nobody may write is a board where nothing happens, so its work waits, and the
+act of making it writable again is the activity that releases it. That is why
+`set_project_archived(false)` calls `resume_project_runs` — without it, a
+shelved run would wait for the next process restart. On the *edge* only: a
+board that was never away is not a board where nothing happened, and its queued
+rows belong to whoever dispatched them.
 
 Inside `enqueue`, the release happens *before* the write, and it cannot move.
 On the board that actually needs releasing — the exhausted one — every card is
@@ -378,14 +467,22 @@ signal would refetch every column to learn that somebody said something.
   definition, and a row already recorded on such a card is called off rather
   than left unsettled.
 - **Archived is read-only for a board's contents** — issues, comments, the
-  team, a retry — enforced in `writable_project`, which every one of those
-  writes starts with. Three families do not ask, and only the first two are by
-  design: the project row's own edits (`update_project`,
-  `set_project_archived`, or a board could never be unarchived), the operator's
-  bookkeeping (`mark_read`, `cancel_run`), and the writes that describe work
-  already under way — `record_event`, and the two sweeps, which never re-read
-  the project row, so a run recorded before the board was archived is still
-  handed out at boot.
+  team, a retry, and starting a run — enforced in `writable_project`, which
+  every one of those writes starts with, the sweeps included (through
+  `resume_project_runs`). Three writes do not ask, and each is deliberate:
+  `set_project_archived`, or a board could never be restored; the operator's
+  bookkeeping (`mark_read`, `cancel_run` — stopping work and noting it was seen
+  are not additions to the board); and `record_event`, which describes work
+  already under way rather than starting any.
+- **Archiving is reversible, so it settles nothing.** A run recorded before a
+  board was shelved is left unsettled — not called off, as a finished card's is
+  — and the restore hands it back out, on the archived→live edge and nowhere
+  else.
+- **A queued row is executed once — not dispatched once.** The claim collapses
+  two dispatches into one execution, but only after both have cut the worktree
+  and either may have settled the row. The boot sweep hands out rows a live
+  enqueue is dispatching right now, so this is a known open shape rather than an
+  invariant; see "One dispatch per row" for the fix and where it belongs.
 - **A timeline append never fails the thing it describes.** Losing the note that
   a card moved is bad; refusing the move because the note could not be written
   is worse.

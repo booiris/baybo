@@ -4,13 +4,18 @@
 
 use std::sync::Arc;
 
-use baybo_model::{AgentFramework, AgentHandle, AgentProfileId, ProjectId, TeamMembership};
+use baybo_model::{
+    AgentFramework, AgentHandle, AgentProfileId, IssueId, IssueRunId, ProjectId, SessionId,
+    TeamMembership,
+};
 use baybo_project::{NewIssueRequest, NewProject, ProjectError, ProjectManager};
 use baybo_store::project::{
-    IssueActor, IssuePriority, IssueRunRow, IssueStatus, IssueUpdate, ProjectUpdate, RunStatus,
-    RunTrigger,
+    AttentionCounts, IssueActor, IssueEventRow, IssuePriority, IssueRow, IssueRunRow, IssueStatus,
+    IssueUpdate, NewIssue, NewIssueEvent, NewIssueRun, ProjectRow, ProjectUpdate,
+    Result as StoreResult, RunStatus, RunTrigger,
 };
 use baybo_workspace::WorkspacePaths;
+use chrono::{DateTime, Utc};
 
 struct Fixture {
     manager: ProjectManager,
@@ -1320,7 +1325,8 @@ async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
         .expect_err("a cancelled card cannot be retried");
     assert!(
         matches!(&refused, ProjectError::Invalid { field, reason }
-            if *field == "issue" && reason.contains("reopen")),
+            if *field == "issue"
+                && reason == "this issue was cancelled — reopen it before running it again"),
         "{refused:?}"
     );
     assert!(f.dispatched.lock().is_empty());
@@ -1329,6 +1335,152 @@ async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
         1,
         "and nothing was recorded either"
     );
+}
+
+/// The retry button predicts these refusals client-side — it has to, or it
+/// would offer a run the server rejects — so `retryRejection` in
+/// `app/web/src/pages/projects/boardModel.ts` carries the server's
+/// sentences word for word, and the toast an operator racing into the 400
+/// gets carries them too.
+///
+/// Nothing generates that correspondence, so it is held by two suites
+/// asserting the same literals, one per language. **The literals are
+/// restated here on purpose**: a test that read them from the same constant
+/// the code does would go green through a reword and leave the button
+/// quoting a sentence nobody sends. This is the side that owns the wording,
+/// so a reword has to break here first.
+#[tokio::test]
+async fn the_retry_refusals_say_exactly_what_the_button_predicts() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let refusal = async |number: i64| match f.manager.retry_run(&p.id, number).await {
+        Err(ProjectError::Invalid { reason, .. }) => reason,
+        other => panic!("#{number} should have been refused: {other:?}"),
+    };
+
+    f.manager
+        .create_issue(&p.id, IssueActor::User, new_issue("nobody on it"))
+        .await
+        .expect("issue");
+    assert_eq!(refusal(1).await, "an issue with nobody on it cannot be run");
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(dev.clone()),
+                ..new_issue("called off")
+            },
+        )
+        .await
+        .expect("issue");
+    f.manager
+        .update_issue(
+            &p.id,
+            2,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel");
+    assert_eq!(
+        refusal(2).await,
+        "this issue was cancelled — reopen it before running it again"
+    );
+
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::Done,
+                assignee: Some(dev),
+                ..new_issue("finished")
+            },
+        )
+        .await
+        .expect("issue");
+    assert_eq!(
+        refusal(3).await,
+        "this issue is done — move it back into the board before running it again"
+    );
+
+    // And the order is the server's, which is why the button follows it: a
+    // cancelled card with nobody on it is refused for the assignee, because
+    // that is the answer the click would have brought back.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel");
+    assert_eq!(refusal(1).await, "an issue with nobody on it cannot be run");
+}
+
+/// The other half of `touching_the_held_card_itself_releases_it`: the press
+/// happened, the ceiling still refused, and what the operator is told is the
+/// budget rather than the row. "This issue already has a run" names a run
+/// that never started and points at nothing to do.
+///
+/// The sentence is restated rather than read from the const, so a reword
+/// breaks here instead of going green while the button's own copy
+/// (`HELD_RUN_NOTE` in `app/web/src/pages/projects/boardModel.ts`) drifts.
+#[tokio::test]
+async fn a_retry_on_a_held_run_blames_the_budget_when_there_is_still_no_room() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Skint")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("work nobody can afford yet")
+            },
+        )
+        .await
+        .expect("issue");
+    let held = f.manager.list_runs(&p.id, 1).await.expect("runs").remove(0);
+    assert_eq!(held.status, RunStatus::Held, "the board is broke");
+    f.dispatched.lock().clear();
+
+    // Still no room: the press is refused, and for the budget rather than
+    // for the row it collided with.
+    match f.manager.retry_run(&p.id, 1).await {
+        Err(ProjectError::Conflict(reason)) => assert_eq!(
+            reason,
+            "this run is held — the project is over its daily budget, and starts as soon as there is room"
+        ),
+        other => panic!("a broke board should have refused: {other:?}"),
+    }
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "and nothing went out on a board with no room"
+    );
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1, "the refused press recorded no second row");
+    assert_eq!(runs[0].id, held.id, "and left the held one where it was");
+    assert_eq!(runs[0].status, RunStatus::Held);
 }
 
 #[tokio::test]
@@ -1566,6 +1718,334 @@ async fn a_run_called_off_after_it_started_is_not_told_it_never_did() {
         })
         .expect("the card says the run was called off");
     assert_eq!(told, started_reason);
+}
+
+/// Archived is the board's read-only state, and the sweep is subject to it
+/// like every other door into a run: an operator who put a board away and
+/// then restarts baybo must not find its agents working again. Both halves
+/// of the sweep answer to it — the hold release always did, and the re-drive
+/// now does.
+///
+/// Left where it is rather than called off, which is the other half of the
+/// rule: a finished card is a judgement on the work and its run is settled,
+/// while archiving is a shelf the board comes back off. Nothing can claim
+/// the dedupe slot the row holds meanwhile, because everything that would is
+/// refused for the same reason the sweep is.
+#[tokio::test]
+async fn the_boot_sweep_leaves_an_archived_boards_runs_where_they_are() {
+    let f = fixture().await;
+    let shelved = f
+        .manager
+        .create_project(new_project("Shelved"))
+        .await
+        .expect("archived board");
+    let live = f
+        .manager
+        .create_project(new_project("Live"))
+        .await
+        .expect("live board");
+    for (project, handle) in [(&shelved.id, "dev-1"), (&live.id, "dev-2")] {
+        let dev = seed_agent(&f, project, handle, AgentFramework::Baybo).await;
+        f.manager
+            .create_issue(
+                project,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::InProgress,
+                    assignee: Some(dev),
+                    ..new_issue("interrupted")
+                },
+            )
+            .await
+            .expect("issue");
+    }
+    let shelved_run = f.manager.list_runs(&shelved.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    // Claimed, so the requeue has something to roll forward: this is the
+    // shape a restart leaves behind, not a row nothing ever started.
+    assert!(
+        f.store
+            .claim_run(&shelved_run, &baybo_model::SessionId::from("shelved-1"))
+            .await
+            .expect("claim"),
+        "an executor had it when the board was put away"
+    );
+    f.manager
+        .set_project_archived(&shelved.id, true)
+        .await
+        .expect("archive");
+    f.dispatched.lock().clear();
+
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        1,
+        "only the live board's run is re-driven"
+    );
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1);
+    assert_eq!(announced[0].project_id, live.id);
+
+    let shelved_runs = f.manager.list_runs(&shelved.id, 1).await.expect("runs");
+    assert_eq!(shelved_runs.len(), 1, "and none was recorded in its place");
+    assert!(
+        !shelved_runs[0].status.is_settled(),
+        "the work is shelved, not called off: {:?}",
+        shelved_runs[0].status
+    );
+    // The card itself never stopped taking work — the board did — so the
+    // operator is told nothing about a run ending.
+    assert!(
+        !f.manager
+            .timeline(&shelved.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::RunSettled { .. }
+            )),
+        "an archived board's card was told its run was called off"
+    );
+}
+
+/// The other end of the rule above. Holding the run rather than calling it
+/// off is only right if something hands it back: the board's own restoration
+/// is that activity, exactly as a raised ceiling is the activity that
+/// releases a hold. Without this the shelved row waits for the next process
+/// restart while holding the issue's live-run slot, so the first thing the
+/// operator does on the restored card is refused as "this issue already has
+/// a run".
+#[tokio::test]
+async fn restoring_a_board_hands_its_shelved_run_back_out() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Shelved"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+    let recorded = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.manager
+        .set_project_archived(&p.id, true)
+        .await
+        .expect("archive");
+    // A restart while it was away changed nothing about it.
+    f.manager.resume_unsettled_runs().await.expect("boot sweep");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .set_project_archived(&p.id, false)
+        .await
+        .expect("restore");
+
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1, "the shelved run is handed back out");
+    assert_eq!(
+        announced[0].id, recorded,
+        "the same run resumes rather than a second being recorded for the same work"
+    );
+    assert_eq!(announced[0].status, RunStatus::Queued);
+    assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+/// …and it hangs off the archived→live **edge**, not off the request. A
+/// board that was never away owes nothing, and the rows a re-drive would
+/// find on it are the ordinary queued ones — a card that has just started,
+/// whose dispatcher is still cutting the worktree. Handing one of those out
+/// a second time is not a no-op: `claim_run` collapses the two into one
+/// *execution*, but only after both dispatchers have run the checkout, and
+/// the one that loses that race settles the row the winner is working in.
+///
+/// A repeat in either direction is still not an error — the board simply
+/// ends up where the caller asked for it.
+#[tokio::test]
+async fn a_board_that_was_never_archived_is_not_re_dispatched_by_a_restore() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Live"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("already under way")
+            },
+        )
+        .await
+        .expect("issue");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "the card's own run went out when it started"
+    );
+    f.dispatched.lock().clear();
+
+    let restored = f
+        .manager
+        .set_project_archived(&p.id, false)
+        .await
+        .expect("restoring a live board is not an error");
+    assert!(restored.archived_at.is_none());
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a board that was never away owes nothing, and its live run is somebody else's"
+    );
+
+    f.manager
+        .set_project_archived(&p.id, true)
+        .await
+        .expect("archive");
+    let again = f
+        .manager
+        .set_project_archived(&p.id, true)
+        .await
+        .expect("archiving a board that is already away is not an error either");
+    assert!(again.archived_at.is_some());
+
+    let unknown = baybo_model::ProjectId::generate();
+    let refused = f
+        .manager
+        .set_project_archived(&unknown, true)
+        .await
+        .expect_err("but a board that does not exist still is");
+    assert!(matches!(refused, ProjectError::NoSuchProject(_)));
+}
+
+/// The real store with one read rigged to fail. No public method can
+/// arrange a storage error, and an erroring read is the whole case the two
+/// halves of a board's resume are counted apart for.
+///
+/// The forwarding is generated rather than typed out: thirty identical
+/// one-line delegations would bury the one method this exists for.
+struct HeldRunsUnreadable(Arc<dyn baybo_store::project::ProjectStore>);
+
+macro_rules! forwards_everything_else {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        #[async_trait::async_trait]
+        impl baybo_store::project::ProjectStore for HeldRunsUnreadable {
+            async fn held_runs(&self, _project: &ProjectId) -> StoreResult<Vec<IssueRunRow>> {
+                Err(baybo_store::StorageError::Storage(
+                    "this board's holds are unreadable".into(),
+                ))
+            }
+            $(async fn $name(&self, $($arg: $ty),*) -> $ret {
+                self.0.$name($($arg),*).await
+            })*
+        }
+    };
+}
+
+forwards_everything_else! {
+    list_projects(include_archived: bool) -> StoreResult<Vec<ProjectRow>>;
+    get_project(id: &ProjectId) -> StoreResult<Option<ProjectRow>>;
+    create_project(row: &ProjectRow) -> StoreResult<()>;
+    update_project(id: &ProjectId, update: &ProjectUpdate) -> StoreResult<bool>;
+    spend_since(project: &ProjectId, since: DateTime<Utc>) -> StoreResult<baybo_model::MicroUsd>;
+    attention() -> StoreResult<Vec<(ProjectId, AttentionCounts)>>;
+    projects_for_sessions(sessions: &[SessionId]) -> StoreResult<Vec<(SessionId, ProjectId)>>;
+    project_feed(project: &ProjectId, before: Option<DateTime<Utc>>, limit: usize)
+        -> StoreResult<Vec<IssueEventRow>>;
+    live_issue_by_source_key(project: &ProjectId, source_key: &str) -> StoreResult<Option<IssueRow>>;
+    list_children(parent: &IssueId) -> StoreResult<Vec<IssueRow>>;
+    hold_run(id: &IssueRunId) -> StoreResult<bool>;
+    release_run(id: &IssueRunId) -> StoreResult<bool>;
+    mark_project_read(id: &ProjectId, at: DateTime<Utc>) -> StoreResult<bool>;
+    set_project_archived(id: &ProjectId, archived: bool) -> StoreResult<bool>;
+    list_issues(project: &ProjectId) -> StoreResult<Vec<IssueRow>>;
+    get_issue(project: &ProjectId, number: i64) -> StoreResult<Option<IssueRow>>;
+    create_issue(new: &NewIssue) -> StoreResult<IssueRow>;
+    update_issue(project: &ProjectId, number: i64, update: &IssueUpdate) -> StoreResult<bool>;
+    move_issue(project: &ProjectId, number: i64, status: IssueStatus, ordered_numbers: &[i64])
+        -> StoreResult<bool>;
+    enqueue_run(new: &NewIssueRun) -> StoreResult<IssueRunRow>;
+    append_event(new: &NewIssueEvent) -> StoreResult<IssueEventRow>;
+    list_events(issue: &IssueId) -> StoreResult<Vec<IssueEventRow>>;
+    events_since(issue: &IssueId, since: DateTime<Utc>) -> StoreResult<Vec<IssueEventRow>>;
+    set_issue_branch(id: &IssueId, branch: &str) -> StoreResult<bool>;
+    list_runs(issue: &IssueId) -> StoreResult<Vec<IssueRunRow>>;
+    active_runs(project: &ProjectId) -> StoreResult<Vec<IssueRunRow>>;
+    get_run(id: &IssueRunId) -> StoreResult<Option<IssueRunRow>>;
+    claim_run(id: &IssueRunId, session: &SessionId) -> StoreResult<bool>;
+    settle_run(id: &IssueRunId, status: RunStatus, error: Option<&str>) -> StoreResult<bool>;
+    requeue_unsettled() -> StoreResult<()>;
+}
+
+/// A board resumes two things — the runs it recorded but never started, and
+/// the holds today's budget allows — and they are counted apart. A board
+/// that cannot read its holds has still re-driven what it re-drove, and the
+/// operator is told both: one number for the work now under way, one error
+/// for the half that failed. Folding them into a single `Err` reports live
+/// agents as work that never started.
+#[tokio::test]
+async fn a_board_that_cannot_read_its_holds_still_reports_what_it_re_drove() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Half broken"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+
+    // The same board, over a store that answers everything except what it
+    // is holding.
+    let dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>> = Arc::default();
+    let manager = ProjectManager::new(
+        Arc::new(HeldRunsUnreadable(Arc::clone(&f.store))),
+        Arc::clone(&f.agents),
+        f.paths.clone(),
+        Arc::new(baybo_project::NoopProjectEvents),
+        {
+            let seen = Arc::clone(&dispatched);
+            Arc::new(move |run| seen.lock().push(run))
+        },
+    );
+
+    assert_eq!(
+        manager
+            .resume_unsettled_runs()
+            .await
+            .expect("the sweep still answers for the boards it could sweep"),
+        1,
+        "the run that went out is still counted"
+    );
+    assert_eq!(
+        dispatched.lock().len(),
+        1,
+        "and it really did go out — an agent is working"
+    );
 }
 
 #[tokio::test]
@@ -2144,22 +2624,23 @@ async fn touching_the_held_card_itself_releases_it() {
         .expect("a new day's ceiling");
     f.dispatched.lock().clear();
 
-    // Retry is refused — the run it would have recorded is the one that just
-    // started, and that run holds the slot. The message is true and the work
-    // is under way; releasing after the write instead would leave this board
-    // held forever, because every enqueue on it is refused before it gets
-    // there.
-    let refused = f
+    // The press releases the hold and hands the row out, and it is reported
+    // as the start it is. The dedupe guard does refuse the row the press
+    // would have written — the slot is taken by the run it just released —
+    // but answering with that conflict would tell the operator nothing
+    // happened about work that is now under way. Releasing *after* the write
+    // instead would leave this board held forever: every enqueue on it is
+    // refused before it gets there.
+    let started = f
         .manager
         .retry_run(&project.id, 1)
         .await
-        .expect_err("the released run holds the slot");
-    assert!(matches!(refused, ProjectError::Conflict(_)), "{refused:?}");
-    assert_eq!(f.dispatched.lock().len(), 1, "but it did start");
-    assert_eq!(
-        f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
-        RunStatus::Queued
-    );
+        .expect("the press is what releases it");
+    assert_eq!(started.status, RunStatus::Queued);
+    assert_eq!(f.dispatched.lock().len(), 1, "and it did start");
+    let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1, "one row, released — not a second beside it");
+    assert_eq!(runs[0].id, started.id);
 }
 
 /// A negative ceiling is a caller mistake, not a board to be silently
@@ -2248,12 +2729,14 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
                 .expect("finish it by hand");
         }
 
-        // A new day's ceiling, written under the manager so nothing is
-        // released yet.
-        f.store
+        f.dispatched.lock().clear();
+        // Raising the ceiling is the door a release comes through, so the
+        // release is driven the way an operator drives it rather than by
+        // reaching past `update_project` into the sweep.
+        f.manager
             .update_project(
                 &project.id,
-                &ProjectUpdate {
+                ProjectUpdate {
                     name: project.name.clone(),
                     description: String::new(),
                     daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
@@ -2261,14 +2744,7 @@ async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
             )
             .await
             .expect("a new day's ceiling");
-        f.dispatched.lock().clear();
 
-        let released = f
-            .manager
-            .release_held_runs(&project.id)
-            .await
-            .expect("release");
-        assert_eq!(released, 0, "called_off={called_off}");
         assert!(
             f.dispatched.lock().is_empty(),
             "called_off={called_off}: a run was dispatched on a card the board is done with"

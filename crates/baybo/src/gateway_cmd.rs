@@ -511,9 +511,12 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     // Board runs that never finished: a `running` row whose actor died with
     // the process is work that was recorded and then interrupted, so boot
-    // returns it to the queue and hands it back out. Idempotent — a settled
-    // run is never picked up, and a re-claim of one already in flight is
-    // refused by the claim itself.
+    // returns it to the queue and hands it back out. A settled run is never
+    // picked up, and the claim collapses two dispatches of one row into one
+    // execution — but this sweep runs *alongside* the server rather than
+    // before it, and the dispatcher cuts the worktree before it claims, so
+    // a row a live enqueue is already dispatching can go out twice. See
+    // `docs/modules/project.md`, "One dispatch per row".
     {
         let projects = Arc::clone(&graph.project_manager);
         task_tracker.track(tokio::spawn(async move {

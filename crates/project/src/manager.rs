@@ -75,6 +75,20 @@ const RUN_CALLED_OFF_UNSTARTED: &str = "the card was finished or cancelled befor
 const RUN_CALLED_OFF_INTERRUPTED: &str =
     "this run was interrupted, and the card was finished or cancelled before it could resume";
 
+/// Why a retry is refused while the budget is holding this card's run.
+///
+/// Pressing "run it again" on a held card is not a no-op: `enqueue`
+/// releases what the ceiling allows *before* it writes, so the press starts
+/// the run whenever there is room, and `retry_run` reports that as the start
+/// it is. This sentence is the other answer — the press happened, the
+/// release was still refused, and the reason is the board's ceiling rather
+/// than anything about this card.
+///
+/// Not the dedupe guard's "this issue already has a run": that names a row
+/// which never started and points the reader at nothing to do.
+const HELD_RUN_REFUSAL: &str =
+    "this run is held — the project is over its daily budget, and starts as soon as there is room";
+
 /// Which of the two sentences is true of this row.
 ///
 /// Derived from the row rather than chosen by the call site, because one
@@ -272,12 +286,13 @@ impl ProjectManager {
     /// guard doing its job, not a failure the caller should see.
     ///
     /// Whatever the board is already holding is released **before** that
-    /// write, and deliberately so. This is the third release site — with a
-    /// budget change and the boot sweep — and the one that makes a rolled-over
-    /// ceiling need no timer. It cannot move after the write: on the board
-    /// that actually needs releasing, the exhausted one, every card is holding
-    /// its own dedupe slot, so every enqueue is refused and a release placed
-    /// afterwards would never be reached. The price is that a caller whose own
+    /// write, and deliberately so. This is the release site that makes a
+    /// rolled-over ceiling need no timer — the others being a budget change,
+    /// a process start, and a board coming back off the shelf. It cannot
+    /// move after the write: on the board that actually needs releasing, the
+    /// exhausted one, every card is holding its own dedupe slot, so every
+    /// enqueue is refused and a release placed afterwards would never be
+    /// reached. The price is that a caller whose own
     /// held run has just become affordable is told the issue already has a run
     /// in flight — which is true, and it is the run they asked for.
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
@@ -368,18 +383,20 @@ impl ProjectManager {
 
     /// Start whatever this board is holding, if it has room again.
     ///
-    /// Released by activity on the board rather than by a clock. Three
-    /// things release: a budget change and the boot sweep call this, and
-    /// [`Self::enqueue`] calls [`Self::release_holds`] directly with the
-    /// headroom it has already measured — on every enqueue that gets past
-    /// the liveness gate onto a card with somebody on it, which is every
-    /// enqueue that was going to write anything. An enqueue the liveness
+    /// Released by activity on the board rather than by a clock. Four things
+    /// release: a budget change calls this, so do the two callers of
+    /// [`Self::resume_project_runs`] — a process start and a board coming
+    /// back off the shelf — and [`Self::enqueue`] calls
+    /// [`Self::release_holds`] directly with the headroom it has already
+    /// measured, on every enqueue that gets past the liveness gate onto a
+    /// card with somebody on it, which is every enqueue that was going to
+    /// write anything. An enqueue the liveness
     /// gate refuses releases nothing, and the board's other holds wait for
     /// the next thing that happens on it. A daily ceiling that rolls over
     /// while nothing is happening therefore needs no timer: the first thing
     /// that happens next releases the hold, and if nothing happens, nothing
     /// needed releasing.
-    pub async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
+    pub(crate) async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
         let headroom = self.headroom(project).await;
         self.release_holds(project, headroom).await
     }
@@ -429,10 +446,10 @@ impl ProjectManager {
     /// The card a recorded run is for, when the board should still run it.
     ///
     /// The two sweeps that hand out rows — a hold the budget has released,
-    /// and the boot re-drive — carry entries written while the card was
-    /// live. Neither has a transition to consult, so the liveness question
-    /// [`Self::enqueue`] answered before writing has to be asked again here,
-    /// against the card as it is *now*.
+    /// and the re-drive of a board that booted or was restored — carry
+    /// entries written while the card was live. Neither has a transition to
+    /// consult, so the liveness question [`Self::enqueue`] answered before
+    /// writing has to be asked again here, against the card as it is *now*.
     ///
     /// `None` covers two different things on purpose, because the caller
     /// does the same thing with both: do not hand this run out. A card that
@@ -745,12 +762,25 @@ impl ProjectManager {
         Ok(self.delivery_for(&issue).await)
     }
 
+    /// The run holding this card's single live slot, if it has one.
+    ///
+    /// At most one can exist — `idx_issue_runs_live` is what makes that true
+    /// — and while it does, nothing can record a second run on the card.
+    /// Asked as "unsettled, then which" rather than as a list of the live
+    /// statuses, because enumerating them at a call site is how `Held` gets
+    /// forgotten: it is unsettled without anything executing.
+    async fn live_run(&self, issue: &IssueRow) -> Result<Option<IssueRunRow>> {
+        Ok(self
+            .store
+            .list_runs(&issue.id)
+            .await?
+            .into_iter()
+            .find(|run| !run.status.is_settled()))
+    }
+
     async fn delivery_for(&self, issue: &IssueRow) -> CommentDelivery {
-        let live = match self.store.list_runs(&issue.id).await {
-            Ok(runs) => runs
-                .into_iter()
-                .find(|run| !run.status.is_settled())
-                .map(|run| run.status),
+        let live = match self.live_run(issue).await {
+            Ok(run) => run.map(|run| run.status),
             Err(e) => {
                 // Fail towards doing nothing: a spurious wake starts an
                 // agent on work nobody asked it to redo.
@@ -793,13 +823,7 @@ impl ProjectManager {
         number: i64,
     ) -> Result<Option<baybo_model::SessionId>> {
         let issue = self.get_issue(project, number).await?;
-        let live = self
-            .store
-            .list_runs(&issue.id)
-            .await?
-            .into_iter()
-            .find(|run| !run.status.is_settled());
-        let Some(run) = live else {
+        let Some(run) = self.live_run(&issue).await? else {
             return Err(ProjectError::invalid(
                 "run",
                 "nothing is running on this issue",
@@ -828,6 +852,15 @@ impl ProjectManager {
     /// card already has a run when it has none and never will. Both
     /// refusals name something the caller can act on: cancel the other run,
     /// or reopen the card.
+    ///
+    /// A **held** run is the one occupied slot a press can do something
+    /// about, and the guard alone cannot see that. [`Self::enqueue`] releases
+    /// what the ceiling allows before it writes, so on a board with room the
+    /// press starts the very run the guard then collides with — the call
+    /// would report a conflict for the work it had just set going. So the
+    /// hold is read before and after: released means started, and this
+    /// returns the row that went out. Still held means the ceiling really did
+    /// refuse, and the reason named is the budget rather than the row.
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
@@ -847,9 +880,23 @@ impl ProjectManager {
                 },
             ));
         }
-        self.enqueue(&issue, RunTrigger::Retry)
-            .await
-            .ok_or_else(|| ProjectError::Conflict("this issue already has a run".to_owned()))
+        let held = self
+            .live_run(&issue)
+            .await?
+            .filter(|run| run.status == RunStatus::Held);
+
+        if let Some(run) = self.enqueue(&issue, RunTrigger::Retry).await {
+            return Ok(run);
+        }
+        match held {
+            Some(held) => match self.live_run(&issue).await? {
+                Some(run) if run.id == held.id && run.status != RunStatus::Held => Ok(run),
+                _ => Err(ProjectError::Conflict(HELD_RUN_REFUSAL.to_owned())),
+            },
+            None => Err(ProjectError::Conflict(
+                "this issue already has a run".to_owned(),
+            )),
+        }
     }
 
     /// The unfinished runs of one board — which cards are working.
@@ -859,34 +906,99 @@ impl ProjectManager {
     }
 
     /// Return orphaned runs to the queue and hand each back for dispatch.
-    /// Called once at boot, before live traffic: a `running` row whose
-    /// actor died with the process is work that never finished.
+    /// Called once per process start, from a task that races the server
+    /// coming up rather than one that finishes before it: a `running` row
+    /// whose actor died with the process is work that never finished.
     ///
-    /// Not through [`Self::enqueue`] — these rows already exist — so the
-    /// liveness gate is asked here instead, per row, via [`Self::live_card`]:
-    /// the process may have been down for a week, and a card the operator
-    /// cancelled meanwhile must not come back to life at boot. The count is
-    /// what was actually re-driven, not what the sweep found.
+    /// Returning them to the queue is global — an orphan is an orphan
+    /// whatever board it is on, an archived one included, and rolling a row
+    /// forward settles nothing. Handing them back out is per board, through
+    /// [`Self::resume_project_runs`], which is what asks whether the board
+    /// takes work at all: one loop over one list of boards, so the runs this
+    /// sweep re-drives and the holds it releases cannot come to disagree
+    /// about which boards are in scope. Boards come in the order they are
+    /// listed and each board's runs by issue number, oldest card first; no
+    /// order is promised *across* boards. The count is what was actually
+    /// re-driven, not what the sweep found.
     pub async fn resume_unsettled_runs(&self) -> Result<usize> {
-        let resumed = self.store.requeue_unsettled().await?;
+        self.store.requeue_unsettled().await?;
         let mut count = 0;
-        for run in resumed {
-            if self.live_card(&run).await.is_none() {
+        for project in self.store.list_projects(false).await? {
+            match self.resume_project_runs(&project.id).await {
+                Ok(resumed) => count += resumed,
+                Err(e) => {
+                    tracing::error!(project = %project.id, error = %e, "could not resume a board's runs")
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Hand out everything one board owes: the runs recorded but never
+    /// started, and the holds today's budget allows.
+    ///
+    /// Not through [`Self::enqueue`] — these rows already exist — so the two
+    /// gates that door applies are asked here instead. **Archived**, once
+    /// for the board, through [`Self::writable_project`]: every door that
+    /// writes a run row refuses a shelved board there, and a sweep that
+    /// dispatched anyway would put an agent to work on a board the operator
+    /// has put away. **Liveness**, once per row, through
+    /// [`Self::live_card`]: the process may have been down for a week, and a
+    /// card cancelled meanwhile must not come back to life.
+    ///
+    /// The two gates dispose of a row differently, and deliberately.
+    /// A finished card's run is **called off**, because that card is never
+    /// taking work again and an unsettled row would hold its dedupe slot for
+    /// nothing. An archived board's runs are **left exactly as they are**,
+    /// because archiving is reversible and is not a judgement on the work:
+    /// [`Self::set_project_archived`] calls this on restore, so the shelved
+    /// run resumes rather than having to be noticed and retried by hand.
+    /// Nothing can enqueue against the slot it holds meanwhile — every door
+    /// that would is refused for the same reason this one is.
+    ///
+    /// Only `Queued` rows are handed out. `Running` means an executor has
+    /// the row: on a restore it is an actor that outlived the archiving and
+    /// is still working, and at a process start the requeue in
+    /// [`Self::resume_unsettled_runs`] turns the orphans back into `Queued`
+    /// before this runs. That sweep races the server rather than preceding
+    /// it, so a restore landing between process start and the requeue's
+    /// commit is the one case where a `Running` row is neither: it is
+    /// skipped, and waits for the next process start. `Held` is the
+    /// budget's to release, which is the second half below — a process
+    /// start is the one moment guaranteed to happen after a ceiling rolls
+    /// over.
+    ///
+    /// This does not make a row's dispatch unique, and nothing here can.
+    /// `claim_run` is scoped to `queued`, so two dispatches of one row
+    /// collapse into one *execution* — but not into one dispatcher: the
+    /// checkout is cut before the claim, and the task that loses that race
+    /// settles the row the winner is running. A restore is an edge, so it
+    /// overlaps only a dispatcher still cutting its worktree. A **process
+    /// start is not an edge at all**: this sweep comes up alongside the
+    /// server rather than before it, and hands out every `Queued` row it
+    /// finds, including one a live enqueue wrote a moment ago and is
+    /// dispatching right now. Closing that is the failure path settling only
+    /// a run nobody has claimed — the dispatcher's code rather than this
+    /// crate's (`docs/modules/project.md`, "One dispatch per row").
+    ///
+    /// The two halves are counted apart. A board whose holds could not be
+    /// read still re-drove what it re-drove, and the operator is told both
+    /// things; folding them into one error would report runs that are
+    /// already under way as work that never started.
+    async fn resume_project_runs(&self, project: &ProjectId) -> Result<usize> {
+        self.writable_project(project).await?;
+        let mut count = 0;
+        for run in self.store.active_runs(project).await? {
+            if run.status != RunStatus::Queued || self.live_card(&run).await.is_none() {
                 continue;
             }
             count += 1;
             (self.dispatch)(run);
         }
-        // Held runs are not "orphaned" — they were never started on purpose
-        // — so the sweep above leaves them alone. Boot is the one moment
-        // guaranteed to happen after a budget rolls over, so re-evaluating
-        // them here is what keeps a hold from outliving its day.
-        for project in self.store.list_projects(false).await? {
-            match self.release_held_runs(&project.id).await {
-                Ok(released) => count += released,
-                Err(e) => {
-                    tracing::error!(project = %project.id, error = %e, "could not release held runs")
-                }
+        match self.release_held_runs(project).await {
+            Ok(released) => count += released,
+            Err(e) => {
+                tracing::error!(project = %project, error = %e, "could not release held runs")
             }
         }
         Ok(count)
@@ -1256,10 +1368,7 @@ impl ProjectManager {
         id: &ProjectId,
         update: ProjectUpdate,
     ) -> Result<ProjectRow> {
-        let existing = self.get_project(id).await?;
-        if existing.archived_at.is_some() {
-            return Err(ProjectError::Archived(id.clone()));
-        }
+        self.writable_project(id).await?;
         let update = ProjectUpdate {
             name: validate_name(&update.name)?,
             description: update.description.trim().to_owned(),
@@ -1275,13 +1384,35 @@ impl ProjectManager {
         self.get_project(id).await
     }
 
-    /// Archive or restore. Archiving is always allowed — including on an
-    /// already-archived project, which is how a restore is idempotent.
+    /// Archive or restore. Either is allowed on a board already in that
+    /// state — a repeat is not an error, it is simply nothing.
+    ///
+    /// A restore hands the board its shelved work back, on the same idiom as
+    /// a budget change ([`Self::update_project`]): released by activity, not
+    /// by a clock. The board's own restoration is that activity. Without it
+    /// the runs recorded before the board was put away — which
+    /// [`Self::resume_project_runs`] deliberately leaves unsettled rather
+    /// than calling off — would wait for the next process restart, each one
+    /// holding its issue's live-run slot until then, so the operator's first
+    /// act on the restored card would be refused as "this issue already has
+    /// a run".
+    ///
+    /// Which is why the store's answer has to be the archived→live **edge**
+    /// and not "the row is there": on a board that was never away the same
+    /// re-drive would hand out the ordinary queued rows a dispatcher is
+    /// already carrying, and a queued row dispatched twice is not free (see
+    /// [`Self::resume_project_runs`]).
     pub async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<ProjectRow> {
+        // `Ok(false)` is "nothing moved" — a board already in that state,
+        // which owes nothing, or no board at all, which is an error. The
+        // read this method ends in anyway is what tells the two apart.
         if !self.store.set_project_archived(id, archived).await? {
-            return Err(ProjectError::NoSuchProject(id.clone()));
+            return self.get_project(id).await;
         }
         self.events.project_changed(id);
+        if !archived && let Err(e) = self.resume_project_runs(id).await {
+            tracing::error!(project = %id, error = %e, "could not resume a board's runs after a restore");
+        }
         self.get_project(id).await
     }
 
@@ -1835,15 +1966,20 @@ impl ProjectManager {
     /// one rule in one place rather than a check each endpoint has to
     /// remember.
     ///
-    /// Three kinds of write do not ask, and only the first two are by
-    /// design: the project row's own edits ([`Self::update_project`],
-    /// [`Self::set_project_archived`] — a board that could not be written
-    /// could not be unarchived either), the operator's own bookkeeping
-    /// ([`Self::mark_read`], [`Self::cancel_run`] — stopping work and
-    /// noting it was seen are not additions to the board), and the writes
-    /// that describe work already under way — [`Self::record_event`] and
-    /// the two sweeps, which settle or hand out rows recorded while the
-    /// board was still live and never re-read the project row.
+    /// Three kinds of write do not ask, and each is deliberate:
+    /// [`Self::set_project_archived`], because a board that could not be
+    /// written could not be restored either; the operator's own bookkeeping
+    /// ([`Self::mark_read`], [`Self::cancel_run`] — stopping work and noting
+    /// it was seen are not additions to the board); and
+    /// [`Self::record_event`], which describes work already under way rather
+    /// than starting any.
+    ///
+    /// Everything that *starts* a run asks. Every door into
+    /// [`Self::enqueue`] begins here, and so does
+    /// [`Self::resume_project_runs`] — the re-drive half for the board, and
+    /// the release half through it, since [`Self::release_held_runs`] is
+    /// reached either from there or from a budget change that has already
+    /// asked.
     async fn writable_project(&self, id: &ProjectId) -> Result<ProjectRow> {
         let project = self.get_project(id).await?;
         if project.archived_at.is_some() {

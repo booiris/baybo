@@ -550,7 +550,14 @@ pub trait ProjectStore: Send + Sync {
     /// matched.
     async fn mark_project_read(&self, id: &ProjectId, at: DateTime<Utc>) -> Result<bool>;
 
-    /// Stamp or clear `archived_at`. `Ok(false)` if no row matched.
+    /// Stamp or clear `archived_at`, when that is a change. Conditional on
+    /// the state it is asked to leave, so `Ok(true)` is the *edge* — this
+    /// call is what put the board away or brought it back — and a caller
+    /// can hang the work a restore owes on it.
+    ///
+    /// `Ok(false)` is "nothing moved": the board was already in that state,
+    /// or there is no such board. Telling those two apart costs a read of
+    /// the row, which the caller that cares does anyway.
     async fn set_project_archived(&self, id: &ProjectId, archived: bool) -> Result<bool>;
 
     /// Every issue on one board, ordered by status then position — the
@@ -624,17 +631,25 @@ pub trait ProjectStore: Send + Sync {
 
     async fn get_run(&self, id: &IssueRunId) -> Result<Option<IssueRunRow>>;
 
-    /// Every unfinished run, oldest first. The boot sweep's scan.
-    async fn unsettled_runs(&self) -> Result<Vec<IssueRunRow>>;
-
     /// Claim a queued run: stamp it `running` with the session it will
-    /// execute in. `Ok(false)` if it is no longer queued — which is how a
-    /// double dispatch resolves into one execution.
+    /// execute in. `Ok(false)` if it is no longer queued — which is how two
+    /// dispatches of one row resolve into one *execution*. Only the
+    /// execution: whatever each dispatcher did before it got here has
+    /// already happened, the checkout included.
     async fn claim_run(&self, id: &IssueRunId, session: &SessionId) -> Result<bool>;
 
     /// Settle a run. Terminal and idempotent: a replay of the same outcome
-    /// is a no-op, so the boot re-drive can never double-settle.
+    /// is a no-op, so a re-driven run can never double-settle.
     /// `Ok(false)` if it was already settled.
+    ///
+    /// The gate is `settled_at IS NULL` and nothing else. It does not ask
+    /// *whose* row this is, so it will settle a run another executor has
+    /// claimed and is working — freeing the issue's dedupe slot under a live
+    /// agent. A caller that might be settling somebody else's row has to
+    /// establish that itself (`docs/modules/project.md`, "One dispatch per
+    /// row"); `status` is what says whether anyone has it, because a
+    /// `queued` row keeps the session of the run it was rolled forward from
+    /// and so cannot be told apart by that.
     async fn settle_run(
         &self,
         id: &IssueRunId,
@@ -642,19 +657,23 @@ pub trait ProjectStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<bool>;
 
-    /// Return the `running` runs to `queued` and hand back every unsettled
-    /// run that is not `held`. Run once at boot: a `running` row whose
-    /// actor died with the process is work that never finished, not work in
-    /// flight.
+    /// Return every `running` run to `queued`, and hand back nothing. Run
+    /// once per process start: a `running` row whose actor died with the
+    /// process is work that never finished, not work in flight.
     ///
     /// The session it was claimed with is kept: the resumed run is the same
     /// run, executed by the same agent, so it belongs in the same thread —
     /// and [`ProjectStore::claim_run`] gates on the status, not on the
     /// session being absent, so a session already on the row cannot refuse
     /// the re-claim. Dropping it would restart the run from an empty
-    /// transcript. `held` rows are left where they are; the budget, not this
-    /// sweep, decides whether they start.
-    async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>>;
+    /// transcript. `held` rows are not touched; the budget, not this sweep,
+    /// decides whether they start.
+    ///
+    /// Which of the rolled-forward rows is then *handed out* is a per-board
+    /// question — an archived board's are not — so the caller reads each
+    /// board's own unfinished runs with [`ProjectStore::active_runs`]
+    /// afterwards, rather than being given one global list to re-filter.
+    async fn requeue_unsettled(&self) -> Result<()>;
 }
 
 /// What caused a run to be enqueued. Shown verbatim in the execution log,
@@ -706,11 +725,13 @@ impl RunTrigger {
 
 /// Where a run is. `Held`, `Queued` and `Running` are the unsettled states
 /// — the ones that hold an issue's dedupe slot. `Running` and `Queued` are
-/// both re-driven by the boot sweep (see
-/// [`ProjectStore::requeue_unsettled`]): a `running` row's actor died with
-/// the process, and a `queued` row was never claimed by one, so neither is
-/// work in flight. `Held` is left alone — a hold was never started on
-/// purpose, so the budget decides when it goes.
+/// both re-driven at a process start, in two steps:
+/// [`ProjectStore::requeue_unsettled`] rolls every `running` row back to
+/// `queued`, because its actor died with the process, and the caller then
+/// hands out the `queued` rows board by board — a `queued` row was never
+/// claimed by an executor, so neither state is work in flight. `Held` is
+/// left alone — a hold was never started on purpose, so the budget decides
+/// when it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {

@@ -246,6 +246,104 @@ export function runDuration(run: IssueRun, now: number): string | null {
 }
 
 /**
+ * The run states that are over. Everything else is unsettled, so a state
+ * this bundle has never heard of reads as work still going rather than as
+ * nothing at all.
+ */
+const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
+
+/**
+ * The run holding this issue's live-run slot, or `null` when it has none.
+ *
+ * At most one can exist — the store's partial unique index over the
+ * unsettled states is what makes that true (`docs/modules/project.md`) —
+ * and while it does, nothing can record a second run on the issue. So this
+ * one question covers everything the ledger decides for a card.
+ *
+ * `held` is unsettled without being in flight: nothing is executing, the
+ * row is waiting on the board's budget. Callers that care about the
+ * difference read the returned run's status; callers that only need "is
+ * the slot taken" never have to enumerate the states, which is the point —
+ * listing the live ones at a call site is how `held` gets forgotten.
+ */
+export function unsettledRun<T extends { status: RunStatus }>(runs: readonly T[]): T | null {
+  return runs.find((run) => !SETTLED.has(run.status)) ?? null;
+}
+
+/**
+ * What a held run is waiting for — a note beside a *working* button, not a
+ * reason the button is dead.
+ *
+ * Pressing "run it again" on a held card is the one thing that acts on the
+ * ledger's refusal rather than bouncing off it: `retry_run` goes through
+ * `enqueue`, which releases what the ceiling allows before it writes, so on
+ * a board with room the press starts this very run. Disabling the button
+ * here would take away the only control that does anything and replace it
+ * with a promise the board keeps only when something else happens on it —
+ * holds are released by activity, not by a clock.
+ *
+ * The wording is the server's own (`HELD_RUN_REFUSAL` in
+ * `crates/project/src/manager.rs`), so the note read before the press and
+ * the toast that arrives when the ceiling refuses again are one sentence
+ * rather than two. It is pinned from the Rust side by
+ * `a_retry_on_a_held_run_starts_it_when_the_board_has_room` in
+ * `crates/project/tests/manager.rs`.
+ */
+export const HELD_RUN_NOTE =
+  'this run is held — the project is over its daily budget, and starts as soon as there is room';
+
+/**
+ * Why running this card refuses to start, or `null` when the button works.
+ *
+ * A hand-written mirror of `ProjectManager::retry_run` in `crates/project`:
+ * its assignee check, and then `runs::accepts_runs`, whose definition of a
+ * card the board has finished with is `stages::is_finished` — Done, or
+ * cancelled. This sits on the same seam as `commentHint` and `mentionHint`
+ * (see `docs/modules/project.md`), for the same reason: the button has to
+ * know whether the request would be refused *before* it is sent, so it
+ * cannot ask the server. Nothing enforces the correspondence — no generated
+ * binding, no shared schema — only the two test suites, one per language,
+ * asserting the same cases: `retryRejection` in `boardModel.test.ts` here,
+ * and `the_retry_refusals_say_exactly_what_the_button_predicts` in
+ * `crates/project/tests/manager.rs` there, which asserts all three sentences
+ * verbatim and in this order. A new reason to refuse a run is a change on
+ * both sides in the same commit; `cargo test` alone will be green with a
+ * button that offers a run the server will reject.
+ *
+ * The sentences are the server's own, word for word. An operator can still
+ * race into the 400 — the card is cancelled in another tab between this
+ * render and the click — and the toast that arrives then carries this exact
+ * sentence (behind `ProjectError::Invalid`'s `invalid <field>: ` prefix),
+ * so the two surfaces are one phrasing of one rule rather than two. The
+ * order is the server's too: a cancelled card with nobody on it is refused
+ * for the assignee, because that is the answer the click would have brought
+ * back.
+ *
+ * These are the card's own refusals, and only those. What the run ledger
+ * does is a separate question, asked of `unsettledRun`: a run in flight
+ * hides the button, because its own row sits right below with the stop on
+ * it, and a held run leaves it working — pressing it is what releases the
+ * hold — with `HELD_RUN_NOTE` beside it. An archived board is refused too,
+ * and this page never
+ * fetches the project row, so it cannot know: that one still arrives as a
+ * toast after the click.
+ */
+export function retryRejection(issue: {
+  status: IssueStatus;
+  assignee?: string | null;
+  cancelled_at_ms?: number | null;
+}): string | null {
+  if (issue.assignee == null) return 'an issue with nobody on it cannot be run';
+  if (issue.cancelled_at_ms != null) {
+    return 'this issue was cancelled — reopen it before running it again';
+  }
+  if (issue.status === 'done') {
+    return 'this issue is done — move it back into the board before running it again';
+  }
+  return null;
+}
+
+/**
  * Why a drop is refused, or `null` when it is fine.
  *
  * In Progress means somebody is on it: a card in that column with no

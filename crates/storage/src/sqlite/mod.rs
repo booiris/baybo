@@ -1423,9 +1423,15 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                 -- turn' as unambiguously its own.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_runs_live
                     ON issue_runs(issue_id) WHERE settled_at IS NULL;
-                -- Serves the boot re-drive and the per-issue execution log.
+                -- The unfinished slice of a table that only grows: at most
+                -- one row per live issue, and every sweep works from it.
+                -- The process-start requeue rewrites it whole, `held_runs`
+                -- reads it in this order, and `active_runs` narrows it to
+                -- one board (re-sorting a handful of rows by issue number,
+                -- which is cheaper than a second index to serve).
                 CREATE INDEX IF NOT EXISTS idx_issue_runs_unsettled
                     ON issue_runs(created_at) WHERE settled_at IS NULL;
+                -- The per-issue execution log, newest attempt first.
                 CREATE INDEX IF NOT EXISTS idx_issue_runs_log
                     ON issue_runs(issue_id, created_at DESC);
                 -- The issue timeline: comments and system events in one

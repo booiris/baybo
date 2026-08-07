@@ -48,5 +48,9 @@ export function budgetHint(micros: number | null | undefined): string {
   if (micros === 0) {
     return 'Paused: work is recorded and held, and starts when you raise this.';
   }
-  return 'Runs are held once the day’s spend reaches this, and start again when it rises or the day rolls over.';
+  // Deliberately not "or the day rolls over": a hold is released by the next
+  // thing that happens on the board — a ceiling change, another card
+  // starting, a restart, a press of Run it again — never by a clock. Saying
+  // the rollover restarts it promises work that will not start on its own.
+  return 'Runs are held once the day’s spend reaches this, and start again as soon as there is room.';
 }

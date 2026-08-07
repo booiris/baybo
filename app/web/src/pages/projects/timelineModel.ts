@@ -1,6 +1,6 @@
 import type { components } from '../../api/schema';
 
-import { COLUMN_LABEL, type IssueStatus, type RunStatus } from './boardModel';
+import { COLUMN_LABEL, unsettledRun, type IssueStatus, type RunStatus } from './boardModel';
 
 export type IssueEvent = components['schemas']['IssueEventDto'];
 export type IssueEventBody = components['schemas']['IssueEventBodyDto'];
@@ -191,12 +191,6 @@ function unnamedEvent(_body: never): string {
 }
 
 /**
- * The run states that are over. Derived here rather than listed at each
- * call site, so a new unsettled state cannot be quietly read as finished.
- */
-const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
-
-/**
  * What sending a comment will do, stated before it is sent.
  *
  * A deliberate mirror of `comment_delivery` in `crates/project`: the
@@ -222,7 +216,7 @@ export function commentHint(
   if (issue.status === 'backlog' || issue.status === 'done') {
     return `Records only — @${assignee} is not working on this right now.`;
   }
-  const live = runs.find((run) => !SETTLED.has(run.status));
+  const live = unsettledRun(runs);
   if (live?.status === 'held') {
     // A held run has not assembled its brief either, so this lands in it —
     // the wait is on the board's budget, not on the comment.

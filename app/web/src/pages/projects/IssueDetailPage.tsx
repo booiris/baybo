@@ -20,9 +20,12 @@ import {
 import {
   COLUMNS,
   COLUMN_LABEL,
+  HELD_RUN_NOTE,
   PRIORITIES,
   assignableAgents,
+  retryRejection,
   runDuration,
+  unsettledRun,
   type Agent,
   type Issue,
   type IssueRun,
@@ -403,6 +406,16 @@ export function IssueDetailPage() {
 
   const cancelled = issue.cancelled_at_ms != null;
   const blocked = issue.blocked_reason != null;
+  // The one run the ledger lets exist at a time, if this card has it. Held
+  // is unsettled without being in flight — nothing is executing and there
+  // is nothing to stop, the row is waiting on the board's budget — and it
+  // still holds the slot, so a retry is refused for as long as it sits
+  // there. Asked as "unsettled, then which" rather than as a list of live
+  // states, because that list is what forgets `held`.
+  const live = unsettledRun(runs);
+  const inFlight = live !== null && live.status !== 'held';
+  const retryRefusal = retryRejection(issue);
+  const heldNote = live?.status === 'held' && retryRefusal === null ? HELD_RUN_NOTE : null;
   const dirty = title !== issue.title || description !== issue.description;
   const children = board.filter((candidate) => candidate.parent === issue.number);
 
@@ -586,20 +599,38 @@ export function IssueDetailPage() {
 
           <section className="border-2 border-black rounded-md bg-surface p-3">
             <h2 className={railLabel}>Execution log</h2>
-            {runs.some((run) => run.status === 'queued' || run.status === 'running') ? null : (
-              <button
-                type="button"
-                className="mt-1 font-mono text-[0.66rem] font-bold underline cursor-pointer disabled:opacity-50"
-                disabled={saving || issue.assignee == null}
-                title={
-                  issue.assignee == null ? 'Assign someone before running this' : undefined
-                }
-                onClick={() => {
-                  void runAgain();
-                }}
-              >
-                {runs.length === 0 ? 'Run it now' : 'Run it again'}
-              </button>
+            {/* Three shapes, because what the reader can do about them
+                differs. A run in flight: the button goes — its own row is
+                directly below with the stop on it, so the reason is already
+                on screen and a click could only collect a conflict. A card
+                the board has finished with, or one nobody is on: the button
+                stays, dead, and says why — the way out (reopen it, drag it
+                back out of Done, assign someone) is not deducible from a
+                control that quietly vanished. A held run: the button stays
+                and *works*, because pressing it is what releases the hold
+                (`enqueue` releases before it writes), with a note saying
+                what it is waiting on.
+                In the page rather than in `title`: a disabled control takes
+                no pointer events, which makes its tooltip exactly the thing
+                an operator cannot reach. */}
+            {inFlight ? null : (
+              <>
+                <button
+                  type="button"
+                  className="mt-1 font-mono text-[0.66rem] font-bold underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={saving || retryRefusal !== null}
+                  onClick={() => {
+                    void runAgain();
+                  }}
+                >
+                  {runs.length === 0 ? 'Run it now' : 'Run it again'}
+                </button>
+                {(retryRefusal ?? heldNote) !== null ? (
+                  <p className="mt-1 font-mono text-[0.62rem] text-ink-soft leading-snug break-words">
+                    {retryRefusal ?? heldNote}
+                  </p>
+                ) : null}
+              </>
             )}
             {runs.length === 0 ? (
               <p className="mt-2 font-mono text-[0.62rem] text-ink-soft leading-snug">

@@ -17,10 +17,12 @@ import {
   orderedNumbers,
   parseDragId,
   placementChanged,
+  retryRejection,
   runDuration,
   runIndicator,
   resolveDrop,
   resolveLanding,
+  unsettledRun,
 } from './boardModel';
 
 function issue(number: number, overrides: Partial<Issue> = {}): Issue {
@@ -214,6 +216,33 @@ describe('runIndicator', () => {
   });
 });
 
+describe('unsettledRun', () => {
+  it('counts every state that is not over — `held` included', () => {
+    // The one that is easy to forget, and the one that matters: a held run
+    // is not executing, but it holds the issue's slot, so nothing else can
+    // start while it sits there.
+    expect(unsettledRun([run(1, { status: 'held' })])?.status).toBe('held');
+    expect(unsettledRun([run(1, { status: 'queued' })])?.status).toBe('queued');
+    expect(unsettledRun([run(1, { status: 'running' })])?.status).toBe('running');
+  });
+
+  it('is null once the ledger is settled', () => {
+    for (const status of ['done', 'failed', 'cancelled'] as const) {
+      expect(unsettledRun([run(1, { status })])).toBeNull();
+    }
+    expect(unsettledRun([])).toBeNull();
+  });
+
+  it('picks the live row out of a card’s history', () => {
+    const history = [
+      run(1, { attempt: 1, status: 'failed' }),
+      run(1, { attempt: 2, status: 'cancelled' }),
+      run(1, { attempt: 3, status: 'held' }),
+    ];
+    expect(unsettledRun(history)?.attempt).toBe(3);
+  });
+});
+
 describe('runDuration', () => {
   it('measures a finished run, and an unfinished one against now', () => {
     expect(runDuration(run(1, { started_at_ms: 0, settled_at_ms: 45_000 }), 99_000)).toBe('45s');
@@ -221,6 +250,47 @@ describe('runDuration', () => {
     expect(runDuration(run(1, { started_at_ms: 10_000 }), 40_000)).toBe('30s');
     // A queued run has not started, so it has no duration to report.
     expect(runDuration(run(1), 40_000)).toBeNull();
+  });
+});
+
+/**
+ * The client half of a hand-written mirror. Its Rust half is
+ * `the_retry_refusals_say_exactly_what_the_button_predicts` in
+ * `crates/project/tests/manager.rs`, which asserts all three sentences
+ * verbatim and in this order — the cases below are those cases, and the
+ * strings are the endpoint's own. Nothing but this pair keeps the button and
+ * the server agreeing on what a run is refused for, so a reword has to break
+ * a build on the side that owns the wording.
+ */
+describe('retryRejection', () => {
+  it('refuses a card the board has finished with, in the server’s own words', () => {
+    // Cancelled and Done are one rule on the server (`stages::is_finished`)
+    // with two sentences, because the way out differs.
+    expect(retryRejection(issue(1, { assignee: 'dev-1', cancelled_at_ms: 111 }))).toBe(
+      'this issue was cancelled — reopen it before running it again',
+    );
+    expect(retryRejection(issue(1, { assignee: 'dev-1', status: 'done' }))).toBe(
+      'this issue is done — move it back into the board before running it again',
+    );
+    // Cancelled outranks the column it is parked in.
+    expect(
+      retryRejection(issue(1, { assignee: 'dev-1', status: 'review', cancelled_at_ms: 111 })),
+    ).toBe('this issue was cancelled — reopen it before running it again');
+  });
+
+  it('refuses a card nobody is on, first — the answer the click would bring back', () => {
+    expect(retryRejection(issue(1))).toBe('an issue with nobody on it cannot be run');
+    // The server asks about the assignee before it asks about the card, so
+    // a cancelled card with nobody on it is refused for the assignee.
+    expect(retryRejection(issue(1, { cancelled_at_ms: 111 }))).toBe(
+      'an issue with nobody on it cannot be run',
+    );
+  });
+
+  it('lets every live column run', () => {
+    for (const status of ['backlog', 'todo', 'in_progress', 'review'] as const) {
+      expect(retryRejection(issue(1, { assignee: 'dev-1', status }))).toBeNull();
+    }
   });
 });
 
