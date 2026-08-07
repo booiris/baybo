@@ -7,6 +7,7 @@ pub mod log_line;
 pub mod oauth;
 pub mod profile;
 pub mod reconciler;
+mod runtime;
 pub mod tool;
 pub mod transport;
 pub mod vault_keys;
@@ -19,5 +20,6 @@ pub use profile::{
     BrowserProfileParams, EmbeddedMcpProfile, browser_mcp_profile, embedded_servers,
 };
 pub use reconciler::McpReconciler;
+pub use runtime::McpRuntime;
 pub use tool::McpTool;
 pub use transport::{McpServerSession, connect};

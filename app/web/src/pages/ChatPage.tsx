@@ -5074,11 +5074,25 @@ export function applySyncReplace(
       rows = [...rows.slice(0, -1), { ...tail, steps: inherited }];
     }
   }
-  // Re-overlay the live reply the page cannot know about. `dropEmptyOpenWork`
-  // first, because stripping the page's in-flight answer step can leave the
-  // turn's block with nothing in it — and an empty "Working" card must not
-  // hover above a reply that is already streaming.
-  const liveReply = trailingStreamingAnswer(prev);
+  // Re-overlay the live reply the page cannot know about — but ONLY while the
+  // turn is still running, the same gate `dropInFlightAnswerStep` and the work
+  // overlay above use. A finished turn's reply IS in the page (that is what
+  // REPLACE means), so re-appending the local partial renders the same answer
+  // twice: the server's complete row, then a truncated prefix of it. And the
+  // re-appended row is still `streaming`, so it survives into the next `prev`
+  // and doubles again on every later REPLACE.
+  //
+  // The window is not a race — this runs inside `setViews`, so an
+  // ordinal-stamped `Frame::Message` would already have finalized the bubble in
+  // place. It is the frame going MISSING (reconnect, `Frame::Gap`) and then a
+  // revisit or a rebased page arriving with the persisted reply. `applySyncMerge`
+  // handles that same case by folding the persisted final INTO the streaming
+  // bubble; in REPLACE the page already carries it, so dropping is the fold.
+  //
+  // `dropEmptyOpenWork` first, because stripping the page's in-flight answer
+  // step can leave the turn's block with nothing in it — and an empty "Working"
+  // card must not hover above a reply that is already streaming.
+  const liveReply = turn?.active === true ? trailingStreamingAnswer(prev) : undefined;
   if (liveReply !== undefined) rows = [...dropEmptyOpenWork(rows), liveReply];
   return rows;
 }

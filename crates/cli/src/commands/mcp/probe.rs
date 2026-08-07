@@ -80,7 +80,13 @@ pub async fn probe(
         return status;
     }
 
-    match tokio::time::timeout(PROBE_TIMEOUT, connect(entry, vault, proxy)).await {
+    let process_manager = baybo_process::ProcessManager::transient();
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        connect(entry, vault, &process_manager, proxy),
+    )
+    .await
+    {
         Err(_) => ProbeStatus::Timeout,
         Ok(Err(e)) => classify(e.to_string()),
         Ok(Ok(session)) => {

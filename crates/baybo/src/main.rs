@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     let tool_registry = Arc::new(baybo_tools::ToolRegistry::with_defaults(
         baybo_tools::builtin::DefaultToolsConfig {
             blob_store: stores.blob.clone(),
+            process_manager: baybo_process::ProcessManager::transient(),
             workspace_paths: workspace_paths.clone(),
             proxy: tool_proxy,
             // argv one-shots (llm/doctor/status) barely touch Bash; there is

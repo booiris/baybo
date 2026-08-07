@@ -35,7 +35,6 @@
 //! and `free` runs directly with no Bash approval. Environment variables and
 //! `cd` changes do NOT persist across invocations.
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -44,7 +43,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::{WorkspacePaths, absolutise};
-use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -300,13 +298,17 @@ pub struct BashTool {
     /// ignore the variables — same loose-coupling rationale as
     /// [`inject_baybo_env`].
     uv_env_prefix: String,
+    process_manager: Arc<baybo_process::ProcessManager>,
     /// Shared, hot-swappable permission mode. Read on every call (and by
     /// [`Tool::description`]); a config reload swaps it via [`LivePermissionMode::set`].
     permission: Arc<LivePermissionMode>,
 }
 
 impl BashTool {
-    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+    pub fn new(
+        workspace_paths: WorkspacePaths,
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Self {
         // Re-anchor at the absolutised root so the env-var values
         // rendered by `build_uv_env_exports` are absolute regardless
         // of whether `config.workspace.path` came in absolute — the
@@ -323,6 +325,7 @@ impl BashTool {
             workspace_root,
             work_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
+            process_manager,
             permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
         }
     }
@@ -555,7 +558,10 @@ const UV_PREWARM_PYTHON: &str = "3.13";
 /// tokio task; failure (uv not installed, network down, …) is logged
 /// at WARN and otherwise swallowed — the agent loop must not depend on
 /// this completing.
-pub fn spawn_uv_python_prewarm(paths: &WorkspacePaths) {
+pub fn spawn_uv_python_prewarm(
+    paths: &WorkspacePaths,
+    process_manager: Arc<baybo_process::ProcessManager>,
+) {
     let env: Vec<(&'static str, PathBuf)> = UV_ENV_VARS
         .iter()
         .map(|(name, get)| (*name, get(paths)))
@@ -569,7 +575,11 @@ pub fn spawn_uv_python_prewarm(paths: &WorkspacePaths) {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
-        match cmd.output().await {
+        let outcome = match process_manager.spawn(&mut cmd, "uv-python-prewarm") {
+            Ok(child) => child.wait_with_output().await,
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(out) if out.status.success() => {
                 tracing::info!(
                     version = UV_PREWARM_PYTHON,
@@ -599,7 +609,10 @@ impl BashTool {
     /// Test-only constructor anchored at `/tmp` — production paths go
     /// through [`Self::new`] with the real workspace.
     pub fn for_test() -> Self {
-        let mut tool = Self::new(WorkspacePaths::new("/tmp"));
+        let mut tool = Self::new(
+            WorkspacePaths::new("/tmp"),
+            baybo_process::ProcessManager::transient(),
+        );
         tool.permission = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
         tool
     }
@@ -915,7 +928,7 @@ impl Tool for BashTool {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
-                res = run_unsandboxed("sh", &args, cwd_ref, &extra_env.vars, timeout) => res?,
+                res = run_unsandboxed(&self.process_manager, "sh", &args, cwd_ref, &extra_env.vars, timeout) => res?,
             }
         } else if execution_route.is_sandboxed() {
             if let Some(sandbox) = ctx.sandbox.as_ref() {
@@ -1074,123 +1087,6 @@ fn prune_outputs_before(dir: &Path, cutoff: std::time::SystemTime) -> usize {
     pruned
 }
 
-/// One persisted detached-command process group. Written at detach and cleared
-/// by the escort on completion, so a boot after a hard kill (SIGKILL / OOM /
-/// crash) — which runs neither the `ProcessGroupKiller` destructors nor the
-/// force-exit reap — can still find and SIGKILL groups this process orphaned.
-/// `command` is the fingerprint that guards against pid-group recycling: a
-/// recorded pgid is only killed if a live member still runs it.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedDetachedGroup {
-    pgid: i32,
-    command: String,
-}
-
-/// Subdir of the background-output dir holding the detached-group ledger, one
-/// `<handle>.json` per live group. Kept out of the output-file dir itself so
-/// `prune_background_outputs` (non-recursive, files only) never touches it.
-pub fn detached_group_dir(background_output_dir: &Path) -> PathBuf {
-    background_output_dir.join("groups")
-}
-
-/// Record a detached unsandboxed command's process group so a future boot can
-/// reap it if this process dies without unwinding. Best-effort; a write
-/// failure just forgoes the crash-safety net for this one turn.
-pub fn record_detached_group(dir: &Path, handle_id: &str, pgid: i32, command: &str) {
-    let record = PersistedDetachedGroup {
-        pgid,
-        command: command.to_string(),
-    };
-    if let Ok(json) = serde_json::to_vec(&record)
-        && std::fs::create_dir_all(dir).is_ok()
-    {
-        let _ = std::fs::write(dir.join(format!("{handle_id}.json")), json);
-    }
-}
-
-/// Drop a detached group's ledger entry once its escort has reaped the group.
-pub fn clear_detached_group(dir: &Path, handle_id: &str) {
-    let _ = std::fs::remove_file(dir.join(format!("{handle_id}.json")));
-}
-
-/// Boot: SIGKILL every persisted detached group that is provably still ours,
-/// then clear the ledger. A recorded pgid is killed only when a live member of
-/// that group still runs the recorded command — so a pgid recycled to an
-/// unrelated group (or a group that already exited) is left alone. Returns the
-/// number of groups killed.
-pub fn reap_persisted_detached_groups(dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut killed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        if let Ok(bytes) = std::fs::read(&path)
-            && let Ok(rec) = serde_json::from_slice::<PersistedDetachedGroup>(&bytes)
-            && group_has_member_running(rec.pgid, &rec.command)
-        {
-            // SAFETY: a negative pid signals the whole group; verified ours by
-            // the live-member-runs-the-command check above.
-            unsafe { libc::kill(-rec.pgid, libc::SIGKILL) };
-            killed += 1;
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-    killed
-}
-
-/// True iff some live process in group `pgid` still has `command` in its
-/// cmdline — the ownership check that makes [`reap_persisted_detached_groups`]
-/// safe against pid-group recycling.
-fn group_has_member_running(pgid: i32, command: &str) -> bool {
-    let needle = normalize_ws(command);
-    if needle.is_empty() {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        if proc_stat_field(&stat, 5).and_then(|f| f.parse::<i32>().ok()) != Some(pgid) {
-            continue;
-        }
-        if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-            let cmdline = normalize_ws(&String::from_utf8_lossy(&raw).replace('\0', " "));
-            if cmdline.contains(&needle) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Whitespace-normalized (single-spaced, trimmed) copy for substring matching.
-fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Field `n` (1-based, per proc(5)) of a `/proc/<pid>/stat` line. Handles a
-/// `comm` (field 2) containing spaces/parens by anchoring on the final ')':
-/// fields 3+ follow it. Only fields ≥ 3 are supported (all this module needs).
-fn proc_stat_field(stat: &str, n: usize) -> Option<&str> {
-    debug_assert!(n >= 3, "fields 1-2 (pid, comm) are not parsed here");
-    let after_comm = stat.get(stat.rfind(')')? + 1..)?.trim_start();
-    after_comm.split_whitespace().nth(n - 3)
-}
-
 enum DetachedOutcome {
     Cancelled,
     Completed(i32),
@@ -1217,8 +1113,16 @@ async fn run_detached(
     sink: &Arc<dyn BackgroundJobSink>,
     escape_policy: SandboxEscapePolicy,
 ) -> crate::Result<Option<ToolOutput>> {
-    let Some(mut child) =
-        spawn_detached_child(route, args, cwd, &extra_env.vars, timeout, ctx).await?
+    let Some(mut child) = spawn_detached_child(
+        &tool.process_manager,
+        route,
+        args,
+        cwd,
+        &extra_env.vars,
+        timeout,
+        ctx,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1334,6 +1238,7 @@ async fn run_detached(
 }
 
 async fn spawn_detached_child(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     route: DetachedExecutionRoute,
     args: &[String],
     cwd: Option<&Path>,
@@ -1364,7 +1269,7 @@ async fn spawn_detached_child(
             }
         }
         DetachedExecutionRoute::Unsandboxed => {
-            match spawn_unsandboxed_detached("sh", args, cwd, extra_env) {
+            match spawn_unsandboxed_detached(process_manager, "sh", args, cwd, extra_env) {
                 Ok(child) => Ok(Some(child)),
                 Err(_) => Ok(None),
             }
@@ -1878,7 +1783,7 @@ impl BashTool {
             _ = ctx.cancellation_token.cancelled() => {
                 Err(ToolError::Execution("cancelled".into()))
             }
-            res = run_unsandboxed("sh", &args, cwd, extra_env, timeout) => res,
+            res = run_unsandboxed(&self.process_manager, "sh", &args, cwd, extra_env, timeout) => res,
         }
     }
 
@@ -2153,124 +2058,35 @@ impl BashTool {
     }
 }
 
-/// Process-global set of unsandboxed process-group leader pids (== pgid,
-/// since these children spawn with `process_group(0)`). Every armed
-/// [`ProcessGroupKiller`] registers its group and deregisters when it reaps
-/// the group or the child exits cleanly, so the set always equals the groups
-/// we still owe a kill.
-///
-/// Its one consumer is [`reap_tracked_process_groups`]: the force-exit path
-/// (`force_exit_watchdog`) `process::exit`s without unwinding, so the
-/// `ProcessGroupKiller` destructors that normally reap detached command trees
-/// never run. Reaping the set there turns "orphan to init and leak until the
-/// next reboot" back into "killed on the way out".
-static TRACKED_PROCESS_GROUPS: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
-
-fn register_process_group(pgid: i32) {
-    TRACKED_PROCESS_GROUPS.lock().insert(pgid);
-}
-
-fn unregister_process_group(pgid: i32) {
-    TRACKED_PROCESS_GROUPS.lock().remove(&pgid);
-}
-
-/// SIGKILL every still-tracked unsandboxed process group. The shutdown
-/// backstop for `force_exit_watchdog`, which `process::exit`s past the
-/// [`ProcessGroupKiller`] destructors that would otherwise reap detached
-/// `Bash` command trees. Draining the set makes it idempotent.
-pub fn reap_tracked_process_groups() {
-    let groups = std::mem::take(&mut *TRACKED_PROCESS_GROUPS.lock());
-    for pgid in groups {
-        // SAFETY: a negative pid signals the whole group; each leader was a
-        // child we spawned with `process_group(0)`.
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
-}
-
-/// SIGKILLs an entire process group on drop unless disarmed. Paired with
-/// `Command::process_group(0)` below so a timed-out or cancelled `sh -c "…"`
-/// reaps its descendants: tokio's `kill_on_drop`/`start_kill` only signal the
-/// direct child, leaving anything it forked (and their children) orphaned and,
-/// in the worst case, spinning at 100% CPU. Its lifetime is mirrored in
-/// [`TRACKED_PROCESS_GROUPS`] so a destructor-less exit can still reap it.
-struct ProcessGroupKiller(Option<i32>);
-
-impl ProcessGroupKiller {
-    /// `child_pid` is the group leader — we spawn with `process_group(0)`, so
-    /// its pgid equals its pid. `None` if the child's id is already gone.
-    fn arm(child_pid: Option<u32>) -> Self {
-        let pgid = child_pid.map(|p| p as i32);
-        if let Some(pgid) = pgid {
-            register_process_group(pgid);
-        }
-        Self(pgid)
-    }
-
-    fn kill_group(&self) {
-        if let Some(pgid) = self.0 {
-            unregister_process_group(pgid);
-            // SAFETY: a negative pid signals the whole group; the leader is our
-            // own child, so this only reaps the command's own process tree.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        }
-    }
-
-    /// The child finished on its own (or we already reaped the group), so the
-    /// pgid may be recycled — deregister it and don't signal it on drop.
-    fn disarm(&mut self) {
-        if let Some(pgid) = self.0 {
-            unregister_process_group(pgid);
-        }
-        self.0 = None;
-    }
-}
-
-impl Drop for ProcessGroupKiller {
-    fn drop(&mut self) {
-        self.kill_group();
-    }
-}
-
 struct ProcessGroupRunningChild {
-    child: tokio::process::Child,
-    group: ProcessGroupKiller,
+    child: baybo_process::ManagedChild,
 }
 
 #[async_trait]
 impl RunningChild for ProcessGroupRunningChild {
     fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
 
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stderr
-            .take()
+            .take_stderr()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
 
     async fn wait(&mut self) -> i32 {
-        let code = self
-            .child
+        self.child
             .wait()
             .await
             .ok()
             .and_then(|s| s.code())
-            .unwrap_or(-1);
-        self.group.disarm();
-        code
+            .unwrap_or(-1)
     }
 
     fn start_kill(&mut self) {
-        self.group.kill_group();
         let _ = self.child.start_kill();
-    }
-
-    fn process_group_id(&self) -> Option<i32> {
-        self.group.0
     }
 }
 
@@ -2295,12 +2111,6 @@ fn build_unsandboxed_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    // Own process group: a `sh -c "…"` forks descendants, and on timeout/cancel
-    // we must reap the whole tree. `kill_on_drop`/`start_kill` only hit the
-    // direct child, orphaning grandchildren; `process_group(0)` makes the child
-    // the group leader so `ProcessGroupKiller` can SIGKILL `-pgid`.
-    cmd.process_group(0);
     cmd
 }
 
@@ -2311,23 +2121,21 @@ fn build_unsandboxed_command(
 /// this function is what makes the fake's detached child behave like a real
 /// one — killable as a whole tree, and carrying a pgid to record.
 pub(crate) fn spawn_unsandboxed_detached(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
     extra_env: &[(String, String)],
 ) -> crate::Result<Box<dyn RunningChild>> {
-    let child = build_unsandboxed_command(program, args, cwd, extra_env)
-        .spawn()
+    let mut command = build_unsandboxed_command(program, args, cwd, extra_env);
+    let child = process_manager
+        .spawn(&mut command, format!("bash-detached:{program}"))
         .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
-    let group = ProcessGroupKiller::arm(child.id());
-    if child.stdout.is_none() || child.stderr.is_none() {
-        group.kill_group();
-        return Err(ToolError::Execution("child output pipe missing".into()));
-    }
-    Ok(Box::new(ProcessGroupRunningChild { child, group }))
+    Ok(Box::new(ProcessGroupRunningChild { child }))
 }
 
 async fn run_unsandboxed(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -2336,21 +2144,16 @@ async fn run_unsandboxed(
 ) -> crate::Result<crate::SandboxedOutput> {
     use tokio::io::AsyncReadExt;
 
-    let mut child = build_unsandboxed_command(program, args, cwd, extra_env)
-        .spawn()
+    let mut command = build_unsandboxed_command(program, args, cwd, extra_env);
+    let mut child = process_manager
+        .spawn(&mut command, format!("bash:{program}"))
         .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
-    // Reaps the group on every early-exit path: the timeout arm below, or the
-    // caller dropping this future on cancellation (its select races us against
-    // the cancellation token). Disarmed after a clean finish.
-    let mut group = ProcessGroupKiller::arm(child.id());
 
     let stdout_pipe = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| ToolError::Execution("child stdout pipe missing".into()))?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| ToolError::Execution("child stderr pipe missing".into()))?;
 
     // Cap unsandboxed stdout/stderr at MAX_OUTPUT_BYTES + slack so a
@@ -2378,18 +2181,11 @@ async fn run_unsandboxed(
             (false, wait.ok().and_then(|s| s.code()).unwrap_or(-1))
         }
         _ = tokio::time::sleep(timeout) => {
-            // Reap the whole group, not just `sh`, then collect the leader's
-            // zombie. Descendants reparent to init, which reaps them.
-            group.kill_group();
+            let _ = child.start_kill();
             let _ = child.wait().await;
             (true, -1)
         }
     };
-    // A select arm completed: the group is already dead (timeout) or the child
-    // exited on its own (a deliberately-backgrounded descendant is left running,
-    // matching the prior contract). The guard still fires if this future is
-    // instead dropped mid-select — the caller's cancellation path.
-    group.disarm();
 
     let stdout = stdout_task.await.unwrap_or_default();
     let stderr = stderr_task.await.unwrap_or_default();
@@ -2457,7 +2253,9 @@ mod tests {
         // new process group. `wait` keeps sh alive so the command hits the
         // timeout instead of exiting on its own.
         let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let process_manager = baybo_process::ProcessManager::transient();
         let out = run_unsandboxed(
+            &process_manager,
             "sh",
             &["-c".to_string(), script],
             None,
@@ -2496,167 +2294,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         false
-    }
-
-    /// The registry that `reap_tracked_process_groups` drains must track
-    /// exactly the armed-but-unreaped groups: `arm` adds, `disarm` (clean
-    /// exit) removes, and the `Drop` guard removes. A stale entry would make
-    /// the force-exit reap SIGKILL a recycled pgid; a missing entry would let
-    /// a detached tree leak past a destructor-less exit. Uses a synthetic
-    /// out-of-`pid_max` leader id so the `Drop`'s group-kill is a harmless
-    /// `ESRCH` and can't collide with a real process or another test's group.
-    #[test]
-    fn process_group_registry_tracks_armed_groups() {
-        let synthetic = i32::MAX;
-        assert!(!TRACKED_PROCESS_GROUPS.lock().contains(&synthetic));
-
-        let mut guard = ProcessGroupKiller::arm(Some(synthetic as u32));
-        assert!(
-            TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
-            "arm must register the group"
-        );
-        guard.disarm();
-        assert!(
-            !TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
-            "disarm must deregister the group"
-        );
-
-        // Re-arm and drop without disarming: the `Drop` guard must also
-        // deregister (its kill is a harmless ESRCH on the synthetic pgid).
-        drop(ProcessGroupKiller::arm(Some(synthetic as u32)));
-        assert!(
-            !TRACKED_PROCESS_GROUPS.lock().contains(&synthetic),
-            "the Drop guard must deregister the group"
-        );
-    }
-
-    #[test]
-    fn proc_stat_field_reads_real_and_tricky_comm() {
-        // Real: field 5 (pgrp) of our own stat matches getpgrp().
-        let stat = std::fs::read_to_string("/proc/self/stat").expect("read self stat");
-        let pgrp: i32 = proc_stat_field(&stat, 5)
-            .and_then(|f| f.parse().ok())
-            .expect("pgrp parses");
-        assert_eq!(pgrp, unsafe { libc::getpgrp() });
-
-        // Synthetic: a comm with embedded spaces and parens must not shift the
-        // post-comm fields (the parser anchors on the final ')').
-        let weird = "1234 (weird ) name) R 1 4321 4321 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 999";
-        assert_eq!(proc_stat_field(weird, 3), Some("R"), "state");
-        assert_eq!(proc_stat_field(weird, 4), Some("1"), "ppid");
-        assert_eq!(proc_stat_field(weird, 5), Some("4321"), "pgrp");
-    }
-
-    fn unique_tag(kind: &str) -> String {
-        format!(
-            "baybo-{kind}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        )
-    }
-
-    /// Boot reap: a persisted group whose live members still run the recorded
-    /// command is SIGKILLed and its ledger entry removed. Leaks the child guard
-    /// (`mem::forget`) so only the on-disk ledger — the sole survivor of a hard
-    /// kill — drives the reap.
-    #[tokio::test]
-    async fn reap_persisted_detached_groups_kills_recorded_group() {
-        let tag = unique_tag("bootreap");
-        let pidfile = std::env::temp_dir().join(format!("{tag}.pid"));
-        let ledger = std::env::temp_dir().join(format!("{tag}.d"));
-        let _ = std::fs::remove_file(&pidfile);
-
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
-        let child =
-            spawn_unsandboxed_detached("sh", &["-c".to_string(), script.clone()], None, &[])
-                .expect("detached spawn ok");
-        let pgid = child
-            .process_group_id()
-            .expect("unsandboxed child has a pgid");
-        std::mem::forget(child);
-
-        record_detached_group(&ledger, "bg-1", pgid, &script);
-
-        let gpid: i32 = {
-            let mut found = None;
-            for _ in 0..40 {
-                if let Ok(s) = std::fs::read_to_string(&pidfile)
-                    && let Ok(p) = s.trim().parse::<i32>()
-                {
-                    found = Some(p);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            found.expect("grandchild wrote its pid")
-        };
-        let _ = std::fs::remove_file(&pidfile);
-
-        let killed = reap_persisted_detached_groups(&ledger);
-        assert_eq!(killed, 1, "the recorded group should be reaped");
-
-        let reaped = wait_until_pid_gone(gpid).await;
-        if !reaped {
-            unsafe { libc::kill(gpid, libc::SIGKILL) };
-        }
-        assert!(reaped, "grandchild {gpid} survived boot reap");
-        assert!(
-            !ledger.join("bg-1.json").exists(),
-            "the ledger entry must be cleared after reaping"
-        );
-        let _ = std::fs::remove_dir_all(&ledger);
-    }
-
-    /// Pid-recycling guard: a persisted pgid whose live members do NOT run the
-    /// recorded command is left untouched — the group is not ours. Proves the
-    /// fingerprint check that keeps boot reaping safe.
-    #[tokio::test]
-    async fn reap_persisted_detached_groups_spares_mismatched_command() {
-        let tag = unique_tag("bootspare");
-        let pidfile = std::env::temp_dir().join(format!("{tag}.pid"));
-        let ledger = std::env::temp_dir().join(format!("{tag}.d"));
-        let _ = std::fs::remove_file(&pidfile);
-
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
-        let child =
-            spawn_unsandboxed_detached("sh", &["-c".to_string(), script.clone()], None, &[])
-                .expect("detached spawn ok");
-        let pgid = child
-            .process_group_id()
-            .expect("unsandboxed child has a pgid");
-        std::mem::forget(child);
-
-        let gpid: i32 = {
-            let mut found = None;
-            for _ in 0..40 {
-                if let Ok(s) = std::fs::read_to_string(&pidfile)
-                    && let Ok(p) = s.trim().parse::<i32>()
-                {
-                    found = Some(p);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            found.expect("grandchild wrote its pid")
-        };
-        let _ = std::fs::remove_file(&pidfile);
-
-        // Record the real pgid but a command no live member runs (simulating a
-        // recycled pgid). The reap must refuse to touch it.
-        record_detached_group(&ledger, "bg-1", pgid, "sleep 999 --unrelated-marker");
-        let killed = reap_persisted_detached_groups(&ledger);
-        assert_eq!(killed, 0, "a mismatched-command group must be spared");
-        assert!(
-            unsafe { libc::kill(gpid, 0) == 0 },
-            "grandchild {gpid} must still be alive after a spared reap"
-        );
-
-        // Clean up the group ourselves (the reap intentionally didn't).
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        let _ = std::fs::remove_dir_all(&ledger);
     }
 
     #[test]
@@ -3197,9 +2834,12 @@ mod tests {
 
     #[test]
     fn sandboxed_description_renders_without_leftover_placeholders() {
-        let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_permission(BashPermissionMode::Manual)
-            .description();
+        let d = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/some/ws"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission(BashPermissionMode::Manual)
+        .description();
         assert!(
             !d.contains("{{"),
             "unfilled placeholder in description:\n{d}"
@@ -3218,8 +2858,11 @@ mod tests {
         let _ = std::fs::create_dir_all(work);
         // `free` Bash + a context with NO sandbox backend: it runs directly (no
         // OS sandbox), but the work-dir jail is still enforced at the tool layer.
-        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
-            .with_permission(BashPermissionMode::Free);
+        let tool = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/tmp"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission(BashPermissionMode::Free);
         let ctx = ctx_with(None);
 
         // In-work command runs directly, no sandbox backend required.
@@ -3246,8 +2889,11 @@ mod tests {
 
     #[test]
     fn free_description_drops_only_the_os_sandbox() {
-        let free = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_permission(BashPermissionMode::Free);
+        let free = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/some/ws"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission(BashPermissionMode::Free);
         let d = free.description();
         assert!(
             !d.contains("{{"),
@@ -3275,8 +2921,11 @@ mod tests {
 
     #[test]
     fn auto_description_advertises_the_risk_judge() {
-        let auto = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_permission(auto_permission());
+        let auto = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/some/ws"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission(auto_permission());
         let d = auto.description();
         assert!(
             !d.contains("{{"),
@@ -3294,8 +2943,11 @@ mod tests {
     #[test]
     fn permission_hot_swap_reskins_description_and_behavior() {
         let handle = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
-        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_permission_handle(Arc::clone(&handle));
+        let tool = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/some/ws"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission_handle(Arc::clone(&handle));
         // Sandboxed: masked surface, OS sandbox on.
         assert!(tool.description().contains(SANDBOXED_MARKER));
         assert!(!tool.skip_os_sandbox());
@@ -3318,8 +2970,11 @@ mod tests {
     fn free_keeps_uv_shims_in_wrap_command() {
         // `free` drops only the OS sandbox; python is still uv-shimmed (unlike
         // the bench profile). The uv exports + shim must survive.
-        let free = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
-            .with_permission(BashPermissionMode::Free);
+        let free = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/tmp"),
+            baybo_process::ProcessManager::transient(),
+        )
+        .with_permission(BashPermissionMode::Free);
         let wrapped = free.wrap_command("python -c 'x'");
         assert!(
             wrapped.contains("uv run python"),
@@ -3342,7 +2997,11 @@ mod tests {
         #[test]
         fn description_is_the_raw_bench_prompt() {
             let cwd = std::env::current_dir().expect("cwd");
-            let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws")).description();
+            let d = BashTool::new(
+                baybo_workspace::WorkspacePaths::new("/some/ws"),
+                baybo_process::ProcessManager::transient(),
+            )
+            .description();
             assert!(!d.contains("{{"), "unfilled placeholder");
             assert!(
                 d.contains(&cwd.display().to_string()),
@@ -3362,8 +3021,11 @@ mod tests {
 
         #[test]
         fn wrap_command_skips_uv() {
-            let w = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
-                .wrap_command("python -c 'x'");
+            let w = BashTool::new(
+                baybo_workspace::WorkspacePaths::new("/tmp"),
+                baybo_process::ProcessManager::transient(),
+            )
+            .wrap_command("python -c 'x'");
             assert!(!w.contains("uv run"), "bench leaked uv shim: {w}");
             assert!(!w.contains("UV_CACHE_DIR"), "bench leaked uv exports: {w}");
         }
@@ -3832,7 +3494,10 @@ mod tests {
     #[tokio::test]
     async fn default_auto_judges_destructive_commands_inside_sandbox() {
         let _ = std::fs::create_dir_all("/tmp/work");
-        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"));
+        let tool = BashTool::new(
+            baybo_workspace::WorkspacePaths::new("/tmp"),
+            baybo_process::ProcessManager::transient(),
+        );
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FakeExecSandbox::new());
         let mut ctx = ctx_with_approval(Some(sandbox), Arc::clone(&gate));
@@ -5773,7 +5438,9 @@ mod tests {
     #[tokio::test]
     async fn unsandboxed_runner_exports_pwd_from_effective_cwd() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let process_manager = baybo_process::ProcessManager::transient();
         let out = run_unsandboxed(
+            &process_manager,
             "env",
             &[],
             Some(workspace.path()),
@@ -5800,7 +5467,9 @@ mod tests {
             "BAYBO_TEST_SECRET".to_string(),
             "injected-value".to_string(),
         )];
+        let process_manager = baybo_process::ProcessManager::transient();
         let out = run_unsandboxed(
+            &process_manager,
             "env",
             &[],
             Some(workspace.path()),

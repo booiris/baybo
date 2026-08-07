@@ -45,27 +45,25 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="
 /// failure) and left permanent rows in the append-only log.
 const RETRY_CUE: &str = "[the user has received only the completion acknowledgement; no complete report for the background results above has reached them yet — produce the complete report now.]";
 
-/// Build the persisted, user-facing acknowledgement that precedes the streamed
-/// analysis turn. It is a bland "work finished, reviewing now" notice with **no
-/// result content**: a finished turn's raw output stays LLM-only (it rides
+/// Build the user-facing acknowledgement that precedes the streamed analysis
+/// turn. It is a bland "work finished, reviewing now" notice with **no result
+/// content**: a finished turn's raw output stays LLM-only (it rides
 /// [`build_notification_content`] as a hidden `agent_context` row), so the user
 /// learns the actual outcome solely from the parent's analysed report, never
 /// from the unprocessed result body.
 ///
-/// Keeping the raw result out of this row is load-bearing, not cosmetic: the
-/// row is an ordinary assistant bubble, so anything in it also renders in the
-/// chat transcript, is full-text indexed (`is_searchable()`), and can surface
-/// as the chat-list preview — all of which must show only what the parent
-/// chose to report.
-pub fn build_completion_reply(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
+/// Returns plain text, not content blocks, because the actor persists this on
+/// the **control-event** plane (`session_control_events`) rather than in
+/// `session_messages` — see the "Buffer-to-delivery durability boundary"
+/// section of `docs/background-notifications.md` for why it cannot be a
+/// transcript row.
+pub fn build_completion_reply(pending: &[PendingBackgroundResult]) -> String {
     let count_noun = if pending.len() > 1 {
         "results"
     } else {
         "result"
     };
-    vec![ContentBlock::Text(
-        BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", count_noun),
-    )]
+    BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", count_noun)
 }
 
 /// The request-time retry cue (see [`RETRY_CUE`]). Stateless — the same for
@@ -240,9 +238,7 @@ mod tests {
         // the user-facing acknowledgement is exactly the lead — no result body.
         assert_eq!(
             build_completion_reply(&pending),
-            vec![ContentBlock::Text(
-                BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "result")
-            )]
+            BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "result")
         );
     }
 
@@ -266,12 +262,10 @@ mod tests {
                 SubagentExitStatus::Completed,
             ),
         ];
-        let ContentBlock::Text(reply) = &build_completion_reply(&pending)[0] else {
-            panic!("completion reply must be text");
-        };
+        let reply = build_completion_reply(&pending);
         assert_eq!(
             reply,
-            &BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "results")
+            BACKGROUND_COMPLETION_REPLY_LEAD.replace("{{count_noun}}", "results")
         );
         // Neither a result body nor a task label may leak into the batch
         // acknowledgement.

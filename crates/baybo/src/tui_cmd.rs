@@ -51,6 +51,7 @@ pub struct Options {
 /// loop exits (user typed `/quit`, adapter closed) or the shared
 /// shutdown signal fires (SIGINT/SIGTERM).
 pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> {
+    let process_manager = baybo_process::ProcessManager::transient();
     let tui_log_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
     let _tracing_guards = init_tracing(TracingMode::Tui {
         tui_sink: Arc::clone(&tui_log_sink),
@@ -94,8 +95,14 @@ pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> 
                     // at a different vault, and they'd disagree on bind
                     // address.
                     let config_path = crate::boot::resolve_config_path();
-                    _auto_gateway =
-                        Some(dev_auto::spawn_and_wait_ready(admin_addr, config_path).await?);
+                    _auto_gateway = Some(
+                        dev_auto::spawn_and_wait_ready(
+                            Arc::clone(&process_manager),
+                            admin_addr,
+                            config_path,
+                        )
+                        .await?,
+                    );
                     // Reconnect with the freshly-rotated token the spawned
                     // gateway just published.
                     let tui_token = read_tui_token(&config).await;
@@ -147,7 +154,10 @@ pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> 
     // long-lived read on the channel socket — bound teardown so the
     // process always exits even if the read can't be cancelled
     // promptly.
-    force_exit_watchdog(std::time::Duration::from_secs(5));
+    force_exit_watchdog(
+        Arc::clone(&process_manager),
+        std::time::Duration::from_secs(5),
+    );
 
     task_tracker.shutdown().await;
     Ok(())
@@ -281,25 +291,12 @@ mod dev_auto {
     use std::time::Duration;
 
     use tokio::net::TcpStream;
-    use tokio::process::{Child, Command};
+    use tokio::process::Command;
     use tracing::info;
 
     /// RAII guard that kills the spawned gateway when dropped.
     pub struct AutoGatewayGuard {
-        child: Option<Child>,
-    }
-
-    impl Drop for AutoGatewayGuard {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                // `start_kill` is non-blocking SIGKILL on Unix, which
-                // is what we want from a Drop impl: no async context
-                // and no opportunity to hang. Gateway's own graceful
-                // shutdown runs on its SIGTERM handler; for dev use
-                // the abrupt stop is acceptable.
-                let _ = child.start_kill();
-            }
-        }
+        child: Option<baybo_process::ManagedChild>,
     }
 
     /// Spawn `baybo gateway start` as a subprocess and poll the admin
@@ -308,6 +305,7 @@ mod dev_auto {
     /// that the listener is accepting — the caller follows up with
     /// the real WS handshake after this returns.
     pub async fn spawn_and_wait_ready(
+        process_manager: std::sync::Arc<baybo_process::ProcessManager>,
         admin_addr: SocketAddr,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<AutoGatewayGuard> {
@@ -323,12 +321,12 @@ mod dev_auto {
         if let Some(path) = config_path.as_deref() {
             cmd.arg("--config").arg(path);
         }
-        let child = cmd
-            .args(["gateway", "start"])
+        cmd.args(["gateway", "start"])
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        let child = process_manager
+            .spawn(&mut cmd, "dev-auto-gateway")
             .map_err(|e| anyhow::anyhow!("spawn {}: {e}", exe.display()))?;
 
         let mut guard = AutoGatewayGuard { child: Some(child) };

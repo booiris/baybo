@@ -4,15 +4,17 @@
 //!
 //! 1. `buffered_results` / `groups` collect results that have not yet been
 //!    committed to the transcript.
-//! 2. `active_delivery` tracks one batch whose public completion reply and
-//!    hidden prompt are durable but whose analysed report has not settled.
+//! 2. `active_delivery` tracks one batch whose hidden prompt is durable but
+//!    whose analysed report has not settled.
 //!
 //! The actor owns scheduling and persistence; `baybo-model` owns the durable
 //! data shape. Keeping the orchestration here makes the buffer-to-ledger
 //! durability boundary explicit and keeps the main actor loop about routing.
 
-use baybo_channels::OutgoingMessage;
-use baybo_model::{BackgroundNotificationDelivery, ContentBlock, PendingBackgroundResult};
+use baybo_channels::{AgentEvent, AgentOutput, NoticeLevel};
+use baybo_model::{
+    BackgroundNotificationDelivery, ContentBlock, ControlEventKind, PendingBackgroundResult,
+};
 use baybo_turn::TurnInput;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
@@ -53,13 +55,6 @@ fn background_batch_source_event_id(handle_ids: &[String]) -> String {
 
 fn background_prompt_source_event_id(handle_ids: &[String]) -> String {
     format!("{}:prompt", background_batch_source_event_id(handle_ids))
-}
-
-fn background_completion_reply_source_event_id(handle_ids: &[String]) -> String {
-    format!(
-        "{}:completion-reply",
-        background_batch_source_event_id(handle_ids)
-    )
 }
 
 fn background_reanchor_source_event_id(delivery: &BackgroundNotificationDelivery) -> String {
@@ -329,51 +324,10 @@ impl AgentActor {
             .collect();
         let content =
             baybo_context::prompts::background_notification::build_notification_content(&pending);
-        let completion_reply =
-            baybo_context::prompts::background_notification::build_completion_reply(&pending);
-        let completion_source_event_id = background_completion_reply_source_event_id(&handle_ids);
-        let Some(completion_outcome) = self
-            .volatile
-            .agent_loop
-            .append_background_completion_reply_once(
-                completion_reply.clone(),
-                &completion_source_event_id,
-            )
-            .await
-        else {
-            warn!(
-                session_id = %self.durable.session.id,
-                "background completion reply failed to persist; restoring buffered batch"
-            );
-            self.durable
-                .session
-                .state
-                .background_notifications
-                .buffered_results = pending;
-            return;
-        };
-        if completion_outcome.was_inserted() {
-            self.send_response(
-                OutgoingMessage {
-                    session_id: self.durable.session.id.clone(),
-                    user_id: self.durable.session.user.id.clone(),
-                    channel: self.durable.session.channel.clone(),
-                    content: completion_reply,
-                    reply_to: None,
-                    metadata: Default::default(),
-                    ordinal: Some(completion_outcome.ordinal()),
-                }
-                .into(),
-                "background_completion",
-            )
-            .await;
-        }
-
         let source_event_id = background_prompt_source_event_id(&handle_ids);
 
-        // The prompt row and its batch idempotency key land atomically. The
-        // completion reply above is independently idempotent; raw results
-        // still own analysed-report delivery until this prompt is durable.
+        // The prompt row and its batch idempotency key land atomically. Raw
+        // results own analysed-report delivery until this prompt is durable.
         let Some(append_outcome) = self
             .volatile
             .agent_loop
@@ -437,6 +391,26 @@ impl AgentActor {
             }
         }
 
+        // The acknowledgement rides the control-event plane: shown in the chat
+        // transcript, never in `session_messages`, so it cannot reach the model.
+        // As an assistant row it did — and a fixed sentence sitting in the
+        // transcript as the model's own last words is a template it imitates,
+        // which is how users saw the same line twice in a row, once from here
+        // and once tacked onto the end of the model's next answer.
+        //
+        // Gated on the prompt insert rather than carrying an idempotency key of
+        // its own: one acknowledgement per analysis turn is exactly the rule,
+        // and the prompt row is already the durable record of "this batch is
+        // new". A crash replay recovers the prompt as `Existing` and stays
+        // quiet. This is also the fix for a duplicate the old key could not
+        // prevent — it hashed the batch's handle set, so a result joining the
+        // batch between a failed attempt and its retry produced a second
+        // acknowledgement for the same work.
+        if append_outcome.was_inserted() {
+            self.announce_background_completion(&pending, prompt_ordinal)
+                .await;
+        }
+
         self.durable
             .session
             .state
@@ -459,6 +433,43 @@ impl AgentActor {
             return;
         }
         self.drive_background_notification_turn(content).await;
+    }
+
+    /// Persist and dispatch the "work finished, reviewing it now" notice for a
+    /// freshly opened batch. Anchored after the batch's prompt row so the chat
+    /// view interleaves it ahead of the analysed report on reload as well as
+    /// live. Best-effort, like every control event: a failed write costs the
+    /// notice its place on reload, never the report.
+    async fn announce_background_completion(
+        &self,
+        pending: &[PendingBackgroundResult],
+        prompt_ordinal: i64,
+    ) {
+        let text = baybo_context::prompts::background_notification::build_completion_reply(pending);
+        let durable_id = self
+            .persist_control_event(
+                prompt_ordinal,
+                ControlEventKind::NoticeInfo,
+                &text,
+                chrono::Utc::now(),
+                "",
+            )
+            .await;
+        self.send_response(
+            AgentOutput {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text,
+                    mid_turn: false,
+                    durable_id,
+                },
+            },
+            "background_completion",
+        )
+        .await;
     }
 
     /// Re-drive a transcript-backed delivery without rollback. A cue row
@@ -712,17 +723,9 @@ mod tests {
             background_prompt_source_event_id(&first),
             background_prompt_source_event_id(&reordered)
         );
-        assert_eq!(
-            background_completion_reply_source_event_id(&first),
-            background_completion_reply_source_event_id(&reordered)
-        );
         assert_ne!(
             background_prompt_source_event_id(&first),
             background_prompt_source_event_id(&different)
-        );
-        assert_ne!(
-            background_completion_reply_source_event_id(&first),
-            background_prompt_source_event_id(&first)
         );
 
         let delivery = BackgroundNotificationDelivery {
@@ -735,10 +738,6 @@ mod tests {
         assert_ne!(
             reanchor,
             background_prompt_source_event_id(&delivery.handle_ids)
-        );
-        assert_ne!(
-            reanchor,
-            background_completion_reply_source_event_id(&delivery.handle_ids)
         );
 
         let legacy = BackgroundNotificationDelivery {

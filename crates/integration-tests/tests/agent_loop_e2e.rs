@@ -1212,8 +1212,8 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         "subagent notice must be persisted as from_user=false"
     );
 
-    // Delivery is deliberately three-stage: a persisted non-LLM completion
-    // reply, streamed analysis, then the canonical final Message.
+    // Delivery is deliberately three-stage: a non-LLM acknowledgement notice,
+    // streamed analysis, then the canonical final Message.
     let completion_reply =
         baybo_context::prompts::background_notification::build_completion_reply(&[
             PendingBackgroundResult::subagent(
@@ -1230,12 +1230,11 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         .position(|output| {
             matches!(
                 &output.event,
-                AgentEvent::Message(message)
-                    if message.content.as_slice() == completion_reply.as_slice()
-                        && message.ordinal.is_some()
+                AgentEvent::Notice { text, durable_id, .. }
+                    if text == &completion_reply && durable_id.is_some()
             )
         })
-        .expect("persisted completion reply");
+        .expect("acknowledgement notice with its durable control-event id");
     let reasoning_index = outputs
         .iter()
         .position(|output| matches!(&output.event, AgentEvent::Reasoning(text) if text.contains("checking the background result")))
@@ -1264,27 +1263,61 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         "completion, reasoning, prose, and final reply must arrive in order: {outputs:?}"
     );
 
-    let completion_context_index = captured[0]
-        .messages
-        .iter()
-        .position(|message| {
-            message.role == Role::Assistant
-                && message.content.as_slice() == completion_reply.as_slice()
-        })
-        .expect("completion reply in model context");
-    let prompt_context_index = captured[0]
-        .messages
-        .iter()
-        .position(|message| {
-            message.role == Role::User
-                && message.content.iter().any(|block| {
-                    matches!(block, ContentBlock::Text(text) if text.contains("<background_results>"))
-                })
-        })
-        .expect("background prompt in model context");
+    // The acknowledgement lives on the control-event plane, so it reaches
+    // neither `session_messages` nor the model. As an assistant row it reached
+    // both, and the model copied the fixed sentence onto the end of its own
+    // later answers — the user saw the same line twice in a row.
     assert!(
-        completion_context_index < prompt_context_index,
-        "the acknowledgement must precede the hidden analysis prompt"
+        !captured[0]
+            .messages
+            .iter()
+            .any(|message| message.content.iter().any(
+                |block| matches!(block, ContentBlock::Text(text) if text == &completion_reply)
+            )),
+        "acknowledgement must stay out of the request the model sees: {:?}",
+        captured[0].messages
+    );
+    let persisted = harness
+        .session_manager
+        .load_session_messages_with_supersede(&session_id)
+        .await
+        .expect("load persisted transcript");
+    assert!(
+        !persisted.iter().any(|row| row
+            .message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text(text) if text == &completion_reply))),
+        "acknowledgement must not be a transcript row at all"
+    );
+
+    // It is durable on its own plane, anchored so the chat view interleaves it
+    // ahead of the analysed report on reload.
+    let control_events = harness
+        .session_manager
+        .list_control_events(&session_id)
+        .await
+        .expect("load control events");
+    let acknowledgement = control_events
+        .iter()
+        .find(|event| event.text == completion_reply)
+        .expect("acknowledgement persisted as a control event");
+    assert_eq!(
+        acknowledgement.kind,
+        baybo_model::ControlEventKind::NoticeInfo
+    );
+    let prompt_ordinal = persisted
+        .iter()
+        .find(|row| {
+            row.message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text(text) if text.contains("<background_results>"))
+            })
+        })
+        .map(|row| row.ordinal)
+        .expect("background prompt persisted");
+    assert_eq!(
+        acknowledgement.after_ordinal, prompt_ordinal,
+        "anchored after the batch's prompt row, before the report"
     );
 
     // The turn drained the buffer.
@@ -1345,11 +1378,7 @@ async fn shutdown_kills_background_command_without_persisting_notification() {
         .await
         .expect("seed stderr");
     let killed = CancellationToken::new();
-    let manager = BackgroundJobManager::new(
-        supervisor_slot,
-        temp.path().join("groups"),
-        shutdown.clone(),
-    );
+    let manager = BackgroundJobManager::new(supervisor_slot, shutdown.clone());
 
     let handle = manager
         .detach_command(DetachedCommand {
@@ -1463,8 +1492,9 @@ async fn background_notification_suppresses_empty_reply() {
         1,
         "the notification turn must still run"
     );
-    // … but only the deterministic completion reply is sent; the blank
-    // analysed report does not create a second Message.
+    // … but only the deterministic acknowledgement is sent, and it rides the
+    // control-event plane as a notice; the blank analysed report creates no
+    // Message at all.
     let completion_reply =
         baybo_context::prompts::background_notification::build_completion_reply(&[
             PendingBackgroundResult::subagent(
@@ -1476,17 +1506,23 @@ async fn background_notification_suppresses_empty_reply() {
                 SubagentExitStatus::Completed,
             ),
         ]);
-    let messages: Vec<_> = outputs
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| matches!(&output.event, AgentEvent::Message(_))),
+        "blank final reply must be suppressed and the acknowledgement is not a Message: {outputs:?}"
+    );
+    let notices: Vec<_> = outputs
         .iter()
         .filter_map(|output| match &output.event {
-            AgentEvent::Message(message) => Some(message),
+            AgentEvent::Notice { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
-    assert_eq!(messages.len(), 1, "blank final reply must be suppressed");
     assert_eq!(
-        messages[0].content, completion_reply,
-        "the non-LLM completion reply still reaches the user"
+        notices,
+        vec![completion_reply.as_str()],
+        "the non-LLM acknowledgement still reaches the user, exactly once"
     );
 
     harness.shutdown().await;
@@ -2199,21 +2235,23 @@ async fn failing_background_notification_caps_retries_and_degrades_to_passive() 
                 SubagentExitStatus::Completed,
             ),
         ]);
-    let messages: Vec<_> = outputs
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| matches!(&output.event, AgentEvent::Message(_))),
+        "every analysed report failed, so no reply may be delivered: {outputs:?}"
+    );
+    let notices: Vec<_> = outputs
         .iter()
         .filter_map(|output| match &output.event {
-            AgentEvent::Message(message) => Some(message),
+            AgentEvent::Notice { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
     assert_eq!(
-        messages.len(),
-        1,
-        "the completion reply is sent once, but every analysed report failed"
-    );
-    assert_eq!(
-        messages[0].content, completion_reply,
-        "only the non-LLM completion reply should be delivered"
+        notices,
+        vec![completion_reply.as_str()],
+        "the acknowledgement is sent once across all five attempts"
     );
     let stored = harness
         .session_manager
@@ -4112,10 +4150,19 @@ async fn grouped_subagents_deliver_one_merged_notification() {
         pending.group = Some(cohort_group.clone());
         AgentMessage::BackgroundJobFinished(Box::new(pending))
     };
-    let count_answers = |outs: &[AgentOutput]| {
-        outs.iter()
+    // One delivery = one acknowledgement + one analysed report. The
+    // acknowledgement rides the control-event plane as a notice; no observer is
+    // wired into the harness, so every notice here is one.
+    let count_deliveries = |outs: &[AgentOutput]| {
+        let acks = outs
+            .iter()
+            .filter(|o| matches!(o.event, AgentEvent::Notice { .. }))
+            .count();
+        let reports = outs
+            .iter()
             .filter(|o| matches!(o.event, AgentEvent::Message(_)))
-            .count()
+            .count();
+        (acks, reports)
     };
 
     // First member finishes ALONE (nothing else queued). The barrier must HOLD
@@ -4128,8 +4175,8 @@ async fn grouped_subagents_deliver_one_merged_notification() {
         .expect("mailbox open");
     let after_first = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
-        count_answers(&after_first),
-        0,
+        count_deliveries(&after_first),
+        (0, 0),
         "the barrier holds the first member — no notification until the cohort completes: {after_first:?}"
     );
 
@@ -4142,9 +4189,9 @@ async fn grouped_subagents_deliver_one_merged_notification() {
         .expect("mailbox open");
     let after_second = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
-        count_answers(&after_second),
-        2,
-        "one merged delivery emits exactly its completion reply and final report: {after_second:?}"
+        count_deliveries(&after_second),
+        (1, 1),
+        "one merged delivery emits exactly its acknowledgement and final report: {after_second:?}"
     );
 
     harness.shutdown().await;
@@ -4230,10 +4277,19 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         pending.group = Some(group);
         AgentMessage::BackgroundJobFinished(Box::new(pending))
     };
-    let count_answers = |outs: &[AgentOutput]| {
-        outs.iter()
+    // One delivery = one acknowledgement + one analysed report. The
+    // acknowledgement rides the control-event plane as a notice; no observer is
+    // wired into the harness, so every notice here is one.
+    let count_deliveries = |outs: &[AgentOutput]| {
+        let acks = outs
+            .iter()
+            .filter(|o| matches!(o.event, AgentEvent::Notice { .. }))
+            .count();
+        let reports = outs
+            .iter()
             .filter(|o| matches!(o.event, AgentEvent::Message(_)))
-            .count()
+            .count();
+        (acks, reports)
     };
 
     // Cohort A completes on its OWN member and fires immediately — it is not
@@ -4248,9 +4304,9 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .expect("mailbox open");
     let after_a = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
-        count_answers(&after_a),
-        2,
-        "cohort A emits its completion reply and final report independently: {after_a:?}"
+        count_deliveries(&after_a),
+        (1, 1),
+        "cohort A emits its acknowledgement and final report independently: {after_a:?}"
     );
 
     // Cohort B then fires its own separate notification.
@@ -4264,9 +4320,9 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .expect("mailbox open");
     let after_b = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(
-        count_answers(&after_b),
-        2,
-        "cohort B emits its own completion reply and final report: {after_b:?}"
+        count_deliveries(&after_b),
+        (1, 1),
+        "cohort B emits its own acknowledgement and final report: {after_b:?}"
     );
 
     harness.shutdown().await;

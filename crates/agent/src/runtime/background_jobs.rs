@@ -14,12 +14,11 @@
 //! cancels the registered token and drains the entry, so the escort kills
 //! the child and skips delivery (a user-stopped result must not surface).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use baybo_model::{PendingBackgroundResult, Session, SessionId, SubagentExitStatus};
-use baybo_tools::builtin::bash::{clear_detached_group, record_detached_group};
 use baybo_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
 use baybo_turn::TurnInputKind;
 use tokio_util::sync::CancellationToken;
@@ -63,22 +62,12 @@ const COMMAND_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
 pub struct BackgroundJobManager {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
     shutdown: CancellationToken,
-    /// The detached-group ledger dir (see [`baybo_tools::builtin::bash::detached_group_dir`]).
-    /// Each backgrounded unsandboxed group is recorded here at detach and
-    /// cleared when its escort finishes, so a boot after a hard kill can reap
-    /// whatever this process orphaned.
-    groups_dir: PathBuf,
 }
 
 impl BackgroundJobManager {
-    pub fn new(
-        supervisor: Arc<OnceLock<AgentSupervisor>>,
-        groups_dir: PathBuf,
-        shutdown: CancellationToken,
-    ) -> Self {
+    pub fn new(supervisor: Arc<OnceLock<AgentSupervisor>>, shutdown: CancellationToken) -> Self {
         Self {
             supervisor,
-            groups_dir,
             shutdown,
         }
     }
@@ -108,23 +97,13 @@ impl BackgroundJobSink for BackgroundJobManager {
                 "background command dispatched before supervisor wired; result will be lost"
             );
         }
-        // Persist the group for crash-safe boot reaping: a SIGKILL/OOM/crash
-        // runs neither the escort's clear below nor the in-process reaps, so
-        // the ledger is the only record that survives to the next boot. Only
-        // unsandboxed children expose a host pgid; sandboxed ones are reaped by
-        // their backend.
-        if let Some(pgid) = job.child.process_group_id() {
-            record_detached_group(&self.groups_dir, &handle_id, pgid, &job.command);
-        }
         let supervisor = Arc::clone(&self.supervisor);
-        let groups_dir = self.groups_dir.clone();
         let shutdown = self.shutdown.clone();
         let returned = handle_id.clone();
         tokio::spawn(async move {
             escort_command(
                 CommandEscort {
                     supervisor,
-                    groups_dir,
                     parent_id,
                     registry_id,
                     handle_id,
@@ -173,7 +152,6 @@ impl BackgroundJobControl for BackgroundJobManager {
 /// delivery is suppressed.
 struct CommandEscort {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
-    groups_dir: PathBuf,
     parent_id: SessionId,
     registry_id: SessionId,
     handle_id: String,
@@ -184,7 +162,6 @@ struct CommandEscort {
 async fn escort_command(escort: CommandEscort, mut job: DetachedCommand) {
     let CommandEscort {
         supervisor,
-        groups_dir,
         parent_id,
         registry_id,
         handle_id,
@@ -205,9 +182,6 @@ async fn escort_command(escort: CommandEscort, mut job: DetachedCommand) {
         }
         code = job.child.wait() => CommandOutcome::Exited(code),
     };
-    // The group is reaped (clean exit or cancel-kill above), so drop its ledger
-    // entry — a later boot must not try to reap an already-gone group.
-    clear_detached_group(&groups_dir, &handle_id);
     // Drain the stdout/stderr → file copy tasks so the files are fully
     // flushed before we read their tails.
     for task in job.copy_tasks.drain(..) {

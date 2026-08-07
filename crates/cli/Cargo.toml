@@ -15,6 +15,7 @@ path = "tests/all.rs"
 
 [dependencies]
 baybo-model = { workspace = true }
+baybo-process = { workspace = true }
 baybo-agent = { workspace = true }
 baybo-context = { workspace = true }
 baybo-channels = { workspace = true }

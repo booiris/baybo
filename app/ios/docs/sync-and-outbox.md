@@ -21,12 +21,73 @@ both legs (same web bundle, same `GatewayJsonClient` API surface):
 ```
 on open / reconnect / gap / buffer-overflow re-attach / safety tick:
   page = sync(since = syncSince(cursor, rows))   # null → newest-page baseline
-  if page.rebased or cursor == null:
-      REPLACE thread with page.rows    # keep the open work block + optimistic sends
+  if REPAIR (since == null because a rendered row outran a non-null cursor):
+      REPLACE the whole thread with page.rows    # order in doubt; newest edge
+  elif page.rebased or since == null:
+      REPLACE the page's window, KEEP the rows above its floor + the reader's place
   else:
       APPEND/merge page.rows           # dedup by row id / platform_msg_id
   cursor = max(cursor, page.next_cursor)   # frozen while rebase-dirty
 ```
+
+Every REPLACE branch keeps the open work block + the optimistic sends
+(`applySyncReplace`).
+
+### Only a REPAIR may throw the loaded history away
+
+A REPLACE used to mean one thing: the page IS the thread now, drop everything
+else and snap to the newest edge. Three different situations reach it, and only
+one of them actually puts the rendered rows in doubt.
+
+- **Repair** — `syncSince` refused a NON-null cursor because a rendered row
+  outran it. The thread may be out of ORDER (the scramble that gate was written
+  against), so the rows it drops are exactly the ones under suspicion. This one
+  keeps the old behaviour.
+- **Rebase** — `rebased` says only that the difference outran the server's
+  `limit` or its scan bound and here is the newest page instead
+  (`docs/sync-protocol.md` "Gap > limit → rebase"). It does **not** mean ordinals
+  were rewritten.
+- **Cursor-less baseline** — a fresh install (no older rows to keep anyway), or
+  the deliberate `restoredUntimedWork` demotion, which asks the gateway to
+  re-time ONE block and says nothing about the rest.
+
+For the last two, `rowsAboveFloor(prev, page.oldest_ordinal, …)` keeps the rows
+above the page's floor, along with `oldestOrdinal`/`hasMoreOlder`/the withheld
+head, which still describe them. The cut is by POSITION, not a filter on
+`ordinal < floor`: a notice or a `/stop` mark carries no ordinal, and a filter
+would delete every one of them out of the half that survives.
+
+The client cannot read the reason off the reply — the frame carries only
+`since_ordinal: null` — so `runSync` records it (`baselineIsRepair`) when it
+posts.
+
+Both non-repair cases are reached by ordinary use, not by pathology. The rebase
+test counts *emitted* rows against `limit`, but the server scans past the
+invisible ones only to `SYNC_SCAN_BOUND_MULTIPLIER × limit`, and one agentic turn
+persists hundreds of invisible tool rows — a handful of turns since the cursor is
+enough. `restoredUntimedWork` fires whenever the mirror holds a closed work block
+with no duration, which backing out of a chat mid-turn mints on its own
+(`keepAnchor` strips the anchor on restore, then `closeWork` has nothing to
+compute from). Before this rule, either one landed as: open a long chat, scroll
+up, watch the pages you just fetched vanish and the thread slam to the bottom.
+
+The scroll half is the same rule stated once more. A reader **at** the newest
+edge is snapped back to it — that is where they were. A reader parked in history
+is not: a REPLACE reuses every surviving row's key, so `captureRowAnchor` takes
+the row under the top of the viewport before the swap and a layout effect puts it
+back under the same pixel afterwards. Only when the rebuild dropped that row —
+the repair's whole premise — do they land at the bottom. Every row carries
+`data-row-id` for this (the message index's jump reads the same handle).
+`transcriptScroll.test.tsx` mounts `<Transcript>` under a fake layout to pin it.
+
+**`hasUntimedWork` only asks the tail, and that window is load-bearing.** The
+demotion buys a re-timing only for a block the baseline page re-delivers, and
+that page is the newest `SYNC_BASELINE_LIMIT` rows. Older blocks used to be
+healed by deletion — the REPLACE dropped everything the page didn't carry — but
+now they SURVIVE, so an out-of-reach one would match again on every open and
+demote the cursor forever. Within the window it stays self-limiting, and its
+worst case (a turn the gateway cannot time either — a cancelled or crashed turn
+has no `work_ended_at`) now costs one round trip per open and nothing on screen.
 
 ### The webview drives sync
 
@@ -91,8 +152,7 @@ a page **only** when it is both stale and carries a row placement cannot file
 (an `n<seq>` notice, or a slash-command echo, which `control_event_item` emits
 with no ordinal). Both conjuncts matter: on the overrun alone it would discard
 pages that merge perfectly — one live reply landing mid-round-trip is enough —
-and each discard costs a round trip plus a REPLACE that resets the paging floor
-and snaps a reader scrolled up in history to the newest edge. It re-runs the
+and each discard costs a round trip plus a REPLACE. It re-runs the
 sync without demoting the cursor; `runSync` re-derives `syncSince` from the
 current thread, so it posts a fresh difference when the live rows already
 advanced the cursor and falls through to a baseline only when the thread is
@@ -267,9 +327,11 @@ Two ways the withheld head can be lost, both closed:
   truncated thread over the only copy of rows the cursor has long since passed,
   and `flushPersist` is synchronous on both `pagehide` and native's detach, so a
   back-out inside that frame reaches it;
-- a **REPLACE drops the reservoir unrendered** (`applySyncPage`) — those rows
-  describe a thread the server has just rebased away, and the page brings its own
-  paging window.
+- a **baseline REPLACE drops the reservoir unrendered** (`applySyncPage`) —
+  those rows describe a thread the repair has just rebuilt away, and the page
+  brings its own paging window. A *rebase* that keeps the rows above its floor
+  keeps the reservoir too: it is older than those, so it still describes the
+  thread on screen.
 
 While the head is withheld, `oldestOrdinal`/`hasMoreOlder` describe what is
 RENDERED (the tail's own floor, and "there is more older"); the drain hands the

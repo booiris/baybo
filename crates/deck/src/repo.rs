@@ -14,7 +14,8 @@
 //! reachable — a purged card's code is still recoverable via history.
 
 use std::path::Path;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 
 use tokio::process::Command;
 
@@ -33,20 +34,27 @@ const GITIGNORE_BODY: &str = ".staging/\ntmux-socks/\n";
 /// `card_id` scopes the `git add` so a concurrent mutation of another card
 /// can't be swept into this commit.
 pub async fn commit_card(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     deck_root: &Path,
     card_id: &str,
     title: &str,
     event: &str,
     detail: &str,
 ) -> Result<Option<String>, String> {
-    ensure_repo(deck_root).await?;
+    ensure_repo(process_manager, deck_root).await?;
 
-    run_git(deck_root, &[], &["add", "-A", "--", ".gitignore", card_id]).await?;
+    run_git(
+        process_manager,
+        deck_root,
+        &[],
+        &["add", "-A", "--", ".gitignore", card_id],
+    )
+    .await?;
 
     // `git diff --cached --quiet` exits 0 when nothing is staged — an
     // identical re-install has no new revision to record, which is a
     // no-op, not a failure.
-    if git_exit(deck_root, &["diff", "--cached", "--quiet"])
+    if git_exit(process_manager, deck_root, &["diff", "--cached", "--quiet"])
         .await?
         .success()
     {
@@ -56,6 +64,7 @@ pub async fn commit_card(
     let message =
         format!("deck: {event} {title} ({card_id})\n\nEvent: {event}\nDetail: {detail}\n");
     run_git(
+        process_manager,
         deck_root,
         &[
             "-c",
@@ -67,14 +76,23 @@ pub async fn commit_card(
     )
     .await?;
 
-    let sha = run_git(deck_root, &[], &["rev-parse", "--short", "HEAD"]).await?;
+    let sha = run_git(
+        process_manager,
+        deck_root,
+        &[],
+        &["rev-parse", "--short", "HEAD"],
+    )
+    .await?;
     Ok(Some(sha.trim().to_string()))
 }
 
 /// Ensure `deck_root` is a git repo with the staging `.gitignore` in
 /// place. Idempotent — a no-op once `.git` exists (the `.gitignore` is
 /// still re-created if an operator removed it).
-async fn ensure_repo(deck_root: &Path) -> Result<(), String> {
+async fn ensure_repo(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    deck_root: &Path,
+) -> Result<(), String> {
     tokio::fs::create_dir_all(deck_root)
         .await
         .map_err(|e| format!("create deck root: {e}"))?;
@@ -87,13 +105,21 @@ async fn ensure_repo(deck_root: &Path) -> Result<(), String> {
     if deck_root.join(".git").exists() {
         return Ok(());
     }
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("init")
         .args(["--quiet", "-b", "main"])
         .arg(deck_root)
-        .status()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = process_manager
+        .spawn(&mut command, "deck-git-init")
         .map_err(|e| format!("spawn git init: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait git init: {e}"))?;
     if !status.success() {
         return Err(format!("git init exited with {status}"));
     }
@@ -101,6 +127,7 @@ async fn ensure_repo(deck_root: &Path) -> Result<(), String> {
 }
 
 async fn run_git(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     deck_root: &Path,
     config_overrides: &[&str],
     subcommand: &[&str],
@@ -113,7 +140,16 @@ async fn run_git(
     for tok in subcommand {
         cmd.arg(tok);
     }
-    let output = cmd.output().await.map_err(|e| format!("spawn git: {e}"))?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process_manager
+        .spawn(&mut cmd, "deck-git")
+        .map_err(|e| format!("spawn git: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("wait git: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "git {} exited with {}: {}",
@@ -128,13 +164,23 @@ async fn run_git(
 /// Run a git subcommand whose non-zero exit is a meaningful answer (not an
 /// error) — `diff --cached --quiet` returns 1 when there are staged
 /// changes.
-async fn git_exit(deck_root: &Path, subcommand: &[&str]) -> Result<ExitStatus, String> {
+async fn git_exit(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    deck_root: &Path,
+    subcommand: &[&str],
+) -> Result<ExitStatus, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(deck_root);
     for tok in subcommand {
         cmd.arg(tok);
     }
-    cmd.status().await.map_err(|e| format!("spawn git: {e}"))
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = process_manager
+        .spawn(&mut cmd, "deck-git")
+        .map_err(|e| format!("spawn git: {e}"))?;
+    child.wait().await.map_err(|e| format!("wait git: {e}"))
 }
 
 #[cfg(test)]
@@ -142,9 +188,14 @@ mod tests {
     use super::*;
 
     async fn log_oneline(deck_root: &Path, pathspec: &str) -> Vec<String> {
-        let out = run_git(deck_root, &[], &["log", "--oneline", "--", pathspec])
-            .await
-            .unwrap();
+        let out = run_git(
+            &baybo_process::ProcessManager::transient(),
+            deck_root,
+            &[],
+            &["log", "--oneline", "--", pathspec],
+        )
+        .await
+        .unwrap();
         out.lines().map(str::to_string).collect()
     }
 
@@ -160,15 +211,29 @@ mod tests {
         let deck = tmp.path().join("deck");
 
         write_card(&deck, "card-a", "v1");
-        let first = commit_card(&deck, "card-a", "Quota", "install", "hash-1")
-            .await
-            .unwrap();
+        let first = commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "Quota",
+            "install",
+            "hash-1",
+        )
+        .await
+        .unwrap();
         assert!(first.is_some(), "install must record a revision");
 
         write_card(&deck, "card-a", "v2");
-        let second = commit_card(&deck, "card-a", "Quota", "update", "hash-1 -> hash-2")
-            .await
-            .unwrap();
+        let second = commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "Quota",
+            "update",
+            "hash-1 -> hash-2",
+        )
+        .await
+        .unwrap();
         assert!(second.is_some());
 
         // Two revisions for the card, newest first.
@@ -178,9 +243,14 @@ mod tests {
         assert!(history[1].contains("install"));
 
         // The prior version is recoverable from history.
-        let old = run_git(&deck, &[], &["show", "HEAD~1:card-a/service.js"])
-            .await
-            .unwrap();
+        let old = run_git(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            &[],
+            &["show", "HEAD~1:card-a/service.js"],
+        )
+        .await
+        .unwrap();
         assert_eq!(old.trim(), "v1");
     }
 
@@ -191,17 +261,31 @@ mod tests {
 
         write_card(&deck, "card-a", "v1");
         assert!(
-            commit_card(&deck, "card-a", "Quota", "install", "hash-1")
-                .await
-                .unwrap()
-                .is_some()
+            commit_card(
+                &baybo_process::ProcessManager::transient(),
+                &deck,
+                "card-a",
+                "Quota",
+                "install",
+                "hash-1"
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
         // No file change — nothing to commit.
         assert!(
-            commit_card(&deck, "card-a", "Quota", "install", "hash-1")
-                .await
-                .unwrap()
-                .is_none()
+            commit_card(
+                &baybo_process::ProcessManager::transient(),
+                &deck,
+                "card-a",
+                "Quota",
+                "install",
+                "hash-1"
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -213,9 +297,16 @@ mod tests {
         write_card(&deck, "card-a", "a1");
         write_card(&deck, "card-b", "b1");
         // Committing card-a must not sweep in card-b's still-untracked dir.
-        commit_card(&deck, "card-a", "A", "install", "ha")
-            .await
-            .unwrap();
+        commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "A",
+            "install",
+            "ha",
+        )
+        .await
+        .unwrap();
         assert!(log_oneline(&deck, "card-a").await.len() == 1);
         assert!(
             log_oneline(&deck, "card-b").await.is_empty(),
@@ -229,23 +320,42 @@ mod tests {
         let deck = tmp.path().join("deck");
 
         write_card(&deck, "card-a", "v1");
-        commit_card(&deck, "card-a", "Quota", "install", "hash-1")
-            .await
-            .unwrap();
+        commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "Quota",
+            "install",
+            "hash-1",
+        )
+        .await
+        .unwrap();
 
         std::fs::remove_dir_all(deck.join("card-a")).unwrap();
-        let purge = commit_card(&deck, "card-a", "Quota", "purge", "hard")
-            .await
-            .unwrap();
+        let purge = commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "Quota",
+            "purge",
+            "hard",
+        )
+        .await
+        .unwrap();
         assert!(purge.is_some(), "purge must record the removal");
 
         // Deletion + install are both in history; the code is still
         // recoverable from the pre-purge revision.
         let history = log_oneline(&deck, "card-a").await;
         assert_eq!(history.len(), 2, "{history:?}");
-        let recovered = run_git(&deck, &[], &["show", "HEAD~1:card-a/service.js"])
-            .await
-            .unwrap();
+        let recovered = run_git(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            &[],
+            &["show", "HEAD~1:card-a/service.js"],
+        )
+        .await
+        .unwrap();
         assert_eq!(recovered.trim(), "v1");
     }
 
@@ -257,11 +367,25 @@ mod tests {
         std::fs::write(deck.join(".staging").join("card-a.old").join("x"), "junk").unwrap();
 
         write_card(&deck, "card-a", "v1");
-        commit_card(&deck, "card-a", "Quota", "install", "hash-1")
-            .await
-            .unwrap();
+        commit_card(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            "card-a",
+            "Quota",
+            "install",
+            "hash-1",
+        )
+        .await
+        .unwrap();
 
-        let tracked = run_git(&deck, &[], &["ls-files"]).await.unwrap();
+        let tracked = run_git(
+            &baybo_process::ProcessManager::transient(),
+            &deck,
+            &[],
+            &["ls-files"],
+        )
+        .await
+        .unwrap();
         assert!(
             !tracked.contains(".staging"),
             "staging scratch must be gitignored: {tracked}"

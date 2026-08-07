@@ -64,6 +64,13 @@ The process runs **directly on the gateway host — no OS sandbox** — spawned 
 
 Restart backoff alone lets a crash-looping card burn CPU forever at the 30s floor, silently. So the supervisor keeps per-card failure counters: **5 crashes or 10 call timeouts inside a 10-minute sliding window auto-disable the card** — service stopped, `quarantined_at` stamped, the card renders an error face on the phone with a Re-enable action. A bad card degrades itself, never the gateway. (A per-card egress budget was considered and declined; timeout + quarantine is the accepted containment.)
 
+Every bun service and `ctx.exec` child is owned by the shared
+`baybo-process::ProcessManager`. The supervisor stores its management
+`JoinHandle`; stop/stop-all cancel and await that task, and the task sends the
+child stop signal and awaits its exit before returning. Dropping any layer still
+kills the whole process group, so a lost supervision task cannot orphan bun or
+one of its descendants.
+
 ### The SDK: runtime-injected, both sides
 
 Agent-generated plumbing is the most likely failure mode, so **card code contains none**. The gateway never runs `service.js` directly; it spawns a **preamble** bundled in the gateway binary which owns the stdio JSON-RPC framing (`init` / `call{id,op,params}` / `result` / `emit` / capability RPCs), builds `ctx`, imports `service.js`, and dispatches into its exports. A service is pure logic:

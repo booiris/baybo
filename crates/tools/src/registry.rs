@@ -260,6 +260,7 @@ mod tests {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>;
         ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
             blob_store,
+            process_manager: baybo_process::ProcessManager::transient(),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             proxy: None,
             permission: Arc::new(crate::builtin::LivePermissionMode::new(
@@ -277,6 +278,7 @@ mod tests {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn baybo_store::BlobStore>;
         let registry = ToolRegistry::with_defaults(crate::builtin::DefaultToolsConfig {
             blob_store,
+            process_manager: baybo_process::ProcessManager::transient(),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             proxy: None,
             permission: Arc::new(crate::builtin::LivePermissionMode::new(

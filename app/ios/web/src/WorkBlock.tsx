@@ -337,7 +337,7 @@ export const WorkBlockView = memo(function WorkBlockView({
       ? [{ kind: "machinery", steps: [], startedAt: row.startedAt }]
       : segments;
   return (
-    <div className="work-ladder">
+    <div className="work-ladder" data-row-id={row.id}>
       {runs.map((seg, i) =>
         seg.kind === "speech" ? (
           <div className="work-said" key={`s${i}`}>

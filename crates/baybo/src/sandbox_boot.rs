@@ -16,6 +16,7 @@ pub(crate) struct SandboxBoot {
 
 pub(crate) async fn resolve_sandbox_runner(
     permission: baybo_config::PermissionPolicy,
+    process_manager: Arc<baybo_process::ProcessManager>,
 ) -> Result<SandboxBoot, baybo_sandbox::SandboxError> {
     if cfg!(feature = "bench-bash") {
         // The bench profile ignores `permission` entirely and runs raw inside a
@@ -32,7 +33,7 @@ pub(crate) async fn resolve_sandbox_runner(
     }
 
     let sandbox_required = permission != baybo_config::PermissionPolicy::Free;
-    match baybo_sandbox::current_platform_runner() {
+    match baybo_sandbox::current_platform_runner(process_manager).await {
         Ok(runner) => match runner.warm().await {
             Ok(()) => {
                 info!(backend = ?runner.backend(), "OS sandbox ready");

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -15,18 +16,35 @@ use crate::error::SandboxError;
 use crate::spec::{Backend, EnvPolicy, FilesystemPolicy, SandboxOutput, SandboxSpec, StdinSource};
 
 pub struct SandboxExecRunner {
+    process_manager: Arc<baybo_process::ProcessManager>,
     binary: PathBuf,
 }
 
 impl SandboxExecRunner {
-    pub fn discover() -> Result<Self, SandboxError> {
+    pub fn discover(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<Self, SandboxError> {
         let binary = locate_binary("sandbox-exec")?;
-        Ok(Self { binary })
+        Ok(Self {
+            process_manager,
+            binary,
+        })
     }
 
-    pub async fn probe() -> Result<SandboxAvailability, SandboxError> {
+    pub async fn probe(
+        process_manager: Arc<baybo_process::ProcessManager>,
+    ) -> Result<SandboxAvailability, SandboxError> {
         let binary = locate_binary("sandbox-exec")?;
-        let out = Command::new(&binary).arg("-h").output().await.ok();
+        let mut command = Command::new(&binary);
+        command
+            .arg("-h")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = match process_manager.spawn(&mut command, "sandbox-probe:sandbox-exec") {
+            Ok(child) => child.wait_with_output().await.ok(),
+            Err(_) => None,
+        };
         let version = out.as_ref().and_then(|o| parse_version(&o.stdout));
         Ok(SandboxAvailability {
             backend: Backend::SandboxExec,
@@ -100,9 +118,7 @@ impl SandboxExecRunner {
         } else {
             cmd.current_dir(&spec.workspace_root);
         }
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(match spec.stdin {
             StdinSource::Null => Stdio::null(),
             StdinSource::Inherit => Stdio::inherit(),
@@ -117,10 +133,12 @@ impl SandboxExecRunner {
         &self,
         mut cmd: Command,
         stdin: &StdinSource,
-    ) -> Result<tokio::process::Child, SandboxError> {
-        let mut child = cmd.spawn()?;
+    ) -> Result<baybo_process::ManagedChild, SandboxError> {
+        let mut child = self
+            .process_manager
+            .spawn(&mut cmd, "sandbox:sandbox-exec")?;
         if let StdinSource::Bytes(bytes) = stdin
-            && let Some(mut handle) = child.stdin.take()
+            && let Some(mut handle) = child.take_stdin()
         {
             let bytes = bytes.clone();
             tokio::spawn(async move {
@@ -222,7 +240,7 @@ impl SandboxRunner for SandboxExecRunner {
 /// (Workspace policy) so it outlives the child rather than being removed when
 /// `spawn_detached` returns.
 struct SandboxExecDetachedChild {
-    child: tokio::process::Child,
+    child: baybo_process::ManagedChild,
     _scratch: Option<tempfile::TempDir>,
 }
 
@@ -230,14 +248,12 @@ struct SandboxExecDetachedChild {
 impl crate::DetachedChild for SandboxExecDetachedChild {
     fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         self.child
-            .stderr
-            .take()
+            .take_stderr()
             .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
     }
     async fn wait(&mut self) -> i32 {

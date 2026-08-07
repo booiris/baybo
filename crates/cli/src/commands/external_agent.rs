@@ -21,17 +21,17 @@ const RESTART_HINT: &str =
 
 pub async fn handle(ctx: &CommandContext, cmd: ExternalAgentCmd) -> Result<CommandOutput> {
     match cmd {
-        ExternalAgentCmd::Status => status(ctx),
+        ExternalAgentCmd::Status => status(ctx).await,
         ExternalAgentCmd::Setup => setup(ctx).await,
         ExternalAgentCmd::Disable => disable(ctx).await,
     }
 }
 
-fn status(ctx: &CommandContext) -> Result<CommandOutput> {
+async fn status(ctx: &CommandContext) -> Result<CommandOutput> {
     let mut human = String::new();
     let mut data: Vec<Value> = Vec::new();
     for kind in ExternalAgentKind::ALL.iter().copied() {
-        let row = describe_kind(ctx, kind);
+        let row = describe_kind(ctx, kind).await;
         let enabled_label = if row.enabled { "enabled" } else { "DISABLED" };
         let probe_label = match &row.probe {
             ProbeOutcome::Ok { resolved_path } => format!("ok ({resolved_path})"),
@@ -93,7 +93,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     // PATH at boot — under a different cwd and possibly a narrower PATH
     // than this CLI. Pinning the concrete absolute location setup just
     // validated keeps both sides on the same binary.
-    let binary_path = match probe(kind, binary_override.as_deref()) {
+    let binary_path = match probe(kind, binary_override.as_deref()).await {
         Ok(resolved) => ensure_absolute(&resolved)?,
         Err(e) => {
             return Err(CliError::Manager(format!(
@@ -199,7 +199,7 @@ enum ProbeOutcome {
     Failed(String),
 }
 
-fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
+async fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
     let (enabled, configured_path) = match kind {
         ExternalAgentKind::Claude => (
             ctx.config.external_agents.claude.enabled,
@@ -210,7 +210,7 @@ fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
             ctx.config.external_agents.codex.binary_path.clone(),
         ),
     };
-    let probe = match probe(kind, configured_path.as_deref()) {
+    let probe = match probe(kind, configured_path.as_deref()).await {
         Ok(resolved_path) => ProbeOutcome::Ok { resolved_path },
         Err(ExternalAgentError::NotInstalled(_)) => ProbeOutcome::NotInstalled,
         Err(e) => ProbeOutcome::Failed(e.to_string()),
@@ -226,17 +226,27 @@ fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
 /// success — that's what the status output renders. The agent itself
 /// is built and thrown away; we just want the side-effect of running
 /// the same checks boot does.
-fn probe(
+async fn probe(
     kind: ExternalAgentKind,
     binary_path: Option<&str>,
 ) -> std::result::Result<String, ExternalAgentError> {
     match kind {
         ExternalAgentKind::Claude => {
-            let agent = ClaudeCliAgent::probe_and_build(binary_path, None)?;
+            let agent = ClaudeCliAgent::probe_and_build(
+                baybo_process::ProcessManager::transient(),
+                binary_path,
+                None,
+            )
+            .await?;
             Ok(agent.binary_path().display().to_string())
         }
         ExternalAgentKind::Codex => {
-            let agent = CodexCliAgent::probe_and_build(binary_path, None)?;
+            let agent = CodexCliAgent::probe_and_build(
+                baybo_process::ProcessManager::transient(),
+                binary_path,
+                None,
+            )
+            .await?;
             Ok(agent.binary_path().display().to_string())
         }
     }

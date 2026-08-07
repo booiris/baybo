@@ -86,6 +86,7 @@ pub use write::WriteTool;
 /// and an `Arc` that read the same way in any order.
 pub struct DefaultToolsConfig {
     pub blob_store: Arc<dyn BlobStore>,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
     pub workspace_paths: WorkspacePaths,
     pub proxy: Option<reqwest::Proxy>,
     pub permission: Arc<bash::LivePermissionMode>,
@@ -98,6 +99,7 @@ pub struct DefaultToolsConfig {
 pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let DefaultToolsConfig {
         blob_store,
+        process_manager,
         workspace_paths,
         proxy,
         permission,
@@ -116,11 +118,18 @@ pub fn default_tools(config: DefaultToolsConfig) -> Vec<(Arc<dyn Tool>, ToolMani
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            BashTool::new(workspace_paths).with_permission_handle(permission),
+            BashTool::new(workspace_paths, Arc::clone(&process_manager))
+                .with_permission_handle(permission),
             vec![ToolCapability::ExecCommand],
         ),
-        trusted(GlobTool, vec![ToolCapability::ReadFile]),
-        trusted(GrepTool, vec![ToolCapability::ReadFile]),
+        trusted(
+            GlobTool::new(Arc::clone(&process_manager)),
+            vec![ToolCapability::ReadFile],
+        ),
+        trusted(
+            GrepTool::new(process_manager),
+            vec![ToolCapability::ReadFile],
+        ),
         trusted(
             WebFetchTool::new(blob_store.clone(), proxy),
             vec![ToolCapability::Http],

@@ -23,8 +23,10 @@ async fn echo_through_sandbox_exec() {
         eprintln!("skipping: sandbox-exec not on $PATH");
         return;
     }
-    let runner: Arc<dyn SandboxRunner> =
-        Arc::new(SandboxExecRunner::discover().expect("sandbox-exec runner"));
+    let runner: Arc<dyn SandboxRunner> = Arc::new(
+        SandboxExecRunner::discover(baybo_process::ProcessManager::transient())
+            .expect("sandbox-exec runner"),
+    );
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = runner
         .run(SandboxSpec {
@@ -58,8 +60,10 @@ async fn host_tmp_writes_are_denied() {
         eprintln!("skipping: sandbox-exec not on $PATH");
         return;
     }
-    let runner: Arc<dyn SandboxRunner> =
-        Arc::new(SandboxExecRunner::discover().expect("sandbox-exec runner"));
+    let runner: Arc<dyn SandboxRunner> = Arc::new(
+        SandboxExecRunner::discover(baybo_process::ProcessManager::transient())
+            .expect("sandbox-exec runner"),
+    );
     let tmp = tempfile::tempdir().expect("tempdir");
     let marker = format!("/tmp/baybo-sandbox-host-escape-{}", std::process::id());
     let _ = std::fs::remove_file(&marker);

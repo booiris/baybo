@@ -250,6 +250,7 @@ pub(crate) struct SpawnConfig {
     pub scratch_dir: PathBuf,
     /// Effective emit clamp (manifest floor already applied).
     pub emit_interval: Duration,
+    pub process_manager: Arc<baybo_process::ProcessManager>,
 }
 
 /// Spawn + init one card service on the host. Waits for the child's
@@ -276,24 +277,24 @@ pub(crate) async fn spawn_service(
         .current_dir(&cfg.bundle_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(|e| {
-        DeckError::ServiceUnavailable(format!(
-            "failed to launch `{}` ({e}); is bun installed and on PATH? \
+        .stderr(Stdio::piped());
+    let mut child = cfg
+        .process_manager
+        .spawn(&mut cmd, format!("deck-service:{}", cfg.card_id))
+        .map_err(|e| {
+            DeckError::ServiceUnavailable(format!(
+                "failed to launch `{}` ({e}); is bun installed and on PATH? \
              (override with {DECK_BUN_ENV})",
-            bun_binary().display()
-        ))
-    })?;
+                bun_binary().display()
+            ))
+        })?;
     let stdin = child
-        .stdin
-        .take()
+        .take_stdin()
         .ok_or_else(|| DeckError::Internal("child stdin unavailable".into()))?;
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| DeckError::Internal("child stdout unavailable".into()))?;
-    let stderr = child.stderr.take();
+    let stderr = child.take_stderr();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
     let mut stdin = stdin;
@@ -505,7 +506,7 @@ pub(crate) async fn spawn_service(
 
     // Waiter task owns the child: kill signal or natural death.
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
-    let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+    let (exit_tx, mut exit_rx) = oneshot::channel::<i32>();
     tokio::spawn(async move {
         let status = tokio::select! {
             status = child.wait() => status,
@@ -522,6 +523,7 @@ pub(crate) async fn spawn_service(
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(err))) => {
             let _ = kill_tx.send(()).await;
+            let _ = (&mut exit_rx).await;
             let tail = stderr_tail.lock().clone();
             return Err(DeckError::DryRun(format!(
                 "service failed to boot: {err}{}",
@@ -534,6 +536,7 @@ pub(crate) async fn spawn_service(
         }
         Ok(Err(_)) | Err(_) => {
             let _ = kill_tx.send(()).await;
+            let _ = (&mut exit_rx).await;
             let tail = stderr_tail.lock().clone();
             return Err(DeckError::DryRun(format!(
                 "service did not become ready within {READY_TIMEOUT:?}{}",

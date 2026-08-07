@@ -7,7 +7,7 @@
 //! entries at construction time and merges them with the user list on
 //! every tick.
 //!
-//! The struct is consumed by [`crate::mcp::McpReconciler::new`]; the
+//! The struct is consumed by [`crate::mcp::McpReconciler::from_config`]; the
 //! gateway builds it from `baybo_gateway::sidecar::SidecarRuntime` (which
 //! lives in `baybo-gateway` and isn't visible from this crate).
 

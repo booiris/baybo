@@ -5,6 +5,7 @@
 //! and parses the raw stdout itself.
 
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -43,6 +44,7 @@ impl Captured {
 /// output. Only spawn / wait / pipe failures surface as `Err`; a
 /// non-zero exit is reported via [`Captured::code`].
 pub(super) async fn capture(
+    process_manager: &Arc<baybo_process::ProcessManager>,
     ctx: &ToolContext,
     max_stdout: u64,
     configure: impl FnOnce(&mut Command),
@@ -54,25 +56,24 @@ pub(super) async fn capture(
     configure(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ToolError::Execution(
-            "ripgrep (`rg`) not found on PATH; install it (e.g. `apt install ripgrep`, \
+    let mut child = process_manager
+        .spawn(&mut cmd, "ripgrep")
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ToolError::Execution(
+                "ripgrep (`rg`) not found on PATH; install it (e.g. `apt install ripgrep`, \
              `brew install ripgrep`, `pacman -S ripgrep`)"
-                .into(),
-        ),
-        _ => ToolError::Execution(format!("spawn rg: {e}")),
-    })?;
+                    .into(),
+            ),
+            _ => ToolError::Execution(format!("spawn rg: {e}")),
+        })?;
 
     let stdout_pipe = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| ToolError::Execution("rg stdout pipe missing".into()))?;
     let stderr_pipe = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| ToolError::Execution("rg stderr pipe missing".into()))?;
 
     let stdout_task = tokio::spawn(async move {

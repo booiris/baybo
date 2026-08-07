@@ -6,6 +6,7 @@ members = [
     "crates/wire",
     "crates/device-proto",
     "crates/llm",
+    "crates/process",
     "crates/tools",
     "crates/workspace",
     "crates/context",
@@ -66,6 +67,7 @@ remote-host-protocol = { path = "remote-host/crates/protocol" }
 remote-host-relay = { path = "remote-host/crates/relay" }
 remote-host-admission = { path = "remote-host/crates/admission" }
 baybo-llm = { path = "crates/llm" }
+baybo-process = { path = "crates/process" }
 baybo-tools = { path = "crates/tools" }
 baybo-workspace = { path = "crates/workspace", default-features = false }
 baybo-context = { path = "crates/context" }

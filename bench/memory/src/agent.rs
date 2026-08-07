@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 /// Env var `baybo` reads for its config path (mirrors `baybo_workspace::paths`).
 const BAYBO_CONFIG_ENV: &str = "BAYBO_CONFIG_PATH";
@@ -163,7 +163,7 @@ pub fn generate_config(
 /// invocations against it share its config (same workspace → they find its
 /// admin addr + tui token).
 pub struct GatewayHandle {
-    child: Child,
+    child: baybo_process::ManagedChild,
     baybo_bin: String,
     config_path: PathBuf,
 }
@@ -177,13 +177,16 @@ impl GatewayHandle {
         config_path: &Path,
         admin_addr: SocketAddr,
     ) -> Result<Self> {
-        let child = Command::new(baybo_bin)
+        let process_manager = baybo_process::ProcessManager::transient();
+        let mut command = Command::new(baybo_bin);
+        command
             .args(["gateway", "start"])
             .env(BAYBO_CONFIG_ENV, config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        let child = process_manager
+            .spawn(&mut command, "bench-memory:gateway")
             .with_context(|| format!("spawn `{baybo_bin} gateway start`"))?;
         let mut handle = Self {
             child,

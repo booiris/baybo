@@ -7,7 +7,7 @@
 //! anchors the match relative to the search root.
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,7 +41,20 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-pub struct GlobTool;
+pub struct GlobTool {
+    process_manager: Arc<baybo_process::ProcessManager>,
+}
+
+impl GlobTool {
+    pub fn new(process_manager: Arc<baybo_process::ProcessManager>) -> Self {
+        Self { process_manager }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self::new(baybo_process::ProcessManager::transient())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Params {
@@ -115,11 +128,15 @@ impl Tool for GlobTool {
             )));
         }
 
-        run_glob(&p, ctx).await
+        run_glob(&self.process_manager, &p, ctx).await
     }
 }
 
-async fn run_glob(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+async fn run_glob(
+    process_manager: &Arc<baybo_process::ProcessManager>,
+    p: &Params,
+    ctx: &ToolContext,
+) -> crate::Result<ToolOutput> {
     // rg matches `--glob` against each candidate path relative to its own
     // working directory, so we run rg *inside* the search root and search
     // `.` rather than passing the root as an argument — otherwise an
@@ -153,7 +170,7 @@ async fn run_glob(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
     // tail keeps the most recent matches; `--hidden` + `--no-ignore`
     // mirror a plain filesystem walk (dotfiles included, .gitignore not
     // applied); `--null` delimits paths unambiguously.
-    let cap = rg::capture(ctx, rg::MAX_STDOUT_BYTES, |cmd| {
+    let cap = rg::capture(process_manager, ctx, rg::MAX_STDOUT_BYTES, |cmd| {
         cmd.current_dir(&p.path)
             .arg("--files")
             .arg("--hidden")
@@ -214,7 +231,8 @@ mod tests {
     }
 
     async fn text(params: Value) -> String {
-        let ToolOutput::Text(s) = GlobTool.execute(params, &ctx()).await.unwrap() else {
+        let ToolOutput::Text(s) = GlobTool::for_test().execute(params, &ctx()).await.unwrap()
+        else {
             panic!("expected text output");
         };
         s
@@ -222,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_relative_path() {
-        let err = GlobTool
+        let err = GlobTool::for_test()
             .execute(json!({ "pattern": "*.rs", "path": "relative/dir" }), &ctx())
             .await
             .unwrap_err();
@@ -234,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_path() {
-        let err = GlobTool
+        let err = GlobTool::for_test()
             .execute(json!({ "pattern": "*.rs" }), &ctx())
             .await
             .unwrap_err();
@@ -247,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_absolute_pattern() {
         let dir = tempfile::tempdir().unwrap();
-        let err = GlobTool
+        let err = GlobTool::for_test()
             .execute(
                 json!({ "pattern": "/etc/**/*", "path": dir.path() }),
                 &ctx(),
@@ -269,7 +287,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GlobTool
+        let out = GlobTool::for_test()
             .execute(json!({ "pattern": "*.rs", "path": dir.path() }), &ctx())
             .await
             .unwrap();
@@ -292,7 +310,7 @@ mod tests {
         tokio::fs::create_dir(&sub).await.unwrap();
         tokio::fs::write(sub.join("deep.rs"), "").await.unwrap();
 
-        let out = GlobTool
+        let out = GlobTool::for_test()
             .execute(json!({ "pattern": "*", "path": dir.path() }), &ctx())
             .await
             .unwrap();
@@ -314,7 +332,7 @@ mod tests {
         tokio::fs::write(sub.join("low.rs"), "").await.unwrap();
         tokio::fs::write(sub.join("note.txt"), "").await.unwrap();
 
-        let out = GlobTool
+        let out = GlobTool::for_test()
             .execute(json!({ "pattern": "*.rs", "path": dir.path() }), &ctx())
             .await
             .unwrap();
@@ -387,7 +405,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = GlobTool
+        let out = GlobTool::for_test()
             .execute(
                 json!({ "pattern": "*.nomatch", "path": dir.path() }),
                 &ctx(),

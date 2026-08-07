@@ -24,6 +24,7 @@ serde_json = { workspace = true }
 # through its concrete (context-free) methods.
 baybo-memory = { workspace = true }
 baybo-model = { workspace = true }
+baybo-process = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }

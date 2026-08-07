@@ -253,6 +253,21 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
+/// The topmost row still on screen, and how far below the viewport's top edge it
+/// sat — what a REPLACE has to put back under a reader parked in history. Every
+/// row carries `data-row-id` for exactly this (and for the message index's
+/// jump), and a REPLACE reuses a surviving row's key, so the handle is still
+/// findable in the rebuilt thread. `null` when no row is on screen to hold onto.
+function captureRowAnchor(): { rowId: string; top: number } | null {
+  for (const el of document.querySelectorAll("[data-row-id]")) {
+    const rect = el.getBoundingClientRect();
+    if (rect.bottom <= 0) continue;
+    const rowId = el.getAttribute("data-row-id");
+    return rowId === null ? null : { rowId, top: rect.top };
+  }
+  return null;
+}
+
 /// Recognise a `/stop` the way the gateway's parser does (leading `/`, first
 /// token, tolerant of a `@bot` suffix / trailing args), so the client can drop
 /// the command's user echo — the native stop button issues `/stop` as an
@@ -337,6 +352,26 @@ export function syncSince(cursor: number | null, rows: Row[]): number | null {
     if (ordinal !== null && ordinal > cursor) return null;
   }
   return cursor;
+}
+
+/// The rows a rebased page does not reach: everything before the FIRST row whose
+/// ordinal the page's window covers. `taken` drops any the rebuild already
+/// carries, so an id can never render twice.
+///
+/// Cut by POSITION, not filtered by ordinal: a notice / `/stop` mark carries no
+/// ordinal to compare, and filtering would delete every one of them out of the
+/// half that survives. The cut keeps each interleaved row with the neighbours it
+/// was written between.
+export function rowsAboveFloor(rows: Row[], floor: number, taken: ReadonlySet<string>): Row[] {
+  let cut = rows.length;
+  for (let i = 0; i < rows.length; i++) {
+    const ordinal = rowCoverageOrdinal(rows[i]);
+    if (ordinal !== null && ordinal >= floor) {
+      cut = i;
+      break;
+    }
+  }
+  return rows.slice(0, cut).filter((r) => !taken.has(r.id));
 }
 
 /// Ids of the rows that get a `CompactionDivider` rendered *before* them: the
@@ -1213,13 +1248,23 @@ export function clearAwaitingApproval(step: WorkStep): WorkStep {
 /// either, so the block would read "worked for a moment" forever. A BASELINE
 /// sync is the only way back — hence `cursor: null` on such a restore.
 ///
-/// Self-limiting, and never a loop: the baseline REPLACE rebuilds the newest
-/// page from the gateway with true timing and re-persists healed, so the next
-/// open takes the normal difference path. A block too old for that page is
-/// dropped from the thread by the REPLACE (and pages back in timed), so it stops
-/// matching too. Worst case is one baseline pull per open.
+/// Only the TAIL is asked, and that window is load-bearing rather than a
+/// shortcut. The demotion buys a re-timing only for a block the baseline page
+/// actually re-delivers, and that page is the newest `SYNC_BASELINE_LIMIT`
+/// transcript rows. Older blocks used to be healed by deletion — the REPLACE
+/// dropped everything the page didn't carry — but a non-repair REPLACE now KEEPS
+/// the rows above the page's floor (`rowsAboveFloor`), so a block up there would
+/// survive, match again on the next open, and demote the cursor forever: a
+/// baseline REPLACE on every single open, for a block no baseline can reach.
+///
+/// Within the window it stays self-limiting: the page rebuilds those blocks with
+/// the gateway's timing and re-persists healed, so the next open takes the
+/// normal difference path. Worst case is one baseline pull per open — of a chat
+/// whose newest page holds a turn the gateway cannot time either (a cancelled or
+/// crashed turn has no `work_ended_at`), which costs a round trip and, since the
+/// rows are no longer in doubt, nothing on screen.
 export function hasUntimedWork(rows: Row[] | undefined): boolean {
-  return (rows ?? []).some(
+  return (rows ?? []).slice(-SYNC_BASELINE_LIMIT).some(
     (r) =>
       r.role === "work" &&
       !r.active &&
@@ -2394,14 +2439,21 @@ const MessageRow = memo(function MessageRow({
       // Compact stand-in for the gateway's `/stop` acknowledgement: a hairline
       // rule flanking a small square + "Stopped", centered.
       return (
-        <div className="stopped-indicator" role="status">
+        <div className="stopped-indicator" role="status" data-row-id={m.id}>
           <span className="stopped-mark" aria-hidden="true" />
           {t("chat.stopped")}
         </div>
       );
     }
     const level = m.level ?? "";
-    return <div className={level === "" ? "bubble notice" : `bubble notice notice-${level}`}>{m.content}</div>;
+    return (
+      <div
+        className={level === "" ? "bubble notice" : `bubble notice notice-${level}`}
+        data-row-id={m.id}
+      >
+        {m.content}
+      </div>
+    );
   }
 
   const attachments = m.attachments ?? [];
@@ -2418,7 +2470,7 @@ const MessageRow = memo(function MessageRow({
 
   if (m.role === "assistant") {
     return (
-      <div className="msg-group assistant">
+      <div className="msg-group assistant" data-row-id={m.id}>
         {attachments.map((a, i) => (
           <AttachmentBubble key={`${a.blob_id}-${i}`} attachment={a} connEpoch={connEpoch} />
         ))}
@@ -2625,6 +2677,10 @@ export function Transcript({
   // Guards one in-flight sync request (the `sync_page`/`sync_failed` reply
   // clears it) so a burst of triggers coalesces to one pull.
   const syncInFlight = useRef(false);
+  // Whether the baseline currently in flight is a REPAIR — see `runSync`. Only a
+  // repair may throw the loaded history away; the other baselines rebuild the
+  // newest page over rows that were never in doubt.
+  const baselineIsRepair = useRef(false);
   // Render-visible mirror of that guard. An EMPTY thread with a sync in flight
   // is the one open the mirror cannot serve — a session this device has never
   // rendered (started on web/TUI, a cron fire, a push tap into a new session,
@@ -2673,6 +2729,11 @@ export function Transcript({
   // viewport (prepending above the top would otherwise jump the scroll
   // position).
   const prependAnchor = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+  // Set just before a REPLACE swaps the durable thread under a reader who is NOT
+  // at the newest edge: the row they were on and where it sat. The layout effect
+  // below puts it back under the same pixel, and falls back to the newest edge
+  // when the rebuild dropped it.
+  const replaceAnchor = useRef<{ rowId: string; top: number } | null>(null);
   // Whether the viewport is pinned to the newest edge (bottom). Maintained by
   // the window scroll listener; new content auto-scrolls only while pinned, so a
   // reader who scrolled up into history isn't yanked back down.
@@ -2784,13 +2845,19 @@ export function Transcript({
 
   // While pinned to the newest edge, keep it in view as content lands (rows,
   // stream deltas, the turn indicator) — pre-paint, so a bubble never paints
-  // off-screen first. A scroll-up PREPEND is exempt even while pinned (a short
-  // thread's "load earlier" tap): the anchor effect below owns that viewport
-  // change — this effect is declared first so the armed anchor is still
-  // visible.
+  // off-screen first. A scroll-up PREPEND and a REPLACE are exempt even while
+  // pinned (a short thread's "load earlier" tap): the anchor effects below own
+  // those viewport changes — this effect is declared first so an armed anchor is
+  // still visible.
   useLayoutEffect(() => {
     const el = scrollEl();
-    if (el && followRef.current && !prependAnchor.current && !userTouchingRef.current) {
+    if (
+      el &&
+      followRef.current &&
+      !prependAnchor.current &&
+      !replaceAnchor.current &&
+      !userTouchingRef.current
+    ) {
       el.scrollTop = el.scrollHeight;
     }
   }, [messages, streaming, turnActive]);
@@ -2872,6 +2939,26 @@ export function Transcript({
     if (!anchor || !el) return;
     el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
     prependAnchor.current = null;
+  }, [messages]);
+
+  // After a REPLACE, put the row the reader was on back under the same pixel.
+  // Declared AFTER the prepend anchor so a history page and a REPLACE landing in
+  // one batch settle on the MEASURED row rather than on the prepend's arithmetic
+  // (which knows nothing about the rows the REPLACE swapped out from under it).
+  useLayoutEffect(() => {
+    const anchor = replaceAnchor.current;
+    const el = scrollEl();
+    if (!anchor || !el) return;
+    replaceAnchor.current = null;
+    const node = document.querySelector(`[data-row-id="${CSS.escape(anchor.rowId)}"]`);
+    if (node === null) {
+      // The rebuild dropped the row — there is nothing left to hold a position
+      // against, which is the baseline repair path's whole premise. Newest edge.
+      followRef.current = true;
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    el.scrollTop += node.getBoundingClientRect().top - anchor.top;
   }, [messages]);
 
   const foldMidTurnNotice = useCallback((level: string, text: string) => {
@@ -3293,7 +3380,18 @@ export function Transcript({
   // by the reply).
   const runSync = useCallback(() => {
     if (syncInFlight.current) return;
-    const since = syncSince(cursorRef.current.cursor, messagesRef.current);
+    const cursor = cursorRef.current.cursor;
+    const since = syncSince(cursor, messagesRef.current);
+    // WHY this baseline is going out, which the reply cannot tell us — the frame
+    // carries only `since_ordinal: null`, and the two reasons want opposite
+    // things from the rebuild. `syncSince` refusing a NON-null cursor means a
+    // rendered row outran it: the thread may be out of ORDER (the scramble this
+    // gate was written against), so the repair has to drop all of it. A cursor
+    // that is simply `null` — a fresh install, or the deliberate
+    // `restoredUntimedWork` demotion — says nothing against the rows on screen;
+    // we just have no watermark, or want one block re-timed. Read once per pull:
+    // `syncInFlight` keeps one request outstanding at a time.
+    baselineIsRepair.current = since === null && cursor !== null;
     const limit = since === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
     setSyncInFlight(true);
     try {
@@ -3351,8 +3449,7 @@ export function Transcript({
       // BOTH conditions, and the narrowness is the point: keying on the
       // overrun alone discards pages that merge perfectly — one live reply
       // landing mid-round-trip is enough to trip it — and each discard costs a
-      // round trip plus a REPLACE that resets `oldestOrdinal`/`hasMoreOlder`
-      // and snaps a reader scrolled up in history to the newest edge.
+      // round trip plus a REPLACE.
       //
       // Re-running the sync is the whole response: the cursor is NOT demoted to
       // `null`. `runSync` re-derives `syncSince` from the CURRENT thread, so the
@@ -3400,17 +3497,59 @@ export function Transcript({
           turnActiveRef.current ? dropInFlightAnswerStep(pageRows) : pageRows,
           frame.compaction_points ?? [],
         );
-        setMessages((prev) => applySyncReplace(prev, folded, unconfirmedSends.current));
-        // The page IS the thread now, and it brings its own paging window. Rows
-        // still withheld from the first paint describe the thread this REPLACE
-        // just rebased away — prepending them a frame later would weld a stale
-        // head onto it, under a floor that no longer refers to them.
-        deferredHead.current = [];
-        oldestOrdinal.current = frame.oldest_ordinal;
-        setHasMoreOlder(frame.has_more_older);
-        // The rebuilt thread IS the newest page — pre-sync scroll position is
-        // meaningless, so snap to the newest edge.
-        followRef.current = true;
+        // Only a REPAIR (`runSync`: a rendered row outran a non-null cursor, so
+        // the thread may be out of order) throws the loaded history away. The
+        // other two REPLACEs do not put those rows in doubt:
+        //
+        // - a REBASE says only that the difference outran the server's limit or
+        //   its scan bound and here is the newest page instead — NOT that
+        //   ordinals were rewritten (docs/sync-protocol.md "Gap > limit →
+        //   rebase");
+        // - a cursor-less BASELINE is a fresh install (no older rows to keep) or
+        //   the deliberate `restoredUntimedWork` demotion, which asks the gateway
+        //   to re-time ONE block and says nothing about the rest.
+        //
+        // Dropping them there is what makes a REPLACE cost a reader the history
+        // they scrolled up for plus the round trips that fetched it.
+        //
+        // `oldestOrdinal` is by construction the oldest durable ordinal actually
+        // RENDERED (`prependOlder` sets it from the page it just folded in; the
+        // mirror's split seeds it from the half it painted), so a floor strictly
+        // below the page's is the same statement as "there are rows above it".
+        const repair = frame.since_ordinal === null && baselineIsRepair.current;
+        const pageFloor = frame.oldest_ordinal;
+        const keepFloor =
+          !repair &&
+          pageFloor !== null &&
+          oldestOrdinal.current !== null &&
+          oldestOrdinal.current < pageFloor
+            ? pageFloor
+            : null;
+        // Read the reader's place off the CURRENT DOM, before the swap is
+        // scheduled. A reader already at the newest edge is snapped back to it
+        // (the pin owns that). One parked up in history is NOT: the rebuilt page
+        // reuses every surviving row's key, so the row they were reading is
+        // still on screen and the anchor effect puts it back under the same
+        // pixel — and only if the rebuild dropped it do they land at the bottom.
+        if (!followRef.current) replaceAnchor.current = captureRowAnchor();
+        setMessages((prev) => {
+          const rebuilt = applySyncReplace(prev, folded, unconfirmedSends.current);
+          if (keepFloor === null) return rebuilt;
+          const head = rowsAboveFloor(prev, keepFloor, new Set(rebuilt.map((r) => r.id)));
+          if (head.length === 0) return rebuilt;
+          // The seam is the same one scroll-up paging makes: a turn wider than
+          // the page has a work block on both sides of it and must stay one card.
+          return foldAdjacentWork([...head, ...rebuilt], frame.compaction_points ?? []);
+        });
+        if (keepFloor === null) {
+          // The page IS the thread now, and it brings its own paging window. Rows
+          // still withheld from the first paint describe the thread this REPLACE
+          // just rebased away — prepending them a frame later would weld a stale
+          // head onto it, under a floor that no longer refers to them.
+          deferredHead.current = [];
+          oldestOrdinal.current = frame.oldest_ordinal;
+          setHasMoreOlder(frame.has_more_older);
+        }
         if (!turnActiveRef.current) clearStreaming();
       } else {
         setMessages((prev) => mergeSyncPage(prev, pageRows, frame.compaction_points ?? []));

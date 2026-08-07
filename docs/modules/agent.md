@@ -260,6 +260,11 @@ The observer fires from the loop's **`Continue` arm only** — after an iteratio
 
 **External CLI subagents** (`external_agent/*`, claude/codex) — opaque subprocesses, so they get real wall-clock guards:
 
+Both CLIs are spawned through the runtime's `ProcessManager`. Cancellation,
+timeout, stream EOF, task drop, process-wide shutdown, and crash recovery all
+reap the full CLI process tree rather than only the direct `claude`/`codex`
+process.
+
 | Const | Value | Meaning |
 |-------|-------|---------|
 | `EXTERNAL_SUBAGENT_TIMEOUT` | 8h | **idle** safety timeout; resets on every output line, kills only a silent/hung process |
