@@ -25,13 +25,17 @@ const ISSUE: Issue = {
 };
 
 let seq = 0;
-function entry(body: IssueEventBody, agent?: string): IssueEvent {
+// A ULID id with a separate handle, the way the server ships one: a
+// fixture that reused the handle as the id could not tell them apart.
+function entry(body: IssueEventBody, handle?: string): IssueEvent {
   seq += 1;
   return {
     id: `evt-${seq}`,
     number: 4,
-    actor: agent ?? 'user',
-    actor_is_agent: agent != null,
+    actor:
+      handle == null
+        ? { kind: 'user' }
+        : { kind: 'agent', id: '01JC3KQ4Z8AAAAAAAAAAAAAAAA', handle },
     body,
     created_at_ms: Date.now(),
   };

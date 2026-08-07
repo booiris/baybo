@@ -5,17 +5,21 @@
 //! it. That is the whole point: a second predicate somewhere else is how
 //! a board ends up with two different answers to "does this start now?".
 
-use baybo_model::IssueRunId;
+use baybo_model::{AgentProfileId, IssueRunId};
 use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
 
 /// What a write did to an issue, in the only terms the predicate cares
 /// about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The assignee is carried whole rather than reduced to "somebody is on
+/// it": handing live work to a *different* agent is an edge the predicate
+/// has to see, and a bool cannot show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
     pub before_status: IssueStatus,
-    pub before_assigned: bool,
+    pub before_assignee: Option<AgentProfileId>,
     pub after_status: IssueStatus,
-    pub after_assigned: bool,
+    pub after_assignee: Option<AgentProfileId>,
 }
 
 /// Whether this transition starts work, and why.
@@ -25,25 +29,26 @@ pub struct Transition {
 ///
 /// * the issue **enters** In Progress with somebody on it — a drag, a REST
 ///   move, an agent's own status change;
-/// * an agent is **put on** an issue already sitting in In Progress —
-///   without this, assigning a card that is already in the column leaves
-///   the board claiming work is under way that nobody started.
+/// * an agent is **put on** an issue already sitting in In Progress,
+///   including in place of a different one — without this, assigning a card
+///   that is already in the column leaves the board claiming work is under
+///   way that nobody started.
 ///
 /// Everything else is not a trigger: staying in the column, leaving it,
 /// re-ordering, editing prose. In particular, dragging *out* of In
 /// Progress does not stop anything — the run outlives the column, and
 /// cancelling it is a separate, explicit act.
 pub fn triggers_run(t: Transition) -> Option<RunTrigger> {
-    if t.after_status != IssueStatus::InProgress || !t.after_assigned {
+    if t.after_status != IssueStatus::InProgress || t.after_assignee.is_none() {
         return None;
     }
     if t.before_status != IssueStatus::InProgress {
         return Some(RunTrigger::Started);
     }
-    if !t.before_assigned {
-        return Some(RunTrigger::Assigned);
-    }
-    None
+    // Who is on it, not merely whether somebody is: handing a live card to
+    // a different agent is a handover, and a handover nobody starts leaves
+    // the board showing @dev-2 on work only @dev-1 ever touched.
+    (t.before_assignee != t.after_assignee).then_some(RunTrigger::Assigned)
 }
 
 impl Transition {
@@ -51,9 +56,9 @@ impl Transition {
     pub fn between(before: &IssueRow, after: &IssueRow) -> Self {
         Self {
             before_status: before.status,
-            before_assigned: before.assignee.is_some(),
+            before_assignee: before.assignee.clone(),
             after_status: after.status,
-            after_assigned: after.assignee.is_some(),
+            after_assignee: after.assignee.clone(),
         }
     }
 
@@ -62,9 +67,9 @@ impl Transition {
     pub fn created(after: &IssueRow) -> Self {
         Self {
             before_status: IssueStatus::Backlog,
-            before_assigned: false,
+            before_assignee: None,
             after_status: after.status,
-            after_assigned: after.assignee.is_some(),
+            after_assignee: after.assignee.clone(),
         }
     }
 }
@@ -86,30 +91,44 @@ pub(crate) fn ledger_entry(issue: &IssueRow, trigger: RunTrigger) -> Option<NewI
 mod tests {
     use super::*;
 
+    fn agent(id: &str) -> Option<AgentProfileId> {
+        Some(AgentProfileId::parse(id.to_owned()).expect("agent id"))
+    }
+
     fn t(
         before_status: IssueStatus,
-        before_assigned: bool,
+        before_assignee: Option<AgentProfileId>,
         after_status: IssueStatus,
-        after_assigned: bool,
+        after_assignee: Option<AgentProfileId>,
     ) -> Transition {
         Transition {
             before_status,
-            before_assigned,
+            before_assignee,
             after_status,
-            after_assigned,
+            after_assignee,
         }
     }
 
     #[test]
     fn entering_in_progress_with_somebody_on_it_starts_work() {
         assert_eq!(
-            triggers_run(t(IssueStatus::Todo, true, IssueStatus::InProgress, true)),
+            triggers_run(t(
+                IssueStatus::Todo,
+                agent("dev-1"),
+                IssueStatus::InProgress,
+                agent("dev-1")
+            )),
             Some(RunTrigger::Started)
         );
         // Wherever it came from.
         for from in [IssueStatus::Backlog, IssueStatus::Review, IssueStatus::Done] {
             assert_eq!(
-                triggers_run(t(from, true, IssueStatus::InProgress, true)),
+                triggers_run(t(
+                    from,
+                    agent("dev-1"),
+                    IssueStatus::InProgress,
+                    agent("dev-1")
+                )),
                 Some(RunTrigger::Started)
             );
         }
@@ -122,9 +141,25 @@ mod tests {
         assert_eq!(
             triggers_run(t(
                 IssueStatus::InProgress,
-                false,
+                None,
                 IssueStatus::InProgress,
-                true
+                agent("dev-1")
+            )),
+            Some(RunTrigger::Assigned)
+        );
+    }
+
+    #[test]
+    fn reassigning_in_the_column_hands_the_card_over() {
+        // A handover on live work is still a start: the new agent has done
+        // nothing yet, and a card showing @dev-2 on work only @dev-1 ever
+        // touched is the board lying about who is doing it.
+        assert_eq!(
+            triggers_run(t(
+                IssueStatus::InProgress,
+                agent("dev-1"),
+                IssueStatus::InProgress,
+                agent("dev-2")
             )),
             Some(RunTrigger::Assigned)
         );
@@ -132,27 +167,50 @@ mod tests {
 
     #[test]
     fn nothing_else_starts_work() {
-        // Already running and still assigned: an edit is not a restart.
+        // Already running and still the same agent: an edit is not a
+        // restart.
         assert!(
             triggers_run(t(
                 IssueStatus::InProgress,
-                true,
+                agent("dev-1"),
                 IssueStatus::InProgress,
-                true
+                agent("dev-1")
             ))
             .is_none()
         );
         // Leaving the column never starts anything — and never stops
         // anything either; the run outlives the drag.
         assert!(
-            triggers_run(t(IssueStatus::InProgress, true, IssueStatus::Review, true)).is_none()
+            triggers_run(t(
+                IssueStatus::InProgress,
+                agent("dev-1"),
+                IssueStatus::Review,
+                agent("dev-2")
+            ))
+            .is_none()
+        );
+        // Handing finished work to somebody else does not reopen it.
+        assert!(
+            triggers_run(t(
+                IssueStatus::Done,
+                agent("dev-1"),
+                IssueStatus::Done,
+                agent("dev-2")
+            ))
+            .is_none()
         );
         // Unassigned work cannot start, and the manager refuses this state
         // anyway.
-        assert!(
-            triggers_run(t(IssueStatus::Todo, false, IssueStatus::InProgress, false)).is_none()
-        );
+        assert!(triggers_run(t(IssueStatus::Todo, None, IssueStatus::InProgress, None)).is_none());
         // Moving between other columns is just moving.
-        assert!(triggers_run(t(IssueStatus::Backlog, true, IssueStatus::Todo, true)).is_none());
+        assert!(
+            triggers_run(t(
+                IssueStatus::Backlog,
+                agent("dev-1"),
+                IssueStatus::Todo,
+                agent("dev-1")
+            ))
+            .is_none()
+        );
     }
 }

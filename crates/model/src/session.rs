@@ -97,6 +97,9 @@ impl std::fmt::Display for ChannelType {
 /// not "who literally constructed this session row".
 ///
 /// Closed strong-typed enum. Extend by adding variants, never by string.
+/// Its accessors below match exhaustively rather than through a catch-all,
+/// so adding a variant fails the build until every accessor says what the
+/// new trigger answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerSource {
@@ -192,11 +195,14 @@ impl TriggerSource {
         }
     }
 
-    /// The cron job this session fired for, or `None` for a user session.
+    /// The cron job this session fired for, or `None` for any session no
+    /// cron job started.
     pub fn cron_job_id(&self) -> Option<&str> {
         match self {
             TriggerSource::Cron { cron_job_id, .. } => Some(cron_job_id),
-            _ => None,
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
         }
     }
 
@@ -208,7 +214,9 @@ impl TriggerSource {
                 issue_id,
                 number,
             } => Some((project_id, issue_id, *number)),
-            _ => None,
+            TriggerSource::User | TriggerSource::Cron { .. } | TriggerSource::Project { .. } => {
+                None
+            }
         }
     }
 
@@ -230,7 +238,9 @@ impl TriggerSource {
             TriggerSource::Cron {
                 origin_session_id, ..
             } => origin_session_id.as_ref(),
-            _ => None,
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
         }
     }
 
@@ -247,7 +257,9 @@ impl TriggerSource {
     pub fn cron_job_title(&self) -> Option<&str> {
         match self {
             TriggerSource::Cron { job_title, .. } => job_title.as_deref(),
-            _ => None,
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                None
+            }
         }
     }
 }
@@ -1002,6 +1014,34 @@ mod tests {
         let back: TriggerSource =
             serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back.cron_job_title(), Some("每日晨报"));
+    }
+
+    /// The board triggers are not cron fires. The cron accessors match
+    /// exhaustively, so a new `TriggerSource` variant cannot inherit a silent
+    /// `None` from them — this pins the answer the board variants give.
+    #[test]
+    fn board_triggers_answer_none_to_every_cron_question() {
+        let project_id = crate::ProjectId::generate();
+        let issue = TriggerSource::Issue {
+            project_id: project_id.clone(),
+            issue_id: crate::IssueId::from("issue-1"),
+            number: 7,
+        };
+        let planning = TriggerSource::Project {
+            project_id: project_id.clone(),
+        };
+
+        for trigger in [&issue, &planning] {
+            assert!(trigger.cron_job_id().is_none());
+            assert!(trigger.cron_origin_session_id().is_none());
+            assert!(trigger.cron_job_title().is_none());
+            assert!(!trigger.is_cron_conversation());
+            assert_eq!(trigger.project(), Some(&project_id));
+            assert!(trigger.is_project_session());
+        }
+
+        assert_eq!(issue.issue().map(|(_, _, number)| number), Some(7));
+        assert!(planning.issue().is_none());
     }
 
     #[test]

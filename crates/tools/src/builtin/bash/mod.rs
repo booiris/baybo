@@ -244,15 +244,28 @@ struct ChildEnv {
 ///
 /// Env beats every config file git would otherwise consult, so this is
 /// what makes a commit say which agent made it. The workspace-level
-/// `.gitconfig` stays as the fallback for every other session — one that
-/// never commits pays nothing for it, and one that does is still
-/// attributable to baybo rather than failing outright.
+/// `.gitconfig` stays as the fallback — for every other session, and for
+/// an issue run whose agent has no handle to author as. One that never
+/// commits pays nothing for it, and one that does is still attributable to
+/// baybo rather than failing outright.
+///
+/// The two halves are deliberately different identifiers. The **name** is
+/// the handle, because that is the half a person reads: `git log` and
+/// `git shortlog` show it, and a ULID there names nobody. The **email**
+/// keeps the profile id, because a handle is unique only within its
+/// project ([`baybo_model::AgentHandle`]) — two boards' `@dev-1` are two
+/// different agents and must not collapse into one author — and because
+/// the id still maps a commit back to an exact profile row after the
+/// agent leaves the team.
 ///
 /// The address is deliberately unroutable: these commits are machine-made
 /// and nobody should be able to reply to one.
-fn git_identity(agent: &baybo_model::AgentProfileId) -> Vec<(String, String)> {
-    let name = agent.as_str().to_owned();
-    let email = format!("{name}@baybo.local");
+fn git_identity(
+    agent: &baybo_model::AgentProfileId,
+    handle: &baybo_model::AgentHandle,
+) -> Vec<(String, String)> {
+    let name = handle.as_str().to_owned();
+    let email = format!("{}@baybo.local", agent.as_str());
     vec![
         ("GIT_AUTHOR_NAME".to_owned(), name.clone()),
         ("GIT_AUTHOR_EMAIL".to_owned(), email.clone()),
@@ -828,9 +841,14 @@ impl Tool for BashTool {
         }
         // An issue run commits as the agent working the card. Only there:
         // `checkout_root` is set for exactly those sessions, and a session
-        // that never commits gains nothing from carrying an identity.
-        if ctx.checkout_root.is_some() {
-            extra_env.vars.extend(git_identity(&ctx.agent_id));
+        // that never commits gains nothing from carrying an identity. An
+        // agent whose handle could not be resolved gets no identity at all
+        // and falls through to the workspace `.gitconfig`, which authors
+        // the commit as baybo — true, where a bare id says nothing.
+        if ctx.checkout_root.is_some()
+            && let Some(handle) = ctx.agent_handle.as_ref()
+        {
+            extra_env.vars.extend(git_identity(&ctx.agent_id, handle));
         }
 
         // Auto permission, destructive-token command: the LLM judge decides before
@@ -4178,8 +4196,12 @@ mod tests {
             timed_out: false,
         });
         let mut ctx = ctx_with(Some(sandbox));
+        // A real generated id, which is a ULID — the shape every production
+        // agent has. A handle-shaped id is reachable only from a test.
+        let id = baybo_model::AgentProfileId::generate();
         ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
-        ctx.agent_id = baybo_model::AgentProfileId::parse("dev-1".to_owned()).expect("agent id");
+        ctx.agent_id = id.clone();
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
 
         BashTool::for_test()
             .execute(json!({ "command": "git commit -m x" }), &ctx)
@@ -4187,21 +4209,48 @@ mod tests {
             .expect("bash runs");
 
         let env = &fake.calls()[0].extra_env;
-        for key in [
-            "GIT_AUTHOR_NAME",
-            "GIT_AUTHOR_EMAIL",
-            "GIT_COMMITTER_NAME",
-            "GIT_COMMITTER_EMAIL",
-        ] {
-            assert!(
-                env.iter().any(|(k, _)| k == key),
-                "{key} must reach the child: {env:?}"
-            );
-        }
-        assert!(
+        let value = |key: &str| {
             env.iter()
-                .any(|(k, v)| k == "GIT_AUTHOR_NAME" && v == "dev-1"),
-            "and it is the agent on the card, not a generic bot: {env:?}"
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("{key} must reach the child: {env:?}"))
+        };
+        assert_eq!(value("GIT_AUTHOR_NAME"), "dev-1");
+        assert_eq!(value("GIT_COMMITTER_NAME"), "dev-1");
+        let email = format!("{id}@baybo.local");
+        assert_eq!(value("GIT_AUTHOR_EMAIL"), email);
+        assert_eq!(value("GIT_COMMITTER_EMAIL"), email);
+        assert!(
+            !env.iter()
+                .any(|(k, v)| k.ends_with("_NAME") && v.contains(id.as_str())),
+            "the ULID must not be what `git log` shows as the author: {env:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_run_whose_agent_has_no_handle_falls_back_to_the_workspace_identity() {
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
+        ctx.agent_id = baybo_model::AgentProfileId::generate();
+
+        BashTool::for_test()
+            .execute(json!({ "command": "git commit -m x" }), &ctx)
+            .await
+            .expect("bash runs");
+
+        assert!(
+            !fake.calls()[0]
+                .extra_env
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_")),
+            "a commit git authors from the workspace `.gitconfig` says baybo, which is \
+             true; one authored by a ULID says nothing"
         );
     }
 
@@ -4235,18 +4284,18 @@ mod tests {
         // being one list: they are both name/value pairs, so conflating
         // them made anything injected disappear from output that mentioned
         // it — and an agent's id appears in its own output constantly.
+        let id = baybo_model::AgentProfileId::generate();
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
-            stdout: b"switched to branch issue/4-x by dev-1
-"
-            .to_vec(),
+            stdout: format!("switched to branch issue/4-x by dev-1 ({id})\n").into_bytes(),
             stderr: Vec::new(),
             timed_out: false,
         });
         let mut ctx = ctx_with(Some(sandbox));
         ctx.secrets = Some(Arc::new(StubSecrets));
         ctx.checkout_root = Some(PathBuf::from("/tmp/work/projects/p/4"));
-        ctx.agent_id = baybo_model::AgentProfileId::parse("dev-1".to_owned()).expect("agent id");
+        ctx.agent_id = id.clone();
+        ctx.agent_handle = Some(baybo_model::AgentHandle::parse("dev-1").expect("handle"));
 
         let out = BashTool::for_test()
             .execute(json!({ "command": "git status" }), &ctx)
@@ -4258,8 +4307,8 @@ mod tests {
         };
         let stdout = v["stdout"].as_str().expect("stdout");
         assert!(
-            stdout.contains("dev-1"),
-            "the agent's own id must survive its own output: {stdout}"
+            stdout.contains("dev-1") && stdout.contains(id.as_str()),
+            "the agent's own handle and id must survive its own output: {stdout}"
         );
     }
 

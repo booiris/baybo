@@ -3,15 +3,20 @@ import { describe, expect, it } from 'vitest';
 import { actorLabel, commentHint, describeEvent, eventShape, eventTime } from './timelineModel';
 import type { IssueEvent, IssueEventBody } from './timelineModel';
 
-function entry(body: IssueEventBody, agent?: string): IssueEvent {
-  return {
-    id: '01J',
-    number: 4,
-    actor: agent ?? 'user',
-    actor_is_agent: agent != null,
-    body,
-    created_at_ms: 0,
-  };
+// The server resolves an agent's handle, so a fixture's id and handle are
+// deliberately different: anything that renders the id is a bug.
+const DEV_ID = '01JC3KQ4Z8AAAAAAAAAAAAAAAA';
+
+function entry(body: IssueEventBody, actor: IssueEvent['actor'] = { kind: 'user' }): IssueEvent {
+  return { id: '01J', number: 4, actor, body, created_at_ms: 0 };
+}
+
+function ref(handle: string) {
+  return { id: DEV_ID, handle };
+}
+
+function agent(handle: string): IssueEvent['actor'] {
+  return { kind: 'agent', ...ref(handle) };
 }
 
 describe('describeEvent', () => {
@@ -24,11 +29,11 @@ describe('describeEvent', () => {
   it('reads all four assignment cases as sentences, not as templates', () => {
     // The one a naive template gets wrong is unassignment: it produces
     // "assigned it to nobody".
-    expect(describeEvent({ kind: 'assigned', to: 'dev-1' })).toBe('assigned it to @dev-1');
-    expect(describeEvent({ kind: 'assigned', from: 'dev-1', to: 'dev-2' })).toBe(
+    expect(describeEvent({ kind: 'assigned', to: ref('dev-1') })).toBe('assigned it to @dev-1');
+    expect(describeEvent({ kind: 'assigned', from: ref('dev-1'), to: ref('dev-2') })).toBe(
       'reassigned it from @dev-1 to @dev-2',
     );
-    expect(describeEvent({ kind: 'assigned', from: 'dev-1' })).toBe('unassigned @dev-1');
+    expect(describeEvent({ kind: 'assigned', from: ref('dev-1') })).toBe('unassigned @dev-1');
     expect(describeEvent({ kind: 'assigned' })).toBe('unassigned it');
   });
 
@@ -61,7 +66,7 @@ describe('describeEvent', () => {
     const kinds: IssueEventBody[] = [
       { kind: 'opened' },
       { kind: 'moved', from: 'todo', to: 'done' },
-      { kind: 'assigned', to: 'dev-1' },
+      { kind: 'assigned', to: ref('dev-1') },
       { kind: 'run_started', attempt: 1, trigger: 'started' },
       { kind: 'run_settled', attempt: 1, status: 'done' },
       { kind: 'blocked', reason: 'waiting' },
@@ -77,9 +82,19 @@ describe('describeEvent', () => {
 });
 
 describe('actorLabel', () => {
-  it('calls the operator "you" and an agent by its handle', () => {
+  it('calls the operator "you" and an agent by its handle — never by its id', () => {
     expect(actorLabel(entry({ kind: 'opened' }))).toBe('you');
-    expect(actorLabel(entry({ kind: 'opened' }, 'dev-1'))).toBe('@dev-1');
+    expect(actorLabel(entry({ kind: 'opened' }, agent('dev-1')))).toBe('@dev-1');
+  });
+
+  it('calls the board’s own gate "the board"', () => {
+    // Nobody held this run. "you held the run — $5.00 of the $5.00 daily
+    // budget is spent" accuses the reader of a decision the gate made.
+    expect(
+      actorLabel(
+        entry({ kind: 'budget_exhausted', spent_micros: 0, limit_micros: 0 }, { kind: 'system' }),
+      ),
+    ).toBe('the board');
   });
 });
 

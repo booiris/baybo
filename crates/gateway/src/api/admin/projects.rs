@@ -77,6 +77,46 @@ async fn on_board(state: &AdminState, project: &ProjectId, row: IssueRow) -> Res
     Ok(IssueDto::on_board(row, &board))
 }
 
+/// Every agent a page of timeline entries names, mapped to its `@handle`.
+type ActorHandles = std::collections::HashMap<AgentProfileId, baybo_model::AgentHandle>;
+
+/// Resolve the agents a page of entries names, once for the whole page.
+///
+/// Through `AgentProfileStore::get` rather than the board's roster, because
+/// a timeline is permanent history: it names agents that have since left
+/// the team, and `list_team` filters exactly those out while `get`
+/// deliberately still reaches them. One point-get per *distinct* agent,
+/// concurrently, the way the roster reads its members' names — and a team
+/// is capped at sixteen, so a page names a handful at most.
+async fn actor_handles(state: &AdminState, rows: &[IssueEventRow]) -> ActorHandles {
+    let mut ids: std::collections::HashSet<AgentProfileId> = std::collections::HashSet::new();
+    for row in rows {
+        if let IssueActor::Agent(id) = &row.actor {
+            ids.insert(id.clone());
+        }
+        // A reassignment names two more agents than its actor does, and
+        // both sides are rendered.
+        if let IssueEventBody::Assigned { from, to } = &row.body {
+            ids.extend(from.iter().chain(to.iter()).cloned());
+        }
+    }
+    futures::future::join_all(ids.into_iter().map(|id| async {
+        let handle = state
+            .agent_profile_store
+            .get(&id)
+            .await
+            .ok()
+            .flatten()?
+            .team?
+            .handle;
+        Some((id, handle))
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Parse a path segment into a [`ProjectId`], running the same grammar the
 /// filesystem depends on rather than trusting the URL.
 pub(super) fn parse_project_id(raw: &str) -> Result<ProjectId> {
@@ -396,6 +436,53 @@ impl From<ApprovalDecisionDto> for baybo_model::ApprovalDecision {
     }
 }
 
+/// An agent as a timeline entry names it.
+///
+/// The handle is resolved server-side rather than by the client, for the
+/// same reason `HiredByDto`'s is: a timeline is history, so it names agents
+/// that have since left the team — and those are precisely the rows the
+/// roster the client holds has filtered out. The id rides along because it
+/// is what opens the agent's profile.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentRefDto {
+    pub id: String,
+    /// The `@handle` to render, without the `@`. Falls back to the id when
+    /// the reference resolves to nothing at all.
+    pub handle: String,
+}
+
+/// Who did the thing an entry records.
+///
+/// Tagged, and three kinds, so the client switches instead of parsing. The
+/// pair it replaces — a string plus an `is_agent` flag — was two fields
+/// that could disagree, and it had no way at all to say the board acted on
+/// its own.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActorDto {
+    /// The operator working the board.
+    User,
+    /// The board acting on its own — today, the budget gate.
+    System,
+    Agent(AgentRefDto),
+}
+
+/// Name one agent, falling back to the bare id when nothing resolved.
+///
+/// An id no profile answers to is a broken reference, not a departed
+/// teammate — the tombstone is what keeps those resolvable — and rendering
+/// the id beats rendering nothing, since it is then the only thing left
+/// that says who acted.
+fn agent_ref(id: &AgentProfileId, handles: &ActorHandles) -> AgentRefDto {
+    AgentRefDto {
+        id: id.as_str().to_owned(),
+        handle: handles
+            .get(id)
+            .map(|handle| handle.as_str().to_owned())
+            .unwrap_or_else(|| id.as_str().to_owned()),
+    }
+}
+
 /// What one timeline entry says.
 ///
 /// A mirror of the store's `IssueEventBody` rather than the type itself,
@@ -415,9 +502,9 @@ pub enum IssueEventBodyDto {
     },
     Assigned {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<String>,
+        from: Option<AgentRefDto>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        to: Option<String>,
+        to: Option<AgentRefDto>,
     },
     RunStarted {
         attempt: i64,
@@ -462,8 +549,10 @@ pub enum IssueEventBodyDto {
     },
 }
 
-impl From<IssueEventBody> for IssueEventBodyDto {
-    fn from(body: IssueEventBody) -> Self {
+impl IssueEventBodyDto {
+    /// Build one body, naming the agents it mentions from the handles
+    /// resolved for the whole page.
+    fn with_handles(body: IssueEventBody, handles: &ActorHandles) -> Self {
         match body {
             IssueEventBody::ApprovalRequested {
                 call_id,
@@ -500,8 +589,8 @@ impl From<IssueEventBody> for IssueEventBodyDto {
                 to: to.into(),
             },
             IssueEventBody::Assigned { from, to } => Self::Assigned {
-                from: from.map(|id| id.to_string()),
-                to: to.map(|id| id.to_string()),
+                from: from.map(|id| agent_ref(&id, handles)),
+                to: to.map(|id| agent_ref(&id, handles)),
             },
             // The run id is deliberately dropped: the execution log in the
             // rail addresses a run by its attempt within this issue, and a
@@ -539,26 +628,27 @@ impl From<IssueEventBody> for IssueEventBodyDto {
 pub struct IssueEventDto {
     pub id: String,
     pub number: i64,
-    /// `"user"`, or the agent's id. Which of the two it is comes from
-    /// [`Self::actor_is_agent`] rather than from parsing this.
-    pub actor: String,
-    pub actor_is_agent: bool,
+    pub actor: ActorDto,
     pub body: IssueEventBodyDto,
     pub created_at_ms: i64,
 }
 
-impl From<IssueEventRow> for IssueEventDto {
-    fn from(row: IssueEventRow) -> Self {
-        let (actor, actor_is_agent) = match &row.actor {
-            IssueActor::User => ("user".to_owned(), false),
-            IssueActor::Agent(id) => (id.to_string(), true),
+impl IssueEventDto {
+    /// Build one entry against the handles resolved for its page.
+    ///
+    /// Not a `From`, because the row alone cannot answer what an agent is
+    /// called — the same reason [`on_board`] is not one either.
+    fn with_handles(row: IssueEventRow, handles: &ActorHandles) -> Self {
+        let actor = match &row.actor {
+            IssueActor::User => ActorDto::User,
+            IssueActor::System => ActorDto::System,
+            IssueActor::Agent(id) => ActorDto::Agent(agent_ref(id, handles)),
         };
         Self {
             id: row.id.as_str().to_owned(),
             number: row.number,
             actor,
-            actor_is_agent,
-            body: row.body.into(),
+            body: IssueEventBodyDto::with_handles(row.body, handles),
             created_at_ms: row.created_at.timestamp_millis(),
         }
     }
@@ -1116,7 +1206,7 @@ pub struct ResolveApprovalRequest {
     responses(
         (status = 204, description = "The prompt was answered"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 404, description = "Unknown project or issue, or no prompt is waiting on that call", body = ErrorBody),
+        (status = 404, description = "Unknown project or issue, or this card has no prompt waiting on that call", body = ErrorBody),
     )
 )]
 async fn resolve_approval(
@@ -1125,14 +1215,20 @@ async fn resolve_approval(
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
-    // Resolve the issue first, so a request naming another board's card
-    // cannot answer a prompt it has no business seeing. The queue is
-    // keyed by call id alone, which is exactly why this check is here.
-    state
+    // Naming a card is not authority to answer for it. The queue is keyed
+    // by call id alone, so the card has to be the one that raised this call
+    // and still be waiting on it — read off the timeline, which is the same
+    // rule the client draws the buttons from, so the two cannot disagree.
+    // The read also 404s an unknown board or card before the queue is
+    // touched.
+    let timeline = state
         .project_manager
-        .get_issue(&id, number)
+        .timeline(&id, number)
         .await
         .map_err(project_err)?;
+    let raised_here = baybo_project::pending_approvals(&timeline)
+        .iter()
+        .any(|open| open == &call_id);
     let channel = state
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
@@ -1141,7 +1237,14 @@ async fn resolve_approval(
     // `resolve_approval` returns the queue entry's own session id, which is
     // what the broadcast has to target — the fan-out is per session, and
     // dispatching without one reaches nobody.
-    let Some(session_id) = channel.resolve_approval(&call_id, decision) else {
+    //
+    // One exit for both refusals: "not this card's call" must be
+    // indistinguishable from "nothing is waiting", or the status itself
+    // confirms the call exists on some other board.
+    let Some(session_id) = raised_here
+        .then(|| channel.resolve_approval(&call_id, decision))
+        .flatten()
+    else {
         return Err(GatewayError::NotFound(format!(
             "no approval waiting on call {call_id}"
         )));
@@ -1265,7 +1368,7 @@ async fn project_feed(
                 .ok_or_else(|| GatewayError::BadRequest(format!("before_ms out of range: {ms}")))
         })
         .transpose()?;
-    let items = state
+    let rows = state
         .project_manager
         .feed(
             &id,
@@ -1273,9 +1376,11 @@ async fn project_feed(
             query.limit.unwrap_or(baybo_project::MAX_FEED_PAGE),
         )
         .await
-        .map_err(project_err)?
+        .map_err(project_err)?;
+    let handles = actor_handles(&state, &rows).await;
+    let items = rows
         .into_iter()
-        .map(IssueEventDto::from)
+        .map(|row| IssueEventDto::with_handles(row, &handles))
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
@@ -1299,13 +1404,15 @@ async fn list_issue_events(
     Path((project_id, number)): Path<(String, i64)>,
 ) -> Result<Json<ListResponse<IssueEventDto>>> {
     let id = parse_project_id(&project_id)?;
-    let items = state
+    let rows = state
         .project_manager
         .timeline(&id, number)
         .await
-        .map_err(project_err)?
+        .map_err(project_err)?;
+    let handles = actor_handles(&state, &rows).await;
+    let items = rows
         .into_iter()
-        .map(IssueEventDto::from)
+        .map(|row| IssueEventDto::with_handles(row, &handles))
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
@@ -1337,7 +1444,10 @@ async fn create_comment(
         .comment(&id, number, IssueActor::User, &req.text)
         .await
         .map_err(project_err)?;
-    Ok(Json(IssueEventDto::from(entry)))
+    // Resolves nothing for an operator's own comment, and stays correct if
+    // this route ever posts as somebody else.
+    let handles = actor_handles(&state, std::slice::from_ref(&entry)).await;
+    Ok(Json(IssueEventDto::with_handles(entry, &handles)))
 }
 
 #[utoipa::path(

@@ -37,11 +37,16 @@ export function applyMention(
 ): { text: string; caret: number } {
   const head = text.slice(0, query.start);
   const tail = text.slice(query.start + 1 + query.prefix.length);
+  const mention = `@${handle}`;
   // A trailing space only when the text does not already have one:
   // completing mid-sentence must not leave a double space where the caret
   // then sits.
-  const inserted = /^\s/.test(tail) ? `@${handle}` : `@${handle} `;
-  return { text: `${head}${inserted}${tail}`, caret: head.length + inserted.length + 1 };
+  const inserted = /^\s/.test(tail) ? mention : `${mention} `;
+  // One past the mention is one past its separator either way — the space
+  // just inserted, or the one the tail already began with. Measuring from
+  // `inserted` instead runs the caret off the end of the box whenever the
+  // separator was the inserted one.
+  return { text: `${head}${inserted}${tail}`, caret: head.length + mention.length + 1 };
 }
 
 /**

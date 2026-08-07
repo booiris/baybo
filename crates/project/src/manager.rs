@@ -223,8 +223,22 @@ impl ProjectManager {
     /// starts the moment there is headroom again. A refused write means the
     /// issue already has a run in flight — the dedupe guard doing its job,
     /// not a failure the caller should see.
+    ///
+    /// Whatever the board is already holding is released **before** that
+    /// write, and deliberately so. This is the third release site — with a
+    /// budget change and the boot sweep — and the one that makes a rolled-over
+    /// ceiling need no timer. It cannot move after the write: on the board
+    /// that actually needs releasing, the exhausted one, every card is holding
+    /// its own dedupe slot, so every enqueue is refused and a release placed
+    /// afterwards would never be reached. The price is that a caller whose own
+    /// held run has just become affordable is told the issue already has a run
+    /// in flight — which is true, and it is the run they asked for.
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
         let entry = ledger_entry(issue, trigger)?;
+        let headroom = self.headroom(&issue.project_id).await;
+        if let Err(e) = self.release_holds(&issue.project_id, headroom).await {
+            tracing::error!(project = %issue.project_id, error = %e, "could not release held runs");
+        }
         let run = match self.store.enqueue_run(&entry).await {
             Ok(run) => run,
             Err(baybo_store::StorageError::Conflict(reason)) => {
@@ -242,7 +256,6 @@ impl ProjectManager {
         };
         self.events.run_changed(&issue.project_id, issue.number);
 
-        let headroom = self.headroom(&issue.project_id).await;
         if let (true, Some((spent_micros, limit_micros))) =
             (headroom.is_exhausted(), headroom.figures())
         {
@@ -253,7 +266,7 @@ impl ProjectManager {
             } else {
                 self.record(
                     issue,
-                    IssueActor::User,
+                    IssueActor::System,
                     IssueEventBody::BudgetExhausted {
                         spent_micros,
                         limit_micros,
@@ -307,19 +320,21 @@ impl ProjectManager {
     /// nothing happens, nothing needed releasing.
     pub async fn release_held_runs(&self, project: &ProjectId) -> Result<usize> {
         let headroom = self.headroom(project).await;
-        let Some((spent_micros, limit_micros)) = headroom.figures() else {
-            // No ceiling at all: release everything, with nothing to report
-            // against.
-            return self.release_all(project, None).await;
-        };
+        self.release_holds(project, headroom).await
+    }
+
+    /// Release every hold this headroom allows, and hand each out.
+    ///
+    /// Takes the headroom rather than reading it, so [`Self::enqueue`] —
+    /// which has already measured the board to decide whether to hold — does
+    /// not query the budget twice for one write.
+    async fn release_holds(&self, project: &ProjectId, headroom: Headroom) -> Result<usize> {
         if headroom.is_exhausted() {
             return Ok(0);
         }
-        self.release_all(project, Some((spent_micros, limit_micros)))
-            .await
-    }
-
-    async fn release_all(&self, project: &ProjectId, figures: Option<(i64, i64)>) -> Result<usize> {
+        // No ceiling at all: release everything, with nothing to report
+        // against, rather than inventing figures for the timeline.
+        let figures = headroom.figures();
         let held = self.store.held_runs(project).await?;
         let mut released = 0;
         for run in held {
@@ -333,7 +348,7 @@ impl ProjectManager {
             {
                 self.record(
                     &issue,
-                    IssueActor::User,
+                    IssueActor::System,
                     IssueEventBody::BudgetRestored {
                         spent_micros,
                         limit_micros,
@@ -478,7 +493,7 @@ impl ProjectManager {
                 issue_id: issue.id.clone(),
                 project_id: project.clone(),
                 number,
-                actor,
+                actor: actor.clone(),
                 body: IssueEventBody::Comment {
                     text: text.to_owned(),
                 },
@@ -486,19 +501,21 @@ impl ProjectManager {
             .await?;
         self.events.timeline_changed(project, number);
 
-        // An @mention on a card nobody is on is the operator saying "you
+        // An @mention on a card nobody is on is the commenter saying "you
         // take this". Applied after the comment is recorded, so the words
         // survive even if the assignment is refused — and applied through
         // `update_issue`, so it goes down the same path a drag does and
         // gets the same trigger, the same timeline entry, and the same
-        // refusals for an agent that cannot run.
+        // refusals for an agent that cannot run. In the commenter's name,
+        // too: a handover a lead performed must not read as the operator's
+        // on a card the operator is being asked to trust.
         let issue = match self.mention_assignment(project, &issue, text).await {
             Some(assignee) => {
                 match self
                     .update_issue(
                         project,
                         number,
-                        IssueActor::User,
+                        actor,
                         IssueUpdate {
                             assignee: Some(Some(assignee)),
                             ..IssueUpdate::default()
@@ -518,10 +535,40 @@ impl ProjectManager {
             None => issue,
         };
 
-        if self.delivery_for(&issue).await == CommentDelivery::Wake {
-            self.enqueue(&issue, RunTrigger::Comment).await;
-        }
+        self.wake_if_listening(&issue).await;
         Ok(entry)
+    }
+
+    /// Start the run a comment asked for, on an issue whose answer had to
+    /// wait.
+    ///
+    /// The wake half of [`Self::comment`], reachable on its own because a
+    /// comment left while a run was executing is deferred
+    /// ([`CommentDelivery::AfterCurrentRun`]) — the executor calls this once
+    /// that run settles and the issue's live-run slot is free again. It goes
+    /// through [`Self::enqueue`] like every other start, so a deferred wake
+    /// gets the same budget gate, the same dedupe guard and the same
+    /// dispatch a drag does; a ledger row written straight to the store
+    /// would be a run nothing ever starts, holding the slot until the next
+    /// boot.
+    ///
+    /// `None` is an answer, not a failure: an issue cancelled, unassigned or
+    /// dragged out of live work while the run was going — or one on a board
+    /// archived meanwhile — is one nobody should be woken on.
+    pub async fn wake_on_comment(&self, project: &ProjectId, number: i64) -> Option<IssueRunRow> {
+        self.writable_project(project).await.ok()?;
+        let issue = self.get_issue(project, number).await.ok()?;
+        self.wake_if_listening(&issue).await
+    }
+
+    /// Enqueue for a comment if the issue is listening. One implementation,
+    /// shared by [`Self::comment`] (which has the row in hand) and
+    /// [`Self::wake_on_comment`] (which has to re-read it).
+    async fn wake_if_listening(&self, issue: &IssueRow) -> Option<IssueRunRow> {
+        if self.delivery_for(issue).await != CommentDelivery::Wake {
+            return None;
+        }
+        self.enqueue(issue, RunTrigger::Comment).await
     }
 
     /// The teammate an @mention hands this card to, if it hands it to
@@ -598,6 +645,12 @@ impl ProjectManager {
     /// waiter watching that turn settles the row with `Cancelled`. Settling
     /// it from both ends would race, and the waiter is the one that knows
     /// whether the turn actually stopped.
+    ///
+    /// The **status**, not the session, is what says a turn is live: the boot
+    /// sweep returns an interrupted run to the queue with the session it was
+    /// claimed with, and there is no turn left in it to stop. Chasing that
+    /// session instead would leave the row unsettled forever, blocking every
+    /// later run on the issue.
     pub async fn cancel_run(
         &self,
         project: &ProjectId,
@@ -616,7 +669,7 @@ impl ProjectManager {
                 "nothing is running on this issue",
             ));
         };
-        match run.session_id {
+        match run.session_id.filter(|_| run.status == RunStatus::Running) {
             Some(session) => Ok(Some(session)),
             None => {
                 self.store
@@ -1177,6 +1230,14 @@ impl ProjectManager {
     /// then dispatch — so a barrier that fires while the process dies is a
     /// run the boot sweep finds rather than a stage that silently never
     /// opened.
+    ///
+    /// A stage that empties while an earlier one is still open is not a
+    /// barrier — see [`crate::stages::barrier_opens`]. The parent has
+    /// nothing new to drive, and the wake would spend its single live-run
+    /// slot, so the barrier that matters is later refused by the dedupe
+    /// index. Nothing is recorded either: the entry's whole meaning is "your
+    /// assignee was woken", and writing it when nobody was is the lie the
+    /// entry exists to avoid.
     async fn check_stage_barrier(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         let finished =
             |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
@@ -1193,7 +1254,7 @@ impl ProjectManager {
                 return;
             }
         };
-        if !crate::stage_complete(&children, after.stage) {
+        if !crate::stages::barrier_opens(&children, after.stage) {
             return;
         }
         // The parent is addressed by number like everything else, so the

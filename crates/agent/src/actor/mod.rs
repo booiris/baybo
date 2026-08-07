@@ -660,20 +660,6 @@ impl AgentActor {
         }
     }
 
-    /// Dispatch a fired cron job through the agent loop.
-    ///
-    /// The cron fire mints a Cron-rooted session, so the turn records
-    /// `origin = Cron`. The content the LLM sees is framed + appended by
-    /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
-    /// so the model treats it as a task to perform now rather than a live
-    /// user message.
-    ///
-    /// `delivery` decides what happens to the reply. A recurring fire sends it
-    /// out through this session's own channel — the session *is* the
-    /// conversation the user reads. A one-shot's session is transient and
-    /// invisible, so nothing goes out here: its result is picked up off this
-    /// turn's terminal lifecycle edge (by the router's cron waiter) and
-    /// delivered into the conversation that scheduled it.
     /// Run an issue's brief as one turn. No channel dispatch: an issue's
     /// audience is its card, and the run's outcome is recorded by the
     /// waiter off this turn's terminal lifecycle edge.
@@ -697,6 +683,20 @@ impl AgentActor {
         Ok(())
     }
 
+    /// Dispatch a fired cron job through the agent loop.
+    ///
+    /// The cron fire mints a Cron-rooted session, so the turn records
+    /// `origin = Cron`. The content the LLM sees is framed + appended by
+    /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
+    /// so the model treats it as a task to perform now rather than a live
+    /// user message.
+    ///
+    /// `delivery` decides what happens to the reply. A recurring fire sends it
+    /// out through this session's own channel — the session *is* the
+    /// conversation the user reads. A one-shot's session is transient and
+    /// invisible, so nothing goes out here: its result is picked up off this
+    /// turn's terminal lifecycle edge (by the router's cron waiter) and
+    /// delivered into the conversation that scheduled it.
     async fn dispatch_cron_prompt(
         &mut self,
         prompt: &str,

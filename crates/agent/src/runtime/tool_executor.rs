@@ -23,6 +23,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use baybo_project::worktree::{self, Checkout};
+use baybo_store::agent_profile::AgentProfileStore;
 use baybo_store::project::ProjectStore;
 
 use crate::runtime::sandbox::SandboxAdapter;
@@ -70,14 +71,58 @@ fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
 /// user-chosen path outside the workspace by design, and that is the
 /// feature. What it must never be is a directory whose writable bind would
 /// swallow the read-only system layer or baybo's own workspace.
+///
+/// Only `resolved` arrives canonical (from [`ToolExecutor::bindable`]); the
+/// root is resolved *here*, because the configured spelling is not the one
+/// the filesystem uses. The default workspace is reached through
+/// `~/.baybo -> /data/…/.baybo`, and with that layout a repository at
+/// `/data/x` never prefixes `/home/u/.baybo` — so comparing a resolved path
+/// against an unresolved base is a guard that can never fire, and the
+/// directory holding baybo's own `state/` and `.key/` would be bound
+/// read-write into the run's sandbox.
+///
+/// [`baybo_workspace::absolutise`] rather than a bare `canonicalize`, so a
+/// root that cannot be resolved degrades to its lexical spelling instead of
+/// refusing every repository. That is not fail-open: the containment check
+/// still runs, only the symlink resolution is skipped — and it is skipped
+/// only when the root is not on disk, which is a workspace with no `state/`
+/// or `.key/` to protect and which boot's `ensure_layout` makes unreachable
+/// in production anyway. Refusing instead would break every issue run on a
+/// mistyped `workspace.path` while protecting nothing. It is also what
+/// `baybo_project::validate_workdir` does at project-creation time, so the
+/// creation-time and bind-time answers cannot disagree.
 fn admits_repo(resolved: &Path, workspace_root: &Path) -> Result<(), String> {
     if let Some(why) = baybo_sandbox::args::writable_bind_refusal(resolved) {
         return Err(why);
     }
-    if workspace_root.starts_with(resolved) {
+    if baybo_workspace::absolutise(workspace_root).starts_with(resolved) {
         return Err("it contains baybo's own workspace".to_owned());
     }
     Ok(())
+}
+
+/// The handle `agent` answers to on its board, or `None` when it has none.
+///
+/// Degrades instead of failing on every miss — a global agent, a profile
+/// row that is gone, a store error — because the one consumer is the
+/// commit identity an issue run's shell carries, and a commit attributed
+/// to a name no reader can resolve is worse than one attributed to baybo.
+/// Neither may stop the commit.
+async fn board_handle(
+    agents: &Arc<dyn AgentProfileStore>,
+    agent: &baybo_model::AgentProfileId,
+) -> Option<baybo_model::AgentHandle> {
+    match agents.get(agent).await {
+        Ok(Some(row)) => row.team.map(|team| team.handle),
+        Ok(None) => {
+            debug!(agent_id = %agent, "the agent working this issue has no profile row; its commits use the workspace identity");
+            None
+        }
+        Err(e) => {
+            debug!(agent_id = %agent, error = %e, "could not read the profile of the agent working this issue; its commits use the workspace identity");
+            None
+        }
+    }
 }
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -359,6 +404,19 @@ fn tool_output_media(output: &ToolOutput) -> (Vec<ContentBlock>, Vec<ContentBloc
     }
 }
 
+/// The two stores an issue run's tool call reads: the project row says
+/// where the repository is, the profile row says what the agent working it
+/// is called.
+///
+/// One field rather than two `Option`s because no assembly wires one
+/// without the other — a second `Option` would admit a board whose agents
+/// cannot be named, which is a state nothing produces and everything
+/// downstream would have to handle.
+pub struct BoardStores {
+    pub projects: Arc<dyn ProjectStore>,
+    pub agents: Arc<dyn AgentProfileStore>,
+}
+
 /// Executes tools with trust-level validation, approval gating, and
 /// observability recording.
 pub struct ToolExecutor {
@@ -386,12 +444,14 @@ pub struct ToolExecutor {
     /// Control surface for the `JobList` / `JobStop` tools. Wired like
     /// [`Self::background_jobs`] (same runtime component implements both).
     background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
-    /// Board store, consulted only to find the checkout of a session whose
-    /// trigger is an issue. Resolved per call rather than held on the
-    /// session, because a session's issue is stable but the project's
-    /// workdir is a row a user can edit. `None` ⇒ no board wired (argv-mode
-    /// boots, tests), and issue sessions then behave like ordinary ones.
-    project_store: Option<Arc<dyn ProjectStore>>,
+    /// Board stores, consulted only for a session whose trigger is an
+    /// issue: the checkout it works in, and the handle its commits are
+    /// authored as. Both resolved per call rather than held on the session,
+    /// because a session's issue is stable but the project's workdir and
+    /// the agent's team membership are rows a user can edit. `None` ⇒ no
+    /// board wired (argv-mode boots, tests), and issue sessions then behave
+    /// like ordinary ones.
+    board: Option<BoardStores>,
 }
 
 impl ToolExecutor {
@@ -407,7 +467,7 @@ impl ToolExecutor {
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
         background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
-        project_store: Option<Arc<dyn ProjectStore>>,
+        board: Option<BoardStores>,
     ) -> Self {
         Self {
             tool_registry,
@@ -420,7 +480,7 @@ impl ToolExecutor {
             virtual_reads,
             background_jobs,
             background_control,
-            project_store,
+            board,
         }
     }
 
@@ -472,7 +532,7 @@ impl ToolExecutor {
         else {
             return None;
         };
-        let store = self.project_store.as_ref()?;
+        let store = &self.board.as_ref()?.projects;
         let project = match store.get_project(project_id).await {
             Ok(Some(project)) => project,
             Ok(None) => return None,
@@ -803,6 +863,13 @@ impl ToolExecutor {
                 // made in the worktree is written entirely under the
                 // repository's `.git`.
                 let checkout = self.issue_checkout(session_trigger).await;
+                // Gated on the checkout so an ordinary session pays for no
+                // extra store read: only an issue run commits, and only a
+                // commit reads this.
+                let agent_handle = match (&checkout, &self.board) {
+                    (Some(_), Some(board)) => board_handle(&board.agents, agent_id).await,
+                    _ => None,
+                };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -910,6 +977,7 @@ impl ToolExecutor {
                     background_control: self.background_control.clone(),
                     notify_silence,
                     checkout_root: checkout.map(|c| c.root),
+                    agent_handle,
                 };
 
                 // Reveal placeholders in the tool's arguments just
@@ -1107,6 +1175,30 @@ mod tests {
         }
     }
 
+    /// The shape the default install has: `~/.baybo` is a symlink to the
+    /// real workspace on a data volume, so the configured root and the
+    /// resolved one are different strings. The repository arrives already
+    /// canonical (that is what `bindable` hands in), so unless the root is
+    /// resolved too, the containment test compares `/home/u/.baybo` against
+    /// `/data/x` — never a prefix, so the guard never fires and the
+    /// directory holding baybo's own `state/` and `.key/` is bound
+    /// read-write into the run's sandbox.
+    #[test]
+    fn a_repo_that_contains_the_workspace_through_a_symlink_is_still_refused() {
+        let real = tempfile::tempdir().expect("tempdir");
+        let workspace = real.path().join(".baybo");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let link = home.path().join(".baybo");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+        let repo = real.path().canonicalize().expect("canonical repo");
+
+        assert!(
+            admits_repo(&repo, &link).is_err(),
+            "the guard must see the workspace's real location however the root is spelled"
+        );
+    }
+
     /// The sandbox binds the caller's own skill directory and no other
     /// agent's. Nothing downstream fails if the wrong one is bound — the
     /// session simply gains read access to skills its scope does not admit —
@@ -1135,6 +1227,67 @@ mod tests {
         assert_ne!(
             super::sandbox_readable_paths(&paths, &theirs),
             super::sandbox_readable_paths(&paths, &mine),
+        );
+    }
+
+    fn profile_row(
+        id: baybo_model::AgentProfileId,
+        team: Option<baybo_model::TeamMembership>,
+    ) -> baybo_store::AgentProfileRow {
+        let now = chrono::Utc::now();
+        baybo_store::AgentProfileRow {
+            id,
+            description: String::new(),
+            avatar_blob_id: None,
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            team,
+            hired_by: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// What a commit is authored as. The profile id is a ULID, so resolving
+    /// the handle is the whole point of reading this row — `git log` showing
+    /// `01JC3KQ4Z8…` names nobody.
+    #[tokio::test]
+    async fn a_team_members_handle_is_what_its_commits_are_authored_as() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
+        agents.insert(profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: baybo_model::ProjectId::generate(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        ));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id)
+                .await
+                .map(|h| h.as_str().to_owned()),
+            Some("dev-1".to_owned()),
+        );
+    }
+
+    /// The two states that license the bash tool's fallback to the
+    /// workspace `.gitconfig`: an agent on no board, and a row that is gone.
+    /// Neither may fail the commit.
+    #[tokio::test]
+    async fn an_agent_with_no_board_and_a_row_that_is_gone_have_no_handle() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let global = baybo_model::AgentProfileId::generate();
+        agents.insert(profile_row(global.clone(), None));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(super::board_handle(&agents, &global).await, None);
+        assert_eq!(
+            super::board_handle(&agents, &baybo_model::AgentProfileId::generate()).await,
+            None,
         );
     }
 

@@ -26,7 +26,7 @@ use baybo_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use baybo_agent::router::Router;
 use baybo_agent::service::{ShutdownSignal, TaskTracker};
 use baybo_agent::supervisor::AgentSupervisor;
-use baybo_agent::tool_executor::ToolExecutor;
+use baybo_agent::tool_executor::{BoardStores, ToolExecutor};
 use baybo_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_config::{BayboConfig, LlmEntryName};
@@ -809,7 +809,10 @@ pub async fn build_managers(
         virtual_reads,
         background_jobs,
         background_control,
-        Some(stores.project.clone()),
+        Some(BoardStores {
+            projects: stores.project.clone(),
+            agents: stores.agent_profile.clone(),
+        }),
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
@@ -1173,6 +1176,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 &graph.channels_registry,
             )),
         )),
+        project_manager: Some(Arc::clone(&graph.project_manager)),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });

@@ -213,8 +213,9 @@ pub async fn branch_of(root: &Path) -> Option<String> {
 /// What happened when an issue's worktree was reclaimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reclaimed {
-    /// The checkout is gone. `branch_deleted` is true when it had produced
-    /// nothing and was removed with it.
+    /// The checkout is gone. `branch_deleted` is true when the branch held
+    /// nothing the repository did not already have and git agreed to drop
+    /// it. Anything either side is unsure about is left behind.
     Removed { branch_deleted: bool },
     /// Left alone, with the reason to put on the timeline. Uncommitted work
     /// is the common one: deleting it would destroy the only copy.
@@ -233,6 +234,8 @@ pub enum Reclaimed {
 /// A branch that never produced a commit is deleted with the tree. One
 /// that did is kept — it is the deliverable, and the whole point of not
 /// merging automatically is that the operator decides what happens to it.
+/// So is one git cannot vouch for: an unknown count is never read as
+/// "empty".
 pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed> {
     if !root.exists() {
         // A stale admin record can outlive the directory; tidying it here
@@ -255,40 +258,63 @@ pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed
 
     // Deleting the branch is safe only now: while the worktree existed the
     // branch was checked out in it, and git would have refused anyway.
+    //
+    // Two independent readings have to agree before the one step here that
+    // cannot be undone. `Some(0)` — not `None` — is ours, and `--delete`
+    // rather than `-D` is git's, which refuses anything it considers
+    // unmerged. A branch either of them is unsure about outlives the card.
     let mut branch_deleted = false;
-    if branch_exists(repo, branch).await? && commits_ahead(repo, branch).await == 0 {
-        branch_deleted = git(repo, &["branch", "-D", branch]).await.is_ok();
+    if branch_exists(repo, branch).await? && commits_ahead(repo, branch).await == Some(0) {
+        branch_deleted = git(repo, &["branch", "--delete", branch]).await.is_ok();
     }
     Ok(Reclaimed::Removed { branch_deleted })
 }
 
-/// How many commits `branch` has that the repository's own checked-out
-/// branch does not — what the issue actually produced.
+/// How many commits `branch` has that the repository's own checkout does
+/// not — what the issue actually produced.
 ///
-/// The base is the main checkout's current branch, which is reliable here
-/// because `git worktree add` never moves it: issue branches live in
-/// worktrees, so the repository's own HEAD stays on whatever the operator
-/// left it on.
+/// `None` is not `Some(0)`: it means git could not answer at all. The two
+/// callers act on certainty in opposite directions — [`reclaim`] deletes a
+/// branch only on `Some(0)`, `surface_branch` records one only on a count
+/// above zero — so folding "unknown" into either would silently destroy a
+/// run's only deliverable or silently hide it. Still never an error: a
+/// count that cannot be taken must not fail the run that produced the work.
 ///
-/// Returns 0 rather than an error when git cannot answer. A miscount makes
-/// a branch chip appear or not appear; failing the run that produced the
-/// work would be the more expensive way to be wrong.
-pub async fn commits_ahead(repo: &Path, branch: &str) -> usize {
-    let base = match run(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-        _ => return 0,
+/// An unborn HEAD is answered rather than refused. A project created
+/// without a workdir is `git init`ed and never committed — the *default*
+/// project shape — and `rev-parse HEAD` hard-fails there. The main checkout
+/// holds nothing in that state, so every commit on the branch is new work
+/// and the whole branch is counted.
+pub async fn commits_ahead(repo: &Path, branch: &str) -> Option<usize> {
+    let head = run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await
+        .ok()?;
+    let range = if head.status.success() {
+        format!("HEAD..refs/heads/{branch}")
+    } else if head.status.code() == Some(UNBORN_HEAD) {
+        format!("refs/heads/{branch}")
+    } else {
+        return None;
     };
-    if base.is_empty() || base == branch {
-        return 0;
+    // `refs/heads/` and the trailing `--` because a branch name alone is
+    // not a safe revision: a file at `issue/4-x` makes git call the
+    // argument ambiguous and exit 128, which would read as "unknown" for a
+    // branch that is perfectly countable.
+    let out = run(repo, &["rev-list", "--count", &range, "--"])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    match run(repo, &["rev-list", "--count", &format!("{base}..{branch}")]).await {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        _ => 0,
-    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
+
+/// `git rev-parse --verify --quiet HEAD` when HEAD cannot be resolved to a
+/// commit but the repository itself is readable — an unborn branch, or the
+/// rarer torn `.git/HEAD`. A path that is not a repository exits 128
+/// instead, and that difference is the whole reason the code is read rather
+/// than the failure being treated as one case.
+const UNBORN_HEAD: i32 = 1;
 
 async fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     Ok(run(
@@ -394,22 +420,7 @@ mod tests {
         tokio::fs::write(root.join("a.txt"), b"hello")
             .await
             .expect("write a file the way a run would");
-        git(&root, &["add", "."]).await.expect("git add");
-        git(
-            &root,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@x",
-                "commit",
-                "--quiet",
-                "-m",
-                "work",
-            ],
-        )
-        .await
-        .expect("git commit");
+        commit(&root, "work").await;
 
         let head = run(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
             .await
@@ -572,16 +583,12 @@ mod tests {
         assert!(root.join(".git").exists());
     }
 
-    /// A repository with one commit — the shape a project pointed at a real
-    /// checkout has, and the one where `worktree add -b` makes a real ref.
-    async fn repo_with_commit() -> tempfile::TempDir {
-        let dir = fresh_repo().await;
-        tokio::fs::write(dir.path().join("seed.txt"), b"seed")
-            .await
-            .expect("write");
-        git(dir.path(), &["add", "."]).await.expect("add");
+    /// Commit whatever is in `dir`, with an identity on the command line so
+    /// the tests never borrow the developer's own git config.
+    async fn commit(dir: &Path, message: &str) {
+        git(dir, &["add", "--all"]).await.expect("git add");
         git(
-            dir.path(),
+            dir,
             &[
                 "-c",
                 "user.name=t",
@@ -590,11 +597,21 @@ mod tests {
                 "commit",
                 "--quiet",
                 "-m",
-                "seed",
+                message,
             ],
         )
         .await
-        .expect("commit");
+        .expect("git commit");
+    }
+
+    /// A repository with one commit — the shape a project pointed at a real
+    /// checkout has, and the one where `worktree add -b` makes a real ref.
+    async fn repo_with_commit() -> tempfile::TempDir {
+        let dir = fresh_repo().await;
+        tokio::fs::write(dir.path().join("seed.txt"), b"seed")
+            .await
+            .expect("write");
+        commit(dir.path(), "seed").await;
         dir
     }
 
@@ -660,22 +677,7 @@ mod tests {
         tokio::fs::write(root.join("a.txt"), b"work")
             .await
             .expect("write");
-        git(&root, &["add", "."]).await.expect("add");
-        git(
-            &root,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@x",
-                "commit",
-                "--quiet",
-                "-m",
-                "work",
-            ],
-        )
-        .await
-        .expect("commit");
+        commit(&root, "work").await;
 
         assert_eq!(
             reclaim(repo.path(), &root, "issue/7-x")
@@ -690,6 +692,91 @@ mod tests {
                 .await
                 .expect("check")
         );
+    }
+
+    #[tokio::test]
+    async fn a_commit_survives_reclaiming_a_card_on_a_project_with_no_commits_of_its_own() {
+        // The default project shape: `git init`ed and never committed, so
+        // the repository's own HEAD is unborn and holds nothing. Every
+        // commit on the issue branch is therefore new work, and finishing
+        // the card must not take it with the tree.
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("11");
+        ensure(repo.path(), &root, "issue/11-x").await.expect("cut");
+        tokio::fs::write(root.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        commit(&root, "work").await;
+
+        assert_eq!(
+            reclaim(repo.path(), &root, "issue/11-x")
+                .await
+                .expect("reclaim"),
+            Reclaimed::Removed {
+                branch_deleted: false
+            }
+        );
+        assert!(
+            branch_exists(repo.path(), "issue/11-x")
+                .await
+                .expect("check"),
+            "the run's only deliverable must outlive the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_commit_counts_when_the_repository_has_none_of_its_own() {
+        // The arithmetic behind the test above, pinned on its own so a
+        // later rewrite of the delete guard cannot hide the regression.
+        let repo = fresh_repo().await;
+        let root = repo.path().join("wt").join("12");
+        ensure(repo.path(), &root, "issue/12-x").await.expect("cut");
+        tokio::fs::write(root.join("a.txt"), b"one")
+            .await
+            .expect("write");
+        commit(&root, "one").await;
+        assert_eq!(commits_ahead(repo.path(), "issue/12-x").await, Some(1));
+
+        tokio::fs::write(root.join("b.txt"), b"two")
+            .await
+            .expect("write");
+        commit(&root, "two").await;
+        assert_eq!(commits_ahead(repo.path(), "issue/12-x").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_count_git_cannot_produce_is_unknown_not_zero() {
+        // `Some(0)` is a licence to delete the branch, so a count git
+        // refused to take must never wear that face.
+        let not_a_repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(commits_ahead(not_a_repo.path(), "issue/1-x").await, None);
+
+        let repo = repo_with_commit().await;
+        assert_eq!(
+            commits_ahead(repo.path(), "issue/1-x").await,
+            None,
+            "a branch that is not there cannot be counted either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_counts_only_what_it_added() {
+        // The ordinary shape — a project pointed at a real checkout — so
+        // spelling the range `refs/heads/<branch> --` cannot regress it.
+        let repo = repo_with_commit().await;
+        let root = repo.path().join("wt").join("13");
+        ensure(repo.path(), &root, "issue/13-x").await.expect("cut");
+        assert_eq!(
+            commits_ahead(repo.path(), "issue/13-x").await,
+            Some(0),
+            "a fresh branch has produced nothing"
+        );
+
+        tokio::fs::write(root.join("a.txt"), b"work")
+            .await
+            .expect("write");
+        commit(&root, "work").await;
+        assert_eq!(commits_ahead(repo.path(), "issue/13-x").await, Some(1));
     }
 
     #[tokio::test]

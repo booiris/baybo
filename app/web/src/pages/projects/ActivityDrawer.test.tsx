@@ -17,7 +17,13 @@ vi.mock('../../api/auth', () => ({
 }));
 
 function entry(id: string, number: number, body: IssueEvent['body']): IssueEvent {
-  return { id, number, actor: 'dev-1', actor_is_agent: true, body, created_at_ms: 0 };
+  return {
+    id,
+    number,
+    actor: { kind: 'agent', id: '01JC3KQ4Z8AAAAAAAAAAAAAAAA', handle: 'dev-1' },
+    body,
+    created_at_ms: 0,
+  };
 }
 
 describe('ActivityDrawer', () => {

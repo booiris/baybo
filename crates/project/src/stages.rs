@@ -1,8 +1,9 @@
 //! Sub-issues and the barriers between them.
 //!
-//! Pure, like the other rule modules here: the barrier decides one thing —
-//! did this stage just finish — and both the wake and the card's progress
-//! ring read it from the same place.
+//! Pure, like the other rule modules here: whether a finished child opens
+//! the next stage is decided once, in [`barrier_opens`], and the wake and
+//! the card's progress ring read this module rather than counting children
+//! for themselves.
 
 use baybo_store::project::{IssueRow, IssueStatus};
 
@@ -32,6 +33,9 @@ fn is_pending(child: &IssueRow) -> bool {
 /// so there is nothing to announce. That is not a hypothetical — detaching
 /// or cancelling the last child of a stage would otherwise read as a
 /// completion.
+///
+/// This alone is not the barrier: a stage can empty while an earlier one is
+/// still being worked. `barrier_opens` is the question the wake asks.
 pub fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
     let mut seen = false;
     for child in children.iter().filter(|c| c.stage == stage) {
@@ -41,6 +45,21 @@ pub fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
         }
     }
     seen
+}
+
+/// Whether finishing a child in `stage` opens a barrier: that stage has
+/// emptied **and** nothing earlier is still open.
+///
+/// The second clause is what makes it a barrier rather than a bulletin.
+/// Stages are planned up front, so a parent routinely carries children in
+/// stages the board has not reached; finishing — or cancelling — one of
+/// those empties a *later* stage while the current one is still being
+/// worked. Waking the parent then is worse than doing nothing: an issue
+/// holds one unfinished run at a time, so the wake would spend the parent's
+/// only slot and the barrier that matters, when the current stage finally
+/// empties, would be refused by the dedupe index and lost.
+pub(crate) fn barrier_opens(children: &[IssueRow], stage: i64) -> bool {
+    stage_complete(children, stage) && !children.iter().any(|c| is_pending(c) && c.stage < stage)
 }
 
 /// `(done, total)` for a parent's card, counting only work that is still
@@ -145,6 +164,44 @@ mod tests {
         // last child of a stage must not read as that stage being done.
         assert!(!stage_complete(&[], 0));
         assert!(!stage_complete(&[child(1, IssueStatus::Done, false)], 0));
+    }
+
+    #[test]
+    fn a_later_stage_emptying_first_is_not_a_barrier() {
+        // Stage 2 has genuinely emptied — but the board is still on stage 0,
+        // so there is nothing new for the parent to drive, and waking it
+        // would spend the one run slot the real barrier needs.
+        let children = vec![
+            child(0, IssueStatus::InProgress, false),
+            child(2, IssueStatus::Done, false),
+        ];
+        assert!(stage_complete(&children, 2));
+        assert!(!barrier_opens(&children, 2));
+
+        let children = vec![
+            child(0, IssueStatus::Done, false),
+            child(2, IssueStatus::Done, false),
+        ];
+        assert!(
+            barrier_opens(&children, 0),
+            "stage 0 opened on its own turn"
+        );
+    }
+
+    #[test]
+    fn the_last_stage_emptying_still_opens_the_barrier() {
+        // Nothing open at all is a barrier, not a suppression: the parent is
+        // woken to close its own work.
+        assert!(barrier_opens(&[child(0, IssueStatus::Done, false)], 0));
+    }
+
+    #[test]
+    fn an_unfinished_stage_never_opens_its_own_barrier() {
+        let children = vec![
+            child(0, IssueStatus::Done, false),
+            child(0, IssueStatus::Todo, false),
+        ];
+        assert!(!barrier_opens(&children, 0));
     }
 
     #[test]

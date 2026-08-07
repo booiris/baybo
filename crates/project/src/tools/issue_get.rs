@@ -92,6 +92,7 @@ impl Tool for IssueGetTool {
             .map(|entry| {
                 let who = match &entry.actor {
                     baybo_store::project::IssueActor::User => "the operator".to_owned(),
+                    baybo_store::project::IssueActor::System => "the board".to_owned(),
                     baybo_store::project::IssueActor::Agent(id) => handle_of(&team, id),
                 };
                 json!({ "at": entry.created_at.to_rfc3339(), "by": who, "event": narrate(&entry.body) })

@@ -1402,8 +1402,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     project_id TEXT    NOT NULL,
                     number     INTEGER NOT NULL,
                     agent_id   TEXT    NOT NULL,
-                    -- Minted when the run is claimed, so a queued run has
-                    -- none yet.
+                    -- The issue's session, stamped when the run is claimed
+                    -- and null until then. NOT cleared by the boot sweep: a
+                    -- run returned to the queue keeps the session it was
+                    -- already working in, so the resumed run continues one
+                    -- transcript instead of opening a second.
                     session_id TEXT,
                     trigger    TEXT    NOT NULL,
                     status     TEXT    NOT NULL,

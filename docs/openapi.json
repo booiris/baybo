@@ -4752,17 +4752,12 @@
                           "id",
                           "number",
                           "actor",
-                          "actor_is_agent",
                           "body",
                           "created_at_ms"
                         ],
                         "properties": {
                           "actor": {
-                            "type": "string",
-                            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
-                          },
-                          "actor_is_agent": {
-                            "type": "boolean"
+                            "$ref": "#/components/schemas/ActorDto"
                           },
                           "body": {
                             "$ref": "#/components/schemas/IssueEventBodyDto"
@@ -5274,7 +5269,7 @@
             }
           },
           "404": {
-            "description": "Unknown project or issue, or no prompt is waiting on that call",
+            "description": "Unknown project or issue, or this card has no prompt waiting on that call",
             "content": {
               "application/json": {
                 "schema": {
@@ -5415,17 +5410,12 @@
                           "id",
                           "number",
                           "actor",
-                          "actor_is_agent",
                           "body",
                           "created_at_ms"
                         ],
                         "properties": {
                           "actor": {
-                            "type": "string",
-                            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
-                          },
-                          "actor_is_agent": {
-                            "type": "boolean"
+                            "$ref": "#/components/schemas/ActorDto"
                           },
                           "body": {
                             "$ref": "#/components/schemas/IssueEventBodyDto"
@@ -7036,6 +7026,62 @@
   },
   "components": {
     "schemas": {
+      "ActorDto": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The operator working the board.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "user"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The board acting on its own — today, the budget gate.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "system"
+                ]
+              }
+            }
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AgentRefDto"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "agent"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "description": "Who did the thing an entry records.\n\nTagged, and three kinds, so the client switches instead of parsing. The\npair it replaces — a string plus an `is_agent` flag — was two fields\nthat could disagree, and it had no way at all to say the board acted on\nits own."
+      },
       "AgentFrameworkDto": {
         "type": "string",
         "description": "Mirror of [`baybo_model::AgentFramework`]; wire strings match the\nspawn protocol's backend tags (`baybo`/`claude`/`codex`).",
@@ -7116,6 +7162,23 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AgentRefDto": {
+        "type": "object",
+        "description": "An agent as a timeline entry names it.\n\nThe handle is resolved server-side rather than by the client, for the\nsame reason `HiredByDto`'s is: a timeline is history, so it names agents\nthat have since left the team — and those are precisely the rows the\nroster the client holds has filtered out. The id rides along because it\nis what opens the agent's profile.",
+        "required": [
+          "id",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string",
+            "description": "The `@handle` to render, without the `@`. Falls back to the id when\nthe reference resolves to nothing at all."
+          },
+          "id": {
+            "type": "string"
           }
         }
       },
@@ -8828,9 +8891,13 @@
             ],
             "properties": {
               "from": {
-                "type": [
-                  "string",
-                  "null"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentRefDto"
+                  }
                 ]
               },
               "kind": {
@@ -8840,9 +8907,13 @@
                 ]
               },
               "to": {
-                "type": [
-                  "string",
-                  "null"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AgentRefDto"
+                  }
                 ]
               }
             }
@@ -9106,17 +9177,12 @@
           "id",
           "number",
           "actor",
-          "actor_is_agent",
           "body",
           "created_at_ms"
         ],
         "properties": {
           "actor": {
-            "type": "string",
-            "description": "`\"user\"`, or the agent's id. Which of the two it is comes from\n[`Self::actor_is_agent`] rather than from parsing this."
-          },
-          "actor_is_agent": {
-            "type": "boolean"
+            "$ref": "#/components/schemas/ActorDto"
           },
           "body": {
             "$ref": "#/components/schemas/IssueEventBodyDto"

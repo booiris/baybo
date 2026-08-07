@@ -250,30 +250,50 @@ pub struct NewIssue {
     pub created_at: DateTime<Utc>,
 }
 
+/// The storage spelling of the operator, and of the board acting on its
+/// own.
+///
+/// Named rather than written at each end: [`IssueActor::to_storage`] and
+/// [`IssueActor::parse`] are the two halves of a fail-closed round trip — an
+/// actor string `parse` does not recognise fails the whole timeline read —
+/// and a consumer matching on the column should reach for the same constant
+/// rather than its own literal.
+pub const ACTOR_USER: &str = "user";
+
+/// See [`ACTOR_USER`].
+pub const ACTOR_SYSTEM: &str = "system";
+
 /// Who did the thing a timeline entry records.
 ///
-/// Two kinds and no more: the operator working the board, and one of the
-/// project's agents. A string here would let a caller invent a third.
+/// Three kinds and no more: the operator working the board, one of the
+/// project's agents, and the board itself. The third is not a courtesy —
+/// the budget gate holds and releases runs with nobody asking, and
+/// attributing that to the operator makes the card accuse the person
+/// reading it of something they did not do. A string here would let a
+/// caller invent a fourth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueActor {
     User,
     Agent(AgentProfileId),
+    /// The board acting on its own — today, the budget gate.
+    System,
 }
 
 impl IssueActor {
     /// Storage form. Agents are prefixed rather than stored bare so the
-    /// two cases stay distinguishable even if an agent is ever named
-    /// `user`.
+    /// cases stay distinguishable even if an agent is ever named `user`.
     pub fn to_storage(&self) -> String {
         match self {
-            IssueActor::User => "user".to_owned(),
+            IssueActor::User => ACTOR_USER.to_owned(),
+            IssueActor::System => ACTOR_SYSTEM.to_owned(),
             IssueActor::Agent(id) => format!("agent:{}", id.as_str()),
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "user" => Some(IssueActor::User),
+            ACTOR_USER => Some(IssueActor::User),
+            ACTOR_SYSTEM => Some(IssueActor::System),
             other => other
                 .strip_prefix("agent:")
                 .and_then(|id| AgentProfileId::parse(id.to_owned()).ok())
@@ -356,7 +376,8 @@ pub enum IssueEventBody {
         decision: baybo_model::ApprovalDecision,
     },
     /// Every non-cancelled child in one of this issue's stages reached
-    /// Done, so its assignee was woken to drive the next one.
+    /// Done, and nothing earlier is still open, so its assignee was woken
+    /// to drive the next one.
     StageCompleted {
         stage: i64,
     },
@@ -612,9 +633,15 @@ pub trait ProjectStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<bool>;
 
-    /// Return every unsettled run to `queued`, clearing the session it was
-    /// claimed with. Run once at boot: a `running` row whose actor died
-    /// with the process is work that never finished, not work in flight.
+    /// Return the `running` runs to `queued` and hand back every unsettled
+    /// run that is not `held`. Run once at boot: a `running` row whose
+    /// actor died with the process is work that never finished, not work in
+    /// flight.
+    ///
+    /// The session it was claimed with is kept — an issue keeps one session
+    /// across its runs, and [`ProjectStore::claim_run`] gates on the status,
+    /// not on the session being absent. `held` rows are left where they are;
+    /// the budget, not this sweep, decides whether they start.
     async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>>;
 }
 
@@ -626,7 +653,8 @@ pub trait ProjectStore: Send + Sync {
 pub enum RunTrigger {
     /// The issue entered In Progress — a drag, a REST move, an agent tool.
     Started,
-    /// An agent was put on an issue already in In Progress.
+    /// An agent was put on an issue already in In Progress, possibly
+    /// replacing another.
     Assigned,
     /// A retry of a settled run.
     Retry,
@@ -660,8 +688,10 @@ impl RunTrigger {
     }
 }
 
-/// Where a run is. `Queued` and `Running` are the unsettled states — the
-/// ones the boot sweep re-drives.
+/// Where a run is. `Held`, `Queued` and `Running` are the unsettled states
+/// — the ones that hold an issue's dedupe slot. Only `Running` is re-driven
+/// by the boot sweep; a hold was never started on purpose, so the budget
+/// decides when it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -757,7 +787,9 @@ pub struct IssueRunRow {
     /// boot sweep don't have to join.
     pub number: i64,
     pub agent_id: AgentProfileId,
-    /// Minted when the run is claimed; `None` while it is still queued.
+    /// The issue's session, stamped when the run is claimed. `None` on a
+    /// run that has never been claimed; a run the boot sweep returned to the
+    /// queue keeps the session it was already working in.
     pub session_id: Option<SessionId>,
     pub trigger: RunTrigger,
     pub status: RunStatus,
@@ -779,4 +811,28 @@ pub struct NewIssueRun {
     pub number: i64,
     pub agent_id: AgentProfileId,
     pub trigger: RunTrigger,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every actor has to survive the round trip through a row. Reading is
+    /// fail-closed — an actor string the enum cannot parse fails the whole
+    /// timeline read — so a variant that writes a spelling `parse` does not
+    /// know makes every card it ever touched unreadable.
+    #[test]
+    fn every_actor_round_trips_through_storage() {
+        for actor in [
+            IssueActor::User,
+            IssueActor::System,
+            IssueActor::Agent(AgentProfileId::parse("dev-1".to_owned()).expect("agent id")),
+        ] {
+            assert_eq!(
+                IssueActor::parse(&actor.to_storage()),
+                Some(actor.clone()),
+                "{actor:?}"
+            );
+        }
+    }
 }

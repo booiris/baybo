@@ -15,9 +15,23 @@ export function eventShape(event: IssueEvent): EventShape {
   return event.body.kind === 'comment' ? 'comment' : 'note';
 }
 
-/** Who to show. The operator is "you"; an agent is its own handle. */
+/**
+ * Who to show. The operator is "you", an agent is its `@handle`, and the
+ * board's own gate is "the board" — a budget hold is nobody's action, and
+ * "you held the run" accuses the reader of one they did not take.
+ *
+ * The handle arrives resolved: an agent that has left the team is not on
+ * the roster this page holds, and a timeline still names it.
+ */
 export function actorLabel(event: IssueEvent): string {
-  return event.actor_is_agent ? `@${event.actor}` : 'you';
+  switch (event.actor.kind) {
+    case 'user':
+      return 'you';
+    case 'system':
+      return 'the board';
+    case 'agent':
+      return `@${event.actor.handle}`;
+  }
 }
 
 /**
@@ -80,8 +94,8 @@ export function describeEvent(body: IssueEventBody): string | null {
     case 'assigned': {
       // Four cases, and each one reads differently. "assigned it to nobody"
       // is what a naive template produces for an unassignment.
-      const from = body.from != null ? `@${body.from}` : null;
-      const to = body.to != null ? `@${body.to}` : null;
+      const from = body.from != null ? `@${body.from.handle}` : null;
+      const to = body.to != null ? `@${body.to.handle}` : null;
       if (to == null) return from != null ? `unassigned ${from}` : 'unassigned it';
       if (from == null) return `assigned it to ${to}`;
       return `reassigned it from ${from} to ${to}`;

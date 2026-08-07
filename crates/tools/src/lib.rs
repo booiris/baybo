@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
+use baybo_model::{AgentHandle, AgentProfileId, SessionId, SpanId, TriggerSource, TurnId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -394,6 +394,16 @@ pub struct ToolContext {
     /// that is a sandbox concern and never a cwd, so it stops at the
     /// executor.
     pub checkout_root: Option<PathBuf>,
+    /// What this session's agent is called on the board its card belongs
+    /// to: the `@handle` a person types into a comment, not the ULID that
+    /// names its persona directory. Populated only alongside
+    /// [`Self::checkout_root`], because its one consumer is the commit
+    /// identity an issue run's shell carries.
+    ///
+    /// `None` for an agent with no board (a chat persona), and for one
+    /// whose profile row could not be read — a commit is then authored by
+    /// the workspace fallback rather than by a name no reader can resolve.
+    pub agent_handle: Option<AgentHandle>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -441,6 +451,7 @@ impl ToolContext {
             background_control: None,
             notify_silence: None,
             checkout_root: None,
+            agent_handle: None,
         }
     }
 }

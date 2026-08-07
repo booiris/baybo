@@ -47,10 +47,47 @@ describe('mentionCandidates', () => {
 });
 
 describe('applyMention', () => {
-  it('replaces what was typed and leaves the caret past the space', () => {
-    const result = applyMention('ask @de about it', { start: 4, prefix: 'de' }, 'dev-1');
-    expect(result.text).toBe('ask @dev-1 about it');
-    expect(result.text.slice(0, result.caret)).toBe('ask @dev-1 ');
+  it('replaces what was typed and leaves the caret one past the mention', () => {
+    const cases = [
+      // Mid-sentence: the tail's space is reused, and the caret steps over it.
+      {
+        text: 'ask @de about it',
+        query: { start: 4, prefix: 'de' },
+        want: 'ask @dev-1 about it',
+        caretAt: 'ask @dev-1 ',
+      },
+      // Before punctuation: the inserted space is the separator, so the caret
+      // belongs before the comma, not after it.
+      {
+        text: 'ask @de,',
+        query: { start: 4, prefix: 'de' },
+        want: 'ask @dev-1 ,',
+        caretAt: 'ask @dev-1 ',
+      },
+      // At the end of the box, where the caret must not run past the text.
+      {
+        text: 'ask @de',
+        query: { start: 4, prefix: 'de' },
+        want: 'ask @dev-1 ',
+        caretAt: 'ask @dev-1 ',
+      },
+      // The mention is the whole comment.
+      {
+        text: '@de',
+        query: { start: 0, prefix: 'de' },
+        want: '@dev-1 ',
+        caretAt: '@dev-1 ',
+      },
+    ];
+
+    for (const { text, query, want, caretAt } of cases) {
+      const result = applyMention(text, query, 'dev-1');
+      expect(result.text).toBe(want);
+      expect(result.text.slice(0, result.caret)).toBe(caretAt);
+      // The offset itself, not just the prefix: `slice` clamps, which is how
+      // a caret past the end of the text stayed invisible.
+      expect(result.caret).toBe(caretAt.length);
+    }
   });
 });
 

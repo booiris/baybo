@@ -1405,6 +1405,24 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * @description Who did the thing an entry records.
+         *
+         *     Tagged, and three kinds, so the client switches instead of parsing. The
+         *     pair it replaces — a string plus an `is_agent` flag — was two fields
+         *     that could disagree, and it had no way at all to say the board acted on
+         *     its own.
+         */
+        ActorDto: {
+            /** @enum {string} */
+            kind: "user";
+        } | {
+            /** @enum {string} */
+            kind: "system";
+        } | (components["schemas"]["AgentRefDto"] & {
+            /** @enum {string} */
+            kind: "agent";
+        });
+        /**
          * @description Mirror of [`baybo_model::AgentFramework`]; wire strings match the
          *     spawn protocol's backend tags (`baybo`/`claude`/`codex`).
          * @enum {string}
@@ -1450,6 +1468,23 @@ export interface components {
             name: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        /**
+         * @description An agent as a timeline entry names it.
+         *
+         *     The handle is resolved server-side rather than by the client, for the
+         *     same reason `HiredByDto`'s is: a timeline is history, so it names agents
+         *     that have since left the team — and those are precisely the rows the
+         *     roster the client holds has filtered out. The id rides along because it
+         *     is what opens the agent's profile.
+         */
+        AgentRefDto: {
+            /**
+             * @description The `@handle` to render, without the `@`. Falls back to the id when
+             *     the reference resolves to nothing at all.
+             */
+            handle: string;
+            id: string;
         };
         /**
          * @description One bucket per UTC day for the analytics chart.
@@ -2458,10 +2493,10 @@ export interface components {
             kind: "moved";
             to: components["schemas"]["IssueStatusDto"];
         } | {
-            from?: string | null;
+            from?: null | components["schemas"]["AgentRefDto"];
             /** @enum {string} */
             kind: "assigned";
-            to?: string | null;
+            to?: null | components["schemas"]["AgentRefDto"];
         } | {
             /** Format: int64 */
             attempt: number;
@@ -2526,12 +2561,7 @@ export interface components {
         };
         /** @description One entry on an issue's timeline. */
         IssueEventDto: {
-            /**
-             * @description `"user"`, or the agent's id. Which of the two it is comes from
-             *     [`Self::actor_is_agent`] rather than from parsing this.
-             */
-            actor: string;
-            actor_is_agent: boolean;
+            actor: components["schemas"]["ActorDto"];
             body: components["schemas"]["IssueEventBodyDto"];
             /** Format: int64 */
             created_at_ms: number;
@@ -7014,12 +7044,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            /**
-                             * @description `"user"`, or the agent's id. Which of the two it is comes from
-                             *     [`Self::actor_is_agent`] rather than from parsing this.
-                             */
-                            actor: string;
-                            actor_is_agent: boolean;
+                            actor: components["schemas"]["ActorDto"];
                             body: components["schemas"]["IssueEventBodyDto"];
                             /** Format: int64 */
                             created_at_ms: number;
@@ -7351,7 +7376,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Unknown project or issue, or no prompt is waiting on that call */
+            /** @description Unknown project or issue, or this card has no prompt waiting on that call */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -7440,12 +7465,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
-                            /**
-                             * @description `"user"`, or the agent's id. Which of the two it is comes from
-                             *     [`Self::actor_is_agent`] rather than from parsing this.
-                             */
-                            actor: string;
-                            actor_is_agent: boolean;
+                            actor: components["schemas"]["ActorDto"];
                             body: components["schemas"]["IssueEventBodyDto"];
                             /** Format: int64 */
                             created_at_ms: number;

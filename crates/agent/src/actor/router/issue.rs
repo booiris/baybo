@@ -19,10 +19,9 @@ use std::sync::Arc;
 use baybo_model::{
     AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, User,
 };
-use baybo_project::{ProjectEvents, worktree};
+use baybo_project::{ProjectEvents, ProjectManager, worktree};
 use baybo_store::project::{
-    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, NewIssueRun, ProjectStore, RunStatus,
-    RunTrigger,
+    IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, ProjectStore, RunStatus,
 };
 use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
 use tokio::sync::broadcast;
@@ -57,8 +56,13 @@ pub struct IssueRunEvent {
 impl Router {
     pub(super) async fn handle_issue_run(&mut self, event: IssueRunEvent) {
         let run_id = event.run.id.clone();
-        let Some(store) = self.project_store.clone() else {
-            warn!(%run_id, "issue run arrived with no project store; cannot execute");
+        // Both or neither: the store settles this run's row, the manager
+        // starts whatever settling it turns out to owe. An assembly with a
+        // board has both — this is the no-board case (the TUI's runtime).
+        let (Some(store), Some(projects)) =
+            (self.project_store.clone(), self.project_manager.clone())
+        else {
+            warn!(%run_id, "issue run arrived with no board wiring; cannot execute");
             return;
         };
 
@@ -118,6 +122,7 @@ impl Router {
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
             store: Arc::clone(&store),
+            projects: Arc::clone(&projects),
             events: self.project_events.clone(),
         };
 
@@ -221,9 +226,15 @@ fn binding_for(agent: &AgentProfileId) -> AgentBinding {
 /// the comment waits here rather than being lost. This terminates: the
 /// follow-up only looks at comments newer than its own predecessor's
 /// start, so a quiet issue stops after one.
+///
+/// Started through the manager rather than written to the store here. That
+/// is the one path that consults the board's budget, refuses a second live
+/// run and hands the row to the dispatcher; a row written directly would be
+/// a run nothing ever starts, holding the issue's only live-run slot until
+/// the next boot.
 async fn follow_up_on_comments(
+    projects: &Arc<ProjectManager>,
     store: &Arc<dyn ProjectStore>,
-    events: Option<&Arc<dyn ProjectEvents>>,
     run: &IssueRunRow,
 ) {
     let said = match store.events_since(&run.issue_id, run.created_at).await {
@@ -238,36 +249,16 @@ async fn follow_up_on_comments(
     if !said {
         return;
     }
-    // Re-read the issue: it may have been cancelled, unassigned or dragged
-    // out of live work while the run was going, and each of those means
-    // nobody should be woken.
-    let issue = match store.get_issue(&run.project_id, run.number).await {
-        Ok(Some(issue)) => issue,
-        _ => return,
-    };
-    if baybo_project::comment_delivery(&issue, None) != baybo_project::CommentDelivery::Wake {
-        return;
-    }
-    let Some(agent_id) = issue.assignee.clone() else {
-        return;
-    };
-    let entry = NewIssueRun {
-        id: baybo_model::IssueRunId::generate(),
-        issue_id: issue.id.clone(),
-        project_id: issue.project_id.clone(),
-        number: issue.number,
-        agent_id,
-        trigger: RunTrigger::Comment,
-    };
-    match store.enqueue_run(&entry).await {
-        Ok(next) => {
-            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up");
-            if let Some(events) = events {
-                events.run_changed(&issue.project_id, issue.number);
-            }
+    // Whether that still wakes anybody is the board's call, not this one's:
+    // the issue may have been cancelled, unassigned or dragged out of live
+    // work while the run was going, and the board goes out of budget or is
+    // archived on its own schedule.
+    match projects.wake_on_comment(&run.project_id, run.number).await {
+        Some(next) => {
+            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up")
         }
-        Err(e) => {
-            warn!(run = %run.id, error = %e, "could not queue the follow-up run");
+        None => {
+            debug!(run = %run.id, "a comment arrived mid-run, but the issue is no longer listening")
         }
     }
 }
@@ -280,6 +271,10 @@ async fn follow_up_on_comments(
 /// rather than code should show no branch anywhere. Keying the row's
 /// `branch` on "has a commit" rather than storing it at creation is what
 /// makes that fall out — there is no second flag that could disagree.
+///
+/// A count git could not take reads the same way as no commits at all: a
+/// branch chip is a claim that there is something to look at, and an
+/// unverified one is worse than none.
 async fn surface_branch(
     store: &Arc<dyn ProjectStore>,
     events: Option<&Arc<dyn ProjectEvents>>,
@@ -300,7 +295,10 @@ async fn surface_branch(
     let Some(branch) = worktree::branch_of(checkout).await else {
         return;
     };
-    if worktree::commits_ahead(Path::new(&project.workdir), &branch).await == 0 {
+    if worktree::commits_ahead(Path::new(&project.workdir), &branch)
+        .await
+        .is_none_or(|ahead| ahead == 0)
+    {
         return;
     }
     match store.set_issue_branch(&issue.id, &branch).await {
@@ -391,6 +389,12 @@ struct IssueRunWaiter {
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
     store: Arc<dyn ProjectStore>,
+    /// The board, for the one thing settling a run can owe: a follow-up for
+    /// a comment that landed mid-run. Held as the manager rather than as a
+    /// store handle so that follow-up goes through the same enqueue — and
+    /// therefore the same budget gate and the same dispatcher — as every
+    /// other run.
+    projects: Arc<ProjectManager>,
     events: Option<Arc<dyn ProjectEvents>>,
 }
 
@@ -413,7 +417,7 @@ impl IssueRunWaiter {
         // Only here, and not in `settle` itself — the two early-failure
         // settles above never started anything, so there is no branch to
         // surface and nothing that could have been said mid-run.
-        follow_up_on_comments(&self.store, self.events.as_ref(), &self.run).await;
+        follow_up_on_comments(&self.projects, &self.store, &self.run).await;
         surface_branch(&self.store, self.events.as_ref(), &self.checkout, &self.run).await;
     }
 
@@ -502,5 +506,232 @@ fn outcome_for(kind: TurnStatusKind) -> (RunStatus, Option<String>) {
             RunStatus::Failed,
             Some(format!("the run ended as {other:?}")),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What settling a run owes the card: a comment that arrived while it
+    //! was executing has to *start* something, not merely be recorded.
+
+    use std::sync::Arc;
+
+    use baybo_model::{
+        AgentFramework, AgentHandle, AgentProfileId, MicroUsd, SessionId, TeamMembership,
+    };
+    use baybo_project::{NewIssueRequest, NewProject, ProjectManager};
+    use baybo_store::project::{IssuePriority, IssueStatus, ProjectRow, ProjectUpdate, RunTrigger};
+    use baybo_workspace::WorkspacePaths;
+
+    use super::*;
+
+    const HANDLE: &str = "dev-1";
+    const BOARD: &str = "Follow-ups";
+
+    struct Board {
+        projects: Arc<ProjectManager>,
+        store: Arc<dyn ProjectStore>,
+        project: ProjectRow,
+        /// Every run the board handed to an executor, in order. A run
+        /// written to the store that never lands here is a run nothing ever
+        /// starts — and it holds the issue's only live-run slot.
+        dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>>,
+        _workspace: tempfile::TempDir,
+    }
+
+    /// A board with one in-progress card whose first run is executing —
+    /// the state the waiter is in when somebody comments.
+    async fn mid_run() -> (Board, IssueRunRow) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let paths = WorkspacePaths::new(workspace.path().to_path_buf());
+        tokio::fs::create_dir_all(paths.work_dir())
+            .await
+            .expect("work dir");
+        let store = baybo_storage::Store::open(workspace.path().join("storage.db"))
+            .await
+            .expect("store");
+        let dispatched: Arc<parking_lot::Mutex<Vec<IssueRunRow>>> = Arc::default();
+        let projects = Arc::new(ProjectManager::new(
+            Arc::clone(&store.project),
+            Arc::clone(&store.agent_profile),
+            paths,
+            Arc::new(baybo_project::NoopProjectEvents),
+            {
+                let seen = Arc::clone(&dispatched);
+                Arc::new(move |run| seen.lock().push(run))
+            },
+        ));
+        let project = projects
+            .create_project(NewProject {
+                name: BOARD.to_owned(),
+                description: String::new(),
+                workdir: None,
+                daily_budget: None,
+            })
+            .await
+            .expect("project");
+
+        // An assignee has to be on the board's team.
+        let agent = AgentProfileId::parse(HANDLE).expect("agent id");
+        let now = chrono::Utc::now();
+        store
+            .agent_profile
+            .create(&baybo_store::AgentProfileRow {
+                id: agent.clone(),
+                description: String::new(),
+                avatar_blob_id: None,
+                framework: AgentFramework::Baybo,
+                llm: None,
+                builtin: false,
+                team: Some(TeamMembership {
+                    project_id: project.id.clone(),
+                    handle: AgentHandle::parse(HANDLE).expect("handle"),
+                }),
+                hired_by: None,
+                deleted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("teammate");
+
+        projects
+            .create_issue(
+                &project.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    title: "wire the importer".to_owned(),
+                    description: String::new(),
+                    status: IssueStatus::InProgress,
+                    priority: IssuePriority::None,
+                    assignee: Some(agent),
+                    parent: None,
+                    stage: 0,
+                    source_key: None,
+                },
+            )
+            .await
+            .expect("issue");
+
+        let first = dispatched.lock().first().cloned().expect("first run");
+        assert!(
+            store
+                .project
+                .claim_run(&first.id, &SessionId::from("sess-issue-1"))
+                .await
+                .expect("claim"),
+            "the executor took the first run"
+        );
+
+        (
+            Board {
+                projects,
+                store: Arc::clone(&store.project),
+                project,
+                dispatched,
+                _workspace: workspace,
+            },
+            first,
+        )
+    }
+
+    /// Say something on the card while its run is executing, and confirm
+    /// the board deferred it rather than answering now.
+    async fn comment_mid_run(board: &Board) {
+        board
+            .projects
+            .comment(
+                &board.project.id,
+                1,
+                IssueActor::User,
+                "also handle the empty case",
+            )
+            .await
+            .expect("comment");
+        assert_eq!(
+            board
+                .projects
+                .comment_delivery(&board.project.id, 1)
+                .await
+                .expect("delivery"),
+            baybo_project::CommentDelivery::AfterCurrentRun,
+            "the comment is deferred to whoever settles this run"
+        );
+        assert_eq!(
+            board.dispatched.lock().len(),
+            1,
+            "and nothing was started while the card was busy"
+        );
+    }
+
+    /// The deferred comment has to reach the *dispatcher*. A ledger row
+    /// written straight to the store is a run nothing ever executes, and
+    /// because an issue may hold only one live run it blocks every later
+    /// start on that card until the next boot.
+    #[tokio::test]
+    async fn a_comment_left_mid_run_starts_a_follow_up_the_dispatcher_actually_gets() {
+        let (board, first) = mid_run().await;
+        comment_mid_run(&board).await;
+        board
+            .store
+            .settle_run(&first.id, RunStatus::Done, None)
+            .await
+            .expect("settle");
+
+        follow_up_on_comments(&board.projects, &board.store, &first).await;
+
+        let dispatched = board.dispatched.lock().clone();
+        assert_eq!(dispatched.len(), 2, "the follow-up was handed to somebody");
+        let follow_up = &dispatched[1];
+        assert_eq!(follow_up.trigger, RunTrigger::Comment);
+        assert_eq!(follow_up.number, first.number);
+        assert_eq!(follow_up.attempt, 2);
+        assert_eq!(
+            follow_up.status,
+            RunStatus::Queued,
+            "queued and on its way, not parked"
+        );
+    }
+
+    /// And it goes through the budget gate on the way, like every other
+    /// start: a board with nothing left records the run it owes and holds
+    /// it, rather than dispatching work it cannot pay for.
+    #[tokio::test]
+    async fn a_follow_up_the_board_cannot_afford_is_held_rather_than_dispatched() {
+        let (board, first) = mid_run().await;
+        comment_mid_run(&board).await;
+        board
+            .store
+            .settle_run(&first.id, RunStatus::Done, None)
+            .await
+            .expect("settle");
+        // Zero is how an operator pauses a board without archiving it.
+        board
+            .projects
+            .update_project(
+                &board.project.id,
+                ProjectUpdate {
+                    name: board.project.name.clone(),
+                    description: board.project.description.clone(),
+                    daily_budget: Some(MicroUsd::ZERO),
+                },
+            )
+            .await
+            .expect("budget");
+
+        follow_up_on_comments(&board.projects, &board.store, &first).await;
+
+        assert_eq!(
+            board.dispatched.lock().len(),
+            1,
+            "nothing started on a board with nothing left to spend"
+        );
+        let runs = board.store.list_runs(&first.issue_id).await.expect("runs");
+        assert_eq!(runs.len(), 2, "but the run the comment asked for exists");
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Held,
+            "owed and waiting for headroom, not dropped"
+        );
     }
 }

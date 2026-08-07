@@ -1087,8 +1087,9 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
     );
 
     // Reassigning while a run is in flight does not start a second one:
-    // the dedupe guard is a unique index, so it holds even though nothing
-    // here checked first.
+    // the trigger predicate does fire — a handover is a start — and the
+    // dedupe guard, a unique index, is what refuses it. Do not "simplify"
+    // the predicate to make this pass; the index is the backstop.
     f.manager
         .update_issue(
             &p.id,
@@ -1107,6 +1108,54 @@ async fn assigning_work_already_in_flight_starts_it_and_never_twice() {
         "an issue holds one run at a time"
     );
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 1);
+}
+
+/// Handing live work to a different agent starts that agent. Otherwise the
+/// board shows @dev-2 on a card only @dev-1 ever touched, and nothing
+/// happens until somebody notices.
+#[tokio::test]
+async fn reassigning_live_work_starts_the_new_agent() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("dev-1 tried and failed")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let first = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&first, RunStatus::Failed).await;
+    f.dispatched.lock().clear();
+
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(other.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hand it to dev-2");
+
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1, "the new assignee was started");
+    assert_eq!(announced[0].agent_id, other);
+    assert_eq!(announced[0].trigger, RunTrigger::Assigned);
+    assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 2);
 }
 
 #[tokio::test]
@@ -1501,15 +1550,27 @@ async fn a_board_over_budget_records_the_work_it_is_not_doing() {
     let timeline = f.manager.timeline(&project.id, 1).await.expect("timeline");
     let held = timeline
         .iter()
-        .find_map(|e| match &e.body {
-            baybo_store::project::IssueEventBody::BudgetExhausted {
-                spent_micros,
-                limit_micros,
-            } => Some((*spent_micros, *limit_micros)),
-            _ => None,
+        .find(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::BudgetExhausted { .. }
+            )
         })
         .expect("the timeline says the run was held");
-    assert_eq!(held, (0, 0));
+    assert!(
+        matches!(
+            held.body,
+            baybo_store::project::IssueEventBody::BudgetExhausted {
+                spent_micros: 0,
+                limit_micros: 0
+            }
+        ),
+        "{:?}",
+        held.body
+    );
+    // In the board's own name. Nobody held this run; attributing the gate to
+    // the operator makes the card accuse the person reading it.
+    assert_eq!(held.actor, IssueActor::System);
 }
 
 /// Raising the ceiling starts what it was blocking, without the operator
@@ -1569,8 +1630,153 @@ async fn a_raised_budget_releases_what_it_was_holding() {
             .any(|e| matches!(
                 e.body,
                 baybo_store::project::IssueEventBody::BudgetRestored { .. }
+            ) && e.actor == IssueActor::System),
+        "and the card says the board released it — the operator raised the \
+         ceiling, they did not start this run"
+    );
+}
+
+/// The release is what makes a rolled-over ceiling need no timer: the next
+/// thing that happens on the board hands out what it was holding.
+#[tokio::test]
+async fn the_next_enqueue_releases_a_hold_the_budget_no_longer_justifies() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Rollover")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev.clone()),
+                ..new_issue("held on Monday")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    assert!(f.dispatched.lock().is_empty(), "nothing to spend it on");
+
+    // Through the raw store, deliberately: `manager.update_project` releases
+    // holds itself, and going around it is the shape of a day rolling over —
+    // headroom changes and nobody tells the manager.
+    f.store
+        .update_project(
+            &project.id,
+            &ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+            },
+        )
+        .await
+        .expect("a new day's ceiling");
+
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("dragged on Tuesday")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(
+        announced.len(),
+        2,
+        "Tuesday's drag started Monday's hold as well as itself"
+    );
+    assert_eq!(announced[0].number, 1, "the older hold went first");
+    assert_eq!(announced[1].number, 2);
+    assert_eq!(
+        f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued,
+        "and #1 no longer sits on its own dedupe slot"
+    );
+    assert!(
+        f.manager
+            .timeline(&project.id, 1)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::BudgetRestored { .. }
             )),
-        "and the card says it was released"
+        "and #1's card says so"
+    );
+}
+
+/// The release happens **before** the write it shares a call with, so the
+/// board that needs it most — the one where every card holds its own dedupe
+/// slot — is reachable at all.
+#[tokio::test]
+async fn touching_the_held_card_itself_releases_it() {
+    let f = fixture().await;
+    let project = f
+        .manager
+        .create_project(NewProject {
+            daily_budget: Some(baybo_model::MicroUsd::ZERO),
+            ..new_project("Stuck")
+        })
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &project.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("the only card on the board")
+            },
+        )
+        .await
+        .expect("create")
+        .into_issue();
+    f.store
+        .update_project(
+            &project.id,
+            &ProjectUpdate {
+                name: project.name.clone(),
+                description: String::new(),
+                daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+            },
+        )
+        .await
+        .expect("a new day's ceiling");
+    f.dispatched.lock().clear();
+
+    // Retry is refused — the run it would have recorded is the one that just
+    // started, and that run holds the slot. The message is true and the work
+    // is under way; releasing after the write instead would leave this board
+    // held forever, because every enqueue on it is refused before it gets
+    // there.
+    let refused = f
+        .manager
+        .retry_run(&project.id, 1)
+        .await
+        .expect_err("the released run holds the slot");
+    assert!(matches!(refused, ProjectError::Conflict(_)), "{refused:?}");
+    assert_eq!(f.dispatched.lock().len(), 1, "but it did start");
+    assert_eq!(
+        f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued
     );
 }
 
@@ -1832,6 +2038,93 @@ async fn a_cancelled_step_opens_its_stage() {
         .expect("cancel #3");
     assert_eq!(f.dispatched.lock().len(), 1, "the stage opened");
     assert_eq!(f.dispatched.lock()[0].trigger, RunTrigger::StageBarrier);
+}
+
+/// Stages are planned up front, so a step of a later stage routinely
+/// finishes while the current one is still being worked. That is not a
+/// barrier: the parent holds one run at a time, so waking it early spends
+/// the slot the real barrier needs and the wake that matters is lost.
+#[tokio::test]
+async fn a_later_stage_finishing_early_does_not_wake_the_parent() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Out of order"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    let parent = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(lead),
+                status: IssueStatus::Todo,
+                ..new_issue("ship the thing")
+            },
+        )
+        .await
+        .expect("parent")
+        .into_issue();
+    for (title, stage) in [("design", 0), ("write the release note", 1)] {
+        f.manager
+            .create_issue(
+                &p.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    parent: Some(parent.number),
+                    stage,
+                    ..new_issue(title)
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{title}: {e}"))
+            .into_issue();
+    }
+    f.dispatched.lock().clear();
+
+    // Stage 1's only step finishes while stage 0 is still open.
+    f.manager
+        .move_issue(&p.id, 3, IssueActor::User, IssueStatus::Done, &[3])
+        .await
+        .expect("finish #3");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "stage 1 emptied, but the board is still on stage 0"
+    );
+    let stages_announced = async |number: i64| -> Vec<i64> {
+        f.manager
+            .timeline(&p.id, number)
+            .await
+            .expect("timeline")
+            .iter()
+            .filter_map(|e| match e.body {
+                baybo_store::project::IssueEventBody::StageCompleted { stage } => Some(stage),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        stages_announced(parent.number).await.is_empty(),
+        "and the card claims no stage opened, because none did"
+    );
+
+    // Now stage 0 empties — the barrier that actually matters, and the one
+    // the early wake would have made unenqueueable.
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2, 3])
+        .await
+        .expect("finish #2");
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1, "the parent woke exactly once");
+    assert_eq!(announced[0].number, parent.number);
+    assert_eq!(announced[0].trigger, RunTrigger::StageBarrier);
+    assert_eq!(
+        stages_announced(parent.number).await,
+        vec![0],
+        "and the entry names the stage that opened"
+    );
 }
 
 /// Sub-issues are one level deep, and that is enforced in both directions.
@@ -2460,6 +2753,70 @@ async fn a_mention_on_an_unowned_card_hands_it_over() {
     );
 }
 
+/// A handover an agent performed is that agent's, not the operator's. The
+/// card is asking the operator to trust what it says happened.
+#[tokio::test]
+async fn a_mention_hands_the_card_over_in_the_commenters_name() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Delegating"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(&p.id, IssueActor::User, new_issue("nobody is on this"))
+        .await
+        .expect("create")
+        .into_issue();
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
+        .await
+        .expect("to todo");
+
+    f.manager
+        .comment(
+            &p.id,
+            1,
+            IssueActor::Agent(lead.clone()),
+            "@dev-1 take this",
+        )
+        .await
+        .expect("comment");
+
+    assert_eq!(
+        f.manager.get_issue(&p.id, 1).await.expect("issue").assignee,
+        Some(dev.clone())
+    );
+    let timeline = f.manager.timeline(&p.id, 1).await.expect("timeline");
+    let comment = timeline
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.body,
+                baybo_store::project::IssueEventBody::Comment { .. }
+            )
+        })
+        .expect("the comment is on the timeline");
+    let assigned = timeline
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.body,
+                baybo_store::project::IssueEventBody::Assigned { to: Some(to), .. } if to == &dev
+            )
+        })
+        .expect("and so is the handover it caused");
+    assert_eq!(comment.actor, IssueActor::Agent(lead.clone()));
+    assert_eq!(
+        assigned.actor,
+        IssueActor::Agent(lead),
+        "the two entries agree on who did it — the lead said it and the lead \
+         did it, not 'you assigned it to @dev-1'"
+    );
+}
+
 /// On a card somebody is working, an @mention is a question — not a
 /// reassignment. Otherwise a passing remark takes work away from whoever
 /// is doing it.
@@ -2530,5 +2887,204 @@ async fn a_mention_of_a_stranger_still_records_the_comment() {
             .expect("timeline")
             .iter()
             .any(|e| matches!(&e.body, baybo_store::project::IssueEventBody::Comment { text } if text.contains("nobody-here")))
+    );
+}
+
+/// A comment left while a run was executing is deferred, and the executor
+/// asks for it once that run settles. It has to come back through the
+/// board: a row written straight to the store is a run nothing starts,
+/// sitting on the issue's only live-run slot until the next boot.
+#[tokio::test]
+async fn a_deferred_wake_starts_the_run_the_comment_asked_for() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Deferred"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("somebody spoke mid-run")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let first = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&first, RunStatus::Done).await;
+    f.dispatched.lock().clear();
+
+    let woken = f
+        .manager
+        .wake_on_comment(&p.id, issue.number)
+        .await
+        .expect("the issue is still listening");
+    assert_eq!(woken.trigger, RunTrigger::Comment);
+    assert_eq!(woken.attempt, 2);
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(
+        announced.len(),
+        1,
+        "and it reached the dispatcher, like every other start"
+    );
+    assert_eq!(announced[0].id, woken.id);
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Queued,
+        "not a row nothing will ever pick up"
+    );
+}
+
+/// `None` from a wake is an answer, not a failure: an issue dragged out of
+/// live work while its run was going is one nobody should be woken on.
+#[tokio::test]
+async fn a_wake_after_a_run_is_refused_once_the_card_leaves_live_work() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Finished"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let issue = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("done by the time anybody replied")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let first = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&first, RunStatus::Done).await;
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Done, &[1])
+        .await
+        .expect("to done");
+    f.dispatched.lock().clear();
+
+    assert!(
+        f.manager
+            .wake_on_comment(&p.id, issue.number)
+            .await
+            .is_none()
+    );
+    assert!(f.dispatched.lock().is_empty());
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "and nothing was recorded to hold the issue's slot"
+    );
+}
+
+/// The boot sweep hands an interrupted run back with the session it was
+/// working in, so the executor continues that transcript rather than
+/// opening a second one on the same issue.
+#[tokio::test]
+async fn a_resumed_run_keeps_the_session_it_was_working_in() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Interrupted"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("killed mid-turn")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    let session = baybo_model::SessionId::from("issue-1-session");
+    assert!(
+        f.store.claim_run(&run, &session).await.expect("claim"),
+        "the executor took it"
+    );
+    f.dispatched.lock().clear();
+
+    f.manager.resume_unsettled_runs().await.expect("boot sweep");
+
+    let announced = f.dispatched.lock().clone();
+    assert_eq!(announced.len(), 1);
+    assert_eq!(announced[0].status, RunStatus::Queued);
+    assert_eq!(
+        announced[0].session_id.as_ref(),
+        Some(&session),
+        "the executor is handed the session the run was already in"
+    );
+}
+
+/// Cancel has to settle a resumed run. The **status** says whether a turn
+/// is live; a queued row carries a session with nothing running in it, and
+/// chasing that session would leave the row unsettled forever, blocking
+/// every later run on the issue.
+#[tokio::test]
+async fn cancelling_a_resumed_run_settles_it_rather_than_chasing_a_dead_turn() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Cancel after boot"))
+        .await
+        .expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("killed mid-turn")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store
+        .claim_run(&run, &baybo_model::SessionId::from("issue-1-session"))
+        .await
+        .expect("claim");
+    f.manager.resume_unsettled_runs().await.expect("boot sweep");
+
+    assert!(
+        f.manager
+            .cancel_run(&p.id, 1)
+            .await
+            .expect("cancel")
+            .is_none(),
+        "a queued run has no live turn to stop, session or no session"
+    );
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs")[0].status,
+        RunStatus::Cancelled
     );
 }

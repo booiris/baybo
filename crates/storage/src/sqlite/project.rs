@@ -1231,12 +1231,17 @@ impl ProjectStore for SqliteProjectStore {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // A `running` row whose actor died with the process is work
-                // that never finished. Returning it to `queued` — and
-                // dropping the dead session — is what lets the sweep hand it
-                // back out without the claim being refused.
+                // that never finished, so it goes back to `queued` for the
+                // sweep to hand out again. The session it was claimed with
+                // stays: it belongs to the issue, not to this run — an issue
+                // keeps one across all of them — and `claim_run` gates on the
+                // status alone, so a session already on the row cannot refuse
+                // the re-claim. Dropping it would start the resumed run from
+                // an empty transcript and take its spend out of
+                // `spend_since`.
                 tx.execute(
-                    "UPDATE issue_runs SET status = 'queued', session_id = NULL, \
-                     started_at = NULL WHERE settled_at IS NULL AND status = 'running'",
+                    "UPDATE issue_runs SET status = 'queued', started_at = NULL \
+                     WHERE settled_at IS NULL AND status = 'running'",
                     [],
                 )?;
                 let raws = {
@@ -1775,13 +1780,35 @@ mod tests {
             "both unfinished runs come back, the settled one does not"
         );
         assert!(resumed.iter().all(|r| r.status == RunStatus::Queued));
+        let session = SessionId::from("issue-2");
+        let swept = resumed.iter().find(|r| r.id == running.id).unwrap();
+        assert_eq!(
+            swept.session_id,
+            Some(session.clone()),
+            "the interrupted run keeps the session it was working in, so the \
+             resumed run continues that transcript instead of opening a second"
+        );
         assert!(
-            resumed.iter().all(|r| r.session_id.is_none()),
-            "the dead session is dropped, or the re-claim would be refused"
+            swept.started_at.is_none(),
+            "it has not started again — `claim_run` re-stamps that"
+        );
+        assert!(
+            resumed
+                .iter()
+                .find(|r| r.id == queued.id)
+                .unwrap()
+                .session_id
+                .is_none(),
+            "a run that was never claimed still has no session"
         );
 
         // The sweep is idempotent — booting twice is not a double dispatch.
         assert_eq!(store.requeue_unsettled().await.unwrap().len(), 2);
+
+        // The worry the sweep used to null the session over: `claim_run`
+        // gates on the status, so a session already on the row does not
+        // refuse the re-claim.
+        assert!(store.claim_run(&running.id, &session).await.unwrap());
     }
 
     #[tokio::test]
@@ -2006,6 +2033,61 @@ mod tests {
         assert_eq!(
             store.spend_since(&theirs.id, since).await.unwrap(),
             baybo_model::MicroUsd::from_micros(7_000)
+        );
+    }
+
+    /// `spend_since` reaches `cost_records` only through the sessions named
+    /// on a board's runs, so a run that loses its session takes its spend off
+    /// the board's books with it — a restart would refund the budget.
+    #[tokio::test]
+    async fn an_interrupted_runs_spend_still_counts_against_its_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SqlitePool::open(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteProjectStore::new(pool.clone());
+        let costs = crate::sqlite::cost::SqliteCostStore::new(pool);
+
+        let p = project("01JCRASH", "crashy");
+        store.create_project(&p).await.unwrap();
+        let issue = store
+            .create_issue(&new_issue(&p.id, "burns tokens", IssueStatus::Todo))
+            .await
+            .unwrap();
+
+        let session = SessionId::from("sess-crashed".to_owned());
+        let run = store.enqueue_run(&new_run(&issue)).await.unwrap();
+        store.claim_run(&run.id, &session).await.unwrap();
+
+        let now = chrono::Utc::now();
+        baybo_store::cost::CostStore::record(
+            &costs,
+            &baybo_model::CostRecord {
+                user_id: "u".into(),
+                session_id: session.clone(),
+                turn_id: baybo_model::TurnId::new(),
+                span_id: baybo_model::SpanId::new(),
+                reason: baybo_model::CallReason::default(),
+                model: "m".into(),
+                reasoning_effort: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: baybo_model::MicroUsd::from_micros(500),
+                timestamp: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let since = now - chrono::Duration::hours(1);
+        let spent = baybo_model::MicroUsd::from_micros(500);
+        assert_eq!(store.spend_since(&p.id, since).await.unwrap(), spent);
+
+        store.requeue_unsettled().await.unwrap();
+        assert_eq!(
+            store.spend_since(&p.id, since).await.unwrap(),
+            spent,
+            "a restart does not refund the board"
         );
     }
 }
