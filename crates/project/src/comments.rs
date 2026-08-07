@@ -41,7 +41,7 @@ fn is_live_work(status: IssueStatus) -> bool {
 ///
 /// `live_run` is the issue's unsettled run, if it has one — at most one by
 /// construction (the per-issue partial unique index).
-pub fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) -> CommentDelivery {
+pub(crate) fn comment_delivery(issue: &IssueRow, live_run: Option<RunStatus>) -> CommentDelivery {
     if issue.assignee.is_none() || issue.cancelled_at.is_some() || !is_live_work(issue.status) {
         return CommentDelivery::RecordOnly;
     }

@@ -390,8 +390,9 @@ pub enum IssueEventBody {
         stage: i64,
     },
     /// The run was recorded but not started: this project has spent its
-    /// budget for the day. The row stays queued, so the work is not lost —
-    /// it starts as soon as the board has headroom again.
+    /// budget for the day. The row is [`RunStatus::Held`] — unsettled, so
+    /// the work is not lost and the issue's dedupe slot stays taken — and it
+    /// starts as soon as the board has headroom again.
     BudgetExhausted {
         /// Micro-USD spent today, and the ceiling it reached.
         spent_micros: i64,
@@ -646,10 +647,13 @@ pub trait ProjectStore: Send + Sync {
     /// actor died with the process is work that never finished, not work in
     /// flight.
     ///
-    /// The session it was claimed with is kept — an issue keeps one session
-    /// across its runs, and [`ProjectStore::claim_run`] gates on the status,
-    /// not on the session being absent. `held` rows are left where they are;
-    /// the budget, not this sweep, decides whether they start.
+    /// The session it was claimed with is kept: the resumed run is the same
+    /// run, executed by the same agent, so it belongs in the same thread —
+    /// and [`ProjectStore::claim_run`] gates on the status, not on the
+    /// session being absent, so a session already on the row cannot refuse
+    /// the re-claim. Dropping it would restart the run from an empty
+    /// transcript. `held` rows are left where they are; the budget, not this
+    /// sweep, decides whether they start.
     async fn requeue_unsettled(&self) -> Result<Vec<IssueRunRow>>;
 }
 

@@ -1175,7 +1175,7 @@ async fn a_cancelled_card_never_starts_a_run() {
             IssueActor::User,
             NewIssueRequest {
                 status: IssueStatus::InProgress,
-                assignee: Some(dev),
+                assignee: Some(dev.clone()),
                 ..new_issue("called off")
             },
         )
@@ -1207,7 +1207,7 @@ async fn a_cancelled_card_never_starts_a_run() {
             1,
             IssueActor::User,
             IssueUpdate {
-                assignee: Some(Some(other.clone())),
+                assignee: Some(Some(other)),
                 ..Default::default()
             },
         )
@@ -1237,6 +1237,98 @@ async fn a_cancelled_card_never_starts_a_run() {
         f.dispatched.lock().is_empty(),
         "a cancelled card entering In Progress starts nothing either"
     );
+
+    // And it is not a one-way door: reviving the card and staffing it is
+    // the explicit act that makes it startable again.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("revive it");
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(dev)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hand it back to somebody");
+    assert_eq!(
+        f.dispatched.lock().len(),
+        1,
+        "a revived card takes work again"
+    );
+}
+
+/// A run on a card the board has finished with is refused whichever door it
+/// arrives at — and only one of those doors carries a transition to look
+/// at, which is why the rule sits on `enqueue` rather than on the trigger
+/// predicate. Here: the retry button.
+#[tokio::test]
+async fn retry_is_refused_on_a_card_the_board_has_finished_with() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("stopped")
+            },
+        )
+        .await
+        .expect("issue");
+    let run = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&run, RunStatus::Failed).await;
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel the card");
+    f.dispatched.lock().clear();
+
+    // Refused as something the operator can fix, not as "this issue already
+    // has a run" — which is what a bare `None` out of `enqueue` would have
+    // been reported as, and it would be a lie.
+    let refused = f
+        .manager
+        .retry_run(&p.id, 1)
+        .await
+        .expect_err("a cancelled card cannot be retried");
+    assert!(
+        matches!(&refused, ProjectError::Invalid { field, reason }
+            if *field == "issue" && reason.contains("reopen")),
+        "{refused:?}"
+    );
+    assert!(f.dispatched.lock().is_empty());
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "and nothing was recorded either"
+    );
 }
 
 #[tokio::test]
@@ -1265,6 +1357,105 @@ async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     let announced = f.dispatched.lock().clone();
     assert_eq!(announced.len(), 1, "and hands it back out to be executed");
     assert_eq!(announced[0].status, RunStatus::Queued);
+}
+
+/// The sweep does not go through `enqueue`, so it asks the liveness
+/// question for itself. The process can have been down for a week: a card
+/// the operator called off meanwhile must not come back to life at boot —
+/// its worktree is already reclaimed, so the resumed run would cut a fresh
+/// one and work on what the operator stopped.
+#[tokio::test]
+async fn the_boot_sweep_calls_off_a_run_whose_card_was_cancelled() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("interrupted")
+            },
+        )
+        .await
+        .expect("issue");
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel it while the process is down");
+    f.dispatched.lock().clear();
+
+    assert_eq!(
+        f.manager.resume_unsettled_runs().await.expect("boot sweep"),
+        0,
+        "the count is what was re-driven, not what the sweep found"
+    );
+    assert!(f.dispatched.lock().is_empty());
+
+    // Settled rather than skipped: an unsettled row holds the issue's
+    // dedupe slot, so leaving it would refuse every run on the card if the
+    // operator ever revived it.
+    let runs = f.manager.list_runs(&p.id, 1).await.expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Cancelled);
+    assert!(runs[0].status.is_settled());
+    // And the card says so, in the board's own name — nobody pressed
+    // anything.
+    let settled = f
+        .manager
+        .timeline(&p.id, 1)
+        .await
+        .expect("timeline")
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::RunSettled {
+                    status: RunStatus::Cancelled,
+                    ..
+                }
+            )
+        })
+        .expect("the card says the run was called off");
+    assert_eq!(settled.actor, IssueActor::System);
+
+    // The slot really is free: revive the card and it takes work again.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("revive");
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(other)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("staff it again");
+    assert_eq!(f.dispatched.lock().len(), 1);
 }
 
 #[tokio::test]
@@ -1889,6 +2080,130 @@ async fn a_negative_budget_is_refused() {
     );
 }
 
+/// A hold outlives the write that recorded it, and the release is on the
+/// enqueue path — so *any* activity anywhere on the board reaches every
+/// hold on it, including holds on cards that were finished or called off in
+/// the meantime. Their worktrees are already reclaimed; dispatching one
+/// would cut a fresh checkout for abandoned work.
+///
+/// Both ways a card stops, because the door does not know which one it is.
+#[tokio::test]
+async fn a_released_hold_never_lands_on_a_card_the_board_has_finished_with() {
+    for called_off in [true, false] {
+        let f = fixture().await;
+        let project = f
+            .manager
+            .create_project(NewProject {
+                daily_budget: Some(baybo_model::MicroUsd::ZERO),
+                ..new_project("Skint")
+            })
+            .await
+            .expect("p");
+        let dev = seed_agent(&f, &project.id, "dev-1", AgentFramework::Baybo).await;
+        f.manager
+            .create_issue(
+                &project.id,
+                IssueActor::User,
+                NewIssueRequest {
+                    status: IssueStatus::InProgress,
+                    assignee: Some(dev),
+                    ..new_issue("work nobody can afford")
+                },
+            )
+            .await
+            .expect("create");
+        assert_eq!(
+            f.manager.list_runs(&project.id, 1).await.expect("runs")[0].status,
+            RunStatus::Held,
+            "the board is broke, so the run is owed rather than started"
+        );
+
+        if called_off {
+            f.manager
+                .update_issue(
+                    &project.id,
+                    1,
+                    IssueActor::User,
+                    IssueUpdate {
+                        cancelled: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("cancel it");
+        } else {
+            f.manager
+                .move_issue(&project.id, 1, IssueActor::User, IssueStatus::Done, &[1])
+                .await
+                .expect("finish it by hand");
+        }
+
+        // A new day's ceiling, written under the manager so nothing is
+        // released yet.
+        f.store
+            .update_project(
+                &project.id,
+                &ProjectUpdate {
+                    name: project.name.clone(),
+                    description: String::new(),
+                    daily_budget: Some(baybo_model::MicroUsd::from_micros(5_000_000)),
+                },
+            )
+            .await
+            .expect("a new day's ceiling");
+        f.dispatched.lock().clear();
+
+        let released = f
+            .manager
+            .release_held_runs(&project.id)
+            .await
+            .expect("release");
+        assert_eq!(released, 0, "called_off={called_off}");
+        assert!(
+            f.dispatched.lock().is_empty(),
+            "called_off={called_off}: a run was dispatched on a card the board is done with"
+        );
+        // Called off rather than left Held: the row would otherwise hold
+        // the issue's dedupe slot forever, and the board would keep
+        // re-reading it on every release.
+        let runs = f.manager.list_runs(&project.id, 1).await.expect("runs");
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Cancelled,
+            "called_off={called_off}"
+        );
+        assert!(
+            f.manager
+                .timeline(&project.id, 1)
+                .await
+                .expect("timeline")
+                .iter()
+                .any(|e| matches!(
+                    e.body,
+                    baybo_store::project::IssueEventBody::RunSettled {
+                        status: RunStatus::Cancelled,
+                        ..
+                    }
+                )),
+            "called_off={called_off}: and the card says the run ended"
+        );
+        // Nothing claimed the budget was restored on a card nobody is
+        // working.
+        assert!(
+            !f.manager
+                .timeline(&project.id, 1)
+                .await
+                .expect("timeline")
+                .iter()
+                .any(|e| matches!(
+                    e.body,
+                    baybo_store::project::IssueEventBody::BudgetRestored { .. }
+                )),
+            "called_off={called_off}"
+        );
+    }
+}
+
 /// The boot sweep must not start held runs as if they were orphans, and
 /// must re-evaluate them against the budget it finds.
 #[tokio::test]
@@ -2056,6 +2371,93 @@ async fn finishing_a_stage_wakes_the_parent_once() {
     assert!(
         f.dispatched.lock().is_empty(),
         "the barrier fires on the transition into Done, not on every save of a Done step"
+    );
+}
+
+/// Cancelling a parent calls off the whole plan. Its steps carry on
+/// existing and can still be closed one by one, but the last one closing
+/// must not wake a card whose worktree has already been handed back.
+///
+/// The barrier has no transition on the *parent* to consult — it is looking
+/// at the child's — so this is a door the trigger predicate could never
+/// have covered.
+#[tokio::test]
+async fn a_cancelled_parent_is_not_woken_by_its_last_step() {
+    let f = fixture().await;
+    let p = f
+        .manager
+        .create_project(new_project("Barrier"))
+        .await
+        .expect("p");
+    let lead = f.manager.team(&p.id).await.expect("team")[0].id.clone();
+    let parent = f
+        .manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                assignee: Some(lead),
+                status: IssueStatus::Todo,
+                ..new_issue("ship the thing")
+            },
+        )
+        .await
+        .expect("parent")
+        .into_issue();
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                parent: Some(parent.number),
+                stage: 0,
+                ..new_issue("design")
+            },
+        )
+        .await
+        .expect("child");
+    f.manager
+        .update_issue(
+            &p.id,
+            parent.number,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call the plan off");
+    f.dispatched.lock().clear();
+
+    f.manager
+        .move_issue(&p.id, 2, IssueActor::User, IssueStatus::Done, &[2])
+        .await
+        .expect("close the last step anyway");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a cancelled parent was woken by its stage emptying"
+    );
+    assert!(
+        f.manager
+            .list_runs(&p.id, parent.number)
+            .await
+            .expect("runs")
+            .is_empty(),
+        "and no ledger row was written for it either"
+    );
+    // The stage still emptied, and the operator is still told: the entry is
+    // a fact about the stage, and only the wake is about the parent.
+    assert!(
+        f.manager
+            .timeline(&p.id, parent.number)
+            .await
+            .expect("timeline")
+            .iter()
+            .any(|e| matches!(
+                e.body,
+                baybo_store::project::IssueEventBody::StageCompleted { stage: 0 }
+            ))
     );
 }
 

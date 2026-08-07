@@ -1267,8 +1267,12 @@ async fn resolve_approval(
     // afterwards. Two things follow. A subagent inherits its parent's
     // trigger, so a prompt raised one level inside a run is still this
     // card's. And a timeline append that failed (`record_event` swallows
-    // one) leaves the card unable to *draw* the button but does not make
-    // the answer unreachable.
+    // one) no longer decides this endpoint's answer, which comes from the
+    // queue rather than from the row. The independence is the endpoint's,
+    // not the operator's: that entry is the only thing on the board
+    // carrying a call id, so a swallowed append still leaves the card with
+    // no button to draw and the prompt ends at the gate's own
+    // deny-on-timeout.
     let raised_here = match parked_approval_session(&channel, &call_id) {
         Some(session) => state
             .session_manager

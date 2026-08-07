@@ -106,7 +106,7 @@ impl Tool for IssueGetTool {
                 absent.push(id);
             }
         }
-        known.extend(self.manager.agent_profiles(absent).await);
+        known.extend(self.manager.agent_profiles(&project, absent).await);
 
         let timeline: Vec<Value> = shown
             .iter()
@@ -207,7 +207,10 @@ fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> Str
             format!("the operator answered: {}", decision.as_str())
         }
         IssueEventBody::StageCompleted { stage } => {
-            format!("stage {stage} finished — every step in it is done")
+            // "or called off", because a cancelled step counts out of its
+            // stage — an agent told the stage is "done" would go looking for
+            // work that was deliberately dropped.
+            format!("stage {stage} finished — every step in it is done or called off")
         }
         IssueEventBody::BudgetExhausted {
             spent_micros,

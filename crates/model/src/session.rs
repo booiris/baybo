@@ -159,10 +159,16 @@ pub enum TriggerSource {
     Project {
         project_id: crate::ProjectId,
     },
-    /// The session an issue's work happens in. One per issue, reused by
-    /// every run of it — so a follow-up run sees what the last one did —
-    /// and never listed in the chat surface: a board's conversations live
-    /// on the board.
+    /// The session an issue's work happens in. One per **agent that works
+    /// the issue**, reused by every run of that agent on it — so a
+    /// follow-up sees what the same agent did last time — and never listed
+    /// in the chat surface: a board's conversations live on the board.
+    ///
+    /// Not one per issue: a session's [`crate::AgentBinding`] is write-once, and
+    /// it selects the persona, the skills and the name the run's commits
+    /// are authored with. A card handed to somebody else therefore gets a
+    /// new session rather than a rebound one, and continuity follows the
+    /// agent through however many hands the card passes.
     Issue {
         project_id: crate::ProjectId,
         issue_id: crate::IssueId,

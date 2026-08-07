@@ -201,7 +201,7 @@ Alongside them: `team`, where each member's `working_on` is what they have in fl
                         json!({
                             "done": done,
                             "total": total,
-                            "open_stages": crate::open_stages(&owned),
+                            "open_stages": crate::stages::open_stages(&owned),
                         }),
                     );
                 }

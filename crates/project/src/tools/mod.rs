@@ -132,6 +132,12 @@ async fn resolve_handle(
 /// [`ProjectManager::agent_profiles`]). An id nothing in `known` answers to
 /// renders as the id — a broken reference is not a departed teammate, and
 /// inventing a handle for it would be worse than showing the raw value.
+///
+/// Board scope is not checked here and does not need to be: the only two
+/// things that fill `known` — [`ProjectManager::team`] and
+/// [`ProjectManager::agent_profiles`] — are each scoped to one board, so an
+/// agent that has moved to another one is simply not in it and falls out as
+/// its id. Re-checking here would be the second predicate.
 fn handle_of(known: &[baybo_store::AgentProfileRow], id: &AgentProfileId) -> String {
     known
         .iter()

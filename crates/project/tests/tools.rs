@@ -478,6 +478,62 @@ async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
     assert_eq!(assigned, "assigned it to @test-engineer");
 }
 
+/// A handle is unique only inside its board, so an id belonging to another
+/// one must not be rendered under this board's naming — `@lead` on their
+/// board is a different agent from `@lead` on ours. It falls back to what
+/// this reader already does for an id it cannot name: the id itself.
+///
+/// The other half of the same rule is the test above: a *departed* teammate
+/// keeps its membership row, so it still resolves. Both are asserted here,
+/// because a scope check written the obvious way ("is it on the live
+/// roster?") passes the first and breaks the second.
+#[tokio::test]
+async fn a_timeline_never_renders_another_boards_handle() {
+    let f = fixture().await;
+    let (mine, lead) = f.open("mine").await;
+    let (_theirs, their_lead) = f.open("theirs").await;
+    let ctx = f.ctx(&mine, &lead);
+    f.call("IssueCreate", &ctx, json!({ "title": "our card" }))
+        .await;
+
+    // An entry on our card naming their agent. No verb produces this today
+    // — `validate_assignee` keeps an assignee on its own board — which is
+    // exactly why the resolver must not be the thing that depends on that.
+    f.manager
+        .record_event(
+            &mine,
+            1,
+            baybo_store::project::IssueActor::Agent(their_lead.clone()),
+            baybo_store::project::IssueEventBody::Comment {
+                text: "passing through".to_owned(),
+            },
+        )
+        .await;
+
+    let card = f.call("IssueGet", &ctx, json!({ "number": 1 })).await;
+    let timeline = card["timeline"].as_array().expect("timeline").clone();
+    let foreign = timeline
+        .iter()
+        .find(|entry| entry["event"] == "passing through")
+        .expect("the entry is on the card");
+    // Their lead's handle is `@lead` — the same string our own lead answers
+    // to — which is precisely why resolving without the board check reads
+    // as somebody who is on this team.
+    assert_eq!(
+        foreign["by"],
+        json!(their_lead.as_str()),
+        "a foreign id renders as itself, not under this board's naming"
+    );
+    // And our own agents are still named, so this is a scope check rather
+    // than a resolver that stopped working.
+    assert!(
+        timeline
+            .iter()
+            .any(|entry| entry["event"] == "opened the issue" && entry["by"] == json!("@lead")),
+        "{timeline:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_update_that_changes_nothing_is_a_mistake_worth_saying() {
     let f = fixture().await;
@@ -720,7 +776,6 @@ mod approvals {
             IssueEventBody::ApprovalResolved { call_id, decision }
                 if call_id == "c1" && *decision == ApprovalDecision::Deny
         )));
-        assert!(baybo_project::pending_approvals(&timeline).is_empty());
     }
 
     /// An ordinary conversation's prompt must pass straight through: the

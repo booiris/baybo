@@ -231,11 +231,13 @@ pub enum Reclaimed {
 /// [`Reclaimed::Kept`] rather than forced. The operator can commit or
 /// discard and the next reclamation will take it.
 ///
-/// A branch that never produced a commit is deleted with the tree. One
-/// that did is kept — it is the deliverable, and the whole point of not
-/// merging automatically is that the operator decides what happens to it.
-/// So is one git cannot vouch for: an unknown count is never read as
-/// "empty".
+/// A branch that holds nothing the repository does not already have is
+/// deleted with the tree — which is a branch that never committed, and
+/// equally one whose commits the operator merged before dragging the card
+/// to Done. A branch that still carries work is kept: it is the
+/// deliverable, and the whole point of not merging automatically is that
+/// the operator decides what happens to it. So is one git cannot vouch for
+/// — an unknown count is never read as "empty".
 pub async fn reclaim(repo: &Path, root: &Path, branch: &str) -> Result<Reclaimed> {
     if !root.exists() {
         // A stale admin record can outlive the directory; tidying it here

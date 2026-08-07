@@ -423,9 +423,10 @@ impl ProjectStore for SqliteProjectStore {
             .pool
             .interact("projects.spend_since", move |conn| {
                 // `IN (SELECT …)` over this board's run sessions rather than
-                // a join: an issue's session is reused by every run of it, so
-                // a join would count one call once per run that shared the
-                // session. The subquery deduplicates by construction.
+                // a join: runs share sessions — an issue keeps one per agent
+                // that works it — so a join would count one call once per
+                // run that shared the session. The subquery deduplicates by
+                // construction, whatever the sharing rule is.
                 let total: i64 = conn.query_row(
                     "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_records \
                      WHERE timestamp >= ?2 AND session_id IN ( \
@@ -1233,12 +1234,12 @@ impl ProjectStore for SqliteProjectStore {
                 // A `running` row whose actor died with the process is work
                 // that never finished, so it goes back to `queued` for the
                 // sweep to hand out again. The session it was claimed with
-                // stays: it belongs to the issue, not to this run — an issue
-                // keeps one across all of them — and `claim_run` gates on the
-                // status alone, so a session already on the row cannot refuse
-                // the re-claim. Dropping it would start the resumed run from
-                // an empty transcript and take its spend out of
-                // `spend_since`.
+                // stays: the resumed run is the same run, executed by the
+                // same agent, so it belongs in the same thread — and
+                // `claim_run` gates on the status alone, so a session already
+                // on the row cannot refuse the re-claim. Dropping it would
+                // start the resumed run from an empty transcript and take its
+                // spend out of `spend_since`.
                 tx.execute(
                     "UPDATE issue_runs SET status = 'queued', started_at = NULL \
                      WHERE settled_at IS NULL AND status = 'running'",
@@ -1934,7 +1935,7 @@ mod tests {
 
     /// The budget gate's read. Two things it has to get right: only this
     /// board's sessions count, and a session reused by several runs counts
-    /// once — an issue keeps one session across every run of it, so a join
+    /// once — an issue keeps one session per agent that works it, so a join
     /// would multiply the same call by the number of runs that shared it.
     #[tokio::test]
     async fn spend_since_sums_one_board_and_never_double_counts_a_session() {
@@ -1965,7 +1966,7 @@ mod tests {
         let other = store.create_issue(&issue(&theirs, "theirs")).await.unwrap();
 
         // One session on our issue, shared by two runs of it — the real
-        // shape, since an issue's session is reused across runs.
+        // shape, since consecutive runs by the same agent share its session.
         let shared = SessionId::from("sess-ours".to_owned());
         let their_session = SessionId::from("sess-theirs".to_owned());
         for (row, session, settle) in [

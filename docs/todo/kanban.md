@@ -263,25 +263,37 @@ announces which of these will happen before sending.
   an agent tool. **Assigning an agent to an issue already sitting in
   In Progress also triggers** (no pending run present — multica's
   `RunSourceAssign`; without this the board shows work in flight that
-  nobody is doing), **including a handover to a different agent**. A
-  **cancelled** issue triggers on neither edge: the board counts cancelled
-  as finished everywhere else and has already reclaimed that card's
-  worktree, so a run there would cut a fresh checkout for abandoned work.
-  Guards: assignee alive, budget headroom, no pending run for the same
-  issue (dedupe), self-loop suppression (an agent flipping its own issue's
-  status inside a run does not re-trigger itself).
+  nobody is doing), **including a handover to a different agent**.
+  Guards: assignee alive, board liveness, budget headroom, no pending run
+  for the same issue (dedupe), self-loop suppression (an agent flipping its
+  own issue's status inside a run does not re-trigger itself).
+- **The trigger predicate is not the only door**, and that is why the
+  liveness guard does not live on it. A released hold, the boot re-drive, a
+  retry and a stage barrier all reach a run with no transition to look at,
+  so **"a card the board has finished with — Done, or cancelled — takes no
+  runs" is asked once, of the card, on the single enqueue path**, and again
+  by the two sweeps that hand out rows recorded earlier. A finished card
+  has already had its worktree reclaimed, so a run there would cut a fresh
+  checkout for abandoned work. A sweep that finds such a row **calls it
+  off** (settles it `cancelled`) rather than skipping it, because an
+  unsettled row holds the issue's dedupe slot and would refuse every run on
+  the card if it were revived.
 - **Run delivery uses the ledger discipline** (record-before-deliver,
   stamp-on-resolution, boot re-drive, idempotent replay — the cron
   delivery pattern). A run row is the ledger entry; a crash between
   enqueue and wake re-drives on boot.
-- **Each issue owns a dedicated session**, created on first run, bound to
-  project + issue, so a follow-up run sees what the last one did. This
-  costs a waiter subtlety: cron mints a fresh session per fire, so its
-  reconcile can take the first terminal turn it finds; a session hosting
-  many runs would hand run #3 run #1's outcome. What makes it safe is the
-  dedupe guard — at most one run per issue is ever in flight — so the
-  newest terminal turn at or after the run's own enqueue is unambiguously
-  the one being waited on. **No project session appears in the global chat list**
+- **An issue keeps one session per agent that works it**, minted on that
+  agent's first run, so a follow-up sees what the last one did. Per agent
+  rather than per issue because a session's `AgentBinding` is write-once —
+  it selects the persona, the skills and the name commits are authored with
+  — so a card handed from `@dev-1` to `@dev-2` cannot follow the card; the
+  run has to move instead, into a session bound to the agent the board says
+  is on it. This costs a waiter subtlety: cron mints a fresh session per
+  fire, so its reconcile can take the first terminal turn it finds; a
+  session hosting many runs would hand run #3 run #1's outcome. What makes
+  it safe is the dedupe guard — at most one run per issue is ever in flight
+  — so the newest terminal turn at or after the run's own enqueue is
+  unambiguously the one being waited on. **No project session appears in the global chat list**
   — issue runs and the lead's planning session alike (the old
   filter-project-sessions todo lands here); the lead session is reached
   only through the in-board panel. The run brief = issue
@@ -474,8 +486,8 @@ announces which of these will happen before sending.
      exhausted board records the work it owes as `RunStatus::Held` rather
      than dropping it; holds are released by activity (any enqueue, a
      budget change, the boot sweep) rather than by a timer. `spend_since`
-     uses `IN (SELECT session_id …)`, not a join — an issue reuses one
-     session across every run of it.
+     uses `IN (SELECT session_id …)`, not a join — runs share sessions, so
+     a join would count one call once per run that shared one.
    - **Stages + parent wake.** One level, enforced in both directions.
      Both the announcement and the barrier fire on the *transition* into a
      finished state — which is also what bounds a stage to one

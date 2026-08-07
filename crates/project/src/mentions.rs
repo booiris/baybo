@@ -13,7 +13,7 @@ use baybo_model::AgentHandle;
 /// [`AgentHandle`]'s, so the scan stops at the first character a handle
 /// cannot contain — which is what lets `@dev-1's` and `@dev-1,` both name
 /// `dev-1`.
-pub fn mentions(text: &str) -> Vec<AgentHandle> {
+pub(crate) fn mentions(text: &str) -> Vec<AgentHandle> {
     let mut found: Vec<AgentHandle> = Vec::new();
     let bytes = text.as_bytes();
     for (index, _) in text.match_indices('@') {
@@ -51,7 +51,7 @@ pub fn mentions(text: &str) -> Vec<AgentHandle> {
 /// The *first* mention wins: "@dev-1 and @qa should look" names one owner
 /// and asks a second to read, and picking the last would silently make the
 /// aside the assignee.
-pub fn assigns_to(assignee_is_set: bool, text: &str) -> Option<AgentHandle> {
+pub(crate) fn assigns_to(assignee_is_set: bool, text: &str) -> Option<AgentHandle> {
     if assignee_is_set {
         return None;
     }

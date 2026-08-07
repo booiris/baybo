@@ -8,13 +8,20 @@
 
 use baybo_store::project::{IssueRow, IssueStatus};
 
-/// Whether a child counts as finished for a barrier.
+/// Whether the board is done with this issue.
 ///
-/// Cancelled counts. A stage waiting on work somebody decided not to do
-/// would never open, and "cancel the step you are not doing" is exactly how
-/// an operator unblocks one.
-fn is_finished(child: &IssueRow) -> bool {
-    child.status == IssueStatus::Done || child.cancelled_at.is_some()
+/// Cancelled counts, which is the whole content of the rule. A stage
+/// waiting on work somebody decided not to do would never open, and "cancel
+/// the step you are not doing" is exactly how an operator unblocks one; by
+/// the same token a cancelled card has had its worktree reclaimed and takes
+/// no more runs ([`crate::runs::accepts_runs`]).
+///
+/// One definition, because the board would otherwise carry several: the
+/// barrier here, the reclamation, and the enqueue gate all mean the same
+/// thing by "finished", and a card that is finished for one of them and not
+/// for another is a card that leaks a worktree or a run.
+pub(crate) fn is_finished(issue: &IssueRow) -> bool {
+    issue.status == IssueStatus::Done || issue.cancelled_at.is_some()
 }
 
 /// A child that still has to happen for its stage to open the next one.
@@ -88,7 +95,7 @@ pub fn progress(children: &[IssueRow]) -> (usize, usize) {
 
 /// The stages that still have unfinished work, lowest first — what the
 /// parent's assignee is being woken to drive.
-pub fn open_stages(children: &[IssueRow]) -> Vec<i64> {
+pub(crate) fn open_stages(children: &[IssueRow]) -> Vec<i64> {
     let mut stages: Vec<i64> = children
         .iter()
         .filter(|c| is_pending(c))
@@ -97,11 +104,6 @@ pub fn open_stages(children: &[IssueRow]) -> Vec<i64> {
     stages.sort_unstable();
     stages.dedup();
     stages
-}
-
-/// Whether every stage is finished — the parent's own work can be closed.
-pub fn all_finished(children: &[IssueRow]) -> bool {
-    !children.is_empty() && children.iter().all(is_finished)
 }
 
 #[cfg(test)]
@@ -237,18 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn all_finished_needs_children_to_be_about() {
-        // An issue with no sub-issues has not "finished all its stages" —
-        // it has none, and treating that as completion would close every
-        // ordinary card the moment anything looked at it.
-        assert!(!all_finished(&[]));
-        assert!(all_finished(&[
-            child(0, IssueStatus::Done, false),
-            child(1, IssueStatus::Todo, true),
-        ]));
-        assert!(!all_finished(&[
-            child(0, IssueStatus::Done, false),
-            child(1, IssueStatus::Todo, false),
-        ]));
+    fn finished_means_done_or_called_off() {
+        // The one definition the barrier, the worktree reclamation and the
+        // enqueue gate all read.
+        assert!(is_finished(&child(0, IssueStatus::Done, false)));
+        assert!(is_finished(&child(0, IssueStatus::Todo, true)));
+        assert!(!is_finished(&child(0, IssueStatus::InProgress, false)));
     }
 }

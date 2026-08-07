@@ -2,14 +2,17 @@
 //!
 //! The ledger row already exists — `baybo-project` wrote it before anything
 //! was told about it. This module is the consumer: it claims the row, mints
-//! or reuses the issue's session, runs the brief as one turn, and settles
-//! the row with what happened.
+//! or reuses the session its agent works the card in, runs the brief as one
+//! turn, and settles the row with what happened.
 //!
 //! The shape is cron's one-shot fire (`cron.rs`), with two differences that
 //! matter. An issue keeps **one session per agent that works it**, so a
-//! follow-up sees what the last one did; that is safe only because at most
-//! one run per issue is ever in flight (a partial unique index enforces
-//! it), which is what lets the waiter treat the terminal turn it sees as
+//! follow-up sees what that same agent did last time — and an agent handed
+//! the card sees none of its predecessor's transcript, which is why the
+//! brief a handover is given is the whole conversation rather than a delta
+//! (`baybo::runtime::issue_brief`). That is safe only because at most one
+//! run per issue is ever in flight (a partial unique index enforces it),
+//! which is what lets the waiter treat the terminal turn it sees as
 //! unambiguously its own. And nothing is dispatched to a channel: an
 //! issue's audience is its card.
 
@@ -17,13 +20,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use baybo_model::{
-    AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, User,
+    AgentBinding, AgentProfileId, ChannelType, Session, SessionId, TriggerSource, TurnId, User,
 };
 use baybo_project::{ProjectEvents, ProjectManager, worktree};
 use baybo_store::project::{
     IssueActor, IssueEventBody, IssueRunRow, NewIssueEvent, ProjectStore, RunStatus,
 };
-use baybo_turn::{TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatusKind};
+use baybo_turn::{
+    CancelReason, TurnInputKind, TurnLifecycle, TurnLifecycleEvent, TurnStatus, TurnStatusKind,
+};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -265,20 +270,24 @@ fn binding_for(agent: &AgentProfileId) -> AgentBinding {
 /// a run nothing ever starts, holding the issue's only live-run slot until
 /// the next boot.
 ///
-/// A run the operator **cancelled** starts nothing, whatever was said. The
-/// card is still InProgress and still assigned, so the board would happily
-/// answer `Wake` — and a fresh run seconds after somebody pressed Cancel
-/// reads as the Stop button not working. Every other terminal status does
-/// follow up: a run that failed with a comment waiting is exactly the case
-/// the follow-up exists for.
+/// A run **a human stopped** starts nothing, whatever was said. The card is
+/// still InProgress and still assigned, so the board would happily answer
+/// `Wake` — and a fresh run seconds after somebody pressed Cancel reads as
+/// the Stop button not working.
+///
+/// Every other ending follows up, and that includes a run that merely
+/// *settled* `Cancelled`: an actor that dies takes its turn to
+/// `Cancelled { SystemCrash }`, and the ledger row cannot tell that apart
+/// from a Stop. Keying on the row's status would drop the comment in
+/// exactly the case this mechanism exists for — see [`RunOutcome`].
 async fn follow_up_on_comments(
     projects: &Arc<ProjectManager>,
     store: &Arc<dyn ProjectStore>,
     run: &IssueRunRow,
-    settled: RunStatus,
+    outcome: &RunOutcome,
 ) {
-    if settled == RunStatus::Cancelled {
-        debug!(run = %run.id, "the run was cancelled; not starting a follow-up on it");
+    if outcome.stopped_by_a_human {
+        debug!(run = %run.id, "somebody stopped this run; not starting a follow-up on it");
         return;
     }
     let said = match store.events_since(&run.issue_id, run.created_at).await {
@@ -438,8 +447,9 @@ struct IssueRunWaiter {
 
 impl IssueRunWaiter {
     async fn run(mut self, actor_token: CancellationToken) {
-        let (status, error) = self.await_run(actor_token).await;
+        let outcome = self.await_run(actor_token).await;
         let run_id = &self.run.id;
+        let status = outcome.status;
         info!(%run_id, ?status, "issue run settled");
         let store = &self.board.store;
         settle(
@@ -447,7 +457,7 @@ impl IssueRunWaiter {
             &self.board.events,
             &self.run,
             status,
-            error.as_deref(),
+            outcome.error.as_deref(),
         )
         .await;
 
@@ -462,10 +472,10 @@ impl IssueRunWaiter {
         // this same worktree, and reading it while somebody else is in it
         // is a race that need not exist.
         surface_branch(store, &self.board.events, &self.checkout, &self.run).await;
-        follow_up_on_comments(&self.board.manager, store, &self.run, status).await;
+        follow_up_on_comments(&self.board.manager, store, &self.run, &outcome).await;
     }
 
-    async fn await_run(&mut self, actor_token: CancellationToken) -> (RunStatus, Option<String>) {
+    async fn await_run(&mut self, actor_token: CancellationToken) -> RunOutcome {
         loop {
             tokio::select! {
                 event = self.terminal_rx.recv() => match event {
@@ -473,7 +483,7 @@ impl IssueRunWaiter {
                         let Some(kind) = ev.phase.terminal_status() else {
                             continue;
                         };
-                        return outcome_for(kind);
+                        return self.outcome_of_edge(&ev.turn_id, kind).await;
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -488,10 +498,7 @@ impl IssueRunWaiter {
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        return (
-                            RunStatus::Failed,
-                            Some("lifecycle bus closed before the run finished".to_owned()),
-                        );
+                        return RunOutcome::failed("lifecycle bus closed before the run finished");
                     }
                 },
                 _ = actor_token.cancelled() => {
@@ -501,10 +508,7 @@ impl IssueRunWaiter {
                     if let Some(outcome) = self.reconcile().await {
                         return outcome;
                     }
-                    return (
-                        RunStatus::Failed,
-                        Some("the run stopped before producing anything".to_owned()),
-                    );
+                    return RunOutcome::failed("the run stopped before producing anything");
                 }
             }
         }
@@ -512,6 +516,36 @@ impl IssueRunWaiter {
 
     fn is_our_run(&self, ev: &TurnLifecycleEvent) -> bool {
         ev.session_id == self.session_id && ev.kind == TurnInputKind::IssueRun
+    }
+
+    /// The outcome of a terminal edge seen on the lifecycle bus.
+    ///
+    /// The edge says a turn was cancelled but not why, and why is the whole
+    /// question — so a cancel, and only a cancel, goes back to the turn for
+    /// its [`CancelReason`]. The row is written before the edge is
+    /// published, so the reason is already durable by the time this reads
+    /// it.
+    ///
+    /// A reason the store cannot produce answers "not a human": one extra
+    /// follow-up run is visible on the card and stoppable, while a comment
+    /// nothing ever answers is the loss the follow-up exists to prevent.
+    async fn outcome_of_edge(&self, turn: &TurnId, kind: TurnStatusKind) -> RunOutcome {
+        let outcome = RunOutcome::of(kind);
+        if kind != TurnStatusKind::Cancelled {
+            return outcome;
+        }
+        let stopped_by_a_human = match self.lifecycle.get(turn).await {
+            Ok(Some(turn)) => stopped_by_a_human(&turn.status),
+            Ok(None) => false,
+            Err(e) => {
+                warn!(run_id = %self.run.id, error = %e, "could not read why the run's turn was cancelled");
+                false
+            }
+        };
+        RunOutcome {
+            stopped_by_a_human,
+            ..outcome
+        }
     }
 
     /// The run's outcome from the store, or `None` if its turn has not
@@ -522,7 +556,7 @@ impl IssueRunWaiter {
     /// first one is that agent's first run forever. That is only
     /// unambiguous because an issue holds at most one unfinished run at a
     /// time.
-    async fn reconcile(&self) -> Option<(RunStatus, Option<String>)> {
+    async fn reconcile(&self) -> Option<RunOutcome> {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
             Err(e) => {
@@ -534,24 +568,85 @@ impl IssueRunWaiter {
             .into_iter()
             .filter(|t| t.input_kind() == TurnInputKind::IssueRun && t.is_terminal())
             .max_by_key(|t| t.started_at)
-            .map(|t| t.status.kind())
-            .map(outcome_for)
+            .map(|t| RunOutcome {
+                stopped_by_a_human: stopped_by_a_human(&t.status),
+                ..RunOutcome::of(t.status.kind())
+            })
     }
 }
 
-fn outcome_for(kind: TurnStatusKind) -> (RunStatus, Option<String>) {
-    match kind {
-        TurnStatusKind::Completed => (RunStatus::Done, None),
-        TurnStatusKind::Cancelled => (RunStatus::Cancelled, None),
-        TurnStatusKind::Failed => (
-            RunStatus::Failed,
-            Some("the run failed; its transcript has the detail".to_owned()),
-        ),
-        other => (
-            RunStatus::Failed,
-            Some(format!("the run ended as {other:?}")),
-        ),
+/// How a run ended: what the ledger row records, plus the one thing the row
+/// cannot carry.
+///
+/// `RunStatus::Cancelled` is written both when somebody presses Stop and
+/// when the run dies — crash recovery rolls an orphaned turn to
+/// `Cancelled { SystemCrash }`, and a cancel propagated down the token tree
+/// arrives as `ParentCancelled`. The turn's [`CancelReason`] is the only
+/// place the two are distinguishable, so it is read once here rather than
+/// guessed at from the status by whoever needs the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunOutcome {
+    status: RunStatus,
+    error: Option<String>,
+    /// A person asked for this to stop, as opposed to it stopping on its
+    /// own. Never true for a status other than `Cancelled`.
+    stopped_by_a_human: bool,
+}
+
+impl RunOutcome {
+    /// What a terminal turn status settles the row as. Says nothing about
+    /// who stopped it — that is [`stopped_by_a_human`], which needs the
+    /// reason the kind has already dropped.
+    fn of(kind: TurnStatusKind) -> Self {
+        match kind {
+            TurnStatusKind::Completed => Self {
+                status: RunStatus::Done,
+                error: None,
+                stopped_by_a_human: false,
+            },
+            TurnStatusKind::Cancelled => Self {
+                status: RunStatus::Cancelled,
+                error: None,
+                stopped_by_a_human: false,
+            },
+            TurnStatusKind::Failed => Self::failed("the run failed; its transcript has the detail"),
+            other => Self::failed(format!("the run ended as {other:?}")),
+        }
     }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: RunStatus::Failed,
+            error: Some(error.into()),
+            stopped_by_a_human: false,
+        }
+    }
+}
+
+/// Whether a cancelled turn was cancelled because a person asked for it.
+///
+/// The operator's Cancel button on the card reaches the turn as
+/// [`CancelReason::OperatorCancel`] (so does the CLI), and `/stop` inside
+/// the session as [`CancelReason::UserStopped`]. Every other reason is the
+/// run dying: an actor that panicked, a parent that went away, a process
+/// that was killed and swept at boot.
+///
+/// `ParentCancelled` reads as dying, and that is the deliberate side of a
+/// race: `TurnLifecycle::cancel` trips the token before it writes the row,
+/// so a body that unwinds inside that window stamps `ParentCancelled` over
+/// the operator's Cancel. Erring the other way would make every shutdown
+/// look like a Stop and drop the comment it was carrying; erring this way
+/// costs, in a race the operator can lose only by pressing Cancel at the
+/// instant the run was already finishing, one follow-up run they can stop
+/// again.
+fn stopped_by_a_human(status: &TurnStatus) -> bool {
+    matches!(
+        status,
+        TurnStatus::Cancelled {
+            reason: CancelReason::OperatorCancel | CancelReason::UserStopped,
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -852,7 +947,13 @@ mod tests {
             .await
             .expect("settle");
 
-        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Done).await;
+        follow_up_on_comments(
+            &board.projects,
+            &board.store,
+            &first,
+            &RunOutcome::of(TurnStatusKind::Completed),
+        )
+        .await;
 
         let dispatched = board.dispatched.lock().clone();
         assert_eq!(dispatched.len(), 2, "the follow-up was handed to somebody");
@@ -893,7 +994,13 @@ mod tests {
             .await
             .expect("budget");
 
-        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Done).await;
+        follow_up_on_comments(
+            &board.projects,
+            &board.store,
+            &first,
+            &RunOutcome::of(TurnStatusKind::Completed),
+        )
+        .await;
 
         assert_eq!(
             board.dispatched.lock().len(),
@@ -909,6 +1016,64 @@ mod tests {
         );
     }
 
+    /// How the waiter reads a run whose turn ended in `reason` — the one
+    /// input that separates a Stop somebody pressed from a run that died,
+    /// since both settle the ledger row `Cancelled`.
+    ///
+    /// Asserts the bus edge and the store reconcile agree: production takes
+    /// the edge, the lagged and actor-died paths take the reconcile, and a
+    /// difference between them would be a comment lost on whichever path
+    /// the timing picked.
+    async fn outcome_after_cancel(
+        board: &Board,
+        run: &IssueRunRow,
+        session: &SessionId,
+        reason: CancelReason,
+    ) -> RunOutcome {
+        let lifecycle = Arc::new(TurnLifecycle::new(Arc::new(
+            baybo_turn::test_support::MemoryTurnStore::new(),
+        )));
+        let turn = lifecycle
+            .start_turn(
+                session.clone(),
+                baybo_model::TriggerKind::Issue,
+                baybo_turn::TurnInput::IssueRun {
+                    run_id: run.id.clone(),
+                    brief: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("turn");
+        lifecycle.start(&turn.id).await.expect("start");
+        lifecycle
+            .cancel(&turn.id, reason, Vec::new())
+            .await
+            .expect("cancel");
+
+        let waiter = IssueRunWaiter {
+            run: run.clone(),
+            checkout: PathBuf::from("/tmp/does-not-matter"),
+            session_id: session.clone(),
+            terminal_rx: lifecycle.subscribe_lifecycle_events(),
+            lifecycle: Arc::clone(&lifecycle),
+            board: BoardWiring {
+                store: Arc::clone(&board.store),
+                events: Arc::new(baybo_project::NoopProjectEvents),
+                manager: Arc::clone(&board.projects),
+            },
+        };
+        let reconciled = waiter.reconcile().await.expect("the turn is terminal");
+        assert_eq!(
+            waiter
+                .outcome_of_edge(&turn.id, TurnStatusKind::Cancelled)
+                .await,
+            reconciled,
+            "the bus edge and the store must read the same cancel the same way"
+        );
+        reconciled
+    }
+
     /// Cancel is the operator saying stop. The card stays InProgress and
     /// stays assigned, so the board would happily answer "wake" — and a
     /// fresh run seconds after the Cancel button reads as the button not
@@ -917,13 +1082,21 @@ mod tests {
     async fn cancelling_a_run_with_a_comment_waiting_does_not_start_another() {
         let (board, first) = mid_run().await;
         comment_mid_run(&board).await;
+        let outcome = outcome_after_cancel(
+            &board,
+            &first,
+            &SessionId::from("sess-issue-1"),
+            CancelReason::OperatorCancel,
+        )
+        .await;
+        assert_eq!(outcome.status, RunStatus::Cancelled);
         board
             .store
-            .settle_run(&first.id, RunStatus::Cancelled, None)
+            .settle_run(&first.id, outcome.status, None)
             .await
             .expect("settle");
 
-        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Cancelled).await;
+        follow_up_on_comments(&board.projects, &board.store, &first, &outcome).await;
 
         assert_eq!(
             board.dispatched.lock().len(),
@@ -940,6 +1113,43 @@ mod tests {
             1,
             "and nothing was written that a boot sweep would later re-drive"
         );
+    }
+
+    /// A run that *died* settles `Cancelled` too: crash recovery rolls the
+    /// turn of an actor that panicked to `Cancelled { SystemCrash }`, and a
+    /// cancel that propagated down the token tree arrives as
+    /// `ParentCancelled`. Nobody pressed Stop in either case, so the comment
+    /// waiting on the card still has to start something — that loss is the
+    /// whole reason the follow-up exists.
+    #[tokio::test]
+    async fn a_run_that_died_with_a_comment_waiting_still_starts_a_follow_up() {
+        for reason in [CancelReason::SystemCrash, CancelReason::ParentCancelled] {
+            let (board, first) = mid_run().await;
+            comment_mid_run(&board).await;
+            let outcome =
+                outcome_after_cancel(&board, &first, &SessionId::from("sess-issue-1"), reason)
+                    .await;
+            assert_eq!(
+                outcome.status,
+                RunStatus::Cancelled,
+                "{reason:?} settles the row exactly as a Stop does"
+            );
+            board
+                .store
+                .settle_run(&first.id, outcome.status, None)
+                .await
+                .expect("settle");
+
+            follow_up_on_comments(&board.projects, &board.store, &first, &outcome).await;
+
+            let dispatched = board.dispatched.lock().clone();
+            assert_eq!(
+                dispatched.len(),
+                2,
+                "a run that died on {reason:?} must not swallow the comment"
+            );
+            assert_eq!(dispatched[1].trigger, RunTrigger::Comment);
+        }
     }
 
     /// A handover has to run as the agent the card now names.

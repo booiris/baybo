@@ -95,7 +95,9 @@ export function pendingApprovals(
  * actor — the caller renders the actor, so putting it here too would
  * produce "you you moved this".
  *
- * Returns `null` for a comment: a comment is not narrated, it is shown.
+ * Returns `null` for a comment, and for nothing else: a comment is not
+ * narrated, it is shown, and `Timeline`'s `Note` drops any entry whose
+ * sentence is nullish.
  */
 export function describeEvent(body: IssueEventBody): string | null {
   switch (body.kind) {
@@ -156,7 +158,24 @@ export function describeEvent(body: IssueEventBody): string | null {
       return `started the held run — ${usd(body.spent_micros)} of ${usd(
         body.limit_micros,
       )} spent today`;
+    default:
+      return unnamedEvent(body);
   }
+}
+
+/**
+ * A body kind this bundle has never heard of — the same case `actorLabel`
+ * covers, on the union that grows fastest: every new thing the board learns
+ * to record adds a variant here.
+ *
+ * The `never` parameter keeps the build-time check that a new kind must be
+ * handled above. The string carries more weight than `actorLabel`'s does:
+ * `Note` renders nothing at all when the sentence is nullish, so falling
+ * through would delete the entry from the card's history rather than
+ * degrade it, and `ActivityDrawer` would show a blank row.
+ */
+function unnamedEvent(_body: never): string {
+  return 'did something this page is too old to describe';
 }
 
 /**

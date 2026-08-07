@@ -1,36 +1,35 @@
-//! The trigger predicate and the enqueue path.
+//! The two predicates a run has to satisfy, and the ledger entry it
+//! becomes.
 //!
-//! One function decides whether a run happens, and every write path — a
-//! drag, a REST move, an assignment, a future agent tool — goes through
-//! it. That is the whole point: a second predicate somewhere else is how
-//! a board ends up with two different answers to "does this start now?".
+//! They ask different questions and are deliberately not folded together.
+//! [`triggers_run`] asks about an **edge**: did this particular write start
+//! work? [`accepts_runs`] asks about a **card**: does this issue still take
+//! work at all? Only the first needs a transition, and only some of the
+//! doors into a run have one — a released hold, a boot re-drive, a retry
+//! and a stage barrier all arrive with nothing but a row. So the card-level
+//! rule cannot live here on the edge; it lives on the one path they all
+//! share, [`crate::ProjectManager::enqueue`], which asks it once.
 
 use baybo_model::{AgentProfileId, IssueRunId};
 use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
 
-/// What a write did to an issue, in the only terms the predicate cares
+/// What a write did to an issue, in the only terms [`triggers_run`] cares
 /// about.
 ///
 /// The assignee is carried whole rather than reduced to "somebody is on
 /// it": handing live work to a *different* agent is an edge the predicate
 /// has to see, and a bool cannot show it.
 ///
-/// Cancellation is carried too, so the predicate can answer for itself
-/// rather than have a caller filter its answer. A second gate at the
-/// dispatch site would be a second predicate, which is exactly what this
-/// module exists to prevent — and it would be invisible to the tests
-/// below, which are where this rule is actually pinned.
+/// Cancellation is *not* carried, and that is the point: it is a fact about
+/// the card rather than about the edge, so it is asked once at the enqueue
+/// chokepoint (see [`accepts_runs`]) instead of once per predicate that
+/// happens to have a transition in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Transition {
+pub(crate) struct Transition {
     pub before_status: IssueStatus,
     pub before_assignee: Option<AgentProfileId>,
     pub after_status: IssueStatus,
     pub after_assignee: Option<AgentProfileId>,
-    /// Whether the issue is cancelled *after* the write. The "before" side
-    /// is not carried: un-cancelling changes neither status nor assignee,
-    /// so it can never be the edge that starts work — reviving a card and
-    /// staffing it are two acts, and the second one is the trigger.
-    pub after_cancelled: bool,
 }
 
 /// Whether this transition starts work, and why.
@@ -50,15 +49,12 @@ pub struct Transition {
 /// Progress does not stop anything — the run outlives the column, and
 /// cancelling it is a separate, explicit act.
 ///
-/// A **cancelled** issue is not a trigger on either edge. The board treats
-/// cancelled as finished everywhere else — `comment_delivery` refuses to
-/// wake one, [`crate::stages`] counts it out of its stage, and
-/// `reclaim_if_finished` has already taken its worktree back — so a run
-/// started here would cut a fresh checkout and put an agent to work on
-/// abandoned work. Reviving the card is what makes it startable again.
-pub fn triggers_run(t: Transition) -> Option<RunTrigger> {
-    if t.after_cancelled || t.after_status != IssueStatus::InProgress || t.after_assignee.is_none()
-    {
+/// Whether the card is one that still takes work at all is **not** asked
+/// here: that is [`accepts_runs`], and
+/// [`crate::ProjectManager::enqueue`] asks it for every door, this one
+/// included.
+pub(crate) fn triggers_run(t: Transition) -> Option<RunTrigger> {
+    if t.after_status != IssueStatus::InProgress || t.after_assignee.is_none() {
         return None;
     }
     if t.before_status != IssueStatus::InProgress {
@@ -70,27 +66,49 @@ pub fn triggers_run(t: Transition) -> Option<RunTrigger> {
     (t.before_assignee != t.after_assignee).then_some(RunTrigger::Assigned)
 }
 
+/// Whether this card still takes work at all.
+///
+/// A card the board has finished with does not, and "finished" is
+/// [`crate::stages::is_finished`]'s single definition — Done, or cancelled.
+/// The board acts on it everywhere else: `comment_delivery` refuses to wake
+/// one, [`crate::stages`] counts it out of its stage, and
+/// `reclaim_if_finished` has already taken its worktree back. So a run
+/// started on one would cut a fresh checkout and put an agent to work on
+/// abandoned work.
+///
+/// Asked of the card rather than of a write, because most of the doors into
+/// a run have no write to look at: a hold released when the budget rolls
+/// over, a row the boot sweep re-drives, a retry, and a parent woken by its
+/// last step were all recorded — or last looked at — while the card was
+/// still live. [`crate::ProjectManager::enqueue`] asks this once for all of
+/// them, and the two sweeps that hand out rows recorded earlier ask it
+/// again against the card as it is now.
+///
+/// Reviving a cancelled card, or dragging a Done one back, is what makes it
+/// startable again.
+pub(crate) fn accepts_runs(issue: &IssueRow) -> bool {
+    !crate::stages::is_finished(issue)
+}
+
 impl Transition {
     /// The transition between two states of the same issue.
-    pub fn between(before: &IssueRow, after: &IssueRow) -> Self {
+    pub(crate) fn between(before: &IssueRow, after: &IssueRow) -> Self {
         Self {
             before_status: before.status,
             before_assignee: before.assignee.clone(),
             after_status: after.status,
             after_assignee: after.assignee.clone(),
-            after_cancelled: after.cancelled_at.is_some(),
         }
     }
 
     /// A newly created issue: it came from nowhere, so the "before" is a
     /// state that can never itself be a trigger.
-    pub fn created(after: &IssueRow) -> Self {
+    pub(crate) fn created(after: &IssueRow) -> Self {
         Self {
             before_status: IssueStatus::Backlog,
             before_assignee: None,
             after_status: after.status,
             after_assignee: after.assignee.clone(),
-            after_cancelled: after.cancelled_at.is_some(),
         }
     }
 }
@@ -127,7 +145,29 @@ mod tests {
             before_assignee,
             after_status,
             after_assignee,
-            after_cancelled: false,
+        }
+    }
+
+    fn issue(status: IssueStatus) -> IssueRow {
+        let now = chrono::Utc::now();
+        IssueRow {
+            id: baybo_model::IssueId::generate(),
+            project_id: baybo_model::ProjectId::parse("p").expect("id"),
+            number: 1,
+            title: "Wire it".into(),
+            description: String::new(),
+            status,
+            priority: baybo_store::project::IssuePriority::None,
+            assignee: agent("dev-1"),
+            position: 0,
+            blocked_reason: None,
+            branch: None,
+            parent_issue_id: None,
+            stage: 0,
+            source_key: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -247,43 +287,26 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_issue_starts_nothing_on_either_edge() {
-        // Cancelled is finished everywhere else on the board, and its
-        // worktree is already gone. Both edges that would otherwise fire
-        // have to see that.
-        let cancelled = |before_status, before_assignee, after_status, after_assignee| Transition {
-            after_cancelled: true,
-            ..t(before_status, before_assignee, after_status, after_assignee)
-        };
-        assert!(
-            triggers_run(cancelled(
-                IssueStatus::Todo,
-                agent("dev-1"),
-                IssueStatus::InProgress,
-                agent("dev-1")
-            ))
-            .is_none(),
-            "entering the column"
-        );
-        assert!(
-            triggers_run(cancelled(
-                IssueStatus::InProgress,
-                agent("dev-1"),
-                IssueStatus::InProgress,
-                agent("dev-2")
-            ))
-            .is_none(),
-            "handing it over"
-        );
-        assert!(
-            triggers_run(cancelled(
-                IssueStatus::InProgress,
-                None,
-                IssueStatus::InProgress,
-                agent("dev-1")
-            ))
-            .is_none(),
-            "staffing it"
-        );
+    fn a_card_the_board_has_finished_with_takes_no_more_runs() {
+        // Cancelled and Done are both "finished" everywhere else on the
+        // board, and the worktree of either is already gone. Every door
+        // into a run asks this, not just the ones that carry a transition.
+        let mut cancelled = issue(IssueStatus::InProgress);
+        cancelled.cancelled_at = Some(chrono::Utc::now());
+        assert!(!accepts_runs(&cancelled), "cancelled");
+        assert!(!accepts_runs(&issue(IssueStatus::Done)), "done");
+        // Cancelled outranks the column it is parked in.
+        let mut cancelled_in_review = issue(IssueStatus::Review);
+        cancelled_in_review.cancelled_at = Some(chrono::Utc::now());
+        assert!(!accepts_runs(&cancelled_in_review), "cancelled in Review");
+
+        for status in [
+            IssueStatus::Backlog,
+            IssueStatus::Todo,
+            IssueStatus::InProgress,
+            IssueStatus::Review,
+        ] {
+            assert!(accepts_runs(&issue(status)), "{status:?}");
+        }
     }
 }

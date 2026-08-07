@@ -89,10 +89,27 @@ describe('describeEvent', () => {
       { kind: 'cancelled' },
       { kind: 'worktree_reclaimed', branch_deleted: true },
       { kind: 'worktree_kept', reason: 'contains modified or untracked files' },
+      { kind: 'approval_requested', call_id: 'c1', tool: 'Bash', summary: 'rm -rf build' },
+      { kind: 'approval_resolved', call_id: 'c1', decision: 'approve' },
+      { kind: 'stage_completed', stage: 1 },
+      { kind: 'budget_exhausted', spent_micros: 5_000_000, limit_micros: 5_000_000 },
+      { kind: 'budget_restored', spent_micros: 1_000_000, limit_micros: 5_000_000 },
     ];
     for (const body of kinds) {
       expect(describeEvent(body), body.kind).toBeTypeOf('string');
     }
+  });
+
+  it('narrates a body kind it has never heard of instead of dropping the entry', () => {
+    // A server newer than the bundle, which `IssueEventBody` is designed to
+    // allow. Returning nothing here is not a soft degradation: `Note`
+    // renders no `<li>` when the sentence is nullish, so the entry would
+    // vanish from the card's history — and `null` is reserved for a
+    // comment, which is shown rather than narrated.
+    const future = { kind: 'merged', sha: 'ab12cd' } as unknown as IssueEventBody;
+    const sentence = describeEvent(future);
+    expect(sentence).toBeTypeOf('string');
+    expect(sentence).not.toBe('');
   });
 });
 

@@ -642,7 +642,7 @@ pub async fn build_managers(
                         return;
                     }
                 };
-                let said = comments_since_previous_run(&store, &run).await;
+                let said = comments_for_brief(&store, &run).await;
                 let brief = issue_brief(&issue, &said);
 
                 // Cutting the worktree happens here, on this spawned task,
@@ -1247,22 +1247,73 @@ pub fn force_exit_watchdog(
     });
 }
 
+/// How far back the comments in a run's brief reach.
+///
+/// A run reads the card through the transcript of the session it is handed,
+/// and that session belongs to the **agent**, not to the issue: an agent
+/// that has not worked this card opens an empty one and has seen nothing,
+/// however much was said to whoever worked it last. So the window is
+/// bounded by this agent's own previous run or not at all — bounding it by
+/// somebody else's run trims a conversation as "already read" against a
+/// reader that has not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BriefWindow {
+    /// Nobody has run this card yet.
+    FirstRun,
+    /// Somebody else has, and this agent has not: a handover. It gets the
+    /// whole conversation, and an account of the worktree it inherits.
+    Handover,
+    /// This agent has run the card before. Everything up to the moment its
+    /// previous run started is already in its transcript.
+    SinceItsLastRun(chrono::DateTime<chrono::Utc>),
+}
+
+/// The card's conversation as one run should read it.
+struct Said {
+    window: BriefWindow,
+    comments: Vec<String>,
+}
+
+/// The label on a delta: everything before it is already in the reader's
+/// transcript. Said last, because the comments are the newest instruction
+/// on the card and a reader that takes them for part of the original
+/// description weights them as background.
+const SAID_SINCE_LAST_RUN: &str = "\n\nSaid since your last run:\n";
+
+/// The label on the whole conversation — the honest one for a reader that
+/// has seen none of it. Calling those comments "since your last run" would
+/// invite an agent to assume it had acted on everything older.
+const SAID_ON_THE_CARD: &str = "\n\nSaid on the card so far:\n";
+
+/// What a handover is owed beyond the conversation: every run of a card
+/// works in the same worktree, so this one arrives holding whatever the
+/// last agent left uncommitted, with none of it in its transcript.
+const INHERITED_WORKTREE: &str = r#"
+
+You are taking this card over from the agent that had it before you. The
+checkout you are given is the one it worked in, so any uncommitted change in
+there is its work and not yours — read what is already in the tree before
+you add to it."#;
+
 /// What an issue's assignee is asked to work on: its title, its description
-/// when it has one, and anything said on the card since the previous run.
-/// Assembled here rather than in the router so the execution path never has
-/// to know an issue's shape.
-fn issue_brief(issue: &baybo_store::project::IssueRow, said: &[String]) -> String {
+/// when it has one, and the part of the card's conversation this run has
+/// not already read. Assembled here rather than in the router so the
+/// execution path never has to know an issue's shape.
+fn issue_brief(issue: &baybo_store::project::IssueRow, said: &Said) -> String {
     let mut brief = if issue.description.trim().is_empty() {
         issue.title.clone()
     } else {
         format!("{}\n\n{}", issue.title, issue.description)
     };
-    if !said.is_empty() {
-        // Last, and labelled: the comments are the newest instruction on
-        // the card, and a reader that treats them as part of the original
-        // description would weight them as background.
-        brief.push_str("\n\nSaid since your last run:\n");
-        for comment in said {
+    if said.window == BriefWindow::Handover {
+        brief.push_str(INHERITED_WORKTREE);
+    }
+    if !said.comments.is_empty() {
+        brief.push_str(match said.window {
+            BriefWindow::SinceItsLastRun(_) => SAID_SINCE_LAST_RUN,
+            BriefWindow::FirstRun | BriefWindow::Handover => SAID_ON_THE_CARD,
+        });
+        for comment in &said.comments {
             brief.push_str(&format!("- {comment}\n"));
         }
     }
@@ -1291,33 +1342,48 @@ async fn prepare_checkout(
     Ok(root)
 }
 
-/// Comments left on the card since the previous run started — the delta a
-/// follow-up run is being asked to take account of.
+/// Which of the card's runs bounds this one's brief.
 ///
-/// Bounded by the previous run rather than by this one: this run's own row
+/// Bounded by a *previous* run rather than by this one: this run's own row
 /// was written when the comment triggered it, so bounding by its own clock
-/// would filter out the very thing it exists to read. With no previous run
-/// this is every comment, which is right for a first run.
-async fn comments_since_previous_run(
+/// would filter out the very thing it exists to read.
+fn brief_window(
+    run: &baybo_store::project::IssueRunRow,
+    runs: &[baybo_store::project::IssueRunRow],
+) -> BriefWindow {
+    let others = || runs.iter().filter(|candidate| candidate.id != run.id);
+    match others()
+        .filter(|candidate| candidate.agent_id == run.agent_id)
+        .map(|candidate| candidate.created_at)
+        .max()
+    {
+        Some(since) => BriefWindow::SinceItsLastRun(since),
+        None if others().next().is_some() => BriefWindow::Handover,
+        None => BriefWindow::FirstRun,
+    }
+}
+
+/// The part of the card's conversation this run is being asked to take
+/// account of, and how much of it that is.
+async fn comments_for_brief(
     store: &Arc<dyn baybo_store::project::ProjectStore>,
     run: &baybo_store::project::IssueRunRow,
-) -> Vec<String> {
-    let previous = match store.list_runs(&run.issue_id).await {
-        Ok(runs) => runs
-            .into_iter()
-            .filter(|candidate| candidate.id != run.id)
-            .map(|candidate| candidate.created_at)
-            .max(),
+) -> Said {
+    let window = match store.list_runs(&run.issue_id).await {
+        Ok(runs) => brief_window(run, &runs),
         Err(e) => {
             tracing::warn!(run = %run.id, error = %e, "could not read prior runs for the brief");
-            return Vec::new();
+            return Said {
+                window: BriefWindow::FirstRun,
+                comments: Vec::new(),
+            };
         }
     };
-    let events = match previous {
-        Some(since) => store.events_since(&run.issue_id, since).await,
-        None => store.list_events(&run.issue_id).await,
+    let events = match window {
+        BriefWindow::SinceItsLastRun(since) => store.events_since(&run.issue_id, since).await,
+        BriefWindow::FirstRun | BriefWindow::Handover => store.list_events(&run.issue_id).await,
     };
-    match events {
+    let comments = match events {
         Ok(events) => events
             .into_iter()
             .filter_map(|event| match event.body {
@@ -1329,9 +1395,178 @@ async fn comments_since_previous_run(
             tracing::warn!(run = %run.id, error = %e, "could not read comments for the brief");
             Vec::new()
         }
-    }
+    };
+    Said { window, comments }
 }
 
 pub(crate) fn manager_shutdown_deadline(budget: std::time::Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + budget.saturating_sub(SHUTDOWN_WATCHDOG_MARGIN)
+}
+
+#[cfg(test)]
+mod tests {
+    //! What an issue run is actually told. The session it works in belongs
+    //! to its agent, so the brief is the only thing an agent handed a card
+    //! mid-flight ever sees of what came before.
+
+    use super::*;
+    use baybo_model::{AgentProfileId, IssueId, IssueRunId, ProjectId};
+    use baybo_store::project::{
+        IssuePriority, IssueRow, IssueRunRow, IssueStatus, RunStatus, RunTrigger,
+    };
+    use chrono::{Duration, Utc};
+
+    fn card() -> IssueRow {
+        let now = Utc::now();
+        IssueRow {
+            id: IssueId::generate(),
+            project_id: ProjectId::generate(),
+            number: 7,
+            title: "wire the importer".to_owned(),
+            description: "it should skip rows with no id".to_owned(),
+            status: IssueStatus::InProgress,
+            priority: IssuePriority::None,
+            assignee: None,
+            position: 0,
+            blocked_reason: None,
+            branch: None,
+            parent_issue_id: None,
+            stage: 0,
+            source_key: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn run(issue: &IssueRow, agent: &AgentProfileId, attempt: i64) -> IssueRunRow {
+        IssueRunRow {
+            id: IssueRunId::generate(),
+            issue_id: issue.id.clone(),
+            project_id: issue.project_id.clone(),
+            number: issue.number,
+            agent_id: agent.clone(),
+            session_id: None,
+            trigger: RunTrigger::Assigned,
+            status: RunStatus::Queued,
+            attempt,
+            error: None,
+            created_at: issue.created_at + Duration::minutes(attempt),
+            started_at: None,
+            settled_at: None,
+        }
+    }
+
+    /// The first run has nothing to be bounded against, and nothing to
+    /// inherit.
+    #[test]
+    fn a_cards_first_run_reads_the_whole_card_as_its_own() {
+        let issue = card();
+        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
+        let first = run(&issue, &dev_1, 1);
+
+        assert_eq!(
+            brief_window(&first, std::slice::from_ref(&first)),
+            BriefWindow::FirstRun
+        );
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::FirstRun,
+                comments: vec!["start with the CSV path".to_owned()],
+            },
+        );
+        assert!(
+            !brief.contains("taking this card over"),
+            "there is nobody to take it over from:\n{brief}"
+        );
+        assert!(brief.contains(SAID_ON_THE_CARD.trim()));
+    }
+
+    /// A second run by the same agent continues one transcript, so the
+    /// delta since its own last run is exactly what it has not read.
+    #[test]
+    fn a_second_run_by_the_same_agent_is_bounded_by_its_own_previous_one() {
+        let issue = card();
+        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
+        let first = run(&issue, &dev_1, 1);
+        let second = run(&issue, &dev_1, 2);
+
+        assert_eq!(
+            brief_window(&second, &[first.clone(), second.clone()]),
+            BriefWindow::SinceItsLastRun(first.created_at)
+        );
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::SinceItsLastRun(first.created_at),
+                comments: vec!["also handle the empty case".to_owned()],
+            },
+        );
+        assert!(
+            brief.contains(SAID_SINCE_LAST_RUN.trim()),
+            "an agent that has read the rest is told only what is new:\n{brief}"
+        );
+    }
+
+    /// A handover opens an **empty** transcript: the card's session belongs
+    /// to the agent, so dev-2 has seen nothing dev-1 was told. Bounding its
+    /// brief by dev-1's run trims the conversation as "already read"
+    /// against a reader that has not read it, and the heading then claims
+    /// those are the comments since a run it never made.
+    #[test]
+    fn a_handover_is_given_the_whole_conversation_and_told_it_is_that() {
+        let issue = card();
+        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
+        let dev_2 = AgentProfileId::parse("dev-2").expect("agent id");
+        let theirs = run(&issue, &dev_1, 1);
+        let handover = run(&issue, &dev_2, 2);
+
+        assert_eq!(
+            brief_window(&handover, &[theirs.clone(), handover.clone()]),
+            BriefWindow::Handover,
+            "dev-2's brief must not be bounded by a run of dev-1's"
+        );
+
+        let brief = issue_brief(
+            &issue,
+            &Said {
+                window: BriefWindow::Handover,
+                comments: vec![
+                    "start with the CSV path".to_owned(),
+                    "also handle the empty case".to_owned(),
+                ],
+            },
+        );
+        assert!(
+            brief.contains(SAID_ON_THE_CARD.trim()),
+            "and must not be told they are the comments since its own last run:\n{brief}"
+        );
+        assert!(!brief.contains(SAID_SINCE_LAST_RUN.trim()), "{brief}");
+        assert!(
+            brief.contains("start with the CSV path") && brief.contains("also handle the empty"),
+            "everything said on the card is new to it:\n{brief}"
+        );
+        assert!(
+            brief.contains("checkout you are given"),
+            "and it arrives holding somebody else's uncommitted work:\n{brief}"
+        );
+    }
+
+    /// Handing the card back is not a handover: that agent's own session,
+    /// with its own transcript, is what it resumes in.
+    #[test]
+    fn an_agent_handed_the_card_back_is_bounded_by_its_own_last_run() {
+        let issue = card();
+        let dev_1 = AgentProfileId::parse("dev-1").expect("agent id");
+        let dev_2 = AgentProfileId::parse("dev-2").expect("agent id");
+        let first = run(&issue, &dev_1, 1);
+        let handover = run(&issue, &dev_2, 2);
+        let back = run(&issue, &dev_1, 3);
+
+        assert_eq!(
+            brief_window(&back, &[first.clone(), handover, back.clone()]),
+            BriefWindow::SinceItsLastRun(first.created_at),
+        );
+    }
 }

@@ -14,7 +14,7 @@ use baybo_store::project::{IssueEventBody, IssueRow};
 /// it stopped — and a stream that also announced every keystroke of a
 /// description would bury exactly that. The description's current text is
 /// on the page above; its history is not something anyone has asked for.
-pub fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEventBody> {
+pub(crate) fn diff_events(before: &IssueRow, after: &IssueRow) -> Vec<IssueEventBody> {
     let mut out = Vec::new();
     if before.status != after.status {
         out.push(IssueEventBody::Moved {

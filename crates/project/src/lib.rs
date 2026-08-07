@@ -1,9 +1,12 @@
 //! Kanban projects: the container, its board, and the rules a write has
 //! to satisfy before it reaches the store.
 //!
-//! See `docs/todo/kanban.md`. This crate owns validation and workdir
-//! materialisation; `baybo-store` declares the persistence port and
-//! `baybo-storage` implements it.
+//! See `docs/modules/project.md` for the architecture, and
+//! `docs/todo/kanban.md` for the product rationale and phasing. This crate
+//! owns the board's write rules, the run ledger's single enqueue path, and
+//! the per-issue worktree; `baybo-store` declares the persistence port,
+//! `baybo-storage` implements it, `baybo-agent` executes the runs recorded
+//! here, and `baybo-gateway` serves the board.
 
 mod approvals;
 mod budget;
@@ -18,9 +21,14 @@ mod timeline;
 pub mod tools;
 pub mod worktree;
 
-pub use approvals::{TimelineApprovalGate, pending_approvals};
-pub use budget::{Headroom, day_start, headroom};
-pub use comments::{CommentDelivery, comment_delivery};
+// Only what a downstream crate actually consumes. Everything else these
+// modules expose is `pub(crate)` and reached as `crate::…`: an item
+// re-exported here is a promise to the gateway, the runtime and this
+// crate's own tests, and a promise nobody is holding is one that quietly
+// grows callers it was never designed for.
+pub use approvals::TimelineApprovalGate;
+pub use budget::Headroom;
+pub use comments::CommentDelivery;
 pub use error::{ProjectError, Result};
 pub use events::{NoopProjectEvents, ProjectEvents};
 pub use manager::{
@@ -28,8 +36,5 @@ pub use manager::{
     NewIssueRequest, NewProject, NewTeamMember, ProjectManager, RunDispatch, no_dispatch,
     validate_workdir,
 };
-pub use mentions::{assigns_to, mentions};
-pub use runs::{Transition, triggers_run};
-pub use stages::{all_finished, open_stages, progress};
-pub use timeline::diff_events;
+pub use stages::progress;
 pub use worktree::Checkout;

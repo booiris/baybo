@@ -46,7 +46,7 @@ impl Headroom {
 /// The comparison is `>=`: a board that has spent exactly its ceiling has
 /// no room for a run whose cost is unknown in advance. Erring the other way
 /// would let every board overspend by one run's worth, every day.
-pub fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
+pub(crate) fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
     let Some(limit) = limit else {
         return Headroom::Unlimited;
     };
@@ -64,7 +64,7 @@ pub fn headroom(limit: Option<MicroUsd>, spent: MicroUsd) -> Headroom {
 /// server's is an accident of deployment, and a budget that rolls over at a
 /// time nobody can predict is worse than one that rolls over at an
 /// inconvenient one.
-pub fn day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn day_start(now: DateTime<Utc>) -> DateTime<Utc> {
     now.date_naive()
         .and_hms_opt(0, 0, 0)
         // `00:00:00` is valid for every date, so this cannot fire; falling

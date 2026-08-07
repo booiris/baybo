@@ -115,19 +115,32 @@ fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Resu
     Ok(())
 }
 
-/// The handle `agent` answers to on its board, or `None` when it has none.
+/// The handle `agent` answers to on `project`, or `None` when it has none
+/// there.
+///
+/// Scoped to the board the run belongs to, because a handle is unique only
+/// inside its board: `@dev-1` here and `@dev-1` there are two different
+/// agents, so a profile whose team is somewhere else must not sign this
+/// board's commits under this board's naming. A removed teammate still
+/// answers — removal is a `deleted_at` tombstone that leaves the
+/// membership itself untouched, and `AgentProfileStore::get` reaches
+/// rows `list_team` filters out.
 ///
 /// Degrades instead of failing on every miss — a global agent, a profile
-/// row that is gone, a store error — because the one consumer is the
-/// commit identity an issue run's shell carries, and a commit attributed
-/// to a name no reader can resolve is worse than one attributed to baybo.
-/// Neither may stop the commit.
+/// row that is gone, a store error, a membership on another board —
+/// because the one consumer is the commit identity an issue run's shell
+/// carries, and a commit attributed to a name no reader can resolve is
+/// worse than one attributed to baybo. Neither may stop the commit.
 async fn board_handle(
     agents: &Arc<dyn AgentProfileStore>,
     agent: &baybo_model::AgentProfileId,
+    project: &baybo_model::ProjectId,
 ) -> Option<baybo_model::AgentHandle> {
     match agents.get(agent).await {
-        Ok(Some(row)) => row.team.map(|team| team.handle),
+        Ok(Some(row)) => row
+            .team
+            .filter(|team| team.project_id == *project)
+            .map(|team| team.handle),
         Ok(None) => {
             debug!(agent_id = %agent, "the agent working this issue has no profile row; its commits use the workspace identity");
             None
@@ -889,8 +902,10 @@ impl ToolExecutor {
                 // rule as the checkout resolved just above: team membership
                 // is a row a lead can edit mid-run, and the read joins one
                 // that path already makes.
-                let agent_handle = match (&checkout, &self.board) {
-                    (Some(_), Some(board)) => board_handle(&board.agents, agent_id).await,
+                let agent_handle = match (&checkout, &self.board, session_trigger.project()) {
+                    (Some(_), Some(board), Some(project)) => {
+                        board_handle(&board.agents, agent_id, project).await
+                    }
                     _ => None,
                 };
                 let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
@@ -1307,6 +1322,60 @@ mod tests {
     async fn a_team_members_handle_is_what_its_commits_are_authored_as() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
         let id = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
+        agents.insert(profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: board.clone(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        ));
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id, &board)
+                .await
+                .map(|h| h.as_str().to_owned()),
+            Some("dev-1".to_owned()),
+        );
+    }
+
+    /// A removed teammate still signs the commits it is about to make: the
+    /// board's own resolver reaches tombstoned rows on purpose, and a run
+    /// settling after its agent was let go must not silently fall back to
+    /// the workspace identity.
+    #[tokio::test]
+    async fn a_removed_teammate_still_resolves_on_the_board_it_worked() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
+        let mut row = profile_row(
+            id.clone(),
+            Some(baybo_model::TeamMembership {
+                project_id: board.clone(),
+                handle: baybo_model::AgentHandle::parse("dev-1").expect("handle"),
+            }),
+        );
+        row.deleted_at = Some(chrono::Utc::now());
+        agents.insert(row);
+        let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
+
+        assert_eq!(
+            super::board_handle(&agents, &id, &board)
+                .await
+                .map(|h| h.as_str().to_owned()),
+            Some("dev-1".to_owned()),
+        );
+    }
+
+    /// A handle is unique only inside its board, so an agent whose team is
+    /// somewhere else has no name *here* — signing this board's commits
+    /// with another board's `@dev-1` names the wrong somebody, which is the
+    /// failure the handle replaced the ULID to avoid.
+    #[tokio::test]
+    async fn an_agent_on_another_board_does_not_sign_this_ones_commits() {
+        let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let id = baybo_model::AgentProfileId::generate();
         agents.insert(profile_row(
             id.clone(),
             Some(baybo_model::TeamMembership {
@@ -1317,10 +1386,8 @@ mod tests {
         let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
 
         assert_eq!(
-            super::board_handle(&agents, &id)
-                .await
-                .map(|h| h.as_str().to_owned()),
-            Some("dev-1".to_owned()),
+            super::board_handle(&agents, &id, &baybo_model::ProjectId::generate()).await,
+            None,
         );
     }
 
@@ -1331,12 +1398,13 @@ mod tests {
     async fn an_agent_with_no_board_and_a_row_that_is_gone_have_no_handle() {
         let agents = baybo_store::test_support::MemoryAgentProfileStore::new();
         let global = baybo_model::AgentProfileId::generate();
+        let board = baybo_model::ProjectId::generate();
         agents.insert(profile_row(global.clone(), None));
         let agents: Arc<dyn AgentProfileStore> = Arc::new(agents);
 
-        assert_eq!(super::board_handle(&agents, &global).await, None);
+        assert_eq!(super::board_handle(&agents, &global, &board).await, None);
         assert_eq!(
-            super::board_handle(&agents, &baybo_model::AgentProfileId::generate()).await,
+            super::board_handle(&agents, &baybo_model::AgentProfileId::generate(), &board).await,
             None,
         );
     }

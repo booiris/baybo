@@ -58,6 +58,11 @@ pub const MAX_ROLE_CHARS: usize = 280;
 /// Upper bound on one activity-feed page.
 pub const MAX_FEED_PAGE: usize = 100;
 
+/// Why a recorded run never happened: its card reached Done or was
+/// cancelled before the board got round to it. Read on the card, so it is a
+/// sentence rather than a code.
+const RUN_CALLED_OFF: &str = "the card was finished or cancelled before this run started";
+
 /// How many `-2`, `-3`, … suffixes to try when a derived handle is taken.
 ///
 /// Bounded because handles stay reserved after removal: a board that has
@@ -202,9 +207,11 @@ impl ProjectManager {
     ///
     /// Record-before-deliver: the row exists before anything can act on
     /// it, so a crash between the two is a run the boot sweep finds rather
-    /// than work that silently never happened. A refused enqueue means the
-    /// issue already has a run in flight — the dedupe guard doing its job,
-    /// not a failure the caller should see.
+    /// than work that silently never happened.
+    ///
+    /// The transition is only half the question — [`Self::enqueue`] asks the
+    /// other half, of the card, and every reason it can decline is one this
+    /// caller has nothing to do about.
     async fn dispatch_if_triggered(&self, transition: Transition, issue: &IssueRow) {
         let Some(trigger) = triggers_run(transition) else {
             return;
@@ -214,15 +221,25 @@ impl ProjectManager {
 
     /// Record a run and start it, unless the board has spent its budget.
     ///
-    /// The single enqueue path — a drag, a comment, a retry and a tool call
-    /// all arrive here, so the gate cannot be forgotten on one of them.
+    /// The single enqueue path — a drag, a comment, a retry, a stage
+    /// barrier and a tool call all arrive here, so the gates cannot be
+    /// forgotten on one of them. There are three, and this is where each is
+    /// asked exactly once: **liveness** ([`crate::runs::accepts_runs`]),
+    /// **dedupe** (the store's per-issue partial unique index), and
+    /// **budget**.
     ///
-    /// The order is deliberate: **the row is written before the budget is
-    /// consulted**, so an exhausted board records work it owes rather than
-    /// dropping it. The run lands `Held`, holds the issue's dedupe slot, and
-    /// starts the moment there is headroom again. A refused write means the
-    /// issue already has a run in flight — the dedupe guard doing its job,
-    /// not a failure the caller should see.
+    /// Liveness comes first, before anything is written. A card that is
+    /// Done or cancelled has already had its worktree reclaimed, so a run
+    /// recorded on it would either cut a fresh checkout for abandoned work
+    /// or — held, then never dispatched — sit unsettled holding the issue's
+    /// dedupe slot against the day somebody revives the card.
+    ///
+    /// The order of the other two is deliberate: **the row is written before
+    /// the budget is consulted**, so an exhausted board records work it owes
+    /// rather than dropping it. The run lands `Held`, holds the issue's
+    /// dedupe slot, and starts the moment there is headroom again. A refused
+    /// write means the issue already has a run in flight — the dedupe guard
+    /// doing its job, not a failure the caller should see.
     ///
     /// Whatever the board is already holding is released **before** that
     /// write, and deliberately so. This is the third release site — with a
@@ -234,6 +251,14 @@ impl ProjectManager {
     /// held run has just become affordable is told the issue already has a run
     /// in flight — which is true, and it is the run they asked for.
     async fn enqueue(&self, issue: &IssueRow, trigger: RunTrigger) -> Option<IssueRunRow> {
+        if !crate::runs::accepts_runs(issue) {
+            tracing::debug!(
+                issue = issue.number,
+                ?trigger,
+                "the card is finished or cancelled; not starting a run on it"
+            );
+            return None;
+        }
         let entry = ledger_entry(issue, trigger)?;
         let headroom = self.headroom(&issue.project_id).await;
         if let Err(e) = self.release_holds(&issue.project_id, headroom).await {
@@ -300,10 +325,10 @@ impl ProjectManager {
         }
         match self
             .store
-            .spend_since(project, crate::day_start(chrono::Utc::now()))
+            .spend_since(project, crate::budget::day_start(chrono::Utc::now()))
             .await
         {
-            Ok(spent) => crate::headroom(limit, spent),
+            Ok(spent) => crate::budget::headroom(limit, spent),
             Err(e) => {
                 tracing::error!(%project, error = %e, "could not read the project's spend");
                 Headroom::Unlimited
@@ -338,14 +363,18 @@ impl ProjectManager {
         let held = self.store.held_runs(project).await?;
         let mut released = 0;
         for run in held {
+            // A hold outlives the write that recorded it, so the card may
+            // have been cancelled or finished in between — and its worktree
+            // reclaimed with it.
+            let Some(issue) = self.live_card(&run).await else {
+                continue;
+            };
             if !self.store.release_run(&run.id).await? {
                 continue;
             }
             released += 1;
             self.events.run_changed(project, run.number);
-            if let (Some((spent_micros, limit_micros)), Ok(issue)) =
-                (figures, self.get_issue(project, run.number).await)
-            {
+            if let Some((spent_micros, limit_micros)) = figures {
                 self.record(
                     &issue,
                     IssueActor::System,
@@ -359,6 +388,72 @@ impl ProjectManager {
             (self.dispatch)(run);
         }
         Ok(released)
+    }
+
+    /// The card a recorded run is for, when the board should still run it.
+    ///
+    /// The two sweeps that hand out rows — a hold the budget has released,
+    /// and the boot re-drive — carry entries written while the card was
+    /// live. Neither has a transition to consult, so the liveness question
+    /// [`Self::enqueue`] answered before writing has to be asked again here,
+    /// against the card as it is *now*.
+    ///
+    /// `None` covers two different things on purpose, because the caller
+    /// does the same thing with both: do not hand this run out. A card that
+    /// has stopped accepting work has its run **called off**, so the ledger
+    /// stops owing work nobody wants and the issue's dedupe slot is free
+    /// again — a row left unsettled there would refuse every run on the card
+    /// if it were ever revived. A card that could not be *read* is left
+    /// exactly as it is, so a storage hiccup costs a delay until the next
+    /// release or boot rather than a settled run.
+    async fn live_card(&self, run: &IssueRunRow) -> Option<IssueRow> {
+        match self.store.get_issue(&run.project_id, run.number).await {
+            Ok(Some(issue)) if crate::runs::accepts_runs(&issue) => Some(issue),
+            Ok(issue) => {
+                self.call_off(run, issue.as_ref()).await;
+                None
+            }
+            Err(e) => {
+                tracing::error!(issue = run.number, error = %e, "could not read the card a recorded run belongs to; leaving the run where it is");
+                None
+            }
+        }
+    }
+
+    /// Settle a run the board is never going to make, and say so on the
+    /// card.
+    ///
+    /// Recorded like any other settlement rather than dropped quietly: a run
+    /// the operator can see on the card has to end somewhere the operator
+    /// can see it end.
+    async fn call_off(&self, run: &IssueRunRow, issue: Option<&IssueRow>) {
+        match self
+            .store
+            .settle_run(&run.id, RunStatus::Cancelled, Some(RUN_CALLED_OFF))
+            .await
+        {
+            Ok(true) => {}
+            // Somebody else settled it first, which is the same outcome.
+            Ok(false) => return,
+            Err(e) => {
+                tracing::error!(issue = run.number, error = %e, "could not call off a run on a finished card");
+                return;
+            }
+        }
+        self.events.run_changed(&run.project_id, run.number);
+        if let Some(issue) = issue {
+            self.record(
+                issue,
+                IssueActor::System,
+                IssueEventBody::RunSettled {
+                    run_id: run.id.clone(),
+                    attempt: run.attempt,
+                    status: RunStatus::Cancelled,
+                    error: Some(RUN_CALLED_OFF.to_owned()),
+                },
+            )
+            .await;
+        }
     }
 
     /// Append to an issue's timeline, and tell whoever is watching.
@@ -429,9 +524,7 @@ impl ProjectManager {
     /// about the work, not a filesystem operation, and it stands whatever
     /// git says.
     async fn reclaim_if_finished(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
-        let finished =
-            |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
-        if finished(before) || !finished(after) {
+        if crate::stages::is_finished(before) || !crate::stages::is_finished(after) {
             return;
         }
         let Ok(Some(project)) = self.store.get_project(&after.project_id).await else {
@@ -583,7 +676,7 @@ impl ProjectManager {
         issue: &IssueRow,
         text: &str,
     ) -> Option<AgentProfileId> {
-        let handle = crate::assigns_to(issue.assignee.is_some(), text)?;
+        let handle = crate::mentions::assigns_to(issue.assignee.is_some(), text)?;
         let team = self.agents.list_team(project).await.ok()?;
         team.into_iter()
             .find(|row| {
@@ -622,7 +715,7 @@ impl ProjectManager {
                 return CommentDelivery::RecordOnly;
             }
         };
-        crate::comment_delivery(issue, live)
+        crate::comments::comment_delivery(issue, live)
     }
 
     /// One issue's timeline, oldest first.
@@ -684,6 +777,14 @@ impl ProjectManager {
     /// Run an issue again. Refused while one is already in flight — the
     /// same dedupe guard a drag hits, surfaced as a conflict rather than a
     /// silent second agent.
+    ///
+    /// A finished or cancelled card is refused too, and with its own
+    /// message. [`Self::enqueue`]'s liveness gate would stop the run either
+    /// way, but the only thing it can tell a caller is `None`, which this
+    /// method reads as the dedupe guard — so the operator would be told the
+    /// card already has a run when it has none and never will. Both
+    /// refusals name something the caller can act on: cancel the other run,
+    /// or reopen the card.
     pub async fn retry_run(&self, project: &ProjectId, number: i64) -> Result<IssueRunRow> {
         self.writable_project(project).await?;
         let issue = self.get_issue(project, number).await?;
@@ -691,6 +792,16 @@ impl ProjectManager {
             return Err(ProjectError::invalid(
                 "assignee",
                 "an issue with nobody on it cannot be run",
+            ));
+        }
+        if !crate::runs::accepts_runs(&issue) {
+            return Err(ProjectError::invalid(
+                "issue",
+                if issue.cancelled_at.is_some() {
+                    "this issue was cancelled — reopen it before running it again"
+                } else {
+                    "this issue is done — move it back into the board before running it again"
+                },
             ));
         }
         self.enqueue(&issue, RunTrigger::Retry)
@@ -707,10 +818,20 @@ impl ProjectManager {
     /// Return orphaned runs to the queue and hand each back for dispatch.
     /// Called once at boot, before live traffic: a `running` row whose
     /// actor died with the process is work that never finished.
+    ///
+    /// Not through [`Self::enqueue`] — these rows already exist — so the
+    /// liveness gate is asked here instead, per row, via [`Self::live_card`]:
+    /// the process may have been down for a week, and a card the operator
+    /// cancelled meanwhile must not come back to life at boot. The count is
+    /// what was actually re-driven, not what the sweep found.
     pub async fn resume_unsettled_runs(&self) -> Result<usize> {
         let resumed = self.store.requeue_unsettled().await?;
-        let mut count = resumed.len();
+        let mut count = 0;
         for run in resumed {
+            if self.live_card(&run).await.is_none() {
+                continue;
+            }
+            count += 1;
             (self.dispatch)(run);
         }
         // Held runs are not "orphaned" — they were never started on purpose
@@ -831,7 +952,8 @@ impl ProjectManager {
         Ok(self.agents.list_team(project).await?)
     }
 
-    /// The profile rows for `ids`, reaching agents that have left the team.
+    /// The profile rows for `ids` **on this board**, reaching agents that
+    /// have left its team.
     ///
     /// [`Self::team`] is the live roster and deliberately hides a departed
     /// teammate; a timeline is permanent history and still names one, which
@@ -840,18 +962,36 @@ impl ProjectManager {
     /// reference is not a departed teammate, and the caller renders it as
     /// the id rather than inventing a handle for it.
     ///
+    /// `project` is the whole reason this is not a bare `get`. A handle is
+    /// unique only inside its board, so `@dev-1` here and `@dev-1` there are
+    /// two different agents and an id belonging to another board must not
+    /// render under this one's naming. It costs the departed teammate
+    /// nothing: removal is a tombstone that stamps `deleted_at` and leaves
+    /// the membership untouched, so an agent that has left still answers
+    /// with the board it worked. Together with [`Self::team`], which is
+    /// board-scoped in SQL, that makes every row a timeline resolves a row
+    /// from this board — so no caller has to remember the rule.
+    ///
     /// One point-get per id, sequentially: a team is capped at
     /// [`MAX_TEAM_AGENTS`], so a card's timeline names a handful at most and
     /// the caller has already passed the roster's own read.
     pub(crate) async fn agent_profiles(
         &self,
+        project: &ProjectId,
         ids: impl IntoIterator<Item = AgentProfileId>,
     ) -> Vec<baybo_store::AgentProfileRow> {
         let mut rows = Vec::new();
         for id in ids {
             match self.agents.get(&id).await {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
+                Ok(Some(row))
+                    if row
+                        .team
+                        .as_ref()
+                        .is_some_and(|team| &team.project_id == project) =>
+                {
+                    rows.push(row)
+                }
+                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(agent = %id, error = %e, "could not resolve an agent a timeline names")
                 }
@@ -1278,9 +1418,7 @@ impl ProjectManager {
     /// run the boot sweep finds rather than a stage that silently never
     /// opened.
     async fn check_stage_barrier(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
-        let finished =
-            |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
-        if finished(before) || !finished(after) {
+        if crate::stages::is_finished(before) || !crate::stages::is_finished(after) {
             return;
         }
         let Some(parent_id) = after.parent_issue_id.clone() else {
