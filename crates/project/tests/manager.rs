@@ -1158,6 +1158,87 @@ async fn reassigning_live_work_starts_the_new_agent() {
     assert_eq!(f.manager.list_runs(&p.id, 1).await.expect("runs").len(), 2);
 }
 
+/// A cancelled card starts nothing, whichever edge is walked. The assignee
+/// picker on the detail page is not disabled for a cancelled card, and
+/// `reclaim_if_finished` has already torn that card's worktree down — a run
+/// started here cuts a fresh checkout and puts an agent to work on
+/// abandoned work.
+#[tokio::test]
+async fn a_cancelled_card_never_starts_a_run() {
+    let f = fixture().await;
+    let p = f.manager.create_project(new_project("p")).await.expect("p");
+    let dev = seed_agent(&f, &p.id, "dev-1", AgentFramework::Baybo).await;
+    let other = seed_agent(&f, &p.id, "dev-2", AgentFramework::Baybo).await;
+    f.manager
+        .create_issue(
+            &p.id,
+            IssueActor::User,
+            NewIssueRequest {
+                status: IssueStatus::InProgress,
+                assignee: Some(dev),
+                ..new_issue("called off")
+            },
+        )
+        .await
+        .expect("issue")
+        .into_issue();
+    let first = f.manager.list_runs(&p.id, 1).await.expect("runs")[0]
+        .id
+        .clone();
+    f.store_settle(&first, RunStatus::Cancelled).await;
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancel the card");
+    f.dispatched.lock().clear();
+
+    // The handover edge: a cancelled card is not live work to hand over.
+    f.manager
+        .update_issue(
+            &p.id,
+            1,
+            IssueActor::User,
+            IssueUpdate {
+                assignee: Some(Some(other.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reassign the cancelled card");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "reassigning abandoned work must not start an agent on it"
+    );
+    assert_eq!(
+        f.manager.list_runs(&p.id, 1).await.expect("runs").len(),
+        1,
+        "and no ledger row is written either"
+    );
+
+    // The entering edge: dragging it back into the column does not revive
+    // it. Un-cancelling is the explicit act that does.
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::Todo, &[1])
+        .await
+        .expect("out of the column");
+    f.manager
+        .move_issue(&p.id, 1, IssueActor::User, IssueStatus::InProgress, &[1])
+        .await
+        .expect("and back in");
+    assert!(
+        f.dispatched.lock().is_empty(),
+        "a cancelled card entering In Progress starts nothing either"
+    );
+}
+
 #[tokio::test]
 async fn a_crash_leaves_runs_the_boot_sweep_hands_back() {
     let f = fixture().await;
@@ -2041,11 +2122,12 @@ async fn a_cancelled_step_opens_its_stage() {
 }
 
 /// Stages are planned up front, so a step of a later stage routinely
-/// finishes while the current one is still being worked. That is not a
-/// barrier: the parent holds one run at a time, so waking it early spends
-/// the slot the real barrier needs and the wake that matters is lost.
+/// finishes while the current one is still being worked. That is a fact
+/// worth telling the operator and not a barrier: the parent holds one run
+/// at a time, so waking it early spends the slot the real barrier needs and
+/// the wake that matters is lost. The card says so; nobody is woken.
 #[tokio::test]
-async fn a_later_stage_finishing_early_does_not_wake_the_parent() {
+async fn a_later_stage_finishing_early_is_announced_but_wakes_nobody() {
     let f = fixture().await;
     let p = f
         .manager
@@ -2105,9 +2187,11 @@ async fn a_later_stage_finishing_early_does_not_wake_the_parent() {
             })
             .collect()
     };
-    assert!(
-        stages_announced(parent.number).await.is_empty(),
-        "and the card claims no stage opened, because none did"
+    assert_eq!(
+        stages_announced(parent.number).await,
+        vec![1],
+        "but the card still says stage 1 closed — it did, and if the entry \
+         waited for the barrier the operator would never hear about it"
     );
 
     // Now stage 0 empties — the barrier that actually matters, and the one
@@ -2122,8 +2206,29 @@ async fn a_later_stage_finishing_early_does_not_wake_the_parent() {
     assert_eq!(announced[0].trigger, RunTrigger::StageBarrier);
     assert_eq!(
         stages_announced(parent.number).await,
-        vec![0],
-        "and the entry names the stage that opened"
+        vec![1, 0],
+        "and each stage is named once, in the order it actually closed"
+    );
+
+    // Re-saving the step that closed stage 1 must not announce it again:
+    // the announcement is bounded by the transition into a finished state,
+    // not by the stage still being complete.
+    f.manager
+        .update_issue(
+            &p.id,
+            3,
+            IssueActor::User,
+            IssueUpdate {
+                title: Some("write the release note (final)".into()),
+                ..IssueUpdate::default()
+            },
+        )
+        .await
+        .expect("retitle the finished step");
+    assert_eq!(
+        stages_announced(parent.number).await,
+        vec![1, 0],
+        "a stage announces once per completion"
     );
 }
 

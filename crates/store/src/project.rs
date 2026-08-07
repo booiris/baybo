@@ -256,12 +256,13 @@ pub struct NewIssue {
 /// Named rather than written at each end: [`IssueActor::to_storage`] and
 /// [`IssueActor::parse`] are the two halves of a fail-closed round trip — an
 /// actor string `parse` does not recognise fails the whole timeline read —
-/// and a consumer matching on the column should reach for the same constant
-/// rather than its own literal.
-pub const ACTOR_USER: &str = "user";
+/// so the two ends must spell it identically or a written row becomes
+/// unreadable. Nothing outside this crate touches the column's text:
+/// readers get [`IssueActor`] back and match on that.
+pub(crate) const ACTOR_USER: &str = "user";
 
 /// See [`ACTOR_USER`].
-pub const ACTOR_SYSTEM: &str = "system";
+pub(crate) const ACTOR_SYSTEM: &str = "system";
 
 /// Who did the thing a timeline entry records.
 ///
@@ -376,8 +377,15 @@ pub enum IssueEventBody {
         decision: baybo_model::ApprovalDecision,
     },
     /// Every non-cancelled child in one of this issue's stages reached
-    /// Done, and nothing earlier is still open, so its assignee was woken
-    /// to drive the next one.
+    /// Done.
+    ///
+    /// A statement about the stage, not about a wake. Stages are planned up
+    /// front, so a later one routinely empties while the board is still on
+    /// an earlier one; that is worth telling the operator and is not a
+    /// barrier, so the assignee is woken only when nothing earlier is still
+    /// open. Widening this to mean "and your assignee was woken" would make
+    /// the out-of-order case unsayable, and the operator would simply never
+    /// hear that the stage closed.
     StageCompleted {
         stage: i64,
     },
@@ -660,8 +668,12 @@ pub enum RunTrigger {
     Retry,
     /// Somebody commented on live work that nobody was reading.
     Comment,
-    /// Every child in one of this issue's stages finished, so its assignee
-    /// was woken to drive the next one.
+    /// Every child in one of this issue's stages finished **and nothing
+    /// earlier was still open**, so its assignee was woken to drive what
+    /// comes next. Strictly narrower than
+    /// [`IssueEventBody::StageCompleted`], which says only that a stage
+    /// emptied: a later stage emptying out of order is announced and wakes
+    /// nobody.
     StageBarrier,
 }
 
@@ -689,9 +701,12 @@ impl RunTrigger {
 }
 
 /// Where a run is. `Held`, `Queued` and `Running` are the unsettled states
-/// — the ones that hold an issue's dedupe slot. Only `Running` is re-driven
-/// by the boot sweep; a hold was never started on purpose, so the budget
-/// decides when it goes.
+/// — the ones that hold an issue's dedupe slot. `Running` and `Queued` are
+/// both re-driven by the boot sweep (see
+/// [`ProjectStore::requeue_unsettled`]): a `running` row's actor died with
+/// the process, and a `queued` row was never claimed by one, so neither is
+/// work in flight. `Held` is left alone — a hold was never started on
+/// purpose, so the budget decides when it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {

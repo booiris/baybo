@@ -6,12 +6,12 @@
 //! the row with what happened.
 //!
 //! The shape is cron's one-shot fire (`cron.rs`), with two differences that
-//! matter. An issue keeps **one session across its runs**, so a follow-up
-//! sees what the last one did; that is safe only because at most one run per
-//! issue is ever in flight (a partial unique index enforces it), which is
-//! what lets the waiter treat the terminal turn it sees as unambiguously its
-//! own. And nothing is dispatched to a channel: an issue's audience is its
-//! card.
+//! matter. An issue keeps **one session per agent that works it**, so a
+//! follow-up sees what the last one did; that is safe only because at most
+//! one run per issue is ever in flight (a partial unique index enforces
+//! it), which is what lets the waiter treat the terminal turn it sees as
+//! unambiguously its own. And nothing is dispatched to a channel: an
+//! issue's audience is its card.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,26 +53,43 @@ pub struct IssueRunEvent {
     pub channel: ChannelType,
 }
 
+/// Everything executing a run needs from the board, as one value.
+///
+/// One `Option` rather than three, because no assembly produces any of
+/// these without the others: the store settles the ledger row, the events
+/// hook tells whoever is watching the card, and the manager starts whatever
+/// the settle turns out to owe. Three independent `Option`s made the bad
+/// combinations representable and left the invariant to a comment — and one
+/// of them (a store with no manager) refused a run that had already been
+/// dispatched, returning without settling its row, which is exactly the
+/// shape the per-issue live index turns into a permanently stuck card.
+#[derive(Clone)]
+pub struct BoardWiring {
+    pub store: Arc<dyn ProjectStore>,
+    pub events: Arc<dyn ProjectEvents>,
+    pub manager: Arc<ProjectManager>,
+}
+
 impl Router {
     pub(super) async fn handle_issue_run(&mut self, event: IssueRunEvent) {
         let run_id = event.run.id.clone();
-        // Both or neither: the store settles this run's row, the manager
-        // starts whatever settling it turns out to owe. An assembly with a
-        // board has both — this is the no-board case (the TUI's runtime).
-        let (Some(store), Some(projects)) =
-            (self.project_store.clone(), self.project_manager.clone())
-        else {
+        // The only refusal left, and it settles nothing on purpose: with no
+        // board there is no store this row lives in. An assembly without one
+        // (the TUI's runtime) also has no `issue_run_rx`, so nothing can
+        // arrive here in the first place.
+        let Some(board) = self.board.clone() else {
             warn!(%run_id, "issue run arrived with no board wiring; cannot execute");
             return;
         };
+        let store = &board.store;
 
-        let session = match self.issue_session(&event).await {
+        let session = match self.issue_session(store, &event).await {
             Ok(session) => session,
             Err(e) => {
                 warn!(%run_id, error = %e, "could not open the issue's session");
                 settle(
-                    &store,
-                    self.project_events.as_ref(),
+                    store,
+                    &board.events,
                     &event.run,
                     RunStatus::Failed,
                     Some(&e.to_string()),
@@ -101,8 +118,8 @@ impl Router {
         let checkout = event.checkout.clone();
 
         record(
-            &store,
-            self.project_events.as_ref(),
+            store,
+            &board.events,
             &event.run,
             IssueEventBody::RunStarted {
                 run_id: event.run.id.clone(),
@@ -121,9 +138,7 @@ impl Router {
             session_id: session.id.clone(),
             lifecycle: Arc::clone(&self.turn_lifecycle),
             terminal_rx: self.turn_lifecycle.subscribe_lifecycle_events(),
-            store: Arc::clone(&store),
-            projects: Arc::clone(&projects),
-            events: self.project_events.clone(),
+            board: board.clone(),
         };
 
         let pins = super::resolve_spawn_pins(&session, &self.agent_profiles).await;
@@ -163,31 +178,48 @@ impl Router {
         tokio::spawn(waiter.run(actor_token));
     }
 
-    /// The issue's session — reused across its runs, minted on the first.
+    /// The issue's session for the agent this run belongs to — reused
+    /// across that agent's runs, minted on its first.
     ///
-    /// The binding is resolved from the run's assignee at mint time and is
-    /// write-once thereafter, so reassigning an issue does not re-point an
-    /// existing session; a new assignee's work happens under the agent the
-    /// session was opened with until the issue's session is replaced.
-    async fn issue_session(&self, event: &IssueRunEvent) -> anyhow::Result<Session> {
-        let store = self
-            .project_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no project store"))?;
+    /// A session's [`AgentBinding`] is write-once: it selects the persona
+    /// and SOUL the turn runs as, the skills it may reach, and the name its
+    /// commits are authored with, and none of those may change mid-thread.
+    /// So the session cannot follow a reassignment — the *run* has to. A run
+    /// handed to a session bound to somebody else would load the previous
+    /// assignee's persona and sign that agent's name onto work the board
+    /// says belongs to the new one, which is worse than an unattributed
+    /// commit because it names the wrong somebody.
+    ///
+    /// Continuity is per agent, not per issue: an agent that already worked
+    /// this card continues in the session it worked it in, however many
+    /// hands the card has passed through since. Newest run first
+    /// (`list_runs` orders by attempt), so the reasonable answer for a card
+    /// reassigned back and forth is the most recent of that agent's own
+    /// sessions.
+    async fn issue_session(
+        &self,
+        store: &Arc<dyn ProjectStore>,
+        event: &IssueRunEvent,
+    ) -> anyhow::Result<Session> {
         let issue = store
             .get_issue(&event.run.project_id, event.run.number)
             .await?
             .ok_or_else(|| anyhow::anyhow!("issue #{} is gone", event.run.number))?;
 
-        // A session that already ran this issue is the one to continue in.
-        if let Some(previous) = store
-            .list_runs(&issue.id)
-            .await?
-            .into_iter()
-            .find_map(|run| run.session_id)
-            && let Some(session) = self.session_manager.get(&previous).await?
-        {
-            return Ok(session);
+        let mut candidates: Vec<SessionId> = Vec::new();
+        for previous in store.list_runs(&issue.id).await? {
+            if let Some(id) = previous.session_id
+                && !candidates.contains(&id)
+            {
+                candidates.push(id);
+            }
+        }
+        for candidate in candidates {
+            if let Some(session) = self.session_manager.get(&candidate).await?
+                && session.state.agent_id_or_builtin() == event.run.agent_id
+            {
+                return Ok(session);
+            }
         }
 
         let user = User {
@@ -232,11 +264,23 @@ fn binding_for(agent: &AgentProfileId) -> AgentBinding {
 /// run and hands the row to the dispatcher; a row written directly would be
 /// a run nothing ever starts, holding the issue's only live-run slot until
 /// the next boot.
+///
+/// A run the operator **cancelled** starts nothing, whatever was said. The
+/// card is still InProgress and still assigned, so the board would happily
+/// answer `Wake` — and a fresh run seconds after somebody pressed Cancel
+/// reads as the Stop button not working. Every other terminal status does
+/// follow up: a run that failed with a comment waiting is exactly the case
+/// the follow-up exists for.
 async fn follow_up_on_comments(
     projects: &Arc<ProjectManager>,
     store: &Arc<dyn ProjectStore>,
     run: &IssueRunRow,
+    settled: RunStatus,
 ) {
+    if settled == RunStatus::Cancelled {
+        debug!(run = %run.id, "the run was cancelled; not starting a follow-up on it");
+        return;
+    }
     let said = match store.events_since(&run.issue_id, run.created_at).await {
         Ok(events) => events
             .into_iter()
@@ -254,6 +298,13 @@ async fn follow_up_on_comments(
     // work while the run was going, and the board goes out of budget or is
     // archived on its own schedule.
     match projects.wake_on_comment(&run.project_id, run.number).await {
+        // The board may record the follow-up without starting it: an
+        // exhausted daily budget parks it `Held` until headroom returns.
+        // Saying "queued" for that is how an operator concludes the board
+        // is stuck when it is merely waiting.
+        Some(next) if next.status == RunStatus::Held => {
+            info!(run = %run.id, next = %next.id, "a comment arrived mid-run; the follow-up is held until the board has budget")
+        }
         Some(next) => {
             info!(run = %run.id, next = %next.id, "a comment arrived mid-run; queued a follow-up")
         }
@@ -277,7 +328,7 @@ async fn follow_up_on_comments(
 /// unverified one is worse than none.
 async fn surface_branch(
     store: &Arc<dyn ProjectStore>,
-    events: Option<&Arc<dyn ProjectEvents>>,
+    events: &Arc<dyn ProjectEvents>,
     checkout: &Path,
     run: &IssueRunRow,
 ) {
@@ -302,11 +353,7 @@ async fn surface_branch(
         return;
     }
     match store.set_issue_branch(&issue.id, &branch).await {
-        Ok(true) => {
-            if let Some(events) = events {
-                events.board_changed(&issue.project_id, Some(issue.number));
-            }
-        }
+        Ok(true) => events.board_changed(&issue.project_id, Some(issue.number)),
         Ok(false) => {}
         Err(e) => warn!(run = %run.id, error = %e, "could not record the issue's branch"),
     }
@@ -314,7 +361,7 @@ async fn surface_branch(
 
 async fn settle(
     store: &Arc<dyn ProjectStore>,
-    events: Option<&Arc<dyn ProjectEvents>>,
+    events: &Arc<dyn ProjectEvents>,
     run: &IssueRunRow,
     status: RunStatus,
     error: Option<&str>,
@@ -324,9 +371,7 @@ async fn settle(
         // already-settled run changed nothing and has nothing to say —
         // and must not put a second entry on the timeline either.
         Ok(true) => {
-            if let Some(events) = events {
-                events.run_changed(&run.project_id, run.number);
-            }
+            events.run_changed(&run.project_id, run.number);
             record(
                 store,
                 events,
@@ -355,7 +400,7 @@ async fn settle(
 /// whose note did not land is far better than the reverse.
 async fn record(
     store: &Arc<dyn ProjectStore>,
-    events: Option<&Arc<dyn ProjectEvents>>,
+    events: &Arc<dyn ProjectEvents>,
     run: &IssueRunRow,
     body: IssueEventBody,
 ) {
@@ -367,11 +412,7 @@ async fn record(
         body,
     };
     match store.append_event(&entry).await {
-        Ok(_) => {
-            if let Some(events) = events {
-                events.timeline_changed(&run.project_id, run.number);
-            }
-        }
+        Ok(_) => events.timeline_changed(&run.project_id, run.number),
         Err(e) => {
             let run_id = &run.id;
             warn!(%run_id, error = %e, "could not record a run's timeline entry");
@@ -388,14 +429,11 @@ struct IssueRunWaiter {
     session_id: SessionId,
     lifecycle: Arc<TurnLifecycle>,
     terminal_rx: broadcast::Receiver<TurnLifecycleEvent>,
-    store: Arc<dyn ProjectStore>,
-    /// The board, for the one thing settling a run can owe: a follow-up for
-    /// a comment that landed mid-run. Held as the manager rather than as a
-    /// store handle so that follow-up goes through the same enqueue — and
-    /// therefore the same budget gate and the same dispatcher — as every
-    /// other run.
-    projects: Arc<ProjectManager>,
-    events: Option<Arc<dyn ProjectEvents>>,
+    /// The board. Carries the manager, not just a store handle, because the
+    /// one thing settling a run can owe — a follow-up for a comment that
+    /// landed mid-run — has to go through the same enqueue, and therefore
+    /// the same budget gate and the same dispatcher, as every other run.
+    board: BoardWiring,
 }
 
 impl IssueRunWaiter {
@@ -403,9 +441,10 @@ impl IssueRunWaiter {
         let (status, error) = self.await_run(actor_token).await;
         let run_id = &self.run.id;
         info!(%run_id, ?status, "issue run settled");
+        let store = &self.board.store;
         settle(
-            &self.store,
-            self.events.as_ref(),
+            store,
+            &self.board.events,
             &self.run,
             status,
             error.as_deref(),
@@ -417,8 +456,13 @@ impl IssueRunWaiter {
         // Only here, and not in `settle` itself — the two early-failure
         // settles above never started anything, so there is no branch to
         // surface and nothing that could have been said mid-run.
-        follow_up_on_comments(&self.projects, &self.store, &self.run).await;
-        surface_branch(&self.store, self.events.as_ref(), &self.checkout, &self.run).await;
+        //
+        // Branch first, follow-up second. Both only read git, so the worst
+        // an overlap costs is a missing chip — but a follow-up run works in
+        // this same worktree, and reading it while somebody else is in it
+        // is a race that need not exist.
+        surface_branch(store, &self.board.events, &self.checkout, &self.run).await;
+        follow_up_on_comments(&self.board.manager, store, &self.run, status).await;
     }
 
     async fn await_run(&mut self, actor_token: CancellationToken) -> (RunStatus, Option<String>) {
@@ -474,9 +518,10 @@ impl IssueRunWaiter {
     /// finished yet.
     ///
     /// Takes the **newest** terminal issue turn, not the first: this
-    /// session hosts every run of its issue, so the first one is run #1's
-    /// forever. That is only unambiguous because an issue holds at most one
-    /// unfinished run at a time.
+    /// session hosts every run its agent has worked on this issue, so the
+    /// first one is that agent's first run forever. That is only
+    /// unambiguous because an issue holds at most one unfinished run at a
+    /// time.
     async fn reconcile(&self) -> Option<(RunStatus, Option<String>)> {
         let turns = match self.lifecycle.list_by_session(&self.session_id, None).await {
             Ok(turns) => turns,
@@ -512,25 +557,38 @@ fn outcome_for(kind: TurnStatusKind) -> (RunStatus, Option<String>) {
 #[cfg(test)]
 mod tests {
     //! What settling a run owes the card: a comment that arrived while it
-    //! was executing has to *start* something, not merely be recorded.
+    //! was executing has to *start* something, not merely be recorded — and
+    //! which session a run is handed, which is what decides whose persona,
+    //! skills and commit name it works under.
 
     use std::sync::Arc;
 
     use baybo_model::{
-        AgentFramework, AgentHandle, AgentProfileId, MicroUsd, SessionId, TeamMembership,
+        AgentFramework, AgentHandle, AgentProfileId, ChannelType, MicroUsd, SessionId,
+        TeamMembership,
     };
     use baybo_project::{NewIssueRequest, NewProject, ProjectManager};
-    use baybo_store::project::{IssuePriority, IssueStatus, ProjectRow, ProjectUpdate, RunTrigger};
+    use baybo_store::project::{
+        IssuePriority, IssueStatus, IssueUpdate, ProjectRow, ProjectUpdate, RunTrigger,
+    };
     use baybo_workspace::WorkspacePaths;
 
     use super::*;
+    use crate::actor::router::{ActorSpawner, LiveRateLimit, RouterConfig};
+    use crate::actor::supervisor::AgentSupervisor;
+    use crate::security::SecurityGateway;
 
     const HANDLE: &str = "dev-1";
+    const OTHER_HANDLE: &str = "dev-2";
     const BOARD: &str = "Follow-ups";
 
     struct Board {
         projects: Arc<ProjectManager>,
         store: Arc<dyn ProjectStore>,
+        /// The whole sqlite handle, for the stores this board's fixtures
+        /// reach past `ProjectStore` for (the team roster, the router's
+        /// profile lookups).
+        db: baybo_storage::Store,
         project: ProjectRow,
         /// Every run the board handed to an executor, in order. A run
         /// written to the store that never lands here is a run nothing ever
@@ -539,9 +597,64 @@ mod tests {
         _workspace: tempfile::TempDir,
     }
 
-    /// A board with one in-progress card whose first run is executing —
-    /// the state the waiter is in when somebody comments.
-    async fn mid_run() -> (Board, IssueRunRow) {
+    impl Board {
+        /// The run the board dispatched `nth` (0-based), which is how these
+        /// tests get the row an executor would have been handed.
+        fn nth_dispatched(&self, nth: usize) -> IssueRunRow {
+            self.dispatched
+                .lock()
+                .get(nth)
+                .cloned()
+                .unwrap_or_else(|| panic!("the board dispatched a run #{nth}"))
+        }
+
+        /// Put `agent` on this board's team under `handle`.
+        async fn hire(&self, agent: &AgentProfileId, handle: &str) {
+            let now = chrono::Utc::now();
+            self.db
+                .agent_profile
+                .create(&baybo_store::AgentProfileRow {
+                    id: agent.clone(),
+                    description: String::new(),
+                    avatar_blob_id: None,
+                    framework: AgentFramework::Baybo,
+                    llm: None,
+                    builtin: false,
+                    team: Some(TeamMembership {
+                        project_id: self.project.id.clone(),
+                        handle: AgentHandle::parse(handle).expect("handle"),
+                    }),
+                    hired_by: None,
+                    deleted_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .expect("teammate");
+        }
+
+        /// Hand the card to somebody else, the way the assignee picker
+        /// does. In progress and staffed either way, so this is a pure
+        /// handover.
+        async fn reassign(&self, to: &AgentProfileId) {
+            self.projects
+                .update_issue(
+                    &self.project.id,
+                    1,
+                    IssueActor::User,
+                    IssueUpdate {
+                        assignee: Some(Some(to.clone())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("reassign");
+        }
+    }
+
+    /// A board with one in-progress card assigned to `dev-1`, and its first
+    /// run dispatched but not yet claimed.
+    async fn board_with_in_progress_card() -> (Board, IssueRunRow) {
         let workspace = tempfile::tempdir().expect("tempdir");
         let paths = WorkspacePaths::new(workspace.path().to_path_buf());
         tokio::fs::create_dir_all(paths.work_dir())
@@ -571,33 +684,23 @@ mod tests {
             .await
             .expect("project");
 
+        let board = Board {
+            projects,
+            store: Arc::clone(&store.project),
+            project,
+            dispatched,
+            db: store,
+            _workspace: workspace,
+        };
+
         // An assignee has to be on the board's team.
         let agent = AgentProfileId::parse(HANDLE).expect("agent id");
-        let now = chrono::Utc::now();
-        store
-            .agent_profile
-            .create(&baybo_store::AgentProfileRow {
-                id: agent.clone(),
-                description: String::new(),
-                avatar_blob_id: None,
-                framework: AgentFramework::Baybo,
-                llm: None,
-                builtin: false,
-                team: Some(TeamMembership {
-                    project_id: project.id.clone(),
-                    handle: AgentHandle::parse(HANDLE).expect("handle"),
-                }),
-                hired_by: None,
-                deleted_at: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .expect("teammate");
+        board.hire(&agent, HANDLE).await;
 
-        projects
+        board
+            .projects
             .create_issue(
-                &project.id,
+                &board.project.id,
                 IssueActor::User,
                 NewIssueRequest {
                     title: "wire the importer".to_owned(),
@@ -613,26 +716,97 @@ mod tests {
             .await
             .expect("issue");
 
-        let first = dispatched.lock().first().cloned().expect("first run");
+        let first = board.nth_dispatched(0);
+        (board, first)
+    }
+
+    /// A board with one in-progress card whose first run is executing —
+    /// the state the waiter is in when somebody comments.
+    async fn mid_run() -> (Board, IssueRunRow) {
+        let (board, first) = board_with_in_progress_card().await;
         assert!(
-            store
-                .project
+            board
+                .store
                 .claim_run(&first.id, &SessionId::from("sess-issue-1"))
                 .await
                 .expect("claim"),
             "the executor took the first run"
         );
+        (board, first)
+    }
 
-        (
-            Board {
-                projects,
-                store: Arc::clone(&store.project),
-                project,
-                dispatched,
-                _workspace: workspace,
-            },
-            first,
-        )
+    /// A router wired to this board, plus the session store it mints into.
+    ///
+    /// These tests stop at the session a run would have been handed, which
+    /// is the thing that decides whose persona, whose skills and whose name
+    /// the work happens under — so the actor spawner is never reached.
+    struct RouterHarness {
+        router: Router,
+        sessions: Arc<baybo_session::SessionManager>,
+        _response_rx: tokio::sync::mpsc::Receiver<baybo_channels::AgentOutput>,
+    }
+
+    fn router_for(board: &Board) -> RouterHarness {
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+        let sessions = Arc::new(baybo_session::SessionManager::new(
+            Arc::new(baybo_session::test_support::MemorySessionStore::new()),
+            Arc::new(baybo_session::test_support::MemorySessionFolderStore::new()),
+        ));
+        let actor_spawner: ActorSpawner =
+            Arc::new(move |_session, _llm, _model, _effort, _tx, _token| {
+                crate::actor::mailbox::channel(1).0
+            });
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let (_trigger_tx, cron_trigger_rx) = tokio::sync::mpsc::channel(1);
+        let router = Router::from_config(RouterConfig {
+            session_manager: Arc::clone(&sessions),
+            supervisor: AgentSupervisor::new(response_tx),
+            channels: Arc::new(baybo_channels::ChannelRegistry::new()),
+            security_gateway: Arc::new(SecurityGateway::new(
+                Arc::new(baybo_security::LeakDetector::with_default_rules()),
+                Arc::new(baybo_security::SecretVault::new(
+                    key,
+                    Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+                )),
+            )),
+            cost_manager: baybo_cost::CostManager::new(
+                Arc::new(baybo_cost::test_support::MemoryCostStore::new()),
+                std::collections::HashMap::new(),
+                baybo_cost::SpendingLimits::default(),
+            ),
+            actor_spawner,
+            turn_lifecycle: Arc::new(baybo_turn::TurnLifecycle::new(Arc::new(
+                baybo_turn::test_support::MemoryTurnStore::new(),
+            ))),
+            cron_store: Arc::new(baybo_cron::test_support::InMemoryCronStore::new()),
+            agent_profiles: Arc::clone(&board.db.agent_profile),
+            cron_trigger_rx,
+            issue_run_rx: None,
+            board: Some(BoardWiring {
+                store: Arc::clone(&board.store),
+                events: Arc::new(baybo_project::NoopProjectEvents),
+                manager: Arc::clone(&board.projects),
+            }),
+            actor_parent_token: CancellationToken::new(),
+            rate_limit: LiveRateLimit::new(100, std::time::Duration::from_secs(60)),
+            workspace: Arc::new(WorkspacePaths::new("/tmp/baybo-issue-router-test")),
+        });
+        RouterHarness {
+            router,
+            sessions,
+            _response_rx: response_rx,
+        }
+    }
+
+    fn run_event(run: &IssueRunRow) -> IssueRunEvent {
+        IssueRunEvent {
+            run: run.clone(),
+            brief: "wire the importer".to_owned(),
+            checkout: PathBuf::from("/tmp/does-not-matter"),
+            user_id: "u1".to_owned(),
+            channel: ChannelType::tui(),
+        }
     }
 
     /// Say something on the card while its run is executing, and confirm
@@ -678,7 +852,7 @@ mod tests {
             .await
             .expect("settle");
 
-        follow_up_on_comments(&board.projects, &board.store, &first).await;
+        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Done).await;
 
         let dispatched = board.dispatched.lock().clone();
         assert_eq!(dispatched.len(), 2, "the follow-up was handed to somebody");
@@ -719,7 +893,7 @@ mod tests {
             .await
             .expect("budget");
 
-        follow_up_on_comments(&board.projects, &board.store, &first).await;
+        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Done).await;
 
         assert_eq!(
             board.dispatched.lock().len(),
@@ -732,6 +906,159 @@ mod tests {
             runs[0].status,
             RunStatus::Held,
             "owed and waiting for headroom, not dropped"
+        );
+    }
+
+    /// Cancel is the operator saying stop. The card stays InProgress and
+    /// stays assigned, so the board would happily answer "wake" — and a
+    /// fresh run seconds after the Cancel button reads as the button not
+    /// working.
+    #[tokio::test]
+    async fn cancelling_a_run_with_a_comment_waiting_does_not_start_another() {
+        let (board, first) = mid_run().await;
+        comment_mid_run(&board).await;
+        board
+            .store
+            .settle_run(&first.id, RunStatus::Cancelled, None)
+            .await
+            .expect("settle");
+
+        follow_up_on_comments(&board.projects, &board.store, &first, RunStatus::Cancelled).await;
+
+        assert_eq!(
+            board.dispatched.lock().len(),
+            1,
+            "cancelling a run must not immediately start another one"
+        );
+        assert_eq!(
+            board
+                .store
+                .list_runs(&first.issue_id)
+                .await
+                .expect("runs")
+                .len(),
+            1,
+            "and nothing was written that a boot sweep would later re-drive"
+        );
+    }
+
+    /// A handover has to run as the agent the card now names.
+    ///
+    /// The session carries the binding, the binding selects the persona and
+    /// the skills, and — since this PR — the name the run's commits are
+    /// authored with. A run handed to the previous assignee's session does
+    /// all of its work as that agent while the card, the timeline and the
+    /// ledger row all say somebody else. The ledger row is right in that
+    /// state, which is why asserting on it cannot see this.
+    #[tokio::test]
+    async fn a_reassigned_card_runs_as_its_new_agent_and_not_the_old_one() {
+        let (board, first) = board_with_in_progress_card().await;
+        let harness = router_for(&board);
+        let dev_1 = AgentProfileId::parse(HANDLE).expect("agent id");
+        let dev_2 = AgentProfileId::parse(OTHER_HANDLE).expect("agent id");
+        board.hire(&dev_2, OTHER_HANDLE).await;
+
+        let first_session = harness
+            .router
+            .issue_session(&board.store, &run_event(&first))
+            .await
+            .expect("session");
+        assert_eq!(
+            first_session.state.agent_id.as_ref(),
+            Some(&dev_1),
+            "the first run opens a session bound to the card's assignee"
+        );
+        board
+            .store
+            .claim_run(&first.id, &first_session.id)
+            .await
+            .expect("claim");
+        board
+            .store
+            .settle_run(&first.id, RunStatus::Done, None)
+            .await
+            .expect("settle");
+
+        board.reassign(&dev_2).await;
+        let handover = board.nth_dispatched(1);
+        assert_eq!(handover.agent_id, dev_2, "the run is dev-2's");
+        let handover_session = harness
+            .router
+            .issue_session(&board.store, &run_event(&handover))
+            .await
+            .expect("session");
+        assert_ne!(
+            handover_session.id, first_session.id,
+            "dev-2 must not work inside the session bound to dev-1"
+        );
+        assert_eq!(
+            handover_session.state.agent_id.as_ref(),
+            Some(&dev_2),
+            "and the session it does work in is bound to dev-2"
+        );
+
+        // Continuity is per agent, not per run: hand the card back and the
+        // first agent picks up where it left off rather than starting over.
+        board
+            .store
+            .claim_run(&handover.id, &handover_session.id)
+            .await
+            .expect("claim");
+        board
+            .store
+            .settle_run(&handover.id, RunStatus::Done, None)
+            .await
+            .expect("settle");
+        board.reassign(&dev_1).await;
+        let back = board.nth_dispatched(2);
+        assert_eq!(back.agent_id, dev_1);
+        assert_eq!(
+            harness
+                .router
+                .issue_session(&board.store, &run_event(&back))
+                .await
+                .expect("session")
+                .id,
+            first_session.id,
+            "an agent handed the card back continues in the session it already worked it in"
+        );
+    }
+
+    /// The continuity F4 exists for, unchanged by the handover rule: a run
+    /// interrupted by a restart is resumed in the session it was already
+    /// running in, not a fresh one with an empty transcript.
+    #[tokio::test]
+    async fn a_resumed_run_continues_in_the_session_it_was_already_in() {
+        let (board, first) = board_with_in_progress_card().await;
+        let harness = router_for(&board);
+
+        let opened = harness
+            .router
+            .issue_session(&board.store, &run_event(&first))
+            .await
+            .expect("session");
+        board
+            .store
+            .claim_run(&first.id, &opened.id)
+            .await
+            .expect("claim");
+
+        // What the boot sweep hands back: the same row, still unsettled.
+        let resumed = harness
+            .router
+            .issue_session(&board.store, &run_event(&first))
+            .await
+            .expect("session");
+        assert_eq!(resumed.id, opened.id);
+        assert_eq!(
+            harness
+                .sessions
+                .get(&opened.id)
+                .await
+                .expect("lookup")
+                .map(|s| s.id),
+            Some(opened.id),
+            "and it is a session the manager actually holds"
         );
     }
 }

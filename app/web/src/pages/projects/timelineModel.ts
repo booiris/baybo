@@ -31,16 +31,23 @@ export function actorLabel(event: IssueEvent): string {
       return 'the board';
     case 'agent':
       return `@${event.actor.handle}`;
+    default:
+      return unnamedActor(event.actor);
   }
 }
 
 /**
- * The sentence a system entry reads as, in third person and without its
- * actor — the caller renders the actor, so putting it here too would
- * produce "you you moved this".
+ * An actor kind this bundle has never heard of — a server newer than the
+ * page it is serving, which `IssueActor` is explicitly designed to allow.
  *
- * Returns `null` for a comment: a comment is not narrated, it is shown.
+ * The `never` parameter is what keeps the build-time check that a fourth
+ * kind must be handled above; the string is what a stale bundle renders
+ * instead of dropping `undefined` into the middle of a sentence.
  */
+function unnamedActor(_kind: never): string {
+  return 'somebody';
+}
+
 /** Micro-USD as the dollars a reader thinks in. */
 function usd(micros: number): string {
   return `$${(micros / 1_000_000).toFixed(2)}`;
@@ -83,6 +90,13 @@ export function pendingApprovals(
   return [...open.values()];
 }
 
+/**
+ * The sentence a system entry reads as, in third person and without its
+ * actor — the caller renders the actor, so putting it here too would
+ * produce "you you moved this".
+ *
+ * Returns `null` for a comment: a comment is not narrated, it is shown.
+ */
 export function describeEvent(body: IssueEventBody): string | null {
   switch (body.kind) {
     case 'comment':
@@ -113,8 +127,11 @@ export function describeEvent(body: IssueEventBody): string | null {
     case 'cancelled':
       return 'cancelled it';
     case 'worktree_reclaimed':
+      // Not "nothing was committed": a branch the operator merged before
+      // dragging the card to Done counts zero commits ahead and git agrees
+      // to drop it, and its work is in the repo.
       return body.branch_deleted
-        ? 'reclaimed the worktree and deleted its branch — nothing was committed'
+        ? 'reclaimed the worktree and deleted its branch — it held nothing this repo did not already have'
         : 'reclaimed the worktree; the branch is still there';
     case 'worktree_kept':
       // git's own reason, because it is the actionable part: the operator
@@ -125,7 +142,12 @@ export function describeEvent(body: IssueEventBody): string | null {
     case 'approval_resolved':
       return `the ${DECISION_LABEL[body.decision]} was recorded`;
     case 'stage_completed':
-      return `stage ${body.stage} finished — every step in it is done`;
+      // A fact about the stage, and nothing about a wake: a stage that
+      // empties while an earlier one is still open is announced and starts
+      // nothing, so the assignee's run — when there is one — says so itself
+      // as `started run #n (stage_barrier)`. Cancelled steps count as
+      // finished, the same way the progress ring counts them.
+      return `stage ${body.stage} finished — every step in it is done or called off`;
     case 'budget_exhausted':
       return `held the run — ${usd(body.spent_micros)} of the ${usd(
         body.limit_micros,
@@ -136,6 +158,12 @@ export function describeEvent(body: IssueEventBody): string | null {
       )} spent today`;
   }
 }
+
+/**
+ * The run states that are over. Derived here rather than listed at each
+ * call site, so a new unsettled state cannot be quietly read as finished.
+ */
+const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
 
 /**
  * What sending a comment will do, stated before it is sent.
@@ -149,12 +177,6 @@ export function describeEvent(body: IssueEventBody): string | null {
  * a person who believes an agent is reading them will wait for an answer
  * nobody is sending.
  */
-/**
- * The run states that are over. Derived here rather than listed at each
- * call site, so a new unsettled state cannot be quietly read as finished.
- */
-const SETTLED: ReadonlySet<RunStatus> = new Set<RunStatus>(['done', 'failed', 'cancelled']);
-
 export function commentHint(
   issue: { status: IssueStatus; assignee?: string | null; cancelled_at_ms?: number | null },
   runs: { status: RunStatus }[],

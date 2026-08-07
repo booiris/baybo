@@ -45,15 +45,30 @@ describe('describeEvent', () => {
   });
 
   it('distinguishes a reclaimed worktree from one that was left alone', () => {
+    // Not "nothing was committed": the branch is dropped when it is zero
+    // commits ahead *and* git agrees, which a branch merged before the card
+    // was dragged to Done also satisfies.
     expect(describeEvent({ kind: 'worktree_reclaimed', branch_deleted: true })).toContain(
-      'nothing was committed',
+      'nothing this repo did not already have',
     );
+    expect(
+      describeEvent({ kind: 'worktree_reclaimed', branch_deleted: true }),
+    ).not.toContain('nothing was committed');
     expect(describeEvent({ kind: 'worktree_reclaimed', branch_deleted: false })).toContain(
       'branch is still there',
     );
     expect(
       describeEvent({ kind: 'worktree_kept', reason: 'contains modified or untracked files' }),
     ).toContain('contains modified or untracked files');
+  });
+
+  it('says a stage emptied without claiming anybody was woken', () => {
+    // The server writes this entry whenever a stage's own children are all
+    // finished, including one that empties while an earlier stage is still
+    // open — which wakes nobody. The wake, when there is one, shows up as
+    // its own `started run #n (stage_barrier)` entry.
+    const sentence = describeEvent({ kind: 'stage_completed', stage: 2 });
+    expect(sentence).toBe('stage 2 finished — every step in it is done or called off');
   });
 
   it('says nothing for a comment, because a comment is shown rather than narrated', () => {
@@ -85,6 +100,14 @@ describe('actorLabel', () => {
   it('calls the operator "you" and an agent by its handle — never by its id', () => {
     expect(actorLabel(entry({ kind: 'opened' }))).toBe('you');
     expect(actorLabel(entry({ kind: 'opened' }, agent('dev-1')))).toBe('@dev-1');
+  });
+
+  it('names an actor kind it has never heard of rather than rendering undefined', () => {
+    // `IssueActor` is designed to grow, and a page outlives the build it
+    // was served by. "01JC… undefined started run #1" is worse than a
+    // vague word.
+    const future = { kind: 'webhook', id: DEV_ID } as unknown as IssueEvent['actor'];
+    expect(actorLabel(entry({ kind: 'opened' }, future))).toBe('somebody');
   });
 
   it('calls the board’s own gate "the board"', () => {

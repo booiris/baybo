@@ -57,12 +57,21 @@ the behaviour was verified against its source (clone inspected 2026-08-05).
    the assignee on request (an ordinary comment) or by the user in a
    terminal. Dragging to Done marks completion **without** touching git;
    entering Done/Cancelled reclaims the worktree — skipped with a
-   timeline note if it holds uncommitted changes; commit-less branches
-   are deleted outright, the rest kept until a later GC.
+   timeline note if it holds uncommitted changes; a branch is deleted
+   only when **both** readings agree it holds nothing — ours, that it is
+   exactly zero commits ahead of the main checkout (an uncountable branch
+   is not an empty one), and git's, via `branch --delete` rather than
+   `-D`, which refuses anything it considers unmerged. Everything else is
+   kept until a later GC.
 10. **Sub-issues with stages, aligned with multica**: one parent level plus
-    integer stage barriers — when every child in stage N is Done, the
-    parent's assignee is woken to drive the next stage; the parent card
-    shows a done/total progress ring.
+    integer stage barriers — when every child in stage N is Done, that
+    stage's completion is recorded on the parent's card, and the parent's
+    assignee is woken to drive the next stage **provided no earlier stage
+    is still open**. Stages are planned up front, so a later one routinely
+    empties first; that is worth saying and is not a barrier, because the
+    parent holds one run at a time and an early wake would spend the slot
+    the real barrier needs. The parent card shows a done/total progress
+    ring.
 11. The unit is named **issue**, accepting future ambiguity with forge
     issues in exchange for matching the reference product and GitHub-shaped
     intuition.
@@ -254,9 +263,13 @@ announces which of these will happen before sending.
   an agent tool. **Assigning an agent to an issue already sitting in
   In Progress also triggers** (no pending run present — multica's
   `RunSourceAssign`; without this the board shows work in flight that
-  nobody is doing). Guards: assignee alive, budget headroom, no pending run
-  for the same issue (dedupe), self-loop suppression (an agent flipping
-  its own issue's status inside a run does not re-trigger itself).
+  nobody is doing), **including a handover to a different agent**. A
+  **cancelled** issue triggers on neither edge: the board counts cancelled
+  as finished everywhere else and has already reclaimed that card's
+  worktree, so a run there would cut a fresh checkout for abandoned work.
+  Guards: assignee alive, budget headroom, no pending run for the same
+  issue (dedupe), self-loop suppression (an agent flipping its own issue's
+  status inside a run does not re-trigger itself).
 - **Run delivery uses the ledger discipline** (record-before-deliver,
   stamp-on-resolution, boot re-drive, idempotent replay — the cron
   delivery pattern). A run row is the ledger entry; a crash between
@@ -342,8 +355,9 @@ announces which of these will happen before sending.
   has at least one commit ahead of base. A research issue never shows any
   branch element — its deliverable is its report on the timeline — and no
   issue-type field exists: whether code was produced is an after-the-fact
-  observation, not an up-front classification. At reclamation a
-  commit-less branch is deleted outright. `ToolContext`
+  observation, not an up-front classification. At reclamation a branch
+  that adds nothing to the repository is deleted, and only when both our
+  own count and `git branch --delete` say so. `ToolContext`
   gains `project_id`; bash/edit/write for an issue run are rooted in the
   worktree. Persona/memory write tiers carry over verbatim from the
   multi-project spec (own persona + project-shared `PROJECT.md`/memory +
@@ -377,16 +391,20 @@ announces which of these will happen before sending.
   - ~~`git worktree remove` needs care~~ **handled**: a dirty tree comes
     back as `Reclaimed::Kept` with git's reason for the timeline; the
     255-after-deleting case is detected by re-checking the directory and
-    finished with a `prune`; a commit-less branch is deleted only after
-    the tree is gone, because until then it is checked out in it.
+    finished with a `prune`; an empty branch is deleted only after the
+    tree is gone, because until then it is checked out in it — and only
+    when the commit count is `Some(0)` and `branch --delete` agrees, so
+    neither "git could not answer" nor "git thinks it is unmerged" is
+    read as "nothing was produced".
 - **No merge machinery**: the platform never merges. The assignee merges
   when asked (an ordinary comment-triggered run in its worktree) or the
   user merges in a terminal. Worktree reclamation runs when an issue
   enters Done or Cancelled — skipped with a timeline note if the
   worktree holds uncommitted changes; branches are kept until a later
   GC.
-- **Stages**: on every child completion, a barrier check runs; when stage
-  N empties, the parent assignee is woken through the same ledger.
+- **Stages**: on every child completion, a barrier check runs. When stage
+  N empties, that is recorded on the parent's card; the parent assignee is
+  woken through the same ledger only if no stage before N is still open.
 - **Lead + hiring**: project creation seeds the lead from a coordinator
   SOUL template. Issue tools for agents: `IssueCreate`, `IssueUpdate`
   (status/assign/stage — status moves flow through the trigger
@@ -418,8 +436,10 @@ announces which of these will happen before sending.
    the same fact and cannot disagree), branch chip on the card face and a
    copy box in the rail, and worktree reclamation on Done/Cancelled with
    the dirty guard — uncommitted work is never destroyed, and the reason
-   git gave lands on the timeline. A commit-less branch goes with its
-   tree; one with commits is the deliverable and is kept.
+   git gave lands on the timeline. A branch that adds nothing to the
+   repository goes with its tree — but only when our count says exactly
+   zero *and* `git branch --delete` agrees; one with commits, and one git
+   cannot vouch for, is the deliverable and is kept.
 
    The merge-by-assignee flow needs no code: it is an ordinary comment on
    a live card, which now wakes the assignee in its own worktree.
@@ -457,7 +477,11 @@ announces which of these will happen before sending.
      uses `IN (SELECT session_id …)`, not a join — an issue reuses one
      session across every run of it.
    - **Stages + parent wake.** One level, enforced in both directions.
-     The barrier fires on the *transition* into a finished state; a
+     Both the announcement and the barrier fire on the *transition* into a
+     finished state — which is also what bounds a stage to one
+     `StageCompleted` entry per completion — but they ask different
+     questions: the entry asks only whether that stage's own children are
+     all done, the wake additionally asks that nothing earlier is open. A
      cancelled step counts as finished and leaves both sides of the
      progress ring.
    - **Activity feed drawer**, derived from `issue_events` across the

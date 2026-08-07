@@ -97,9 +97,13 @@ impl std::fmt::Display for ChannelType {
 /// not "who literally constructed this session row".
 ///
 /// Closed strong-typed enum. Extend by adding variants, never by string.
-/// Its accessors below match exhaustively rather than through a catch-all,
-/// so adding a variant fails the build until every accessor says what the
-/// new trigger answers.
+/// Every accessor below — and [`Session::can_host_background_jobs`], which
+/// reads the trigger too — matches exhaustively rather than through a
+/// catch-all or a `matches!`, so adding a variant fails the build until
+/// each one says what the new trigger answers. `matches!` is not
+/// exhaustiveness-checked, which is the whole reason none is used here:
+/// under one a new board-shaped variant would silently inherit "not a
+/// project session" and be listed, pushed and dreamed on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerSource {
@@ -223,11 +227,17 @@ impl TriggerSource {
     /// Whether this session belongs to a project board. Such sessions are
     /// never listed in the chat surface, never pushed, and never fed to the
     /// dream pass: their conversation belongs to an issue.
+    ///
+    /// Spelled as a `match` rather than `matches!` for the same reason as
+    /// every accessor here — this one decides whether a conversation is
+    /// hidden from the user, and a new variant that silently inherited
+    /// `false` would be listed, pushed and dreamed on with nobody having
+    /// decided that.
     pub fn is_project_session(&self) -> bool {
-        matches!(
-            self,
-            TriggerSource::Project { .. } | TriggerSource::Issue { .. }
-        )
+        match self {
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => true,
+            TriggerSource::User | TriggerSource::Cron { .. } => false,
+        }
     }
 
     /// The conversation that created this session's cron job, if any. Used
@@ -248,7 +258,12 @@ impl TriggerSource {
     /// (recurring fires). Chat-list filtering and the push allowlist key off
     /// this: a cron session that is *not* a conversation stays invisible.
     pub fn is_cron_conversation(&self) -> bool {
-        matches!(self, TriggerSource::Cron { conversation, .. } if *conversation)
+        match self {
+            TriggerSource::Cron { conversation, .. } => *conversation,
+            TriggerSource::User | TriggerSource::Project { .. } | TriggerSource::Issue { .. } => {
+                false
+            }
+        }
     }
 
     /// The job's title as it stood when this fire was minted — the fallback
@@ -405,7 +420,16 @@ impl Session {
     /// complete by the time it notifies. See
     /// `agent::runtime::background_jobs::background_eligible`.
     pub fn can_host_background_jobs(&self) -> bool {
-        (matches!(self.trigger, TriggerSource::User) || self.trigger.is_cron_conversation())
+        // Exhaustive over the trigger for the same reason the accessors on
+        // `TriggerSource` are: a new variant has to say whether a
+        // background result may land in it, and the answer for a board
+        // session is no — nobody can open it to read one.
+        let hostable = match &self.trigger {
+            TriggerSource::User => true,
+            TriggerSource::Cron { .. } => self.trigger.is_cron_conversation(),
+            TriggerSource::Project { .. } | TriggerSource::Issue { .. } => false,
+        };
+        hostable
             && match &self.lineage {
                 None => true,
                 Some(l) => !matches!(l.kind, LineageKind::Subagent),
@@ -1014,6 +1038,31 @@ mod tests {
         let back: TriggerSource =
             serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back.cron_job_title(), Some("每日晨报"));
+    }
+
+    /// Every accessor matches exhaustively, so a new `TriggerSource`
+    /// variant cannot inherit a silent answer from any of them — this pins
+    /// the answers the variants that exist today actually give.
+    #[test]
+    fn every_accessor_answers_for_every_trigger() {
+        let project_id = crate::ProjectId::generate();
+        let cron = TriggerSource::Cron {
+            cron_job_id: "cron-1".into(),
+            origin_session_id: None,
+            conversation: false,
+            job_title: None,
+            project_id: Some(project_id.clone()),
+        };
+        // A board-bound fire is still an ordinary cron conversation: the
+        // binding makes the board's tools visible, it does not hide the
+        // session from the chat surface.
+        assert_eq!(cron.project(), Some(&project_id));
+        assert!(!cron.is_project_session());
+        assert!(!TriggerSource::User.is_project_session());
+        assert!(TriggerSource::User.project().is_none());
+        assert!(TriggerSource::User.issue().is_none());
+        assert!(!TriggerSource::User.is_cron_conversation());
+        assert_eq!(TriggerSource::User.kind(), TriggerKind::User);
     }
 
     /// The board triggers are not cron fires. The cron accessors match

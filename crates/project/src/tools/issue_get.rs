@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use baybo_store::project::IssueEventBody;
+use baybo_model::AgentProfileId;
+use baybo_store::project::{IssueEventBody, IssueEventRow};
 use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, ToolTriggerScope};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -86,20 +87,40 @@ impl Tool for IssueGetTool {
             .map_err(project_err)?;
 
         let skipped = events.len().saturating_sub(MAX_TIMELINE_ENTRIES);
-        let timeline: Vec<Value> = events
+        let shown = &events[skipped..];
+        // A timeline is permanent history, so it names agents the live
+        // roster no longer carries — and the roster is what `team` is.
+        // Nothing unassigns a departed teammate's cards either, so the
+        // assignee is asked for too. Whoever the card names but the roster
+        // does not is resolved one by one, so a teammate that has left
+        // still reads as `@handle` instead of a ULID nobody recognises.
+        let mut known = team;
+        let mut absent: Vec<AgentProfileId> = Vec::new();
+        for id in issue
+            .assignee
             .iter()
-            .skip(skipped)
+            .cloned()
+            .chain(shown.iter().flat_map(named_agents))
+        {
+            if !known.iter().any(|row| row.id == id) && !absent.contains(&id) {
+                absent.push(id);
+            }
+        }
+        known.extend(self.manager.agent_profiles(absent).await);
+
+        let timeline: Vec<Value> = shown
+            .iter()
             .map(|entry| {
                 let who = match &entry.actor {
                     baybo_store::project::IssueActor::User => "the operator".to_owned(),
                     baybo_store::project::IssueActor::System => "the board".to_owned(),
-                    baybo_store::project::IssueActor::Agent(id) => handle_of(&team, id),
+                    baybo_store::project::IssueActor::Agent(id) => handle_of(&known, id),
                 };
-                json!({ "at": entry.created_at.to_rfc3339(), "by": who, "event": narrate(&entry.body) })
+                json!({ "at": entry.created_at.to_rfc3339(), "by": who, "event": narrate(&entry.body, &known) })
             })
             .collect();
 
-        let mut out = render_issue(&issue, &team);
+        let mut out = render_issue(&issue, &known);
         if let Value::Object(map) = &mut out {
             map.insert("description".into(), json!(issue.description));
             map.insert("timeline".into(), json!(timeline));
@@ -111,13 +132,31 @@ impl Tool for IssueGetTool {
     }
 }
 
+/// Every agent one timeline entry names — its actor, plus both sides of a
+/// reassignment, which names two more agents than its actor does and
+/// renders both.
+fn named_agents(entry: &IssueEventRow) -> Vec<AgentProfileId> {
+    let mut ids = Vec::new();
+    if let baybo_store::project::IssueActor::Agent(id) = &entry.actor {
+        ids.push(id.clone());
+    }
+    if let IssueEventBody::Assigned { from, to } = &entry.body {
+        ids.extend(from.iter().chain(to.iter()).cloned());
+    }
+    ids
+}
+
 /// One timeline entry as a sentence.
 ///
 /// Prose rather than the tagged JSON the web client renders: the reader
 /// here is a model assembling context, and "moved from todo to in_progress"
 /// costs fewer tokens than the object it came from and needs no schema to
 /// interpret.
-fn narrate(body: &IssueEventBody) -> String {
+///
+/// `known` carries the agents the entry may name. Agents address each other
+/// by handle everywhere else on the board, so a sentence that reads
+/// "assigned it to 01JC3KQ4…" is one the next run cannot act on.
+fn narrate(body: &IssueEventBody, known: &[baybo_store::AgentProfileRow]) -> String {
     match body {
         IssueEventBody::Comment { text } => text.clone(),
         IssueEventBody::Opened => "opened the issue".to_owned(),
@@ -125,8 +164,8 @@ fn narrate(body: &IssueEventBody) -> String {
             format!("moved it from {} to {}", from.as_str(), to.as_str())
         }
         IssueEventBody::Assigned { from, to } => match (from, to) {
-            (_, Some(to)) => format!("assigned it to {to}"),
-            (Some(from), None) => format!("unassigned {from}"),
+            (_, Some(to)) => format!("assigned it to {}", handle_of(known, to)),
+            (Some(from), None) => format!("unassigned {}", handle_of(known, from)),
             (None, None) => "left it unassigned".to_owned(),
         },
         IssueEventBody::RunStarted {
@@ -148,7 +187,12 @@ fn narrate(body: &IssueEventBody) -> String {
         IssueEventBody::Cancelled => "cancelled it".to_owned(),
         IssueEventBody::WorktreeReclaimed { branch_deleted } => {
             if *branch_deleted {
-                "reclaimed the worktree; the branch had no commits and went with it".to_owned()
+                // Not "nothing was committed": a branch merged before the
+                // card was dragged to Done also counts zero commits ahead,
+                // and git agrees to drop it.
+                "reclaimed the worktree; the branch held nothing the repository did not already \
+                 have, so it went too"
+                    .to_owned()
             } else {
                 "reclaimed the worktree; the branch was kept".to_owned()
             }

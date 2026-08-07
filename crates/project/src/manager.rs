@@ -831,6 +831,35 @@ impl ProjectManager {
         Ok(self.agents.list_team(project).await?)
     }
 
+    /// The profile rows for `ids`, reaching agents that have left the team.
+    ///
+    /// [`Self::team`] is the live roster and deliberately hides a departed
+    /// teammate; a timeline is permanent history and still names one, which
+    /// is exactly what [`baybo_store::AgentProfileStore::get`] is for. An id
+    /// nothing answers to is simply absent from the result — a broken
+    /// reference is not a departed teammate, and the caller renders it as
+    /// the id rather than inventing a handle for it.
+    ///
+    /// One point-get per id, sequentially: a team is capped at
+    /// [`MAX_TEAM_AGENTS`], so a card's timeline names a handful at most and
+    /// the caller has already passed the roster's own read.
+    pub(crate) async fn agent_profiles(
+        &self,
+        ids: impl IntoIterator<Item = AgentProfileId>,
+    ) -> Vec<baybo_store::AgentProfileRow> {
+        let mut rows = Vec::new();
+        for id in ids {
+            match self.agents.get(&id).await {
+                Ok(Some(row)) => rows.push(row),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %id, error = %e, "could not resolve an agent a timeline names")
+                }
+            }
+        }
+        rows
+    }
+
     /// Put somebody new on a team.
     ///
     /// `hired_by` is `None` when the operator did it and `Some(agent)` when
@@ -1220,24 +1249,34 @@ impl ProjectManager {
         Ok(after)
     }
 
-    /// Wake a parent when one of its stages just emptied.
+    /// Tell a parent one of its stages just emptied, and wake it when that
+    /// opens a barrier.
+    ///
+    /// Two questions, deliberately answered separately, because they have
+    /// different answers. **Announcing** asks whether this stage's own
+    /// children are all done — a fact about the stage, true whenever it
+    /// happens, and the only thing [`IssueEventBody::StageCompleted`]
+    /// claims. **Waking** asks [`crate::stages::barrier_opens`], which also
+    /// requires nothing earlier to be open: a parent holds one run at a
+    /// time, so waking it on a stage the board has not reached yet spends
+    /// the slot the real barrier needs and the wake that matters is then
+    /// refused by the dedupe index. Folding the two together loses one or
+    /// the other — either the operator is told a stage opened when nobody
+    /// was woken, or a stage that emptied out of order is never mentioned
+    /// at all.
     ///
     /// Only on the *transition* into a finished state, and only for a child:
-    /// re-saving a Done sub-issue must not wake the parent again, and an
-    /// ordinary card has no parent to wake.
+    /// re-saving a Done sub-issue must not announce again, and an ordinary
+    /// card has no parent to tell. That is also what bounds the entry to one
+    /// per completion — a stage that is already complete has no child left
+    /// to finish, so it can only be announced a second time after it
+    /// genuinely re-opens (a step reopened, or a new step filed into it),
+    /// which the timeline records too.
     ///
     /// The wake goes through the same ledger as everything else — record,
     /// then dispatch — so a barrier that fires while the process dies is a
     /// run the boot sweep finds rather than a stage that silently never
     /// opened.
-    ///
-    /// A stage that empties while an earlier one is still open is not a
-    /// barrier — see [`crate::stages::barrier_opens`]. The parent has
-    /// nothing new to drive, and the wake would spend its single live-run
-    /// slot, so the barrier that matters is later refused by the dedupe
-    /// index. Nothing is recorded either: the entry's whole meaning is "your
-    /// assignee was woken", and writing it when nobody was is the lie the
-    /// entry exists to avoid.
     async fn check_stage_barrier(&self, before: &IssueRow, after: &IssueRow, actor: IssueActor) {
         let finished =
             |issue: &IssueRow| issue.status == IssueStatus::Done || issue.cancelled_at.is_some();
@@ -1254,7 +1293,7 @@ impl ProjectManager {
                 return;
             }
         };
-        if !crate::stages::barrier_opens(&children, after.stage) {
+        if !crate::stages::stage_complete(&children, after.stage) {
             return;
         }
         // The parent is addressed by number like everything else, so the
@@ -1277,7 +1316,7 @@ impl ProjectManager {
         .await;
         // Nobody on the parent means nobody to wake. The event above still
         // lands, so the operator sees the stage opened and can staff it.
-        if parent.assignee.is_some() {
+        if parent.assignee.is_some() && crate::stages::barrier_opens(&children, after.stage) {
             self.enqueue(&parent, RunTrigger::StageBarrier).await;
         }
     }

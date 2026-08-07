@@ -1436,7 +1436,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     issue_id   TEXT    NOT NULL,
                     project_id TEXT    NOT NULL,
                     number     INTEGER NOT NULL,
-                    -- 'user' or 'agent:<id>'.
+                    -- 'user', 'system' or 'agent:<id>' — the three forms
+                    -- `IssueActor::to_storage` writes. The read is
+                    -- fail-closed (an unrecognised value fails the whole
+                    -- timeline), so anything writing this column has to
+                    -- spell it the way that enum does.
                     actor      TEXT    NOT NULL,
                     -- Derived from `body`, stored so a filter by kind does
                     -- not have to parse every row's JSON.

@@ -67,14 +67,23 @@ fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
 
 /// Whether a **resolved** project repository may be bound read-write.
 ///
-/// Containment cannot be the test here — a project's repository is a
+/// Plain containment cannot be the test here — a project's repository is a
 /// user-chosen path outside the workspace by design, and that is the
 /// feature. What it must never be is a directory whose writable bind would
-/// swallow the read-only system layer or baybo's own workspace.
+/// swallow the read-only system layer, or one that overlaps baybo's own
+/// workspace **in either direction**: a parent of the workspace binds
+/// `state/` and `.key/` read-write, and so does a directory inside it. The
+/// single exemption is `work/`, which a run's shell may already write and
+/// which is where a project created without a workdir gets its repository.
+///
+/// That pair of rules is exactly [`baybo_project::validate_workdir`]'s, so
+/// the creation-time and bind-time answers cannot disagree — a workdir the
+/// board refuses to accept is one the sandbox also refuses to bind, and the
+/// defence-in-depth is real rather than claimed.
 ///
 /// Only `resolved` arrives canonical (from [`ToolExecutor::bindable`]); the
-/// root is resolved *here*, because the configured spelling is not the one
-/// the filesystem uses. The default workspace is reached through
+/// workspace paths are resolved *here*, because the configured spelling is
+/// not the one the filesystem uses. The default workspace is reached through
 /// `~/.baybo -> /data/…/.baybo`, and with that layout a repository at
 /// `/data/x` never prefixes `/home/u/.baybo` — so comparing a resolved path
 /// against an unresolved base is a guard that can never fire, and the
@@ -83,20 +92,25 @@ fn admits_worktree(resolved: &Path, work_dir: &Path) -> Result<(), String> {
 ///
 /// [`baybo_workspace::absolutise`] rather than a bare `canonicalize`, so a
 /// root that cannot be resolved degrades to its lexical spelling instead of
-/// refusing every repository. That is not fail-open: the containment check
-/// still runs, only the symlink resolution is skipped — and it is skipped
+/// refusing every repository. That is not fail-open: the containment checks
+/// still run, only the symlink resolution is skipped — and it is skipped
 /// only when the root is not on disk, which is a workspace with no `state/`
 /// or `.key/` to protect and which boot's `ensure_layout` makes unreachable
 /// in production anyway. Refusing instead would break every issue run on a
-/// mistyped `workspace.path` while protecting nothing. It is also what
-/// `baybo_project::validate_workdir` does at project-creation time, so the
-/// creation-time and bind-time answers cannot disagree.
-fn admits_repo(resolved: &Path, workspace_root: &Path) -> Result<(), String> {
+/// mistyped `workspace.path` while protecting nothing.
+fn admits_repo(resolved: &Path, paths: &baybo_workspace::WorkspacePaths) -> Result<(), String> {
     if let Some(why) = baybo_sandbox::args::writable_bind_refusal(resolved) {
         return Err(why);
     }
-    if baybo_workspace::absolutise(workspace_root).starts_with(resolved) {
+    let root = baybo_workspace::absolutise(paths.root());
+    let work = baybo_workspace::absolutise(&paths.work_dir());
+    if root.starts_with(resolved) {
         return Err("it contains baybo's own workspace".to_owned());
+    }
+    // No `work/` exemption on the ancestor side above: containing `work/`
+    // does not stop a parent from containing `state/` and `.key/` as well.
+    if resolved.starts_with(&root) && !resolved.starts_with(&work) {
+        return Err("it is inside baybo's own workspace".to_owned());
     }
     Ok(())
 }
@@ -551,15 +565,19 @@ impl ToolExecutor {
         // then demanding containment is what makes the swap inert: the
         // resolved path either still lands under the work dir or it is not
         // bound at all.
+        // `workspace_root` is the sandbox scope — the *canonicalised*
+        // `<workspace>/work/` (see the field, and `sandbox_root` in
+        // `baybo::runtime`), so this compares resolved against resolved
+        // even when the workspace is reached through a symlink.
         let work_dir = self.workspace_root.clone();
         let root = self.bindable(&root, |p| admits_worktree(p, &work_dir))?;
         // The repository is a user-chosen path outside the workspace by
-        // design, so containment cannot be the test. What it must never be
-        // is a directory whose writable bind would swallow the read-only
-        // system layer, or baybo's own workspace.
-        let workspace_root = self.workspace_paths.root().to_path_buf();
+        // design, so plain containment cannot be the test. What it must
+        // never be is a directory whose writable bind would swallow the
+        // read-only system layer, or one overlapping baybo's own workspace
+        // either way round.
         let repo = self.bindable(Path::new(&project.workdir), |p| {
-            admits_repo(p, &workspace_root)
+            admits_repo(p, &self.workspace_paths)
         })?;
         Some(Checkout { root, repo })
     }
@@ -863,9 +881,14 @@ impl ToolExecutor {
                 // made in the worktree is written entirely under the
                 // repository's `.git`.
                 let checkout = self.issue_checkout(session_trigger).await;
-                // Gated on the checkout so an ordinary session pays for no
-                // extra store read: only an issue run commits, and only a
-                // commit reads this.
+                // Gated on the checkout, so an ordinary session pays for no
+                // store read at all. An issue run pays one profile point-get
+                // per tool call — every call, not just the one that commits,
+                // because the handle rides `ToolContext` and the context is
+                // built per call. That is deliberately the same freshness
+                // rule as the checkout resolved just above: team membership
+                // is a row a lead can edit mid-run, and the read joins one
+                // that path already makes.
                 let agent_handle = match (&checkout, &self.board) {
                     (Some(_), Some(board)) => board_handle(&board.agents, agent_id).await,
                     _ => None,
@@ -1160,19 +1183,46 @@ mod tests {
     }
 
     /// A repository is outside the workspace by design, so the rule is not
-    /// containment — it is that the bind must not swallow the read-only
-    /// system layer or baybo's own state.
+    /// plain containment — it is that the bind must not swallow the
+    /// read-only system layer or baybo's own state.
     #[test]
     fn a_repository_may_be_anywhere_except_over_the_system_or_the_workspace() {
-        let ws = Path::new("/home/u/.baybo");
-        assert!(admits_repo(Path::new("/data/kanban"), ws).is_ok());
-        assert!(admits_repo(Path::new("/home/u/code/app"), ws).is_ok());
+        let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
+        assert!(admits_repo(Path::new("/data/kanban"), &ws).is_ok());
+        assert!(admits_repo(Path::new("/home/u/code/app"), &ws).is_ok());
         for bad in ["/", "/usr", "/etc", "/home/u/.baybo", "/home/u"] {
             assert!(
-                admits_repo(Path::new(bad), ws).is_err(),
+                admits_repo(Path::new(bad), &ws).is_err(),
                 "{bad} must not be bindable as a repository"
             );
         }
+    }
+
+    /// The half the bind-time guard was missing: a directory *inside* the
+    /// workspace. `validate_workdir` refuses one at project-creation time,
+    /// so admitting it here meant the two answers disagreed and a row that
+    /// reached the store some other way (an edit, an import, a future
+    /// caller) would bind `state/` and `.key/` read-write into a run's
+    /// shell. `work/` is the one exemption, and not a cosmetic one: it is
+    /// where a project created without a workdir gets its repository, so
+    /// refusing it would refuse the default project shape.
+    #[test]
+    fn a_repository_inside_the_workspace_is_refused_unless_it_is_under_work() {
+        let ws = baybo_workspace::WorkspacePaths::new("/home/u/.baybo");
+        for bad in [
+            "/home/u/.baybo/state",
+            "/home/u/.baybo/.key",
+            "/home/u/.baybo/personas/01J",
+        ] {
+            assert!(
+                admits_repo(Path::new(bad), &ws).is_err(),
+                "{bad} is inside the workspace and must not be bound as a repository"
+            );
+        }
+        assert!(
+            admits_repo(Path::new("/home/u/.baybo/work/importer"), &ws).is_ok(),
+            "the auto-created workdir of a project with no repository must still bind"
+        );
     }
 
     /// The shape the default install has: `~/.baybo` is a symlink to the
@@ -1194,7 +1244,7 @@ mod tests {
         let repo = real.path().canonicalize().expect("canonical repo");
 
         assert!(
-            admits_repo(&repo, &link).is_err(),
+            admits_repo(&repo, &baybo_workspace::WorkspacePaths::new(link)).is_err(),
             "the guard must see the workspace's real location however the root is spelled"
         );
     }
@@ -1288,6 +1338,269 @@ mod tests {
         assert_eq!(
             super::board_handle(&agents, &baybo_model::AgentProfileId::generate()).await,
             None,
+        );
+    }
+
+    const FIXTURE_HANDLE: &str = "dev-1";
+    const CAPTURE_TOOL: &str = "capture_ctx";
+
+    /// The two context fields an issue run's identity lives in.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenContext {
+        checkout_root: Option<PathBuf>,
+        agent_handle: Option<baybo_model::AgentHandle>,
+    }
+
+    type Seen = Arc<Mutex<Option<SeenContext>>>;
+
+    /// A tool that records the context it was handed and does nothing else.
+    ///
+    /// Declares `ExecCommand` because that is the capability the one real
+    /// consumer of the identity (`Bash`) carries, so the executor takes the
+    /// same branch it takes in production.
+    struct CaptureTool {
+        seen: Seen,
+    }
+
+    #[async_trait::async_trait]
+    impl baybo_tools::Tool for CaptureTool {
+        fn name(&self) -> &str {
+            CAPTURE_TOOL
+        }
+        fn description(&self) -> String {
+            "records its context".to_owned()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            ctx: &ToolContext,
+        ) -> baybo_tools::Result<ToolOutput> {
+            *self.seen.lock() = Some(SeenContext {
+                checkout_root: ctx.checkout_root.clone(),
+                agent_handle: ctx.agent_handle.clone(),
+            });
+            Ok(ToolOutput::Text(String::new()))
+        }
+    }
+
+    /// An executor wired the way `baybo::runtime` wires the real one, on a
+    /// workspace reached through a symlink — the default install's shape
+    /// (`~/.baybo -> /data/…/.baybo`).
+    struct IssueRunFixture {
+        executor: ToolExecutor,
+        trigger: baybo_model::TriggerSource,
+        agent: baybo_model::AgentProfileId,
+        /// Resolved (post-symlink) locations, which is what a bind must be.
+        worktree: PathBuf,
+        repo: PathBuf,
+        seen: Seen,
+        _real: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        _repo_dir: tempfile::TempDir,
+    }
+
+    async fn issue_run_fixture() -> IssueRunFixture {
+        let real = tempfile::tempdir().expect("tempdir");
+        let workspace = real.path().join(".baybo");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let link = home.path().join(".baybo");
+        std::os::unix::fs::symlink(&workspace, &link).expect("symlink");
+
+        // Exactly the two values `baybo::runtime` builds: the layout is
+        // anchored at the CONFIGURED spelling, the sandbox scope is the
+        // canonicalised `work/`.
+        let paths = baybo_workspace::WorkspacePaths::new(link.clone());
+        std::fs::create_dir_all(paths.work_dir()).expect("work dir");
+        let sandbox_root = paths.work_dir().canonicalize().expect("canonical work dir");
+
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let store = baybo_storage::Store::open(workspace.join("storage.db"))
+            .await
+            .expect("store");
+
+        let project_id = baybo_model::ProjectId::generate();
+        let number = 4;
+        let now = chrono::Utc::now();
+        store
+            .project
+            .create_project(&baybo_store::project::ProjectRow {
+                id: project_id.clone(),
+                name: "Importer".to_owned(),
+                description: String::new(),
+                workdir: repo_dir.path().to_string_lossy().into_owned(),
+                daily_budget: None,
+                read_at: None,
+                archived_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("project");
+
+        let agent = baybo_model::AgentProfileId::generate();
+        store
+            .agent_profile
+            .create(&profile_row(
+                agent.clone(),
+                Some(baybo_model::TeamMembership {
+                    project_id: project_id.clone(),
+                    handle: baybo_model::AgentHandle::parse(FIXTURE_HANDLE).expect("handle"),
+                }),
+            ))
+            .await
+            .expect("teammate");
+
+        // The dispatcher cuts this before the run starts; the executor only
+        // ever reports one that is already on disk.
+        let worktree = worktree::worktree_root(&paths, &project_id, number);
+        std::fs::create_dir_all(&worktree).expect("worktree");
+
+        let seen = Arc::new(Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            Arc::new(CaptureTool {
+                seen: Arc::clone(&seen),
+            }),
+            ToolManifest {
+                name: CAPTURE_TOOL.to_owned(),
+                description: "records its context".to_owned(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "properties": {}}),
+                capabilities: vec![ToolCapability::ExecCommand],
+                channels: Vec::new(),
+            },
+        );
+
+        let key = baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+            .expect("key");
+        let security_gateway = Arc::new(SecurityGateway::new(
+            Arc::new(baybo_security::LeakDetector::with_default_rules()),
+            Arc::new(baybo_security::SecretVault::new(
+                key,
+                Arc::new(baybo_security::test_support::MemorySecretStore::new()),
+            )),
+        ));
+
+        let executor = ToolExecutor::new(
+            Arc::new(registry),
+            Arc::new(ApprovalGateMap::new()),
+            security_gateway,
+            sandbox_root,
+            paths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(BoardStores {
+                projects: Arc::clone(&store.project),
+                agents: Arc::clone(&store.agent_profile),
+            }),
+        );
+
+        IssueRunFixture {
+            executor,
+            trigger: baybo_model::TriggerSource::Issue {
+                project_id,
+                issue_id: baybo_model::IssueId::generate(),
+                number,
+            },
+            agent,
+            worktree: worktree.canonicalize().expect("canonical worktree"),
+            repo: repo_dir.path().canonicalize().expect("canonical repo"),
+            seen,
+            _real: real,
+            _home: home,
+            _repo_dir: repo_dir,
+        }
+    }
+
+    /// The whole worktree layer on the default install's layout. The
+    /// worktree is addressed through the configured spelling
+    /// (`~/.baybo/work/.worktrees/…`) and resolves to the real volume, so
+    /// the containment guard has to be comparing resolved-vs-resolved —
+    /// `workspace_root` is the canonicalised `work/` dir, not
+    /// `config.workspace.path`. If it were the latter, this returns `None`
+    /// and no issue run in production is ever handed a checkout at all.
+    #[tokio::test]
+    async fn a_worktree_under_a_symlinked_workspace_is_still_bound() {
+        let fixture = issue_run_fixture().await;
+
+        let checkout = fixture
+            .executor
+            .issue_checkout(&fixture.trigger)
+            .await
+            .expect("an issue session gets its checkout");
+        assert_eq!(checkout.root, fixture.worktree);
+        assert_eq!(checkout.repo, fixture.repo);
+    }
+
+    /// The wiring nothing else covers: the bash tool's tests set
+    /// `agent_handle` by hand and the resolver's tests call it directly, so
+    /// only an end-to-end call proves the executor puts the resolved handle
+    /// on the context an issue run's tool actually receives. Without it,
+    /// `let agent_handle = None;` keeps every other test green and silently
+    /// hands every commit back to the workspace fallback.
+    #[tokio::test]
+    async fn an_issue_runs_tool_call_carries_the_agents_handle() {
+        let fixture = issue_run_fixture().await;
+        let session_id = SessionId::from("sess-issue-4");
+        let recorder = Arc::new(SpanRecorder::new(
+            session_id.clone(),
+            "u1".to_owned(),
+            Arc::new(baybo_trace::test_support::MemoryTraceStore::new()),
+            baybo_trace::TraceEventStream::default(),
+        ));
+        let step = recorder
+            .begin_step(TurnId::new(), baybo_trace::StepKind::LlmIteration)
+            .await
+            .expect("step");
+        let user = User {
+            id: "u1".to_owned(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        };
+
+        let executed = fixture
+            .executor
+            .execute(
+                CAPTURE_TOOL,
+                json!({}),
+                &session_id,
+                &fixture.trigger,
+                &fixture.agent,
+                &user,
+                &Arc::new(Mutex::new(Vec::new())),
+                &recorder,
+                &step,
+                None,
+                "tool-use-1".to_owned(),
+                None,
+                None,
+                CancellationToken::new(),
+                None,
+                None,
+                false,
+                ReadTracker::default(),
+                None,
+            )
+            .await;
+        assert!(executed.output.is_ok(), "the capture tool ran");
+
+        let seen = fixture.seen.lock().clone().expect("the tool saw a context");
+        assert_eq!(
+            seen.checkout_root,
+            Some(fixture.worktree.clone()),
+            "an issue run's tool works in the card's worktree"
+        );
+        assert_eq!(
+            seen.agent_handle.map(|h| h.as_str().to_owned()),
+            Some(FIXTURE_HANDLE.to_owned()),
+            "and commits as the agent working the card, not as its ULID"
         );
     }
 

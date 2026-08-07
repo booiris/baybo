@@ -1185,13 +1185,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         issue_run_rx: graph.issue_run_rx.take(),
-        project_store: Some(graph.stores.project.clone()),
-        project_events: Some(Arc::new(
-            baybo_gateway::project_events::GatewayProjectEvents::new(Arc::clone(
-                &graph.channels_registry,
+        board: Some(baybo_agent::router::BoardWiring {
+            store: graph.stores.project.clone(),
+            events: Arc::new(baybo_gateway::project_events::GatewayProjectEvents::new(
+                Arc::clone(&graph.channels_registry),
             )),
-        )),
-        project_manager: Some(Arc::clone(&graph.project_manager)),
+            manager: Arc::clone(&graph.project_manager),
+        }),
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
     });

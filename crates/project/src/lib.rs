@@ -30,6 +30,6 @@ pub use manager::{
 };
 pub use mentions::{assigns_to, mentions};
 pub use runs::{Transition, triggers_run};
-pub use stages::{all_finished, open_stages, progress, stage_complete};
+pub use stages::{all_finished, open_stages, progress};
 pub use timeline::diff_events;
 pub use worktree::Checkout;

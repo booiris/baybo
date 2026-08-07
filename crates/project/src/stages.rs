@@ -1,9 +1,10 @@
 //! Sub-issues and the barriers between them.
 //!
-//! Pure, like the other rule modules here: whether a finished child opens
-//! the next stage is decided once, in [`barrier_opens`], and the wake and
-//! the card's progress ring read this module rather than counting children
-//! for themselves.
+//! Pure, like the other rule modules here: whether a stage has emptied is
+//! decided once, in [`stage_complete`], whether that opens the next stage
+//! once in [`barrier_opens`], and the announcement, the wake and the card's
+//! progress ring read this module rather than counting children for
+//! themselves.
 
 use baybo_store::project::{IssueRow, IssueStatus};
 
@@ -34,9 +35,11 @@ fn is_pending(child: &IssueRow) -> bool {
 /// or cancelling the last child of a stage would otherwise read as a
 /// completion.
 ///
-/// This alone is not the barrier: a stage can empty while an earlier one is
-/// still being worked. `barrier_opens` is the question the wake asks.
-pub fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
+/// This is the question the **announcement** asks, and it is all
+/// `StageCompleted` claims. It is not the barrier: a stage can empty while
+/// an earlier one is still being worked, and the parent has nothing new to
+/// drive then. [`barrier_opens`] is the question the **wake** asks.
+pub(crate) fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
     let mut seen = false;
     for child in children.iter().filter(|c| c.stage == stage) {
         seen = true;
@@ -50,14 +53,16 @@ pub fn stage_complete(children: &[IssueRow], stage: i64) -> bool {
 /// Whether finishing a child in `stage` opens a barrier: that stage has
 /// emptied **and** nothing earlier is still open.
 ///
-/// The second clause is what makes it a barrier rather than a bulletin.
-/// Stages are planned up front, so a parent routinely carries children in
-/// stages the board has not reached; finishing — or cancelling — one of
-/// those empties a *later* stage while the current one is still being
-/// worked. Waking the parent then is worse than doing nothing: an issue
-/// holds one unfinished run at a time, so the wake would spend the parent's
-/// only slot and the barrier that matters, when the current stage finally
-/// empties, would be refused by the dedupe index and lost.
+/// The second clause is what makes it a barrier rather than a bulletin —
+/// and the bulletin is [`stage_complete`]'s job, which is why the two are
+/// separate questions rather than one. Stages are planned up front, so a
+/// parent routinely carries children in stages the board has not reached;
+/// finishing — or cancelling — one of those empties a *later* stage while
+/// the current one is still being worked. That is worth saying on the card
+/// and worth doing nothing about: an issue holds one unfinished run at a
+/// time, so a wake there would spend the parent's only slot and the barrier
+/// that matters, when the current stage finally empties, would be refused
+/// by the dedupe index and lost.
 pub(crate) fn barrier_opens(children: &[IssueRow], stage: i64) -> bool {
     stage_complete(children, stage) && !children.iter().any(|c| is_pending(c) && c.stage < stage)
 }

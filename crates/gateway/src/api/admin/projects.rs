@@ -88,7 +88,20 @@ type ActorHandles = std::collections::HashMap<AgentProfileId, baybo_model::Agent
 /// deliberately still reaches them. One point-get per *distinct* agent,
 /// concurrently, the way the roster reads its members' names — and a team
 /// is capped at sixteen, so a page names a handful at most.
-async fn actor_handles(state: &AdminState, rows: &[IssueEventRow]) -> ActorHandles {
+///
+/// Scoped to `project` all the same. A handle is unique only inside its
+/// board, so `@dev-1` here and `@dev-1` there are two different agents, and
+/// an id belonging to another board must not be rendered under this one's
+/// naming. This does not cost the departed teammate anything: removal is a
+/// tombstone that stamps `deleted_at` and leaves the membership itself
+/// untouched, so a departed agent still answers with the board it worked
+/// on. An id that fails the check resolves to nothing and renders as the
+/// id, which is what a reference this board cannot name should look like.
+async fn actor_handles(
+    state: &AdminState,
+    project: &ProjectId,
+    rows: &[IssueEventRow],
+) -> ActorHandles {
     let mut ids: std::collections::HashSet<AgentProfileId> = std::collections::HashSet::new();
     for row in rows {
         if let IssueActor::Agent(id) = &row.actor {
@@ -101,15 +114,14 @@ async fn actor_handles(state: &AdminState, rows: &[IssueEventRow]) -> ActorHandl
         }
     }
     futures::future::join_all(ids.into_iter().map(|id| async {
-        let handle = state
+        let team = state
             .agent_profile_store
             .get(&id)
             .await
             .ok()
             .flatten()?
-            .team?
-            .handle;
-        Some((id, handle))
+            .team?;
+        (team.project_id == *project).then_some((id, team.handle))
     }))
     .await
     .into_iter()
@@ -1193,6 +1205,26 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionDto,
 }
 
+/// The session a still-parked prompt was raised in, if the queue has one
+/// for `call_id`.
+///
+/// A pass over the sessions with something parked, because that is how the
+/// queue is addressable — and it is bounded by prompts a person has not
+/// answered yet, not by anything a board accumulates. `None` covers both
+/// "no such call" and "already answered", which the caller must not tell
+/// apart on the wire.
+fn parked_approval_session(
+    channel: &baybo_channels::Channel,
+    call_id: &str,
+) -> Option<baybo_model::SessionId> {
+    channel.pending_approval_sessions().into_iter().find(|s| {
+        channel
+            .pending_approvals(s)
+            .iter()
+            .any(|req| req.call_id == call_id)
+    })
+}
+
 #[utoipa::path(
     post,
     path = "/projects/{project_id}/issues/{number}/approvals/{call_id}",
@@ -1215,24 +1247,44 @@ async fn resolve_approval(
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode> {
     let id = parse_project_id(&project_id)?;
-    // Naming a card is not authority to answer for it. The queue is keyed
-    // by call id alone, so the card has to be the one that raised this call
-    // and still be waiting on it — read off the timeline, which is the same
-    // rule the client draws the buttons from, so the two cannot disagree.
-    // The read also 404s an unknown board or card before the queue is
-    // touched.
-    let timeline = state
+    // A point read, and its result is used: it 404s an unknown board or
+    // card before the queue is touched, and the card's own id is what the
+    // parked prompt is checked against below.
+    let issue = state
         .project_manager
-        .timeline(&id, number)
+        .get_issue(&id, number)
         .await
         .map_err(project_err)?;
-    let raised_here = baybo_project::pending_approvals(&timeline)
-        .iter()
-        .any(|open| open == &call_id);
     let channel = state
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
         .ok_or_else(|| GatewayError::NotFound("the owner channel".to_owned()))?;
+    // Naming a card is not authority to answer for it: the queue is keyed
+    // by call id alone. What binds a prompt to a card is the **session** it
+    // was raised in — `TimelineApprovalGate` puts the prompt on whatever
+    // card that session's trigger names — so this asks the gate's own
+    // question rather than re-reading the timeline entry the gate wrote
+    // afterwards. Two things follow. A subagent inherits its parent's
+    // trigger, so a prompt raised one level inside a run is still this
+    // card's. And a timeline append that failed (`record_event` swallows
+    // one) leaves the card unable to *draw* the button but does not make
+    // the answer unreachable.
+    let raised_here = match parked_approval_session(&channel, &call_id) {
+        Some(session) => state
+            .session_manager
+            .get(&session)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| {
+                session
+                    .trigger
+                    .issue()
+                    .map(|(_, issue_id, _)| *issue_id == issue.id)
+            })
+            .unwrap_or(false),
+        None => false,
+    };
     let decision: baybo_model::ApprovalDecision = req.decision.into();
     // `resolve_approval` returns the queue entry's own session id, which is
     // what the broadcast has to target — the fan-out is per session, and
@@ -1377,7 +1429,7 @@ async fn project_feed(
         )
         .await
         .map_err(project_err)?;
-    let handles = actor_handles(&state, &rows).await;
+    let handles = actor_handles(&state, &id, &rows).await;
     let items = rows
         .into_iter()
         .map(|row| IssueEventDto::with_handles(row, &handles))
@@ -1409,7 +1461,7 @@ async fn list_issue_events(
         .timeline(&id, number)
         .await
         .map_err(project_err)?;
-    let handles = actor_handles(&state, &rows).await;
+    let handles = actor_handles(&state, &id, &rows).await;
     let items = rows
         .into_iter()
         .map(|row| IssueEventDto::with_handles(row, &handles))
@@ -1444,10 +1496,13 @@ async fn create_comment(
         .comment(&id, number, IssueActor::User, &req.text)
         .await
         .map_err(project_err)?;
-    // Resolves nothing for an operator's own comment, and stays correct if
-    // this route ever posts as somebody else.
-    let handles = actor_handles(&state, std::slice::from_ref(&entry)).await;
-    Ok(Json(IssueEventDto::with_handles(entry, &handles)))
+    // No handles to resolve, and no lookup to spend on finding that out:
+    // the actor is the operator by construction two lines up, and a comment
+    // body names nobody. An empty map is the whole answer.
+    Ok(Json(IssueEventDto::with_handles(
+        entry,
+        &ActorHandles::new(),
+    )))
 }
 
 #[utoipa::path(

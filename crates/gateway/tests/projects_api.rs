@@ -737,13 +737,18 @@ async fn the_activity_feed_is_the_boards_timelines_read_across_it() {
 
     open_issue(&router, &a, "first").await;
     open_issue(&router, &a, "second").await;
-    post(
+    let posted = post(
         &router,
         &format!("/v1/projects/{a}/issues/1/comments"),
         json!({ "text": "a note on #1" }),
         StatusCode::OK,
     )
     .await;
+    // The posted entry comes back in the same shape the feed renders it in,
+    // and the operator's own comment names nobody — so there is no handle
+    // for this response to resolve.
+    assert_eq!(posted["actor"], json!({ "kind": "user" }));
+    assert_eq!(posted["body"]["text"], "a note on #1");
     open_issue(&router, &b, "somebody else's").await;
 
     let feed = get(&router, &format!("/v1/projects/{a}/feed"), StatusCode::OK).await;
@@ -871,6 +876,49 @@ async fn a_timeline_names_agents_by_handle_even_after_they_leave() {
     assert_eq!(comment["actor"]["handle"], "dev-1");
 }
 
+/// A handle is unique only inside its board, so an id belonging to another
+/// board cannot be rendered under this one's naming: `@dev-1` there and
+/// `@dev-1` here are two different agents, and lending the name across
+/// would say a teammate did work they have never seen.
+#[tokio::test]
+async fn a_timeline_will_not_name_an_agent_from_another_board() {
+    const THEIR_ID: &str = "01JC3KQ4Z8BBBBBBBBBBBBBBBB";
+
+    let (router, tg) = router().await;
+    let ours = open_project(&router, "ours").await;
+    let theirs = open_project(&router, "theirs").await;
+    // Same handle on both boards — which is legal, and exactly what makes a
+    // cross-board resolution a lie rather than a curiosity.
+    seed_teammate(&tg, &ours, "dev-1").await;
+    seed_teammate_with_id(&tg, &theirs, THEIR_ID, "dev-1").await;
+    open_issue(&router, &ours, "our card").await;
+
+    tg.deps
+        .project_manager
+        .record_event(
+            &baybo_model::ProjectId::parse(ours.clone()).expect("project id"),
+            1,
+            baybo_store::project::IssueActor::Agent(
+                baybo_model::AgentProfileId::parse(THEIR_ID).expect("agent id"),
+            ),
+            baybo_store::project::IssueEventBody::Comment {
+                text: "wrong board".to_owned(),
+            },
+        )
+        .await;
+
+    let events = issue_events(&router, &ours, 1).await;
+    let comment = events
+        .iter()
+        .find(|e| e["body"]["kind"] == "comment")
+        .expect("the entry is on the timeline");
+    assert_eq!(comment["actor"]["kind"], "agent");
+    assert_eq!(
+        comment["actor"]["handle"], THEIR_ID,
+        "an id this board cannot name renders as the id, not as somebody else's handle"
+    );
+}
+
 /// The budget gate acts with nobody asking, so the wire has to be able to
 /// say so: "you held the run — $5.00 of the $5.00 daily budget is spent"
 /// accuses the reader of a decision the board made on its own.
@@ -903,6 +951,11 @@ async fn the_boards_own_actions_are_neither_the_operators_nor_an_agents() {
 
 /// The approval queue is keyed by call id alone, so the endpoint's job is
 /// to refuse a request that names a card it has no business answering for.
+///
+/// Driven through the real `TimelineApprovalGate`, so the `call_id` the
+/// card's button posts is the one the queue is actually keyed by — a
+/// fixture that writes the timeline entry by hand proves the endpoint's
+/// arithmetic and nothing about that coupling.
 #[tokio::test]
 async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     let (router, tg) = router().await;
@@ -910,11 +963,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     // the channel lookup — which looks exactly like the card check this
     // test exists to exercise. Installed first, so every 404 below is the
     // refusal it claims to be.
-    baybo_gateway::channel::boot::install_channels(
-        &tg.deps.channel_registry,
-        &tg.deps.config.channels,
-    )
-    .expect("install the owner channel");
+    install_owner_channel(&tg);
     let p = open_project(&router, "approving").await;
     open_issue(&router, &p, "needs a hand").await;
 
@@ -944,39 +993,37 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     )
     .await;
 
-    // Now a real prompt, parked on the owner channel's queue the way a
-    // blocked tool call parks one, and recorded on #1's timeline the way the
-    // gate records it. The queue is keyed by call id alone, so this is the
-    // case that says whether the card check does anything.
+    // Now a real prompt: raised inside #1's own session, through the gate
+    // production installs, so both the queue entry and the timeline entry
+    // are written by the code that writes them for real.
     open_issue(&router, &p, "a card that did not ask").await;
     let other = open_project(&router, "somebody else's").await;
     open_issue(&router, &other, "their card").await;
-    let (session, blocked) = park_approval(&tg, "c-real").await;
+    let session = issue_session(&tg, &p, 1).await;
+    let blocked = park_approval(&tg, &session, "c-real").await;
     let channel = tg
         .deps
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
         .expect("owner channel");
-    // The harness installs no `TimelineApprovalGate`, so the entry the gate
-    // would have written goes on by hand — it is what says which card asked.
-    tg.deps
-        .project_manager
-        .record_event(
-            &baybo_model::ProjectId::parse(p.clone()).expect("project id"),
-            1,
-            baybo_store::project::IssueActor::User,
-            baybo_store::project::IssueEventBody::ApprovalRequested {
-                call_id: "c-real".to_owned(),
-                tool: "Bash".to_owned(),
-                summary: "rm -rf build".to_owned(),
-            },
-        )
-        .await;
+
+    // The card offers a button, and the call id on it is the queue's own —
+    // that pair is what the operator actually posts.
+    let asked = issue_events(&router, &p, 1)
+        .await
+        .into_iter()
+        .find(|e| e["body"]["kind"] == "approval_requested")
+        .expect("the gate put the prompt on the card that raised it");
+    assert_eq!(asked["body"]["call_id"], "c-real");
+    let call_id = asked["body"]["call_id"]
+        .as_str()
+        .expect("call id")
+        .to_owned();
 
     // A card that exists on another board must not be able to answer it…
     post(
         &router,
-        &format!("/v1/projects/{other}/issues/1/approvals/c-real"),
+        &format!("/v1/projects/{other}/issues/1/approvals/{call_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NOT_FOUND,
     )
@@ -990,7 +1037,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     // the same as having raised it.
     post(
         &router,
-        &format!("/v1/projects/{p}/issues/2/approvals/c-real"),
+        &format!("/v1/projects/{p}/issues/2/approvals/{call_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NOT_FOUND,
     )
@@ -1004,7 +1051,7 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     // …while the card that raised it answers it, and the call unblocks.
     post(
         &router,
-        &format!("/v1/projects/{p}/issues/1/approvals/c-real"),
+        &format!("/v1/projects/{p}/issues/1/approvals/{call_id}"),
         json!({ "decision": "approve" }),
         StatusCode::NO_CONTENT,
     )
@@ -1015,23 +1062,95 @@ async fn answering_an_approval_has_to_name_a_card_on_this_board() {
     );
 }
 
-/// Park a real approval prompt on the owner channel's queue, the way a
-/// blocked tool call parks one. Returns the session it belongs to and the
-/// call still waiting on the answer.
+/// Install the owner channel and put the board's approval gate over it, the
+/// way `runtime.rs` does at boot — a prompt raised in an issue's session is
+/// only ever on a card because that wrapper put it there.
+fn install_owner_channel(tg: &baybo_gateway::test_support::TestGateway) {
+    baybo_gateway::channel::boot::install_channels(
+        &tg.deps.channel_registry,
+        &tg.deps.config.channels,
+    )
+    .expect("install the owner channel");
+    let owner = baybo_model::ChannelType::owner();
+    let gates = tg.deps.channel_registry.approval_gates();
+    let inner = gates.type_gate(&owner);
+    gates.insert(
+        owner,
+        std::sync::Arc::new(baybo_project::TimelineApprovalGate::new(
+            inner,
+            std::sync::Arc::clone(&tg.deps.project_manager),
+            tg.deps.session_manager.store(),
+        )),
+    );
+}
+
+/// The session an issue's run works in: bound to the card by its trigger,
+/// which is the only thing that tells the gate — and the endpoint — which
+/// card a prompt belongs to.
+async fn issue_session(
+    tg: &baybo_gateway::test_support::TestGateway,
+    project: &str,
+    number: i64,
+) -> baybo_model::SessionId {
+    let project = baybo_model::ProjectId::parse(project.to_owned()).expect("project id");
+    let issue = tg
+        .deps
+        .project_manager
+        .get_issue(&project, number)
+        .await
+        .expect("the card exists");
+    let channel = baybo_model::ChannelType::owner();
+    tg.deps
+        .session_manager
+        .create_bound_session_with_trigger(
+            baybo_model::User {
+                id: "owner".to_owned(),
+                name: None,
+                channel: channel.clone(),
+            },
+            channel,
+            baybo_model::TriggerSource::Issue {
+                project_id: project,
+                issue_id: issue.id,
+                number,
+            },
+            None,
+        )
+        .await
+        .expect("mint the issue's session")
+        .id
+}
+
+/// Park a real approval prompt for `session`, the way a blocked tool call
+/// parks one: through the gate the tool path resolves, not the channel's
+/// own. Returns the call still waiting on an answer.
 async fn park_approval(
     tg: &baybo_gateway::test_support::TestGateway,
+    session: &baybo_model::SessionId,
     call_id: &str,
-) -> (
-    baybo_model::SessionId,
-    tokio::task::JoinHandle<baybo_model::ApprovalDecision>,
-) {
+) -> tokio::task::JoinHandle<baybo_model::ApprovalDecision> {
+    let gate = tg
+        .deps
+        .channel_registry
+        .approval_gates()
+        .get(&baybo_model::ChannelType::owner(), session);
+    park_through(tg, gate, session, call_id).await
+}
+
+/// The same, through whichever gate the caller wants to exercise — the
+/// channel's own one skips the board wrapper, which is how a test reaches
+/// the state a swallowed timeline append leaves behind.
+async fn park_through(
+    tg: &baybo_gateway::test_support::TestGateway,
+    gate: std::sync::Arc<dyn baybo_tools::ApprovalGate>,
+    session: &baybo_model::SessionId,
+    call_id: &str,
+) -> tokio::task::JoinHandle<baybo_model::ApprovalDecision> {
     let channel = tg
         .deps
         .channel_registry
         .get(&baybo_model::ChannelType::owner())
         .expect("owner channel");
-    let gate = channel.approval_gate().expect("approval gate");
-    let session = baybo_model::SessionId::new();
     let blocked = tokio::spawn({
         let session = session.clone();
         let call_id = call_id.to_owned();
@@ -1050,17 +1169,64 @@ async fn park_approval(
         }
     });
     for _ in 0..200 {
-        if !channel.pending_approvals(&session).is_empty() {
+        if !channel.pending_approvals(session).is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert_eq!(
-        channel.pending_approvals(&session).len(),
-        1,
-        "prompt parked"
+    assert_eq!(channel.pending_approvals(session).len(), 1, "prompt parked");
+    blocked
+}
+
+/// The card that raised a prompt can answer it even if the timeline entry
+/// for it never landed.
+///
+/// `record_event` swallows a failed append by its own doc, and the answer
+/// is what unblocks the run — so the endpoint asks the session the prompt
+/// was raised in, which is the same thing the gate asked before writing
+/// anything. A check derived from the timeline instead would 404 here and
+/// leave the tool call parked until the gate timed it out.
+#[tokio::test]
+async fn answering_a_prompt_does_not_depend_on_its_timeline_entry() {
+    let (router, tg) = router().await;
+    install_owner_channel(&tg);
+    let p = open_project(&router, "no entry").await;
+    open_issue(&router, &p, "still blocked").await;
+    let session = issue_session(&tg, &p, 1).await;
+
+    // Through the channel's own gate, so nothing is written to the card:
+    // exactly the state a swallowed append leaves behind.
+    let channel = tg
+        .deps
+        .channel_registry
+        .get(&baybo_model::ChannelType::owner())
+        .expect("owner channel");
+    let blocked = park_through(
+        &tg,
+        channel.approval_gate().expect("approval gate"),
+        &session,
+        "c-unwritten",
+    )
+    .await;
+    assert!(
+        issue_events(&router, &p, 1)
+            .await
+            .iter()
+            .all(|e| e["body"]["kind"] != "approval_requested"),
+        "the card shows no prompt, which is the situation under test"
     );
-    (session, blocked)
+
+    post(
+        &router,
+        &format!("/v1/projects/{p}/issues/1/approvals/c-unwritten"),
+        json!({ "decision": "deny" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        blocked.await.expect("the blocked call returns"),
+        baybo_model::ApprovalDecision::Deny
+    );
 }
 
 /// A prompt raised by an ordinary chat session belongs to no card, so no
@@ -1068,17 +1234,21 @@ async fn park_approval(
 #[tokio::test]
 async fn a_prompt_from_a_chat_session_cannot_be_answered_from_a_card() {
     let (router, tg) = router().await;
-    baybo_gateway::channel::boot::install_channels(
-        &tg.deps.channel_registry,
-        &tg.deps.config.channels,
-    )
-    .expect("install the owner channel");
+    install_owner_channel(&tg);
     let p = open_project(&router, "not a door").await;
     open_issue(&router, &p, "unrelated").await;
 
-    // No timeline entry: the gate passes a non-issue session straight
-    // through without writing to any card.
-    let (session, _blocked) = park_approval(&tg, "c-chat").await;
+    // A session the gate finds no card for: it passes straight through and
+    // writes to no timeline.
+    let session = baybo_model::SessionId::new();
+    let _blocked = park_approval(&tg, &session, "c-chat").await;
+    assert!(
+        issue_events(&router, &p, 1)
+            .await
+            .iter()
+            .all(|e| e["body"]["kind"] != "approval_requested"),
+        "a chat's prompt lands on no card"
+    );
 
     post(
         &router,

@@ -123,14 +123,21 @@ async fn resolve_handle(
         })
 }
 
-/// The reverse: an id as the handle a reader would recognise.
-fn handle_of(team: &[baybo_store::AgentProfileRow], id: &AgentProfileId) -> String {
-    team.iter()
+/// The reverse: an id as the handle a reader would recognise, out of the
+/// rows the caller has already read.
+///
+/// The caller decides what `known` contains, and that is the whole design:
+/// a card face wants the live roster, while a timeline is permanent history
+/// and must also carry the agents that have since left it (see
+/// [`ProjectManager::agent_profiles`]). An id nothing in `known` answers to
+/// renders as the id — a broken reference is not a departed teammate, and
+/// inventing a handle for it would be worse than showing the raw value.
+fn handle_of(known: &[baybo_store::AgentProfileRow], id: &AgentProfileId) -> String {
+    known
+        .iter()
         .find(|row| &row.id == id)
         .and_then(|row| row.team.as_ref())
         .map(|t| format!("@{}", t.handle))
-        // A removed teammate is not on the roster but is still named by the
-        // work it did, so the id is the honest answer rather than a blank.
         .unwrap_or_else(|| id.as_str().to_owned())
 }
 

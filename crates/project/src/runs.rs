@@ -14,12 +14,23 @@ use baybo_store::project::{IssueRow, IssueStatus, NewIssueRun, RunTrigger};
 /// The assignee is carried whole rather than reduced to "somebody is on
 /// it": handing live work to a *different* agent is an edge the predicate
 /// has to see, and a bool cannot show it.
+///
+/// Cancellation is carried too, so the predicate can answer for itself
+/// rather than have a caller filter its answer. A second gate at the
+/// dispatch site would be a second predicate, which is exactly what this
+/// module exists to prevent — and it would be invisible to the tests
+/// below, which are where this rule is actually pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
     pub before_status: IssueStatus,
     pub before_assignee: Option<AgentProfileId>,
     pub after_status: IssueStatus,
     pub after_assignee: Option<AgentProfileId>,
+    /// Whether the issue is cancelled *after* the write. The "before" side
+    /// is not carried: un-cancelling changes neither status nor assignee,
+    /// so it can never be the edge that starts work — reviving a card and
+    /// staffing it are two acts, and the second one is the trigger.
+    pub after_cancelled: bool,
 }
 
 /// Whether this transition starts work, and why.
@@ -38,8 +49,16 @@ pub struct Transition {
 /// re-ordering, editing prose. In particular, dragging *out* of In
 /// Progress does not stop anything — the run outlives the column, and
 /// cancelling it is a separate, explicit act.
+///
+/// A **cancelled** issue is not a trigger on either edge. The board treats
+/// cancelled as finished everywhere else — `comment_delivery` refuses to
+/// wake one, [`crate::stages`] counts it out of its stage, and
+/// `reclaim_if_finished` has already taken its worktree back — so a run
+/// started here would cut a fresh checkout and put an agent to work on
+/// abandoned work. Reviving the card is what makes it startable again.
 pub fn triggers_run(t: Transition) -> Option<RunTrigger> {
-    if t.after_status != IssueStatus::InProgress || t.after_assignee.is_none() {
+    if t.after_cancelled || t.after_status != IssueStatus::InProgress || t.after_assignee.is_none()
+    {
         return None;
     }
     if t.before_status != IssueStatus::InProgress {
@@ -59,6 +78,7 @@ impl Transition {
             before_assignee: before.assignee.clone(),
             after_status: after.status,
             after_assignee: after.assignee.clone(),
+            after_cancelled: after.cancelled_at.is_some(),
         }
     }
 
@@ -70,6 +90,7 @@ impl Transition {
             before_assignee: None,
             after_status: after.status,
             after_assignee: after.assignee.clone(),
+            after_cancelled: after.cancelled_at.is_some(),
         }
     }
 }
@@ -106,6 +127,7 @@ mod tests {
             before_assignee,
             after_status,
             after_assignee,
+            after_cancelled: false,
         }
     }
 
@@ -179,7 +201,17 @@ mod tests {
             .is_none()
         );
         // Leaving the column never starts anything — and never stops
-        // anything either; the run outlives the drag.
+        // anything either; the run outlives the drag. Both arms: the plain
+        // drag, and a drag that also hands the card on.
+        assert!(
+            triggers_run(t(
+                IssueStatus::InProgress,
+                agent("dev-1"),
+                IssueStatus::Review,
+                agent("dev-1")
+            ))
+            .is_none()
+        );
         assert!(
             triggers_run(t(
                 IssueStatus::InProgress,
@@ -211,6 +243,47 @@ mod tests {
                 agent("dev-1")
             ))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_issue_starts_nothing_on_either_edge() {
+        // Cancelled is finished everywhere else on the board, and its
+        // worktree is already gone. Both edges that would otherwise fire
+        // have to see that.
+        let cancelled = |before_status, before_assignee, after_status, after_assignee| Transition {
+            after_cancelled: true,
+            ..t(before_status, before_assignee, after_status, after_assignee)
+        };
+        assert!(
+            triggers_run(cancelled(
+                IssueStatus::Todo,
+                agent("dev-1"),
+                IssueStatus::InProgress,
+                agent("dev-1")
+            ))
+            .is_none(),
+            "entering the column"
+        );
+        assert!(
+            triggers_run(cancelled(
+                IssueStatus::InProgress,
+                agent("dev-1"),
+                IssueStatus::InProgress,
+                agent("dev-2")
+            ))
+            .is_none(),
+            "handing it over"
+        );
+        assert!(
+            triggers_run(cancelled(
+                IssueStatus::InProgress,
+                None,
+                IssueStatus::InProgress,
+                agent("dev-1")
+            ))
+            .is_none(),
+            "staffing it"
         );
     }
 }

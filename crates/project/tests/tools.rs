@@ -406,6 +406,78 @@ async fn the_triage_filter_finds_the_cards_nobody_is_on() {
     assert_eq!(taken["issues"][0]["title"], "taken");
 }
 
+/// A card's history keeps naming an agent long after it leaves the team, so
+/// the timeline the *agents* read has to resolve one — the live roster is
+/// exactly what stops carrying it. A ULID here is unusable: `@handle` is the
+/// only name a follow-up run can address anything by.
+#[tokio::test]
+async fn a_departed_teammate_is_still_named_on_the_timeline_an_agent_reads() {
+    let f = fixture().await;
+    let (project, lead) = f.open("Turnover").await;
+    let ctx = f.ctx(&project, &lead);
+    let hired = f
+        .call(
+            "ProjectAgentCreate",
+            &ctx,
+            json!({ "name": "Test Engineer", "role": "Writes the tests." }),
+        )
+        .await;
+    assert_eq!(hired["handle"], "@test-engineer");
+    f.call("IssueCreate", &ctx, json!({ "title": "Cover the parser" }))
+        .await;
+    f.call(
+        "IssueUpdate",
+        &ctx,
+        json!({ "number": 1, "assignee": "@test-engineer" }),
+    )
+    .await;
+
+    let leaver = f
+        .manager
+        .team(&project)
+        .await
+        .expect("team")
+        .into_iter()
+        .find(|row| {
+            row.team
+                .as_ref()
+                .is_some_and(|t| t.handle.as_str() == "test-engineer")
+        })
+        .expect("the hire is on the roster")
+        .id;
+    // Nothing unassigns a departed teammate's cards, so both the entry that
+    // named it and the card face outlive its membership.
+    f.manager
+        .remove_from_team(&project, &leaver)
+        .await
+        .expect("it leaves the team");
+    assert!(
+        !f.manager
+            .team(&project)
+            .await
+            .expect("team")
+            .iter()
+            .any(|row| row.id == leaver),
+        "the roster has stopped carrying it, which is the whole problem"
+    );
+
+    let card = f.call("IssueGet", &ctx, json!({ "number": 1 })).await;
+    let rendered = card.to_string();
+    assert!(
+        !rendered.contains(leaver.as_str()),
+        "no ULID may reach an agent's reader: {rendered}"
+    );
+    assert_eq!(card["assignee"], "@test-engineer");
+    let assigned = card["timeline"]
+        .as_array()
+        .expect("timeline")
+        .iter()
+        .filter_map(|entry| entry["event"].as_str())
+        .find(|event| event.starts_with("assigned it to"))
+        .expect("the assignment is on the timeline");
+    assert_eq!(assigned, "assigned it to @test-engineer");
+}
+
 #[tokio::test]
 async fn an_update_that_changes_nothing_is_a_mistake_worth_saying() {
     let f = fixture().await;
