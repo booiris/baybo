@@ -4,11 +4,36 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Baybo Dashboard</title>
+    <meta
+      name="description"
+      content="Chat with your Baybo agents and inspect their traces, cron jobs, background jobs, and spend."
+    />
+
+    <!-- PWA. `theme-color` tints the OS chrome around an installed window; the
+         icon set is derived from `assets/baybo.png`, the same mark the iOS app
+         ships (see docs/webui.md). The `apple-*` pair is what an installed iOS
+         window reads — Safari still ignores `display: standalone` from the
+         manifest. -->
+    <meta name="theme-color" content="#faf6ec" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Baybo" />
+
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- `crossorigin` makes this a CORS request (Google answers
+         `access-control-allow-origin: *`), so the service worker gets an
+         inspectable response instead of an opaque one it could only cache
+         blind — an opaque error would otherwise pin itself in the font cache
+         forever. Drop the attribute and offline loses the @font-face rules. -->
     <link
       href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
+      crossorigin="anonymous"
     />
   </head>
   <body>

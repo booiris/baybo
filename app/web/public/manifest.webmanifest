@@ -1,0 +1,21 @@
+{
+  "id": "/",
+  "name": "Baybo Dashboard",
+  "short_name": "Baybo",
+  "description": "Chat with your Baybo agents and inspect their traces, cron jobs, background jobs, and spend.",
+  "lang": "en",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#faf6ec",
+  "categories": ["productivity", "developer", "utilities"],
+  "icons": [
+    { "src": "/pwa-192.png", "type": "image/png", "sizes": "192x192", "purpose": "any" },
+    { "src": "/pwa-512.png", "type": "image/png", "sizes": "512x512", "purpose": "any" },
+    { "src": "/pwa-maskable-512.png", "type": "image/png", "sizes": "512x512", "purpose": "maskable" }
+  ]
+}

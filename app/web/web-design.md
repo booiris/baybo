@@ -57,7 +57,7 @@ The Baybo Dashboard follows a **warm** "Neo-Brutalist" design language character
 
 ### 2. Main Dashboard
 
-- **Global icon rail (`components/IconRail.tsx`):** A narrow (48px) solid-amber, icon-only vertical bar mounted on every route (replaces the old 180px text sidebar). Chat is the primary destination (a chat-bubble mark, `RiChat3Line`); admin surfaces (Log/Trace/Cron/Jobs/Analytics/Agents/LLM) sit below; logout is pinned to the bottom. Labels surface as hover tooltips.
+- **Global icon rail (`components/IconRail.tsx`):** A narrow (48px) solid-amber, icon-only vertical bar mounted on every route (replaces the old 180px text sidebar). Chat is the primary destination (a chat-bubble mark, `RiChat3Line`); admin surfaces (Log/Trace/Cron/Jobs/Analytics/Agents/LLM) sit below; logout is pinned to the bottom, with the PWA install button directly above it when the browser offers one. Labels surface as hover tooltips.
 - **Content Area:** Scrollable main view with `bg-canvas`.
 
 ### 3. Chat (three-zone, app/mac-style)
@@ -87,3 +87,13 @@ In the chat view the **thread sits on `surface`** (`#fffdf7`) while all **side p
 
 - **Library:** [Remix Icon](https://remixicon.com/) (via `react-icons/ri`).
 - **Style:** Outlined or filled depending on emphasis, usually `text-xl`.
+
+## App icon (PWA)
+
+The installed app's icon is `assets/baybo.png` — the line-art robot, black on white, **not** restyled onto a brutalist gold tile. It is the same artwork the iOS app ships as its AppIcon, and one product should not wear two faces in a task switcher. The dashboard's neo-brutalism is the *interface's* language, not the brand's.
+
+Every file in `public/` (`pwa-192`, `pwa-512`, `pwa-maskable-512`, `apple-touch-icon`, `favicon.ico`) is derived from that one source; the commands and the three non-obvious numbers in them are in [`../../docs/webui.md`](../../docs/webui.md).
+
+## Update prompt
+
+`src/pwa/PwaUpdateBanner.tsx` is the one piece of floating chrome outside a page: a gold pill (`bg-brand` + `text-ink`, the usual dark-on-warm pairing) fixed **bottom-right**, offering RELOAD when a newer bundle is installed and waiting. Bottom-right and not centre — the chat composer owns the bottom of the reading band at every width.

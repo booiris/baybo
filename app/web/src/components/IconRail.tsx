@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   RiAlarmLine,
@@ -6,6 +7,7 @@ import {
   RiCpuLine,
   RiFileList3Line,
   RiGitMergeLine,
+  RiInstallLine,
   RiKanbanView2,
   RiLogoutBoxRLine,
   RiRobot2Line,
@@ -18,6 +20,7 @@ import {
   boardsNeedingAttention,
   useAttention,
 } from '../pages/projects/useAttention';
+import { installPrompt } from '../pwa/registerSW';
 
 // Global app rail (replaces the old text sidebar): a solid amber, icon-only
 // vertical bar mounted on every route. Chat is the primary destination (the
@@ -45,6 +48,13 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
 export function IconRail({ version }: { version?: string }) {
   const { logout } = useAuth();
   const waiting = useAttention();
+  // Chromium hands the install prompt to whoever wants it; the rail is where a
+  // user already looks for app-level actions. Absent everywhere else (Safari
+  // installs via Share → Add to Home Screen), and gone once installed.
+  const { canInstall } = useSyncExternalStore(
+    installPrompt.subscribe,
+    installPrompt.getSnapshot,
+  );
   return (
     <aside className="w-12 shrink-0 bg-brand border-r-2 border-black flex flex-col items-center gap-3 pt-3 pb-3">
       <NavLink
@@ -92,14 +102,21 @@ export function IconRail({ version }: { version?: string }) {
         })}
       </nav>
 
-      <button
-        type="button"
-        onClick={logout}
-        title="Logout"
-        className={`${railBtn} ${railIdle} mt-auto`}
-      >
-        <RiLogoutBoxRLine className="text-lg" />
-      </button>
+      <div className="mt-auto flex flex-col items-center gap-3">
+        {canInstall && (
+          <button
+            type="button"
+            onClick={() => void installPrompt.prompt()}
+            title="Install app"
+            className={`${railBtn} ${railIdle}`}
+          >
+            <RiInstallLine className="text-lg" />
+          </button>
+        )}
+        <button type="button" onClick={logout} title="Logout" className={`${railBtn} ${railIdle}`}>
+          <RiLogoutBoxRLine className="text-lg" />
+        </button>
+      </div>
     </aside>
   );
 }
