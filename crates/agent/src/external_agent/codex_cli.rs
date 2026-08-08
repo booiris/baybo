@@ -39,7 +39,7 @@ use super::probe::{
 };
 use super::{
     ExternalAgent, ExternalAgentError, ExternalAgentEvent, ExternalAgentRequest,
-    ExternalAgentStream, Result,
+    ExternalAgentStream, Result, mark_tool_error,
 };
 
 const AGENT_NAME: &str = "codex";
@@ -54,6 +54,11 @@ const INSTALL_HINT: &str =
 /// registry / approval gate.
 const CODEX_TOOL_SHELL: &str = "codex_shell";
 const CODEX_TOOL_FILE_CHANGE: &str = "codex_file_change";
+
+/// Bodies of the synthetic `codex_file_change` tool result. codex reports no
+/// diff for an edit, so the outcome is all a reader gets.
+const CODEX_FILE_CHANGE_APPLIED: &str = "applied";
+const CODEX_FILE_CHANGE_FAILED: &str = "codex reported the file change did not complete";
 
 #[derive(Debug)]
 pub struct CodexCliAgent {
@@ -243,13 +248,15 @@ fn spawn_stream_parser(
                             }
                         }
                         ThreadEvent::ItemCompleted {
-                            item: ThreadItem::Reasoning { summary },
+                            item: ThreadItem::Reasoning { text },
                         } => {
-                            if !summary.is_empty() {
+                            if !text.is_empty() {
+                                // `Summary`, not `Text`: codex exposes only a
+                                // summary of its reasoning, never the raw chain.
                                 yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
                                     vec![ContentBlock::Thinking {
                                         id: None,
-                                        content: vec![ThinkingContent::Summary { text: summary }],
+                                        content: vec![ThinkingContent::Summary { text }],
                                     }],
                                 )));
                             }
@@ -261,6 +268,7 @@ fn spawn_stream_parser(
                                     command,
                                     aggregated_output,
                                     exit_code,
+                                    status,
                                 },
                         } => {
                             // Pair (Assistant tool_use) + (Tool
@@ -278,16 +286,25 @@ fn spawn_stream_parser(
                                     signature: None,
                                 }],
                             )));
+                            // A missing exit code means codex never reported one
+                            // (killed, rejected, still-running at stream end), so
+                            // it counts as failure alongside a non-zero one — the
+                            // transcript must not read as a clean run.
+                            let failed =
+                                status.failed() || exit_code.is_none_or(|code| code != 0);
                             let result = match exit_code {
                                 Some(code) => format!("exit_code={code}\n{aggregated_output}"),
-                                None => aggregated_output,
+                                None => format!("exit_code=unknown\n{aggregated_output}"),
                             };
                             yield Ok(ExternalAgentEvent::Intermediate(
-                                ChatMessage::tool_result(tool_use_id, result),
+                                ChatMessage::tool_result(
+                                    tool_use_id,
+                                    mark_tool_error(result, failed),
+                                ),
                             ));
                         }
                         ThreadEvent::ItemCompleted {
-                            item: ThreadItem::FileChange { id, changes },
+                            item: ThreadItem::FileChange { id, changes, status },
                         } => {
                             let tool_use_id = format!("codex-{id}");
                             yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
@@ -298,8 +315,17 @@ fn spawn_stream_parser(
                                     signature: None,
                                 }],
                             )));
+                            let failed = status.failed();
+                            let result = if failed {
+                                CODEX_FILE_CHANGE_FAILED
+                            } else {
+                                CODEX_FILE_CHANGE_APPLIED
+                            };
                             yield Ok(ExternalAgentEvent::Intermediate(
-                                ChatMessage::tool_result(tool_use_id, "applied".to_string()),
+                                ChatMessage::tool_result(
+                                    tool_use_id,
+                                    mark_tool_error(result.to_string(), failed),
+                                ),
                             ));
                         }
                         ThreadEvent::TurnCompleted { usage } => {
@@ -421,9 +447,15 @@ enum ThreadItem {
         #[serde(default)]
         text: String,
     },
+    /// codex emits its reasoning summary under `text`, NOT `summary` — the
+    /// same key `AgentMessage` uses. Verified against codex-cli 0.146.1:
+    /// `{"id":"item_2","type":"reasoning","text":"**Calculating …**"}`.
+    /// A mismatch here is silent: `serde(default)` yields an empty string and
+    /// the item is dropped, so every reasoning step vanishes from the
+    /// transcript with no parse error. See the fixture test below.
     Reasoning {
         #[serde(default)]
-        summary: String,
+        text: String,
     },
     CommandExecution {
         id: String,
@@ -433,14 +465,42 @@ enum ThreadItem {
         aggregated_output: String,
         #[serde(default)]
         exit_code: Option<i64>,
+        #[serde(default)]
+        status: ItemStatus,
     },
     FileChange {
         id: String,
         #[serde(default)]
         changes: serde_json::Value,
+        #[serde(default)]
+        status: ItemStatus,
     },
     #[serde(other)]
     Other,
+}
+
+/// Terminal disposition codex reports on an `item.completed` payload.
+///
+/// `FileChange` carries no exit code, so without this a rejected or failed
+/// edit persisted the literal `"applied"` — a transcript reader asking "did
+/// that edit land?" got "yes" from a run that never touched the file.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemStatus {
+    #[default]
+    Completed,
+    Failed,
+    /// Newer/unknown dispositions. Treated as non-success: a status codex
+    /// felt the need to distinguish from `completed` is not one to record as
+    /// a success in a row that is never rewritten.
+    #[serde(other)]
+    Other,
+}
+
+impl ItemStatus {
+    fn failed(self) -> bool {
+        self != Self::Completed
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,20 +599,47 @@ mod tests {
         }
     }
 
+    /// VERBATIM `codex exec --json` output (codex-cli 0.146.1). A hand-written
+    /// fixture is worth nothing here: the previous one spelled the field
+    /// `summary`, which is what the parser expected and what codex has never
+    /// sent — so the test passed while every reasoning item was silently
+    /// dropped in production. Replace these only by re-capturing from the CLI.
+    ///
+    /// Reasoning items appear only on runs long enough to warrant them; a
+    /// one-line arithmetic prompt yields `reasoning_output_tokens` but no
+    /// item. Capture with a task that writes a script, runs it, and checks
+    /// the output.
     #[test]
     fn parse_reasoning_item_completed() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"**Creating and running Armstrong script**"}}"#;
+        match serde_json::from_str::<ThreadEvent>(line).unwrap() {
+            ThreadEvent::ItemCompleted {
+                item: ThreadItem::Reasoning { text },
+            } => assert_eq!(text, "**Creating and running Armstrong script**"),
+            other => panic!("expected Reasoning item, got {other:?}"),
+        }
+    }
+
+    /// The shape the retired fixture asserted. Kept as a tripwire: if codex
+    /// ever renames the field back, this starts parsing and the assertion
+    /// fires instead of the loss going silent again.
+    #[test]
+    fn reasoning_item_keyed_summary_carries_no_text() {
         let line = r#"{"type":"item.completed","item":{"id":"item_4","type":"reasoning","summary":"thinking"}}"#;
         match serde_json::from_str::<ThreadEvent>(line).unwrap() {
             ThreadEvent::ItemCompleted {
-                item: ThreadItem::Reasoning { summary },
-            } => assert_eq!(summary, "thinking"),
+                item: ThreadItem::Reasoning { text },
+            } => assert!(
+                text.is_empty(),
+                "codex now sends reasoning under `summary`; the projection drops it"
+            ),
             other => panic!("expected Reasoning item, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_command_execution_item_completed() {
-        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","aggregated_output":"foo\n","exit_code":0,"status":"completed"}}"#;
+        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/usr/bin/zsh -lc 'python3 fib.py'","aggregated_output":"0 1 1 2 3 5 8 13 21 34\n","exit_code":0,"status":"completed"}}"#;
         match serde_json::from_str::<ThreadEvent>(line).unwrap() {
             ThreadEvent::ItemCompleted {
                 item:
@@ -561,12 +648,14 @@ mod tests {
                         command,
                         aggregated_output,
                         exit_code,
+                        status,
                     },
             } => {
-                assert_eq!(id, "item_1");
-                assert_eq!(command, "ls");
-                assert_eq!(aggregated_output, "foo\n");
+                assert_eq!(id, "item_2");
+                assert_eq!(command, "/usr/bin/zsh -lc 'python3 fib.py'");
+                assert_eq!(aggregated_output, "0 1 1 2 3 5 8 13 21 34\n");
                 assert_eq!(exit_code, Some(0));
+                assert!(!status.failed());
             }
             other => panic!("expected CommandExecution item, got {other:?}"),
         }
@@ -574,15 +663,57 @@ mod tests {
 
     #[test]
     fn parse_file_change_item_completed() {
-        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/x","kind":"add"}],"status":"completed"}}"#;
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"/w/fib.py","kind":"add"}],"status":"completed"}}"#;
         match serde_json::from_str::<ThreadEvent>(line).unwrap() {
             ThreadEvent::ItemCompleted {
-                item: ThreadItem::FileChange { id, changes },
+                item:
+                    ThreadItem::FileChange {
+                        id,
+                        changes,
+                        status,
+                    },
             } => {
-                assert_eq!(id, "item_3");
+                assert_eq!(id, "item_1");
                 let arr = changes.as_array().expect("array");
                 assert_eq!(arr.len(), 1);
+                assert!(!status.failed());
             }
+            other => panic!("expected FileChange item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_or_unknown_item_status_counts_as_failure() {
+        let cases = [
+            (r#""failed""#, true),
+            (r#""in_progress""#, true),
+            (r#""some_future_status""#, true),
+            (r#""completed""#, false),
+        ];
+        for (raw, expect_failed) in cases {
+            let line = format!(
+                r#"{{"type":"item.completed","item":{{"id":"i","type":"file_change","changes":[],"status":{raw}}}}}"#
+            );
+            match serde_json::from_str::<ThreadEvent>(&line).unwrap() {
+                ThreadEvent::ItemCompleted {
+                    item: ThreadItem::FileChange { status, .. },
+                } => assert_eq!(status.failed(), expect_failed, "status {raw}"),
+                other => panic!("expected FileChange item, got {other:?}"),
+            }
+        }
+    }
+
+    /// An item with no `status` at all must not read as a clean success —
+    /// `#[serde(default)]` picks `Completed`, so this pins the one case where
+    /// the default is load-bearing rather than incidental.
+    #[test]
+    fn a_missing_item_status_defaults_to_completed() {
+        let line =
+            r#"{"type":"item.completed","item":{"id":"i","type":"file_change","changes":[]}}"#;
+        match serde_json::from_str::<ThreadEvent>(line).unwrap() {
+            ThreadEvent::ItemCompleted {
+                item: ThreadItem::FileChange { status, .. },
+            } => assert!(!status.failed()),
             other => panic!("expected FileChange item, got {other:?}"),
         }
     }

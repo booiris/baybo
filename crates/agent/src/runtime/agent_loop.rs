@@ -8,7 +8,8 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext, MemoryScope};
 use baybo_model::{
-    ChatMessage, ContentBlock, LlmEntryName, MessageSource, ThinkingContent, TurnId,
+    ChatMessage, ContentBlock, LlmEntryName, MessageSource, TOOL_RESULT_ERROR_PREFIX,
+    ThinkingContent, TurnId,
 };
 use baybo_turn::{TurnInput, TurnInputKind, TurnLifecycle, TurnOutput};
 use futures::StreamExt;
@@ -1492,7 +1493,7 @@ impl AgentLoop {
                     push_bounded_images(&mut llm_visible_images, llm_images.iter().cloned());
                     text.clone()
                 }
-                Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
+                Ok(ToolOutput::Error(msg)) => format!("{TOOL_RESULT_ERROR_PREFIX} {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
                         && matches!(denied, baybo_tools::ToolError::Denied { .. })
@@ -1504,7 +1505,7 @@ impl AgentLoop {
                             tool_call.name
                         )
                     } else {
-                        format!("Error: {e}")
+                        format!("{TOOL_RESULT_ERROR_PREFIX} {e}")
                     }
                 }
             };
@@ -2344,6 +2345,22 @@ impl AgentLoop {
         // streamed as ephemeral `Reasoning` rather than answer `AnswerDelta`.
         let mut pending_reasoning = String::new();
 
+        // A provider splits one turn's reasoning into several thinking blocks,
+        // each a self-contained section that typically opens with its own
+        // `**Headline**`. The DELTA stream carries no separator between them —
+        // the boundary is the `ThinkingBlock` event that closes a section — so
+        // concatenating deltas verbatim glues the next headline onto the tail
+        // of the previous section's last sentence (`…I need!**Inspecting the
+        // repo**`). Every client re-assembles the deltas the same way, so the
+        // break has to be inserted here, once, rather than in each of them.
+        //
+        // `rig`'s `ReasoningDelta` carries an `id` that would mark the same
+        // boundary, but every provider hardcodes it to `None` (rig even
+        // asserts that in its own Anthropic test) — the block event is the only
+        // signal that actually arrives.
+        let mut reasoning_seen = false;
+        let mut reasoning_part_closed = false;
+
         loop {
             // Stop consuming the moment the turn is cancelled, falling through
             // to flush + return the partial. The stream drops on function exit,
@@ -2377,7 +2394,21 @@ impl AgentLoop {
                     // Raw accumulates into `thinking` for the response (sanitized
                     // wholesale at finalize); a parallel buffer streams it to the
                     // channel through the same leak boundary the answer text uses.
+                    //
+                    // The section break goes ONLY into the streamed copy. `thinking`
+                    // is echoed back to providers that stream reasoning as deltas
+                    // only, so it must stay byte-exact — and it is used solely when
+                    // no `ThinkingBlock` ever arrived, which is exactly the case
+                    // where no break is inserted, so the two cannot disagree.
                     thinking.push_str(&r);
+                    if reasoning_part_closed && reasoning_seen {
+                        // A blank line, not a lone newline: CommonMark folds a
+                        // single one into a space, which leaves the headline glued
+                        // exactly as before.
+                        pending_reasoning.push_str("\n\n");
+                    }
+                    reasoning_part_closed = false;
+                    reasoning_seen |= !r.is_empty();
                     pending_reasoning.push_str(&r);
                     let flush_to = safe_flush_boundary(&pending_reasoning);
                     if flush_to > 0 {
@@ -2386,7 +2417,14 @@ impl AgentLoop {
                             .await;
                     }
                 }
-                StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
+                StreamEvent::ThinkingBlock(block) => {
+                    // Closes one thinking section. Arm the break rather than
+                    // emitting it now: a block can be the last thing in the turn
+                    // (and a `redacted_thinking` one arrives with no deltas at
+                    // all), and neither should leave a trailing blank line.
+                    thinking_blocks.push(block);
+                    reasoning_part_closed = true;
+                }
                 StreamEvent::Usage(u) => usage = u,
             }
         }

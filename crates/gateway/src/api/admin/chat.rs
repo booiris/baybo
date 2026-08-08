@@ -50,7 +50,7 @@ use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, StampedEvent}
 use baybo_model::{
     AgentBinding, AgentFramework, ApprovalDecision, ChannelType, ChatMessage, ContentBlock,
     ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName, Role, Session,
-    SessionId, ThinkingContent, TriggerSource, User,
+    SessionId, TOOL_RESULT_ERROR_PREFIX, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use baybo_store::SearchScope;
@@ -3397,6 +3397,14 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
 
 /// Concatenate the visible text of a model thinking block (redacted
 /// reasoning carries no display text and is skipped).
+///
+/// Segments are separated by a BLANK line. Each one is its own section and
+/// typically opens with a `**Headline**`; the client renders this as markdown,
+/// and CommonMark folds a lone newline into a space — which glues the headline
+/// onto the tail of the previous section's last sentence
+/// (`…I need!**Inspecting the repo**`). A multi-segment block only ever comes
+/// from the non-streaming completion path, so this reconstruction is the only
+/// place that boundary can be preserved or lost.
 fn thinking_text(content: &[ThinkingContent]) -> String {
     let mut out = String::new();
     for c in content {
@@ -3408,7 +3416,7 @@ fn thinking_text(content: &[ThinkingContent]) -> String {
             continue;
         }
         if !out.is_empty() {
-            out.push('\n');
+            out.push_str("\n\n");
         }
         out.push_str(part);
     }
@@ -3452,7 +3460,7 @@ fn tool_result_status(content: &str) -> String {
     let inner = inner.trim_start();
     if inner.starts_with("The user explicitly denied permission") {
         "denied".to_owned()
-    } else if inner.starts_with("Error:") {
+    } else if inner.starts_with(TOOL_RESULT_ERROR_PREFIX) {
         "error".to_owned()
     } else {
         "ok".to_owned()
@@ -4481,7 +4489,29 @@ mod tests {
                 text: "tl;dr".to_owned(),
             },
         ];
-        assert_eq!(thinking_text(&blocks), "step 1\ntl;dr");
+        assert_eq!(thinking_text(&blocks), "step 1\n\ntl;dr");
+    }
+
+    /// The shape the store is full of on the non-streaming path: a segment ends
+    /// mid-sentence and the next opens with a bold headline. A lone newline
+    /// between them is folded to a space by the client's markdown parser, which
+    /// renders `…I need!**Inspecting the repo**` — the headline swallowed by the
+    /// previous paragraph.
+    #[test]
+    fn thinking_text_separates_sections_with_a_blank_line() {
+        let blocks = vec![
+            ThinkingContent::Summary {
+                text: "I want to look at the globs I need!".to_owned(),
+            },
+            ThinkingContent::Summary {
+                text: "**Inspecting the repo**\n\nI need to inspect it.".to_owned(),
+            },
+        ];
+        assert!(
+            thinking_text(&blocks).contains("I need!\n\n**Inspecting the repo**"),
+            "got {:?}",
+            thinking_text(&blocks)
+        );
     }
 
     #[test]

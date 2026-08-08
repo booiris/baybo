@@ -46,7 +46,16 @@ function blockText(block: ContentBlock): string | null {
   if ('Thinking' in block) {
     // A redacted block carries no readable text — say so rather than rendering
     // an empty row that looks like the agent thought nothing.
-    return block.Thinking.content.map((c) => (c.kind === 'redacted' ? '[redacted reasoning]' : c.text)).join('\n');
+    //
+    // BLANK line between segments, not a single newline. Each summary segment
+    // is its own section and typically opens with a `**Headline**`; CommonMark
+    // folds a lone newline into a space, so joining with `\n` glues that
+    // headline onto the tail of the previous segment's last sentence
+    // (`…I need!**Inspecting the repo**`). The segment boundary is real — it is
+    // a separate array entry, and flattening is the only place it can be lost.
+    return block.Thinking.content
+      .map((c) => (c.kind === 'redacted' ? '[redacted reasoning]' : c.text))
+      .join('\n\n');
   }
   return null;
 }

@@ -843,6 +843,124 @@ async fn reasoning_chunks_stream_as_reasoning_events() {
     harness.shutdown().await;
 }
 
+/// Collect every streamed `Reasoning` event into the single string a client
+/// builds by concatenating them — the exact assembly `ChatPage`'s
+/// `appendReasoningStep` and the iOS transcript's `reasoning` case both do.
+fn streamed_reasoning(outs: &[AgentOutput]) -> String {
+    outs.iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Reasoning(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn thinking_block(text: &str) -> ContentBlock {
+    ContentBlock::Thinking {
+        id: None,
+        content: vec![ThinkingContent::Text {
+            text: text.to_owned(),
+            signature: None,
+        }],
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_thinking_section_breaks_the_streamed_reasoning_into_paragraphs() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    // The real Anthropic shape: deltas for one section, the block event that
+    // closes it, then deltas for the next — which open with their own bold
+    // headline and carry no separator of their own.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("I want to look at the globs I need!".into()),
+        StreamEvent::ThinkingBlock(thinking_block("I want to look at the globs I need!")),
+        StreamEvent::Reasoning("**Inspecting the repo**\n\nI need to inspect it.".into()),
+        StreamEvent::ThinkingBlock(thinking_block(
+            "**Inspecting the repo**\n\nI need to inspect it.",
+        )),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let reasoning = streamed_reasoning(&outs);
+
+    assert!(
+        reasoning.contains("I need!\n\n**Inspecting the repo**"),
+        "a closed section must be separated from the next by a BLANK line — a lone \
+         newline is folded to a space by CommonMark and leaves the headline glued \
+         onto the previous sentence. Got: {reasoning:?}"
+    );
+    assert!(
+        !reasoning.starts_with('\n'),
+        "no leading break before the first section, got {reasoning:?}"
+    );
+    assert!(
+        !reasoning.ends_with("\n\n"),
+        "the block closing the LAST section must not leave a trailing blank line, \
+         got {reasoning:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_redacted_block_before_any_text_does_not_indent_the_first_section() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    // `redacted_thinking` arrives as a block with no deltas ahead of it, so the
+    // break has to be armed by a closed section rather than by any block.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::ThinkingBlock(ContentBlock::Thinking {
+            id: None,
+            content: vec![ThinkingContent::Redacted {
+                data: "AAAA".into(),
+            }],
+        }),
+        StreamEvent::Reasoning("**Starting out**\n\nfirst thoughts".into()),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let reasoning = streamed_reasoning(&outs);
+
+    assert_eq!(
+        reasoning.trim_end(),
+        "**Starting out**\n\nfirst thoughts",
+        "a redacted block ahead of the first delta must not push the trace down"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The delta-only providers (DeepSeek and other OpenAI-compatible endpoints)
+/// never emit a `ThinkingBlock`, so their reasoning is synthesized from the
+/// accumulated text and echoed back on the next request. No block means no
+/// break is ever inserted, which is what keeps the streamed copy and the
+/// persisted one from diverging.
+#[tokio::test(start_paused = true)]
+async fn delta_only_reasoning_is_streamed_verbatim() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("first part.".into()),
+        StreamEvent::Reasoning("second part.".into()),
+        StreamEvent::Text("done".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        streamed_reasoning(&outs).trim_end(),
+        "first part.second part."
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
     // DeepSeek thinking mode streams reasoning only as deltas (never a

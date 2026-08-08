@@ -204,7 +204,7 @@ describe('buildTranscriptNodes — thinking blocks', () => {
     expect(nodes).toHaveLength(1);
     expect(nodes[0].kind).toBe('thinking');
     expect(nodes[0].title).toBe('Thinking');
-    expect(nodes[0].text).toBe('first the lint job\nthen the tests');
+    expect(nodes[0].text).toBe('first the lint job\n\nthen the tests');
   });
 
   it('renders a redaction placeholder rather than an empty row', () => {
@@ -229,7 +229,24 @@ describe('buildTranscriptNodes — thinking blocks', () => {
       ])),
     ]);
 
-    expect(nodes[0].text).toBe('checking CI\n[redacted reasoning]\nlint failed');
+    expect(nodes[0].text).toBe('checking CI\n\n[redacted reasoning]\n\nlint failed');
+  });
+
+  it('separates segments with a BLANK line so a leading headline is not glued on', () => {
+    // The shape the store is full of: a segment ends mid-sentence and the next
+    // opens with a bold headline. Joined with a lone `\n`, CommonMark folds it
+    // to a space and renders `…I need!**Inspecting the repo**` — the headline
+    // swallowed by the previous paragraph. Only a blank line splits them.
+    const nodes = buildTranscriptNodes([
+      row(1, T0, msg('assistant', 'agent', [
+        thinking([
+          { kind: 'summary', text: 'I want to look at the globs I need!' },
+          { kind: 'summary', text: '**Inspecting the repo**\n\nI need to inspect the repo.' },
+        ]),
+      ])),
+    ]);
+
+    expect(nodes[0].text).toContain('I need!\n\n**Inspecting the repo**');
   });
 
   it('drops a thinking block with no segments at all', () => {

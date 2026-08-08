@@ -168,6 +168,13 @@ pub const TOOL_OUTPUT_OPEN_PREFIX: &str = "<tool_output";
 /// flags forged ones in untrusted input.
 pub const TOOL_OUTPUT_CLOSE_PREFIX: &str = "</tool_output";
 
+/// Prefix stamped on a tool result whose call failed. The structured outcome
+/// is not persisted, so this literal *is* the durable failure signal: every
+/// producer (`baybo-agent`'s loop and its external-agent legs) writes it and
+/// the transcript reader that colour-codes failures on reload keys off it.
+/// Shared so a fourth producer cannot invent a spelling the reader misses.
+pub const TOOL_RESULT_ERROR_PREFIX: &str = "Error:";
+
 /// A single thinking/reasoning content item from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

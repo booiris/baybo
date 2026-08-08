@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_llm::TokenUsage;
-use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind};
+use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind, TOOL_RESULT_ERROR_PREFIX};
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
@@ -100,6 +100,28 @@ pub enum ExternalAgentEvent {
 }
 
 pub type ExternalAgentStream = Pin<Box<dyn Stream<Item = Result<ExternalAgentEvent>> + Send>>;
+
+/// Stamp a failed external tool result with the same prefix the in-process
+/// loop uses, so one reader recognises failures from every producer.
+///
+/// The external legs cannot carry the outcome any other way: `ContentBlock::
+/// ToolResult` has no error flag, and `ToolResultMeta` is reserved for
+/// baybo-audited calls (read/write fingerprints, approval decisions) that an
+/// opaque CLI never produces. Rows are never rewritten, so an unmarked
+/// failure is permanently indistinguishable from success.
+pub(crate) fn mark_tool_error(content: String, is_error: bool) -> String {
+    if !is_error {
+        return content;
+    }
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return format!("{TOOL_RESULT_ERROR_PREFIX} (no output)");
+    }
+    if trimmed.starts_with(TOOL_RESULT_ERROR_PREFIX) {
+        return content;
+    }
+    format!("{TOOL_RESULT_ERROR_PREFIX} {content}")
+}
 
 #[async_trait]
 pub trait ExternalAgent: Send + Sync {
@@ -226,6 +248,23 @@ mod tests {
                 ExternalAgentEvent::FinalContent(vec![ContentBlock::Text("ok".into())]),
             )])))
         }
+    }
+
+    #[test]
+    fn mark_tool_error_marks_only_failures_and_never_twice() {
+        assert_eq!(mark_tool_error("ok".into(), false), "ok");
+        assert_eq!(mark_tool_error("boom".into(), true), "Error: boom");
+        // A CLI whose own output already leads with the prefix must not end up
+        // with `Error: Error: …`.
+        assert_eq!(
+            mark_tool_error("Error: boom".into(), true),
+            "Error: boom",
+            "already-marked content must not be double-prefixed"
+        );
+        // An empty failure is the case that most needs a marker: without one
+        // the row is blank and reads as a silent success.
+        assert_eq!(mark_tool_error(String::new(), true), "Error: (no output)");
+        assert_eq!(mark_tool_error("  \n ".into(), true), "Error: (no output)");
     }
 
     #[test]
